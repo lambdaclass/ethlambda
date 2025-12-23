@@ -1,5 +1,6 @@
 use clap::Parser;
 use ethereum_types::{H256, U256};
+use ethlambda_types::genesis::Genesis;
 use serde::{Deserialize, Serialize};
 
 const ASCII_ART: &str = r#"
