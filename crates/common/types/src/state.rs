@@ -1,7 +1,7 @@
 use ethereum_types::{H256, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::block::BlockHeader;
+use crate::{block::BlockHeader, genesis::Genesis};
 
 #[derive(Debug)]
 pub struct Slot(u64);
@@ -31,14 +31,33 @@ pub struct State {
     // justifications_validators: JustificationValidators,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl State {
+    pub fn from_genesis(genesis: &Genesis) -> Self {
+        State {
+            config: genesis.config.clone(),
+            slot: Slot(0),
+            latest_block_header: BlockHeader {
+                slot: Slot(0),
+                proposer_index: 0,
+                parent_root: H256::zero(),
+                state_root: H256::zero(),
+                // TODO: this should be the hash_tree_root of an empty block body
+                body_root: H256::zero(),
+            },
+            latest_justified: genesis.latest_justified.clone(),
+            latest_finalized: genesis.latest_finalized.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Checkpoint {
     root: H256,
     // Used U256 due to it being serialized as string
     slot: U256,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     num_validators: u64,
     genesis_time: u64,

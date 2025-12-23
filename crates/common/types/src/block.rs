@@ -13,13 +13,13 @@ use crate::state::Slot;
 #[derive(Debug)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
-    slot: Slot,
+    pub slot: Slot,
     /// The index of the validator that proposed the block
-    proposer_index: u64,
+    pub proposer_index: u64,
     /// The root of the parent block
-    parent_root: H256,
+    pub parent_root: H256,
     /// The root of the state after applying transactions in this block
-    state_root: H256,
+    pub state_root: H256,
     /// The root of the block body
-    body_root: H256,
+    pub body_root: H256,
 }

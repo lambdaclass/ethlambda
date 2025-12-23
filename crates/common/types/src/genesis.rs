@@ -3,14 +3,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{Checkpoint, NetworkConfig};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Genesis {
-    config: NetworkConfig,
-    latest_justified: Checkpoint,
-    latest_finalized: Checkpoint,
-    historical_block_hashes: Vec<H256>,
-    justified_slots: Vec<bool>,
-    // justifications_roots: Vec<String>,
+    pub config: NetworkConfig,
+    pub latest_justified: Checkpoint,
+    pub latest_finalized: Checkpoint,
+    pub historical_block_hashes: Vec<H256>,
+    pub justified_slots: Vec<bool>,
+    // TODO: uncomment
+    // pub justifications_roots: Vec<String>,
     // TODO: this is an SSZ bitlist
-    // justifications_validators: String,
+    // pub justifications_validators: String,
 }
