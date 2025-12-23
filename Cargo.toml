@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 default-members = ["bin/ethlambda"]
-members = ["bin/ethlambda"]
+members = ["bin/ethlambda", "crates/blockchain/fork_choice", "crates/blockchain/state_transition", "crates/common/crypto", "crates/common/types", "crates/net/p2p", "crates/net/rpc", "crates/storage"]
 
 [workspace.package]
 authors = ["LambdaClass"]

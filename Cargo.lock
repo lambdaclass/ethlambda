@@ -5,3 +5,31 @@ version = 4
 [[package]]
 name = "ethlambda"
 version = "0.1.0"
+
+[[package]]
+name = "ethlambda_crypto"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_fork_choice"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_p2p"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_rpc"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_state_transition"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_storage"
+version = "0.1.0"
+
+[[package]]
+name = "ethlambda_types"
+version = "0.1.0"
