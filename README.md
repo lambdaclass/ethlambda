@@ -9,3 +9,5 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 2. Connect to P2P layer and listen for new blocks from peers
 3. Compute next state based on received blocks
 4. Receive attestations from peers and apply fork-choice rule to actively determine the head of the chain
+5. Produce and broadcast attestations for the head of the chain
+6. Produce new blocks and broadcast them to peers
