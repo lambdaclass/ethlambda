@@ -34,6 +34,16 @@ Read more about our engineering philosophy [in this post of our blog](https://bl
 - Prioritize code readability and maintainability over premature optimizations.
 - Avoid concurrency split all over the codebase. Concurrency adds complexity. Only use where strictly necessary.
 
+## 📚 References and acknowledgements
+
+The following links, repos, companies and projects have been important in the development of this repo, we have learned a lot from them and want to thank and acknowledge them.
+
+- [Ethereum](https://ethereum.org/en/)
+- [LeanEthereum](https://github.com/leanEthereum)
+- [Zeam](https://github.com/blockblaz/zeam)
+
+If we forgot to include anyone, please file an issue so we can add you. We always strive to reference the inspirations and code we use, but as an organization with multiple people, mistakes can happen, and someone might forget to include a reference.
+
 ## Roadmap
 
 0. Initial project setup and integration with [lean-quickstart](https://github.com/blockblaz/lean-quickstart)
