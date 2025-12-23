@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Used by makefile to run local devnets
+/lean-quickstart
