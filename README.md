@@ -2,6 +2,20 @@
 
 Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust.
 
+## Getting started
+
+We use `cargo` as our build system. To build and run the client, simply run:
+
+```sh
+cargo run
+```
+
+Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
+
+## Running in a devnet
+
+To quickly spin up a devnet, see [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
+
 ## Roadmap
 
 0. Initial project setup and integration with [lean-quickstart](https://github.com/blockblaz/lean-quickstart)
