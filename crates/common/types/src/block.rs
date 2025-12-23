@@ -1,0 +1,25 @@
+use ethereum_types::H256;
+
+use crate::state::Slot;
+
+/// The header of a block, containing metadata.
+///
+/// Block headers summarize blocks without storing full content. The header
+/// includes references to the parent and the resulting state. It also contains
+/// a hash of the block body.
+///
+/// Headers are smaller than full blocks. They're useful for tracking the chain
+/// without storing everything.
+#[derive(Debug)]
+pub struct BlockHeader {
+    /// The slot in which the block was proposed
+    slot: Slot,
+    /// The index of the validator that proposed the block
+    proposer_index: u64,
+    /// The root of the parent block
+    parent_root: H256,
+    /// The root of the state after applying transactions in this block
+    state_root: H256,
+    /// The root of the block body
+    body_root: H256,
+}
