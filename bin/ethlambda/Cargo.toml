@@ -5,3 +5,9 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+ethlambda_types.workspace = true
+
+serde.workspace = true
+ethereum-types.workspace = true
+serde_json.workspace = true
+clap.workspace = true

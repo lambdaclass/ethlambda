@@ -1,7 +1,16 @@
 [workspace]
 resolver = "3"
 default-members = ["bin/ethlambda"]
-members = ["bin/ethlambda", "crates/blockchain/fork_choice", "crates/blockchain/state_transition", "crates/common/crypto", "crates/common/types", "crates/net/p2p", "crates/net/rpc", "crates/storage"]
+members = [
+    "bin/ethlambda",
+    "crates/blockchain/fork_choice",
+    "crates/blockchain/state_transition",
+    "crates/common/crypto",
+    "crates/common/types",
+    "crates/net/p2p",
+    "crates/net/rpc",
+    "crates/storage",
+]
 
 [workspace.package]
 authors = ["LambdaClass"]
@@ -14,3 +23,21 @@ rust-version = "1.92.0"
 version = "0.1.0"
 
 [workspace.dependencies]
+ethlambda_types = { path = "crates/common/types" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.117"
+
+clap = { version = "4.3", features = ["derive", "env"] }
+
+# H256 type
+# TODO: switch to ethrex implementation when available
+ethereum-types = { version = "0.15.1", features = ["serialize"] }
+
+# SSZ deps
+# TODO: roll up our own implementation
+ethereum_ssz_derive = "0.8.3"
+ethereum_ssz = "0.8.3"
+ssz_types = "0.10.1"
+tree_hash = "0.9.1"
+tree_hash_derive = "0.9.1"
