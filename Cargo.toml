@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+default-members = ["bin/ethlambda"]
+members = ["bin/ethlambda"]
+
+[workspace.package]
+authors = ["LambdaClass"]
+edition = "2024"
+keywords = ["ethereum", "blockchain", "consensus", "protocol"]
+license = "LICENSE"
+readme = "README.md"
+repository = "https://github.com/lambdaclass/ethlambda"
+rust-version = "1.92.0"
+version = "0.1.0"
+
+[workspace.dependencies]
