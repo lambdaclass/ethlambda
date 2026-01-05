@@ -10,6 +10,9 @@ ethlambda_types.workspace = true
 
 tokio.workspace = true
 
+tracing.workspace = true
+tracing-subscriber = "0.3"
+
 serde.workspace = true
 ethereum-types.workspace = true
 serde_json.workspace = true

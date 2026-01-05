@@ -1369,6 +1369,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1387,6 +1389,7 @@ dependencies = [
  "ethrex-p2p",
  "ethrex-rlp",
  "libp2p",
+ "tracing",
 ]
 
 [[package]]

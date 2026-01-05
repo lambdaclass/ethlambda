@@ -1,6 +1,8 @@
 use clap::Parser;
 use ethlambda_p2p::{parse_validators_file, start_p2p};
 use ethlambda_types::{genesis::Genesis, state::State};
+use tracing::info;
+use tracing_subscriber::{FmtSubscriber, Registry, layer::SubscriberExt};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -22,6 +24,8 @@ struct CliOptions {
 
 #[tokio::main]
 async fn main() {
+    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer());
+    tracing::subscriber::set_global_default(subscriber).unwrap();
     let options = CliOptions::parse();
 
     println!("{ASCII_ART}");
@@ -36,6 +40,8 @@ async fn main() {
     let bootnodes = parse_validators_file(&options.validators_file);
 
     start_p2p(bootnodes, options.gossipsub_port);
+
+    info!("Node initialized");
 
     tokio::signal::ctrl_c()
         .await
