@@ -1,4 +1,5 @@
 use clap::Parser;
+use ethlambda_p2p::{parse_validators_file, start_p2p};
 use ethlambda_types::{genesis::Genesis, state::State};
 
 const ASCII_ART: &str = r#"
@@ -13,9 +14,14 @@ const ASCII_ART: &str = r#"
 struct CliOptions {
     #[arg(long)]
     custom_genesis_json_file: String,
+    #[arg(long)]
+    validators_file: String,
+    #[arg(long)]
+    gossipsub_port: u16,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let options = CliOptions::parse();
 
     println!("{ASCII_ART}");
@@ -26,6 +32,14 @@ fn main() {
         serde_json::from_str(&genesis_json).expect("Failed to parse genesis.json");
 
     let initial_state = State::from_genesis(&genesis);
+
+    let bootnodes = parse_validators_file(&options.validators_file);
+
+    start_p2p(bootnodes, options.gossipsub_port);
+
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl-c signal");
 
     println!("Shutting down...");
 }

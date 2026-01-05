@@ -10,3 +10,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+libp2p = { version = "0.56", features = ["full"] }
+
+# Required for NodeEnr parsing
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }

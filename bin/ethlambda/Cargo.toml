@@ -5,7 +5,10 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+ethlambda_p2p.workspace = true
 ethlambda_types.workspace = true
+
+tokio.workspace = true
 
 serde.workspace = true
 ethereum-types.workspace = true

@@ -10,5 +10,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 serde.workspace = true
 ethereum-types.workspace = true
