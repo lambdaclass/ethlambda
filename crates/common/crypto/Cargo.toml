@@ -1,5 +1,5 @@
 [package]
-name = "ethlambda_crypto"
+name = "ethlambda-crypto"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true

@@ -23,13 +23,13 @@ rust-version = "1.92.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-ethlambda_fork_choice = { path = "crates/blockchain/fork_choice" }
-ethlambda_state_transition = { path = "crates/blockchain/state_transition" }
-ethlambda_crypto = { path = "crates/common/crypto" }
-ethlambda_types = { path = "crates/common/types" }
-ethlambda_p2p = { path = "crates/net/p2p" }
-ethlambda_rpc = { path = "crates/net/rpc" }
-ethlambda_storage = { path = "crates/storage" }
+ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
+ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
+ethlambda-crypto = { path = "crates/common/crypto" }
+ethlambda-types = { path = "crates/common/types" }
+ethlambda-p2p = { path = "crates/net/p2p" }
+ethlambda-rpc = { path = "crates/net/rpc" }
+ethlambda-storage = { path = "crates/storage" }
 
 tracing = "0.1"
 thiserror = "2.0.9"

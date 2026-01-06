@@ -1,10 +1,12 @@
 use std::{net::IpAddr, time::Duration};
 
+use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId,
     gossipsub::{Behaviour, MessageAuthenticity, ValidationMode},
+    identity::PublicKey,
     multiaddr::Protocol,
 };
 
@@ -44,8 +46,10 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         let addr = Multiaddr::empty()
             .with(bootnode.ip.into())
             .with(Protocol::Udp(bootnode.quic_port))
-            .with(Protocol::QuicV1);
-        swarm.add_peer_address(PeerId::random(), addr);
+            .with(Protocol::QuicV1)
+            .with_p2p(PeerId::from_public_key(&bootnode.public_key))
+            .expect("failed to add peer ID to multiaddr");
+        swarm.dial(addr).unwrap();
     }
     let addr = Multiaddr::empty()
         .with("127.0.0.1".parse::<IpAddr>().unwrap().into())
@@ -61,6 +65,7 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
 pub struct Bootnode {
     ip: IpAddr,
     quic_port: u16,
+    public_key: PublicKey,
 }
 
 pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
@@ -84,16 +89,22 @@ pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
             .find(|(key, _)| key.as_ref() == b"quic")
             .expect("node doesn't support QUIC");
 
-        // let (_, public_key_bytes) = record
-        //     .pairs
-        //     .iter()
-        //     .find(|(key, _)| key.as_ref() == b"secp256k1")
-        //     .expect("node record missing public key");
+        let (_, public_key_rlp) = record
+            .pairs
+            .iter()
+            .find(|(key, _)| key.as_ref() == b"secp256k1")
+            .expect("node record missing public key");
+
+        let public_key_bytes = H264::decode(public_key_rlp).unwrap();
+        let public_key =
+            libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
+                .unwrap();
 
         let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
         bootnodes.push(Bootnode {
             ip: "127.0.0.1".parse().unwrap(),
             quic_port,
+            public_key: public_key.into(),
         });
     }
     bootnodes

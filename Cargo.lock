@@ -1364,8 +1364,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ethereum-types",
- "ethlambda_p2p",
- "ethlambda_types",
+ "ethlambda-p2p",
+ "ethlambda-types",
  "serde",
  "serde_json",
  "tokio",
@@ -1374,38 +1374,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethlambda_crypto"
+name = "ethlambda-crypto"
 version = "0.1.0"
 
 [[package]]
-name = "ethlambda_fork_choice"
+name = "ethlambda-fork-choice"
 version = "0.1.0"
 
 [[package]]
-name = "ethlambda_p2p"
+name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
+ "hex",
  "libp2p",
  "tracing",
 ]
 
 [[package]]
-name = "ethlambda_rpc"
+name = "ethlambda-rpc"
 version = "0.1.0"
 
 [[package]]
-name = "ethlambda_state_transition"
+name = "ethlambda-state-transition"
 version = "0.1.0"
 
 [[package]]
-name = "ethlambda_storage"
+name = "ethlambda-storage"
 version = "0.1.0"
 
 [[package]]
-name = "ethlambda_types"
+name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
  "ethereum-types",

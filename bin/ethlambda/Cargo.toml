@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-ethlambda_p2p.workspace = true
-ethlambda_types.workspace = true
+ethlambda-p2p.workspace = true
+ethlambda-types.workspace = true
 
 tokio.workspace = true
 
