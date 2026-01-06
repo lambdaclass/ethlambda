@@ -12,4 +12,4 @@ lint: ## 🔍 Run clippy on all workspace crates
 run-devnet: lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
 	cargo build \
 	&& cd lean-quickstart \
-	&& NETWORK_DIR=local-devnet ./spin-node.sh --node ream_0,ethlambda_0 --generateGenesis
+	&& NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ethlambda_0 --generateGenesis

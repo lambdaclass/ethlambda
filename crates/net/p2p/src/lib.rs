@@ -5,12 +5,15 @@ use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId,
+    futures::StreamExt,
     gossipsub::{Behaviour, MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
 };
 
-pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
+mod messages;
+
+pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -30,6 +33,7 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         .build()
         .expect("invalid gossipsub config");
 
+    // TODO: setup custom message ID function
     let behavior: Behaviour =
         libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
             .expect("failed to initiate behaviour");
@@ -44,11 +48,17 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
     .unwrap();
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
+    // TODO: implement Executor with spawned?
+    // libp2p::swarm::Config::with_executor(executor)
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
         .with_behaviour(|_| behavior)
         .expect("failed to add behaviour to swarm")
+        .with_swarm_config(|config| {
+            // Disable idle connection timeout
+            config.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+        })
         .build();
     for bootnode in bootnodes {
         let addr = Multiaddr::empty()
@@ -68,6 +78,15 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         .expect("failed to bind gossipsub listening address");
 
     println!("P2P node started on port {listening_port}");
+
+    event_loop(swarm).await;
+}
+
+async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
+    while let Some(event) = swarm.next().await {
+        // Handle swarm events here
+        println!("Swarm event: {:?}", event);
+    }
 }
 
 pub struct Bootnode {

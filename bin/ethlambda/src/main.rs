@@ -2,7 +2,7 @@ use clap::Parser;
 use ethlambda_p2p::{parse_validators_file, start_p2p};
 use ethlambda_types::{genesis::Genesis, state::State};
 use tracing::info;
-use tracing_subscriber::{FmtSubscriber, Registry, layer::SubscriberExt};
+use tracing_subscriber::{Registry, layer::SubscriberExt};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -39,13 +39,17 @@ async fn main() {
 
     let bootnodes = parse_validators_file(&options.validators_file);
 
-    start_p2p(bootnodes, options.gossipsub_port);
+    let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port));
 
     info!("Node initialized");
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl-c signal");
-
+    tokio::select! {
+        _ = p2p_handle => {
+            panic!("P2P node task has exited unexpectedly");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            // Ctrl-C received, shutting down
+        }
+    }
     println!("Shutting down...");
 }
