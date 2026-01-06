@@ -6,7 +6,7 @@ use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId,
     gossipsub::{Behaviour, MessageAuthenticity, ValidationMode},
-    identity::PublicKey,
+    identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
 };
 
@@ -36,7 +36,15 @@ pub fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
 
     // TODO: set peer scoring params
 
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    // TODO: load identity from config or flag
+    let secret_key = secp256k1::SecretKey::try_from_bytes(
+        b")\x95PR\x9ay\xbc-\xce\x007G\xc5/\xb0c\x94e\xc8\x93\xe0\x0b\x04@\xacf\x14Mb^\x06j"
+            .to_vec(),
+    )
+    .unwrap();
+    let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
+
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
         .with_behaviour(|_| behavior)
