@@ -1,5 +1,5 @@
 [package]
-name = "ethlambda_types"
+name = "ethlambda-types"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true
@@ -10,5 +10,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 serde.workspace = true
 ethereum-types.workspace = true

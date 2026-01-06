@@ -1,5 +1,5 @@
 [package]
-name = "ethlambda_fork_choice"
+name = "ethlambda-fork-choice"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true

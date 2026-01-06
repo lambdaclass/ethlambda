@@ -1,5 +1,5 @@
 [package]
-name = "ethlambda_state_transition"
+name = "ethlambda-state-transition"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true

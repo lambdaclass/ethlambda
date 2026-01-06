@@ -1,5 +1,5 @@
 [package]
-name = "ethlambda_p2p"
+name = "ethlambda-p2p"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true
@@ -10,3 +10,20 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ethlambda-types.workspace = true
+
+async-trait = "0.1"
+
+libp2p = { version = "0.56", features = ["full"] }
+
+snap = "1.1"
+
+tracing.workspace = true
+
+# Required for NodeEnr parsing
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+
+[dev-dependencies]
+hex = "0.4"

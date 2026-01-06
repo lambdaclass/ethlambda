@@ -52,13 +52,14 @@ impl State {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Checkpoint {
-    root: H256,
+    pub root: H256,
     // Used U256 due to it being serialized as string
-    slot: U256,
+    // TODO: use u64 and implement custom serialization
+    pub slot: U256,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    num_validators: u64,
-    genesis_time: u64,
+    pub num_validators: u64,
+    pub genesis_time: u64,
 }

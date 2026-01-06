@@ -5,7 +5,13 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-ethlambda_types.workspace = true
+ethlambda-p2p.workspace = true
+ethlambda-types.workspace = true
+
+tokio.workspace = true
+
+tracing.workspace = true
+tracing-subscriber = "0.3"
 
 serde.workspace = true
 ethereum-types.workspace = true
