@@ -1385,12 +1385,14 @@ version = "0.1.0"
 name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
  "hex",
  "libp2p",
+ "snap",
  "tracing",
 ]
 

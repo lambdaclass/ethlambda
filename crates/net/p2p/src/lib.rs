@@ -4,12 +4,17 @@ use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
-    Multiaddr, PeerId,
+    Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
-    gossipsub::{Behaviour, MessageAuthenticity, ValidationMode},
+    gossipsub::{self, MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
+    request_response::{self, Event, Message},
+    swarm::{NetworkBehaviour, SwarmEvent},
 };
+use tracing::{info, trace};
+
+use crate::messages::status::STATUS_PROTOCOL_V1;
 
 mod messages;
 
@@ -34,9 +39,20 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         .expect("invalid gossipsub config");
 
     // TODO: setup custom message ID function
-    let behavior: Behaviour =
-        libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
-            .expect("failed to initiate behaviour");
+    let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
+        .expect("failed to initiate behaviour");
+    let req_resp = request_response::Behaviour::new(
+        vec![(
+            StreamProtocol::new(STATUS_PROTOCOL_V1),
+            request_response::ProtocolSupport::Full,
+        )],
+        Default::default(),
+    );
+
+    let behavior = Behaviour {
+        gossipsub,
+        req_resp,
+    };
 
     // TODO: set peer scoring params
 
@@ -82,10 +98,34 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
     event_loop(swarm).await;
 }
 
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    gossipsub: gossipsub::Behaviour,
+    req_resp: request_response::Behaviour<messages::status::StatusCodec>,
+}
+
+/// Event loop for the P2P crate.
+/// Processes swarm events, including incoming requests, responses, and gossip.
 async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
     while let Some(event) = swarm.next().await {
-        // Handle swarm events here
-        println!("Swarm event: {:?}", event);
+        match event {
+            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(Event::Message {
+                peer,
+                connection_id,
+                message:
+                    Message::Request {
+                        request_id,
+                        request,
+                        channel,
+                    },
+            })) => {
+                info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            }
+            _ => {
+                trace!(?event, "Ignored swarm event");
+            }
+        }
     }
 }
 

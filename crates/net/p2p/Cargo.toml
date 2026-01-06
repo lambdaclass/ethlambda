@@ -12,7 +12,11 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 
+async-trait = "0.1"
+
 libp2p = { version = "0.56", features = ["full"] }
+
+snap = "1.1"
 
 tracing.workspace = true
 
