@@ -4,8 +4,8 @@ use tree_hash_derive::TreeHash;
 
 use crate::{block::BlockHeader, genesis::Genesis, primitives::H256};
 
-#[derive(Debug)]
-pub struct Slot(u64);
+/// The maximum number of validators that can be in the registry.
+pub const VALIDATOR_REGISTRY_LIMIT: u64 = 4096; // 2 ** 12
 
 /// The main consensus state object
 #[derive(Debug)]
@@ -13,7 +13,7 @@ pub struct State {
     /// The chain's configuration parameters
     config: NetworkConfig,
     /// The current slot number
-    slot: Slot,
+    slot: u64,
     /// The header of the most recent block
     latest_block_header: BlockHeader,
     /// The latest justified checkpoint
@@ -36,9 +36,9 @@ impl State {
     pub fn from_genesis(genesis: &Genesis) -> Self {
         State {
             config: genesis.config.clone(),
-            slot: Slot(0),
+            slot: 0,
             latest_block_header: BlockHeader {
-                slot: Slot(0),
+                slot: 0,
                 proposer_index: 0,
                 parent_root: H256::ZERO,
                 state_root: H256::ZERO,
