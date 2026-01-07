@@ -1752,6 +1752,7 @@ dependencies = [
  "ethrex-rlp",
  "hex",
  "libp2p",
+ "sha2",
  "snap",
  "ssz_types",
  "tracing",

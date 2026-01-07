@@ -12,6 +12,7 @@ use libp2p::{
     request_response::{self, Event, Message},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use sha2::Digest;
 use tracing::{info, trace};
 
 use crate::messages::status::{STATUS_PROTOCOL_V1, Status};
@@ -35,12 +36,14 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
         .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
         .validation_mode(ValidationMode::Anonymous)
+        .message_id_fn(compute_message_id)
         .build()
         .expect("invalid gossipsub config");
 
     // TODO: setup custom message ID function
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
+
     let req_resp = request_response::Behaviour::new(
         vec![(
             StreamProtocol::new(STATUS_PROTOCOL_V1),
@@ -213,4 +216,25 @@ pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
         });
     }
     bootnodes
+}
+
+fn compute_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+    const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+    const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
+    let mut hasher = sha2::Sha256::new();
+    let decompressed = snap::raw::Decoder::new().decompress_vec(&message.data);
+
+    let (domain, data) = match decompressed.as_ref() {
+        Ok(decompressed_data) => (MESSAGE_DOMAIN_VALID_SNAPPY, decompressed_data),
+        Err(_) => (MESSAGE_DOMAIN_INVALID_SNAPPY, &message.data),
+    };
+    let topic = message.topic.as_str().as_bytes();
+    let topic_len = (topic.len() as u64).to_be_bytes();
+    hasher.update(&domain);
+    hasher.update(&topic_len);
+    hasher.update(topic);
+    hasher.update(data);
+    let hash = hasher.finalize();
+    gossipsub::MessageId(hash[..20].to_vec())
 }
