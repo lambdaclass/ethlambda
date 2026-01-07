@@ -6,7 +6,7 @@ use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
-    gossipsub::{self, MessageAuthenticity, ValidationMode},
+    gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
     request_response,
@@ -15,13 +15,12 @@ use libp2p::{
 use sha2::Digest;
 use tracing::{info, trace};
 
-use crate::messages::status::{STATUS_PROTOCOL_V1, Status};
+use crate::{
+    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
+    messages::status::{STATUS_PROTOCOL_V1, Status},
+};
 
-/// Topic kind for block gossip
-const BLOCK_TOPIC_KIND: &str = "block";
-/// Topic kind for attestation gossip
-const ATTESTATION_TOPIC_KIND: &str = "attestation";
-
+mod gossipsub;
 mod messages;
 
 pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
@@ -105,7 +104,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
     let network = "devnet0";
     for topic_kind in topic_kinds {
         let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
-        let topic = gossipsub::IdentTopic::new(topic_str);
+        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
@@ -117,7 +116,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    gossipsub: gossipsub::Behaviour,
+    gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<messages::status::StatusCodec>,
 }
 
@@ -132,9 +131,9 @@ async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
                 handle_req_resp_message(&mut swarm, message).await;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                message @ gossipsub::Event::Message { .. },
+                message @ libp2p::gossipsub::Event::Message { .. },
             )) => {
-                handle_gossipsub_message(&mut swarm, message).await;
+                gossipsub::handle_gossipsub_message(&mut swarm, message).await;
             }
             _ => {
                 trace!(?event, "Ignored swarm event");
@@ -174,34 +173,6 @@ async fn handle_req_resp_message(
             response,
         } => {
             info!(finalized_slot=%response.finalized.slot, head_slot=%response.head.slot, "Received status response from peer {peer}");
-        }
-    }
-}
-
-async fn handle_gossipsub_message(swarm: &mut libp2p::Swarm<Behaviour>, event: gossipsub::Event) {
-    let gossipsub::Event::Message {
-        propagation_source: _,
-        message_id: _,
-        message,
-    } = event
-    else {
-        unreachable!("we already matched on event_loop");
-    };
-    match message.topic.as_str().split("/").nth(2) {
-        Some(BLOCK_TOPIC_KIND) => {
-            info!(
-                "Received block gossip message of size {} bytes",
-                message.data.len()
-            );
-        }
-        Some(ATTESTATION_TOPIC_KIND) => {
-            info!(
-                "Received attestation gossip message of size {} bytes",
-                message.data.len()
-            );
-        }
-        _ => {
-            trace!("Received message on unknown topic: {}", message.topic);
         }
     }
 }
@@ -254,7 +225,7 @@ pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
     bootnodes
 }
 
-fn compute_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
     const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
     const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
@@ -272,5 +243,5 @@ fn compute_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
     hasher.update(topic);
     hasher.update(data);
     let hash = hasher.finalize();
-    gossipsub::MessageId(hash[..20].to_vec())
+    libp2p::gossipsub::MessageId(hash[..20].to_vec())
 }
