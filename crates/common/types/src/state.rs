@@ -1,7 +1,8 @@
-use ethereum_types::{H256, U256};
 use serde::{Deserialize, Serialize};
+use ssz_derive::{Decode, Encode};
+use tree_hash_derive::TreeHash;
 
-use crate::{block::BlockHeader, genesis::Genesis};
+use crate::{block::BlockHeader, genesis::Genesis, primitives::H256};
 
 #[derive(Debug)]
 pub struct Slot(u64);
@@ -39,10 +40,10 @@ impl State {
             latest_block_header: BlockHeader {
                 slot: Slot(0),
                 proposer_index: 0,
-                parent_root: H256::zero(),
-                state_root: H256::zero(),
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
                 // TODO: this should be the hash_tree_root of an empty block body
-                body_root: H256::zero(),
+                body_root: H256::ZERO,
             },
             latest_justified: genesis.latest_justified.clone(),
             latest_finalized: genesis.latest_finalized.clone(),
@@ -50,12 +51,25 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
     pub root: H256,
     // Used U256 due to it being serialized as string
-    // TODO: use u64 and implement custom serialization
-    pub slot: U256,
+    #[serde(deserialize_with = "deser_dec_str")]
+    pub slot: u64,
+}
+
+// Taken from ethrex-common
+pub fn deser_dec_str<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = String::deserialize(d)?;
+    value
+        .parse()
+        .map_err(|_| D::Error::custom("Failed to deserialize u64 value"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

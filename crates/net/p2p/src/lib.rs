@@ -14,7 +14,7 @@ use libp2p::{
 };
 use tracing::{info, trace};
 
-use crate::messages::status::STATUS_PROTOCOL_V1;
+use crate::messages::status::{STATUS_PROTOCOL_V1, Status};
 
 mod messages;
 
@@ -110,21 +110,59 @@ struct Behaviour {
 async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
     while let Some(event) = swarm.next().await {
         match event {
-            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(Event::Message {
-                peer,
-                connection_id,
-                message:
-                    Message::Request {
-                        request_id,
-                        request,
-                        channel,
-                    },
-            })) => {
-                info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(message @ Event::Message { .. })) => {
+                handle_req_resp_message(&mut swarm, message).await;
             }
+            // SwarmEvent::Behaviour(BehaviourEvent::ReqResp(Event::Message {
+            //     peer,
+            //     connection_id,
+            //     message:
+            //         Message::Request {
+            //             request_id,
+            //             request,
+            //             channel,
+            //         },
+            // })) => {
+            //     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            // }
             _ => {
                 trace!(?event, "Ignored swarm event");
             }
+        }
+    }
+}
+
+async fn handle_req_resp_message(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    event: Event<Status, Status>,
+) {
+    let Event::Message {
+        peer,
+        connection_id: _,
+        message,
+    } = event
+    else {
+        unreachable!("we already matched on event_loop");
+    };
+    match message {
+        Message::Request {
+            request_id: _,
+            request,
+            channel,
+        } => {
+            info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            swarm
+                .behaviour_mut()
+                .req_resp
+                .send_response(channel, request.clone())
+                .unwrap();
+            swarm.behaviour_mut().req_resp.send_request(&peer, request);
+        }
+        Message::Response {
+            request_id: _,
+            response,
+        } => {
+            info!(finalized_slot=%response.finalized.slot, head_slot=%response.head.slot, "Received status response from peer {peer}");
         }
     }
 }

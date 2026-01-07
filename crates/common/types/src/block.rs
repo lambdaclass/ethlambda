@@ -1,4 +1,4 @@
-use ethereum_types::H256;
+use crate::primitives::H256;
 
 use crate::state::Slot;
 

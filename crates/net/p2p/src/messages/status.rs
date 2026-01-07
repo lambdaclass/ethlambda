@@ -1,8 +1,13 @@
 use std::io;
 
 use ethlambda_types::state::Checkpoint;
-use ethrex_common::{H256, U256};
-use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite};
+use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use snap::read::FrameEncoder;
+use ssz::{Decode, Encode};
+use ssz_derive::{Decode, Encode};
+use tracing::trace;
+
+use crate::messages::MAX_COMPRESSED_PAYLOAD_SIZE;
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 
@@ -32,6 +37,17 @@ impl libp2p::request_response::Codec for StatusCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
+        let mut result = 0_u8;
+        io.read_exact(std::slice::from_mut(&mut result)).await?;
+
+        // TODO: send errors to event loop?
+        if result != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-zero result in response",
+            ));
+        }
+
         let payload = decode_payload(io).await?;
         let status = deserialize_payload(payload)?;
         Ok(status)
@@ -46,7 +62,18 @@ impl libp2p::request_response::Codec for StatusCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        todo!();
+        trace!(?req, "Writing status request");
+
+        let encoded = req.as_ssz_bytes();
+        let mut compressor = FrameEncoder::new(&encoded[..]);
+
+        let mut buf = Vec::new();
+        io::Read::read_to_end(&mut compressor, &mut buf)?;
+
+        let mut size_buf = [0; 5];
+        let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
+        io.write(varint_buf).await?;
+        io.write(&buf).await?;
 
         Ok(())
     }
@@ -60,7 +87,19 @@ impl libp2p::request_response::Codec for StatusCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        todo!();
+        // Send result byte
+        io.write(&[0]).await?;
+
+        let encoded = resp.as_ssz_bytes();
+        let mut compressor = FrameEncoder::new(&encoded[..]);
+
+        let mut buf = Vec::new();
+        io::Read::read_to_end(&mut compressor, &mut buf)?;
+
+        let mut size_buf = [0; 5];
+        let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
+        io.write(varint_buf).await?;
+        io.write(&buf).await?;
 
         Ok(())
     }
@@ -70,12 +109,21 @@ async fn decode_payload<T>(io: &mut T) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
-    let mut varint_buf = [0; std::mem::size_of::<usize>()];
+    // TODO: limit bytes received
+    let mut varint_buf = [0; 5];
 
-    io.take(varint_buf.len() as u64)
+    let read = io
+        .take(varint_buf.len() as u64)
         .read(&mut varint_buf)
         .await?;
-    let (size, rest) = decode_varint(&varint_buf);
+    let (size, rest) = decode_varint(&varint_buf[..read])?;
+
+    if (size as usize) < rest.len() || size as usize > MAX_COMPRESSED_PAYLOAD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid message size",
+        ));
+    }
 
     let mut message = vec![0; size as usize];
     if rest.is_empty() {
@@ -93,49 +141,30 @@ where
 }
 
 fn deserialize_payload(payload: Vec<u8>) -> io::Result<Status> {
-    if payload.len() != 80 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid status message length",
-        ));
-    }
-
-    let finalized_root = H256(
-        payload[..32]
-            .try_into()
-            .expect("slice with incorrect length"),
-    );
-    let finalized_slot = u64::from_be_bytes(
-        payload[32..40]
-            .try_into()
-            .expect("slice with incorrect length"),
-    );
-
-    let head_root = H256(
-        payload[40..72]
-            .try_into()
-            .expect("slice with incorrect length"),
-    );
-    let head_slot = u64::from_be_bytes(
-        payload[72..]
-            .try_into()
-            .expect("slice with incorrect length"),
-    );
-
-    let status = Status {
-        finalized: Checkpoint {
-            root: finalized_root,
-            slot: U256::from(finalized_slot),
-        },
-        head: Checkpoint {
-            root: head_root,
-            slot: U256::from(head_slot),
-        },
-    };
+    let status = Status::from_ssz_bytes(&payload)
+        // We turn to string since DecodeError does not implement std::error::Error
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
     Ok(status)
 }
 
-fn decode_varint(buf: &[u8]) -> (u32, &[u8]) {
+/// Encodes a u32 as a varint into the provided buffer, returning a slice of the buffer
+/// containing the encoded bytes.
+fn encode_varint(mut value: u32, dst: &mut [u8; 5]) -> &[u8] {
+    for i in 0..5 {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        dst[i] = byte;
+        if value == 0 {
+            return &dst[..=i];
+        }
+    }
+    &dst[..]
+}
+
+fn decode_varint(buf: &[u8]) -> io::Result<(u32, &[u8])> {
     let mut result = 0_u32;
     let mut read_size = 0;
 
@@ -147,10 +176,16 @@ fn decode_varint(buf: &[u8]) -> (u32, &[u8]) {
             break;
         }
     }
-    (result, &buf[read_size..])
+    if read_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message size is bigger than 28 bits",
+        ));
+    }
+    Ok((result, &buf[read_size..]))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct Status {
     pub finalized: Checkpoint,
     pub head: Checkpoint,
@@ -164,7 +199,7 @@ mod tests {
     fn test_decode_varint() {
         // Example from https://protobuf.dev/programming-guides/encoding/
         let buf = [0b10010110, 0b00000001];
-        let (value, rest) = decode_varint(&buf);
+        let (value, rest) = decode_varint(&buf).unwrap();
         assert_eq!(value, 150);
 
         let expected: &[u8] = &[];
