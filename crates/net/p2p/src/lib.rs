@@ -9,13 +9,18 @@ use libp2p::{
     gossipsub::{self, MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response::{self, Event, Message},
+    request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
 use tracing::{info, trace};
 
 use crate::messages::status::{STATUS_PROTOCOL_V1, Status};
+
+/// Topic kind for block gossip
+const BLOCK_TOPIC_KIND: &str = "block";
+/// Topic kind for attestation gossip
+const ATTESTATION_TOPIC_KIND: &str = "attestation";
 
 mod messages;
 
@@ -96,7 +101,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let topic_kinds = ["block", "attestation"];
+    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
     let network = "devnet0";
     for topic_kind in topic_kinds {
         let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
@@ -121,21 +126,16 @@ struct Behaviour {
 async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
     while let Some(event) = swarm.next().await {
         match event {
-            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(message @ Event::Message { .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
+                message @ request_response::Event::Message { .. },
+            )) => {
                 handle_req_resp_message(&mut swarm, message).await;
             }
-            // SwarmEvent::Behaviour(BehaviourEvent::ReqResp(Event::Message {
-            //     peer,
-            //     connection_id,
-            //     message:
-            //         Message::Request {
-            //             request_id,
-            //             request,
-            //             channel,
-            //         },
-            // })) => {
-            //     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-            // }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                message @ gossipsub::Event::Message { .. },
+            )) => {
+                handle_gossipsub_message(&mut swarm, message).await;
+            }
             _ => {
                 trace!(?event, "Ignored swarm event");
             }
@@ -145,9 +145,9 @@ async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
 
 async fn handle_req_resp_message(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    event: Event<Status, Status>,
+    event: request_response::Event<Status, Status>,
 ) {
-    let Event::Message {
+    let request_response::Event::Message {
         peer,
         connection_id: _,
         message,
@@ -156,7 +156,7 @@ async fn handle_req_resp_message(
         unreachable!("we already matched on event_loop");
     };
     match message {
-        Message::Request {
+        request_response::Message::Request {
             request_id: _,
             request,
             channel,
@@ -169,11 +169,39 @@ async fn handle_req_resp_message(
                 .unwrap();
             swarm.behaviour_mut().req_resp.send_request(&peer, request);
         }
-        Message::Response {
+        request_response::Message::Response {
             request_id: _,
             response,
         } => {
             info!(finalized_slot=%response.finalized.slot, head_slot=%response.head.slot, "Received status response from peer {peer}");
+        }
+    }
+}
+
+async fn handle_gossipsub_message(swarm: &mut libp2p::Swarm<Behaviour>, event: gossipsub::Event) {
+    let gossipsub::Event::Message {
+        propagation_source: _,
+        message_id: _,
+        message,
+    } = event
+    else {
+        unreachable!("we already matched on event_loop");
+    };
+    match message.topic.as_str().split("/").nth(2) {
+        Some(BLOCK_TOPIC_KIND) => {
+            info!(
+                "Received block gossip message of size {} bytes",
+                message.data.len()
+            );
+        }
+        Some(ATTESTATION_TOPIC_KIND) => {
+            info!(
+                "Received attestation gossip message of size {} bytes",
+                message.data.len()
+            );
+        }
+        _ => {
+            trace!("Received message on unknown topic: {}", message.topic);
         }
     }
 }
