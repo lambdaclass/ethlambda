@@ -56,14 +56,14 @@ The initial project setup and integration with [lean-quickstart](https://github.
 This milestone focuses on connecting to other clients and listening for new blocks through gossipsub.
 
 - Connect to other peers via libp2p ✅
-- Respond to STATUS messages from other peers 🏗️
-- Listen for new blocks in gossipsub
+- Respond to STATUS messages from other peers ✅
+- Listen for new blocks in gossipsub ✅
 
 ### Compute current chain state
 
 This milestone focuses on computing the chain state from the gossiped by peers received.
 
-- Generate initial state from genesis configuration
+- Generate initial state from genesis configuration 🏗️
 - Implement state transition function
 - Transition state on each new block
 
