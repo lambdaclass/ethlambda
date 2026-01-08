@@ -1,5 +1,6 @@
 use clap::Parser;
 use ethlambda_p2p::{parse_validators_file, start_p2p};
+use ethlambda_rpc::metrics::start_prometheus_metrics_api;
 use ethlambda_types::{genesis::Genesis, state::State};
 use tracing::info;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
@@ -40,6 +41,10 @@ async fn main() {
     let bootnodes = parse_validators_file(&options.validators_file);
 
     let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port));
+
+    start_prometheus_metrics_api("127.0.0.1:8008".parse().unwrap())
+        .await
+        .unwrap();
 
     info!("Node initialized");
 
