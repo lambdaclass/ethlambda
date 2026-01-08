@@ -34,7 +34,7 @@ tree_hash_derive = "0.12.0"
 
 sha2 = "0.10"
 
-hex = "0.4"
+prometheus.workspace = true
 
 [dev-dependencies]
 hex = "0.4"

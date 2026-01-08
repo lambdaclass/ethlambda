@@ -10,3 +10,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+axum = "0.8.1"
+tokio.workspace = true
+prometheus.workspace = true

@@ -7,6 +7,7 @@ authors.workspace = true
 [dependencies]
 ethlambda-p2p.workspace = true
 ethlambda-types.workspace = true
+ethlambda-rpc.workspace = true
 
 tokio.workspace = true
 
