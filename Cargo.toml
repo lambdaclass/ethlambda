@@ -44,6 +44,9 @@ clap = { version = "4.3", features = ["derive", "env"] }
 # TODO: switch to ethrex implementation when available
 ethereum-types = { version = "0.15.1", features = ["serialize"] }
 
+# XMSS signatures
+leansig = { git = "https://github.com/leanEthereum/leansig.git", rev = "ae12a5feb25d917c42b6466444ebd56ec115a629" }
+
 # SSZ deps
 # TODO: roll up our own implementation
 ethereum_ssz_derive = "0.8.3"

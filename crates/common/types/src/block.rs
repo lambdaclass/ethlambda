@@ -1,11 +1,15 @@
-use ssz_types::typenum::N4096;
+use ssz_derive::{Decode, Encode};
+use ssz_types::typenum::U4096;
+use tree_hash_derive::TreeHash;
 
 use crate::{
     attestation::{Attestation, Attestations},
     primitives::H256,
+    signature::Signature,
 };
 
 /// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
+#[derive(Clone, Encode, Decode)]
 pub struct SignedBlockWithAttestation {
     /// The block plus an attestation from proposer being signed.
     pub message: BlockWithAttestation,
@@ -22,15 +26,22 @@ pub struct SignedBlockWithAttestation {
     pub signature: BlockSignatures,
 }
 
+// Manual Debug impl because leanSig signatures don't implement Debug.
+impl core::fmt::Debug for SignedBlockWithAttestation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SignedBlockWithAttestation")
+            .field("message", &self.message)
+            .field("signature", &"...")
+            .finish()
+    }
+}
+
 /// Aggregated signature list included alongside the block.
 /// Size limited to [`crate::state::VALIDATOR_REGISTRY_LIMIT`].
-pub type BlockSignatures = ssz_types::VariableList<
-    // TODO: change to Signature type when available
-    u64,
-    N4096,
->;
+pub type BlockSignatures = ssz_types::VariableList<Signature, U4096>;
 
 /// Bundle containing a block and the proposer's attestation.
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct BlockWithAttestation {
     /// The proposed block message.
     pub block: Block,
@@ -47,7 +58,7 @@ pub struct BlockWithAttestation {
 ///
 /// Headers are smaller than full blocks. They're useful for tracking the chain
 /// without storing everything.
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
     pub slot: u64,
@@ -62,6 +73,7 @@ pub struct BlockHeader {
 }
 
 /// A complete block including header and body.
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct Block {
     /// The slot in which the block was proposed.
     pub slot: u64,
@@ -79,6 +91,7 @@ pub struct Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///
