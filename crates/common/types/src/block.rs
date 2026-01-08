@@ -1,11 +1,11 @@
 use ssz_derive::{Decode, Encode};
-use ssz_types::typenum::U4096;
+use ssz_types::typenum::{Diff, U488, U3600, U4096};
 use tree_hash_derive::TreeHash;
 
 use crate::{
     attestation::{Attestation, Attestations},
     primitives::H256,
-    signature::Signature,
+    signature::{Signature, SignatureSize},
 };
 
 /// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
@@ -38,7 +38,8 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
 
 /// Aggregated signature list included alongside the block.
 /// Size limited to [`crate::state::VALIDATOR_REGISTRY_LIMIT`].
-pub type BlockSignatures = ssz_types::VariableList<Signature, U4096>;
+pub type BlockSignatures =
+    ssz_types::VariableList<ssz_types::FixedVector<u8, SignatureSize>, U4096>;
 
 /// Bundle containing a block and the proposer's attestation.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
