@@ -133,7 +133,7 @@ async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
                 message @ libp2p::gossipsub::Event::Message { .. },
             )) => {
-                gossipsub::handle_gossipsub_message(&mut swarm, message).await;
+                gossipsub::handle_gossipsub_message(message).await;
             }
             _ => {
                 trace!(?event, "Ignored swarm event");
