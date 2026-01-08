@@ -63,8 +63,8 @@ This milestone focuses on connecting to other clients and listening for new bloc
 
 This milestone focuses on computing the chain state from the gossiped by peers received.
 
-- Generate initial state from genesis configuration 🏗️
-- Implement state transition function
+- Generate initial state from genesis configuration ✅
+- Implement state transition function 🏗️
 - Transition state on each new block
 
 ### Apply fork-choice rule
