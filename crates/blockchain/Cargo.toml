@@ -1,0 +1,20 @@
+[package]
+name = "ethlambda-blockchain"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ethlambda-storage.workspace = true
+ethlambda-types.workspace = true
+
+spawned-concurrency.workspace = true
+
+tracing.workspace = true
+
+prometheus.workspace = true

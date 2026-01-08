@@ -3,6 +3,7 @@ resolver = "3"
 default-members = ["bin/ethlambda"]
 members = [
     "bin/ethlambda",
+    "crates/blockchain",
     "crates/blockchain/fork_choice",
     "crates/blockchain/state_transition",
     "crates/common/crypto",
@@ -23,6 +24,7 @@ rust-version = "1.92.0"
 version = "0.1.0"
 
 [workspace.dependencies]
+ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
 ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
@@ -37,6 +39,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.117"
 hex = "0.4"
 
+spawned-concurrency = "0.4"
+spawned-rt = "0.4"
 tokio = "1.0"
 
 prometheus = "0.14"

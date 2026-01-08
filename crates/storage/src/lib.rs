@@ -1,11 +1,16 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use ethlambda_types::{
     attestation::SignedAttestation,
     block::Block,
-    primitives::H256,
-    state::{Checkpoint, State},
+    primitives::{H256, TreeHash},
+    state::{ChainConfig, Checkpoint, State},
 };
+
+pub struct Store(Arc<Mutex<StoreInner>>);
 
 /// Forkchoice store tracking chain state and validator attestations.
 ///
@@ -22,12 +27,12 @@ use ethlambda_types::{
 /// - an interval tick occurs (activating new attestations),
 /// - or when the head is recomputed.
 #[derive(Clone)]
-pub struct Store {
+struct StoreInner {
     /// Current time in intervals since genesis.
     time: u64,
 
     /// Chain configuration parameters.
-    // config: Config,
+    config: ChainConfig,
 
     /// Root of the current canonical chain head block.
     ///
@@ -82,4 +87,47 @@ pub struct Store {
     /// - They migrate to `latest_known_attestations` via interval ticks.
     /// - Keyed by validator index to enforce one attestation per validator.
     latest_new_attestations: HashMap<u64, SignedAttestation>,
+}
+
+impl Store {
+    pub fn from_genesis(genesis_state: State) -> Self {
+        let genesis_state_root = genesis_state.tree_hash_root();
+        let genesis_block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: genesis_state_root,
+            body: Default::default(),
+        };
+        Self::get_forkchoice_store(genesis_state, genesis_block)
+    }
+
+    pub fn get_forkchoice_store(anchor_state: State, anchor_block: Block) -> Self {
+        let anchor_state_root = anchor_state.tree_hash_root();
+        let anchor_block_root = anchor_block.tree_hash_root();
+
+        let mut blocks = HashMap::new();
+        blocks.insert(anchor_block_root, anchor_block.clone());
+
+        let mut states = HashMap::new();
+        states.insert(anchor_state_root, anchor_state.clone());
+
+        let anchor_checkpoint = Checkpoint {
+            root: anchor_block_root,
+            slot: 0,
+        };
+
+        Self(Arc::new(Mutex::new(StoreInner {
+            time: 0,
+            config: anchor_state.config.clone(),
+            head: anchor_block_root,
+            safe_target: anchor_block_root,
+            latest_justified: anchor_checkpoint,
+            latest_finalized: anchor_checkpoint,
+            blocks,
+            states,
+            latest_known_attestations: HashMap::new(),
+            latest_new_attestations: HashMap::new(),
+        })))
+    }
 }

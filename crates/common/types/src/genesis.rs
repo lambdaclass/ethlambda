@@ -1,11 +1,11 @@
 use ethereum_types::H256;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Checkpoint, NetworkConfig};
+use crate::state::{ChainConfig, Checkpoint};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Genesis {
-    pub config: NetworkConfig,
+    pub config: ChainConfig,
     pub latest_justified: Checkpoint,
     pub latest_finalized: Checkpoint,
     pub historical_block_hashes: Vec<H256>,

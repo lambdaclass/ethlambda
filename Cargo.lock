@@ -1788,16 +1788,31 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ethereum-types",
+ "ethlambda-blockchain",
  "ethlambda-p2p",
  "ethlambda-rpc",
+ "ethlambda-storage",
  "ethlambda-types",
  "hex",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "spawned-concurrency",
+ "spawned-rt",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ethlambda-blockchain"
+version = "0.1.0"
+dependencies = [
+ "ethlambda-storage",
+ "ethlambda-types",
+ "prometheus",
+ "spawned-concurrency",
+ "tracing",
 ]
 
 [[package]]
@@ -1815,6 +1830,7 @@ dependencies = [
  "async-trait",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "ethlambda-blockchain",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",

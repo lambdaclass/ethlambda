@@ -6,6 +6,7 @@ use std::{
 use clap::Parser;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
+use ethlambda_storage::Store;
 use ethlambda_types::{
     genesis::Genesis,
     state::{State, Validator, ValidatorPubkey},
@@ -13,6 +14,8 @@ use ethlambda_types::{
 use serde::Deserialize;
 use tracing::info;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+use ethlambda_blockchain::BlockChain;
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -52,9 +55,12 @@ async fn main() {
 
     let validators = read_validators(&validators_path);
 
-    let initial_state = State::from_genesis(&genesis, validators);
+    let genesis_state = State::from_genesis(&genesis, validators);
+    let store = Store::from_genesis(genesis_state);
 
-    let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port));
+    let blockchain = BlockChain::spawn(store);
+
+    let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port, blockchain));
 
     start_prometheus_metrics_api("127.0.0.1:8008".parse().unwrap())
         .await

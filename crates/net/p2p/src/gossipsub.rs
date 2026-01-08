@@ -1,3 +1,4 @@
+use ethlambda_blockchain::BlockChain;
 use ethlambda_types::block::SignedBlockWithAttestation;
 use libp2p::gossipsub::Event;
 use ssz::Decode;
@@ -8,7 +9,7 @@ pub const BLOCK_TOPIC_KIND: &str = "block";
 /// Topic kind for attestation gossip
 pub const ATTESTATION_TOPIC_KIND: &str = "attestation";
 
-pub async fn handle_gossipsub_message(event: Event) {
+pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event) {
     let Event::Message {
         propagation_source: _,
         message_id: _,
@@ -30,8 +31,9 @@ pub async fn handle_gossipsub_message(event: Event) {
             else {
                 return;
             };
-            info!(slot=%signed_block.message.block.slot, "Received new block");
-            update_head_slot(signed_block.message.block.slot);
+            let slot = signed_block.message.block.slot;
+            info!(%slot, "Received new block from gossipsub, sending for processing");
+            blockchain.notify_new_block(signed_block).await;
         }
         Some(ATTESTATION_TOPIC_KIND) => {
             info!(
@@ -50,13 +52,4 @@ fn decompress_message(data: &[u8]) -> snap::Result<Vec<u8>> {
     let mut uncompressed_data = vec![0u8; uncompressed_size];
     snap::raw::Decoder::new().decompress(&data, &mut uncompressed_data)?;
     Ok(uncompressed_data)
-}
-
-fn update_head_slot(slot: u64) {
-    static LEAN_HEAD_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_head_slot", "Latest slot of the lean chain")
-                .unwrap()
-        });
-    LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
 }

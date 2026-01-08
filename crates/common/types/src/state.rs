@@ -19,25 +19,25 @@ pub type ValidatorRegistryLimit = U4096;
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct State {
     /// The chain's configuration parameters
-    config: NetworkConfig,
+    pub config: ChainConfig,
     /// The current slot number
-    slot: u64,
+    pub slot: u64,
     /// The header of the most recent block
-    latest_block_header: BlockHeader,
+    pub latest_block_header: BlockHeader,
     /// The latest justified checkpoint
-    latest_justified: Checkpoint,
+    pub latest_justified: Checkpoint,
     /// The latest finalized checkpoint
-    latest_finalized: Checkpoint,
+    pub latest_finalized: Checkpoint,
     /// A list of historical block root hashes
-    historical_block_hashes: HistoricalBlockHashes,
+    pub historical_block_hashes: HistoricalBlockHashes,
     /// A bitfield indicating which historical slots were justified
-    justified_slots: JustifiedSlots,
+    pub justified_slots: JustifiedSlots,
     /// Registry of validators tracked by the state
-    validators: ssz_types::VariableList<Validator, ValidatorRegistryLimit>,
+    pub validators: ssz_types::VariableList<Validator, ValidatorRegistryLimit>,
     /// Roots of justified blocks
-    justifications_roots: JustificationRoots,
+    pub justifications_roots: JustificationRoots,
     /// A bitlist of validators who participated in justifications
-    justifications_validators: JustificationValidators,
+    pub justifications_validators: JustificationValidators,
 }
 
 /// The maximum number of historical block roots to store in the state.
@@ -104,10 +104,12 @@ impl State {
     }
 }
 
+/// Represents a checkpoint in the chain's history.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
+    /// The root hash of the checkpoint's block.
     pub root: H256,
-    // Used U256 due to it being serialized as string
+    /// The slot number of the checkpoint's block.
     #[serde(deserialize_with = "deser_dec_str")]
     pub slot: u64,
 }
@@ -126,6 +128,6 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
-pub struct NetworkConfig {
+pub struct ChainConfig {
     pub genesis_time: u64,
 }

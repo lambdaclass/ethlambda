@@ -5,10 +5,14 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+ethlambda-blockchain.workspace = true
 ethlambda-p2p.workspace = true
 ethlambda-types.workspace = true
 ethlambda-rpc.workspace = true
+ethlambda-storage.workspace = true
 
+spawned-concurrency.workspace = true
+spawned-rt.workspace = true
 tokio.workspace = true
 
 tracing.workspace = true

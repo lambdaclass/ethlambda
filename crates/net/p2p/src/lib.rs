@@ -1,5 +1,6 @@
 use std::{net::IpAddr, time::Duration};
 
+use ethlambda_blockchain::BlockChain;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -23,7 +24,7 @@ use crate::{
 mod gossipsub;
 mod messages;
 
-pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
+pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain: BlockChain) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -110,7 +111,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16) {
 
     println!("P2P node started on port {listening_port}");
 
-    event_loop(swarm).await;
+    event_loop(swarm, blockchain).await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -122,7 +123,7 @@ struct Behaviour {
 
 /// Event loop for the P2P crate.
 /// Processes swarm events, including incoming requests, responses, and gossip.
-async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
+async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>, mut blockchain: BlockChain) {
     while let Some(event) = swarm.next().await {
         match event {
             SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
@@ -133,7 +134,7 @@ async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>) {
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
                 message @ libp2p::gossipsub::Event::Message { .. },
             )) => {
-                gossipsub::handle_gossipsub_message(message).await;
+                gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
             }
             _ => {
                 trace!(?event, "Ignored swarm event");
