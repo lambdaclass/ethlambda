@@ -11,7 +11,7 @@ pub struct Genesis {
     pub historical_block_hashes: Vec<H256>,
     pub justified_slots: Vec<bool>,
     // TODO: uncomment
-    // pub justifications_roots: Vec<String>,
+    pub justifications_roots: Vec<String>,
     // TODO: this is an SSZ bitlist
-    // pub justifications_validators: String,
+    pub justifications_validators: String,
 }

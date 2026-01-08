@@ -37,4 +37,3 @@ sha2 = "0.10"
 prometheus.workspace = true
 
 [dev-dependencies]
-hex = "0.4"

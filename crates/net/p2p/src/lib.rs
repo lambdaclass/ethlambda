@@ -183,19 +183,11 @@ pub struct Bootnode {
     public_key: PublicKey,
 }
 
-pub fn parse_validators_file(bootnodes_path: &str) -> Vec<Bootnode> {
-    let bootnodes_yaml =
-        std::fs::read_to_string(bootnodes_path).expect("Failed to read validators.yaml");
-
+pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
     let mut bootnodes = vec![];
 
     // File is YAML, but we try to avoid pulling a full YAML parser just for this
-    for line in bootnodes_yaml.lines() {
-        let trimmed_line = line.trim();
-        if trimmed_line.is_empty() {
-            continue;
-        }
-        let enr_str = trimmed_line.strip_prefix("- ").unwrap();
+    for enr_str in enrs {
         let base64_decoded = ethrex_common::base64::decode(&enr_str.as_bytes()[4..]);
         let record = NodeRecord::decode(&base64_decoded).unwrap();
         let (_, quic_port_bytes) = record

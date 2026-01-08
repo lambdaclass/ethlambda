@@ -1,7 +1,16 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
 use clap::Parser;
-use ethlambda_p2p::{parse_validators_file, start_p2p};
+use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
-use ethlambda_types::{genesis::Genesis, state::State};
+use ethlambda_types::{
+    genesis::Genesis,
+    state::{State, Validator, ValidatorPubkey},
+};
+use serde::Deserialize;
 use tracing::info;
 use tracing_subscriber::{Registry, layer::SubscriberExt};
 
@@ -16,9 +25,7 @@ const ASCII_ART: &str = r#"
 #[derive(Debug, clap::Parser)]
 struct CliOptions {
     #[arg(long)]
-    custom_genesis_json_file: String,
-    #[arg(long)]
-    validators_file: String,
+    custom_network_config_dir: PathBuf,
     #[arg(long)]
     gossipsub_port: u16,
 }
@@ -31,14 +38,21 @@ async fn main() {
 
     println!("{ASCII_ART}");
 
-    let genesis_json = std::fs::read_to_string(&options.custom_genesis_json_file)
-        .expect("Failed to read genesis.json");
+    let genesis_path = options.custom_network_config_dir.join("genesis.json");
+    let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
+    let validators_path = options
+        .custom_network_config_dir
+        .join("annotated_validators.yaml");
 
-    let bootnodes = parse_validators_file(&options.validators_file);
+    let genesis_json = std::fs::read_to_string(&genesis_path).expect("Failed to read genesis.json");
     let genesis: Genesis =
         serde_json::from_str(&genesis_json).expect("Failed to parse genesis.json");
 
-    let initial_state = State::from_genesis(&genesis, vec![]);
+    let bootnodes = read_bootnodes(&bootnodes_path);
+
+    let validators = read_validators(&validators_path);
+
+    let initial_state = State::from_genesis(&genesis, validators);
 
     let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port));
 
@@ -57,4 +71,63 @@ async fn main() {
         }
     }
     println!("Shutting down...");
+}
+
+fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
+    let bootnodes_yaml =
+        std::fs::read_to_string(bootnodes_path).expect("Failed to read bootnodes file");
+    let enrs: Vec<String> =
+        serde_yaml_ng::from_str(&bootnodes_yaml).expect("Failed to parse bootnodes file");
+    parse_enrs(enrs)
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotatedValidator {
+    index: u64,
+    #[serde(rename = "pubkey_hex")]
+    #[serde(deserialize_with = "deser_pubkey_hex")]
+    pubkey: ValidatorPubkey,
+    // privkey_file: PathBuf,
+}
+
+// Taken from ethrex-common
+pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkey, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = String::deserialize(d)?;
+    let pubkey: ValidatorPubkey = hex::decode(&value)
+        .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
+        .try_into()
+        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+    Ok(pubkey)
+}
+
+fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
+    let validators_yaml =
+        std::fs::read_to_string(validators_path).expect("Failed to read validators file");
+    // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
+    let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
+        serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
+
+    let mut validators: Vec<Validator> = validator_infos
+        .into_iter()
+        .map(|(_, v)| Validator {
+            pubkey: v[0].pubkey,
+            index: v[0].index,
+        })
+        .collect();
+
+    validators.sort_by_key(|v| v.index);
+    let num_validators = validators.len();
+
+    validators.dedup_by_key(|v| v.index);
+
+    if validators.len() != num_validators {
+        panic!("Duplicate validator indices found in config");
+    }
+
+    validators
 }

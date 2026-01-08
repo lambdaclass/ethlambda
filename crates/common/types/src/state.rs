@@ -16,7 +16,7 @@ use crate::{
 pub type ValidatorRegistryLimit = U4096;
 
 /// The main consensus state object
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct State {
     /// The chain's configuration parameters
     config: NetworkConfig,
@@ -63,10 +63,12 @@ type JustificationValidators =
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
 pub struct Validator {
     /// XMSS one-time signature public key.
-    pubkey: [u8; 52],
+    pub pubkey: ValidatorPubkey,
     /// Validator index in the registry.
-    index: u64,
+    pub index: u64,
 }
+
+pub type ValidatorPubkey = [u8; 52];
 
 impl State {
     pub fn from_genesis(genesis: &Genesis, validators: Vec<Validator>) -> Self {
@@ -78,20 +80,27 @@ impl State {
             body_root: BlockBody::default().tree_hash_root(),
         };
         let validators = ssz_types::VariableList::new(validators).unwrap();
-        State {
+        let justified_slots =
+            JustifiedSlots::with_capacity(0).expect("failed to initialize empty list");
+        let justifications_validators =
+            JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
+
+        let state = State {
             config: genesis.config.clone(),
             slot: 0,
             latest_block_header: genesis_header,
             latest_justified: genesis.latest_justified.clone(),
             latest_finalized: genesis.latest_finalized.clone(),
             historical_block_hashes: Default::default(),
-            justified_slots: JustifiedSlots::from_bytes(Default::default())
-                .expect("failed to initialize empty list"),
+            justified_slots,
             validators,
             justifications_roots: Default::default(),
-            justifications_validators: JustificationValidators::from_bytes(Default::default())
-                .expect("failed to initialize empty list"),
-        }
+            justifications_validators,
+        };
+
+        dbg!(state.tree_hash_root());
+
+        state
     }
 }
 
@@ -116,8 +125,7 @@ where
         .map_err(|_| D::Error::custom("Failed to deserialize u64 value"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct NetworkConfig {
-    pub num_validators: u64,
     pub genesis_time: u64,
 }
