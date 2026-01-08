@@ -6,6 +6,7 @@ use crate::{
     attestation::{Attestation, Attestations},
     primitives::H256,
     signature::{Signature, SignatureSize},
+    state::ValidatorRegistryLimit,
 };
 
 /// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
@@ -37,9 +38,8 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
 }
 
 /// Aggregated signature list included alongside the block.
-/// Size limited to [`crate::state::VALIDATOR_REGISTRY_LIMIT`].
 pub type BlockSignatures =
-    ssz_types::VariableList<ssz_types::FixedVector<u8, SignatureSize>, U4096>;
+    ssz_types::VariableList<ssz_types::FixedVector<u8, SignatureSize>, ValidatorRegistryLimit>;
 
 /// Bundle containing a block and the proposer's attestation.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
@@ -92,7 +92,7 @@ pub struct Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Default, Clone, Encode, Decode, TreeHash)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///

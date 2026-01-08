@@ -33,12 +33,12 @@ async fn main() {
 
     let genesis_json = std::fs::read_to_string(&options.custom_genesis_json_file)
         .expect("Failed to read genesis.json");
+
+    let bootnodes = parse_validators_file(&options.validators_file);
     let genesis: Genesis =
         serde_json::from_str(&genesis_json).expect("Failed to parse genesis.json");
 
-    let initial_state = State::from_genesis(&genesis);
-
-    let bootnodes = parse_validators_file(&options.validators_file);
+    let initial_state = State::from_genesis(&genesis, vec![]);
 
     let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port));
 

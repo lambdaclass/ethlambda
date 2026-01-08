@@ -2,7 +2,10 @@ use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::U4096;
 use tree_hash_derive::TreeHash;
 
-use crate::{signature::Signature, state::Checkpoint};
+use crate::{
+    signature::Signature,
+    state::{Checkpoint, ValidatorRegistryLimit},
+};
 
 /// Validator specific attestation wrapping shared attestation data.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
@@ -31,8 +34,7 @@ pub struct AttestationData {
 }
 
 /// List of validator attestations included in a block.
-/// Size limited to [`crate::state::VALIDATOR_REGISTRY_LIMIT`].
-pub type Attestations = ssz_types::VariableList<Attestation, U4096>;
+pub type Attestations = ssz_types::VariableList<Attestation, ValidatorRegistryLimit>;
 
 /// Validator attestation bundled with its signature.
 #[derive(Clone, Encode, Decode)]
