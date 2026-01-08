@@ -8,7 +8,7 @@ use crate::{block::BlockHeader, genesis::Genesis, primitives::H256};
 pub const VALIDATOR_REGISTRY_LIMIT: u64 = 4096; // 2 ** 12
 
 /// The main consensus state object
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     /// The chain's configuration parameters
     config: NetworkConfig,
