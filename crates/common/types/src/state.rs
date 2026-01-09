@@ -50,7 +50,7 @@ type HistoricalRootsLimit = U262144; // 2**18
 type HistoricalBlockHashes = ssz_types::VariableList<H256, HistoricalRootsLimit>;
 
 /// Bitlist tracking justified slots up to historical roots limit.
-type JustifiedSlots = ssz_types::BitList<HistoricalRootsLimit>;
+pub type JustifiedSlots = ssz_types::BitList<HistoricalRootsLimit>;
 
 /// List of justified block roots up to historical_roots_limit.
 type JustificationRoots = ssz_types::VariableList<H256, HistoricalRootsLimit>;

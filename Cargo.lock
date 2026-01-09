@@ -1860,6 +1860,7 @@ name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
