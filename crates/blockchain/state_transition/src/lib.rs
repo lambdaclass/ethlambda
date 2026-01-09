@@ -15,13 +15,26 @@ pub enum Error {
     ParentSlotIsNewer { parent_slot: u64, block_slot: u64 },
     #[error("invalid proposer: expected {expected}, found {found}")]
     InvalidProposer { expected: u64, found: u64 },
-    #[error("parent root doesn't match: expected {expected}, found {found}")]
+    #[error("parent root mismatch: expected {expected}, found {found}")]
     InvalidParent { expected: H256, found: H256 },
+    #[error("state root mismatch: expected {expected}, computed {computed}")]
+    StateRootMismatch { expected: H256, computed: H256 },
 }
 
 pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
     process_slots(state, block.slot)?;
     process_block(state, block)?;
+
+    let computed_state_root = state.tree_hash_root();
+    if block.state_root != computed_state_root {
+        return Err(Error::StateRootMismatch {
+            expected: block.state_root,
+            computed: computed_state_root,
+        });
+    }
+
+    // Cache the latest state root
+    state.latest_block_header.state_root = computed_state_root;
     Ok(())
 }
 
@@ -33,7 +46,8 @@ fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
             current_slot: state.slot,
         });
     }
-    // TODO: cache the pre-block state root?
+    // NOTE: we cache the state root at the end of the state_transition
+    // function instead of here.
     state.slot = target_slot;
     Ok(())
 }
@@ -136,6 +150,8 @@ fn current_proposer(slot: u64, num_validators: u64) -> u64 {
     slot % num_validators
 }
 
+/// Apply attestations and update justification/finalization
+/// according to the Lean Consensus 3SF-mini rules.
 fn process_attestations(state: &mut State, attestations: &Attestations) -> Result<(), Error> {
     Ok(())
 }
