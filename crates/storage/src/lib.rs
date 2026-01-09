@@ -67,7 +67,7 @@ struct StoreInner {
     /// Every block that might participate in fork choice must appear here.
     blocks: HashMap<H256, Block>,
 
-    /// Mapping from state root to State objects.
+    /// Mapping from block root to State objects.
     ///
     /// For each known block, we keep its post-state.
     ///
@@ -129,5 +129,9 @@ impl Store {
             latest_known_attestations: HashMap::new(),
             latest_new_attestations: HashMap::new(),
         })))
+    }
+
+    pub fn has_state(&self, block_root: &H256) -> bool {
+        self.0.lock().unwrap().states.contains_key(block_root)
     }
 }

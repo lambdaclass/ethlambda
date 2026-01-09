@@ -1,7 +1,7 @@
 use ethlambda_storage::Store;
-use ethlambda_types::block::SignedBlockWithAttestation;
+use ethlambda_types::{block::SignedBlockWithAttestation, primitives::TreeHash};
 use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
-use tracing::error;
+use tracing::{error, warn};
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -28,6 +28,33 @@ impl BlockChain {
 
 struct BlockChainServer {
     store: Store,
+}
+
+impl BlockChainServer {
+    fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+        let slot = signed_block.message.block.slot;
+        update_head_slot(slot);
+
+        let block = signed_block.message.block;
+        let proposer_attestation = signed_block.message.proposer_attestation;
+        let signatures = signed_block.signature;
+
+        let block_root = block.tree_hash_root();
+
+        if self.store.has_state(&block_root) {
+            return;
+        }
+
+        if !self.store.has_state(&block.parent_root) {
+            // TODO: backfill missing blocks
+            warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
+            return;
+        }
+
+        // TODO: validate block signatures
+
+        // TODO: execute block and obtain new state
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -58,8 +85,8 @@ impl GenServer for BlockChainServer {
         _handle: &GenServerHandle<Self>,
     ) -> CastResponse {
         match message {
-            CastMessage::NewBlock(block) => {
-                update_head_slot(block.message.block.slot);
+            CastMessage::NewBlock(signed_block) => {
+                self.on_block(signed_block);
             }
         }
         CastResponse::NoReply
