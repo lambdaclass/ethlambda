@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ethlambda-storage.workspace = true
+ethlambda-state-transition.workspace = true
 ethlambda-types.workspace = true
 
 spawned-concurrency.workspace = true

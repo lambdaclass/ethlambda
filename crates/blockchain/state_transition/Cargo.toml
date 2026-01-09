@@ -10,3 +10,4 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ethlambda-types.workspace = true

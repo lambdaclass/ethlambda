@@ -134,4 +134,8 @@ impl Store {
     pub fn has_state(&self, block_root: &H256) -> bool {
         self.0.lock().unwrap().states.contains_key(block_root)
     }
+
+    pub fn get_state(&self, block_root: &H256) -> Option<State> {
+        self.0.lock().unwrap().states.get(block_root).cloned()
+    }
 }

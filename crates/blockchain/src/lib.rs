@@ -45,15 +45,15 @@ impl BlockChainServer {
             return;
         }
 
-        if !self.store.has_state(&block.parent_root) {
+        let Some(pre_state) = self.store.get_state(&block.parent_root) else {
             // TODO: backfill missing blocks
             warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
             return;
-        }
+        };
 
         // TODO: validate block signatures
 
-        // TODO: execute block and obtain new state
+        let state_changes = ethlambda_state_transition::state_transition(&pre_state, &block);
     }
 }
 
