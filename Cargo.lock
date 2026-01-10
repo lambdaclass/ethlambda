@@ -1813,6 +1813,7 @@ dependencies = [
  "ethlambda-types",
  "prometheus",
  "spawned-concurrency",
+ "thiserror 2.0.17",
  "tracing",
 ]
 

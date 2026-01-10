@@ -17,5 +17,6 @@ ethlambda-types.workspace = true
 spawned-concurrency.workspace = true
 
 tracing.workspace = true
+thiserror.workspace = true
 
 prometheus.workspace = true
