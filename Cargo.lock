@@ -1841,6 +1841,7 @@ dependencies = [
  "sha2",
  "snap",
  "ssz_types",
+ "thiserror 2.0.17",
  "tracing",
  "tree_hash",
  "tree_hash_derive",
