@@ -202,6 +202,14 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
             .iter()
             .find(|(key, _)| key.as_ref() == b"secp256k1")
             .expect("node record missing public key");
+        
+        let (_, ip_bytes) = record
+            .pairs
+            .iter()
+            .find(|(key, _)| key.as_ref() == b"ip")
+            .expect("node record missing IP address");
+
+        let ip = IpAddr::decode(ip_bytes).unwrap();
 
         let public_key_bytes = H264::decode(public_key_rlp).unwrap();
         let public_key =
@@ -210,7 +218,7 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
 
         let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
         bootnodes.push(Bootnode {
-            ip: "127.0.0.1".parse().unwrap(),
+            ip,
             quic_port,
             public_key: public_key.into(),
         });

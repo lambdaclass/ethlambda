@@ -33,6 +33,8 @@ ssz_types = "0.14.0"
 tree_hash = "0.12.0"
 tree_hash_derive = "0.12.0"
 
+thiserror.workspace = true
+
 sha2 = "0.10"
 
 prometheus.workspace = true
