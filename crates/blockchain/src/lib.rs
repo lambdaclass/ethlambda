@@ -1,10 +1,17 @@
 use ethlambda_storage::Store;
-use ethlambda_types::{block::SignedBlockWithAttestation, primitives::TreeHash};
+use ethlambda_types::{block::{SignedBlockWithAttestation, VerifySignatureError}, primitives::TreeHash};
 use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
 use tracing::{error, warn};
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
+}
+
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Signed block signature verification failed")]
+    VerifySignatureError(#[from] VerifySignatureError),
 }
 
 impl BlockChain {
@@ -35,9 +42,9 @@ impl BlockChainServer {
         let slot = signed_block.message.block.slot;
         update_head_slot(slot);
 
-        let block = signed_block.message.block;
-        let proposer_attestation = signed_block.message.proposer_attestation;
-        let signatures = signed_block.signature;
+        let block = &signed_block.message.block;
+        let proposer_attestation = &signed_block.message.proposer_attestation;
+        let signatures = &signed_block.signature;
 
         let block_root = block.tree_hash_root();
 
@@ -51,7 +58,10 @@ impl BlockChainServer {
             return;
         };
 
-        // TODO: validate block signatures
+        if let Err(err) = signed_block.verify_signatures(&pre_state) {
+            error!(%slot, %block_root, parent=%block.parent_root, "Signed block signature verification failed: {}", err);
+            return;
+        }
 
         let state_changes = ethlambda_state_transition::state_transition(&pre_state, &block);
     }
