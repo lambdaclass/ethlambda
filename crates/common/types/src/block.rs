@@ -1,11 +1,10 @@
 use ssz_derive::{Decode, Encode};
-use ssz_types::typenum::{Diff, U488, U3600, U4096};
 use tree_hash_derive::TreeHash;
 
 use crate::{
-    attestation::{Attestation, Attestations},
+    attestation::{AggregatedAttestation, Attestation},
     primitives::H256,
-    signature::{Signature, SignatureSize},
+    signature::SignatureSize,
     state::ValidatorRegistryLimit,
 };
 
@@ -98,5 +97,9 @@ pub struct BlockBody {
     ///
     /// Individual signatures live in the aggregated block signature list, so
     /// these entries contain only attestation data without per-attestation signatures.
-    pub attestations: Attestations,
+    pub attestations: AggregatedAttestations,
 }
+
+/// List of aggregated attestations included in a block.
+pub type AggregatedAttestations =
+    ssz_types::VariableList<AggregatedAttestation, ValidatorRegistryLimit>;

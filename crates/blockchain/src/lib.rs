@@ -1,7 +1,7 @@
 use ethlambda_storage::Store;
 use ethlambda_types::{block::SignedBlockWithAttestation, primitives::TreeHash};
 use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -33,7 +33,6 @@ struct BlockChainServer {
 impl BlockChainServer {
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
-        update_head_slot(slot);
 
         let block = signed_block.message.block;
         let proposer_attestation = signed_block.message.proposer_attestation;
@@ -45,7 +44,7 @@ impl BlockChainServer {
             return;
         }
 
-        let Some(pre_state) = self.store.get_state(&block.parent_root) else {
+        let Some(mut pre_state) = self.store.get_state(&block.parent_root) else {
             // TODO: backfill missing blocks
             warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
             return;
@@ -53,7 +52,16 @@ impl BlockChainServer {
 
         // TODO: validate block signatures
 
-        let state_changes = ethlambda_state_transition::state_transition(&pre_state, &block);
+        if let Err(err) = ethlambda_state_transition::state_transition(&mut pre_state, &block) {
+            warn!(%slot, %block_root, %err, "State transition failed for new block");
+            return;
+        }
+        let post_state = pre_state;
+
+        self.store.add_block(block, post_state);
+
+        info!(%slot, %block_root, "Processed new block");
+        update_head_slot(slot);
     }
 }
 

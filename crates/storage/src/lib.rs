@@ -138,4 +138,11 @@ impl Store {
     pub fn get_state(&self, block_root: &H256) -> Option<State> {
         self.0.lock().unwrap().states.get(block_root).cloned()
     }
+
+    pub fn add_block(&self, block: Block, state: State) {
+        let block_root = block.tree_hash_root();
+        let mut inner = self.0.lock().unwrap();
+        inner.blocks.insert(block_root, block);
+        inner.states.insert(block_root, state);
+    }
 }

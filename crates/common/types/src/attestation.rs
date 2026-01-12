@@ -1,5 +1,4 @@
 use ssz_derive::{Decode, Encode};
-use ssz_types::typenum::U4096;
 use tree_hash_derive::TreeHash;
 
 use crate::{
@@ -33,9 +32,6 @@ pub struct AttestationData {
     pub source: Checkpoint,
 }
 
-/// List of validator attestations included in a block.
-pub type Attestations = ssz_types::VariableList<Attestation, ValidatorRegistryLimit>;
-
 /// Validator attestation bundled with its signature.
 #[derive(Clone, Encode, Decode)]
 pub struct SignedAttestation {
@@ -44,3 +40,22 @@ pub struct SignedAttestation {
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
     signature: Signature,
 }
+
+/// Aggregated attestation consisting of participation bits and message.
+#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+pub struct AggregatedAttestation {
+    /// Bitfield indicating which validators participated in the aggregation.
+    pub aggregation_bits: AggregationBits,
+
+    /// Combined attestation data similar to the beacon chain format.
+    ///
+    /// Multiple validator attestations are aggregated here without the complexity of
+    /// committee assignments.
+    pub data: AttestationData,
+}
+
+/// Bitlist representing validator participation in an attestation or signature.
+///
+/// A general-purpose bitfield for tracking which validators have participated
+/// in some collective action (attestation, signature aggregation, etc.).
+pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
