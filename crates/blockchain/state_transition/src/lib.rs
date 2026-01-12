@@ -263,6 +263,14 @@ fn checkpoint_exists(state: &State, checkpoint: Checkpoint) -> bool {
 ///     1. Less than or equal to 5.
 ///     2. A perfect square (e.g., 9, 16, 25...).
 ///     3. A pronic number (of the form x^2 + x, e.g., 6, 12, 20...).
+///
+/// See https://github.com/ethereum/research/blob/c003fe1c1a785797e7b53e3cbf9569b989be6e93/3sf-mini/consensus.py#L52-L54
+/// for the 3SF-mini reference.
+///
+/// For why we have unjustifiable slots, consider that in high-latency
+/// scenarios, validators may vote for many different slots, making none of them
+/// reach the supermajority threshold. By having unjustifiable slots, we can
+/// funnel votes towards only some slots, increasing finalization chances.
 fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
     let Some(delta) = slot.checked_sub(finalized_slot) else {
         // Candidate slot must not be before finalized slot
