@@ -53,10 +53,10 @@ type HistoricalBlockHashes = ssz_types::VariableList<H256, HistoricalRootsLimit>
 pub type JustifiedSlots = ssz_types::BitList<HistoricalRootsLimit>;
 
 /// List of justified block roots up to historical_roots_limit.
-type JustificationRoots = ssz_types::VariableList<H256, HistoricalRootsLimit>;
+pub type JustificationRoots = ssz_types::VariableList<H256, HistoricalRootsLimit>;
 
 /// Bitlist for tracking validator justifications per historical root.
-type JustificationValidators =
+pub type JustificationValidators =
     ssz_types::BitList<ssz_types::typenum::Prod<HistoricalRootsLimit, ValidatorRegistryLimit>>;
 
 /// Represents a validator's static metadata and operational interface.
