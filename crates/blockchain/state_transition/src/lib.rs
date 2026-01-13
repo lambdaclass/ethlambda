@@ -36,6 +36,8 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
             computed: computed_state_root,
         });
     }
+    // Cache the state root in the latest block header
+    state.latest_block_header.state_root = computed_state_root;
     Ok(())
 }
 
