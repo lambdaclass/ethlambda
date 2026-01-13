@@ -109,7 +109,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
-    println!("P2P node started on port {listening_port}");
+    info!("P2P node started on port {listening_port}");
 
     event_loop(swarm, blockchain).await;
 }
@@ -162,6 +162,7 @@ async fn handle_req_resp_message(
             channel,
         } => {
             info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            // TODO: send real status
             swarm
                 .behaviour_mut()
                 .req_resp

@@ -64,15 +64,15 @@ This milestone focuses on connecting to other clients and listening for new bloc
 This milestone focuses on computing the chain state from the gossiped by peers received.
 
 - Generate initial state from genesis configuration ✅
-- Implement state transition function 🏗️
-- Transition state on each new block
+- Implement state transition function ✅
+- Transition state on each new block ✅
 
 ### Apply fork-choice rule
 
 This milestone focuses on choosing the head of the chain based on gossiped attestations.
 
-- Listen for attestations in gossipsub
-- Implement fork-choice rule
+- Listen for attestations in gossipsub ✅
+- Implement fork-choice rule 🏗️
 - Apply fork-choice rule based on received attestations
 
 ### Produce blocks and attestations

@@ -6,6 +6,12 @@ help: ## 📚 Show help for each of the Makefile recipes
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
+LEAN_SPEC_COMMIT_HASH:=bf0f606a75095cf1853529bc770516b1464d9716
+
+leanSpec:
+	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
+	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
+
 # lean-quickstart:
 # 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 

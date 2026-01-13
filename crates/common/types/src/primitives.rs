@@ -4,4 +4,7 @@ use tree_hash::Hash256;
 pub use ssz::{Decode, Encode};
 pub use tree_hash::TreeHash;
 
+pub use ssz_types::{BitList, BitVector, FixedVector, VariableList};
 pub type H256 = Hash256;
+
+pub type ByteList<N> = ssz_types::VariableList<u8, N>;

@@ -11,3 +11,6 @@ version.workspace = true
 
 [dependencies]
 ethlambda-types.workspace = true
+ethlambda-fork-choice.workspace = true
+
+tracing.workspace = true

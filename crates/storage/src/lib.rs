@@ -4,11 +4,12 @@ use std::{
 };
 
 use ethlambda_types::{
-    attestation::SignedAttestation,
+    attestation::AttestationData,
     block::Block,
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
+use tracing::info;
 
 pub struct Store(Arc<Mutex<StoreInner>>);
 
@@ -79,18 +80,21 @@ struct StoreInner {
     ///
     /// - These attestations are "known" and contribute to fork choice weights.
     /// - Keyed by validator index to enforce one attestation per validator.
-    latest_known_attestations: HashMap<u64, SignedAttestation>,
+    latest_known_attestations: HashMap<u64, AttestationData>,
 
     /// Latest signed attestations by validator that are pending processing.
     ///
     /// - These attestations are "new" and do not yet contribute to fork choice.
     /// - They migrate to `latest_known_attestations` via interval ticks.
     /// - Keyed by validator index to enforce one attestation per validator.
-    latest_new_attestations: HashMap<u64, SignedAttestation>,
+    latest_new_attestations: HashMap<u64, AttestationData>,
 }
 
 impl Store {
-    pub fn from_genesis(genesis_state: State) -> Self {
+    pub fn from_genesis(mut genesis_state: State) -> Self {
+        // Ensure the header state root is zero before computing the state root
+        genesis_state.latest_block_header.state_root = H256::ZERO;
+
         let genesis_state_root = genesis_state.tree_hash_root();
         let genesis_block = Block {
             slot: 0,
@@ -110,12 +114,14 @@ impl Store {
         blocks.insert(anchor_block_root, anchor_block.clone());
 
         let mut states = HashMap::new();
-        states.insert(anchor_state_root, anchor_state.clone());
+        states.insert(anchor_block_root, anchor_state.clone());
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
             slot: 0,
         };
+
+        info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
         Self(Arc::new(Mutex::new(StoreInner {
             time: 0,
@@ -137,5 +143,49 @@ impl Store {
 
     pub fn get_state(&self, block_root: &H256) -> Option<State> {
         self.0.lock().unwrap().states.get(block_root).cloned()
+    }
+
+    pub fn add_block(&self, block: Block, state: State) {
+        let block_root = block.tree_hash_root();
+        let mut inner = self.0.lock().unwrap();
+        inner.blocks.insert(block_root, block);
+        inner.states.insert(block_root, state);
+    }
+
+    pub fn get_genesis_time(&self) -> u64 {
+        self.0.lock().unwrap().config.genesis_time
+    }
+
+    pub fn accept_new_attestations(&self) {
+        let mut inner = self.0.lock().unwrap();
+        let mut latest_new_attestations = std::mem::take(&mut inner.latest_new_attestations);
+        inner
+            .latest_known_attestations
+            .extend(latest_new_attestations.drain());
+        inner.latest_new_attestations = latest_new_attestations;
+
+        let head = ethlambda_fork_choice::compute_lmd_ghost_head(
+            inner.latest_justified.root,
+            &inner.blocks,
+            &inner.latest_known_attestations,
+            0,
+        );
+        inner.head = head;
+    }
+
+    pub fn update_safe_target(&self) {
+        let mut inner = self.0.lock().unwrap();
+        let head_state = &inner.states[&inner.head];
+        let num_validators = head_state.validators.len() as u64;
+
+        let min_target_score = (num_validators * 2).div_ceil(3);
+
+        let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
+            inner.latest_finalized.root,
+            &inner.blocks,
+            &inner.latest_known_attestations,
+            min_target_score,
+        );
+        inner.safe_target = safe_target;
     }
 }

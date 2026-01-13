@@ -2,6 +2,7 @@ use leansig::{signature::SignatureScheme, serialization::Serializable};
 use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::{Diff, U488, U3600, U4096};
 use tree_hash::TreeHash;
+use ssz_types::typenum::U1048576;
 use tree_hash_derive::TreeHash;
 use thiserror::Error;
 use crate::{
@@ -9,6 +10,9 @@ use crate::{
     primitives::H256,
     signature::{LeanPublicKey, LeanSignatureScheme, Signature, SignatureSize},
     state::{State, ValidatorRegistryLimit},
+    attestation::{AggregatedAttestation, Attestation, XmssSignature},
+    primitives::{ByteList, H256},
+    state::ValidatorRegistryLimit,
 };
 
 /// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
@@ -98,9 +102,60 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
     }
 }
 
-/// Aggregated signature list included alongside the block.
-pub type BlockSignatures =
-    ssz_types::VariableList<ssz_types::FixedVector<u8, SignatureSize>, ValidatorRegistryLimit>;
+/// Signature payload for the block.
+#[derive(Clone, Encode, Decode)]
+pub struct BlockSignatures {
+    /// Signature for the proposer's attestation.
+    // TODO: this goes after attestation_signatures in the spec
+    proposer_signature: XmssSignature,
+
+    /// Attestation signatures for the aggregated attestations in the block body.
+    ///
+    /// Each entry corresponds to an aggregated attestation from the block body and
+    /// contains the leanVM aggregated signature proof bytes for the participating validators.
+    ///
+    /// TODO:
+    /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
+    attestation_signatures: AttestationSignatures,
+}
+
+/// List of per-attestation aggregated signature proofs.
+///
+/// Each entry corresponds to an aggregated attestation from the block body.
+///
+/// It contains:
+///     - the participants bitfield,
+///     - proof bytes from leanVM signature aggregation.
+// pub type AttestationSignatures =
+//     ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
+pub type AttestationSignatures =
+    ssz_types::VariableList<NaiveAggregatedSignature, ValidatorRegistryLimit>;
+
+pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
+
+/// Cryptographic proof that a set of validators signed a message.
+///
+/// This container encapsulates the output of the leanVM signature aggregation,
+/// combining the participant set with the proof bytes. This design ensures
+/// the proof is self-describing: it carries information about which validators
+/// it covers.
+///
+/// The proof can verify that all participants signed the same message in the
+/// same epoch, using a single verification operation instead of checking
+/// each signature individually.
+#[derive(Clone, Encode, Decode)]
+pub struct AggregatedSignatureProof {
+    /// Bitfield indicating which validators' signatures are included.
+    participants: AggregationBits,
+    /// The raw aggregated proof bytes from leanVM.
+    proof_data: ByteList<U1048576>, // 1
+}
+
+/// Bitlist representing validator participation in an attestation or signature.
+///
+/// A general-purpose bitfield for tracking which validators have participated
+/// in some collective action (attestation, signature aggregation, etc.).
+pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
 
 /// Bundle containing a block and the proposer's attestation.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
@@ -159,5 +214,9 @@ pub struct BlockBody {
     ///
     /// Individual signatures live in the aggregated block signature list, so
     /// these entries contain only attestation data without per-attestation signatures.
-    pub attestations: Attestations,
+    pub attestations: AggregatedAttestations,
 }
+
+/// List of aggregated attestations included in a block.
+pub type AggregatedAttestations =
+    ssz_types::VariableList<AggregatedAttestation, ValidatorRegistryLimit>;

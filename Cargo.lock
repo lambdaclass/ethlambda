@@ -1441,6 +1441,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "datatest-stable"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a867d7322eb69cf3a68a5426387a25b45cb3b9c5ee41023ee6cea92e2afadd82"
+dependencies = [
+ "camino",
+ "fancy-regex",
+ "libtest-mimic",
+ "walkdir",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1824,6 +1836,9 @@ version = "0.1.0"
 [[package]]
 name = "ethlambda-fork-choice"
 version = "0.1.0"
+dependencies = [
+ "ethlambda-types",
+]
 
 [[package]]
 name = "ethlambda-p2p"
@@ -1837,6 +1852,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
+ "hex",
  "libp2p",
  "prometheus",
  "sha2",
@@ -1860,14 +1876,21 @@ dependencies = [
 name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
+ "datatest-stable 0.3.3",
  "ethlambda-types",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-fork-choice",
  "ethlambda-types",
+ "tracing",
 ]
 
 [[package]]
@@ -1960,7 +1983,7 @@ dependencies = [
  "bitvec",
  "bls12_381",
  "bytes",
- "datatest-stable",
+ "datatest-stable 0.2.10",
  "derive_more 1.0.0",
  "ethrex-common",
  "ethrex-crypto",

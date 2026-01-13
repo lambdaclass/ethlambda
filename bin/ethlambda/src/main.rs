@@ -13,7 +13,7 @@ use ethlambda_types::{
 };
 use serde::Deserialize;
 use tracing::info;
-use tracing_subscriber::{Registry, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
 
@@ -35,7 +35,10 @@ struct CliOptions {
 
 #[tokio::main]
 async fn main() {
-    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer());
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
+    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
     tracing::subscriber::set_global_default(subscriber).unwrap();
     let options = CliOptions::parse();
 

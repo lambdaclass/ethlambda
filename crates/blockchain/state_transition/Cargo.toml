@@ -11,3 +11,18 @@ version.workspace = true
 
 [dependencies]
 ethlambda-types.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+hex.workspace = true
+
+datatest-stable = "0.3.3"
+
+[[test]]
+name = "lean_spec"
+path = "tests/lean_spec.rs"
+harness = false
