@@ -1,3 +1,4 @@
+use ssz::Encode;
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
@@ -36,9 +37,18 @@ pub struct AttestationData {
 #[derive(Clone, Encode, Decode)]
 pub struct SignedAttestation {
     /// The attestation message signed by the validator.
-    message: Attestation,
+    pub message: Attestation,
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
-    signature: Signature,
+    pub signature: Signature,
+}
+
+impl core::fmt::Debug for SignedAttestation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignedAttestation")
+            .field("message", &self.message)
+            .field("signature", &self.signature.as_ssz_bytes())
+            .finish()
+    }
 }
 
 /// Aggregated attestation consisting of participation bits and message.

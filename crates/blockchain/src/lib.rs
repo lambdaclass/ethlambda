@@ -1,5 +1,6 @@
 use ethlambda_storage::Store;
 use ethlambda_types::{
+    attestation::SignedAttestation,
     block::SignedBlockWithAttestation,
     primitives::{Encode, TreeHash},
 };
@@ -26,6 +27,17 @@ impl BlockChain {
             .cast(CastMessage::NewBlock(block))
             .await
             .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new block"));
+    }
+
+    /// Sends an attestation to the BlockChain for processing.
+    ///
+    /// Note that this is *NOT* `async`, since the internal [`GenServerHandle::cast`] is non-blocking.
+    pub async fn notify_new_attestation(&mut self, attestation: SignedAttestation) {
+        let _ = self
+            .handle
+            .cast(CastMessage::NewAttestation(attestation))
+            .await
+            .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new attestation"));
     }
 }
 
@@ -70,11 +82,14 @@ impl BlockChainServer {
         info!(%slot, %block_root, %state_root, "Processed new block");
         update_head_slot(slot);
     }
+
+    fn on_attestation(&mut self, attestation: SignedAttestation) {}
 }
 
 #[derive(Clone, Debug)]
 enum CastMessage {
     NewBlock(SignedBlockWithAttestation),
+    NewAttestation(SignedAttestation),
 }
 
 impl GenServer for BlockChainServer {
@@ -103,6 +118,7 @@ impl GenServer for BlockChainServer {
             CastMessage::NewBlock(signed_block) => {
                 self.on_block(signed_block);
             }
+            CastMessage::NewAttestation(attestation) => self.on_attestation(attestation),
         }
         CastResponse::NoReply
     }
