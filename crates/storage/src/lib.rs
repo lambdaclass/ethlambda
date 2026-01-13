@@ -9,6 +9,7 @@ use ethlambda_types::{
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
+use tracing::info;
 
 pub struct Store(Arc<Mutex<StoreInner>>);
 
@@ -90,7 +91,10 @@ struct StoreInner {
 }
 
 impl Store {
-    pub fn from_genesis(genesis_state: State) -> Self {
+    pub fn from_genesis(mut genesis_state: State) -> Self {
+        // Ensure the header state root is zero before computing the state root
+        genesis_state.latest_block_header.state_root = H256::ZERO;
+
         let genesis_state_root = genesis_state.tree_hash_root();
         let genesis_block = Block {
             slot: 0,
@@ -110,12 +114,14 @@ impl Store {
         blocks.insert(anchor_block_root, anchor_block.clone());
 
         let mut states = HashMap::new();
-        states.insert(anchor_state_root, anchor_state.clone());
+        states.insert(anchor_block_root, anchor_state.clone());
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
             slot: 0,
         };
+
+        info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
         Self(Arc::new(Mutex::new(StoreInner {
             time: 0,
