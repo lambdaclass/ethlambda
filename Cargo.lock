@@ -1848,6 +1848,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
+ "hex",
  "libp2p",
  "prometheus",
  "sha2",

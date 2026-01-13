@@ -53,3 +53,16 @@ fn decompress_message(data: &[u8]) -> snap::Result<Vec<u8>> {
     snap::raw::Decoder::new().decompress(&data, &mut uncompressed_data)?;
     Ok(uncompressed_data)
 }
+
+#[cfg(test)]
+mod tests {
+    use ethlambda_types::block::SignedBlockWithAttestation;
+    use ssz::Decode;
+
+    #[test]
+    fn test_decode_block() {
+        // Sample uncompressed block sent by Zeam (commit b153373806aa49f65aadc47c41b68ead4fab7d6e)
+        let block_bytes = include_bytes!("../test_data/signed_block_with_attestation.ssz");
+        let _block = SignedBlockWithAttestation::from_ssz_bytes(block_bytes).unwrap();
+    }
+}
