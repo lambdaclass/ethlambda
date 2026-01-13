@@ -26,58 +26,49 @@ pub struct StateTransitionTest {
     pub network: String,
     #[serde(rename = "leanEnv")]
     pub lean_env: String,
-    pub pre: BeaconState,
+    pub pre: TestState,
     pub blocks: Vec<Block>,
-    pub post: Option<BeaconState>,
+    pub post: Option<PostState>,
     #[serde(rename = "_info")]
     pub info: TestInfo,
 }
 
 /// Pre-state of the beacon chain
 #[derive(Debug, Clone, Deserialize)]
-pub struct BeaconState {
-    pub config: Option<Config>,
-    pub slot: Option<u64>,
+pub struct TestState {
+    pub config: Config,
+    pub slot: u64,
     #[serde(rename = "latestBlockHeader")]
-    pub latest_block_header: Option<BlockHeader>,
+    pub latest_block_header: BlockHeader,
     #[serde(rename = "latestJustified")]
-    pub latest_justified: Option<Checkpoint>,
+    pub latest_justified: Checkpoint,
     #[serde(rename = "latestFinalized")]
-    pub latest_finalized: Option<Checkpoint>,
+    pub latest_finalized: Checkpoint,
     #[serde(rename = "historicalBlockHashes")]
-    pub historical_block_hashes: Option<Container<H256>>,
+    pub historical_block_hashes: Container<H256>,
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Option<Container<u64>>,
-    pub validators: Option<Container<Validator>>,
+    pub justified_slots: Container<u64>,
+    pub validators: Container<Validator>,
     #[serde(rename = "justificationsRoots")]
-    pub justifications_roots: Option<Container<H256>>,
+    pub justifications_roots: Container<H256>,
     #[serde(rename = "justificationsValidators")]
-    pub justifications_validators: Option<Container<bool>>,
+    pub justifications_validators: Container<bool>,
 }
 
-impl From<BeaconState> for State {
-    fn from(value: BeaconState) -> Self {
+impl From<TestState> for State {
+    fn from(value: TestState) -> Self {
         let historical_block_hashes =
-            VariableList::new(value.historical_block_hashes.unwrap().data).unwrap();
-        let validators = VariableList::new(
-            value
-                .validators
-                .unwrap()
-                .data
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        )
-        .unwrap();
-        let justifications_roots =
-            VariableList::new(value.justifications_roots.unwrap().data).unwrap();
+            VariableList::new(value.historical_block_hashes.data).unwrap();
+        let validators =
+            VariableList::new(value.validators.data.into_iter().map(Into::into).collect()).unwrap();
+        let justifications_roots = VariableList::new(value.justifications_roots.data).unwrap();
 
         State {
-            config: value.config.unwrap().into(),
-            slot: value.slot.unwrap(),
-            latest_block_header: value.latest_block_header.unwrap().into(),
-            latest_justified: value.latest_justified.unwrap().into(),
-            latest_finalized: value.latest_finalized.unwrap().into(),
+            config: value.config.into(),
+            slot: value.slot,
+            latest_block_header: value.latest_block_header.into(),
+            latest_justified: value.latest_justified.into(),
+            latest_finalized: value.latest_finalized.into(),
             historical_block_hashes,
             justified_slots: BitList::with_capacity(0).unwrap(),
             validators,
@@ -203,6 +194,52 @@ impl From<BlockBody> for ethlambda_types::block::BlockBody {
             attestations: VariableList::new(vec![]).unwrap(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostState {
+    #[serde(rename = "configGenesisTime")]
+    pub config_genesis_time: Option<u64>,
+    pub slot: Option<u64>,
+
+    #[serde(rename = "latestBlockHeaderSlot")]
+    pub latest_block_header_slot: Option<u64>,
+    #[serde(rename = "latestBlockHeaderStateRoot")]
+    pub latest_block_header_state_root: Option<H256>,
+    #[serde(rename = "latestBlockHeaderProposerIndex")]
+    pub latest_block_header_proposer_index: Option<u64>,
+    #[serde(rename = "latestBlockHeaderParentRoot")]
+    pub latest_block_header_parent_root: Option<H256>,
+    #[serde(rename = "latestBlockHeaderBodyRoot")]
+    pub latest_block_header_body_root: Option<H256>,
+
+    #[serde(rename = "latestJustifiedSlot")]
+    pub latest_justified_slot: Option<u64>,
+    #[serde(rename = "latestJustifiedRoot")]
+    pub latest_justified_root: Option<H256>,
+
+    #[serde(rename = "latestFinalizedSlot")]
+    pub latest_finalized_slot: Option<u64>,
+    #[serde(rename = "latestFinalizedRoot")]
+    pub latest_finalized_root: Option<H256>,
+
+    #[serde(rename = "historicalBlockHashesCount")]
+    pub historical_block_hashes_count: Option<u64>,
+    #[serde(rename = "historicalBlockHashes")]
+    pub historical_block_hashes: Option<Container<H256>>,
+
+    #[serde(rename = "justifiedSlots")]
+    pub justified_slots: Option<Container<u64>>,
+
+    #[serde(rename = "justificationsRoots")]
+    pub justifications_roots: Option<Container<H256>>,
+
+    #[serde(rename = "justificationsValidators")]
+    pub justifications_validators: Option<Container<bool>>,
+
+    #[serde(rename = "validatorCount")]
+    pub validator_count: Option<u64>,
 }
 
 /// Test metadata and information
