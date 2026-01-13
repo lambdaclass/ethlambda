@@ -29,6 +29,18 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
     process_slots(state, block.slot)?;
     process_block(state, block)?;
 
+    // Uncomment for debugging state transitions
+    // std::fs::write(
+    //     &format!("block_slot_{}.ssz", state.slot),
+    //     block.as_ssz_bytes(),
+    // )
+    // .unwrap();
+    // std::fs::write(
+    //     &format!("post_state_slot_{}.ssz", state.slot),
+    //     state.as_ssz_bytes(),
+    // )
+    // .unwrap();
+
     let computed_state_root = state.tree_hash_root();
     if block.state_root != computed_state_root {
         return Err(Error::StateRootMismatch {
@@ -36,8 +48,6 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
             computed: computed_state_root,
         });
     }
-    // Cache the state root in the latest block header
-    state.latest_block_header.state_root = computed_state_root;
     Ok(())
 }
 

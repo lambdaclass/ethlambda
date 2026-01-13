@@ -1,5 +1,8 @@
 use ethlambda_storage::Store;
-use ethlambda_types::{block::SignedBlockWithAttestation, primitives::TreeHash};
+use ethlambda_types::{
+    block::SignedBlockWithAttestation,
+    primitives::{Encode, TreeHash},
+};
 use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
 use tracing::{error, info, warn};
 
@@ -56,9 +59,11 @@ impl BlockChainServer {
             warn!(%slot, %block_root, %err, "State transition failed for new block");
             return;
         }
-        let post_state = pre_state;
+        // Cache the state root in the latest block header
+        let state_root = block.state_root;
+        pre_state.latest_block_header.state_root = state_root;
 
-        let state_root = post_state.latest_block_header.state_root;
+        let post_state = pre_state;
 
         self.store.add_block(block, post_state);
 
