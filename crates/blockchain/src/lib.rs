@@ -85,7 +85,7 @@ impl BlockChainServer {
             }
             2 => {
                 // Mid-slot - update safe target for validators
-                // self.store = self.store.update_safe_target();
+                self.store.update_safe_target();
             }
             3 => {
                 // End of slot - accept accumulated attestations

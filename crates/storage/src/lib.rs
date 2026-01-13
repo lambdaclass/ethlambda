@@ -164,11 +164,28 @@ impl Store {
             .extend(latest_new_attestations.drain());
         inner.latest_new_attestations = latest_new_attestations;
 
-        ethlambda_fork_choice::compute_lmd_ghost_head(
+        let head = ethlambda_fork_choice::compute_lmd_ghost_head(
             inner.latest_justified.root,
             &inner.blocks,
             &inner.latest_known_attestations,
             0,
         );
+        inner.head = head;
+    }
+
+    pub fn update_safe_target(&self) {
+        let mut inner = self.0.lock().unwrap();
+        let head_state = inner.states[inner.head];
+        let num_validators = head_state.validators.len() as u64;
+
+        let min_target_score = (num_validators * 2).div_ceil(3);
+
+        let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
+            inner.latest_finalized.root,
+            &inner.blocks,
+            &inner.latest_known_attestations,
+            min_target_score,
+        );
+        inner.safe_target = safe_target;
     }
 }
