@@ -282,6 +282,10 @@ fn process_attestations(
                 .set(i, true)
                 .expect("we just updated the capacity")
         });
+    state.justifications_roots = justification_roots
+        .try_into()
+        .expect("justifications_roots limit exceeded");
+    state.justifications_validators = justifications_validators;
     Ok(())
 }
 
