@@ -1,10 +1,6 @@
 use std::collections::HashMap;
 
-use ethlambda_types::{
-    attestation::{AttestationData, SignedAttestation},
-    block::Block,
-    primitives::H256,
-};
+use ethlambda_types::{attestation::AttestationData, block::Block, primitives::H256};
 
 /// Compute the LMD GHOST head of the chain, given a starting root, a set of blocks,
 /// a set of attestations, and a minimum score threshold.
@@ -63,7 +59,7 @@ pub fn compute_lmd_ghost_head(
         // Choose best child: most attestations, then lexicographically highest hash
         head = *children
             .into_iter()
-            .max_by_key(|root| (weights.get(root).copied().unwrap_or(0), root))
+            .max_by_key(|root| (weights.get(*root).copied().unwrap_or(0), *root))
             .expect("checked it's not empty");
     }
 
