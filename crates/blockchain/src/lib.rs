@@ -58,9 +58,11 @@ impl BlockChainServer {
         }
         let post_state = pre_state;
 
+        let state_root = post_state.latest_block_header.state_root;
+
         self.store.add_block(block, post_state);
 
-        info!(%slot, %block_root, "Processed new block");
+        info!(%slot, %block_root, %state_root, "Processed new block");
         update_head_slot(slot);
     }
 }
