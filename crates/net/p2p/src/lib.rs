@@ -162,6 +162,7 @@ async fn handle_req_resp_message(
             channel,
         } => {
             info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+            // TODO: send real status
             swarm
                 .behaviour_mut()
                 .req_resp
