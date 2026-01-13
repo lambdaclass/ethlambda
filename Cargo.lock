@@ -1885,6 +1885,7 @@ name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
+ "tracing",
 ]
 
 [[package]]

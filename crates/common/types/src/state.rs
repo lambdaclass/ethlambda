@@ -97,9 +97,6 @@ impl State {
             justifications_roots: Default::default(),
             justifications_validators,
         };
-
-        dbg!(state.tree_hash_root());
-
         state
     }
 }

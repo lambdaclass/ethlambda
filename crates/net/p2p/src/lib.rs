@@ -109,7 +109,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
-    println!("P2P node started on port {listening_port}");
+    info!("P2P node started on port {listening_port}");
 
     event_loop(swarm, blockchain).await;
 }
