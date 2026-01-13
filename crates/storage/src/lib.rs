@@ -151,4 +151,8 @@ impl Store {
         inner.blocks.insert(block_root, block);
         inner.states.insert(block_root, state);
     }
+
+    pub fn get_genesis_time(&self) -> u64 {
+        self.0.lock().unwrap().config.genesis_time
+    }
 }

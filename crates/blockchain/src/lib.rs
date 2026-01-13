@@ -1,9 +1,13 @@
+use std::time::{Duration, SystemTime};
+
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
 };
-use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
-use tracing::{error, info, warn};
+use spawned_concurrency::tasks::{
+    CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
+};
+use tracing::{error, info, trace, warn};
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -11,9 +15,13 @@ pub struct BlockChain {
 
 impl BlockChain {
     pub fn spawn(store: Store) -> BlockChain {
-        BlockChain {
-            handle: BlockChainServer { store }.start(),
-        }
+        let genesis_time = store.get_genesis_time();
+        let handle = BlockChainServer { store }.start();
+        let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::default());
+        send_after(time_until_genesis, handle.clone(), CastMessage::Tick);
+        BlockChain { handle }
     }
 
     /// Sends a block to the BlockChain for processing.
@@ -44,6 +52,15 @@ struct BlockChainServer {
 }
 
 impl BlockChainServer {
+    fn on_tick(&mut self, timestamp: u64) {
+        let time = timestamp - self.store.get_genesis_time();
+        // TODO: check if we are proposing
+        let has_proposal = false;
+        let slot = time / 4;
+        let interval = time - slot * 4;
+        trace!(%slot, %interval, "processing tick");
+    }
+
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
 
@@ -88,6 +105,7 @@ impl BlockChainServer {
 enum CastMessage {
     NewBlock(SignedBlockWithAttestation),
     NewAttestation(SignedAttestation),
+    Tick,
 }
 
 impl GenServer for BlockChainServer {
@@ -110,9 +128,23 @@ impl GenServer for BlockChainServer {
     async fn handle_cast(
         &mut self,
         message: Self::CastMsg,
-        _handle: &GenServerHandle<Self>,
+        handle: &GenServerHandle<Self>,
     ) -> CastResponse {
         match message {
+            CastMessage::Tick => {
+                let timestamp = SystemTime::UNIX_EPOCH
+                    .elapsed()
+                    .expect("already past the unix epoch");
+                self.on_tick(timestamp.as_secs());
+                // Schedule the next tick at the start of the next second
+                let millis_to_next_sec =
+                    ((timestamp.as_secs() as u128 + 1) * 1000 - timestamp.as_millis()) as u64;
+                send_after(
+                    Duration::from_millis(millis_to_next_sec),
+                    handle.clone(),
+                    message,
+                );
+            }
             CastMessage::NewBlock(signed_block) => {
                 self.on_block(signed_block);
             }
