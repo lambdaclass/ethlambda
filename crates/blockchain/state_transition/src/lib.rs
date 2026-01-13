@@ -36,9 +36,6 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
             computed: computed_state_root,
         });
     }
-
-    // Cache the latest state root
-    state.latest_block_header.state_root = computed_state_root;
     Ok(())
 }
 
@@ -50,8 +47,10 @@ fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
             current_slot: state.slot,
         });
     }
-    // NOTE: we cache the state root at the end of the state_transition
-    // function instead of here.
+    if state.latest_block_header.state_root == H256::ZERO {
+        // Special case: cache the state root if not already set.
+        state.latest_block_header.state_root = state.tree_hash_root();
+    }
     state.slot = target_slot;
     Ok(())
 }
@@ -156,7 +155,10 @@ fn current_proposer(slot: u64, num_validators: u64) -> u64 {
 
 /// Apply attestations and update justification/finalization
 /// according to the Lean Consensus 3SF-mini rules.
-fn process_attestations(state: &mut State, attestations: &AggregatedAttestations) -> Result<(), Error> {
+fn process_attestations(
+    state: &mut State,
+    attestations: &AggregatedAttestations,
+) -> Result<(), Error> {
     let validator_count = state.validators.len();
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
@@ -213,23 +215,35 @@ fn process_attestations(state: &mut State, attestations: &AggregatedAttestations
         }
 
         // Record the vote
-        let votes = justifications.entry(target.root).or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
+        let votes = justifications
+            .entry(target.root)
+            .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
         // Mark that each validator in this aggregation has voted for the target.
-        for (validator_id, _) in attestation.aggregation_bits.iter().enumerate().filter(|(_, voted)| *voted) {
+        for (validator_id, _) in attestation
+            .aggregation_bits
+            .iter()
+            .enumerate()
+            .filter(|(_, voted)| *voted)
+        {
             votes[validator_id] = true;
         }
 
         // Check whether the vote count crosses the supermajority threshold
         let vote_count = votes.iter().filter(|voted| **voted).count();
-        if 3 *vote_count >= 2 * validator_count {
+        if 3 * vote_count >= 2 * validator_count {
             // The block becomes justified
             state.latest_justified = target;
-            state.justified_slots.set(target.slot as usize, true).expect("we already resized in process_block_header");
+            state
+                .justified_slots
+                .set(target.slot as usize, true)
+                .expect("we already resized in process_block_header");
 
             justifications.remove(&target.root);
 
             // Consider whether finalization can advance
-            if !((source.slot + 1)..target.slot).any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot)) {
+            if !((source.slot + 1)..target.slot)
+                .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
+            {
                 state.latest_finalized = source;
             }
         }
@@ -243,8 +257,19 @@ fn process_attestations(state: &mut State, attestations: &AggregatedAttestations
         roots.sort();
         roots
     };
-    let mut justifications_validators = JustificationValidators::with_capacity(justification_roots.len() * validator_count).expect("maximum validator justifications reached");
-    justification_roots.iter().flat_map(|root| justifications[root].iter()).enumerate().filter(|(_, voted)| **voted).for_each(|(i, _)| justifications_validators.set(i, true).expect("we just updated the capacity"));
+    let mut justifications_validators =
+        JustificationValidators::with_capacity(justification_roots.len() * validator_count)
+            .expect("maximum validator justifications reached");
+    justification_roots
+        .iter()
+        .flat_map(|root| justifications[root].iter())
+        .enumerate()
+        .filter(|(_, voted)| **voted)
+        .for_each(|(i, _)| {
+            justifications_validators
+                .set(i, true)
+                .expect("we just updated the capacity")
+        });
     Ok(())
 }
 
@@ -276,7 +301,7 @@ fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         // Candidate slot must not be before finalized slot
         return false;
     };
-    return 
+    return
         // Rule 1: The first 5 slots after finalization are always justifiable.
         //
         // Examples: delta = 0, 1, 2, 3, 4, 5
