@@ -3,9 +3,8 @@ use ssz_types::typenum::U1048576;
 use tree_hash_derive::TreeHash;
 
 use crate::{
-    attestation::{AggregatedAttestation, Attestation},
+    attestation::{AggregatedAttestation, Attestation, XmssSignature},
     primitives::{ByteList, H256},
-    signature::SignatureSize,
     state::ValidatorRegistryLimit,
 };
 
@@ -67,8 +66,6 @@ pub type AttestationSignatures =
     ssz_types::VariableList<NaiveAggregatedSignature, ValidatorRegistryLimit>;
 
 pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
-
-pub type XmssSignature = ssz_types::FixedVector<u8, SignatureSize>;
 
 /// Cryptographic proof that a set of validators signed a message.
 ///

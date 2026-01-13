@@ -1,9 +1,8 @@
-use ssz::Encode;
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
 use crate::{
-    signature::Signature,
+    signature::SignatureSize,
     state::{Checkpoint, ValidatorRegistryLimit},
 };
 
@@ -34,24 +33,17 @@ pub struct AttestationData {
 }
 
 /// Validator attestation bundled with its signature.
-#[derive(Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct SignedAttestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,
     /// The attestation message signed by the validator.
     pub message: AttestationData,
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
-    pub signature: Signature,
+    pub signature: XmssSignature,
 }
 
-impl core::fmt::Debug for SignedAttestation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SignedAttestation")
-            .field("message", &self.message)
-            .field("signature", &self.signature.as_ssz_bytes())
-            .finish()
-    }
-}
+pub type XmssSignature = ssz_types::FixedVector<u8, SignatureSize>;
 
 /// Aggregated attestation consisting of participation bits and message.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
