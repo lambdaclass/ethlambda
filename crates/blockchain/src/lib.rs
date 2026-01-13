@@ -1,8 +1,6 @@
 use ethlambda_storage::Store;
 use ethlambda_types::{
-    attestation::SignedAttestation,
-    block::SignedBlockWithAttestation,
-    primitives::{Encode, TreeHash},
+    attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
 };
 use spawned_concurrency::tasks::{CallResponse, CastResponse, GenServer, GenServerHandle};
 use tracing::{error, info, warn};

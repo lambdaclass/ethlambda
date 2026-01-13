@@ -47,8 +47,8 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
             else {
                 return;
             };
-            let slot = signed_attestation.message.data.slot;
-            let validator = signed_attestation.message.validator_id;
+            let slot = signed_attestation.message.slot;
+            let validator = signed_attestation.validator_id;
             info!(%slot, %validator, "Received new attestation from gossipsub, sending for processing");
             blockchain.notify_new_attestation(signed_attestation).await;
         }

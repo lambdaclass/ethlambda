@@ -36,8 +36,10 @@ pub struct AttestationData {
 /// Validator attestation bundled with its signature.
 #[derive(Clone, Encode, Decode)]
 pub struct SignedAttestation {
+    /// The index of the validator making the attestation.
+    pub validator_id: u64,
     /// The attestation message signed by the validator.
-    pub message: Attestation,
+    pub message: AttestationData,
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
     pub signature: Signature,
 }
