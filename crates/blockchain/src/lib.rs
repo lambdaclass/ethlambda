@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -20,7 +23,6 @@ impl BlockChain {
     pub fn spawn(store: Store) -> BlockChain {
         let genesis_time = store.get_genesis_time();
         let handle = BlockChainServer {
-            time: 0,
             genesis_time,
             store,
         }
@@ -75,7 +77,7 @@ impl BlockChainServer {
             0 => {
                 // Start of slot - process attestations if proposal exists
                 if has_proposal {
-                    // self.store = self.store.accept_new_attestations();
+                    self.store.accept_new_attestations();
                 }
             }
             1 => {
@@ -87,7 +89,7 @@ impl BlockChainServer {
             }
             3 => {
                 // End of slot - accept accumulated attestations
-                // self.store = self.store.accept_new_attestations();
+                self.store.accept_new_attestations();
             }
             _ => unreachable!("slots only have 4 intervals"),
         }

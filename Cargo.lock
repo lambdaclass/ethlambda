@@ -1835,6 +1835,9 @@ version = "0.1.0"
 [[package]]
 name = "ethlambda-fork-choice"
 version = "0.1.0"
+dependencies = [
+ "ethlambda-types",
+]
 
 [[package]]
 name = "ethlambda-p2p"
@@ -1884,6 +1887,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-fork-choice",
  "ethlambda-types",
  "tracing",
 ]

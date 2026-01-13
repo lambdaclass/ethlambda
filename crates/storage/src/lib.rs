@@ -80,14 +80,14 @@ struct StoreInner {
     ///
     /// - These attestations are "known" and contribute to fork choice weights.
     /// - Keyed by validator index to enforce one attestation per validator.
-    latest_known_attestations: HashMap<u64, SignedAttestation>,
+    latest_known_attestations: HashMap<u64, AttestationData>,
 
     /// Latest signed attestations by validator that are pending processing.
     ///
     /// - These attestations are "new" and do not yet contribute to fork choice.
     /// - They migrate to `latest_known_attestations` via interval ticks.
     /// - Keyed by validator index to enforce one attestation per validator.
-    latest_new_attestations: HashMap<u64, SignedAttestation>,
+    latest_new_attestations: HashMap<u64, AttestationData>,
 }
 
 impl Store {
@@ -154,5 +154,21 @@ impl Store {
 
     pub fn get_genesis_time(&self) -> u64 {
         self.0.lock().unwrap().config.genesis_time
+    }
+
+    pub fn accept_new_attestations(&self) {
+        let mut inner = self.0.lock().unwrap();
+        let mut latest_new_attestations = std::mem::take(&mut inner.latest_new_attestations);
+        inner
+            .latest_known_attestations
+            .extend(latest_new_attestations.drain());
+        inner.latest_new_attestations = latest_new_attestations;
+
+        ethlambda_fork_choice::compute_lmd_ghost_head(
+            inner.latest_justified.root,
+            &inner.blocks,
+            &inner.latest_known_attestations,
+            0,
+        );
     }
 }
