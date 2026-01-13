@@ -1,10 +1,11 @@
-use ethlambda_types::state::State;
-use serde::{Deserialize, Serialize};
+use ethlambda_types::primitives::{BitList, H256, VariableList};
+use ethlambda_types::state::{State, ValidatorPubkey};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
 /// Root struct for state transition test vectors
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StateTransitionTestVector {
     #[serde(flatten)]
     pub tests: HashMap<String, StateTransitionTest>,
@@ -20,59 +21,74 @@ impl StateTransitionTestVector {
 }
 
 /// A single state transition test case
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StateTransitionTest {
     pub network: String,
     #[serde(rename = "leanEnv")]
     pub lean_env: String,
     pub pre: BeaconState,
     pub blocks: Vec<Block>,
-    pub post: Option<PostState>,
+    pub post: Option<BeaconState>,
     #[serde(rename = "_info")]
     pub info: TestInfo,
 }
 
 /// Pre-state of the beacon chain
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BeaconState {
-    pub config: Config,
-    pub slot: u64,
+    pub config: Option<Config>,
+    pub slot: Option<u64>,
     #[serde(rename = "latestBlockHeader")]
-    pub latest_block_header: BlockHeader,
+    pub latest_block_header: Option<BlockHeader>,
     #[serde(rename = "latestJustified")]
-    pub latest_justified: Checkpoint,
+    pub latest_justified: Option<Checkpoint>,
     #[serde(rename = "latestFinalized")]
-    pub latest_finalized: Checkpoint,
+    pub latest_finalized: Option<Checkpoint>,
     #[serde(rename = "historicalBlockHashes")]
-    pub historical_block_hashes: Container<String>,
+    pub historical_block_hashes: Option<Container<H256>>,
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Container<u64>,
-    pub validators: Container<Validator>,
+    pub justified_slots: Option<Container<u64>>,
+    pub validators: Option<Container<Validator>>,
     #[serde(rename = "justificationsRoots")]
-    pub justifications_roots: Container<String>,
+    pub justifications_roots: Option<Container<H256>>,
     #[serde(rename = "justificationsValidators")]
-    pub justifications_validators: Container<serde_json::Value>,
+    pub justifications_validators: Option<Container<bool>>,
 }
 
 impl From<BeaconState> for State {
     fn from(value: BeaconState) -> Self {
+        let historical_block_hashes =
+            VariableList::new(value.historical_block_hashes.unwrap().data).unwrap();
+        let validators = VariableList::new(
+            value
+                .validators
+                .unwrap()
+                .data
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+        .unwrap();
+        let justifications_roots =
+            VariableList::new(value.justifications_roots.unwrap().data).unwrap();
+
         State {
-            config: value.config.into(),
-            slot: value.slot,
-            latest_block_header: value.latest_block_header.into(),
-            latest_justified: (),
-            latest_finalized: (),
-            historical_block_hashes: (),
-            justified_slots: (),
-            validators: (),
-            justifications_roots: (),
-            justifications_validators: (),
+            config: value.config.unwrap().into(),
+            slot: value.slot.unwrap(),
+            latest_block_header: value.latest_block_header.unwrap().into(),
+            latest_justified: value.latest_justified.unwrap().into(),
+            latest_finalized: value.latest_finalized.unwrap().into(),
+            historical_block_hashes,
+            justified_slots: BitList::with_capacity(0).unwrap(),
+            validators,
+            justifications_roots,
+            justifications_validators: BitList::with_capacity(0).unwrap(),
         }
     }
 }
 
 /// Configuration for the beacon chain
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(rename = "genesisTime")]
     pub genesis_time: u64,
@@ -86,166 +102,111 @@ impl From<Config> for ethlambda_types::state::ChainConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Checkpoint {
+    pub root: H256,
+    pub slot: u64,
+}
+
+impl From<Checkpoint> for ethlambda_types::state::Checkpoint {
+    fn from(value: Checkpoint) -> Self {
+        Self {
+            root: value.root,
+            slot: value.slot,
+        }
+    }
+}
+
 /// Block header representing the latest block
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BlockHeader {
     pub slot: u64,
     #[serde(rename = "proposerIndex")]
     pub proposer_index: u64,
     #[serde(rename = "parentRoot")]
-    pub parent_root: String,
+    pub parent_root: H256,
     #[serde(rename = "stateRoot")]
-    pub state_root: String,
+    pub state_root: H256,
     #[serde(rename = "bodyRoot")]
-    pub body_root: String,
+    pub body_root: H256,
 }
 
-/// Checkpoint (root + slot pair)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Checkpoint {
-    pub root: String,
-    pub slot: u64,
+impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
+    fn from(value: BlockHeader) -> Self {
+        Self {
+            slot: value.slot,
+            proposer_index: value.proposer_index,
+            parent_root: value.parent_root,
+            state_root: value.state_root,
+            body_root: value.body_root,
+        }
+    }
 }
 
 /// Validator information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Validator {
-    pub pubkey: String,
-    pub index: u64,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub withdrawal_credentials: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_balance: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slashed: Option<bool>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_eligibility_epoch: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_epoch: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_epoch: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub withdrawable_epoch: Option<u64>,
+    index: u64,
+    #[serde(deserialize_with = "deser_pubkey_hex")]
+    pubkey: ValidatorPubkey,
+}
+
+impl From<Validator> for ethlambda_types::state::Validator {
+    fn from(value: Validator) -> Self {
+        Self {
+            index: value.index,
+            pubkey: value.pubkey,
+        }
+    }
 }
 
 /// Generic container for arrays
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Container<T> {
     pub data: Vec<T>,
 }
 
 /// A block to be processed
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Block {
     pub slot: u64,
     #[serde(rename = "proposerIndex")]
     pub proposer_index: u64,
     #[serde(rename = "parentRoot")]
-    pub parent_root: String,
+    pub parent_root: H256,
     #[serde(rename = "stateRoot")]
-    pub state_root: String,
+    pub state_root: H256,
     pub body: BlockBody,
 }
 
-/// Block body containing attestations and other data
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockBody {
-    pub attestations: Container<serde_json::Value>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deposits: Option<Container<serde_json::Value>>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub withdrawals: Option<Container<serde_json::Value>>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub voluntary_exits: Option<Container<serde_json::Value>>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+impl From<Block> for ethlambda_types::block::Block {
+    fn from(value: Block) -> Self {
+        Self {
+            slot: value.slot,
+            proposer_index: value.proposer_index,
+            parent_root: value.parent_root,
+            state_root: value.state_root,
+            body: value.body.into(),
+        }
+    }
 }
 
-/// Post-state expectations after processing blocks
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostState {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slot: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestJustifiedSlot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_justified_slot: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestJustifiedRoot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_justified_root: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "latestFinalizedSlot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_finalized_slot: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestFinalizedRoot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_finalized_root: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validator_count: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "configGenesisTime")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_genesis_time: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestBlockHeaderSlot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_block_header_slot: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestBlockHeaderProposerIndex")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_block_header_proposer_index: Option<u64>,
-    #[serde(default)]
-    #[serde(rename = "latestBlockHeaderParentRoot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_block_header_parent_root: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "latestBlockHeaderStateRoot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_block_header_state_root: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "latestBlockHeaderBodyRoot")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_block_header_body_root: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "historicalBlockHashes")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub historical_block_hashes: Option<Container<String>>,
-    #[serde(default)]
-    #[serde(rename = "justifiedSlots")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justified_slots: Option<Container<u64>>,
-    #[serde(default)]
-    #[serde(rename = "justificationsRoots")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justifications_roots: Option<Container<String>>,
-    #[serde(default)]
-    #[serde(rename = "justificationsValidators")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justifications_validators: Option<Container<serde_json::Value>>,
-    #[serde(default)]
-    #[serde(rename = "historicalBlockHashesCount")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub historical_block_hashes_count: Option<u64>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+/// Block body containing attestations and other data
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockBody {
+    pub attestations: Container<()>,
+}
+
+impl From<BlockBody> for ethlambda_types::block::BlockBody {
+    fn from(value: BlockBody) -> Self {
+        Self {
+            attestations: VariableList::new(vec![]).unwrap(),
+        }
+    }
 }
 
 /// Test metadata and information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TestInfo {
     pub hash: String,
     pub comment: String,
@@ -254,4 +215,20 @@ pub struct TestInfo {
     pub description: String,
     #[serde(rename = "fixtureFormat")]
     pub fixture_format: String,
+}
+
+// Helpers
+
+pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkey, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = String::deserialize(d)?;
+    let pubkey: ValidatorPubkey = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
+        .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
+        .try_into()
+        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+    Ok(pubkey)
 }
