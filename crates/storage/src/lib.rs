@@ -4,7 +4,7 @@ use std::{
 };
 
 use ethlambda_types::{
-    attestation::SignedAttestation,
+    attestation::AttestationData,
     block::Block,
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
@@ -175,7 +175,7 @@ impl Store {
 
     pub fn update_safe_target(&self) {
         let mut inner = self.0.lock().unwrap();
-        let head_state = inner.states[inner.head];
+        let head_state = &inner.states[&inner.head];
         let num_validators = head_state.validators.len() as u64;
 
         let min_target_score = (num_validators * 2).div_ceil(3);
