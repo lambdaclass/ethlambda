@@ -40,6 +40,10 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
 /// Signature payload for the block.
 #[derive(Clone, Encode, Decode)]
 pub struct BlockSignatures {
+    /// Signature for the proposer's attestation.
+    // TODO: this goes after attestation_signatures in the spec
+    proposer_signature: XmssSignature,
+
     /// Attestation signatures for the aggregated attestations in the block body.
     ///
     /// Each entry corresponds to an aggregated attestation from the block body and
@@ -48,9 +52,6 @@ pub struct BlockSignatures {
     /// TODO:
     /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
     attestation_signatures: AttestationSignatures,
-
-    /// Signature for the proposer's attestation.
-    proposer_signature: XmssSignature,
 }
 
 /// List of per-attestation aggregated signature proofs.
@@ -60,8 +61,12 @@ pub struct BlockSignatures {
 /// It contains:
 ///     - the participants bitfield,
 ///     - proof bytes from leanVM signature aggregation.
+// pub type AttestationSignatures =
+//     ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
 pub type AttestationSignatures =
-    ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
+    ssz_types::VariableList<NaiveAggregatedSignature, ValidatorRegistryLimit>;
+
+pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
 
 pub type XmssSignature = ssz_types::FixedVector<u8, SignatureSize>;
 
@@ -80,7 +85,7 @@ pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     participants: AggregationBits,
     /// The raw aggregated proof bytes from leanVM.
-    proof_data: ByteList<U1048576>, // 1 MiB max size
+    proof_data: ByteList<U1048576>, // 1
 }
 
 /// Bitlist representing validator participation in an attestation or signature.
