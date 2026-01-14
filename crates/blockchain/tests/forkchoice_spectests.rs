@@ -42,7 +42,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let block_time =
                         signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
-                    store.on_tick(block_time, false);
+
+                    // NOTE: the has_proposal argument is set to true, following the spec
+                    store.on_tick(block_time, true);
                     let result = store.on_block(signed_block);
 
                     match (result.is_ok(), step.valid) {
@@ -66,8 +68,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 }
                 "tick" => {
                     let timestamp = step.time.expect("tick step missing time");
-                    // TODO: check if this is true
-                    // has_proposal is false since tests don't simulate proposals
+                    // NOTE: the has_proposal argument is set to false, following the spec
                     store.on_tick(timestamp, false);
                 }
                 other => {
