@@ -7,7 +7,7 @@ use ethlambda_types::{
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 use crate::SECONDS_PER_SLOT;
 
@@ -37,7 +37,7 @@ pub struct Store {
     time: u64,
 
     /// Chain configuration parameters.
-    _config: ChainConfig,
+    config: ChainConfig,
 
     /// Root of the current canonical chain head block.
     ///
@@ -144,7 +144,7 @@ impl Store {
 
         Self {
             time: 0,
-            _config: anchor_state.config.clone(),
+            config: anchor_state.config.clone(),
             head: anchor_block_root,
             safe_target: anchor_block_root,
             latest_justified: anchor_checkpoint,
@@ -222,6 +222,47 @@ impl Store {
         // TODO: Time Check - Validate attestation is not too far in the future
 
         Ok(())
+    }
+
+    pub fn on_tick(&mut self, timestamp: u64, has_proposal: bool) {
+        let time = timestamp - self.config.genesis_time;
+
+        // If we're more than a slot behind, fast-forward to a slot before.
+        // Operations are idempotent, so this should be fine.
+        if time.saturating_sub(self.time) > SECONDS_PER_SLOT {
+            self.time = time - SECONDS_PER_SLOT;
+        }
+
+        while self.time < time {
+            self.time += 1;
+
+            let slot = self.time / SECONDS_PER_SLOT;
+            let interval = self.time % SECONDS_PER_SLOT;
+
+            trace!(%slot, %interval, "processing tick");
+
+            // NOTE: here we assume on_tick never skips intervals
+            match interval {
+                0 => {
+                    // Start of slot - process attestations if proposal exists
+                    if has_proposal {
+                        self.accept_new_attestations();
+                    }
+                }
+                1 => {
+                    // Second interval - no action
+                }
+                2 => {
+                    // Mid-slot - update safe target for validators
+                    self.update_safe_target();
+                }
+                3 => {
+                    // End of slot - accept accumulated attestations
+                    self.accept_new_attestations();
+                }
+                _ => unreachable!("slots only have 4 intervals"),
+            }
+        }
     }
 
     pub fn on_gossip_attestation(

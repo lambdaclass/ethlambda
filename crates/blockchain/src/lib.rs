@@ -7,7 +7,7 @@ use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
 use store::Store;
-use tracing::{error, trace, warn};
+use tracing::{error, warn};
 
 pub mod store;
 
@@ -67,33 +67,7 @@ impl BlockChainServer {
         // TODO: check if we are proposing
         let has_proposal = false;
 
-        // TODO: this should be moved to Store
-        let time = timestamp - self.genesis_time;
-        let slot = time / SECONDS_PER_SLOT;
-        let interval = time % SECONDS_PER_SLOT;
-        trace!(%slot, %interval, "processing tick");
-
-        // NOTE: here we assume on_tick never skips intervals
-        match interval {
-            0 => {
-                // Start of slot - process attestations if proposal exists
-                if has_proposal {
-                    self.store.accept_new_attestations();
-                }
-            }
-            1 => {
-                // Second interval - no action
-            }
-            2 => {
-                // Mid-slot - update safe target for validators
-                self.store.update_safe_target();
-            }
-            3 => {
-                // End of slot - accept accumulated attestations
-                self.store.accept_new_attestations();
-            }
-            _ => unreachable!("slots only have 4 intervals"),
-        }
+        self.store.on_tick(timestamp, has_proposal);
     }
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
