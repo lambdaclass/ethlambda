@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, XmssSignature},
     block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
-    primitives::{Decode, H256, TreeHash},
-    signature::Signature,
+    primitives::{H256, TreeHash},
+    signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
 use tracing::{info, warn};
@@ -419,6 +419,15 @@ pub enum StoreError {
     #[error("Validator index out of range")]
     InvalidValidatorIndex,
 
+    #[error("Failed to decode validator {0}'s public key")]
+    PubkeyDecodingFailed(u64),
+
+    #[error("Proposer signature could not be decoded")]
+    ProposerSignatureDecodingFailed,
+
+    #[error("Proposer signature verification failed")]
+    ProposerSignatureVerificationFailed,
+
     #[error("State transition failed: {0}")]
     StateTransitionFailed(#[from] ethlambda_state_transition::Error),
 
@@ -471,19 +480,51 @@ fn verify_signatures(
     let validators = &state.validators;
     let num_validators = validators.len() as u64;
 
-    for (attestation, _aggregated_signature) in attestations.iter().zip(attestation_signatures) {
+    for (attestation, aggregated_signature) in attestations.iter().zip(attestation_signatures) {
         let validator_ids = aggregation_bits_to_validator_indices(&attestation.aggregation_bits);
         if validator_ids.iter().any(|vid| *vid >= num_validators) {
             return Err(StoreError::InvalidValidatorIndex);
         }
-        // TODO: verify signatures
+        let epoch = attestation.data.slot.try_into().expect("slot exceeds u32");
+        let message = attestation.data.tree_hash_root();
+
+        // TODO: move to aggregated verification
+        for (validator, signature) in validator_ids.into_iter().zip(aggregated_signature) {
+            let validator = validators
+                .get(validator as usize)
+                .ok_or(StoreError::InvalidValidatorIndex)?;
+            let pubkey = validator
+                .get_pubkey()
+                .map_err(|_| StoreError::PubkeyDecodingFailed(validator.index))?;
+
+            let validator_signature = ValidatorSignature::from_bytes(&signature)
+                .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+
+            if !pubkey.is_valid(epoch, &message, &validator_signature) {
+                return Err(StoreError::ProposerSignatureVerificationFailed);
+            }
+        }
     }
+
     let proposer_attestation = &signed_block.message.proposer_attestation;
-    let proposer_signature = &signed_block.signature.proposer_signature;
+    let proposer_signature =
+        ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+            .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
     let proposer = validators
         .get(block.proposer_index as usize)
-        .expect("we already checked the proposer index is valid");
+        .ok_or(StoreError::InvalidValidatorIndex)?;
 
-    // TODO: verify proposer signature
+    let proposer_pubkey = proposer
+        .get_pubkey()
+        .map_err(|_| StoreError::PubkeyDecodingFailed(proposer.index))?;
+    let epoch = proposer_attestation
+        .data
+        .slot
+        .try_into()
+        .expect("slot exceeds u32");
+    let message = proposer_attestation.data.tree_hash_root();
+    if !proposer_pubkey.is_valid(epoch, &message, &proposer_signature) {
+        return Err(StoreError::ProposerSignatureVerificationFailed);
+    }
     Ok(())
 }
