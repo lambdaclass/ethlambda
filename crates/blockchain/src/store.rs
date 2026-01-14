@@ -186,7 +186,7 @@ impl Store {
         let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
             self.latest_finalized.root,
             &self.blocks,
-            &self.latest_known_attestations,
+            &self.latest_new_attestations,
             min_target_score,
         );
         self.safe_target = safe_target;
