@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, XmssSignature},
@@ -6,7 +6,7 @@ use ethlambda_types::{
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::SECONDS_PER_SLOT;
 
@@ -349,6 +349,9 @@ impl Store {
         let aggregated_attestations = &block.body.attestations;
         let attestation_signatures = &signed_block.signature.attestation_signatures;
 
+        // Process block body attestations.
+        // TODO: fail the block if an attestation is invalid. Right now we
+        // just log a warning.
         for (att, proof) in aggregated_attestations
             .iter()
             .zip(attestation_signatures.iter())
@@ -356,9 +359,9 @@ impl Store {
             let validator_ids = aggregation_bits_to_validator_indices(&att.aggregation_bits);
             let data_root = att.data.tree_hash_root();
 
-            for vid in validator_ids {
+            for validator_id in validator_ids {
                 // Update Proof Map - Store the proof so future block builders can reuse this aggregation
-                let key: SignatureKey = (vid, data_root);
+                let key: SignatureKey = (validator_id, data_root);
                 self.aggregated_payloads
                     .entry(key)
                     .or_default()
@@ -366,11 +369,13 @@ impl Store {
 
                 // Update Fork Choice - Register the vote immediately (historical/on-chain)
                 let attestation = Attestation {
-                    validator_id: vid,
+                    validator_id,
                     data: att.data.clone(),
                 };
-                // Ignore errors for individual attestations in a block
-                let _ = self.on_attestation(attestation, true);
+                // TODO: validate attestations before processing
+                if let Err(err) = self.on_attestation(attestation, true) {
+                    warn!(%slot, %validator_id, %err, "Invalid attestation in block");
+                }
             }
         }
 
@@ -394,8 +399,10 @@ impl Store {
         );
 
         // Process proposer attestation (enters "new" stage, not "known")
-        // TODO: validate attestation before block processing
-        let _ = self.on_attestation(proposer_attestation, false);
+        // TODO: validate attestations before processing
+        if let Err(err) = self.on_attestation(proposer_attestation, false) {
+            warn!(%slot, %err, "Invalid proposer attestation in block");
+        }
 
         info!(%slot, %block_root, %state_root, "Processed new block");
         Ok(())
@@ -427,6 +434,14 @@ pub enum StoreError {
 
     #[error("Attestation from future slot")]
     FutureAttestation,
+
+    #[error(
+        "Attestation signature count ({signatures}) does not match attestation count ({attestations})"
+    )]
+    AttestationSignatureMismatch {
+        signatures: usize,
+        attestations: usize,
+    },
 }
 
 /// Extract validator indices from aggregation bits.
@@ -438,14 +453,17 @@ fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
 }
 
 fn verify_signatures(
-    state: &State,
+    _state: &State,
     signed_block: &SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
     let block = &signed_block.message.block;
-    let aggregated_attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
     if block.body.attestations.len() != attestation_signatures.len() {
-        return Err(StoreError);
+        return Err(StoreError::AttestationSignatureMismatch {
+            signatures: attestation_signatures.len(),
+            attestations: block.body.attestations.len(),
+        });
     }
+    // TODO: validate cryptographic signatures
     Ok(())
 }
