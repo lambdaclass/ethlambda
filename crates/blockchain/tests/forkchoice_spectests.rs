@@ -4,7 +4,7 @@ use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::{H256, VariableList},
+    primitives::VariableList,
     state::State,
 };
 
@@ -241,18 +241,6 @@ fn validate_attestation_check(
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
-    // Error on unsupported check fields (only if no alternative checks exist)
-    let has_other_slot_checks = check.attestation_slot.is_some()
-        || check.source_slot.is_some()
-        || check.target_slot.is_some();
-    if check.head_slot.is_some() && !has_other_slot_checks {
-        return Err(format!(
-            "Step {}: attestation 'headSlot' without other slot checks not supported",
-            step_idx
-        )
-        .into());
-    }
-
     let validator_id = check.validator;
     let location = check.location.as_str();
 
@@ -279,6 +267,16 @@ fn validate_attestation_check(
             return Err(format!(
                 "Step {}: attestation slot mismatch for validator {}: expected {}, got {}",
                 step_idx, validator_id, expected_slot, attestation.slot
+            )
+            .into());
+        }
+    }
+
+    if let Some(expected_head_slot) = check.head_slot {
+        if attestation.head.slot != expected_head_slot {
+            return Err(format!(
+                "Step {}: attestation head slot mismatch: expected {}, got {}",
+                step_idx, expected_head_slot, attestation.head.slot
             )
             .into());
         }
