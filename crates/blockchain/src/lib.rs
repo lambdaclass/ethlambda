@@ -22,11 +22,7 @@ impl BlockChain {
     pub fn spawn(genesis_state: State) -> BlockChain {
         let genesis_time = genesis_state.config.genesis_time;
         let store = Store::from_genesis(genesis_state);
-        let handle = BlockChainServer {
-            genesis_time,
-            store,
-        }
-        .start();
+        let handle = BlockChainServer { store }.start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -58,7 +54,6 @@ impl BlockChain {
 }
 
 struct BlockChainServer {
-    genesis_time: u64,
     store: Store,
 }
 
