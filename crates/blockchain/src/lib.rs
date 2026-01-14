@@ -16,7 +16,7 @@ pub struct BlockChain {
 }
 
 /// Seconds in a slot. Each slot has 4 intervals of 1 second each.
-const SECONDS_PER_SLOT: u64 = 4;
+pub const SECONDS_PER_SLOT: u64 = 4;
 
 impl BlockChain {
     pub fn spawn(genesis_state: State) -> BlockChain {

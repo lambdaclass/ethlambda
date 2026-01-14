@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ethlambda_blockchain::store::Store;
+use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -30,6 +30,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Initialize store from anchor state/block
         let anchor_state: State = test.anchor_state.into();
         let anchor_block: Block = test.anchor_block.into();
+        let genesis_time = anchor_state.config.genesis_time;
         let mut store = Store::get_forkchoice_store(anchor_state, anchor_block);
 
         // Process steps
@@ -38,6 +39,10 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 "block" => {
                     let block_data = step.block.expect("block step missing block data");
                     let signed_block = build_signed_block(block_data);
+
+                    let block_time =
+                        signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
+                    store.on_tick(block_time, false);
                     let result = store.on_block(signed_block);
 
                     match (result.is_ok(), step.valid) {
