@@ -4,7 +4,7 @@ use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::VariableList,
+    primitives::{H256, VariableList},
     state::State,
 };
 
@@ -118,44 +118,16 @@ fn validate_checks(
         )
         .into());
     }
-    if checks.latest_justified_slot.is_some() {
+    if checks.latest_justified_root_label.is_some() && checks.latest_justified_root.is_none() {
         return Err(format!(
-            "Step {}: 'latestJustifiedSlot' check not supported",
+            "Step {}: 'latestJustifiedRootLabel' without 'latestJustifiedRoot' not supported",
             step_idx
         )
         .into());
     }
-    if checks.latest_justified_root.is_some() {
+    if checks.latest_finalized_root_label.is_some() && checks.latest_finalized_root.is_none() {
         return Err(format!(
-            "Step {}: 'latestJustifiedRoot' check not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_justified_root_label.is_some() {
-        return Err(format!(
-            "Step {}: 'latestJustifiedRootLabel' check not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_finalized_slot.is_some() {
-        return Err(format!(
-            "Step {}: 'latestFinalizedSlot' check not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_finalized_root.is_some() {
-        return Err(format!(
-            "Step {}: 'latestFinalizedRoot' check not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_finalized_root_label.is_some() {
-        return Err(format!(
-            "Step {}: 'latestFinalizedRootLabel' check not supported",
+            "Step {}: 'latestFinalizedRootLabel' without 'latestFinalizedRoot' not supported",
             step_idx
         )
         .into());
@@ -201,6 +173,54 @@ fn validate_checks(
             return Err(format!(
                 "Step {}: headRoot mismatch: expected {:?}, got {:?}",
                 step_idx, expected_root, head_root
+            )
+            .into());
+        }
+    }
+
+    // Validate latestJustifiedSlot
+    if let Some(expected_slot) = checks.latest_justified_slot {
+        let justified = store.latest_justified();
+        if justified.slot != expected_slot {
+            return Err(format!(
+                "Step {}: latestJustifiedSlot mismatch: expected {}, got {}",
+                step_idx, expected_slot, justified.slot
+            )
+            .into());
+        }
+    }
+
+    // Validate latestJustifiedRoot
+    if let Some(ref expected_root) = checks.latest_justified_root {
+        let justified = store.latest_justified();
+        if justified.root != *expected_root {
+            return Err(format!(
+                "Step {}: latestJustifiedRoot mismatch: expected {:?}, got {:?}",
+                step_idx, expected_root, justified.root
+            )
+            .into());
+        }
+    }
+
+    // Validate latestFinalizedSlot
+    if let Some(expected_slot) = checks.latest_finalized_slot {
+        let finalized = store.latest_finalized();
+        if finalized.slot != expected_slot {
+            return Err(format!(
+                "Step {}: latestFinalizedSlot mismatch: expected {}, got {}",
+                step_idx, expected_slot, finalized.slot
+            )
+            .into());
+        }
+    }
+
+    // Validate latestFinalizedRoot
+    if let Some(ref expected_root) = checks.latest_finalized_root {
+        let finalized = store.latest_finalized();
+        if finalized.root != *expected_root {
+            return Err(format!(
+                "Step {}: latestFinalizedRoot mismatch: expected {:?}, got {:?}",
+                step_idx, expected_root, finalized.root
             )
             .into());
         }

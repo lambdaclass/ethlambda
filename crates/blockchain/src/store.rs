@@ -522,6 +522,16 @@ impl Store {
     pub fn safe_target(&self) -> H256 {
         self.safe_target
     }
+
+    /// Returns a reference to the latest justified checkpoint.
+    pub fn latest_justified(&self) -> &Checkpoint {
+        &self.latest_justified
+    }
+
+    /// Returns a reference to the latest finalized checkpoint.
+    pub fn latest_finalized(&self) -> &Checkpoint {
+        &self.latest_finalized
+    }
 }
 
 /// Errors that can occur during Store operations.
