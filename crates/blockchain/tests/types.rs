@@ -82,19 +82,35 @@ pub struct BlockStepData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreChecks {
+    // Validated fields
     #[serde(rename = "headSlot")]
     pub head_slot: Option<u64>,
     #[serde(rename = "headRoot")]
     pub head_root: Option<H256>,
-    #[serde(rename = "headRootLabel")]
-    #[allow(dead_code)]
-    pub head_root_label: Option<String>,
     #[serde(rename = "attestationChecks")]
     pub attestation_checks: Option<Vec<AttestationCheck>>,
     #[serde(rename = "attestationTargetSlot")]
     pub attestation_target_slot: Option<u64>,
+
+    // Unsupported fields (will error if present in test fixture)
+    pub time: Option<u64>,
+    #[serde(rename = "headRootLabel")]
+    pub head_root_label: Option<String>,
+    #[serde(rename = "latestJustifiedSlot")]
+    pub latest_justified_slot: Option<u64>,
+    #[serde(rename = "latestJustifiedRoot")]
+    pub latest_justified_root: Option<H256>,
+    #[serde(rename = "latestJustifiedRootLabel")]
+    pub latest_justified_root_label: Option<String>,
+    #[serde(rename = "latestFinalizedSlot")]
+    pub latest_finalized_slot: Option<u64>,
+    #[serde(rename = "latestFinalizedRoot")]
+    pub latest_finalized_root: Option<H256>,
+    #[serde(rename = "latestFinalizedRootLabel")]
+    pub latest_finalized_root_label: Option<String>,
+    #[serde(rename = "safeTarget")]
+    pub safe_target: Option<H256>,
     #[serde(rename = "lexicographicHeadAmong")]
-    #[allow(dead_code)]
     pub lexicographic_head_among: Option<Vec<String>>,
 }
 
@@ -104,7 +120,6 @@ pub struct AttestationCheck {
     #[serde(rename = "attestationSlot")]
     pub attestation_slot: Option<u64>,
     #[serde(rename = "headSlot")]
-    #[allow(dead_code)]
     pub head_slot: Option<u64>,
     #[serde(rename = "sourceSlot")]
     pub source_slot: Option<u64>,
@@ -270,7 +285,6 @@ impl From<Block> for DomainBlock {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockBody {
-    #[allow(dead_code)]
     pub attestations: Container<AggregatedAttestation>,
 }
 

@@ -107,6 +107,77 @@ fn validate_checks(
     checks: &StoreChecks,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
+    // Error on unsupported check fields
+    if checks.time.is_some() {
+        return Err(format!("Step {}: 'time' check not supported", step_idx).into());
+    }
+    if checks.head_root_label.is_some() && checks.head_root.is_none() {
+        return Err(format!(
+            "Step {}: 'headRootLabel' without 'headRoot' not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_justified_slot.is_some() {
+        return Err(format!(
+            "Step {}: 'latestJustifiedSlot' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_justified_root.is_some() {
+        return Err(format!(
+            "Step {}: 'latestJustifiedRoot' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_justified_root_label.is_some() {
+        return Err(format!(
+            "Step {}: 'latestJustifiedRootLabel' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_finalized_slot.is_some() {
+        return Err(format!(
+            "Step {}: 'latestFinalizedSlot' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_finalized_root.is_some() {
+        return Err(format!(
+            "Step {}: 'latestFinalizedRoot' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.latest_finalized_root_label.is_some() {
+        return Err(format!(
+            "Step {}: 'latestFinalizedRootLabel' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.safe_target.is_some() {
+        return Err(format!("Step {}: 'safeTarget' check not supported", step_idx).into());
+    }
+    if checks.attestation_target_slot.is_some() {
+        return Err(format!(
+            "Step {}: 'attestationTargetSlot' check not supported",
+            step_idx
+        )
+        .into());
+    }
+    if checks.lexicographic_head_among.is_some() {
+        return Err(format!(
+            "Step {}: 'lexicographicHeadAmong' check not supported",
+            step_idx
+        )
+        .into());
+    }
+
     // Validate headSlot
     if let Some(expected_slot) = checks.head_slot {
         let head_root = store.head();
@@ -142,22 +213,6 @@ fn validate_checks(
         }
     }
 
-    // Validate attestationTargetSlot (safe_target)
-    if let Some(expected_slot) = checks.attestation_target_slot {
-        let safe_target = store.safe_target();
-        let target_block = store
-            .blocks()
-            .get(&safe_target)
-            .ok_or_else(|| format!("Step {}: safe_target block not found", step_idx))?;
-        if target_block.slot != expected_slot {
-            return Err(format!(
-                "Step {}: attestationTargetSlot mismatch: expected {}, got {}",
-                step_idx, expected_slot, target_block.slot
-            )
-            .into());
-        }
-    }
-
     Ok(())
 }
 
@@ -166,6 +221,18 @@ fn validate_attestation_check(
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
+    // Error on unsupported check fields (only if no alternative checks exist)
+    let has_other_slot_checks = check.attestation_slot.is_some()
+        || check.source_slot.is_some()
+        || check.target_slot.is_some();
+    if check.head_slot.is_some() && !has_other_slot_checks {
+        return Err(format!(
+            "Step {}: attestation 'headSlot' without other slot checks not supported",
+            step_idx
+        )
+        .into());
+    }
+
     let validator_id = check.validator;
     let location = check.location.as_str();
 
