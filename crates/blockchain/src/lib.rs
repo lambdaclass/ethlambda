@@ -98,47 +98,7 @@ impl BlockChainServer {
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
-
-        let block = &signed_block.message.block;
-        let proposer_attestation = &signed_block.message.proposer_attestation;
-        let signatures = &signed_block.signature;
-
-        let block_root = block.tree_hash_root();
-
-        if self.store.has_state(&block_root) {
-            return;
-        }
-
-        let Some(mut pre_state) = self.store.get_state(&block.parent_root) else {
-            // TODO: backfill missing blocks
-            warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
-            return;
-        };
-
-        if let Err(err) = validate_signatures(&pre_state, &signed_block) {
-            warn!(%slot, %block_root, %err, "Block has invalid signatures");
-            return;
-        }
-
-        if let Err(err) = ethlambda_state_transition::state_transition(&mut pre_state, &block) {
-            warn!(%slot, %block_root, %err, "State transition failed for new block");
-            return;
-        }
-        // Cache the state root in the latest block header
-        let state_root = block.state_root;
-        pre_state.latest_block_header.state_root = state_root;
-
-        let post_state = pre_state;
-
-        let attestations = &block.body.attestations;
-        for (attestation, proof) in attestations.iter().zip(&signatures.attestation_signatures) {
-            // Add attestation
-        }
-
-        self.store.add_block(signed_block.message.block, post_state);
-        self.store.update_head();
-
-        info!(%slot, %block_root, %state_root, "Processed new block");
+        self.store.on_block(signed_block);
         update_head_slot(slot);
     }
 
@@ -205,12 +165,4 @@ fn update_head_slot(slot: u64) {
                 .unwrap()
         });
     LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
-}
-
-fn validate_signatures(
-    state: &State,
-    signed_block: &SignedBlockWithAttestation,
-) -> Result<(), String> {
-    // TODO: validate signatures
-    Ok(())
 }

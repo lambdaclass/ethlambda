@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
-    attestation::AttestationData,
-    block::Block,
+    attestation::{AttestationData, XmssSignature},
+    block::{AggregatedSignatureProof, Block, SignedBlockWithAttestation},
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
-use tracing::info;
+use tracing::{info, warn};
+
+/// Key for looking up individual validator signatures.
+/// Used to index signature caches by (validator, message) pairs.
+///
+/// Values are (validator_index, attestation_data_root).
+type SignatureKey = (u64, H256);
 
 /// Forkchoice store tracking chain state and validator attestations.
 ///
@@ -83,6 +89,19 @@ pub struct Store {
     /// - They migrate to `latest_known_attestations` via interval ticks.
     /// - Keyed by validator index to enforce one attestation per validator.
     latest_new_attestations: HashMap<u64, AttestationData>,
+
+    /// Per-validator XMSS signatures learned from gossip.
+    ///
+    /// Keyed by SignatureKey(validator_id, attestation_data_root).
+    gossip_signatures: HashMap<SignatureKey, XmssSignature>,
+
+    /// Aggregated signature proofs learned from blocks.
+    /// - Keyed by SignatureKey(validator_id, attestation_data_root).
+    /// - Values are lists of AggregatedSignatureProof, each containing the participants
+    ///   bitfield indicating which validators signed.
+    /// - Used for recursive signature aggregation when building blocks.
+    /// - Populated by on_block.
+    aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
 }
 
 impl Store {
@@ -132,37 +151,13 @@ impl Store {
         }
     }
 
-    pub fn has_state(&self, block_root: &H256) -> bool {
-        self.states.contains_key(block_root)
-    }
-
-    pub fn get_state(&self, block_root: &H256) -> Option<State> {
-        self.states.get(block_root).cloned()
-    }
-
-    pub fn add_block(&mut self, block: Block, state: State) {
-        let block_root = block.tree_hash_root();
-
-        self.latest_justified = state.latest_justified;
-        self.latest_finalized = state.latest_finalized;
-
-        self.blocks.insert(block_root, block);
-        self.states.insert(block_root, state);
-    }
-
     pub fn accept_new_attestations(&mut self) {
         let mut latest_new_attestations = std::mem::take(&mut self.latest_new_attestations);
         self.latest_known_attestations
             .extend(latest_new_attestations.drain());
         self.latest_new_attestations = latest_new_attestations;
 
-        let head = ethlambda_fork_choice::compute_lmd_ghost_head(
-            self.latest_justified.root,
-            &self.blocks,
-            &self.latest_known_attestations,
-            0,
-        );
-        self.head = head;
+        self.update_head();
     }
 
     pub fn update_head(&mut self) {
@@ -189,4 +184,62 @@ impl Store {
         );
         self.safe_target = safe_target;
     }
+
+    pub fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+        let slot = signed_block.message.block.slot;
+
+        let block = &signed_block.message.block;
+        let proposer_attestation = &signed_block.message.proposer_attestation;
+        let signatures = &signed_block.signature;
+
+        let block_root = block.tree_hash_root();
+
+        if self.blocks.contains_key(&block_root) {
+            return;
+        }
+
+        let Some(pre_state) = self.states.get(&block.parent_root) else {
+            // TODO: backfill missing blocks
+            warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
+            return;
+        };
+
+        if let Err(err) = verify_signatures(pre_state, &signed_block) {
+            warn!(%slot, %block_root, %err, "Block has invalid signatures");
+            return;
+        }
+        let mut post_state = pre_state.clone();
+
+        if let Err(err) = ethlambda_state_transition::state_transition(&mut post_state, &block) {
+            warn!(%slot, %block_root, %err, "State transition failed for new block");
+            return;
+        }
+        // Cache the state root in the latest block header
+        let state_root = block.state_root;
+        post_state.latest_block_header.state_root = state_root;
+
+        self.blocks
+            .insert(block_root, signed_block.message.block.clone());
+        self.states.insert(block_root, post_state);
+
+        let attestations = &block.body.attestations;
+        for (attestation, proof) in attestations.iter().zip(&signatures.attestation_signatures) {
+            // Add attestation
+        }
+
+        self.latest_justified = post_state.latest_justified;
+        self.latest_finalized = post_state.latest_finalized;
+
+        self.update_head();
+
+        info!(%slot, %block_root, %state_root, "Processed new block");
+    }
+}
+
+fn verify_signatures(
+    state: &State,
+    signed_block: &SignedBlockWithAttestation,
+) -> Result<(), String> {
+    // TODO: validate signatures
+    Ok(())
 }
