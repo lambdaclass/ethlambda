@@ -24,7 +24,12 @@ use crate::{
 mod gossipsub;
 mod messages;
 
-pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain: BlockChain) {
+pub async fn start_p2p(
+    node_key: Vec<u8>,
+    bootnodes: Vec<Bootnode>,
+    listening_port: u16,
+    blockchain: BlockChain,
+) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -64,12 +69,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
 
     // TODO: set peer scoring params
 
-    // TODO: load identity from config or flag
-    let secret_key = secp256k1::SecretKey::try_from_bytes(
-        b")\x95PR\x9ay\xbc-\xce\x007G\xc5/\xb0c\x94e\xc8\x93\xe0\x0b\x04@\xacf\x14Mb^\x06j"
-            .to_vec(),
-    )
-    .unwrap();
+    let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
     // TODO: implement Executor with spawned?

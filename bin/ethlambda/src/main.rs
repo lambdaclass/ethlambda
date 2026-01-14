@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +12,7 @@ use ethlambda_types::{
     state::{State, Validator, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
@@ -30,6 +31,12 @@ struct CliOptions {
     custom_network_config_dir: PathBuf,
     #[arg(long)]
     gossipsub_port: u16,
+    #[arg(long)]
+    metrics_address: IpAddr,
+    #[arg(long)]
+    metrics_port: u16,
+    #[arg(long)]
+    node_key: PathBuf,
 }
 
 #[tokio::main]
@@ -39,9 +46,15 @@ async fn main() {
         .from_env_lossy();
     let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
     tracing::subscriber::set_global_default(subscriber).unwrap();
+
     let options = CliOptions::parse();
 
+    let metrics_socket = SocketAddr::new(options.metrics_address, options.metrics_port);
+    let node_p2p_key = read_hex_file_bytes(&options.node_key);
+
     println!("{ASCII_ART}");
+
+    info!(node_key=?options.node_key, "got node key");
 
     let genesis_path = options.custom_network_config_dir.join("genesis.json");
     let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
@@ -61,11 +74,14 @@ async fn main() {
 
     let blockchain = BlockChain::spawn(genesis_state);
 
-    let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port, blockchain));
+    let p2p_handle = tokio::spawn(start_p2p(
+        node_p2p_key,
+        bootnodes,
+        options.gossipsub_port,
+        blockchain,
+    ));
 
-    start_prometheus_metrics_api("127.0.0.1:8008".parse().unwrap())
-        .await
-        .unwrap();
+    start_prometheus_metrics_api(metrics_socket).await.unwrap();
 
     info!("Node initialized");
 
@@ -137,4 +153,20 @@ fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
     }
 
     validators
+}
+
+fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
+    let path = path.as_ref();
+    let Ok(file_content) = std::fs::read_to_string(path)
+        .inspect_err(|err| error!(file=%path.display(), %err, "Failed to read hex file"))
+    else {
+        std::process::exit(1);
+    };
+    let hex_string = file_content.trim().trim_start_matches("0x");
+    let Ok(bytes) = hex::decode(hex_string)
+        .inspect_err(|err| error!(file=%path.display(), %err, "Failed to decode hex file"))
+    else {
+        std::process::exit(1);
+    };
+    bytes
 }
