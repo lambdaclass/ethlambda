@@ -169,7 +169,7 @@ impl Store {
 
     pub fn update_head(&mut self) {
         let head = ethlambda_fork_choice::compute_lmd_ghost_head(
-            self.latest_finalized.root,
+            self.latest_justified.root,
             &self.blocks,
             &self.latest_known_attestations,
             0,
@@ -184,7 +184,7 @@ impl Store {
         let min_target_score = (num_validators * 2).div_ceil(3);
 
         let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
-            self.latest_finalized.root,
+            self.latest_justified.root,
             &self.blocks,
             &self.latest_new_attestations,
             min_target_score,
