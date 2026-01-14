@@ -4,7 +4,6 @@ use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAttestation, XmssSignature},
     block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
     primitives::{H256, TreeHash},
-    signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
 use tracing::{info, trace, warn};
@@ -289,6 +288,7 @@ impl Store {
         let message = attestation.data.tree_hash_root();
         #[cfg(not(feature = "skip-signature-verification"))]
         {
+            use ethlambda_types::signature::ValidatorSignature;
             let epoch = target.slot.try_into().expect("slot exceeds u32");
             let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
@@ -587,6 +587,8 @@ fn verify_signatures(
     state: &State,
     signed_block: &SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
+    use ethlambda_types::signature::ValidatorSignature;
+
     let block = &signed_block.message.block;
     let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
