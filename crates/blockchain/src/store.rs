@@ -518,11 +518,6 @@ impl Store {
         &self.latest_new_attestations
     }
 
-    /// Returns the root of the current safe target for attestation.
-    pub fn safe_target(&self) -> H256 {
-        self.safe_target
-    }
-
     /// Returns a reference to the latest justified checkpoint.
     pub fn latest_justified(&self) -> &Checkpoint {
         &self.latest_justified
