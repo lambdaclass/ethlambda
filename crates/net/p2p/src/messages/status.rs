@@ -72,8 +72,8 @@ impl libp2p::request_response::Codec for StatusCodec {
 
         let mut size_buf = [0; 5];
         let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
-        io.write(varint_buf).await?;
-        io.write(&buf).await?;
+        io.write_all(varint_buf).await?;
+        io.write_all(&buf).await?;
 
         Ok(())
     }
@@ -88,7 +88,7 @@ impl libp2p::request_response::Codec for StatusCodec {
         T: AsyncWrite + Unpin + Send,
     {
         // Send result byte
-        io.write(&[0]).await?;
+        io.write_all(&[0]).await?;
 
         let encoded = resp.as_ssz_bytes();
         let mut compressor = FrameEncoder::new(&encoded[..]);
@@ -98,8 +98,8 @@ impl libp2p::request_response::Codec for StatusCodec {
 
         let mut size_buf = [0; 5];
         let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
-        io.write(varint_buf).await?;
-        io.write(&buf).await?;
+        io.write_all(varint_buf).await?;
+        io.write_all(&buf).await?;
 
         Ok(())
     }

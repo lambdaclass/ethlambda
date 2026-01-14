@@ -37,7 +37,7 @@ pub struct Store {
     time: u64,
 
     /// Chain configuration parameters.
-    config: ChainConfig,
+    _config: ChainConfig,
 
     /// Root of the current canonical chain head block.
     ///
@@ -144,7 +144,7 @@ impl Store {
 
         Self {
             time: 0,
-            config: anchor_state.config.clone(),
+            _config: anchor_state.config.clone(),
             head: anchor_block_root,
             safe_target: anchor_block_root,
             latest_justified: anchor_checkpoint,
@@ -290,7 +290,7 @@ impl Store {
             let should_update = self
                 .latest_known_attestations
                 .get(&validator_id)
-                .map_or(true, |latest| latest.slot < attestation_slot);
+                .is_none_or(|latest| latest.slot < attestation_slot);
 
             if should_update {
                 self.latest_known_attestations

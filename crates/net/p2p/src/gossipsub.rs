@@ -59,9 +59,9 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
 }
 
 fn decompress_message(data: &[u8]) -> snap::Result<Vec<u8>> {
-    let uncompressed_size = snap::raw::decompress_len(&data)?;
+    let uncompressed_size = snap::raw::decompress_len(data)?;
     let mut uncompressed_data = vec![0u8; uncompressed_size];
-    snap::raw::Decoder::new().decompress(&data, &mut uncompressed_data)?;
+    snap::raw::Decoder::new().decompress(data, &mut uncompressed_data)?;
     Ok(uncompressed_data)
 }
 

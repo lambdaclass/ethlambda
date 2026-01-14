@@ -8,7 +8,7 @@ use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
 use ethlambda_types::{
     genesis::Genesis,
-    state::{State, Validator, ValidatorPubkey},
+    state::{State, Validator, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
 use tracing::info;
@@ -93,19 +93,19 @@ struct AnnotatedValidator {
     index: u64,
     #[serde(rename = "pubkey_hex")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    pubkey: ValidatorPubkey,
+    pubkey: ValidatorPubkeyBytes,
     // privkey_file: PathBuf,
 }
 
 // Taken from ethrex-common
-pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkey, D::Error>
+pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
 
     let value = String::deserialize(d)?;
-    let pubkey: ValidatorPubkey = hex::decode(&value)
+    let pubkey: ValidatorPubkeyBytes = hex::decode(&value)
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
         .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
@@ -120,8 +120,8 @@ fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
         serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
 
     let mut validators: Vec<Validator> = validator_infos
-        .into_iter()
-        .map(|(_, v)| Validator {
+        .into_values()
+        .map(|v| Validator {
             pubkey: v[0].pubkey,
             index: v[0].index,
         })

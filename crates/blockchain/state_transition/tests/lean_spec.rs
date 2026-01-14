@@ -43,7 +43,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             }
         }
     }
-    return Ok(());
+    Ok(())
 }
 
 fn compare_post_states(
@@ -69,102 +69,102 @@ fn compare_post_states(
         justifications_validators,
         validator_count,
     } = expected_post;
-    if let Some(config_genesis_time) = config_genesis_time {
-        if post_state.config.genesis_time != *config_genesis_time {
-            return Err(format!(
-                "genesis_time mismatch: expected {}, got {}",
-                config_genesis_time, post_state.config.genesis_time
-            )
-            .into());
-        }
+    if let Some(config_genesis_time) = config_genesis_time
+        && post_state.config.genesis_time != *config_genesis_time
+    {
+        return Err(format!(
+            "genesis_time mismatch: expected {}, got {}",
+            config_genesis_time, post_state.config.genesis_time
+        )
+        .into());
     }
-    if let Some(slot) = slot {
-        if post_state.slot != *slot {
-            return Err(
-                format!("slot mismatch: expected {}, got {}", slot, post_state.slot).into(),
-            );
-        }
+    if let Some(slot) = slot
+        && post_state.slot != *slot
+    {
+        return Err(
+            format!("slot mismatch: expected {}, got {}", slot, post_state.slot).into(),
+        );
     }
-    if let Some(latest_block_header_slot) = latest_block_header_slot {
-        if post_state.latest_block_header.slot != *latest_block_header_slot {
-            return Err(format!(
-                "latest_block_header.slot mismatch: expected {}, got {}",
-                latest_block_header_slot, post_state.latest_block_header.slot
-            )
-            .into());
-        }
+    if let Some(latest_block_header_slot) = latest_block_header_slot
+        && post_state.latest_block_header.slot != *latest_block_header_slot
+    {
+        return Err(format!(
+            "latest_block_header.slot mismatch: expected {}, got {}",
+            latest_block_header_slot, post_state.latest_block_header.slot
+        )
+        .into());
     }
-    if let Some(latest_block_header_state_root) = latest_block_header_state_root {
-        if post_state.latest_block_header.state_root != *latest_block_header_state_root {
-            return Err(format!(
-                "latest_block_header.state_root mismatch: expected {:?}, got {:?}",
-                latest_block_header_state_root, post_state.latest_block_header.state_root
-            )
-            .into());
-        }
+    if let Some(latest_block_header_state_root) = latest_block_header_state_root
+        && post_state.latest_block_header.state_root != *latest_block_header_state_root
+    {
+        return Err(format!(
+            "latest_block_header.state_root mismatch: expected {:?}, got {:?}",
+            latest_block_header_state_root, post_state.latest_block_header.state_root
+        )
+        .into());
     }
-    if let Some(latest_block_header_proposer_index) = latest_block_header_proposer_index {
-        if post_state.latest_block_header.proposer_index != *latest_block_header_proposer_index {
-            return Err(format!(
-                "latest_block_header.proposer_index mismatch: expected {}, got {}",
-                latest_block_header_proposer_index, post_state.latest_block_header.proposer_index
-            )
-            .into());
-        }
+    if let Some(latest_block_header_proposer_index) = latest_block_header_proposer_index
+        && post_state.latest_block_header.proposer_index != *latest_block_header_proposer_index
+    {
+        return Err(format!(
+            "latest_block_header.proposer_index mismatch: expected {}, got {}",
+            latest_block_header_proposer_index, post_state.latest_block_header.proposer_index
+        )
+        .into());
     }
-    if let Some(latest_block_header_parent_root) = latest_block_header_parent_root {
-        if post_state.latest_block_header.parent_root != *latest_block_header_parent_root {
-            return Err(format!(
-                "latest_block_header.parent_root mismatch: expected {:?}, got {:?}",
-                latest_block_header_parent_root, post_state.latest_block_header.parent_root
-            )
-            .into());
-        }
+    if let Some(latest_block_header_parent_root) = latest_block_header_parent_root
+        && post_state.latest_block_header.parent_root != *latest_block_header_parent_root
+    {
+        return Err(format!(
+            "latest_block_header.parent_root mismatch: expected {:?}, got {:?}",
+            latest_block_header_parent_root, post_state.latest_block_header.parent_root
+        )
+        .into());
     }
-    if let Some(latest_block_header_body_root) = latest_block_header_body_root {
-        if post_state.latest_block_header.body_root != *latest_block_header_body_root {
-            return Err(format!(
-                "latest_block_header.body_root mismatch: expected {:?}, got {:?}",
-                latest_block_header_body_root, post_state.latest_block_header.body_root
-            )
-            .into());
-        }
+    if let Some(latest_block_header_body_root) = latest_block_header_body_root
+        && post_state.latest_block_header.body_root != *latest_block_header_body_root
+    {
+        return Err(format!(
+            "latest_block_header.body_root mismatch: expected {:?}, got {:?}",
+            latest_block_header_body_root, post_state.latest_block_header.body_root
+        )
+        .into());
     }
-    if let Some(latest_justified_slot) = latest_justified_slot {
-        if post_state.latest_justified.slot != *latest_justified_slot {
-            return Err(format!(
-                "latest_justified.slot mismatch: expected {}, got {}",
-                latest_justified_slot, post_state.latest_justified.slot
-            )
-            .into());
-        }
+    if let Some(latest_justified_slot) = latest_justified_slot
+        && post_state.latest_justified.slot != *latest_justified_slot
+    {
+        return Err(format!(
+            "latest_justified.slot mismatch: expected {}, got {}",
+            latest_justified_slot, post_state.latest_justified.slot
+        )
+        .into());
     }
-    if let Some(latest_justified_root) = latest_justified_root {
-        if post_state.latest_justified.root != *latest_justified_root {
-            return Err(format!(
-                "latest_justified.root mismatch: expected {:?}, got {:?}",
-                latest_justified_root, post_state.latest_justified.root
-            )
-            .into());
-        }
+    if let Some(latest_justified_root) = latest_justified_root
+        && post_state.latest_justified.root != *latest_justified_root
+    {
+        return Err(format!(
+            "latest_justified.root mismatch: expected {:?}, got {:?}",
+            latest_justified_root, post_state.latest_justified.root
+        )
+        .into());
     }
-    if let Some(latest_finalized_slot) = latest_finalized_slot {
-        if post_state.latest_finalized.slot != *latest_finalized_slot {
-            return Err(format!(
-                "latest_finalized.slot mismatch: expected {}, got {}",
-                latest_finalized_slot, post_state.latest_finalized.slot
-            )
-            .into());
-        }
+    if let Some(latest_finalized_slot) = latest_finalized_slot
+        && post_state.latest_finalized.slot != *latest_finalized_slot
+    {
+        return Err(format!(
+            "latest_finalized.slot mismatch: expected {}, got {}",
+            latest_finalized_slot, post_state.latest_finalized.slot
+        )
+        .into());
     }
-    if let Some(latest_finalized_root) = latest_finalized_root {
-        if post_state.latest_finalized.root != *latest_finalized_root {
-            return Err(format!(
-                "latest_finalized.root mismatch: expected {:?}, got {:?}",
-                latest_finalized_root, post_state.latest_finalized.root
-            )
-            .into());
-        }
+    if let Some(latest_finalized_root) = latest_finalized_root
+        && post_state.latest_finalized.root != *latest_finalized_root
+    {
+        return Err(format!(
+            "latest_finalized.root mismatch: expected {:?}, got {:?}",
+            latest_finalized_root, post_state.latest_finalized.root
+        )
+        .into());
     }
     if let Some(historical_block_hashes_count) = historical_block_hashes_count {
         let count = post_state.historical_block_hashes.len() as u64;

@@ -232,8 +232,8 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     };
     let topic = message.topic.as_str().as_bytes();
     let topic_len = (topic.len() as u64).to_be_bytes();
-    hasher.update(&domain);
-    hasher.update(&topic_len);
+    hasher.update(domain);
+    hasher.update(topic_len);
     hasher.update(topic);
     hasher.update(data);
     let hash = hasher.finalize();

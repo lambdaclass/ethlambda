@@ -1,5 +1,5 @@
 use ethlambda_types::primitives::{BitList, H256, VariableList};
-use ethlambda_types::state::{State, ValidatorPubkey};
+use ethlambda_types::state::{State, ValidatorPubkeyBytes};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -23,13 +23,16 @@ impl StateTransitionTestVector {
 /// A single state transition test case
 #[derive(Debug, Clone, Deserialize)]
 pub struct StateTransitionTest {
+    #[allow(dead_code)]
     pub network: String,
     #[serde(rename = "leanEnv")]
+    #[allow(dead_code)]
     pub lean_env: String,
     pub pre: TestState,
     pub blocks: Vec<Block>,
     pub post: Option<PostState>,
     #[serde(rename = "_info")]
+    #[allow(dead_code)]
     pub info: TestInfo,
 }
 
@@ -139,7 +142,7 @@ impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
 pub struct Validator {
     index: u64,
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    pubkey: ValidatorPubkey,
+    pubkey: ValidatorPubkeyBytes,
 }
 
 impl From<Validator> for ethlambda_types::state::Validator {
@@ -245,6 +248,7 @@ pub struct PostState {
 
 /// Test metadata and information
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TestInfo {
     pub hash: String,
     pub comment: String,
@@ -257,14 +261,14 @@ pub struct TestInfo {
 
 // Helpers
 
-pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkey, D::Error>
+pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
 
     let value = String::deserialize(d)?;
-    let pubkey: ValidatorPubkey = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
+    let pubkey: ValidatorPubkeyBytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
         .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
