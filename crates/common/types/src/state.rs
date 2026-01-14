@@ -93,19 +93,18 @@ impl State {
         let justifications_validators =
             JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
 
-        let state = State {
+        Self {
             config: genesis.config.clone(),
             slot: 0,
             latest_block_header: genesis_header,
-            latest_justified: genesis.latest_justified.clone(),
-            latest_finalized: genesis.latest_finalized.clone(),
+            latest_justified: genesis.latest_justified,
+            latest_finalized: genesis.latest_finalized,
             historical_block_hashes: Default::default(),
             justified_slots,
             validators,
             justifications_roots: Default::default(),
             justifications_validators,
-        };
-        state
+        }
     }
 }
 

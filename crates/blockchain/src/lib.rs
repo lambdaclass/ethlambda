@@ -29,7 +29,7 @@ impl BlockChain {
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
-            .unwrap_or(Duration::default());
+            .unwrap_or_default();
         send_after(time_until_genesis, handle.clone(), CastMessage::Tick);
         BlockChain { handle }
     }

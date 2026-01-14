@@ -298,10 +298,10 @@ impl Store {
             }
 
             // Remove pending attestation if superseded by on-chain attestation
-            if let Some(existing_new) = self.latest_new_attestations.get(&validator_id) {
-                if existing_new.slot <= attestation_slot {
-                    self.latest_new_attestations.remove(&validator_id);
-                }
+            if let Some(existing_new) = self.latest_new_attestations.get(&validator_id)
+                && existing_new.slot <= attestation_slot
+            {
+                self.latest_new_attestations.remove(&validator_id);
             }
         } else {
             // Network gossip attestation processing
@@ -316,7 +316,7 @@ impl Store {
             let should_update = self
                 .latest_new_attestations
                 .get(&validator_id)
-                .map_or(true, |latest| latest.slot < attestation_slot);
+                .is_none_or(|latest| latest.slot < attestation_slot);
 
             if should_update {
                 self.latest_new_attestations
@@ -543,7 +543,7 @@ fn verify_signatures(
                 .get_pubkey()
                 .map_err(|_| StoreError::PubkeyDecodingFailed(validator.index))?;
 
-            let validator_signature = ValidatorSignature::from_bytes(&signature)
+            let validator_signature = ValidatorSignature::from_bytes(signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
 
             if !pubkey.is_valid(epoch, &message, &validator_signature) {

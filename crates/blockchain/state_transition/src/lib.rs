@@ -317,11 +317,10 @@ fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         // Candidate slot must not be before finalized slot
         return false;
     };
-    return
-        // Rule 1: The first 5 slots after finalization are always justifiable.
-        //
-        // Examples: delta = 0, 1, 2, 3, 4, 5
-        delta <= 5
+    // Rule 1: The first 5 slots after finalization are always justifiable.
+    //
+    // Examples: delta = 0, 1, 2, 3, 4, 5
+    delta <= 5
         // Rule 2: Slots at perfect square distances are justifiable.
         //
         // Examples: delta = 1, 4, 9, 16, 25, 36, 49, 64, ...
@@ -333,5 +332,5 @@ fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         // Mathematical insight: For pronic delta = n(n+1), we have:
         //   4*delta + 1 = 4n(n+1) + 1 = (2n+1)^2
         // Check: 4*delta+1 is an odd perfect square
-        || (4*delta + 1).isqrt().pow(2) == 4*delta + 1 && (4*delta + 1) % 2 == 1;
+        || (4*delta + 1).isqrt().pow(2) == 4*delta + 1 && (4*delta + 1) % 2 == 1
 }

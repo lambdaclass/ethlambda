@@ -1870,7 +1870,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "prometheus",
+ "thiserror 2.0.17",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

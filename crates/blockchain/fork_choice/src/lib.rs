@@ -58,7 +58,7 @@ pub fn compute_lmd_ghost_head(
     {
         // Choose best child: most attestations, then lexicographically highest hash
         head = *children
-            .into_iter()
+            .iter()
             .max_by_key(|root| (weights.get(*root).copied().unwrap_or(0), *root))
             .expect("checked it's not empty");
     }

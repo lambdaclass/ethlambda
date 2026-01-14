@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
 use axum::{Router, routing::get};
+use thiserror::Error;
+use tracing::warn;
 
 pub async fn start_prometheus_metrics_api(address: SocketAddr) -> Result<(), std::io::Error> {
     let app = Router::new()
@@ -15,23 +17,35 @@ pub async fn start_prometheus_metrics_api(address: SocketAddr) -> Result<(), std
 }
 
 pub(crate) async fn get_metrics() -> String {
-    gather_default_metrics().unwrap()
+    gather_default_metrics()
+        .inspect_err(|err| {
+            warn!(%err, "Failed to gather Prometheus metrics");
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Prometheus error: {0}")]
+    Prometheus(#[from] prometheus::Error),
+    #[error("UTF-8 conversion error: {0}")]
+    FromUtf8(#[from] std::string::FromUtf8Error),
 }
 
 /// Returns all metrics currently registered in Prometheus' default registry.
 ///
 /// Both profiling and RPC metrics register with this default registry, and the
 /// metrics API surfaces them by calling this helper.
-pub fn gather_default_metrics() -> Result<String, ()> {
+pub fn gather_default_metrics() -> Result<String, Error> {
     use prometheus::{Encoder, TextEncoder};
 
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
 
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
+    encoder.encode(&metric_families, &mut buffer)?;
 
-    let res = String::from_utf8(buffer).unwrap();
+    let res = String::from_utf8(buffer)?;
 
     Ok(res)
 }

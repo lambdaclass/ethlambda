@@ -189,7 +189,8 @@ pub struct BlockBody {
 }
 
 impl From<BlockBody> for ethlambda_types::block::BlockBody {
-    fn from(value: BlockBody) -> Self {
+    fn from(_value: BlockBody) -> Self {
+        // TODO: implement attestations deserialization
         Self {
             attestations: VariableList::new(vec![]).unwrap(),
         }
