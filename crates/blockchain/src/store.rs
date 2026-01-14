@@ -240,11 +240,15 @@ impl Store {
 
             trace!(%slot, %interval, "processing tick");
 
+            // has_proposal is only signaled for the final tick (matching Python spec behavior)
+            let is_final_tick = self.time == time;
+            let should_signal_proposal = has_proposal && is_final_tick;
+
             // NOTE: here we assume on_tick never skips intervals
             match interval {
                 0 => {
                     // Start of slot - process attestations if proposal exists
-                    if has_proposal {
+                    if should_signal_proposal {
                         self.accept_new_attestations();
                     }
                 }
