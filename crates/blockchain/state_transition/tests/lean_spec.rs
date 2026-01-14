@@ -5,11 +5,20 @@ use ethlambda_types::{block::Block, state::State};
 
 use crate::types::PostState;
 
+const SUPPORTED_FIXTURE_FORMAT: &str = "state_transition_test";
+
 mod types;
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     let tests = types::StateTransitionTestVector::from_file(path)?;
     for (name, test) in tests.tests {
+        if test.info.fixture_format != SUPPORTED_FIXTURE_FORMAT {
+            return Err(format!(
+                "Unsupported fixture format: {} (expected {})",
+                test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
+            )
+            .into());
+        }
         println!("Running test: {}", name);
 
         let mut pre_state: State = test.pre.into();
@@ -81,9 +90,7 @@ fn compare_post_states(
     if let Some(slot) = slot
         && post_state.slot != *slot
     {
-        return Err(
-            format!("slot mismatch: expected {}, got {}", slot, post_state.slot).into(),
-        );
+        return Err(format!("slot mismatch: expected {}, got {}", slot, post_state.slot).into());
     }
     if let Some(latest_block_header_slot) = latest_block_header_slot
         && post_state.latest_block_header.slot != *latest_block_header_slot
