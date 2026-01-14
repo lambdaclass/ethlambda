@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::VariableList,
+    primitives::{H256, TreeHash, VariableList},
     state::State,
 };
 
@@ -33,11 +36,22 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let genesis_time = anchor_state.config.genesis_time;
         let mut store = Store::get_forkchoice_store(anchor_state, anchor_block);
 
+        // Block registry: maps block labels to their roots
+        let mut block_registry: HashMap<String, H256> = HashMap::new();
+
         // Process steps
         for (step_idx, step) in test.steps.into_iter().enumerate() {
             match step.step_type.as_str() {
                 "block" => {
                     let block_data = step.block.expect("block step missing block data");
+
+                    // Register block label if present
+                    if let Some(ref label) = block_data.block_root_label {
+                        let block: Block = block_data.block.clone().into();
+                        let root = H256::from(block.tree_hash_root());
+                        block_registry.insert(label.clone(), root);
+                    }
+
                     let signed_block = build_signed_block(block_data);
 
                     let block_time =
@@ -79,7 +93,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
             // Validate checks
             if let Some(checks) = step.checks {
-                validate_checks(&store, &checks, step_idx)?;
+                validate_checks(&store, &checks, step_idx, &block_registry)?;
             }
         }
     }
@@ -106,6 +120,7 @@ fn validate_checks(
     store: &Store,
     checks: &StoreChecks,
     step_idx: usize,
+    block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
     // Error on unsupported check fields
     if checks.time.is_some() {
@@ -138,13 +153,6 @@ fn validate_checks(
     if checks.attestation_target_slot.is_some() {
         return Err(format!(
             "Step {}: 'attestationTargetSlot' check not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.lexicographic_head_among.is_some() {
-        return Err(format!(
-            "Step {}: 'lexicographicHeadAmong' check not supported",
             step_idx
         )
         .into());
@@ -233,6 +241,11 @@ fn validate_checks(
         }
     }
 
+    // Validate lexicographicHeadAmong
+    if let Some(ref fork_labels) = checks.lexicographic_head_among {
+        validate_lexicographic_head_among(store, fork_labels, step_idx, block_registry)?;
+    }
+
     Ok(())
 }
 
@@ -302,6 +315,147 @@ fn validate_attestation_check(
             )
             .into());
         }
+    }
+
+    Ok(())
+}
+
+fn validate_lexicographic_head_among(
+    store: &Store,
+    fork_labels: &[String],
+    step_idx: usize,
+    block_registry: &HashMap<String, H256>,
+) -> datatest_stable::Result<()> {
+    // Require at least 2 forks to test tiebreaker
+    if fork_labels.len() < 2 {
+        return Err(format!(
+            "Step {}: lexicographicHeadAmong requires at least 2 forks, got {}",
+            step_idx,
+            fork_labels.len()
+        )
+        .into());
+    }
+
+    let blocks = store.blocks();
+
+    // Resolve all fork labels to roots and compute their weights
+    // Map: label -> (root, slot, weight)
+    let mut fork_data: HashMap<&str, (H256, u64, usize)> = HashMap::new();
+
+    for label in fork_labels {
+        let root = block_registry.get(label).ok_or_else(|| {
+            format!(
+                "Step {}: lexicographicHeadAmong label '{}' not found in block registry. Available: {:?}",
+                step_idx, label, block_registry.keys().collect::<Vec<_>>()
+            )
+        })?;
+
+        let block = blocks.get(root).ok_or_else(|| {
+            format!(
+                "Step {}: block for label '{}' not found in store",
+                step_idx, label
+            )
+        })?;
+        let slot = block.slot;
+
+        // Calculate attestation weight: count attestations voting for this fork
+        // An attestation votes for this fork if its head is this block or a descendant
+        let mut weight = 0;
+        for attestation in store.latest_known_attestations().values() {
+            let att_head_root = attestation.head.root;
+            // Check if attestation head is this block or a descendant
+            if att_head_root == *root {
+                weight += 1;
+            } else if let Some(att_block) = blocks.get(&att_head_root) {
+                // Walk back from attestation head to see if we reach this block
+                let mut current = att_head_root;
+                let mut current_slot = att_block.slot;
+                while current_slot > slot {
+                    if let Some(blk) = blocks.get(&current) {
+                        if blk.parent_root == *root {
+                            weight += 1;
+                            break;
+                        }
+                        current = blk.parent_root;
+                        current_slot = blocks.get(&current).map(|b| b.slot).unwrap_or(0);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        fork_data.insert(label.as_str(), (*root, slot, weight));
+    }
+
+    // Verify all forks are at the same slot
+    let slots: HashSet<u64> = fork_data.values().map(|(_, slot, _)| *slot).collect();
+    if slots.len() > 1 {
+        let slot_info: Vec<_> = fork_data
+            .iter()
+            .map(|(label, (_, slot, _))| format!("{}: {}", label, slot))
+            .collect();
+        return Err(format!(
+            "Step {}: lexicographicHeadAmong forks have different slots: {}",
+            step_idx,
+            slot_info.join(", ")
+        )
+        .into());
+    }
+
+    // Verify all forks have equal weight
+    let weights: HashSet<usize> = fork_data.values().map(|(_, _, weight)| *weight).collect();
+    if weights.len() > 1 {
+        let weight_info: Vec<_> = fork_data
+            .iter()
+            .map(|(label, (_, _, weight))| format!("{}: {}", label, weight))
+            .collect();
+        return Err(format!(
+            "Step {}: lexicographicHeadAmong forks have unequal weights: {}. \
+             All forks must have equal attestation weight for tiebreaker to apply.",
+            step_idx,
+            weight_info.join(", ")
+        )
+        .into());
+    }
+
+    // Find the lexicographically highest root among the equal-weight forks
+    let expected_head_root = fork_data
+        .values()
+        .map(|(root, _, _)| *root)
+        .max()
+        .expect("fork_data is not empty");
+
+    // Verify the current head matches the lexicographically highest root
+    let actual_head_root = store.head();
+    if actual_head_root != expected_head_root {
+        let highest_label = fork_data
+            .iter()
+            .find(|(_, (root, _, _))| *root == expected_head_root)
+            .map(|(label, _)| *label)
+            .unwrap_or("unknown");
+        let actual_label = fork_data
+            .iter()
+            .find(|(_, (root, _, _))| *root == actual_head_root)
+            .map(|(label, _)| *label)
+            .unwrap_or("unknown");
+
+        let fork_info: Vec<_> = fork_data
+            .iter()
+            .map(|(label, (root, _, weight))| {
+                format!("  {label}: root={root:?} weight={weight}")
+            })
+            .collect();
+
+        let weight = weights.iter().next().unwrap_or(&0);
+        let fork_info = fork_info.join("\n");
+        return Err(format!(
+            "Step {step_idx}: lexicographic tiebreaker failed.\n\
+             Expected head: '{highest_label}' ({expected_head_root:?})\n\
+             Actual head:   '{actual_label}' ({actual_head_root:?})\n\
+             All competing forks (equal weight={weight}):\n{fork_info}"
+        )
+        .into());
     }
 
     Ok(())

@@ -72,7 +72,6 @@ pub struct BlockStepData {
     #[serde(rename = "proposerAttestation")]
     pub proposer_attestation: ProposerAttestation,
     #[serde(rename = "blockRootLabel")]
-    #[allow(dead_code)]
     pub block_root_label: Option<String>,
 }
 
