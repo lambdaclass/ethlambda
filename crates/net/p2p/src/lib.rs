@@ -1,4 +1,7 @@
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use ethlambda_blockchain::BlockChain;
 use ethrex_common::H264;
@@ -24,7 +27,12 @@ use crate::{
 mod gossipsub;
 mod messages;
 
-pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain: BlockChain) {
+pub async fn start_p2p(
+    node_key: Vec<u8>,
+    bootnodes: Vec<Bootnode>,
+    listening_socket: SocketAddr,
+    blockchain: BlockChain,
+) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -64,12 +72,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
 
     // TODO: set peer scoring params
 
-    // TODO: load identity from config or flag
-    let secret_key = secp256k1::SecretKey::try_from_bytes(
-        b")\x95PR\x9ay\xbc-\xce\x007G\xc5/\xb0c\x94e\xc8\x93\xe0\x0b\x04@\xacf\x14Mb^\x06j"
-            .to_vec(),
-    )
-    .unwrap();
+    let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
     // TODO: implement Executor with spawned?
@@ -94,8 +97,8 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
         swarm.dial(addr).unwrap();
     }
     let addr = Multiaddr::empty()
-        .with("127.0.0.1".parse::<IpAddr>().unwrap().into())
-        .with(Protocol::Udp(listening_port))
+        .with(listening_socket.ip().into())
+        .with(Protocol::Udp(listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
         .listen_on(addr)
@@ -109,7 +112,7 @@ pub async fn start_p2p(bootnodes: Vec<Bootnode>, listening_port: u16, blockchain
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
-    info!("P2P node started on port {listening_port}");
+    info!("P2P node started on {listening_socket}");
 
     event_loop(swarm, blockchain).await;
 }
