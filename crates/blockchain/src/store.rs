@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
-    attestation::{Attestation, AttestationData, XmssSignature},
+    attestation::{Attestation, AttestationData, SignedAttestation, XmssSignature},
     block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
     primitives::{H256, TreeHash},
     signature::ValidatorSignature,
@@ -224,6 +224,43 @@ impl Store {
         Ok(())
     }
 
+    pub fn on_gossip_attestation(
+        &mut self,
+        signed_attestation: SignedAttestation,
+    ) -> Result<(), StoreError> {
+        let validator_id = signed_attestation.validator_id;
+        let attestation = Attestation {
+            validator_id,
+            data: signed_attestation.message,
+        };
+        self.validate_attestation(&attestation)?;
+        let target = attestation.data.target;
+        let target_state = self
+            .states
+            .get(&target.root)
+            .ok_or(StoreError::MissingTargetState(target.root))?;
+        if validator_id >= target_state.validators.len() as u64 {
+            return Err(StoreError::InvalidValidatorIndex);
+        }
+        let validator_pubkey = target_state.validators[validator_id as usize]
+            .get_pubkey()
+            .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+        let epoch = target.slot.try_into().expect("slot exceeds u32");
+        let message = attestation.data.tree_hash_root();
+        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+            .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        if !validator_pubkey.is_valid(epoch, &message, &signature) {
+            return Err(StoreError::SignatureVerificationFailed);
+        }
+        self.on_attestation(attestation, false)?;
+
+        // Store signature for later lookup during block building
+        let signature_key = (validator_id, message);
+        self.gossip_signatures
+            .insert(signature_key, signed_attestation.signature);
+        Ok(())
+    }
+
     /// Process a new attestation and place it into the correct attestation stage.
     ///
     /// Attestations can come from:
@@ -233,7 +270,7 @@ impl Store {
     /// The Attestation Pipeline:
     /// - Stage 1 (latest_new_attestations): Pending attestations not yet counted in fork choice.
     /// - Stage 2 (latest_known_attestations): Active attestations used by LMD-GHOST.
-    pub fn on_attestation(
+    fn on_attestation(
         &mut self,
         attestation: Attestation,
         is_from_block: bool,
@@ -422,6 +459,12 @@ pub enum StoreError {
     #[error("Failed to decode validator {0}'s public key")]
     PubkeyDecodingFailed(u64),
 
+    #[error("Validator signature could not be decoded")]
+    SignatureDecodingFailed,
+
+    #[error("Validator signature verification failed")]
+    SignatureVerificationFailed,
+
     #[error("Proposer signature could not be decoded")]
     ProposerSignatureDecodingFailed,
 
@@ -453,6 +496,9 @@ pub enum StoreError {
         signatures: usize,
         attestations: usize,
     },
+
+    #[error("Missing target state for block: {0}")]
+    MissingTargetState(H256),
 }
 
 /// Extract validator indices from aggregation bits.
@@ -498,10 +544,10 @@ fn verify_signatures(
                 .map_err(|_| StoreError::PubkeyDecodingFailed(validator.index))?;
 
             let validator_signature = ValidatorSignature::from_bytes(&signature)
-                .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
 
             if !pubkey.is_valid(epoch, &message, &validator_signature) {
-                return Err(StoreError::ProposerSignatureVerificationFailed);
+                return Err(StoreError::SignatureVerificationFailed);
             }
         }
     }

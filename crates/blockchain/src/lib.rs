@@ -104,7 +104,11 @@ impl BlockChainServer {
         update_head_slot(slot);
     }
 
-    fn on_attestation(&mut self, _attestation: SignedAttestation) {}
+    fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
+        if let Err(err) = self.store.on_gossip_attestation(attestation) {
+            warn!(%err, "Failed to process gossiped attestation");
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,7 +158,7 @@ impl GenServer for BlockChainServer {
             CastMessage::NewBlock(signed_block) => {
                 self.on_block(signed_block);
             }
-            CastMessage::NewAttestation(attestation) => self.on_attestation(attestation),
+            CastMessage::NewAttestation(attestation) => self.on_gossip_attestation(attestation),
         }
         CastResponse::NoReply
     }
