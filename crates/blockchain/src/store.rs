@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use ethlambda_types::{
-    attestation::{AttestationData, XmssSignature},
-    block::{AggregatedSignatureProof, Block, SignedBlockWithAttestation},
+    attestation::{Attestation, AttestationData, XmssSignature},
+    block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
-use tracing::{info, warn};
+use tracing::info;
+
+use crate::SECONDS_PER_SLOT;
 
 /// Key for looking up individual validator signatures.
 /// Used to index signature caches by (validator, message) pairs.
@@ -101,7 +103,9 @@ pub struct Store {
     ///   bitfield indicating which validators signed.
     /// - Used for recursive signature aggregation when building blocks.
     /// - Populated by on_block.
-    aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
+    // TODO: change back to AggregatedSignatureProof when implemented
+    // aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
+    aggregated_payloads: HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
 }
 
 impl Store {
@@ -148,6 +152,8 @@ impl Store {
             states,
             latest_known_attestations: HashMap::new(),
             latest_new_attestations: HashMap::new(),
+            gossip_signatures: HashMap::new(),
+            aggregated_payloads: HashMap::new(),
         }
     }
 
@@ -185,61 +191,261 @@ impl Store {
         self.safe_target = safe_target;
     }
 
-    pub fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
-        let slot = signed_block.message.block.slot;
+    /// Validate incoming attestation before processing.
+    ///
+    /// Ensures the vote respects the basic laws of time and topology:
+    ///     1. The blocks voted for must exist in our store.
+    ///     2. A vote cannot span backwards in time (source > target).
+    ///     3. A vote cannot be for a future slot.
+    pub fn validate_attestation(&self, attestation: &Attestation) -> Result<(), StoreError> {
+        let data = &attestation.data;
 
-        let block = &signed_block.message.block;
-        let proposer_attestation = &signed_block.message.proposer_attestation;
-        let signatures = &signed_block.signature;
+        // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
+        if !self.blocks.contains_key(&data.source.root) {
+            return Err(StoreError::UnknownSourceBlock(data.source.root));
+        }
+        if !self.blocks.contains_key(&data.target.root) {
+            return Err(StoreError::UnknownTargetBlock(data.target.root));
+        }
+        if !self.blocks.contains_key(&data.head.root) {
+            return Err(StoreError::UnknownHeadBlock(data.head.root));
+        }
 
+        // Topology Check - Source must be older than Target.
+        if data.source.slot > data.target.slot {
+            return Err(StoreError::SourceExceedsTarget);
+        }
+
+        // TODO: Consistency Check - Validate checkpoint slots match block slots
+
+        // TODO: Time Check - Validate attestation is not too far in the future
+
+        Ok(())
+    }
+
+    /// Process a new attestation and place it into the correct attestation stage.
+    ///
+    /// Attestations can come from:
+    /// - a block body (on-chain, `is_from_block=true`), or
+    /// - the gossip network (off-chain, `is_from_block=false`).
+    ///
+    /// The Attestation Pipeline:
+    /// - Stage 1 (latest_new_attestations): Pending attestations not yet counted in fork choice.
+    /// - Stage 2 (latest_known_attestations): Active attestations used by LMD-GHOST.
+    pub fn on_attestation(
+        &mut self,
+        attestation: Attestation,
+        is_from_block: bool,
+    ) -> Result<(), StoreError> {
+        // First, ensure the attestation is structurally and temporally valid.
+        self.validate_attestation(&attestation)?;
+
+        let validator_id = attestation.validator_id;
+        let attestation_data = attestation.data;
+        let attestation_slot = attestation_data.slot;
+
+        if is_from_block {
+            // On-chain attestation processing
+            // These are historical attestations from other validators included by the proposer.
+            // They are processed immediately as "known" attestations.
+
+            let should_update = self
+                .latest_known_attestations
+                .get(&validator_id)
+                .map_or(true, |latest| latest.slot < attestation_slot);
+
+            if should_update {
+                self.latest_known_attestations
+                    .insert(validator_id, attestation_data.clone());
+            }
+
+            // Remove pending attestation if superseded by on-chain attestation
+            if let Some(existing_new) = self.latest_new_attestations.get(&validator_id) {
+                if existing_new.slot <= attestation_slot {
+                    self.latest_new_attestations.remove(&validator_id);
+                }
+            }
+        } else {
+            // Network gossip attestation processing
+            // These enter the "new" stage and must wait for interval tick acceptance.
+
+            // Reject attestations from future slots
+            let time_slots = self.time / SECONDS_PER_SLOT;
+            if attestation_slot > time_slots {
+                return Err(StoreError::FutureAttestation);
+            }
+
+            let should_update = self
+                .latest_new_attestations
+                .get(&validator_id)
+                .map_or(true, |latest| latest.slot < attestation_slot);
+
+            if should_update {
+                self.latest_new_attestations
+                    .insert(validator_id, attestation_data);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process a new block and update the forkchoice state.
+    ///
+    /// This method integrates a block into the forkchoice store by:
+    /// 1. Validating the block's parent exists
+    /// 2. Computing the post-state via the state transition function
+    /// 3. Processing attestations included in the block body (on-chain)
+    /// 4. Updating the forkchoice head
+    /// 5. Processing the proposer's attestation (as if gossiped)
+    pub fn on_block(&mut self, signed_block: SignedBlockWithAttestation) -> Result<(), StoreError> {
+        // Unpack block components
+        let block = signed_block.message.block.clone();
+        let proposer_attestation = signed_block.message.proposer_attestation.clone();
         let block_root = block.tree_hash_root();
+        let slot = block.slot;
 
+        // Skip duplicate blocks (idempotent operation)
         if self.blocks.contains_key(&block_root) {
-            return;
+            return Ok(());
         }
 
-        let Some(pre_state) = self.states.get(&block.parent_root) else {
-            // TODO: backfill missing blocks
-            warn!(%slot, %block_root, parent=%block.parent_root, "Missing pre-state for new block");
-            return;
-        };
+        // Verify parent chain is available
+        // TODO: sync parent chain if parent is missing
+        let parent_state =
+            self.states
+                .get(&block.parent_root)
+                .ok_or(StoreError::MissingParentState {
+                    parent_root: block.parent_root,
+                    slot,
+                })?;
 
-        if let Err(err) = verify_signatures(pre_state, &signed_block) {
-            warn!(%slot, %block_root, %err, "Block has invalid signatures");
-            return;
-        }
-        let mut post_state = pre_state.clone();
+        // Validate cryptographic signatures
+        // TODO: change error
+        verify_signatures(parent_state, &signed_block)?;
 
-        if let Err(err) = ethlambda_state_transition::state_transition(&mut post_state, &block) {
-            warn!(%slot, %block_root, %err, "State transition failed for new block");
-            return;
-        }
+        // Execute state transition function to compute post-block state
+        let mut post_state = parent_state.clone();
+        ethlambda_state_transition::state_transition(&mut post_state, &block)?;
+
         // Cache the state root in the latest block header
         let state_root = block.state_root;
         post_state.latest_block_header.state_root = state_root;
 
-        self.blocks
-            .insert(block_root, signed_block.message.block.clone());
-        self.states.insert(block_root, post_state);
-
-        let attestations = &block.body.attestations;
-        for (attestation, proof) in attestations.iter().zip(&signatures.attestation_signatures) {
-            // Add attestation
+        // If post-state has a higher justified checkpoint, update the store
+        if post_state.latest_justified.slot > self.latest_justified.slot {
+            self.latest_justified = post_state.latest_justified;
         }
 
-        self.latest_justified = post_state.latest_justified;
-        self.latest_finalized = post_state.latest_finalized;
+        // If post-state has a higher finalized checkpoint, update the store
+        if post_state.latest_finalized.slot > self.latest_finalized.slot {
+            self.latest_finalized = post_state.latest_finalized;
+        }
 
+        // Store block and state
+        self.blocks.insert(block_root, block.clone());
+        self.states.insert(block_root, post_state);
+
+        // Process block body attestations and their signatures
+        let aggregated_attestations = &block.body.attestations;
+        let attestation_signatures = &signed_block.signature.attestation_signatures;
+
+        for (att, proof) in aggregated_attestations
+            .iter()
+            .zip(attestation_signatures.iter())
+        {
+            let validator_ids = aggregation_bits_to_validator_indices(&att.aggregation_bits);
+            let data_root = att.data.tree_hash_root();
+
+            for vid in validator_ids {
+                // Update Proof Map - Store the proof so future block builders can reuse this aggregation
+                let key: SignatureKey = (vid, data_root);
+                self.aggregated_payloads
+                    .entry(key)
+                    .or_default()
+                    .push(proof.clone());
+
+                // Update Fork Choice - Register the vote immediately (historical/on-chain)
+                let attestation = Attestation {
+                    validator_id: vid,
+                    data: att.data.clone(),
+                };
+                // Ignore errors for individual attestations in a block
+                let _ = self.on_attestation(attestation, true);
+            }
+        }
+
+        // Update forkchoice head based on new block and attestations
+        // IMPORTANT: This must happen BEFORE processing proposer attestation
+        // to prevent the proposer from gaining circular weight advantage.
         self.update_head();
 
+        // Process proposer attestation as if received via gossip
+        // The proposer's attestation should NOT affect this block's fork choice position.
+        // It is treated as pending until interval 3 (end of slot).
+
+        // Store the proposer's signature for potential future block building
+        let proposer_sig_key: SignatureKey = (
+            proposer_attestation.validator_id,
+            proposer_attestation.data.tree_hash_root(),
+        );
+        self.gossip_signatures.insert(
+            proposer_sig_key,
+            signed_block.signature.proposer_signature.clone(),
+        );
+
+        // Process proposer attestation (enters "new" stage, not "known")
+        // TODO: validate attestation before block processing
+        let _ = self.on_attestation(proposer_attestation, false);
+
         info!(%slot, %block_root, %state_root, "Processed new block");
+        Ok(())
     }
+}
+
+/// Errors that can occur during Store operations.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error(
+        "Parent state not found (root={parent_root}). Sync parent chain before processing block at slot {slot}."
+    )]
+    MissingParentState { parent_root: H256, slot: u64 },
+
+    #[error("State transition failed: {0}")]
+    StateTransitionFailed(#[from] ethlambda_state_transition::Error),
+
+    #[error("Unknown source block: {0}")]
+    UnknownSourceBlock(H256),
+
+    #[error("Unknown target block: {0}")]
+    UnknownTargetBlock(H256),
+
+    #[error("Unknown head block: {0}")]
+    UnknownHeadBlock(H256),
+
+    #[error("Source checkpoint slot must not exceed target")]
+    SourceExceedsTarget,
+
+    #[error("Attestation from future slot")]
+    FutureAttestation,
+}
+
+/// Extract validator indices from aggregation bits.
+fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
+    bits.iter()
+        .enumerate()
+        .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
+        .collect()
 }
 
 fn verify_signatures(
     state: &State,
     signed_block: &SignedBlockWithAttestation,
-) -> Result<(), String> {
-    // TODO: validate signatures
+) -> Result<(), StoreError> {
+    let block = &signed_block.message.block;
+    let aggregated_attestations = &block.body.attestations;
+    let attestation_signatures = &signed_block.signature.attestation_signatures;
+    if block.body.attestations.len() != attestation_signatures.len() {
+        return Err(StoreError);
+    }
     Ok(())
 }

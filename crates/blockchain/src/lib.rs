@@ -1,14 +1,13 @@
 use std::time::{Duration, SystemTime};
 
 use ethlambda_types::{
-    attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
-    state::State,
+    attestation::SignedAttestation, block::SignedBlockWithAttestation, state::State,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
 use store::Store;
-use tracing::{error, info, trace, warn};
+use tracing::{error, trace, warn};
 
 mod store;
 
@@ -98,11 +97,14 @@ impl BlockChainServer {
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
-        self.store.on_block(signed_block);
+        if let Err(err) = self.store.on_block(signed_block) {
+            warn!(%slot, %err, "Failed to process block");
+            return;
+        }
         update_head_slot(slot);
     }
 
-    fn on_attestation(&mut self, attestation: SignedAttestation) {}
+    fn on_attestation(&mut self, _attestation: SignedAttestation) {}
 }
 
 #[derive(Clone, Debug)]
