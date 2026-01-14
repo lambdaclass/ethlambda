@@ -23,6 +23,6 @@ hex.workspace = true
 datatest-stable = "0.3.3"
 
 [[test]]
-name = "lean_spec"
-path = "tests/lean_spec.rs"
+name = "stf_spectests"
+path = "tests/stf_spectests.rs"
 harness = false

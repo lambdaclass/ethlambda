@@ -188,14 +188,70 @@ impl From<Block> for ethlambda_types::block::Block {
 /// Block body containing attestations and other data
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockBody {
-    pub attestations: Container<()>,
+    pub attestations: Container<AggregatedAttestation>,
 }
 
 impl From<BlockBody> for ethlambda_types::block::BlockBody {
-    fn from(_value: BlockBody) -> Self {
-        // TODO: implement attestations deserialization
+    fn from(value: BlockBody) -> Self {
+        let attestations = value
+            .attestations
+            .data
+            .into_iter()
+            .map(Into::into)
+            .collect();
         Self {
-            attestations: VariableList::new(vec![]).unwrap(),
+            attestations: VariableList::new(attestations).expect("too many attestations"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggregatedAttestation {
+    #[serde(rename = "aggregationBits")]
+    pub aggregation_bits: AggregationBits,
+    pub data: AttestationData,
+}
+
+impl From<AggregatedAttestation> for ethlambda_types::attestation::AggregatedAttestation {
+    fn from(value: AggregatedAttestation) -> Self {
+        Self {
+            aggregation_bits: value.aggregation_bits.into(),
+            data: value.data.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AggregationBits {
+    pub data: Vec<bool>,
+}
+
+impl From<AggregationBits> for ethlambda_types::attestation::AggregationBits {
+    fn from(value: AggregationBits) -> Self {
+        let mut bits =
+            ethlambda_types::attestation::AggregationBits::with_capacity(value.data.len()).unwrap();
+        for (i, &b) in value.data.iter().enumerate() {
+            bits.set(i, b).unwrap();
+        }
+        bits
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttestationData {
+    pub slot: u64,
+    pub head: Checkpoint,
+    pub target: Checkpoint,
+    pub source: Checkpoint,
+}
+
+impl From<AttestationData> for ethlambda_types::attestation::AttestationData {
+    fn from(value: AttestationData) -> Self {
+        Self {
+            slot: value.slot,
+            head: value.head.into(),
+            target: value.target.into(),
+            source: value.source.into(),
         }
     }
 }
