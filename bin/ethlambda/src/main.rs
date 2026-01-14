@@ -6,7 +6,6 @@ use std::{
 use clap::Parser;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
-use ethlambda_storage::Store;
 use ethlambda_types::{
     genesis::Genesis,
     state::{State, Validator, ValidatorPubkey},
@@ -59,9 +58,8 @@ async fn main() {
     let validators = read_validators(&validators_path);
 
     let genesis_state = State::from_genesis(&genesis, validators);
-    let store = Store::from_genesis(genesis_state);
 
-    let blockchain = BlockChain::spawn(store);
+    let blockchain = BlockChain::spawn(genesis_state);
 
     let p2p_handle = tokio::spawn(start_p2p(bootnodes, options.gossipsub_port, blockchain));
 

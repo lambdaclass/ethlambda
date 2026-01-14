@@ -1,16 +1,16 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 
-use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
+    state::State,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
+use store::Store;
 use tracing::{error, info, trace, warn};
+
+mod store;
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -20,8 +20,9 @@ pub struct BlockChain {
 const SECONDS_PER_SLOT: u64 = 4;
 
 impl BlockChain {
-    pub fn spawn(store: Store) -> BlockChain {
-        let genesis_time = store.get_genesis_time();
+    pub fn spawn(genesis_state: State) -> BlockChain {
+        let genesis_time = genesis_state.config.genesis_time;
+        let store = Store::from_genesis(genesis_state);
         let handle = BlockChainServer {
             genesis_time,
             store,
@@ -98,9 +99,9 @@ impl BlockChainServer {
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
 
-        let block = signed_block.message.block;
-        let proposer_attestation = signed_block.message.proposer_attestation;
-        let signatures = signed_block.signature;
+        let block = &signed_block.message.block;
+        let proposer_attestation = &signed_block.message.proposer_attestation;
+        let signatures = &signed_block.signature;
 
         let block_root = block.tree_hash_root();
 
@@ -114,7 +115,10 @@ impl BlockChainServer {
             return;
         };
 
-        // TODO: validate block signatures
+        if let Err(err) = validate_signatures(&pre_state, &signed_block) {
+            warn!(%slot, %block_root, %err, "Block has invalid signatures");
+            return;
+        }
 
         if let Err(err) = ethlambda_state_transition::state_transition(&mut pre_state, &block) {
             warn!(%slot, %block_root, %err, "State transition failed for new block");
@@ -126,7 +130,13 @@ impl BlockChainServer {
 
         let post_state = pre_state;
 
-        self.store.add_block(block, post_state);
+        let attestations = &block.body.attestations;
+        for (attestation, proof) in attestations.iter().zip(&signatures.attestation_signatures) {
+            // Add attestation
+        }
+
+        self.store.add_block(signed_block.message.block, post_state);
+        self.store.update_head();
 
         info!(%slot, %block_root, %state_root, "Processed new block");
         update_head_slot(slot);
@@ -195,4 +205,12 @@ fn update_head_slot(slot: u64) {
                 .unwrap()
         });
     LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
+}
+
+fn validate_signatures(
+    state: &State,
+    signed_block: &SignedBlockWithAttestation,
+) -> Result<(), String> {
+    // TODO: validate signatures
+    Ok(())
 }

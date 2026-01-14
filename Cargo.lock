@@ -1820,6 +1820,7 @@ dependencies = [
 name = "ethlambda-blockchain"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-fork-choice",
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
@@ -1887,7 +1888,6 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
- "ethlambda-fork-choice",
  "ethlambda-types",
  "tracing",
 ]
