@@ -1820,11 +1820,15 @@ dependencies = [
 name = "ethlambda-blockchain"
 version = "0.1.0"
 dependencies = [
+ "datatest-stable 0.3.3",
  "ethlambda-fork-choice",
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
+ "hex",
  "prometheus",
+ "serde",
+ "serde_json",
  "spawned-concurrency",
  "thiserror 2.0.17",
  "tracing",

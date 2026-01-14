@@ -245,13 +245,18 @@ impl Store {
         let validator_pubkey = target_state.validators[validator_id as usize]
             .get_pubkey()
             .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
-        let epoch = target.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.tree_hash_root();
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        if !validator_pubkey.is_valid(epoch, &message, &signature) {
-            return Err(StoreError::SignatureVerificationFailed);
+        #[cfg(not(feature = "skip-signature-verification"))]
+        {
+            let epoch = target.slot.try_into().expect("slot exceeds u32");
+            let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
+            if !validator_pubkey.is_valid(epoch, &message, &signature) {
+                return Err(StoreError::SignatureVerificationFailed);
+            }
         }
+        #[cfg(feature = "skip-signature-verification")]
+        let _ = validator_pubkey;
         self.on_attestation(attestation, false)?;
 
         // Store signature for later lookup during block building
@@ -358,7 +363,9 @@ impl Store {
                 })?;
 
         // Validate cryptographic signatures
-        // TODO: change error
+        // TODO: extract signature verification to a pre-checks function
+        // to avoid the need for this
+        #[cfg(not(feature = "skip-signature-verification"))]
         verify_signatures(parent_state, &signed_block)?;
 
         // Execute state transition function to compute post-block state
@@ -444,6 +451,31 @@ impl Store {
 
         info!(%slot, %block_root, %state_root, "Processed new block");
         Ok(())
+    }
+
+    /// Returns the root of the current canonical chain head block.
+    pub fn head(&self) -> H256 {
+        self.head
+    }
+
+    /// Returns a reference to all known blocks.
+    pub fn blocks(&self) -> &HashMap<H256, Block> {
+        &self.blocks
+    }
+
+    /// Returns a reference to the latest known attestations by validator.
+    pub fn latest_known_attestations(&self) -> &HashMap<u64, AttestationData> {
+        &self.latest_known_attestations
+    }
+
+    /// Returns a reference to the latest new (pending) attestations by validator.
+    pub fn latest_new_attestations(&self) -> &HashMap<u64, AttestationData> {
+        &self.latest_new_attestations
+    }
+
+    /// Returns the root of the current safe target for attestation.
+    pub fn safe_target(&self) -> H256 {
+        self.safe_target
     }
 }
 

@@ -9,7 +9,7 @@ use spawned_concurrency::tasks::{
 use store::Store;
 use tracing::{error, trace, warn};
 
-mod store;
+pub mod store;
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -64,10 +64,11 @@ struct BlockChainServer {
 
 impl BlockChainServer {
     fn on_tick(&mut self, timestamp: u64) {
-        let time = timestamp - self.genesis_time;
         // TODO: check if we are proposing
         let has_proposal = false;
 
+        // TODO: this should be moved to Store
+        let time = timestamp - self.genesis_time;
         let slot = time / SECONDS_PER_SLOT;
         let interval = time % SECONDS_PER_SLOT;
         trace!(%slot, %interval, "processing tick");

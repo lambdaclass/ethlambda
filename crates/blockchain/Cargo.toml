@@ -9,6 +9,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# To skip signature verification during tests
+skip-signature-verification = []
+
 [dependencies]
 ethlambda-storage.workspace = true
 ethlambda-state-transition.workspace = true
@@ -21,3 +25,15 @@ thiserror.workspace = true
 tracing.workspace = true
 
 prometheus.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+datatest-stable = "0.3.3"
+
+[[test]]
+name = "forkchoice_spectests"
+path = "tests/forkchoice_spectests.rs"
+harness = false
+required-features = ["skip-signature-verification"]
