@@ -72,13 +72,13 @@ This milestone focuses on computing the chain state from the gossiped by peers r
 This milestone focuses on choosing the head of the chain based on gossiped attestations.
 
 - Listen for attestations in gossipsub ✅
-- Implement fork-choice rule 🏗️
-- Apply fork-choice rule based on received attestations
+- Implement fork-choice rule ✅
+- Apply fork-choice rule based on received attestations ✅
 
 ### Produce blocks and attestations
 
 This milestone focuses on performing the duties of a validator.
 
-- Produce and broadcast attestations on each slot
+- Produce and broadcast attestations on each slot 🏗️
 - Compute current proposer for each slot
 - Build and broadcast new blocks when proposing
