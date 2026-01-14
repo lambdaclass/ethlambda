@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, XmssSignature},
     block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
-    primitives::{H256, TreeHash},
+    primitives::{Decode, H256, TreeHash},
+    signature::Signature,
     state::{ChainConfig, Checkpoint, State},
 };
 use tracing::{info, warn};
@@ -412,10 +413,11 @@ impl Store {
 /// Errors that can occur during Store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error(
-        "Parent state not found (root={parent_root}). Sync parent chain before processing block at slot {slot}."
-    )]
+    #[error("Parent state not found for slot {slot}. Missing block: {parent_root}")]
     MissingParentState { parent_root: H256, slot: u64 },
+
+    #[error("Validator index out of range")]
+    InvalidValidatorIndex,
 
     #[error("State transition failed: {0}")]
     StateTransitionFailed(#[from] ethlambda_state_transition::Error),
@@ -429,14 +431,14 @@ pub enum StoreError {
     #[error("Unknown head block: {0}")]
     UnknownHeadBlock(H256),
 
-    #[error("Source checkpoint slot must not exceed target")]
+    #[error("Source checkpoint slot exceeds target")]
     SourceExceedsTarget,
 
-    #[error("Attestation from future slot")]
+    #[error("Attestation is for future slot")]
     FutureAttestation,
 
     #[error(
-        "Attestation signature count ({signatures}) does not match attestation count ({attestations})"
+        "Attestations and signatures don't match in length: got {signatures} signatures and {attestations} attestations"
     )]
     AttestationSignatureMismatch {
         signatures: usize,
@@ -453,17 +455,35 @@ fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
 }
 
 fn verify_signatures(
-    _state: &State,
+    state: &State,
     signed_block: &SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
     let block = &signed_block.message.block;
+    let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
-    if block.body.attestations.len() != attestation_signatures.len() {
+
+    if attestations.len() != attestation_signatures.len() {
         return Err(StoreError::AttestationSignatureMismatch {
             signatures: attestation_signatures.len(),
-            attestations: block.body.attestations.len(),
+            attestations: attestations.len(),
         });
     }
-    // TODO: validate cryptographic signatures
+    let validators = &state.validators;
+    let num_validators = validators.len() as u64;
+
+    for (attestation, _aggregated_signature) in attestations.iter().zip(attestation_signatures) {
+        let validator_ids = aggregation_bits_to_validator_indices(&attestation.aggregation_bits);
+        if validator_ids.iter().any(|vid| *vid >= num_validators) {
+            return Err(StoreError::InvalidValidatorIndex);
+        }
+        // TODO: verify signatures
+    }
+    let proposer_attestation = &signed_block.message.proposer_attestation;
+    let proposer_signature = &signed_block.signature.proposer_signature;
+    let proposer = validators
+        .get(block.proposer_index as usize)
+        .expect("we already checked the proposer index is valid");
+
+    // TODO: verify proposer signature
     Ok(())
 }
