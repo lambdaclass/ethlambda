@@ -1,4 +1,7 @@
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use ethlambda_blockchain::BlockChain;
 use ethrex_common::H264;
@@ -27,7 +30,7 @@ mod messages;
 pub async fn start_p2p(
     node_key: Vec<u8>,
     bootnodes: Vec<Bootnode>,
-    listening_port: u16,
+    listening_socket: SocketAddr,
     blockchain: BlockChain,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
@@ -94,8 +97,8 @@ pub async fn start_p2p(
         swarm.dial(addr).unwrap();
     }
     let addr = Multiaddr::empty()
-        .with("127.0.0.1".parse::<IpAddr>().unwrap().into())
-        .with(Protocol::Udp(listening_port))
+        .with(listening_socket.ip().into())
+        .with(Protocol::Udp(listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
         .listen_on(addr)
@@ -109,7 +112,7 @@ pub async fn start_p2p(
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
-    info!("P2P node started on port {listening_port}");
+    info!("P2P node started on {listening_socket}");
 
     event_loop(swarm, blockchain).await;
 }

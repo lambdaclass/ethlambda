@@ -51,6 +51,7 @@ async fn main() {
 
     let metrics_socket = SocketAddr::new(options.metrics_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
     println!("{ASCII_ART}");
 
@@ -74,12 +75,7 @@ async fn main() {
 
     let blockchain = BlockChain::spawn(genesis_state);
 
-    let p2p_handle = tokio::spawn(start_p2p(
-        node_p2p_key,
-        bootnodes,
-        options.gossipsub_port,
-        blockchain,
-    ));
+    let p2p_handle = tokio::spawn(start_p2p(node_p2p_key, bootnodes, p2p_socket, blockchain));
 
     start_prometheus_metrics_api(metrics_socket).await.unwrap();
 
