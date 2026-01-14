@@ -582,6 +582,7 @@ fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(not(feature = "skip-signature-verification"))]
 fn verify_signatures(
     state: &State,
     signed_block: &SignedBlockWithAttestation,
