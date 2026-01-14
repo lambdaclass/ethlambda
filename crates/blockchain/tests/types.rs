@@ -59,6 +59,7 @@ pub struct ForkChoiceStep {
     #[serde(rename = "stepType")]
     pub step_type: String,
     pub block: Option<BlockStepData>,
+    pub time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

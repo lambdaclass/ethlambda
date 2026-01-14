@@ -59,6 +59,12 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         _ => {}
                     }
                 }
+                "tick" => {
+                    let timestamp = step.time.expect("tick step missing time");
+                    // TODO: check if this is true
+                    // has_proposal is false since tests don't simulate proposals
+                    store.on_tick(timestamp, false);
+                }
                 other => {
                     // Fail for unsupported step types for now
                     return Err(format!("Unsupported step type '{other}'",).into());
@@ -163,7 +169,7 @@ fn validate_attestation_check(
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
-            )
+            );
         }
     };
 
