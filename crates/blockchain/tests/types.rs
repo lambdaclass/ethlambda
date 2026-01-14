@@ -1,5 +1,9 @@
 use ethlambda_types::{
-    attestation::{Attestation as DomainAttestation, AttestationData as DomainAttestationData},
+    attestation::{
+        AggregatedAttestation as DomainAggregatedAttestation,
+        AggregationBits as DomainAggregationBits, Attestation as DomainAttestation,
+        AttestationData as DomainAttestationData,
+    },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     primitives::{BitList, H256, VariableList},
     state::{
@@ -138,15 +142,8 @@ impl From<TestState> for State {
     fn from(value: TestState) -> Self {
         let historical_block_hashes =
             VariableList::new(value.historical_block_hashes.data).unwrap();
-        let validators = VariableList::new(
-            value
-                .validators
-                .data
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        )
-        .unwrap();
+        let validators =
+            VariableList::new(value.validators.data.into_iter().map(Into::into).collect()).unwrap();
         let justifications_roots = VariableList::new(value.justifications_roots.data).unwrap();
 
         State {
@@ -278,10 +275,15 @@ pub struct BlockBody {
 }
 
 impl From<BlockBody> for DomainBlockBody {
-    fn from(_value: BlockBody) -> Self {
-        // We don't process block body attestations in fork choice tests for now
+    fn from(value: BlockBody) -> Self {
+        let attestations = value
+            .attestations
+            .data
+            .into_iter()
+            .map(Into::into)
+            .collect();
         Self {
-            attestations: VariableList::empty(),
+            attestations: VariableList::new(attestations).expect("too many attestations"),
         }
     }
 }
@@ -289,16 +291,32 @@ impl From<BlockBody> for DomainBlockBody {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregatedAttestation {
     #[serde(rename = "aggregationBits")]
-    #[allow(dead_code)]
     pub aggregation_bits: AggregationBits,
-    #[allow(dead_code)]
     pub data: AttestationData,
+}
+
+impl From<AggregatedAttestation> for DomainAggregatedAttestation {
+    fn from(value: AggregatedAttestation) -> Self {
+        Self {
+            aggregation_bits: value.aggregation_bits.into(),
+            data: value.data.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregationBits {
-    #[allow(dead_code)]
     pub data: Vec<bool>,
+}
+
+impl From<AggregationBits> for DomainAggregationBits {
+    fn from(value: AggregationBits) -> Self {
+        let mut bits = DomainAggregationBits::with_capacity(value.data.len()).unwrap();
+        for (i, &b) in value.data.iter().enumerate() {
+            bits.set(i, b).unwrap();
+        }
+        bits
+    }
 }
 
 // ============================================================================
@@ -364,8 +382,8 @@ pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
     use serde::Deserialize;
+    use serde::de::Error;
 
     let value = String::deserialize(d)?;
     let pubkey: ValidatorPubkeyBytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
