@@ -150,12 +150,36 @@ fn validate_checks(
     if checks.safe_target.is_some() {
         return Err(format!("Step {}: 'safeTarget' check not supported", step_idx).into());
     }
-    if checks.attestation_target_slot.is_some() {
-        return Err(format!(
-            "Step {}: 'attestationTargetSlot' check not supported",
-            step_idx
-        )
-        .into());
+    // Validate attestationTargetSlot
+    if let Some(expected_slot) = checks.attestation_target_slot {
+        let target = store.get_attestation_target();
+        if target.slot != expected_slot {
+            return Err(format!(
+                "Step {}: attestationTargetSlot mismatch: expected {}, got {}",
+                step_idx, expected_slot, target.slot
+            )
+            .into());
+        }
+
+        // Also validate the root matches a block at this slot
+        let block_found = store
+            .blocks()
+            .iter()
+            .any(|(root, block)| block.slot == expected_slot && *root == target.root);
+
+        if !block_found {
+            let available: Vec<_> = store
+                .blocks()
+                .iter()
+                .filter(|(_, block)| block.slot == expected_slot)
+                .map(|(root, _)| format!("{:?}", root))
+                .collect();
+            return Err(format!(
+                "Step {}: attestationTarget.root {:?} does not match any block at slot {}. Available blocks: {:?}",
+                step_idx, target.root, expected_slot, available
+            )
+            .into());
+        }
     }
 
     // Validate headSlot
