@@ -17,6 +17,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
+use ssz::Encode;
 use tokio::sync::mpsc;
 use tracing::{info, trace};
 
@@ -106,17 +107,22 @@ pub async fn start_p2p(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
     let network = "devnet0";
+    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
     for topic_kind in topic_kinds {
         let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
         let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
+    // Create topic for outbound attestations
+    let attestation_topic = libp2p::gossipsub::IdentTopic::new(format!(
+        "/leanconsensus/{network}/{ATTESTATION_TOPIC_KIND}/ssz_snappy"
+    ));
+
     info!("P2P node started on {listening_socket}");
 
-    event_loop(swarm, blockchain, p2p_rx).await;
+    event_loop(swarm, blockchain, p2p_rx, attestation_topic).await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -132,6 +138,7 @@ async fn event_loop(
     mut swarm: libp2p::Swarm<Behaviour>,
     mut blockchain: BlockChain,
     mut p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    attestation_topic: libp2p::gossipsub::IdentTopic,
 ) {
     loop {
         tokio::select! {
@@ -141,7 +148,7 @@ async fn event_loop(
                 let Some(message) = message else {
                     break;
                 };
-                handle_outgoing_gossip(&mut swarm, message).await;
+                handle_outgoing_gossip(&mut swarm, message, &attestation_topic).await;
             }
             event = swarm.next() => {
                 let Some(event) = event else {
@@ -167,11 +174,32 @@ async fn event_loop(
     }
 }
 
-async fn handle_outgoing_gossip(_swarm: &mut libp2p::Swarm<Behaviour>, message: OutboundGossip) {
+async fn handle_outgoing_gossip(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    message: OutboundGossip,
+    attestation_topic: &libp2p::gossipsub::IdentTopic,
+) {
     match message {
-        OutboundGossip::PublishAttestation(_attestation) => {
-            // TODO: encode and publish attestation to gossipsub
-            trace!("Publishing attestation to gossipsub");
+        OutboundGossip::PublishAttestation(attestation) => {
+            let slot = attestation.message.slot;
+            let validator = attestation.validator_id;
+
+            // Encode to SSZ
+            let ssz_bytes = attestation.as_ssz_bytes();
+
+            // Compress with raw snappy
+            let compressed = gossipsub::compress_message(&ssz_bytes);
+
+            // Publish to gossipsub
+            if let Err(err) = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(attestation_topic.clone(), compressed)
+            {
+                tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub");
+            } else {
+                trace!(%slot, %validator, "Published attestation to gossipsub");
+            }
         }
     }
 }
