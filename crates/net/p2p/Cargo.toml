@@ -19,6 +19,7 @@ libp2p = { version = "0.56", features = ["full"] }
 
 snap = "1.1"
 
+tokio.workspace = true
 tracing.workspace = true
 
 # Required for NodeEnr parsing

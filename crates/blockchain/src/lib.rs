@@ -7,9 +7,17 @@ use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
 use store::Store;
+use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 pub mod store;
+
+/// Messages sent from the blockchain to the P2P layer for publishing.
+#[derive(Clone, Debug)]
+pub enum OutboundGossip {
+    /// Publish an attestation to the gossip network.
+    PublishAttestation(SignedAttestation),
+}
 
 pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
@@ -19,10 +27,13 @@ pub struct BlockChain {
 pub const SECONDS_PER_SLOT: u64 = 4;
 
 impl BlockChain {
-    pub fn spawn(genesis_state: State) -> BlockChain {
+    pub fn spawn(
+        genesis_state: State,
+        p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+    ) -> BlockChain {
         let genesis_time = genesis_state.config.genesis_time;
         let store = Store::from_genesis(genesis_state);
-        let handle = BlockChainServer { store }.start();
+        let handle = BlockChainServer { store, p2p_tx }.start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -55,6 +66,7 @@ impl BlockChain {
 
 struct BlockChainServer {
     store: Store,
+    p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
 }
 
 impl BlockChainServer {

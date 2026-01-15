@@ -73,9 +73,16 @@ async fn main() {
 
     let genesis_state = State::from_genesis(&genesis, validators);
 
-    let blockchain = BlockChain::spawn(genesis_state);
+    let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
+    let blockchain = BlockChain::spawn(genesis_state, p2p_tx);
 
-    let p2p_handle = tokio::spawn(start_p2p(node_p2p_key, bootnodes, p2p_socket, blockchain));
+    let p2p_handle = tokio::spawn(start_p2p(
+        node_p2p_key,
+        bootnodes,
+        p2p_socket,
+        blockchain,
+        p2p_rx,
+    ));
 
     start_prometheus_metrics_api(metrics_socket).await.unwrap();
 

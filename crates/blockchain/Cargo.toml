@@ -21,6 +21,8 @@ ethlambda-types.workspace = true
 
 spawned-concurrency.workspace = true
 
+tokio.workspace = true
+
 thiserror.workspace = true
 tracing.workspace = true
 
