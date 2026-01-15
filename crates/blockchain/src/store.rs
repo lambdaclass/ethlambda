@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use ethlambda_state_transition::slot_is_justifiable_after;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAttestation, XmssSignature},
     block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
@@ -9,6 +10,8 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::SECONDS_PER_SLOT;
+
+const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Key for looking up individual validator signatures.
 /// Used to index signature caches by (validator, message) pairs.
@@ -496,6 +499,43 @@ impl Store {
 
         info!(%slot, %block_root, %state_root, "Processed new block");
         Ok(())
+    }
+
+    /// Calculate target checkpoint for validator attestations.
+    ///
+    /// NOTE: this assumes that we have all the blocks from the head back to the latest finalized.
+    pub fn get_attestation_target(&self) -> Checkpoint {
+        // Start from current head
+        let mut target_block_root = self.head;
+        let mut target_block = &self.blocks[&target_block_root];
+
+        let safe_target_block_slot = self.blocks[&self.safe_target].slot;
+
+        // Walk back toward safe target (up to `JUSTIFICATION_LOOKBACK_SLOTS` steps)
+        //
+        // This ensures the target doesn't advance too far ahead of safe target,
+        // providing a balance between liveness and safety.
+        for _ in 0..JUSTIFICATION_LOOKBACK_SLOTS {
+            if target_block.slot > safe_target_block_slot {
+                target_block_root = target_block.parent_root;
+                target_block = &self.blocks[&target_block_root];
+            } else {
+                break;
+            }
+        }
+
+        // Ensure target is in justifiable slot range
+        //
+        // Walk back until we find a slot that satisfies justifiability rules
+        // relative to the latest finalized checkpoint.
+        while !slot_is_justifiable_after(target_block.slot, self.latest_finalized.slot) {
+            target_block_root = target_block.parent_root;
+            target_block = &self.blocks[&target_block_root];
+        }
+        Checkpoint {
+            root: target_block_root,
+            slot: target_block.slot,
+        }
     }
 
     /// Returns the root of the current canonical chain head block.
