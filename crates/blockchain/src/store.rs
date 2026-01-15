@@ -538,6 +538,95 @@ impl Store {
         }
     }
 
+    /// Produce attestation data for the given slot.
+    pub fn produce_attestation_data(&self, slot: u64) -> AttestationData {
+        // Get the head block the validator sees for this slot
+        let head_checkpoint = Checkpoint {
+            root: self.head,
+            slot: self.blocks[&self.head].slot,
+        };
+
+        // Calculate the target checkpoint for this attestation
+        let target_checkpoint = self.get_attestation_target();
+
+        // Construct attestation data
+        AttestationData {
+            slot,
+            head: head_checkpoint,
+            target: target_checkpoint,
+            source: self.latest_justified.clone(),
+        }
+    }
+
+    /// Get the head for block proposal at the given slot.
+    ///
+    /// Ensures store is up-to-date and processes any pending attestations
+    /// before returning the canonical head.
+    pub fn get_proposal_head(&mut self, slot: u64) -> H256 {
+        // Calculate time corresponding to this slot
+        let slot_time = self.config.genesis_time + slot * SECONDS_PER_SLOT;
+
+        // Advance time to current slot (ticking intervals)
+        self.on_tick(slot_time, true);
+
+        // Process any pending attestations before proposal
+        self.accept_new_attestations();
+
+        self.head
+    }
+
+    /// Produce a block and per-aggregated-attestation signature payloads for the target slot.
+    ///
+    /// Returns the finalized block and attestation signature payloads aligned
+    /// with `block.body.attestations`.
+    pub fn produce_block_with_signatures(
+        &mut self,
+        slot: u64,
+        validator_index: u64,
+    ) -> Result<(Block, Vec<NaiveAggregatedSignature>), StoreError> {
+        // Get parent block and state to build upon
+        let head_root = self.get_proposal_head(slot);
+        let head_state = self
+            .states
+            .get(&head_root)
+            .ok_or(StoreError::MissingParentState {
+                parent_root: head_root,
+                slot,
+            })?
+            .clone();
+
+        // Validate proposer authorization for this slot
+        let num_validators = head_state.validators.len() as u64;
+        if !is_proposer(validator_index, slot, num_validators) {
+            return Err(StoreError::NotProposer {
+                validator_index,
+                slot,
+            });
+        }
+
+        // Convert AttestationData to Attestation objects for build_block
+        let available_attestations: Vec<Attestation> = self
+            .latest_known_attestations
+            .iter()
+            .map(|(&validator_id, data)| Attestation {
+                validator_id,
+                data: data.clone(),
+            })
+            .collect();
+
+        // TODO: Implement build_block on State
+        // The build_block method should:
+        // 1. Create candidate block with current attestations
+        // 2. Apply state transition (slot advancement + block processing)
+        // 3. Find new valid attestations matching post-state requirements
+        // 4. Continue until no new attestations can be added (fixed point)
+        // 5. Finalize block with computed state root
+        //
+        // For now, return a placeholder error
+        let _ = (available_attestations, head_state);
+        todo!("build_block not yet implemented on State")
+    }
+
     /// Returns the root of the current canonical chain head block.
     pub fn head(&self) -> H256 {
         self.head
@@ -621,6 +710,19 @@ pub enum StoreError {
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
+
+    #[error("Validator {validator_index} is not the proposer for slot {slot}")]
+    NotProposer { validator_index: u64, slot: u64 },
+}
+
+/// Check if a validator is the proposer for a given slot.
+///
+/// Proposer selection uses simple round-robin: `slot % num_validators`.
+fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
+    if num_validators == 0 {
+        return false;
+    }
+    slot % num_validators == validator_index
 }
 
 /// Extract validator indices from aggregation bits.
