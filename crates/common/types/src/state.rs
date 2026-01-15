@@ -109,7 +109,7 @@ impl State {
 }
 
 /// Represents a checkpoint in the chain's history.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
     /// The root hash of the checkpoint's block.
     pub root: H256,

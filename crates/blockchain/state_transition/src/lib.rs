@@ -52,7 +52,7 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
 }
 
 /// Advance the state through empty slots up to, but not including, target_slot.
-fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
+pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
     if state.slot >= target_slot {
         return Err(Error::StateSlotIsNewer {
             target_slot,
@@ -68,7 +68,7 @@ fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
 }
 
 /// Apply full block processing including header and body.
-fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
+pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
     process_block_header(state, block)?;
     process_attestations(state, &block.body.attestations)?;
     Ok(())
