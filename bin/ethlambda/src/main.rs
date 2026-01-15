@@ -29,11 +29,11 @@ const ASCII_ART: &str = r#"
 struct CliOptions {
     #[arg(long)]
     custom_network_config_dir: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
-    #[arg(long)]
+    #[arg(long, default_value = "127.0.0.1")]
     metrics_address: IpAddr,
-    #[arg(long)]
+    #[arg(long, default_value = "5054")]
     metrics_port: u16,
     #[arg(long)]
     node_key: PathBuf,
