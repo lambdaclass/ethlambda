@@ -631,6 +631,7 @@ impl Store {
             &available_attestations,
             &known_block_roots,
             &self.gossip_signatures,
+            &self.aggregated_payloads,
         )?;
 
         Ok((block, signatures))
@@ -765,8 +766,8 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
         .map(|(data, validator_ids)| {
             // Find max validator id to determine bitlist capacity
             let max_id = validator_ids.iter().copied().max().unwrap_or(0) as usize;
-            let mut bits = AggregationBits::with_capacity(max_id + 1)
-                .expect("validator count exceeds limit");
+            let mut bits =
+                AggregationBits::with_capacity(max_id + 1).expect("validator count exceeds limit");
 
             for vid in validator_ids {
                 bits.set(vid as usize, true)
@@ -781,23 +782,7 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
         .collect()
 }
 
-/// Build a valid block on top of the given state using fixed-point attestation collection.
-///
-/// This function implements the block building algorithm from the lean specification:
-/// 1. Create a candidate block with current attestations
-/// 2. Apply state transition to compute post-state
-/// 3. Find new valid attestations matching post-state requirements
-/// 4. Repeat until no new attestations can be added (fixed point)
-/// 5. Compute signatures and return the finalized block
-///
-/// # Arguments
-/// * `head_state` - The state to build upon
-/// * `slot` - Target slot for the block
-/// * `proposer_index` - Index of the validator proposing the block
-/// * `parent_root` - Root of the parent block
-/// * `available_attestations` - Pool of attestations to potentially include
-/// * `known_block_roots` - Set of known block roots for validation
-/// * `gossip_signatures` - Per-validator signatures from the gossip network
+/// Build a valid block on top of this state.
 fn build_block(
     head_state: &State,
     slot: u64,
@@ -806,6 +791,7 @@ fn build_block(
     available_attestations: &[Attestation],
     known_block_roots: &HashSet<H256>,
     gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
+    aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
 ) -> Result<(Block, State, Vec<NaiveAggregatedSignature>), StoreError> {
     // Start with empty attestation set
     let mut attestations: Vec<Attestation> = Vec::new();
@@ -835,9 +821,8 @@ fn build_block(
 
         // Apply state transition: process_slots + process_block
         let mut post_state = head_state.clone();
-        process_slots(&mut post_state, slot).map_err(StoreError::StateTransitionFailed)?;
-        process_block(&mut post_state, &candidate_block)
-            .map_err(StoreError::StateTransitionFailed)?;
+        process_slots(&mut post_state, slot)?;
+        process_block(&mut post_state, &candidate_block)?;
 
         // Find new valid attestations matching post-state requirements
         let mut new_attestations: Vec<Attestation> = Vec::new();
@@ -862,7 +847,9 @@ fn build_block(
             }
 
             // Only include if we have a signature for this attestation
-            if gossip_signatures.contains_key(&sig_key) {
+            let has_gossip_sig = gossip_signatures.contains_key(&sig_key);
+            let has_block_proof = aggregated_payloads.contains_key(&sig_key);
+            if has_gossip_sig || has_block_proof {
                 new_attestations.push(attestation.clone());
                 included_keys.insert(sig_key);
             }
