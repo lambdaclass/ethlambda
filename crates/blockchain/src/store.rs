@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use ethlambda_state_transition::{process_block, process_slots, slot_is_justifiable_after};
+use ethlambda_state_transition::{
+    is_proposer, process_block, process_slots, slot_is_justifiable_after,
+};
 use ethlambda_types::{
     attestation::{
         AggregatedAttestation, Attestation, AttestationData, SignedAttestation, XmssSignature,
@@ -725,16 +727,6 @@ pub enum StoreError {
     NotProposer { validator_index: u64, slot: u64 },
 }
 
-/// Check if a validator is the proposer for a given slot.
-///
-/// Proposer selection uses simple round-robin: `slot % num_validators`.
-fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
-    if num_validators == 0 {
-        return false;
-    }
-    slot % num_validators == validator_index
-}
-
 /// Extract validator indices from aggregation bits.
 fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
     bits.iter()
@@ -783,6 +775,7 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
 }
 
 /// Build a valid block on top of this state.
+#[expect(clippy::too_many_arguments)]
 fn build_block(
     head_state: &State,
     slot: u64,
