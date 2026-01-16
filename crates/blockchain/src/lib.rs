@@ -131,17 +131,15 @@ impl BlockChainServer {
             }
 
             // Sign the attestation
-            let signature =
-                match self
-                    .key_manager
-                    .sign_attestation(validator_id, epoch, &message_hash)
-                {
-                    Ok(sig) => sig,
-                    Err(err) => {
-                        error!(%slot, %validator_id, %err, "Failed to sign attestation");
-                        continue;
-                    }
-                };
+            let Ok(signature) = self
+                .key_manager
+                .sign_attestation(validator_id, epoch, &message_hash)
+                .inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
+                )
+            else {
+                continue;
+            };
 
             // Create signed attestation
             let signed_attestation = SignedAttestation {
