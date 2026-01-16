@@ -1,4 +1,7 @@
-use leansig::{serialization::Serializable, signature::SignatureScheme};
+use leansig::{
+    serialization::Serializable,
+    signature::{SignatureScheme, SigningError},
+};
 use ssz::DecodeError;
 use ssz_types::typenum::{Diff, U488, U3600};
 
@@ -8,6 +11,7 @@ type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_
 
 type LeanSigPublicKey = <LeanSignatureScheme as SignatureScheme>::PublicKey;
 type LeanSigSignature = <LeanSignatureScheme as SignatureScheme>::Signature;
+type LeanSigSecretKey = <LeanSignatureScheme as SignatureScheme>::SecretKey;
 
 pub type Signature = LeanSigSignature;
 
@@ -21,6 +25,10 @@ impl ValidatorSignature {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let sig = LeanSigSignature::from_bytes(bytes)?;
         Ok(Self { inner: sig })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.to_bytes()
     }
 }
 
@@ -36,5 +44,26 @@ impl ValidatorPublicKey {
 
     pub fn is_valid(&self, epoch: u32, message: &H256, signature: &ValidatorSignature) -> bool {
         LeanSignatureScheme::verify(&self.inner, epoch, message, &signature.inner)
+    }
+}
+
+/// Validator private key for signing attestations and blocks.
+pub struct ValidatorSecretKey {
+    inner: LeanSigSecretKey,
+}
+
+impl ValidatorSecretKey {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let sk = LeanSigSecretKey::from_bytes(bytes)?;
+        Ok(Self { inner: sk })
+    }
+
+    /// Sign a message with this private key.
+    ///
+    /// The epoch is used as part of the XMSS signature scheme to track
+    /// one-time signature usage.
+    pub fn sign(&mut self, epoch: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
+        let sig = LeanSignatureScheme::sign(&mut self.inner, epoch, message)?;
+        Ok(ValidatorSignature { inner: sig })
     }
 }
