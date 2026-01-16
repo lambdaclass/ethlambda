@@ -38,6 +38,9 @@ struct CliOptions {
     metrics_port: u16,
     #[arg(long)]
     node_key: PathBuf,
+    /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
+    #[arg(long)]
+    node_id: String,
 }
 
 #[tokio::main]
@@ -71,7 +74,7 @@ async fn main() {
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validators = read_validators(&validators_path);
-    let validator_keys = read_validator_keys(&validators_path);
+    let validator_keys = read_validator_keys(&validators_path, &options.node_id);
 
     let genesis_state = State::from_genesis(&genesis, validators);
 
@@ -160,7 +163,10 @@ fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
     validators
 }
 
-fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, ValidatorSecretKey> {
+fn read_validator_keys(
+    validators_path: impl AsRef<Path>,
+    node_id: &str,
+) -> HashMap<u64, ValidatorSecretKey> {
     let validators_path = validators_path.as_ref();
     let validators_yaml =
         std::fs::read_to_string(validators_path).expect("Failed to read validators file");
@@ -168,10 +174,13 @@ fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, Valida
     let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
         serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
 
+    let validator_vec = validator_infos
+        .get(node_id)
+        .unwrap_or_else(|| panic!("Node ID '{}' not found in validators config", node_id));
+
     let mut validator_keys = HashMap::new();
 
-    for (name, validator_vec) in validator_infos {
-        let validator = &validator_vec[0];
+    for validator in validator_vec {
         let validator_index = validator.index;
 
         // Resolve the private key file path relative to the validators config directory
@@ -184,22 +193,22 @@ fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, Valida
                 .join(&validator.privkey_file)
         };
 
-        info!(validator=%name, index=validator_index, privkey_file=?privkey_path, "Loading validator private key");
+        info!(node_id=%node_id, index=validator_index, privkey_file=?privkey_path, "Loading validator private key");
 
         // Read the hex-encoded private key file
         let privkey_bytes = read_hex_file_bytes(&privkey_path);
 
         // Parse the private key
-        let secret_key = ValidatorSecretKey::from_bytes(&privkey_bytes)
-            .unwrap_or_else(|err| {
-                error!(validator=%name, index=validator_index, privkey_file=?privkey_path, ?err, "Failed to parse validator secret key");
-                std::process::exit(1);
-            });
+        let secret_key = ValidatorSecretKey::from_bytes(&privkey_bytes).unwrap_or_else(|err| {
+            error!(node_id=%node_id, index=validator_index, privkey_file=?privkey_path, ?err, "Failed to parse validator secret key");
+            std::process::exit(1);
+        });
 
         validator_keys.insert(validator_index, secret_key);
     }
 
     info!(
+        node_id = %node_id,
         count = validator_keys.len(),
         "Loaded validator private keys"
     );
