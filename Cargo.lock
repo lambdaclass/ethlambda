@@ -1831,6 +1831,7 @@ dependencies = [
  "serde_json",
  "spawned-concurrency",
  "thiserror 2.0.17",
+ "tokio",
  "tracing",
 ]
 
@@ -1863,6 +1864,7 @@ dependencies = [
  "sha2",
  "snap",
  "ssz_types",
+ "tokio",
  "tracing",
  "tree_hash",
  "tree_hash_derive",

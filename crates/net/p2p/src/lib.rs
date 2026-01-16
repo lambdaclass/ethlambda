@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use ethlambda_blockchain::BlockChain;
+use ethlambda_blockchain::{BlockChain, OutboundGossip};
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -17,6 +17,8 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
+use ssz::Encode;
+use tokio::sync::mpsc;
 use tracing::{info, trace};
 
 use crate::{
@@ -32,6 +34,7 @@ pub async fn start_p2p(
     bootnodes: Vec<Bootnode>,
     listening_socket: SocketAddr,
     blockchain: BlockChain,
+    p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
@@ -104,17 +107,22 @@ pub async fn start_p2p(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
     let network = "devnet0";
+    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
     for topic_kind in topic_kinds {
         let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
         let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
         swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
     }
 
+    // Create topic for outbound attestations
+    let attestation_topic = libp2p::gossipsub::IdentTopic::new(format!(
+        "/leanconsensus/{network}/{ATTESTATION_TOPIC_KIND}/ssz_snappy"
+    ));
+
     info!("P2P node started on {listening_socket}");
 
-    event_loop(swarm, blockchain).await;
+    event_loop(swarm, blockchain, p2p_rx, attestation_topic).await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -125,23 +133,70 @@ struct Behaviour {
 }
 
 /// Event loop for the P2P crate.
-/// Processes swarm events, including incoming requests, responses, and gossip.
-async fn event_loop(mut swarm: libp2p::Swarm<Behaviour>, mut blockchain: BlockChain) {
-    while let Some(event) = swarm.next().await {
-        match event {
-            SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
-                message @ request_response::Event::Message { .. },
-            )) => {
-                handle_req_resp_message(&mut swarm, message).await;
+/// Processes swarm events, incoming requests, responses, gossip, and outgoing messages from blockchain.
+async fn event_loop(
+    mut swarm: libp2p::Swarm<Behaviour>,
+    mut blockchain: BlockChain,
+    mut p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    attestation_topic: libp2p::gossipsub::IdentTopic,
+) {
+    loop {
+        tokio::select! {
+            biased;
+
+            message = p2p_rx.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                handle_outgoing_gossip(&mut swarm, message, &attestation_topic).await;
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                message @ libp2p::gossipsub::Event::Message { .. },
-            )) => {
-                gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
+            event = swarm.next() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match event {
+                    SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
+                        message @ request_response::Event::Message { .. },
+                    )) => {
+                        handle_req_resp_message(&mut swarm, message).await;
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                        message @ libp2p::gossipsub::Event::Message { .. },
+                    )) => {
+                        gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
+                    }
+                    _ => {
+                        trace!(?event, "Ignored swarm event");
+                    }
+                }
             }
-            _ => {
-                trace!(?event, "Ignored swarm event");
-            }
+        }
+    }
+}
+
+async fn handle_outgoing_gossip(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    message: OutboundGossip,
+    attestation_topic: &libp2p::gossipsub::IdentTopic,
+) {
+    match message {
+        OutboundGossip::PublishAttestation(attestation) => {
+            let slot = attestation.message.slot;
+            let validator = attestation.validator_id;
+
+            // Encode to SSZ
+            let ssz_bytes = attestation.as_ssz_bytes();
+
+            // Compress with raw snappy
+            let compressed = gossipsub::compress_message(&ssz_bytes);
+
+            // Publish to gossipsub
+            let _ = swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(attestation_topic.clone(), compressed)
+                .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
+                .inspect_err(|err| tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub"));
         }
     }
 }

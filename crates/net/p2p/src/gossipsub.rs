@@ -65,6 +65,17 @@ fn decompress_message(data: &[u8]) -> snap::Result<Vec<u8>> {
     Ok(uncompressed_data)
 }
 
+/// Compress data using raw snappy format (for gossipsub messages).
+pub fn compress_message(data: &[u8]) -> Vec<u8> {
+    let max_compressed_len = snap::raw::max_compress_len(data.len());
+    let mut compressed = vec![0u8; max_compressed_len];
+    let compressed_len = snap::raw::Encoder::new()
+        .compress(data, &mut compressed)
+        .expect("snappy compression should not fail");
+    compressed.truncate(compressed_len);
+    compressed
+}
+
 #[cfg(test)]
 mod tests {
     use ethlambda_types::block::SignedBlockWithAttestation;

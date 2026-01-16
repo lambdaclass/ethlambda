@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use ethlambda_state_transition::{process_block, process_slots, slot_is_justifiable_after};
+use ethlambda_state_transition::{
+    is_proposer, process_block, process_slots, slot_is_justifiable_after,
+};
 use ethlambda_types::{
     attestation::{
         AggregatedAttestation, Attestation, AttestationData, SignedAttestation, XmssSignature,
@@ -666,6 +668,16 @@ impl Store {
     pub fn latest_finalized(&self) -> &Checkpoint {
         &self.latest_finalized
     }
+
+    /// Returns a reference to the chain configuration.
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
+    }
+
+    /// Returns a reference to the head state if it exists.
+    pub fn head_state(&self) -> Option<&State> {
+        self.states.get(&self.head)
+    }
 }
 
 /// Errors that can occur during Store operations.
@@ -725,16 +737,6 @@ pub enum StoreError {
     NotProposer { validator_index: u64, slot: u64 },
 }
 
-/// Check if a validator is the proposer for a given slot.
-///
-/// Proposer selection uses simple round-robin: `slot % num_validators`.
-fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
-    if num_validators == 0 {
-        return false;
-    }
-    slot % num_validators == validator_index
-}
-
 /// Extract validator indices from aggregation bits.
 fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
     bits.iter()
@@ -783,6 +785,7 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
 }
 
 /// Build a valid block on top of this state.
+#[expect(clippy::too_many_arguments)]
 fn build_block(
     head_state: &State,
     slot: u64,
@@ -791,7 +794,7 @@ fn build_block(
     available_attestations: &[Attestation],
     known_block_roots: &HashSet<H256>,
     gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
-    aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
+    _aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
 ) -> Result<(Block, State, Vec<NaiveAggregatedSignature>), StoreError> {
     // Start with empty attestation set
     let mut attestations: Vec<Attestation> = Vec::new();
@@ -847,9 +850,8 @@ fn build_block(
             }
 
             // Only include if we have a signature for this attestation
-            let has_gossip_sig = gossip_signatures.contains_key(&sig_key);
-            let has_block_proof = aggregated_payloads.contains_key(&sig_key);
-            if has_gossip_sig || has_block_proof {
+            // TODO: consider aggregated payloads as well
+            if gossip_signatures.contains_key(&sig_key) {
                 new_attestations.push(attestation.clone());
                 included_keys.insert(sig_key);
             }
@@ -871,7 +873,8 @@ fn build_block(
             let data_root = agg_att.data.tree_hash_root();
             let validator_ids = aggregation_bits_to_validator_indices(&agg_att.aggregation_bits);
 
-            // Collect signatures for participating validators
+            // Collect signatures for participating validators.
+            // We already checked the signatures are available.
             let sigs: Vec<XmssSignature> = validator_ids
                 .iter()
                 .filter_map(|&vid| gossip_signatures.get(&(vid, data_root)).cloned())

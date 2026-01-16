@@ -165,6 +165,16 @@ fn current_proposer(slot: u64, num_validators: u64) -> u64 {
     slot % num_validators
 }
 
+/// Check if a validator is the proposer for a given slot.
+///
+/// Proposer selection uses simple round-robin: `slot % num_validators`.
+pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
+    if num_validators == 0 {
+        return false;
+    }
+    current_proposer(slot, num_validators) == validator_index
+}
+
 /// Apply attestations and update justification/finalization
 /// according to the Lean Consensus 3SF-mini rules.
 fn process_attestations(
