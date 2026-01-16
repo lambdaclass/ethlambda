@@ -14,10 +14,22 @@ Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful 
 
 ## Running in a devnet
 
-<!-- TODO: add small tutorial here? -->
+To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):
 
-To quickly spin up a devnet, see [lean-quickstart](https://github.com/blockblaz/lean-quickstart).
-We have a WIP integration with it [in our fork](https://github.com/lambdaclass/lean-quickstart/tree/add-ethlambda).
+```sh
+# Clone lean-quickstart (if not already present)
+git clone https://github.com/blockblaz/lean-quickstart.git
+
+# Build the ethlambda Docker image
+make docker-build
+
+# Run a 3-client devnet (zeam, ream, ethlambda)
+cd lean-quickstart
+NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ream_0,ethlambda_0 --generateGenesis --metrics
+```
+
+This generates fresh genesis files and starts all three clients with metrics enabled.
+Press `Ctrl+C` to stop all nodes.
 
 ## Philosophy
 
