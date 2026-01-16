@@ -1,0 +1,9 @@
+# Ignore everything by default
+*
+
+# Include only files needed for the build
+!Cargo.toml
+!Cargo.lock
+!bin/
+!crates/
+!LICENSE
