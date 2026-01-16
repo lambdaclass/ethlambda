@@ -66,6 +66,7 @@ async fn main() {
     let validators_path = options
         .custom_network_config_dir
         .join("annotated_validators.yaml");
+    let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
 
     let genesis_json = std::fs::read_to_string(&genesis_path).expect("Failed to read genesis.json");
     let genesis: Genesis =
@@ -74,7 +75,8 @@ async fn main() {
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validators = read_validators(&validators_path);
-    let validator_keys = read_validator_keys(&validators_path, &options.node_id);
+    let validator_keys =
+        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
     let genesis_state = State::from_genesis(&genesis, validators);
 
@@ -165,9 +167,11 @@ fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
 
 fn read_validator_keys(
     validators_path: impl AsRef<Path>,
+    validator_keys_dir: impl AsRef<Path>,
     node_id: &str,
 ) -> HashMap<u64, ValidatorSecretKey> {
     let validators_path = validators_path.as_ref();
+    let validator_keys_dir = validator_keys_dir.as_ref();
     let validators_yaml =
         std::fs::read_to_string(validators_path).expect("Failed to read validators file");
     // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
@@ -187,16 +191,14 @@ fn read_validator_keys(
         let privkey_path = if validator.privkey_file.is_absolute() {
             validator.privkey_file.clone()
         } else {
-            validators_path
-                .parent()
-                .expect("validators_path should have a parent directory")
-                .join(&validator.privkey_file)
+            validator_keys_dir.join(&validator.privkey_file)
         };
 
         info!(node_id=%node_id, index=validator_index, privkey_file=?privkey_path, "Loading validator private key");
 
         // Read the hex-encoded private key file
-        let privkey_bytes = read_hex_file_bytes(&privkey_path);
+        let privkey_bytes =
+            std::fs::read(&privkey_path).expect("Failed to read validator secret key file");
 
         // Parse the private key
         let secret_key = ValidatorSecretKey::from_bytes(&privkey_bytes).unwrap_or_else(|err| {
