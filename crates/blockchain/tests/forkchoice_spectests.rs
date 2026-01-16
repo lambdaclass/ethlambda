@@ -466,9 +466,7 @@ fn validate_lexicographic_head_among(
 
         let fork_info: Vec<_> = fork_data
             .iter()
-            .map(|(label, (root, _, weight))| {
-                format!("  {label}: root={root:?} weight={weight}")
-            })
+            .map(|(label, (root, _, weight))| format!("  {label}: root={root:?} weight={weight}"))
             .collect();
 
         let weight = weights.iter().next().unwrap_or(&0);

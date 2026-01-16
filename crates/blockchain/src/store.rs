@@ -1,9 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use ethlambda_state_transition::slot_is_justifiable_after;
+use ethlambda_state_transition::{
+    is_proposer, process_block, process_slots, slot_is_justifiable_after,
+};
 use ethlambda_types::{
-    attestation::{Attestation, AttestationData, SignedAttestation, XmssSignature},
-    block::{AggregationBits, Block, NaiveAggregatedSignature, SignedBlockWithAttestation},
+    attestation::{
+        AggregatedAttestation, Attestation, AttestationData, SignedAttestation, XmssSignature,
+    },
+    block::{
+        AggregatedAttestations, AggregationBits, Block, BlockBody, NaiveAggregatedSignature,
+        SignedBlockWithAttestation,
+    },
     primitives::{H256, TreeHash},
     state::{ChainConfig, Checkpoint, State},
 };
@@ -538,6 +545,100 @@ impl Store {
         }
     }
 
+    /// Produce attestation data for the given slot.
+    pub fn produce_attestation_data(&self, slot: u64) -> AttestationData {
+        // Get the head block the validator sees for this slot
+        let head_checkpoint = Checkpoint {
+            root: self.head,
+            slot: self.blocks[&self.head].slot,
+        };
+
+        // Calculate the target checkpoint for this attestation
+        let target_checkpoint = self.get_attestation_target();
+
+        // Construct attestation data
+        AttestationData {
+            slot,
+            head: head_checkpoint,
+            target: target_checkpoint,
+            source: self.latest_justified,
+        }
+    }
+
+    /// Get the head for block proposal at the given slot.
+    ///
+    /// Ensures store is up-to-date and processes any pending attestations
+    /// before returning the canonical head.
+    pub fn get_proposal_head(&mut self, slot: u64) -> H256 {
+        // Calculate time corresponding to this slot
+        let slot_time = self.config.genesis_time + slot * SECONDS_PER_SLOT;
+
+        // Advance time to current slot (ticking intervals)
+        self.on_tick(slot_time, true);
+
+        // Process any pending attestations before proposal
+        self.accept_new_attestations();
+
+        self.head
+    }
+
+    /// Produce a block and per-aggregated-attestation signature payloads for the target slot.
+    ///
+    /// Returns the finalized block and attestation signature payloads aligned
+    /// with `block.body.attestations`.
+    pub fn produce_block_with_signatures(
+        &mut self,
+        slot: u64,
+        validator_index: u64,
+    ) -> Result<(Block, Vec<NaiveAggregatedSignature>), StoreError> {
+        // Get parent block and state to build upon
+        let head_root = self.get_proposal_head(slot);
+        let head_state = self
+            .states
+            .get(&head_root)
+            .ok_or(StoreError::MissingParentState {
+                parent_root: head_root,
+                slot,
+            })?
+            .clone();
+
+        // Validate proposer authorization for this slot
+        let num_validators = head_state.validators.len() as u64;
+        if !is_proposer(validator_index, slot, num_validators) {
+            return Err(StoreError::NotProposer {
+                validator_index,
+                slot,
+            });
+        }
+
+        // Convert AttestationData to Attestation objects for build_block
+        let available_attestations: Vec<Attestation> = self
+            .latest_known_attestations
+            .iter()
+            .map(|(&validator_id, data)| Attestation {
+                validator_id,
+                data: data.clone(),
+            })
+            .collect();
+
+        // Get known block roots for attestation validation
+        let known_block_roots: HashSet<H256> = self.blocks.keys().copied().collect();
+
+        // Build the block using fixed-point attestation collection
+        let (block, _post_state, signatures) = build_block(
+            &head_state,
+            slot,
+            validator_index,
+            head_root,
+            &available_attestations,
+            &known_block_roots,
+            &self.gossip_signatures,
+            &self.aggregated_payloads,
+        )?;
+
+        Ok((block, signatures))
+    }
+
     /// Returns the root of the current canonical chain head block.
     pub fn head(&self) -> H256 {
         self.head
@@ -566,6 +667,16 @@ impl Store {
     /// Returns a reference to the latest finalized checkpoint.
     pub fn latest_finalized(&self) -> &Checkpoint {
         &self.latest_finalized
+    }
+
+    /// Returns a reference to the chain configuration.
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
+    }
+
+    /// Returns a reference to the head state if it exists.
+    pub fn head_state(&self) -> Option<&State> {
+        self.states.get(&self.head)
     }
 }
 
@@ -621,6 +732,9 @@ pub enum StoreError {
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
+
+    #[error("Validator {validator_index} is not the proposer for slot {slot}")]
+    NotProposer { validator_index: u64, slot: u64 },
 }
 
 /// Extract validator indices from aggregation bits.
@@ -629,6 +743,163 @@ fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
         .enumerate()
         .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
         .collect()
+}
+
+/// Group individual attestations by their data and create aggregated attestations.
+///
+/// Attestations with identical `AttestationData` are combined into a single
+/// `AggregatedAttestation` with a bitfield indicating participating validators.
+fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<AggregatedAttestation> {
+    // Group attestations by their data root
+    let mut groups: HashMap<H256, (AttestationData, Vec<u64>)> = HashMap::new();
+
+    for attestation in attestations {
+        let data_root = attestation.data.tree_hash_root();
+        groups
+            .entry(data_root)
+            .or_insert_with(|| (attestation.data.clone(), Vec::new()))
+            .1
+            .push(attestation.validator_id);
+    }
+
+    // Convert groups into aggregated attestations
+    groups
+        .into_values()
+        .map(|(data, validator_ids)| {
+            // Find max validator id to determine bitlist capacity
+            let max_id = validator_ids.iter().copied().max().unwrap_or(0) as usize;
+            let mut bits =
+                AggregationBits::with_capacity(max_id + 1).expect("validator count exceeds limit");
+
+            for vid in validator_ids {
+                bits.set(vid as usize, true)
+                    .expect("validator id exceeds capacity");
+            }
+
+            AggregatedAttestation {
+                aggregation_bits: bits,
+                data,
+            }
+        })
+        .collect()
+}
+
+/// Build a valid block on top of this state.
+#[expect(clippy::too_many_arguments)]
+fn build_block(
+    head_state: &State,
+    slot: u64,
+    proposer_index: u64,
+    parent_root: H256,
+    available_attestations: &[Attestation],
+    known_block_roots: &HashSet<H256>,
+    gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
+    _aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
+) -> Result<(Block, State, Vec<NaiveAggregatedSignature>), StoreError> {
+    // Start with empty attestation set
+    let mut attestations: Vec<Attestation> = Vec::new();
+
+    // Track which attestations we've already considered (by validator_id, data_root)
+    let mut included_keys: HashSet<SignatureKey> = HashSet::new();
+
+    // Fixed-point loop: collect attestations until no new ones can be added
+    let (post_state, aggregated_attestations) = loop {
+        // Aggregate attestations by data for the candidate block
+        let aggregated = aggregate_attestations_by_data(&attestations);
+        let aggregated_attestations: AggregatedAttestations = aggregated
+            .clone()
+            .try_into()
+            .expect("attestation count exceeds limit");
+
+        // Create candidate block with current attestations (state_root is placeholder)
+        let candidate_block = Block {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: H256::ZERO,
+            body: BlockBody {
+                attestations: aggregated_attestations,
+            },
+        };
+
+        // Apply state transition: process_slots + process_block
+        let mut post_state = head_state.clone();
+        process_slots(&mut post_state, slot)?;
+        process_block(&mut post_state, &candidate_block)?;
+
+        // Find new valid attestations matching post-state requirements
+        let mut new_attestations: Vec<Attestation> = Vec::new();
+
+        for attestation in available_attestations {
+            let data_root = attestation.data.tree_hash_root();
+            let sig_key: SignatureKey = (attestation.validator_id, data_root);
+
+            // Skip if already included
+            if included_keys.contains(&sig_key) {
+                continue;
+            }
+
+            // Skip if target block is unknown
+            if !known_block_roots.contains(&attestation.data.head.root) {
+                continue;
+            }
+
+            // Skip if attestation source does not match post-state's latest justified
+            if attestation.data.source != post_state.latest_justified {
+                continue;
+            }
+
+            // Only include if we have a signature for this attestation
+            // TODO: consider aggregated payloads as well
+            if gossip_signatures.contains_key(&sig_key) {
+                new_attestations.push(attestation.clone());
+                included_keys.insert(sig_key);
+            }
+        }
+
+        // Fixed point reached: no new attestations found
+        if new_attestations.is_empty() {
+            break (post_state, aggregated);
+        }
+
+        // Add new attestations and continue iteration
+        attestations.extend(new_attestations);
+    };
+
+    // Compute signatures for each aggregated attestation
+    let signatures: Vec<NaiveAggregatedSignature> = aggregated_attestations
+        .iter()
+        .map(|agg_att| {
+            let data_root = agg_att.data.tree_hash_root();
+            let validator_ids = aggregation_bits_to_validator_indices(&agg_att.aggregation_bits);
+
+            // Collect signatures for participating validators.
+            // We already checked the signatures are available.
+            let sigs: Vec<XmssSignature> = validator_ids
+                .iter()
+                .filter_map(|&vid| gossip_signatures.get(&(vid, data_root)).cloned())
+                .collect();
+
+            sigs.try_into().expect("signature count exceeds limit")
+        })
+        .collect();
+
+    // Build final block with correct state root
+    let final_aggregated: AggregatedAttestations = aggregated_attestations
+        .try_into()
+        .expect("attestation count exceeds limit");
+
+    let final_block = Block {
+        slot,
+        proposer_index,
+        parent_root,
+        state_root: post_state.tree_hash_root(),
+        body: BlockBody {
+            attestations: final_aggregated,
+        },
+    };
+
+    Ok((final_block, post_state, signatures))
 }
 
 #[cfg(not(feature = "skip-signature-verification"))]

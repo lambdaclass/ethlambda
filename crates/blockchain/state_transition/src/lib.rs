@@ -52,7 +52,7 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
 }
 
 /// Advance the state through empty slots up to, but not including, target_slot.
-fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
+pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
     if state.slot >= target_slot {
         return Err(Error::StateSlotIsNewer {
             target_slot,
@@ -68,7 +68,7 @@ fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
 }
 
 /// Apply full block processing including header and body.
-fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
+pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
     process_block_header(state, block)?;
     process_attestations(state, &block.body.attestations)?;
     Ok(())
@@ -163,6 +163,16 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
 /// validator count, following the lean protocol specification.
 fn current_proposer(slot: u64, num_validators: u64) -> u64 {
     slot % num_validators
+}
+
+/// Check if a validator is the proposer for a given slot.
+///
+/// Proposer selection uses simple round-robin: `slot % num_validators`.
+pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
+    if num_validators == 0 {
+        return false;
+    }
+    current_proposer(slot, num_validators) == validator_index
 }
 
 /// Apply attestations and update justification/finalization
