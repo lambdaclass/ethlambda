@@ -62,8 +62,8 @@ impl ValidatorSecretKey {
     ///
     /// The epoch is used as part of the XMSS signature scheme to track
     /// one-time signature usage.
-    pub fn sign(&mut self, epoch: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
-        let sig = LeanSignatureScheme::sign(&mut self.inner, epoch, message)?;
+    pub fn sign(&self, epoch: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
+        let sig = LeanSignatureScheme::sign(&self.inner, epoch, message)?;
         Ok(ValidatorSignature { inner: sig })
     }
 }

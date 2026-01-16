@@ -119,7 +119,7 @@ impl BlockChainServer {
         // Hash the attestation data for signing
         let message_hash = attestation_data.tree_hash_root();
 
-        // Epoch for signing (slot as u32 per Zeam's implementation)
+        // Epoch for signing
         let epoch = slot as u32;
 
         // For each registered validator, produce and publish attestation
