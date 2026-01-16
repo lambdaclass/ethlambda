@@ -47,6 +47,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout leanSpec
+        uses: actions/checkout@v4
+        with:
+          repository: leanEthereum/leanSpec
+          path: ../leanSpec
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Generate test fixtures
+        working-directory: ../leanSpec
+        run: uv run fill --clean --fork=devnet
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
