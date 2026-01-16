@@ -18,7 +18,7 @@ leanSpec:
 # lean-quickstart:
 # 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
-run-devnet: lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
+run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
 	cargo build \
 	&& cd lean-quickstart \
 	&& NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ethlambda_0 --generateGenesis --metrics
