@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
 use ethlambda_types::{
-    attestation::SignedAttestation, block::SignedBlockWithAttestation,
-    primitives::TreeHash, signature::ValidatorSecretKey, state::State,
+    attestation::SignedAttestation, block::SignedBlockWithAttestation, primitives::TreeHash,
+    signature::ValidatorSecretKey, state::State,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
@@ -131,16 +131,17 @@ impl BlockChainServer {
             }
 
             // Sign the attestation
-            let signature = match self
-                .key_manager
-                .sign_attestation(validator_id, epoch, &message_hash)
-            {
-                Ok(sig) => sig,
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to sign attestation");
-                    continue;
-                }
-            };
+            let signature =
+                match self
+                    .key_manager
+                    .sign_attestation(validator_id, epoch, &message_hash)
+                {
+                    Ok(sig) => sig,
+                    Err(err) => {
+                        error!(%slot, %validator_id, %err, "Failed to sign attestation");
+                        continue;
+                    }
+                };
 
             // Create signed attestation
             let signed_attestation = SignedAttestation {

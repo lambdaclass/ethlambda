@@ -191,15 +191,12 @@ async fn handle_outgoing_gossip(
             let compressed = gossipsub::compress_message(&ssz_bytes);
 
             // Publish to gossipsub
-            if let Err(err) = swarm
+            let _ = swarm
                 .behaviour_mut()
                 .gossipsub
                 .publish(attestation_topic.clone(), compressed)
-            {
-                tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub");
-            } else {
-                trace!(%slot, %validator, "Published attestation to gossipsub");
-            }
+                .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
+                .inspect_err(|err| tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub"));
         }
     }
 }

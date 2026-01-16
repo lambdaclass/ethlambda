@@ -178,7 +178,8 @@ fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, Valida
         let privkey_path = if validator.privkey_file.is_absolute() {
             validator.privkey_file.clone()
         } else {
-            validators_path.parent()
+            validators_path
+                .parent()
                 .expect("validators_path should have a parent directory")
                 .join(&validator.privkey_file)
         };
@@ -198,7 +199,10 @@ fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, Valida
         validator_keys.insert(validator_index, secret_key);
     }
 
-    info!(count=validator_keys.len(), "Loaded validator private keys");
+    info!(
+        count = validator_keys.len(),
+        "Loaded validator private keys"
+    );
 
     validator_keys
 }
