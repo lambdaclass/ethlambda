@@ -784,7 +784,7 @@ fn build_block(
     available_attestations: &[Attestation],
     known_block_roots: &HashSet<H256>,
     gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
-    aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
+    _aggregated_payloads: &HashMap<SignatureKey, Vec<NaiveAggregatedSignature>>,
 ) -> Result<(Block, State, Vec<NaiveAggregatedSignature>), StoreError> {
     // Start with empty attestation set
     let mut attestations: Vec<Attestation> = Vec::new();
@@ -840,9 +840,8 @@ fn build_block(
             }
 
             // Only include if we have a signature for this attestation
-            let has_gossip_sig = gossip_signatures.contains_key(&sig_key);
-            let has_block_proof = aggregated_payloads.contains_key(&sig_key);
-            if has_gossip_sig || has_block_proof {
+            // TODO: consider aggregated payloads as well
+            if gossip_signatures.contains_key(&sig_key) {
                 new_attestations.push(attestation.clone());
                 included_keys.insert(sig_key);
             }
@@ -864,7 +863,8 @@ fn build_block(
             let data_root = agg_att.data.tree_hash_root();
             let validator_ids = aggregation_bits_to_validator_indices(&agg_att.aggregation_bits);
 
-            // Collect signatures for participating validators
+            // Collect signatures for participating validators.
+            // We already checked the signatures are available.
             let sigs: Vec<XmssSignature> = validator_ids
                 .iter()
                 .filter_map(|&vid| gossip_signatures.get(&(vid, data_root)).cloned())
