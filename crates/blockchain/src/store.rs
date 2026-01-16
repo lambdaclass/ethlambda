@@ -668,6 +668,16 @@ impl Store {
     pub fn latest_finalized(&self) -> &Checkpoint {
         &self.latest_finalized
     }
+
+    /// Returns a reference to the chain configuration.
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
+    }
+
+    /// Returns a reference to the head state if it exists.
+    pub fn head_state(&self) -> Option<&State> {
+        self.states.get(&self.head)
+    }
 }
 
 /// Errors that can occur during Store operations.

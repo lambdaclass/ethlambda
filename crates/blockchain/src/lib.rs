@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
+use ethlambda_state_transition::is_proposer;
 use ethlambda_types::{
-    attestation::SignedAttestation, block::SignedBlockWithAttestation, state::State,
+    attestation::SignedAttestation, block::SignedBlockWithAttestation,
+    primitives::TreeHash, signature::ValidatorSecretKey, state::State,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
 use store::Store;
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
+pub mod key_manager;
 pub mod store;
 
 /// Messages sent from the blockchain to the P2P layer for publishing.
@@ -30,10 +34,17 @@ impl BlockChain {
     pub fn spawn(
         genesis_state: State,
         p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+        validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
         let genesis_time = genesis_state.config.genesis_time;
         let store = Store::from_genesis(genesis_state);
-        let handle = BlockChainServer { store, p2p_tx }.start();
+        let key_manager = key_manager::KeyManager::new(validator_keys);
+        let handle = BlockChainServer {
+            store,
+            p2p_tx,
+            key_manager,
+        }
+        .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -67,14 +78,87 @@ impl BlockChain {
 struct BlockChainServer {
     store: Store,
     p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+    key_manager: key_manager::KeyManager,
 }
 
 impl BlockChainServer {
     fn on_tick(&mut self, timestamp: u64) {
+        let genesis_time = self.store.config().genesis_time;
+
+        // Calculate current slot and interval
+        let time_since_genesis = timestamp.saturating_sub(genesis_time);
+        let slot = time_since_genesis / SECONDS_PER_SLOT;
+        let interval = time_since_genesis % SECONDS_PER_SLOT;
+
+        // Produce attestations at interval 1
+        if interval == 1 {
+            self.produce_attestations(slot);
+        }
+
         // TODO: check if we are proposing
         let has_proposal = false;
 
         self.store.on_tick(timestamp, has_proposal);
+    }
+
+    fn produce_attestations(&mut self, slot: u64) {
+        // Get the head state to determine number of validators
+        let head_state = match self.store.head_state() {
+            Some(state) => state,
+            None => {
+                warn!(%slot, "Cannot produce attestations: no head state");
+                return;
+            }
+        };
+
+        let num_validators = head_state.validators.len() as u64;
+
+        // Produce attestation data once for all validators
+        let attestation_data = self.store.produce_attestation_data(slot);
+
+        // Hash the attestation data for signing
+        let message_hash = attestation_data.tree_hash_root();
+
+        // Epoch for signing (slot as u32 per Zeam's implementation)
+        let epoch = slot as u32;
+
+        // For each registered validator, produce and publish attestation
+        for validator_id in self.key_manager.validator_ids() {
+            // Skip if this validator is the slot proposer
+            if is_proposer(validator_id, slot, num_validators) {
+                info!(%slot, %validator_id, "Skipping attestation for proposer");
+                continue;
+            }
+
+            // Sign the attestation
+            let signature = match self
+                .key_manager
+                .sign_attestation(validator_id, epoch, &message_hash)
+            {
+                Ok(sig) => sig,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to sign attestation");
+                    continue;
+                }
+            };
+
+            // Create signed attestation
+            let signed_attestation = SignedAttestation {
+                validator_id,
+                message: attestation_data.clone(),
+                signature,
+            };
+
+            // Publish to gossip network
+            if let Err(err) = self
+                .p2p_tx
+                .send(OutboundGossip::PublishAttestation(signed_attestation))
+            {
+                error!(%slot, %validator_id, %err, "Failed to publish attestation");
+            } else {
+                info!(%slot, %validator_id, "Published attestation");
+            }
+        }
     }
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {

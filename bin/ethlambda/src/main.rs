@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -9,6 +9,7 @@ use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
 use ethlambda_types::{
     genesis::Genesis,
+    signature::ValidatorSecretKey,
     state::{State, Validator, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
@@ -70,11 +71,12 @@ async fn main() {
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validators = read_validators(&validators_path);
+    let validator_keys = read_validator_keys(&validators_path);
 
     let genesis_state = State::from_genesis(&genesis, validators);
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
-    let blockchain = BlockChain::spawn(genesis_state, p2p_tx);
+    let blockchain = BlockChain::spawn(genesis_state, p2p_tx, validator_keys);
 
     let p2p_handle = tokio::spawn(start_p2p(
         node_p2p_key,
@@ -113,7 +115,7 @@ struct AnnotatedValidator {
     #[serde(rename = "pubkey_hex")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
     pubkey: ValidatorPubkeyBytes,
-    // privkey_file: PathBuf,
+    privkey_file: PathBuf,
 }
 
 // Taken from ethrex-common
@@ -156,6 +158,49 @@ fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
     }
 
     validators
+}
+
+fn read_validator_keys(validators_path: impl AsRef<Path>) -> HashMap<u64, ValidatorSecretKey> {
+    let validators_path = validators_path.as_ref();
+    let validators_yaml =
+        std::fs::read_to_string(validators_path).expect("Failed to read validators file");
+    // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
+    let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
+        serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
+
+    let mut validator_keys = HashMap::new();
+
+    for (name, validator_vec) in validator_infos {
+        let validator = &validator_vec[0];
+        let validator_index = validator.index;
+
+        // Resolve the private key file path relative to the validators config directory
+        let privkey_path = if validator.privkey_file.is_absolute() {
+            validator.privkey_file.clone()
+        } else {
+            validators_path.parent()
+                .expect("validators_path should have a parent directory")
+                .join(&validator.privkey_file)
+        };
+
+        info!(validator=%name, index=validator_index, privkey_file=?privkey_path, "Loading validator private key");
+
+        // Read the hex-encoded private key file
+        let privkey_bytes = read_hex_file_bytes(&privkey_path);
+
+        // Parse the private key
+        let secret_key = ValidatorSecretKey::from_bytes(&privkey_bytes)
+            .unwrap_or_else(|err| {
+                error!(validator=%name, index=validator_index, privkey_file=?privkey_path, ?err, "Failed to parse validator secret key");
+                std::process::exit(1);
+            });
+
+        validator_keys.insert(validator_index, secret_key);
+    }
+
+    info!(count=validator_keys.len(), "Loaded validator private keys");
+
+    validator_keys
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
