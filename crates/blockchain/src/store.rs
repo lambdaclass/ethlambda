@@ -303,7 +303,8 @@ impl Store {
         #[cfg(not(feature = "skip-signature-verification"))]
         {
             use ethlambda_types::signature::ValidatorSignature;
-            let epoch = target.slot.try_into().expect("slot exceeds u32");
+            // Use attestation.data.slot as epoch (matching what Zeam and ethlambda use for signing)
+            let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
             let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
             if !validator_pubkey.is_valid(epoch, &message, &signature) {
