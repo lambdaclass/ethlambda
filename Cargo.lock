@@ -1886,11 +1886,17 @@ name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
+ "ethereum_ssz",
+ "ethereum_ssz_derive",
+ "ethlambda-blockchain",
  "ethlambda-types",
  "hex",
+ "leansig",
  "serde",
  "serde_json",
+ "ssz_types",
  "thiserror 2.0.17",
+ "tree_hash",
 ]
 
 [[package]]
