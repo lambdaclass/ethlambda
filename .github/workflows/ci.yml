@@ -51,6 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: leanEthereum/leanSpec
+          ref: bf0f606a75095cf1853529bc770516b1464d9716
           path: ./leanSpec
 
       - name: Install uv
