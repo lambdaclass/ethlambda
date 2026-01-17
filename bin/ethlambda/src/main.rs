@@ -187,22 +187,22 @@ fn read_validator_keys(
     for validator in validator_vec {
         let validator_index = validator.index;
 
-        // Resolve the private key file path relative to the validators config directory
-        let privkey_path = if validator.privkey_file.is_absolute() {
+        // Resolve the secret key file path relative to the validators config directory
+        let secret_key_path = if validator.privkey_file.is_absolute() {
             validator.privkey_file.clone()
         } else {
             validator_keys_dir.join(&validator.privkey_file)
         };
 
-        info!(node_id=%node_id, index=validator_index, privkey_file=?privkey_path, "Loading validator private key");
+        info!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, "Loading validator secret key");
 
-        // Read the hex-encoded private key file
-        let privkey_bytes =
-            std::fs::read(&privkey_path).expect("Failed to read validator secret key file");
+        // Read the hex-encoded secret key file
+        let secret_key_bytes =
+            std::fs::read(&secret_key_path).expect("Failed to read validator secret key file");
 
-        // Parse the private key
-        let secret_key = ValidatorSecretKey::from_bytes(&privkey_bytes).unwrap_or_else(|err| {
-            error!(node_id=%node_id, index=validator_index, privkey_file=?privkey_path, ?err, "Failed to parse validator secret key");
+        // Parse the secret key
+        let secret_key = ValidatorSecretKey::from_bytes(&secret_key_bytes).unwrap_or_else(|err| {
+            error!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, ?err, "Failed to parse validator secret key");
             std::process::exit(1);
         });
 
@@ -212,7 +212,7 @@ fn read_validator_keys(
     info!(
         node_id = %node_id,
         count = validator_keys.len(),
-        "Loaded validator private keys"
+        "Loaded validator secret keys"
     );
 
     validator_keys
