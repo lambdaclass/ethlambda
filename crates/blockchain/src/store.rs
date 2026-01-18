@@ -950,9 +950,11 @@ fn verify_signatures(
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
+
     let proposer_signature =
         ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
             .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+
     let proposer = validators
         .get(block.proposer_index as usize)
         .ok_or(StoreError::InvalidValidatorIndex)?;
@@ -960,12 +962,14 @@ fn verify_signatures(
     let proposer_pubkey = proposer
         .get_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(proposer.index))?;
+
     let epoch = proposer_attestation
         .data
         .slot
         .try_into()
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
+
     if !proposer_pubkey.is_valid(epoch, &message, &proposer_signature) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }

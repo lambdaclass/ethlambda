@@ -45,34 +45,6 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlockWithAttestation = test.signed_block_with_attestation.into();
 
-        // Debug: print details for specific test
-        if name.contains("test_proposer_signature[") && !name.contains("attester") {
-            let proposer_att_data = &signed_block.message.proposer_attestation.data;
-            let message_hash = proposer_att_data.tree_hash_root();
-            println!("[test_proposer_signature] AttestationData tree hash: 0x{}", hex::encode(message_hash));
-            println!(
-                "[test_proposer_signature] Slot (epoch): {}",
-                signed_block.message.proposer_attestation.data.slot
-            );
-            println!(
-                "[test_proposer_signature] Proposer validator_id: {}",
-                signed_block.message.proposer_attestation.validator_id
-            );
-            println!("[test_proposer_signature] AttestationData fields:");
-            println!("[test_proposer_signature]   slot: {}", proposer_att_data.slot);
-            println!("[test_proposer_signature]   head: root=0x{}, slot={}", hex::encode(proposer_att_data.head.root), proposer_att_data.head.slot);
-            println!("[test_proposer_signature]   target: root=0x{}, slot={}", hex::encode(proposer_att_data.target.root), proposer_att_data.target.slot);
-            println!("[test_proposer_signature]   source: root=0x{}, slot={}", hex::encode(proposer_att_data.source.root), proposer_att_data.source.slot);
-
-            // Print signature bytes (first 64 bytes)
-            let sig_bytes: &[u8] = signed_block.signature.proposer_signature.as_ref();
-            println!(
-                "[test_proposer_signature] Signature bytes (first 64): {}",
-                hex::encode(&sig_bytes[..64.min(sig_bytes.len())])
-            );
-            println!("[test_proposer_signature] Signature total length: {}", sig_bytes.len());
-        }
-
         // Advance time to the block's slot
         let block_time = signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
         store.on_tick(block_time, true);

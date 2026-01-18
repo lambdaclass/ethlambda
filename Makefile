@@ -16,7 +16,7 @@ leanSpec:
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet -o fixtures
+	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures
 
 # lean-quickstart:
 # 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
