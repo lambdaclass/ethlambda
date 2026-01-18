@@ -27,15 +27,26 @@ thiserror.workspace = true
 tracing.workspace = true
 
 prometheus.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 datatest-stable = "0.3.3"
+leansig.workspace = true
+tree_hash = "0.12.0"
+ethereum_ssz = "0.10.0"
+ethereum_ssz_derive = "0.10.0"
+ssz_types = "0.14.0"
 
 [[test]]
 name = "forkchoice_spectests"
 path = "tests/forkchoice_spectests.rs"
 harness = false
 required-features = ["skip-signature-verification"]
+
+[[test]]
+name = "signature_spectests"
+path = "tests/signature_spectests.rs"
+harness = false

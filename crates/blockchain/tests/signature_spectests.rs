@@ -58,6 +58,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 "[test_proposer_signature] Proposer validator_id: {}",
                 signed_block.message.proposer_attestation.validator_id
             );
+            println!("[test_proposer_signature] AttestationData fields:");
+            println!("[test_proposer_signature]   slot: {}", proposer_att_data.slot);
+            println!("[test_proposer_signature]   head: root=0x{}, slot={}", hex::encode(proposer_att_data.head.root), proposer_att_data.head.slot);
+            println!("[test_proposer_signature]   target: root=0x{}, slot={}", hex::encode(proposer_att_data.target.root), proposer_att_data.target.slot);
+            println!("[test_proposer_signature]   source: root=0x{}, slot={}", hex::encode(proposer_att_data.source.root), proposer_att_data.source.slot);
 
             // Print signature bytes (first 64 bytes)
             let sig_bytes: &[u8] = signed_block.signature.proposer_signature.as_ref();
@@ -106,6 +111,6 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
 datatest_stable::harness!({
     test = run,
-    root = "../../../../ethlambda/leanSpec/fixtures/consensus/verify_signatures",
+    root = "../../../ethlambda/leanSpec/fixtures/consensus/verify_signatures",
     pattern = r".*\.json"
 });

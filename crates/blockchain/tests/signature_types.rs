@@ -402,10 +402,16 @@ impl ProposerSignature {
         // Encode to SSZ bytes
         let bytes = ssz_sig.as_ssz_bytes();
 
+        println!("[DEBUG to_xmss_signature] co_path length: {}", self.path.siblings.data.len());
+        println!("[DEBUG to_xmss_signature] hashes length: {}", self.hashes.data.len());
+        println!("[DEBUG to_xmss_signature] SSZ encoded size before padding: {}", bytes.len());
+
         // Pad to exactly SignatureSize bytes (3112)
         let sig_size = 3112;
-        let mut padded = bytes;
+        let mut padded = bytes.clone();
         padded.resize(sig_size, 0);
+
+        println!("[DEBUG to_xmss_signature] After padding: {} bytes", padded.len());
 
         XmssSignature::new(padded).expect("signature size mismatch")
     }
