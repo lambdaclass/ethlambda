@@ -15,6 +15,9 @@ leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
+leanSpec/fixtures: leanSpec
+	cd leanSpec && uv run fill --fork devnet -o fixtures
+
 # lean-quickstart:
 # 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
