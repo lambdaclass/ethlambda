@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ethlambda_blockchain::{store::Store, SECONDS_PER_SLOT};
+use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
 use ethlambda_types::{
     block::{Block, SignedBlockWithAttestation},
     primitives::TreeHash,

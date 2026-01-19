@@ -1,19 +1,17 @@
 use ethlambda_types::attestation::{
-    AggregatedAttestation as EthAggregatedAttestation,
-    AggregationBits as EthAggregationBits, Attestation as EthAttestation,
-    AttestationData as EthAttestationData, XmssSignature,
+    AggregatedAttestation as EthAggregatedAttestation, AggregationBits as EthAggregationBits,
+    Attestation as EthAttestation, AttestationData as EthAttestationData, XmssSignature,
 };
 use ethlambda_types::block::{
-    AggregatedAttestations, AttestationSignatures, Block as EthBlock,
-    BlockBody as EthBlockBody, BlockSignatures, BlockWithAttestation,
-    NaiveAggregatedSignature, SignedBlockWithAttestation,
+    AggregatedAttestations, AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody,
+    BlockSignatures, BlockWithAttestation, NaiveAggregatedSignature, SignedBlockWithAttestation,
 };
 use ethlambda_types::primitives::{BitList, Encode, H256, VariableList};
 use ethlambda_types::state::{Checkpoint as EthCheckpoint, State, ValidatorPubkeyBytes};
 use serde::Deserialize;
 use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
-use ssz_types::typenum::{U28, U32};
 use ssz_types::FixedVector;
+use ssz_types::typenum::{U28, U32};
 use std::collections::HashMap;
 use std::path::Path;
 
