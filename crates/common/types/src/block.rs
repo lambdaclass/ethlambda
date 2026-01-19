@@ -39,10 +39,6 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
 /// Signature payload for the block.
 #[derive(Clone, Encode, Decode)]
 pub struct BlockSignatures {
-    /// Signature for the proposer's attestation.
-    // TODO: this goes after attestation_signatures in the spec
-    pub proposer_signature: XmssSignature,
-
     /// Attestation signatures for the aggregated attestations in the block body.
     ///
     /// Each entry corresponds to an aggregated attestation from the block body and
@@ -51,6 +47,9 @@ pub struct BlockSignatures {
     /// TODO:
     /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
     pub attestation_signatures: AttestationSignatures,
+
+    /// Signature for the proposer's attestation.
+    pub proposer_signature: XmssSignature,
 }
 
 /// List of per-attestation aggregated signature proofs.
