@@ -1,4 +1,4 @@
-.PHONY: help lint docker-build run-devnet
+.PHONY: help lint docker-build run-devnet test
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -6,10 +6,14 @@ help: ## 📚 Show help for each of the Makefile recipes
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
+test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
+	cargo test --workspace
+	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
+
 docker-build: ## 🐳 Build the Docker image
 	docker build -t ethlambda:latest .
 
-LEAN_SPEC_COMMIT_HASH:=bf0f606a75095cf1853529bc770516b1464d9716
+LEAN_SPEC_COMMIT_HASH:=fbbacbea4545be870e25e3c00a90fc69e019c5bb
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
