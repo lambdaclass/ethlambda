@@ -48,12 +48,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download test fixtures
-        uses: actions/download-artifact@v5
-        with:
-          repository: leanEthereum/leanSpec
-          name: fixtures-prod-scheme
-          path: ./leanSpec/fixtures
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p leanSpec/fixtures
+          gh run download --repo leanEthereum/leanSpec --name fixtures-prod-scheme --dir leanSpec/fixtures
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
