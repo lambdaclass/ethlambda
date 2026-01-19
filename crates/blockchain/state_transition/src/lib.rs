@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use ethlambda_types::{
     block::{AggregatedAttestations, Block, BlockHeader},
     primitives::{H256, TreeHash},
-    state::{Checkpoint, JustificationValidators, JustifiedSlots, State},
+    state::{Checkpoint, JustificationValidators, State},
 };
+
+mod justified_slots_ops;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -130,19 +132,18 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         .try_into()
         .expect("maximum slots reached");
 
-    // Extend justified_slots with [is_genesis_parent] + [false] * num_empty_slots
-    // We do this by creating a new bitlist with enough capacity, which sets all bits to 0.
-    // Then we compute the AND/union of both bitlists.
-    // TODO: replace with a better API once we roll our own SSZ lib
-    let mut justified_slots =
-        JustifiedSlots::with_capacity(state.justified_slots.len() + 1 + num_empty_slots)
-            .expect("maximum justified slots reached");
-
-    justified_slots
-        .set(state.justified_slots.len(), is_genesis_parent)
-        .expect("we just created this with enough capacity");
-
-    state.justified_slots = state.justified_slots.union(&justified_slots);
+    // Extend justified_slots to cover slots up to (block.slot - 1)
+    //
+    // The storage is relative to the finalized boundary.
+    // The current block's slot is not materialized until processing completes,
+    // so we only extend up to the last materialized slot.
+    let last_materialized_slot = block.slot - 1;
+    justified_slots_ops::extend_to_slot(
+        &mut state.justified_slots,
+        state.latest_finalized.slot,
+        last_materialized_slot,
+        false,
+    );
 
     let new_header = BlockHeader {
         slot: block.slot,
@@ -203,21 +204,21 @@ fn process_attestations(
         let target = attestation_data.target;
 
         // Check that the source is already justified
-        if !state
-            .justified_slots
-            .get(source.slot as usize)
-            .unwrap_or(false)
-        {
+        if !justified_slots_ops::is_slot_justified(
+            &state.justified_slots,
+            state.latest_finalized.slot,
+            source.slot,
+        ) {
             // TODO: why doesn't this make the block invalid?
             continue;
         }
 
         // Ignore votes for targets that have already reached consensus
-        if state
-            .justified_slots
-            .get(target.slot as usize)
-            .unwrap_or(false)
-        {
+        if justified_slots_ops::is_slot_justified(
+            &state.justified_slots,
+            state.latest_finalized.slot,
+            target.slot,
+        ) {
             continue;
         }
 
@@ -255,10 +256,12 @@ fn process_attestations(
         if 3 * vote_count >= 2 * validator_count {
             // The block becomes justified
             state.latest_justified = target;
-            state
-                .justified_slots
-                .set(target.slot as usize, true)
-                .expect("we already resized in process_block_header");
+            justified_slots_ops::set_justified(
+                &mut state.justified_slots,
+                state.latest_finalized.slot,
+                target.slot,
+                true,
+            );
 
             justifications.remove(&target.root);
 
@@ -266,7 +269,11 @@ fn process_attestations(
             if !((source.slot + 1)..target.slot)
                 .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
             {
+                let old_finalized_slot = state.latest_finalized.slot;
                 state.latest_finalized = source;
+                // Shift window to drop finalized slots from the front
+                let delta = (source.slot - old_finalized_slot) as usize;
+                justified_slots_ops::shift_window(&mut state.justified_slots, delta);
             }
         }
     }
