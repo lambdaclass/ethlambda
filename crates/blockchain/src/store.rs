@@ -211,12 +211,14 @@ impl Store {
         let data = &attestation.data;
 
         // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
-        if !self.blocks.contains_key(&data.source.root) {
-            return Err(StoreError::UnknownSourceBlock(data.source.root));
-        }
-        if !self.blocks.contains_key(&data.target.root) {
-            return Err(StoreError::UnknownTargetBlock(data.target.root));
-        }
+        let source_block = self
+            .blocks
+            .get(&data.source.root)
+            .ok_or(StoreError::UnknownSourceBlock(data.source.root))?;
+        let target_block = self
+            .blocks
+            .get(&data.target.root)
+            .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
         if !self.blocks.contains_key(&data.head.root) {
             return Err(StoreError::UnknownHeadBlock(data.head.root));
         }
@@ -226,9 +228,29 @@ impl Store {
             return Err(StoreError::SourceExceedsTarget);
         }
 
-        // TODO: Consistency Check - Validate checkpoint slots match block slots
+        // Consistency Check - Validate checkpoint slots match block slots.
+        if source_block.slot != data.source.slot {
+            return Err(StoreError::SourceSlotMismatch {
+                checkpoint_slot: data.source.slot,
+                block_slot: source_block.slot,
+            });
+        }
+        if target_block.slot != data.target.slot {
+            return Err(StoreError::TargetSlotMismatch {
+                checkpoint_slot: data.target.slot,
+                block_slot: target_block.slot,
+            });
+        }
 
-        // TODO: Time Check - Validate attestation is not too far in the future
+        // Time Check - Validate attestation is not too far in the future.
+        // We allow a small margin for clock disparity (1 slot), but no further.
+        let current_slot = self.time / SECONDS_PER_SLOT;
+        if data.slot > current_slot + 1 {
+            return Err(StoreError::AttestationTooFarInFuture {
+                attestation_slot: data.slot,
+                current_slot,
+            });
+        }
 
         Ok(())
     }
@@ -369,9 +391,12 @@ impl Store {
             // These enter the "new" stage and must wait for interval tick acceptance.
 
             // Reject attestations from future slots
-            let time_slots = self.time / SECONDS_PER_SLOT;
-            if attestation_slot > time_slots {
-                return Err(StoreError::FutureAttestation);
+            let current_slot = self.time / SECONDS_PER_SLOT;
+            if attestation_slot > current_slot {
+                return Err(StoreError::AttestationTooFarInFuture {
+                    attestation_slot,
+                    current_slot,
+                });
             }
 
             let should_update = self
@@ -727,8 +752,25 @@ pub enum StoreError {
     #[error("Source checkpoint slot exceeds target")]
     SourceExceedsTarget,
 
-    #[error("Attestation is for future slot")]
-    FutureAttestation,
+    #[error("Source checkpoint slot {checkpoint_slot} does not match block slot {block_slot}")]
+    SourceSlotMismatch {
+        checkpoint_slot: u64,
+        block_slot: u64,
+    },
+
+    #[error("Target checkpoint slot {checkpoint_slot} does not match block slot {block_slot}")]
+    TargetSlotMismatch {
+        checkpoint_slot: u64,
+        block_slot: u64,
+    },
+
+    #[error(
+        "Attestation slot {attestation_slot} is too far in future (current slot: {current_slot})"
+    )]
+    AttestationTooFarInFuture {
+        attestation_slot: u64,
+        current_slot: u64,
+    },
 
     #[error(
         "Attestations and signatures don't match in length: got {signatures} signatures and {attestations} attestations"
