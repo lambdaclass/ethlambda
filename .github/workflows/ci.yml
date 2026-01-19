@@ -59,7 +59,7 @@ jobs:
 
       - name: Generate test fixtures
         working-directory: ./leanSpec
-        run: uv run fill --clean --fork=devnet
+        run: uv run fill --clean --fork=devnet --scheme=prod
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
