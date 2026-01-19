@@ -676,8 +676,15 @@ impl Store {
     }
 
     /// Returns a reference to the head state if it exists.
-    pub fn head_state(&self) -> Option<&State> {
-        self.states.get(&self.head)
+    pub fn head_state(&self) -> &State {
+        self.states
+            .get(&self.head)
+            .expect("head state is always available")
+    }
+
+    /// Returns the slot of the current safe target block.
+    pub fn safe_target_slot(&self) -> u64 {
+        self.blocks[&self.safe_target].slot
     }
 }
 

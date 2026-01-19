@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 pub mod key_manager;
+mod metrics;
 pub mod store;
 
 /// Messages sent from the blockchain to the P2P layer for publishing.
@@ -90,6 +91,9 @@ impl BlockChainServer {
         let slot = time_since_genesis / SECONDS_PER_SLOT;
         let interval = time_since_genesis % SECONDS_PER_SLOT;
 
+        // Update current slot metric
+        metrics::update_current_slot(slot);
+
         // Produce attestations at interval 1
         if interval == 1 {
             self.produce_attestations(slot);
@@ -99,17 +103,14 @@ impl BlockChainServer {
         let has_proposal = false;
 
         self.store.on_tick(timestamp, has_proposal);
+
+        // Update safe target slot metric (updated by store.on_tick at interval 2)
+        metrics::update_safe_target_slot(self.store.safe_target_slot());
     }
 
     fn produce_attestations(&mut self, slot: u64) {
         // Get the head state to determine number of validators
-        let head_state = match self.store.head_state() {
-            Some(state) => state,
-            None => {
-                warn!(%slot, "Cannot produce attestations: no head state");
-                return;
-            }
-        };
+        let head_state = self.store.head_state();
 
         let num_validators = head_state.validators.len() as u64;
 
@@ -149,14 +150,16 @@ impl BlockChainServer {
             };
 
             // Publish to gossip network
-            if let Err(err) = self
+            let Ok(_) = self
                 .p2p_tx
                 .send(OutboundGossip::PublishAttestation(signed_attestation))
-            {
-                error!(%slot, %validator_id, %err, "Failed to publish attestation");
-            } else {
-                info!(%slot, %validator_id, "Published attestation");
-            }
+                .inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
+                )
+            else {
+                continue;
+            };
+            info!(%slot, %validator_id, "Published attestation");
         }
     }
 
@@ -166,7 +169,10 @@ impl BlockChainServer {
             warn!(%slot, %err, "Failed to process block");
             return;
         }
-        update_head_slot(slot);
+        metrics::update_head_slot(slot);
+        metrics::update_latest_justified_slot(self.store.latest_justified().slot);
+        metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
+        metrics::update_validators_count(self.store.head_state().validators.len() as u64);
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
@@ -227,13 +233,4 @@ impl GenServer for BlockChainServer {
         }
         CastResponse::NoReply
     }
-}
-
-fn update_head_slot(slot: u64) {
-    static LEAN_HEAD_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_head_slot", "Latest slot of the lean chain")
-                .unwrap()
-        });
-    LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
 }
