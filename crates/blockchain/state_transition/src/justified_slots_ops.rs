@@ -9,60 +9,41 @@ use ethlambda_types::state::JustifiedSlots;
 /// Calculate relative index for a slot after finalization.
 /// Returns None if slot <= finalized_slot (implicitly justified).
 fn relative_index(target_slot: u64, finalized_slot: u64) -> Option<usize> {
-    if target_slot <= finalized_slot {
-        return None;
-    }
-    Some((target_slot - finalized_slot - 1) as usize)
+    target_slot
+        .checked_sub(finalized_slot)?
+        .checked_sub(1)
+        .map(|idx| idx as usize)
 }
 
 /// Check if a slot is justified (finalized slots are implicitly justified).
 pub fn is_slot_justified(slots: &JustifiedSlots, finalized_slot: u64, target_slot: u64) -> bool {
-    match relative_index(target_slot, finalized_slot) {
-        None => true, // Finalized slots are implicitly justified
-        Some(idx) => slots.get(idx).unwrap_or(false),
-    }
+    relative_index(target_slot, finalized_slot)
+        .map(|idx| slots.get(idx).unwrap_or(false))
+        .unwrap_or(true) // Finalized slots are implicitly justified
 }
 
-/// Set justification status for a slot. Returns true if set, false if slot is finalized.
-pub fn set_justified(
-    slots: &mut JustifiedSlots,
-    finalized_slot: u64,
-    target_slot: u64,
-    value: bool,
-) -> bool {
+/// Mark a slot as justified. No-op if slot is finalized.
+pub fn set_justified(slots: &mut JustifiedSlots, finalized_slot: u64, target_slot: u64) {
     if let Some(idx) = relative_index(target_slot, finalized_slot) {
-        slots.set(idx, value).expect("index out of bounds");
-        true
-    } else {
-        false
+        slots.set(idx, true).expect("index out of bounds");
     }
 }
 
 /// Extend capacity to cover slots up to target_slot relative to finalized boundary.
-/// New slots are initialized to the given default value.
-pub fn extend_to_slot(
-    slots: &mut JustifiedSlots,
-    finalized_slot: u64,
-    target_slot: u64,
-    default: bool,
-) {
-    if let Some(required_idx) = relative_index(target_slot, finalized_slot) {
-        let required_capacity = required_idx + 1;
-        if slots.len() >= required_capacity {
-            return;
-        }
-        // Create a new bitlist with the required capacity.
-        // All new bits are initialized to 0, then we optionally set them to 1 if default is true.
-        let mut extended =
-            JustifiedSlots::with_capacity(required_capacity).expect("capacity limit exceeded");
-        if default {
-            for i in slots.len()..required_capacity {
-                extended.set(i, true).expect("within capacity");
-            }
-        }
-        // Union preserves existing bits and adds new ones
-        *slots = slots.union(&extended);
+/// New slots are initialized to false (unjustified).
+pub fn extend_to_slot(slots: &mut JustifiedSlots, finalized_slot: u64, target_slot: u64) {
+    let Some(required_idx) = relative_index(target_slot, finalized_slot) else {
+        return;
+    };
+    let required_capacity = required_idx + 1;
+    if slots.len() >= required_capacity {
+        return;
     }
+    // Create a new bitlist with the required capacity (all bits default to false).
+    // Union preserves existing bits and extends the length.
+    let extended =
+        JustifiedSlots::with_capacity(required_capacity).expect("capacity limit exceeded");
+    *slots = slots.union(&extended);
 }
 
 /// Shift window by dropping finalized slots when finalization advances.

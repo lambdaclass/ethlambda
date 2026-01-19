@@ -142,7 +142,6 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         &mut state.justified_slots,
         state.latest_finalized.slot,
         last_materialized_slot,
-        false,
     );
 
     let new_header = BlockHeader {
@@ -260,7 +259,6 @@ fn process_attestations(
                 &mut state.justified_slots,
                 state.latest_finalized.slot,
                 target.slot,
-                true,
             );
 
             justifications.remove(&target.root);
