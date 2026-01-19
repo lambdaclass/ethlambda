@@ -47,19 +47,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout leanSpec
-        uses: actions/checkout@v4
+      - name: Download test fixtures
+        uses: actions/download-artifact@v5
         with:
           repository: leanEthereum/leanSpec
-          ref: bf0f606a75095cf1853529bc770516b1464d9716
-          path: ./leanSpec
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Generate test fixtures
-        working-directory: ./leanSpec
-        run: uv run fill --clean --fork=devnet --scheme=prod
+          name: fixtures-prod-scheme
+          path: ./leanSpec/fixtures
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
