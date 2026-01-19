@@ -197,6 +197,18 @@ fn process_attestations(
         })
         .collect();
 
+    // For is_justifiable_after checks (must use original value, not updated during iteration)
+    let original_finalized_slot = state.latest_finalized.slot;
+
+    // Build root_to_slots mapping for justifications pruning.
+    // A root may appear at multiple slots (missed slots produce duplicate zero hashes).
+    let mut root_to_slots: HashMap<H256, Vec<u64>> = HashMap::new();
+    for slot in (state.latest_finalized.slot + 1)..state.historical_block_hashes.len() as u64 {
+        if let Some(root) = state.historical_block_hashes.get(slot as usize) {
+            root_to_slots.entry(*root).or_default().push(slot);
+        }
+    }
+
     for attestation in attestations {
         let attestation_data = &attestation.data;
         let source = attestation_data.source;
@@ -232,7 +244,7 @@ fn process_attestations(
         }
 
         // Ensure the target falls on a slot that can be justified after the finalized one.
-        if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
+        if !slot_is_justifiable_after(target.slot, original_finalized_slot) {
             continue;
         }
 
@@ -263,15 +275,24 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            // Consider whether finalization can advance
+            // Consider whether finalization can advance.
+            // Use ORIGINAL finalized slot for is_justifiable_after check.
             if !((source.slot + 1)..target.slot)
-                .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
+                .any(|slot| slot_is_justifiable_after(slot, original_finalized_slot))
             {
                 let old_finalized_slot = state.latest_finalized.slot;
                 state.latest_finalized = source;
+
                 // Shift window to drop finalized slots from the front
-                let delta = (source.slot - old_finalized_slot) as usize;
+                let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
                 justified_slots_ops::shift_window(&mut state.justified_slots, delta);
+
+                // Prune justifications whose roots only appear at now-finalized slots
+                justifications.retain(|root, _| {
+                    root_to_slots.get(root).is_some_and(|slots| {
+                        slots.iter().any(|&slot| slot > state.latest_finalized.slot)
+                    })
+                });
             }
         }
     }
