@@ -59,12 +59,8 @@ pub struct BlockSignatures {
 /// It contains:
 ///     - the participants bitfield,
 ///     - proof bytes from leanVM signature aggregation.
-// pub type AttestationSignatures =
-//     ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
 pub type AttestationSignatures =
-    ssz_types::VariableList<NaiveAggregatedSignature, ValidatorRegistryLimit>;
-
-pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
+    ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
 
 /// Cryptographic proof that a set of validators signed a message.
 ///
@@ -79,9 +75,39 @@ pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, Valid
 #[derive(Clone, Encode, Decode)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
-    participants: AggregationBits,
+    pub participants: AggregationBits,
     /// The raw aggregated proof bytes from leanVM.
-    proof_data: ByteList<U1048576>, // 1
+    pub proof_data: ByteList<U1048576>,
+}
+
+impl AggregatedSignatureProof {
+    /// Create a new aggregated signature proof.
+    pub fn new(participants: AggregationBits, proof_data: ByteList<U1048576>) -> Self {
+        Self {
+            participants,
+            proof_data,
+        }
+    }
+
+    /// Create an empty proof with the given participants bitfield.
+    ///
+    /// Used as a placeholder when actual aggregation is not yet implemented.
+    pub fn empty(participants: AggregationBits) -> Self {
+        Self {
+            participants,
+            proof_data: ByteList::empty(),
+        }
+    }
+
+    /// Get the participants bitfield.
+    pub fn participants(&self) -> &AggregationBits {
+        &self.participants
+    }
+
+    /// Get the proof data.
+    pub fn proof_data(&self) -> &ByteList<U1048576> {
+        &self.proof_data
+    }
 }
 
 /// Bitlist representing validator participation in an attestation or signature.

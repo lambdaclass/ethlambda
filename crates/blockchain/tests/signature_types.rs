@@ -3,8 +3,9 @@ use ethlambda_types::attestation::{
     Attestation as EthAttestation, AttestationData as EthAttestationData, XmssSignature,
 };
 use ethlambda_types::block::{
-    AggregatedAttestations, AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody,
-    BlockSignatures, BlockWithAttestation, NaiveAggregatedSignature, SignedBlockWithAttestation,
+    AggregatedAttestations, AggregatedSignatureProof, AggregationBits as EthAggregationBitsSig,
+    AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody, BlockSignatures,
+    BlockWithAttestation, SignedBlockWithAttestation,
 };
 use ethlambda_types::primitives::{BitList, Encode, H256, VariableList};
 use ethlambda_types::state::{Checkpoint as EthCheckpoint, State, ValidatorPubkeyBytes};
@@ -216,19 +217,19 @@ impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
 
         let proposer_signature = value.signature.proposer_signature.to_xmss_signature();
 
-        // For now, attestation signatures use placeholder proofData (for future SNARK aggregation).
-        // We create empty NaiveAggregatedSignature entries to match the attestation count.
-        // The actual signature verification for attestations is not yet implemented.
+        // Convert attestation signatures to AggregatedSignatureProof.
+        // Each proof contains the participants bitfield from the test data.
+        // The proof_data is currently empty (placeholder for future leanVM aggregation).
         let attestation_signatures: AttestationSignatures = value
             .signature
             .attestation_signatures
             .data
             .into_iter()
-            .map(|_att_sig| {
-                // Create empty signature list for each attestation
-                // Real implementation would parse proofData or individual signatures
-                let empty: NaiveAggregatedSignature = Vec::new().try_into().unwrap();
-                empty
+            .map(|att_sig| {
+                // Convert participants bitfield
+                let participants: EthAggregationBitsSig = att_sig.participants.into();
+                // Create proof with participants but empty proof_data
+                AggregatedSignatureProof::empty(participants)
             })
             .collect::<Vec<_>>()
             .try_into()
@@ -237,8 +238,8 @@ impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
         SignedBlockWithAttestation {
             message,
             signature: BlockSignatures {
-                proposer_signature,
                 attestation_signatures,
+                proposer_signature,
             },
         }
     }
