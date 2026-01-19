@@ -52,7 +52,7 @@ clap = { version = "4.3", features = ["derive", "env"] }
 ethereum-types = { version = "0.15.1", features = ["serialize"] }
 
 # XMSS signatures
-leansig = { git = "https://github.com/leanEthereum/leansig.git", rev = "ae12a5feb25d917c42b6466444ebd56ec115a629" }
+leansig = { git = "https://github.com/leanEthereum/leansig.git", rev = "f10dcbe" }
 
 # SSZ deps
 # TODO: roll up our own implementation
