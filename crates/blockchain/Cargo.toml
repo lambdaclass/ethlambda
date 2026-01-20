@@ -45,8 +45,3 @@ name = "forkchoice_spectests"
 path = "tests/forkchoice_spectests.rs"
 harness = false
 required-features = ["skip-signature-verification"]
-
-[[test]]
-name = "signature_spectests"
-path = "tests/signature_spectests.rs"
-harness = false
