@@ -13,7 +13,7 @@ test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verificat
 docker-build: ## 🐳 Build the Docker image
 	docker build -t ghcr.io/lambdaclass/ethlambda:latest .
 
-LEAN_SPEC_COMMIT_HASH:=fbbacbea4545be870e25e3c00a90fc69e019c5bb
+LEAN_SPEC_COMMIT_HASH:=050fa4a18881d54d7dc07601fe59e34eb20b9630
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
