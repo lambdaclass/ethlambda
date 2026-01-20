@@ -77,6 +77,13 @@ Additional features:
 
 We support the [pq-devnet-1 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-1.md). A dedicated git branch and docker tag `devnet1` are available for this version.
 
-## Roadmap
+## Incoming features
 
-_TBD_
+Some features we are looking to implement in the near future, in order of priority:
+
+- [pq-devnet-2](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md) support: signature aggregation with leanMultisig
+- Data persistence: DB-backed Store
+- Historical syncing from genesis for existing devnets
+- Checkpoint sync for long-lived networks
+- Observability: more metrics from leanMetrics and better logs
+- RPC endpoints for chain data consumption
