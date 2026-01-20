@@ -97,17 +97,11 @@ pub struct Store {
     /// - Keyed by validator index to enforce one attestation per validator.
     latest_new_attestations: HashMap<u64, AttestationData>,
 
-    /// Per-validator XMSS signatures learned from gossip.
+    /// Per-validator XMSS signatures for attestations.
     ///
     /// Keyed by SignatureKey(validator_id, attestation_data_root).
-    gossip_signatures: HashMap<SignatureKey, XmssSignature>,
-
-    /// Individual signatures learned from blocks.
-    /// - Keyed by SignatureKey(validator_id, attestation_data_root).
-    /// - Stores the same signature data as gossip_signatures but populated from blocks.
-    /// - Used for block building when validators haven't gossiped but their
-    ///   signatures appeared in previous blocks.
-    block_signatures: HashMap<SignatureKey, XmssSignature>,
+    /// Populated from both gossip network and blocks.
+    signatures: HashMap<SignatureKey, XmssSignature>,
 }
 
 impl Store {
@@ -154,8 +148,7 @@ impl Store {
             states,
             latest_known_attestations: HashMap::new(),
             latest_new_attestations: HashMap::new(),
-            gossip_signatures: HashMap::new(),
-            block_signatures: HashMap::new(),
+            signatures: HashMap::new(),
         }
     }
 
@@ -331,7 +324,7 @@ impl Store {
 
         // Store signature for later lookup during block building
         let signature_key = (validator_id, message);
-        self.gossip_signatures
+        self.signatures
             .insert(signature_key, signed_attestation.signature);
         Ok(())
     }
@@ -478,7 +471,7 @@ impl Store {
             // Store the signature for future block building (if available)
             if let Some(sig) = signatures.get(i) {
                 let key: SignatureKey = (validator_id, data_root);
-                self.block_signatures.insert(key, sig.clone());
+                self.signatures.insert(key, sig.clone());
             }
 
             // Update Fork Choice - Register the vote immediately (historical/on-chain)
@@ -504,7 +497,7 @@ impl Store {
             proposer_attestation.data.tree_hash_root(),
         );
         if let Some(proposer_sig) = signed_block.signature.last() {
-            self.gossip_signatures
+            self.signatures
                 .insert(proposer_sig_key, proposer_sig.clone());
         }
 
@@ -643,8 +636,7 @@ impl Store {
             head_root,
             &available_attestations,
             &known_block_roots,
-            &self.gossip_signatures,
-            &self.block_signatures,
+            &self.signatures,
         )?;
 
         Ok((block, signatures))
@@ -777,7 +769,6 @@ pub enum StoreError {
 /// Returns the block, post-state, and a flat list of attestation signatures
 /// (one per attestation in block.body.attestations). The proposer signature
 /// is NOT included; it is appended by the caller.
-#[expect(clippy::too_many_arguments)]
 fn build_block(
     head_state: &State,
     slot: u64,
@@ -785,8 +776,7 @@ fn build_block(
     parent_root: H256,
     available_attestations: &[Attestation],
     known_block_roots: &HashSet<H256>,
-    gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
-    block_signatures: &HashMap<SignatureKey, XmssSignature>,
+    signatures: &HashMap<SignatureKey, XmssSignature>,
 ) -> Result<(Block, State, Vec<XmssSignature>), StoreError> {
     // Start with empty attestation set
     let mut attestations: Vec<Attestation> = Vec::new();
@@ -840,8 +830,7 @@ fn build_block(
             }
 
             // Only include if we have a signature for this attestation
-            // Check both gossip and block signatures
-            if gossip_signatures.contains_key(&sig_key) || block_signatures.contains_key(&sig_key) {
+            if signatures.contains_key(&sig_key) {
                 new_attestations.push(attestation.clone());
                 included_keys.insert(sig_key);
             }
@@ -857,16 +846,12 @@ fn build_block(
     };
 
     // Compute flat signature list for attestations
-    let signatures: Vec<XmssSignature> = final_attestations
+    let attestation_signatures: Vec<XmssSignature> = final_attestations
         .iter()
         .filter_map(|att| {
             let data_root = att.data.tree_hash_root();
             let sig_key: SignatureKey = (att.validator_id, data_root);
-            // Prefer gossip signatures, fall back to block signatures
-            gossip_signatures
-                .get(&sig_key)
-                .or_else(|| block_signatures.get(&sig_key))
-                .cloned()
+            signatures.get(&sig_key).cloned()
         })
         .collect();
 
@@ -885,7 +870,7 @@ fn build_block(
         },
     };
 
-    Ok((final_block, post_state, signatures))
+    Ok((final_block, post_state, attestation_signatures))
 }
 
 /// Verify all signatures in a signed block.
