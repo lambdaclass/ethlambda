@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn test_decode_block() {
-        // Sample uncompressed block sent by Zeam (commit b153373806aa49f65aadc47c41b68ead4fab7d6e)
+        // Sample uncompressed block sent by Zeam (docker tag devnet1, version 41b3b11)
         let block_bytes = include_bytes!("../test_data/signed_block_with_attestation.ssz");
         let _block = SignedBlockWithAttestation::from_ssz_bytes(block_bytes).unwrap();
     }
