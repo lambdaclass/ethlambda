@@ -73,6 +73,10 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
+### pq-devnet-1
+
+We support the [pq-devnet-1 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-1.md). A dedicated git branch and docker tag `devnet1` are available for this version.
+
 ## Roadmap
 
 _TBD_
