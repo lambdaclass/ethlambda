@@ -1,10 +1,9 @@
 use ethlambda_types::attestation::{
-    AggregatedAttestation as EthAggregatedAttestation, AggregationBits as EthAggregationBits,
     Attestation as EthAttestation, AttestationData as EthAttestationData, XmssSignature,
 };
 use ethlambda_types::block::{
-    AggregatedAttestations, AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody,
-    BlockSignatures, BlockWithAttestation, NaiveAggregatedSignature, SignedBlockWithAttestation,
+    Attestations, Block as EthBlock, BlockBody as EthBlockBody, BlockSignatures,
+    BlockWithAttestation, SignedBlockWithAttestation,
 };
 use ethlambda_types::primitives::{BitList, Encode, H256, VariableList};
 use ethlambda_types::state::{Checkpoint as EthCheckpoint, State, ValidatorPubkeyBytes};
@@ -209,37 +208,36 @@ pub struct TestSignedBlockWithAttestation {
 
 impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
     fn from(value: TestSignedBlockWithAttestation) -> Self {
+        let block: EthBlock = value.message.block.into();
+        let proposer_attestation: EthAttestation = value.message.proposer_attestation.into();
+
         let message = BlockWithAttestation {
-            block: value.message.block.into(),
-            proposer_attestation: value.message.proposer_attestation.into(),
+            block: block.clone(),
+            proposer_attestation,
         };
 
-        let proposer_signature = value.signature.proposer_signature.to_xmss_signature();
+        // Build flat signature list: [attestation_sig_0, ..., attestation_sig_n, proposer_sig]
+        // For now, attestation signatures use empty/default placeholders since the test
+        // fixture format still uses aggregated proofData which is not parsed.
+        let attestation_count = block.body.attestations.len();
+        let mut signatures: Vec<XmssSignature> = Vec::with_capacity(attestation_count + 1);
 
-        // For now, attestation signatures use placeholder proofData (for future SNARK aggregation).
-        // We create empty NaiveAggregatedSignature entries to match the attestation count.
-        // The actual signature verification for attestations is not yet implemented.
-        let attestation_signatures: AttestationSignatures = value
-            .signature
-            .attestation_signatures
-            .data
-            .into_iter()
-            .map(|_att_sig| {
-                // Create empty signature list for each attestation
-                // Real implementation would parse proofData or individual signatures
-                let empty: NaiveAggregatedSignature = Vec::new().try_into().unwrap();
-                empty
-            })
-            .collect::<Vec<_>>()
+        // Add placeholder signatures for each individual attestation
+        for _ in 0..attestation_count {
+            signatures.push(Default::default());
+        }
+
+        // Add the proposer signature at the end
+        let proposer_signature = value.signature.proposer_signature.to_xmss_signature();
+        signatures.push(proposer_signature);
+
+        let block_signatures: BlockSignatures = signatures
             .try_into()
-            .expect("too many attestation signatures");
+            .expect("too many signatures");
 
         SignedBlockWithAttestation {
             message,
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures,
-            },
+            signature: block_signatures,
         }
     }
 }
@@ -288,18 +286,34 @@ pub struct BlockBody {
 
 impl From<BlockBody> for EthBlockBody {
     fn from(value: BlockBody) -> Self {
-        let attestations: AggregatedAttestations = value
+        // Expand aggregated attestations into individual attestations
+        let attestations: Vec<EthAttestation> = value
             .attestations
             .data
             .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>()
+            .flat_map(|agg| {
+                // For each true bit in aggregation_bits, create an individual attestation
+                agg.aggregation_bits
+                    .data
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, voted)| **voted)
+                    .map(|(validator_id, _)| EthAttestation {
+                        validator_id: validator_id as u64,
+                        data: agg.data.clone().into(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let attestations: Attestations = attestations
             .try_into()
             .expect("too many attestations");
         Self { attestations }
     }
 }
 
+/// Aggregated attestation from test fixtures (expands to individual attestations)
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AggregatedAttestation {
@@ -308,29 +322,10 @@ pub struct AggregatedAttestation {
     pub data: AttestationData,
 }
 
-impl From<AggregatedAttestation> for EthAggregatedAttestation {
-    fn from(value: AggregatedAttestation) -> Self {
-        Self {
-            aggregation_bits: value.aggregation_bits.into(),
-            data: value.data.into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AggregationBits {
     pub data: Vec<bool>,
-}
-
-impl From<AggregationBits> for EthAggregationBits {
-    fn from(value: AggregationBits) -> Self {
-        let mut bits = EthAggregationBits::with_capacity(value.data.len()).unwrap();
-        for (i, &b) in value.data.iter().enumerate() {
-            bits.set(i, b).unwrap();
-        }
-        bits
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

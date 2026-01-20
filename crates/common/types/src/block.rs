@@ -1,10 +1,9 @@
 use ssz_derive::{Decode, Encode};
-use ssz_types::typenum::U1048576;
 use tree_hash_derive::TreeHash;
 
 use crate::{
-    attestation::{AggregatedAttestation, Attestation, XmssSignature},
-    primitives::{ByteList, H256},
+    attestation::{Attestation, XmssSignature},
+    primitives::H256,
     state::ValidatorRegistryLimit,
 };
 
@@ -36,60 +35,16 @@ impl core::fmt::Debug for SignedBlockWithAttestation {
     }
 }
 
-/// Signature payload for the block.
-#[derive(Clone, Encode, Decode)]
-pub struct BlockSignatures {
-    /// Signature for the proposer's attestation.
-    // TODO: this goes after attestation_signatures in the spec
-    pub proposer_signature: XmssSignature,
-
-    /// Attestation signatures for the aggregated attestations in the block body.
-    ///
-    /// Each entry corresponds to an aggregated attestation from the block body and
-    /// contains the leanVM aggregated signature proof bytes for the participating validators.
-    ///
-    /// TODO:
-    /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
-    pub attestation_signatures: AttestationSignatures,
-}
-
-/// List of per-attestation aggregated signature proofs.
+/// Flat list of XMSS signatures for a block.
 ///
-/// Each entry corresponds to an aggregated attestation from the block body.
+/// Signatures remain in attestation order followed by the proposer signature
+/// over entire message. For devnet 1, however the proposer signature is just
+/// over message.proposer_attestation since leanVM is not yet performant enough
+/// to aggregate signatures with sufficient throughput.
 ///
-/// It contains:
-///     - the participants bitfield,
-///     - proof bytes from leanVM signature aggregation.
-// pub type AttestationSignatures =
-//     ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
-pub type AttestationSignatures =
-    ssz_types::VariableList<NaiveAggregatedSignature, ValidatorRegistryLimit>;
-
-pub type NaiveAggregatedSignature = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
-
-/// Cryptographic proof that a set of validators signed a message.
-///
-/// This container encapsulates the output of the leanVM signature aggregation,
-/// combining the participant set with the proof bytes. This design ensures
-/// the proof is self-describing: it carries information about which validators
-/// it covers.
-///
-/// The proof can verify that all participants signed the same message in the
-/// same epoch, using a single verification operation instead of checking
-/// each signature individually.
-#[derive(Clone, Encode, Decode)]
-pub struct AggregatedSignatureProof {
-    /// Bitfield indicating which validators' signatures are included.
-    participants: AggregationBits,
-    /// The raw aggregated proof bytes from leanVM.
-    proof_data: ByteList<U1048576>, // 1
-}
-
-/// Bitlist representing validator participation in an attestation or signature.
-///
-/// A general-purpose bitfield for tracking which validators have participated
-/// in some collective action (attestation, signature aggregation, etc.).
-pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
+/// Ordering: [attestation_sig_0, attestation_sig_1, ..., attestation_sig_n, proposer_sig]
+/// where signatures[i] corresponds to attestations[i] for i < n.
+pub type BlockSignatures = ssz_types::VariableList<XmssSignature, ValidatorRegistryLimit>;
 
 /// Bundle containing a block and the proposer's attestation.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]
@@ -144,13 +99,13 @@ pub struct Block {
 /// packaged into blocks.
 #[derive(Debug, Default, Clone, Encode, Decode, TreeHash)]
 pub struct BlockBody {
-    /// Plain validator attestations carried in the block body.
+    /// Individual validator attestations carried in the block body.
     ///
-    /// Individual signatures live in the aggregated block signature list, so
+    /// Individual signatures live in the flat block signature list, so
     /// these entries contain only attestation data without per-attestation signatures.
-    pub attestations: AggregatedAttestations,
+    /// Each attestation[i] corresponds to signature[i] in BlockSignatures.
+    pub attestations: Attestations,
 }
 
-/// List of aggregated attestations included in a block.
-pub type AggregatedAttestations =
-    ssz_types::VariableList<AggregatedAttestation, ValidatorRegistryLimit>;
+/// List of individual attestations included in a block.
+pub type Attestations = ssz_types::VariableList<Attestation, ValidatorRegistryLimit>;

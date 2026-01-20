@@ -193,18 +193,33 @@ pub struct BlockBody {
 
 impl From<BlockBody> for ethlambda_types::block::BlockBody {
     fn from(value: BlockBody) -> Self {
-        let attestations = value
+        // Expand aggregated attestations into individual attestations
+        let attestations: Vec<ethlambda_types::attestation::Attestation> = value
             .attestations
             .data
             .into_iter()
-            .map(Into::into)
+            .flat_map(|agg| {
+                // For each true bit in aggregation_bits, create an individual attestation
+                agg.aggregation_bits
+                    .data
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, voted)| **voted)
+                    .map(|(validator_id, _)| ethlambda_types::attestation::Attestation {
+                        validator_id: validator_id as u64,
+                        data: agg.data.clone().into(),
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
+
         Self {
             attestations: VariableList::new(attestations).expect("too many attestations"),
         }
     }
 }
 
+/// Aggregated attestation from test fixtures (expands to individual attestations)
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregatedAttestation {
     #[serde(rename = "aggregationBits")]
@@ -212,29 +227,9 @@ pub struct AggregatedAttestation {
     pub data: AttestationData,
 }
 
-impl From<AggregatedAttestation> for ethlambda_types::attestation::AggregatedAttestation {
-    fn from(value: AggregatedAttestation) -> Self {
-        Self {
-            aggregation_bits: value.aggregation_bits.into(),
-            data: value.data.into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregationBits {
     pub data: Vec<bool>,
-}
-
-impl From<AggregationBits> for ethlambda_types::attestation::AggregationBits {
-    fn from(value: AggregationBits) -> Self {
-        let mut bits =
-            ethlambda_types::attestation::AggregationBits::with_capacity(value.data.len()).unwrap();
-        for (i, &b) in value.data.iter().enumerate() {
-            bits.set(i, b).unwrap();
-        }
-        bits
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

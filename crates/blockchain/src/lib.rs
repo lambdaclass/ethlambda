@@ -230,18 +230,20 @@ impl BlockChainServer {
             return;
         };
 
+        // Assemble flat signature list: [attestation_sig_0, ..., attestation_sig_n, proposer_sig]
+        let mut signatures = attestation_signatures;
+        signatures.push(proposer_signature);
+        let block_signatures: BlockSignatures = signatures
+            .try_into()
+            .expect("signatures within limit");
+
         // Assemble SignedBlockWithAttestation
         let signed_block = SignedBlockWithAttestation {
             message: BlockWithAttestation {
                 block,
                 proposer_attestation,
             },
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures: attestation_signatures
-                    .try_into()
-                    .expect("attestation signatures within limit"),
-            },
+            signature: block_signatures,
         };
 
         // Publish to gossip network

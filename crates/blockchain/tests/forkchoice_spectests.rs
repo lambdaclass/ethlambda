@@ -104,15 +104,22 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttest
     let block: Block = block_data.block.into();
     let proposer_attestation: Attestation = block_data.proposer_attestation.into();
 
+    // Build flat signature list: one signature per attestation + proposer signature
+    // For tests, we use empty/default signatures since signature verification is skipped
+    let attestation_count = block.body.attestations.len();
+    let mut signatures = Vec::with_capacity(attestation_count + 1);
+    for _ in 0..attestation_count {
+        signatures.push(Default::default());
+    }
+    // Add proposer signature at the end
+    signatures.push(Default::default());
+
     SignedBlockWithAttestation {
         message: BlockWithAttestation {
             block,
             proposer_attestation,
         },
-        signature: BlockSignatures {
-            proposer_signature: Default::default(),
-            attestation_signatures: VariableList::empty(),
-        },
+        signature: signatures.try_into().expect("signature count within limit"),
     }
 }
 

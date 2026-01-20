@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
-    block::{AggregatedAttestations, Block, BlockHeader},
+    block::{Attestations, Block, BlockHeader},
     primitives::{H256, TreeHash},
     state::{Checkpoint, JustificationValidators, State},
 };
@@ -177,10 +177,7 @@ pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool
 
 /// Apply attestations and update justification/finalization
 /// according to the Lean Consensus 3SF-mini rules.
-fn process_attestations(
-    state: &mut State,
-    attestations: &AggregatedAttestations,
-) -> Result<(), Error> {
+fn process_attestations(state: &mut State, attestations: &Attestations) -> Result<(), Error> {
     let validator_count = state.validators.len();
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
@@ -210,6 +207,7 @@ fn process_attestations(
     }
 
     for attestation in attestations {
+        let validator_id = attestation.validator_id;
         let attestation_data = &attestation.data;
         let source = attestation_data.source;
         let target = attestation_data.target;
@@ -248,18 +246,13 @@ fn process_attestations(
             continue;
         }
 
-        // Record the vote
+        // Record the vote for this individual attestation
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
-        // Mark that each validator in this aggregation has voted for the target.
-        for (validator_id, _) in attestation
-            .aggregation_bits
-            .iter()
-            .enumerate()
-            .filter(|(_, voted)| *voted)
-        {
-            votes[validator_id] = true;
+        // Mark that this validator has voted for the target
+        if (validator_id as usize) < validator_count {
+            votes[validator_id as usize] = true;
         }
 
         // Check whether the vote count crosses the supermajority threshold

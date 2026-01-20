@@ -1,9 +1,5 @@
 use ethlambda_types::{
-    attestation::{
-        AggregatedAttestation as DomainAggregatedAttestation,
-        AggregationBits as DomainAggregationBits, Attestation as DomainAttestation,
-        AttestationData as DomainAttestationData,
-    },
+    attestation::{Attestation as DomainAttestation, AttestationData as DomainAttestationData},
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     primitives::{BitList, H256, VariableList},
     state::{
@@ -289,11 +285,24 @@ pub struct BlockBody {
 
 impl From<BlockBody> for DomainBlockBody {
     fn from(value: BlockBody) -> Self {
-        let attestations = value
+        // Expand aggregated attestations into individual attestations
+        let attestations: Vec<DomainAttestation> = value
             .attestations
             .data
             .into_iter()
-            .map(Into::into)
+            .flat_map(|agg| {
+                // For each true bit in aggregation_bits, create an individual attestation
+                agg.aggregation_bits
+                    .data
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, voted)| **voted)
+                    .map(|(validator_id, _)| DomainAttestation {
+                        validator_id: validator_id as u64,
+                        data: agg.data.clone().into(),
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
         Self {
             attestations: VariableList::new(attestations).expect("too many attestations"),
@@ -301,6 +310,7 @@ impl From<BlockBody> for DomainBlockBody {
     }
 }
 
+/// Aggregated attestation from test fixtures (expands to individual attestations)
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregatedAttestation {
     #[serde(rename = "aggregationBits")]
@@ -308,28 +318,9 @@ pub struct AggregatedAttestation {
     pub data: AttestationData,
 }
 
-impl From<AggregatedAttestation> for DomainAggregatedAttestation {
-    fn from(value: AggregatedAttestation) -> Self {
-        Self {
-            aggregation_bits: value.aggregation_bits.into(),
-            data: value.data.into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct AggregationBits {
     pub data: Vec<bool>,
-}
-
-impl From<AggregationBits> for DomainAggregationBits {
-    fn from(value: AggregationBits) -> Self {
-        let mut bits = DomainAggregationBits::with_capacity(value.data.len()).unwrap();
-        for (i, &b) in value.data.iter().enumerate() {
-            bits.set(i, b).unwrap();
-        }
-        bits
-    }
 }
 
 // ============================================================================
