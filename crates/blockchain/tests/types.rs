@@ -33,9 +33,6 @@ impl ForkChoiceTestVector {
 pub struct ForkChoiceTest {
     #[allow(dead_code)]
     pub network: String,
-    #[serde(rename = "leanEnv")]
-    #[allow(dead_code)]
-    pub lean_env: String,
     #[serde(rename = "anchorState")]
     pub anchor_state: TestState,
     #[serde(rename = "anchorBlock")]
@@ -280,28 +277,18 @@ impl From<Block> for DomainBlock {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockBody {
-    pub attestations: Container<AggregatedAttestation>,
+    pub attestations: Container<Attestation>,
 }
 
 impl From<BlockBody> for DomainBlockBody {
     fn from(value: BlockBody) -> Self {
-        // Expand aggregated attestations into individual attestations
         let attestations: Vec<DomainAttestation> = value
             .attestations
             .data
             .into_iter()
-            .flat_map(|agg| {
-                // For each true bit in aggregation_bits, create an individual attestation
-                agg.aggregation_bits
-                    .data
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, voted)| **voted)
-                    .map(|(validator_id, _)| DomainAttestation {
-                        validator_id: validator_id as u64,
-                        data: agg.data.clone().into(),
-                    })
-                    .collect::<Vec<_>>()
+            .map(|att| DomainAttestation {
+                validator_id: att.validator_id,
+                data: att.data.into(),
             })
             .collect();
         Self {
@@ -310,17 +297,12 @@ impl From<BlockBody> for DomainBlockBody {
     }
 }
 
-/// Aggregated attestation from test fixtures (expands to individual attestations)
+/// Individual attestation from test fixtures (unaggregated format)
 #[derive(Debug, Clone, Deserialize)]
-pub struct AggregatedAttestation {
-    #[serde(rename = "aggregationBits")]
-    pub aggregation_bits: AggregationBits,
+pub struct Attestation {
+    #[serde(rename = "validatorId")]
+    pub validator_id: u64,
     pub data: AttestationData,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AggregationBits {
-    pub data: Vec<bool>,
 }
 
 // ============================================================================
