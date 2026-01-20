@@ -21,7 +21,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -45,14 +45,30 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Download test fixtures
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # - name: Download test fixtures
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     mkdir -p leanSpec/fixtures
+      #     gh run download --repo leanEthereum/leanSpec --name fixtures-prod-scheme --dir leanSpec/fixtures
+
+      - name: Checkout leanSpec
+        uses: actions/checkout@v6
+        with:
+          repository: leanEthereum/leanSpec
+          ref: 050fa4a18881d54d7dc07601fe59e34eb20b9630
+          path: leanSpec
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Generate test fixtures
+        working-directory: leanSpec
         run: |
-          mkdir -p leanSpec/fixtures
-          gh run download --repo leanEthereum/leanSpec --name fixtures-prod-scheme --dir leanSpec/fixtures
+          uv sync
+          uv run fill --fork=devnet --clean -n auto
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
