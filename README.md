@@ -59,38 +59,20 @@ The following links, repos, companies and projects have been important in the de
 
 If we forgot to include anyone, please file an issue so we can add you. We always strive to reference the inspirations and code we use, but as an organization with multiple people, mistakes can happen, and someone might forget to include a reference.
 
+## Current Status
+
+The client implements the core features of a Lean Ethereum consensus client:
+
+- **Networking** — libp2p peer connections, STATUS message handling, gossipsub for blocks and attestations
+- **State management** — genesis state generation, state transition function, block processing
+- **Fork choice** — 3SF-mini fork choice rule implementation with attestation-based head selection
+- **Validator duties** — attestation production and broadcasting, block building
+
+Additional features:
+
+- [leanMetrics](docs/metrics.md) support for monitoring and observability
+- [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
+
 ## Roadmap
 
-The initial project setup and integration with [lean-quickstart](https://github.com/blockblaz/lean-quickstart) are complete.
-
-### Listen for new blocks
-
-This milestone focuses on connecting to other clients and listening for new blocks through gossipsub.
-
-- Connect to other peers via libp2p ✅
-- Respond to STATUS messages from other peers ✅
-- Listen for new blocks in gossipsub ✅
-
-### Compute current chain state
-
-This milestone focuses on computing the chain state from the gossiped by peers received.
-
-- Generate initial state from genesis configuration ✅
-- Implement state transition function ✅
-- Transition state on each new block ✅
-
-### Apply fork-choice rule
-
-This milestone focuses on choosing the head of the chain based on gossiped attestations.
-
-- Listen for attestations in gossipsub ✅
-- Implement fork-choice rule ✅
-- Apply fork-choice rule based on received attestations ✅
-
-### Produce blocks and attestations
-
-This milestone focuses on performing the duties of a validator.
-
-- Produce and broadcast attestations on each slot ✅
-- Compute current proposer for each slot ✅
-- Build and broadcast new blocks when proposing ✅
+_TBD_
