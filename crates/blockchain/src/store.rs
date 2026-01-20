@@ -306,7 +306,7 @@ impl Store {
         let validator_pubkey = target_state.validators[validator_id as usize]
             .get_pubkey()
             .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
-        let message = attestation.data.tree_hash_root();
+        let message = attestation.tree_hash_root();
         #[cfg(not(feature = "skip-signature-verification"))]
         {
             use ethlambda_types::signature::ValidatorSignature;
@@ -907,7 +907,7 @@ fn verify_signatures(
         }
 
         let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let message = attestation.data.tree_hash_root();
+        let message = attestation.tree_hash_root();
 
         let validator = validators
             .get(validator_id as usize)
@@ -947,7 +947,7 @@ fn verify_signatures(
         .slot
         .try_into()
         .expect("slot exceeds u32");
-    let message = proposer_attestation.data.tree_hash_root();
+    let message = proposer_attestation.tree_hash_root();
 
     if !proposer_pubkey.is_valid(epoch, &message, &proposer_signature) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
