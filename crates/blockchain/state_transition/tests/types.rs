@@ -25,9 +25,6 @@ impl StateTransitionTestVector {
 pub struct StateTransitionTest {
     #[allow(dead_code)]
     pub network: String,
-    #[serde(rename = "leanEnv")]
-    #[allow(dead_code)]
-    pub lean_env: String,
     pub pre: TestState,
     pub blocks: Vec<Block>,
     pub post: Option<PostState>,
@@ -188,28 +185,18 @@ impl From<Block> for ethlambda_types::block::Block {
 /// Block body containing attestations and other data
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockBody {
-    pub attestations: Container<AggregatedAttestation>,
+    pub attestations: Container<Attestation>,
 }
 
 impl From<BlockBody> for ethlambda_types::block::BlockBody {
     fn from(value: BlockBody) -> Self {
-        // Expand aggregated attestations into individual attestations
         let attestations: Vec<ethlambda_types::attestation::Attestation> = value
             .attestations
             .data
             .into_iter()
-            .flat_map(|agg| {
-                // For each true bit in aggregation_bits, create an individual attestation
-                agg.aggregation_bits
-                    .data
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, voted)| **voted)
-                    .map(|(validator_id, _)| ethlambda_types::attestation::Attestation {
-                        validator_id: validator_id as u64,
-                        data: agg.data.clone().into(),
-                    })
-                    .collect::<Vec<_>>()
+            .map(|att| ethlambda_types::attestation::Attestation {
+                validator_id: att.validator_id,
+                data: att.data.into(),
             })
             .collect();
 
@@ -219,17 +206,12 @@ impl From<BlockBody> for ethlambda_types::block::BlockBody {
     }
 }
 
-/// Aggregated attestation from test fixtures (expands to individual attestations)
+/// Individual attestation from test fixtures (unaggregated format)
 #[derive(Debug, Clone, Deserialize)]
-pub struct AggregatedAttestation {
-    #[serde(rename = "aggregationBits")]
-    pub aggregation_bits: AggregationBits,
+pub struct Attestation {
+    #[serde(rename = "validatorId")]
+    pub validator_id: u64,
     pub data: AttestationData,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AggregationBits {
-    pub data: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

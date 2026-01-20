@@ -134,15 +134,37 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
 
     // Extend justified_slots to cover slots up to (block.slot - 1)
     //
-    // The storage is relative to the finalized boundary.
     // The current block's slot is not materialized until processing completes,
-    // so we only extend up to the last materialized slot.
-    let last_materialized_slot = block.slot - 1;
+    // so we only extend up to the last materialized slot (parent's slot).
+    let parent_slot = parent_header.slot;
     justified_slots_ops::extend_to_slot(
         &mut state.justified_slots,
         state.latest_finalized.slot,
-        last_materialized_slot,
+        parent_slot,
     );
+
+    // Mark the genesis/parent slot as justified when processing the first block.
+    // This matches the Python spec's behavior which explicitly stores this bit.
+    if is_genesis_parent {
+        justified_slots_ops::set_justified(
+            &mut state.justified_slots,
+            state.latest_finalized.slot,
+            parent_slot,
+        );
+    }
+
+    // Extend for any empty slots between parent and this block
+    for _slot in (parent_slot + 1)..block.slot {
+        // Empty slots are not justified, but we need to extend the bitlist
+        // to maintain the correct length. The extend_to_slot function handles this.
+    }
+    if block.slot > parent_slot + 1 {
+        justified_slots_ops::extend_to_slot(
+            &mut state.justified_slots,
+            state.latest_finalized.slot,
+            block.slot - 1,
+        );
+    }
 
     let new_header = BlockHeader {
         slot: block.slot,
