@@ -144,12 +144,6 @@ impl BlockChainServer {
         // Produce attestation data once for all validators
         let attestation_data = self.store.produce_attestation_data(slot);
 
-        // Hash the attestation data for signing
-        let message_hash = attestation_data.tree_hash_root();
-
-        // Epoch for signing
-        let epoch = slot as u32;
-
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
             // Skip if this validator is the slot proposer
@@ -158,14 +152,16 @@ impl BlockChainServer {
                 continue;
             }
 
+            // Hash the attestation data for signing
+            let attestation = Attestation {
+                data: attestation_data.clone(),
+                validator_id,
+            };
+
             // Sign the attestation
-            let Ok(signature) = self
-                .key_manager
-                .sign_attestation(validator_id, epoch, &message_hash)
-                .inspect_err(
-                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
-                )
-            else {
+            let Ok(signature) = self.key_manager.sign_attestation(&attestation).inspect_err(
+                |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
+            ) else {
                 continue;
             };
 
@@ -218,11 +214,9 @@ impl BlockChainServer {
         };
 
         // Sign the proposer's attestation
-        let message_hash = proposer_attestation.data.tree_hash_root();
-        let epoch = slot as u32;
         let Ok(proposer_signature) = self
             .key_manager
-            .sign_attestation(validator_id, epoch, &message_hash)
+            .sign_attestation(&proposer_attestation)
             .inspect_err(
                 |err| error!(%slot, %validator_id, %err, "Failed to sign proposer attestation"),
             )
@@ -233,9 +227,8 @@ impl BlockChainServer {
         // Assemble flat signature list: [attestation_sig_0, ..., attestation_sig_n, proposer_sig]
         let mut signatures = attestation_signatures;
         signatures.push(proposer_signature);
-        let block_signatures: BlockSignatures = signatures
-            .try_into()
-            .expect("signatures within limit");
+        let block_signatures: BlockSignatures =
+            signatures.try_into().expect("signatures within limit");
 
         // Assemble SignedBlockWithAttestation
         let signed_block = SignedBlockWithAttestation {

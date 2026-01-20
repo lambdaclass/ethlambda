@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
-    attestation::XmssSignature,
-    primitives::H256,
+    attestation::{Attestation, XmssSignature},
+    primitives::{H256, TreeHash},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
 
@@ -51,7 +51,7 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Signs an attestation message for the specified validator.
+    /// Signs a message for the specified validator.
     ///
     /// # Arguments
     ///
@@ -68,13 +68,13 @@ impl KeyManager {
     /// # Example
     ///
     /// ```ignore
-    /// let signature = key_manager.sign_attestation(
+    /// let signature = key_manager.sign_message(
     ///     validator_id,
     ///     epoch,
     ///     &message_hash
     /// )?;
     /// ```
-    pub fn sign_attestation(
+    fn sign_message(
         &mut self,
         validator_id: u64,
         epoch: u32,
@@ -96,6 +96,15 @@ impl KeyManager {
 
         Ok(xmss_sig)
     }
+
+    pub fn sign_attestation(
+        &mut self,
+        attestation: &Attestation,
+    ) -> Result<XmssSignature, KeyManagerError> {
+        let message_hash = attestation.tree_hash_root();
+        let epoch = attestation.data.slot as u32;
+        self.sign_message(attestation.validator_id, epoch, &message_hash)
+    }
 }
 
 #[cfg(test)]
@@ -110,12 +119,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_attestation_validator_not_found() {
+    fn test_sign_message_validator_not_found() {
         let keys = HashMap::new();
         let mut key_manager = KeyManager::new(keys);
         let message = H256::default();
 
-        let result = key_manager.sign_attestation(123, 0, &message);
+        let result = key_manager.sign_message(123, 0, &message);
         assert!(matches!(
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))
