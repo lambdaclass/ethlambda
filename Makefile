@@ -11,7 +11,7 @@ test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verificat
 	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
 
 docker-build: ## 🐳 Build the Docker image
-	docker build -t ghcr.io/lambdaclass/ethlambda:latest .
+	docker build -t ghcr.io/lambdaclass/ethlambda:local .
 
 LEAN_SPEC_COMMIT_HASH:=050fa4a18881d54d7dc07601fe59e34eb20b9630
 
