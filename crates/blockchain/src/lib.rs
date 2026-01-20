@@ -239,6 +239,8 @@ impl BlockChainServer {
             signature: block_signatures,
         };
 
+        self.on_block(signed_block.clone());
+
         // Publish to gossip network
         let Ok(()) = self
             .p2p_tx
