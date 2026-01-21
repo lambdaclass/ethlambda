@@ -10,8 +10,14 @@ test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verificat
 	cargo test --workspace
 	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
 
+GIT_COMMIT=$(shell git rev-parse HEAD)
+GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
+
 docker-build: ## 🐳 Build the Docker image
-	docker build -t ghcr.io/lambdaclass/ethlambda:local .
+	docker build \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
+		-t ghcr.io/lambdaclass/ethlambda:local .
 
 LEAN_SPEC_COMMIT_HASH:=fbbacbea4545be870e25e3c00a90fc69e019c5bb
 

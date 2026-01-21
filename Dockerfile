@@ -7,10 +7,6 @@ WORKDIR /app
 RUN cargo install cargo-chef
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
 
-LABEL org.opencontainers.image.source=https://github.com/lambdaclass/ethlambda
-LABEL org.opencontainers.image.description="ethlambda is a modular Ethereum beam chain client."
-LABEL org.opencontainers.image.licenses="MIT"
-
 # Builds a cargo-chef plan
 FROM chef AS planner
 COPY --exclude=.git --exclude=target . .
@@ -45,6 +41,16 @@ RUN cp /app/target/$BUILD_PROFILE/ethlambda /app/ethlambda
 # Use Ubuntu as the release image
 FROM ubuntu AS runtime
 WORKDIR /app
+
+LABEL org.opencontainers.image.source=https://github.com/lambdaclass/ethlambda
+LABEL org.opencontainers.image.description="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust."
+LABEL org.opencontainers.image.licenses="MIT"
+
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
 
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
