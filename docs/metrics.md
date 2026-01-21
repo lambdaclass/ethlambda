@@ -10,8 +10,8 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 
 | Name   | Type  | Usage | Sample collection event | Labels | Supported     |
 |--------|-------|-------|-------------------------|--------|---------------|
-| `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | □ |
-| `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | □ |
+| `lean_node_info` | Gauge | Node information (always 1) | On node start | name, version | ✅ |
+| `lean_node_start_time_seconds` | Gauge | Start timestamp | On node start | | ✅ |
 
 
 ## PQ Signature Metrics
@@ -32,7 +32,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | Name   | Type  | Usage | Sample collection event | Labels | Buckets | Supported |
 |--------|-------|-------|-------------------------|--------|---------|-----------|
 | `lean_head_slot` | Gauge | Latest slot of the lean chain | On get fork choice head | | | ✅ |
-| `lean_current_slot` | Gauge | Current slot of the lean chain | On scrape | | | ✅ |
+| `lean_current_slot` | Gauge | Current slot of the lean chain | On scrape | | | ✅(*) |
 | `lean_safe_target_slot` | Gauge | Safe target slot | On safe target update | | | ✅ |
 |`lean_fork_choice_block_processing_time_seconds`| Histogram | Time taken to process block | On fork choice process block | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
 |`lean_attestations_valid_total`| Counter | Total number of valid attestations | On validate attestation | source=block,gossip | | □ |
@@ -59,7 +59,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 
 | Name   | Type  | Usage | Sample collection event | Labels | Supported |
 |--------|-------|-------|-------------------------|--------|-----------|
-|`lean_validators_count`| Gauge | Number of validators managed by a node | On scrape |  | ✅ |
+|`lean_validators_count`| Gauge | Number of validators managed by a node | On scrape |  | ✅(*) |
 
 ## Network Metrics
 
@@ -68,3 +68,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |`lean_connected_peers`| Gauge | Number of connected peers | On scrape | client=lantern,qlean,ream,zeam | □ |
 |`lean_peer_connection_events_total`| Counter | Total number of peer connection events | On peer connection | direction=inbound,outbound<br>result=success,timeout,error | □ |
 |`lean_peer_disconnection_events_total`| Counter | Total number of peer disconnection events | On peer disconnection | direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error | □ |
+
+---
+
+✅(*) **Partial support**: These metrics are implemented but not collected "on scrape" as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.
