@@ -47,6 +47,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}-${{ matrix.arch }}
           platforms: linux/${{ matrix.arch }}
