@@ -77,12 +77,14 @@ pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,
     /// The raw aggregated proof bytes from leanVM.
-    pub proof_data: ByteList<U1048576>,
+    pub proof_data: ByteListMiB,
 }
+
+pub type ByteListMiB = ByteList<U1048576>;
 
 impl AggregatedSignatureProof {
     /// Create a new aggregated signature proof.
-    pub fn new(participants: AggregationBits, proof_data: ByteList<U1048576>) -> Self {
+    pub fn new(participants: AggregationBits, proof_data: ByteListMiB) -> Self {
         Self {
             participants,
             proof_data,
@@ -105,7 +107,7 @@ impl AggregatedSignatureProof {
     }
 
     /// Get the proof data.
-    pub fn proof_data(&self) -> &ByteList<U1048576> {
+    pub fn proof_data(&self) -> &ByteListMiB {
         &self.proof_data
     }
 }
