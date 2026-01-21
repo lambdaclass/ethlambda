@@ -4,6 +4,7 @@ use std::{
 };
 
 use ethlambda_blockchain::{BlockChain, OutboundGossip};
+use ethlambda_types::{primitives::H256, state::Checkpoint};
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -238,6 +239,14 @@ async fn event_loop(
                         metrics::notify_peer_connected(&peer_id, "inbound", "error");
                         warn!(%error, "Incoming connection error");
                     }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        info!(%peer_id, "Connection established, sending status request");
+                        let placeholder_status = Status {
+                            finalized: Checkpoint { root: H256::ZERO, slot: 0 },
+                            head: Checkpoint { root: H256::ZERO, slot: 0 },
+                        };
+                        swarm.behaviour_mut().req_resp.send_request(&peer_id, placeholder_status);
+                    }
                     _ => {
                         trace!(?event, "Ignored swarm event");
                     }
@@ -318,7 +327,6 @@ async fn handle_req_resp_message(
                 .req_resp
                 .send_response(channel, request.clone())
                 .unwrap();
-            swarm.behaviour_mut().req_resp.send_request(&peer, request);
         }
         request_response::Message::Response {
             request_id: _,
