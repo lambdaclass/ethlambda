@@ -200,12 +200,17 @@ fn process_attestations(
     // For is_justifiable_after checks (must use original value, not updated during iteration)
     let original_finalized_slot = state.latest_finalized.slot;
 
-    // Build root_to_slots mapping for justifications pruning.
-    // A root may appear at multiple slots (missed slots produce duplicate zero hashes).
-    let mut root_to_slots: HashMap<H256, Vec<u64>> = HashMap::new();
+    // Map roots to their latest slot for pruning.
+    //
+    // Votes for zero hash are ignored, so we only need the most recent slot
+    // where a root appears to decide whether it is still unfinalized.
+    let mut root_to_slot: HashMap<H256, u64> = HashMap::new();
     for slot in (state.latest_finalized.slot + 1)..state.historical_block_hashes.len() as u64 {
         if let Some(root) = state.historical_block_hashes.get(slot as usize) {
-            root_to_slots.entry(*root).or_default().push(slot);
+            root_to_slot
+                .entry(*root)
+                .and_modify(|x| *x = (*x).max(slot))
+                .or_insert(slot);
         }
     }
 
@@ -230,6 +235,11 @@ fn process_attestations(
             state.latest_finalized.slot,
             target.slot,
         ) {
+            continue;
+        }
+
+        // Ignore votes that reference zero-hash slots.
+        if source.root == H256::ZERO || target.root == H256::ZERO {
             continue;
         }
 
@@ -289,9 +299,8 @@ fn process_attestations(
 
                 // Prune justifications whose roots only appear at now-finalized slots
                 justifications.retain(|root, _| {
-                    root_to_slots.get(root).is_some_and(|slots| {
-                        slots.iter().any(|&slot| slot > state.latest_finalized.slot)
-                    })
+                    let slot = root_to_slot[root];
+                    slot > state.latest_finalized.slot
                 });
             }
         }
