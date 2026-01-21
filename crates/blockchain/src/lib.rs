@@ -144,12 +144,6 @@ impl BlockChainServer {
         // Produce attestation data once for all validators
         let attestation_data = self.store.produce_attestation_data(slot);
 
-        // Hash the attestation data for signing
-        let message_hash = attestation_data.tree_hash_root();
-
-        // Epoch for signing
-        let epoch = slot as u32;
-
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
             // Skip if this validator is the slot proposer
@@ -161,7 +155,7 @@ impl BlockChainServer {
             // Sign the attestation
             let Ok(signature) = self
                 .key_manager
-                .sign_attestation(validator_id, epoch, &message_hash)
+                .sign_attestation(validator_id, &attestation_data)
                 .inspect_err(
                     |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
                 )
@@ -218,11 +212,9 @@ impl BlockChainServer {
         };
 
         // Sign the proposer's attestation
-        let message_hash = proposer_attestation.data.tree_hash_root();
-        let epoch = slot as u32;
         let Ok(proposer_signature) = self
             .key_manager
-            .sign_attestation(validator_id, epoch, &message_hash)
+            .sign_attestation(validator_id, &proposer_attestation.data)
             .inspect_err(
                 |err| error!(%slot, %validator_id, %err, "Failed to sign proposer attestation"),
             )
@@ -243,6 +235,9 @@ impl BlockChainServer {
                     .expect("attestation signatures within limit"),
             },
         };
+
+        // Process the block locally before publishing
+        self.on_block(signed_block.clone());
 
         // Publish to gossip network
         let Ok(()) = self

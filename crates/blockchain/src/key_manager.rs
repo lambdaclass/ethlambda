@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
-    attestation::XmssSignature,
-    primitives::H256,
+    attestation::{AttestationData, XmssSignature},
+    primitives::{H256, TreeHash},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
 
@@ -51,30 +51,45 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Signs an attestation message for the specified validator.
+    /// Signs an attestation for the specified validator.
+    ///
+    /// This method computes the message hash from the attestation data and signs it
+    /// using the validator's secret key.
     ///
     /// # Arguments
     ///
     /// * `validator_id` - The ID of the validator whose key should be used for signing
-    /// * `epoch` - The epoch number used in the XMSS signature scheme
-    /// * `message` - The message hash to sign (typically the hash tree root of AttestationData)
+    /// * `attestation_data` - The attestation data to sign
     ///
     /// # Returns
     ///
     /// Returns an `XmssSignature` (3112 bytes) on success, or a `KeyManagerError` if:
     /// - The validator ID is not found in the KeyManager
     /// - The signing operation fails
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let signature = key_manager.sign_attestation(
-    ///     validator_id,
-    ///     epoch,
-    ///     &message_hash
-    /// )?;
-    /// ```
     pub fn sign_attestation(
+        &mut self,
+        validator_id: u64,
+        attestation_data: &AttestationData,
+    ) -> Result<XmssSignature, KeyManagerError> {
+        let message_hash = attestation_data.tree_hash_root();
+        let epoch = attestation_data.slot as u32;
+        self.sign_message(validator_id, epoch, &message_hash)
+    }
+
+    /// Signs a message hash for the specified validator.
+    ///
+    /// # Arguments
+    ///
+    /// * `validator_id` - The ID of the validator whose key should be used for signing
+    /// * `epoch` - The epoch number used in the XMSS signature scheme
+    /// * `message` - The message hash to sign
+    ///
+    /// # Returns
+    ///
+    /// Returns an `XmssSignature` (3112 bytes) on success, or a `KeyManagerError` if:
+    /// - The validator ID is not found in the KeyManager
+    /// - The signing operation fails
+    fn sign_message(
         &mut self,
         validator_id: u64,
         epoch: u32,
@@ -115,7 +130,7 @@ mod tests {
         let mut key_manager = KeyManager::new(keys);
         let message = H256::default();
 
-        let result = key_manager.sign_attestation(123, 0, &message);
+        let result = key_manager.sign_message(123, 0, &message);
         assert!(matches!(
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))
