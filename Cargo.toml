@@ -61,3 +61,7 @@ ethereum_ssz = "0.8.3"
 ssz_types = "0.10.1"
 tree_hash = "0.9.1"
 tree_hash_derive = "0.9.1"
+
+# Build-time version info
+vergen = { version = "9", features = ["build", "rustc"] }
+vergen-git2 = "9"

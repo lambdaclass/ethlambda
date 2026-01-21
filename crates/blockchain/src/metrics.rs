@@ -55,3 +55,32 @@ pub fn update_safe_target_slot(slot: u64) {
         });
     LEAN_SAFE_TARGET_SLOT.set(slot.try_into().unwrap());
 }
+
+pub fn set_node_info(name: &str, version: &str) {
+    static LEAN_NODE_INFO: std::sync::LazyLock<prometheus::IntGaugeVec> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_gauge_vec!(
+                "lean_node_info",
+                "Node information (always 1)",
+                &["name", "version"]
+            )
+            .unwrap()
+        });
+    LEAN_NODE_INFO.with_label_values(&[name, version]).set(1);
+}
+
+pub fn set_node_start_time() {
+    static LEAN_NODE_START_TIME_SECONDS: std::sync::LazyLock<prometheus::IntGauge> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_gauge!(
+                "lean_node_start_time_seconds",
+                "Timestamp when node started"
+            )
+            .unwrap()
+        });
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    LEAN_NODE_START_TIME_SECONDS.set(timestamp as i64);
+}

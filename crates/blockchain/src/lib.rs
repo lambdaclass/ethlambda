@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 pub mod key_manager;
-mod metrics;
+pub mod metrics;
 pub mod store;
 
 /// Messages sent from the blockchain to the P2P layer for publishing.

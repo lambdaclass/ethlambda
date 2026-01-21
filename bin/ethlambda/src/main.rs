@@ -1,3 +1,5 @@
+mod version;
+
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
@@ -27,6 +29,7 @@ const ASCII_ART: &str = r#"
 "#;
 
 #[derive(Debug, clap::Parser)]
+#[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
     #[arg(long)]
     custom_network_config_dir: PathBuf,
@@ -52,6 +55,10 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let options = CliOptions::parse();
+
+    // Set node info metrics
+    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
+    ethlambda_blockchain::metrics::set_node_start_time();
 
     let metrics_socket = SocketAddr::new(options.metrics_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
