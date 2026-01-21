@@ -2,6 +2,8 @@
 
 We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at `http://<metrics_address>:<metrics_port>/metrics` (default: `http://127.0.0.1:5054/metrics`).
 
+We provide a ready-to-use Grafana + Prometheus monitoring stack in the [`metrics/`](../metrics/) directory. It includes pre-configured dashboards from the [leanMetrics](https://github.com/leanEthereum/leanMetrics) repository for visualizing the metrics described below. See the [metrics README](../metrics/README.md) for setup instructions.
+
 The exposed metrics follow [the leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/3b32b300cca5ed7a7a2b3f142273fae9dbc171bf/metrics.md), with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.
 
 ## Node Info Metrics
