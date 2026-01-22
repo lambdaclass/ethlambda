@@ -161,10 +161,7 @@ pub fn verify_aggregated_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leansig::{
-        serialization::Serializable,
-        signature::{SignatureScheme, SignatureSchemeSecretKey},
-    };
+    use leansig::{serialization::Serializable, signature::SignatureScheme};
     use rand::{SeedableRng, rngs::StdRng};
 
     // The signature scheme type used in ethlambda-types
@@ -186,17 +183,7 @@ mod tests {
         let log_lifetime = 5; // 2^5 = 32 epochs
         let lifetime = 1 << log_lifetime;
 
-        let (pk, mut sk) =
-            LeanSignatureScheme::key_gen(&mut rng, activation_epoch as usize, lifetime);
-
-        // Advance the key to the signing epoch
-        let mut iterations = 0;
-        while !sk.get_prepared_interval().contains(&(signing_epoch as u64))
-            && iterations < signing_epoch
-        {
-            sk.advance_preparation();
-            iterations += 1;
-        }
+        let (pk, sk) = LeanSignatureScheme::key_gen(&mut rng, activation_epoch as usize, lifetime);
 
         let sig = LeanSignatureScheme::sign(&sk, signing_epoch, message).unwrap();
 
