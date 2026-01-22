@@ -27,6 +27,7 @@ pub type Signature = LeanSigSignature;
 
 pub type SignatureSize = Diff<U3600, U488>;
 
+#[derive(Clone)]
 pub struct ValidatorSignature {
     inner: LeanSigSignature,
 }
