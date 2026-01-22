@@ -63,7 +63,6 @@ tree_hash = "0.9.1"
 tree_hash_derive = "0.9.1"
 
 # Build-time version info
-vergen = { version = "9", features = ["build", "rustc"] }
-vergen-git2 = "9"
+vergen-git2 = { version = "9", features = ["rustc"] }
 
 rand = "0.9"

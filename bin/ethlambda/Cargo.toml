@@ -27,5 +27,4 @@ ethereum-types.workspace = true
 clap.workspace = true
 
 [build-dependencies]
-vergen.workspace = true
 vergen-git2.workspace = true

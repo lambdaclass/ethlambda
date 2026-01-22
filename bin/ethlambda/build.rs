@@ -1,5 +1,4 @@
-use vergen::{Emitter, RustcBuilder};
-use vergen_git2::Git2Builder;
+use vergen_git2::{Emitter, Git2Builder, RustcBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let git2 = Git2Builder::default().branch(true).sha(true).build()?;
