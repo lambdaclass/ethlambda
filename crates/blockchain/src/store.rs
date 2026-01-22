@@ -16,7 +16,7 @@ use ethlambda_types::{
 };
 use tracing::{info, trace, warn};
 
-use crate::SECONDS_PER_SLOT;
+use crate::{SECONDS_PER_SLOT, metrics};
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
@@ -175,13 +175,24 @@ impl Store {
     }
 
     pub fn update_head(&mut self) {
-        let head = ethlambda_fork_choice::compute_lmd_ghost_head(
+        let old_head = self.head;
+        let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
             self.latest_justified.root,
             &self.blocks,
             &self.latest_known_attestations,
             0,
         );
-        self.head = head;
+
+        // Detect reorgs: head changed and new head is not a direct child of old head
+        if new_head != old_head
+            && let Some(new_head_block) = self.blocks.get(&new_head)
+            && new_head_block.parent_root != old_head
+        {
+            metrics::inc_fork_choice_reorgs();
+            info!(%old_head, %new_head, "Fork choice reorg detected");
+        }
+
+        self.head = new_head;
     }
 
     pub fn update_safe_target(&mut self) {
@@ -308,7 +319,10 @@ impl Store {
             validator_id,
             data: signed_attestation.message,
         };
-        self.validate_attestation(&attestation)?;
+        if let Err(err) = self.validate_attestation(&attestation) {
+            metrics::inc_attestations_invalid("gossip");
+            return Err(err);
+        }
         let target = attestation.data.target;
         let target_state = self
             .states
@@ -339,6 +353,7 @@ impl Store {
             let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
             self.gossip_signatures.insert(signature_key, signature);
+            metrics::inc_attestations_valid("gossip");
         }
         Ok(())
     }
@@ -501,6 +516,9 @@ impl Store {
                 // TODO: validate attestations before processing
                 if let Err(err) = self.on_attestation(attestation, true) {
                     warn!(%slot, %validator_id, %err, "Invalid attestation in block");
+                    metrics::inc_attestations_invalid("block");
+                } else {
+                    metrics::inc_attestations_valid("block");
                 }
             }
         }
