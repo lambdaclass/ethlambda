@@ -95,6 +95,8 @@ impl KeyManager {
         epoch: u32,
         message: &H256,
     ) -> Result<XmssSignature, KeyManagerError> {
+        let start = std::time::Instant::now();
+
         let secret_key = self
             .keys
             .get_mut(&validator_id)
@@ -109,6 +111,7 @@ impl KeyManager {
         let xmss_sig = XmssSignature::try_from(sig_bytes)
             .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))?;
 
+        crate::metrics::observe_pq_sig_attestation_signing_time(start.elapsed().as_secs_f64());
         Ok(xmss_sig)
     }
 }

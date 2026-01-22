@@ -227,3 +227,63 @@ pub fn observe_fork_choice_reorg_depth(depth: u64) {
         });
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
 }
+
+/// Record attestation signing time in seconds.
+pub fn observe_pq_sig_attestation_signing_time(duration_secs: f64) {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<
+        prometheus::Histogram,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_histogram!(
+            "lean_pq_sig_attestation_signing_time_seconds",
+            "Duration to sign an attestation",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS.observe(duration_secs);
+}
+
+/// Record attestation verification time in seconds.
+pub fn observe_pq_sig_attestation_verification_time(duration_secs: f64) {
+    static LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<
+        prometheus::Histogram,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_histogram!(
+            "lean_pq_sig_attestation_verification_time_seconds",
+            "Duration to verify an attestation signature",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS.observe(duration_secs);
+}
+
+/// Record attestation signatures building time in seconds.
+pub fn observe_pq_sig_attestation_signatures_building_time(duration_secs: f64) {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_BUILDING_TIME_SECONDS: std::sync::LazyLock<
+        prometheus::Histogram,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_histogram!(
+            "lean_pq_sig_attestation_signatures_building_time_seconds",
+            "Duration to build attestation signatures",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_ATTESTATION_SIGNATURES_BUILDING_TIME_SECONDS.observe(duration_secs);
+}
+
+/// Record aggregated signatures verification time in seconds.
+pub fn observe_pq_sig_aggregated_signatures_verification_time(duration_secs: f64) {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<
+        prometheus::Histogram,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_histogram!(
+            "lean_pq_sig_aggregated_signatures_verification_time_seconds",
+            "Duration to verify aggregated signatures",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS.observe(duration_secs);
+}

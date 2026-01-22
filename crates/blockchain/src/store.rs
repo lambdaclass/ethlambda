@@ -389,7 +389,12 @@ impl Store {
             let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
             let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-            if !signature.is_valid(&validator_pubkey, epoch, &message) {
+            let verify_start = std::time::Instant::now();
+            let is_valid = signature.is_valid(&validator_pubkey, epoch, &message);
+            metrics::observe_pq_sig_attestation_verification_time(
+                verify_start.elapsed().as_secs_f64(),
+            );
+            if !is_valid {
                 return Err(StoreError::SignatureVerificationFailed);
             }
         }
@@ -1027,6 +1032,7 @@ fn build_block(
         included_attestations.extend(new_attestations);
     };
 
+    let sig_build_start = std::time::Instant::now();
     // Compute the aggregated signatures for the attestations.
     let (aggregated_attestations, aggregated_signatures) = compute_aggregated_signatures(
         post_state.validators.iter().as_slice(),
@@ -1034,6 +1040,9 @@ fn build_block(
         gossip_signatures,
         aggregated_payloads,
     )?;
+    metrics::observe_pq_sig_attestation_signatures_building_time(
+        sig_build_start.elapsed().as_secs_f64(),
+    );
 
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
@@ -1179,6 +1188,8 @@ fn verify_signatures(
 
     // Verify each attestation's signature proof
     for (attestation, aggregated_proof) in attestations.iter().zip(attestation_signatures) {
+        let agg_verify_start = std::time::Instant::now();
+
         let validator_ids = aggregation_bits_to_validator_indices(&attestation.aggregation_bits);
         if validator_ids.iter().any(|vid| *vid >= num_validators) {
             return Err(StoreError::InvalidValidatorIndex);
@@ -1199,6 +1210,12 @@ fn verify_signatures(
 
         verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, epoch)
             .map_err(StoreError::AggregateVerificationFailed)?;
+
+        // Count as valid since structural checks passed (actual verification is TODO)
+        metrics::inc_pq_sig_aggregated_signatures_valid();
+        metrics::observe_pq_sig_aggregated_signatures_verification_time(
+            agg_verify_start.elapsed().as_secs_f64(),
+        );
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
