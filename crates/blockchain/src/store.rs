@@ -970,13 +970,20 @@ fn build_block(
         .try_into()
         .expect("attestation count exceeds limit");
 
-    let final_block = Block {
+    let mut final_block = Block {
         slot,
         proposer_index,
         parent_root,
-        state_root: post_state.tree_hash_root(),
+        state_root: H256::ZERO,
         body: BlockBody { attestations },
     };
+
+    // Recompute post-state with final block to get correct state root
+    let mut post_state = head_state.clone();
+    process_slots(&mut post_state, slot)?;
+    process_block(&mut post_state, &final_block)?;
+
+    final_block.state_root = post_state.tree_hash_root();
 
     Ok((final_block, post_state, aggregated_signatures))
 }
