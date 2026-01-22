@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -31,6 +32,7 @@ use crate::{
 
 mod gossipsub;
 mod messages;
+pub mod metrics;
 
 pub async fn start_p2p(
     node_key: Vec<u8>,
@@ -154,6 +156,9 @@ async fn event_loop(
     attestation_topic: libp2p::gossipsub::IdentTopic,
     block_topic: libp2p::gossipsub::IdentTopic,
 ) {
+    // Track connected peers for metrics
+    let mut connected_peers: HashSet<PeerId> = HashSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -178,6 +183,60 @@ async fn event_loop(
                         message @ libp2p::gossipsub::Event::Message { .. },
                     )) => {
                         gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
+                    }
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        endpoint,
+                        ..
+                    } => {
+                        let direction = if endpoint.is_dialer() {
+                            "outbound"
+                        } else {
+                            "inbound"
+                        };
+                        connected_peers.insert(peer_id);
+                        metrics::inc_peer_connection_events(direction, "success");
+                        // Use "unknown" as client label since we don't know the client type yet
+                        metrics::set_connected_peers("unknown", connected_peers.len() as u64);
+                        info!(%peer_id, %direction, "Peer connected");
+                    }
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        endpoint,
+                        cause,
+                        ..
+                    } => {
+                        let direction = if endpoint.is_dialer() {
+                            "outbound"
+                        } else {
+                            "inbound"
+                        };
+                        let reason = match cause {
+                            Some(err) => {
+                                // Categorize disconnection reasons
+                                let err_str = err.to_string().to_lowercase();
+                                if err_str.contains("timeout") || err_str.contains("keep alive") {
+                                    "timeout"
+                                } else if err_str.contains("reset") || err_str.contains("refused") {
+                                    "remote_close"
+                                } else {
+                                    "error"
+                                }
+                            }
+                            None => "local_close",
+                        };
+                        connected_peers.remove(&peer_id);
+                        metrics::inc_peer_disconnection_events(direction, reason);
+                        metrics::set_connected_peers("unknown", connected_peers.len() as u64);
+                        info!(%peer_id, %direction, %reason, "Peer disconnected");
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        metrics::inc_peer_connection_events("outbound", "error");
+                        trace!(?peer_id, %error, "Outgoing connection error");
+                    }
+                    SwarmEvent::IncomingConnectionError { error, .. } => {
+                        metrics::inc_peer_connection_events("inbound", "error");
+                        trace!(%error, "Incoming connection error");
                     }
                     _ => {
                         trace!(?event, "Ignored swarm event");
