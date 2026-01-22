@@ -16,6 +16,8 @@ use store::Store;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::store::StoreError;
+
 pub mod key_manager;
 pub mod metrics;
 pub mod store;
@@ -102,7 +104,7 @@ impl BlockChainServer {
         // At interval 0, check if we will propose (but don't build the block yet).
         // Tick forkchoice first to accept attestations, then build the block
         // using the freshly-accepted attestations.
-        let proposer_validator_id = (interval == 0)
+        let proposer_validator_id = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
@@ -237,7 +239,10 @@ impl BlockChainServer {
         };
 
         // Process the block locally before publishing
-        self.on_block(signed_block.clone());
+        if let Err(err) = self.process_block(signed_block.clone()) {
+            error!(%slot, %validator_id, %err, "Failed to process built block");
+            return;
+        };
 
         // Publish to gossip network
         let Ok(()) = self
@@ -251,16 +256,24 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+    fn process_block(
+        &mut self,
+        signed_block: SignedBlockWithAttestation,
+    ) -> Result<(), StoreError> {
         let slot = signed_block.message.block.slot;
-        if let Err(err) = self.store.on_block(signed_block) {
-            warn!(%slot, %err, "Failed to process block");
-            return;
-        }
+        self.store.on_block(signed_block)?;
         metrics::update_head_slot(slot);
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.store.head_state().validators.len() as u64);
+        Ok(())
+    }
+
+    fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+        let slot = signed_block.message.block.slot;
+        if let Err(err) = self.process_block(signed_block) {
+            warn!(%slot, %err, "Failed to process block");
+        }
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {

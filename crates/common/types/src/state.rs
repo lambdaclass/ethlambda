@@ -72,6 +72,7 @@ pub struct Validator {
 
 impl Validator {
     pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, DecodeError> {
+        // TODO: make this unfallible by moving check to the constructor
         ValidatorPublicKey::from_bytes(&self.pubkey)
     }
 }

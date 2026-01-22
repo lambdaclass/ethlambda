@@ -17,6 +17,7 @@ skip-signature-verification = []
 ethlambda-storage.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true
+ethlambda-crypto.workspace = true
 ethlambda-types.workspace = true
 
 spawned-concurrency.workspace = true
@@ -34,7 +35,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 datatest-stable = "0.3.3"
-leansig.workspace = true
 tree_hash = "0.12.0"
 ethereum_ssz = "0.10.0"
 ethereum_ssz_derive = "0.10.0"
