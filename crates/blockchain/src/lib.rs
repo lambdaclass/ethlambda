@@ -102,7 +102,7 @@ impl BlockChainServer {
         // At interval 0, check if we will propose (but don't build the block yet).
         // Tick forkchoice first to accept attestations, then build the block
         // using the freshly-accepted attestations.
-        let proposer_validator_id = (interval == 0)
+        let proposer_validator_id = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
