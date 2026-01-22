@@ -10,3 +10,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ethlambda-types.workspace = true
+
+lean-multisig = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "825c1fc22bad0bfbdb3a656d209944f38d8733fa" }
+# rec_aggregation is needed to access the config types (LeanSigPubKey, LeanSigSignature)
+# which are not re-exported by lean-multisig
+rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", rev = "825c1fc22bad0bfbdb3a656d209944f38d8733fa" }
+
+leansig.workspace = true
+thiserror.workspace = true
+rand.workspace = true
