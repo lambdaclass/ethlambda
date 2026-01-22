@@ -41,6 +41,10 @@ impl ValidatorSignature {
         self.inner.to_bytes()
     }
 
+    pub fn is_valid(&self, pubkey: &ValidatorPublicKey, epoch: u32, message: &H256) -> bool {
+        LeanSignatureScheme::verify(&pubkey.inner, epoch, message, &self.inner)
+    }
+
     /// Get a reference to the inner leansig signature.
     ///
     /// This is useful for passing to lean-multisig aggregation functions.
@@ -62,10 +66,6 @@ impl ValidatorPublicKey {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner.to_bytes()
-    }
-
-    pub fn is_valid(&self, epoch: u32, message: &H256, signature: &ValidatorSignature) -> bool {
-        LeanSignatureScheme::verify(&self.inner, epoch, message, &signature.inner)
     }
 
     /// Get a reference to the inner leansig public key.

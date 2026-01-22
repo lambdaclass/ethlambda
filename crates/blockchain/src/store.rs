@@ -328,7 +328,7 @@ impl Store {
             let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
             let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-            if !validator_pubkey.is_valid(epoch, &message, &signature) {
+            if !signature.is_valid(&validator_pubkey, epoch, &message) {
                 return Err(StoreError::SignatureVerificationFailed);
             }
         }
@@ -1099,7 +1099,7 @@ fn verify_signatures(
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
 
-    if !proposer_pubkey.is_valid(epoch, &message, &proposer_signature) {
+    if !proposer_signature.is_valid(&proposer_pubkey, epoch, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
     Ok(())
