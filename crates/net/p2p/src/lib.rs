@@ -23,7 +23,10 @@ use tracing::{info, trace};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
-    messages::status::{STATUS_PROTOCOL_V1, Status},
+    messages::{
+        MAX_COMPRESSED_PAYLOAD_SIZE,
+        status::{STATUS_PROTOCOL_V1, Status},
+    },
 };
 
 mod gossipsub;
@@ -53,6 +56,13 @@ pub async fn start_p2p(
         .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
+        // Taken from ream
+        .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
+        .max_messages_per_rpc(Some(500))
+        .validate_messages()
+        .allow_self_origin(true)
+        .flood_publish(false)
+        .idontwant_message_size_threshold(1000)
         .build()
         .expect("invalid gossipsub config");
 
