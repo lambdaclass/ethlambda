@@ -321,8 +321,7 @@ impl Store {
             .get_pubkey()
             .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
         let message = attestation.data.tree_hash_root();
-        #[cfg(not(feature = "skip-signature-verification"))]
-        {
+        if cfg!(not(feature = "skip-signature-verification")) {
             use ethlambda_types::signature::ValidatorSignature;
             // Use attestation.data.slot as epoch (matching what Zeam and ethlambda use for signing)
             let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
@@ -332,15 +331,15 @@ impl Store {
                 return Err(StoreError::SignatureVerificationFailed);
             }
         }
-        #[cfg(feature = "skip-signature-verification")]
-        let _ = validator_pubkey;
         self.on_attestation(attestation, false)?;
 
-        // Store signature for later lookup during block building
-        let signature_key = (validator_id, message);
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        self.gossip_signatures.insert(signature_key, signature);
+        if cfg!(not(feature = "skip-signature-verification")) {
+            // Store signature for later lookup during block building
+            let signature_key = (validator_id, message);
+            let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
+            self.gossip_signatures.insert(signature_key, signature);
+        }
         Ok(())
     }
 
@@ -446,8 +445,9 @@ impl Store {
         // Validate cryptographic signatures
         // TODO: extract signature verification to a pre-checks function
         // to avoid the need for this
-        #[cfg(not(feature = "skip-signature-verification"))]
-        verify_signatures(parent_state, &signed_block)?;
+        if cfg!(not(feature = "skip-signature-verification")) {
+            verify_signatures(parent_state, &signed_block)?;
+        }
 
         // Execute state transition function to compute post-block state
         let mut post_state = parent_state.clone();
@@ -514,16 +514,18 @@ impl Store {
         // The proposer's attestation should NOT affect this block's fork choice position.
         // It is treated as pending until interval 3 (end of slot).
 
-        // Store the proposer's signature for potential future block building
-        let proposer_sig_key: SignatureKey = (
-            proposer_attestation.validator_id,
-            proposer_attestation.data.tree_hash_root(),
-        );
-        let proposer_sig =
-            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-                .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        self.gossip_signatures
-            .insert(proposer_sig_key, proposer_sig);
+        if cfg!(not(feature = "skip-signature-verification")) {
+            // Store the proposer's signature for potential future block building
+            let proposer_sig_key: SignatureKey = (
+                proposer_attestation.validator_id,
+                proposer_attestation.data.tree_hash_root(),
+            );
+            let proposer_sig =
+                ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+                    .map_err(|_| StoreError::SignatureDecodingFailed)?;
+            self.gossip_signatures
+                .insert(proposer_sig_key, proposer_sig);
+        }
 
         // Process proposer attestation (enters "new" stage, not "known")
         // TODO: validate attestations before processing
@@ -1079,7 +1081,6 @@ fn compute_aggregated_signatures(
 /// Verify all signatures in a signed block.
 ///
 /// Each attestation has a corresponding proof in the signature list.
-#[cfg(not(feature = "skip-signature-verification"))]
 fn verify_signatures(
     state: &State,
     signed_block: &SignedBlockWithAttestation,
