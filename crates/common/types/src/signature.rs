@@ -46,11 +46,8 @@ impl ValidatorSignature {
         LeanSignatureScheme::verify(&pubkey.inner, epoch, message, &self.inner)
     }
 
-    /// Get a reference to the inner leansig signature.
-    ///
-    /// This is useful for passing to lean-multisig aggregation functions.
-    pub fn as_inner(&self) -> &LeanSigSignature {
-        &self.inner
+    pub fn into_inner(self) -> LeanSigSignature {
+        self.inner
     }
 }
 
@@ -69,11 +66,8 @@ impl ValidatorPublicKey {
         self.inner.to_bytes()
     }
 
-    /// Get a reference to the inner leansig public key.
-    ///
-    /// This is useful for passing to lean-multisig aggregation functions.
-    pub fn as_inner(&self) -> &LeanSigPublicKey {
-        &self.inner
+    pub fn into_inner(self) -> LeanSigPublicKey {
+        self.inner
     }
 }
 

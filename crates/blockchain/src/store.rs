@@ -785,10 +785,10 @@ pub enum StoreError {
     ParticipantsMismatch,
 
     #[error("Aggregated signature verification failed: {0}")]
-    AggregatedSignatureVerificationFailed(String),
+    AggregateVerificationFailed(ethlambda_crypto::VerificationError),
 
     #[error("Signature aggregation failed: {0}")]
-    SignatureAggregationFailed(String),
+    SignatureAggregationFailed(ethlambda_crypto::AggregationError),
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
@@ -962,7 +962,7 @@ fn build_block(
         &included_attestations,
         gossip_signatures,
         aggregated_payloads,
-    );
+    )?;
 
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
@@ -989,7 +989,7 @@ fn compute_aggregated_signatures(
     attestations: &[Attestation],
     gossip_signatures: &HashMap<SignatureKey, ValidatorSignature>,
     aggregated_payloads: &HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
-) -> (Vec<AggregatedAttestation>, Vec<AggregatedSignatureProof>) {
+) -> Result<(Vec<AggregatedAttestation>, Vec<AggregatedSignatureProof>), StoreError> {
     let mut results = vec![];
 
     for aggregated in aggregate_attestations_by_data(attestations) {
@@ -1024,8 +1024,8 @@ fn compute_aggregated_signatures(
         if !gossip_ids.is_empty() {
             let participants = aggregation_bits_from_validator_indices(&gossip_ids);
             let proof_data =
-                aggregate_signatures(&gossip_keys, &gossip_sigs, &message, data.slot as u32)
-                    .unwrap();
+                aggregate_signatures(gossip_keys, gossip_sigs, &message, data.slot as u32)
+                    .map_err(StoreError::SignatureAggregationFailed)?;
             let aggregated_attestation = AggregatedAttestation {
                 aggregation_bits: participants.clone(),
                 data: data.clone(),
@@ -1073,11 +1073,7 @@ fn compute_aggregated_signatures(
         }
     }
 
-    if results.is_empty() {
-        return (vec![], vec![]);
-    }
-
-    results.into_iter().unzip()
+    Ok(results.into_iter().unzip())
 }
 
 /// Verify all signatures in a signed block.
@@ -1124,8 +1120,8 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
-        verify_aggregated_signature(&aggregated_proof.proof_data, &public_keys, &message, epoch)
-            .map_err(|e| StoreError::AggregatedSignatureVerificationFailed(format!("{e}")))?;
+        verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, epoch)
+            .map_err(StoreError::AggregateVerificationFailed)?;
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;

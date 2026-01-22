@@ -1,18 +1,16 @@
 use std::sync::Once;
 
-use ethlambda_types::primitives::{Decode, Encode, VariableList};
+use ethlambda_types::primitives::{Decode, Encode};
 use ethlambda_types::{
     block::ByteListMiB,
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
 use lean_multisig::{
-    Devnet2XmssAggregateSignature, ProofError, XmssAggregateError,
-    xmss_aggregate_signatures as lean_xmss_aggregate_signatures, xmss_aggregation_setup_prover,
-    xmss_aggregation_setup_verifier,
-    xmss_verify_aggregated_signatures as lean_xmss_verify_aggregated_signatures,
+    Devnet2XmssAggregateSignature, ProofError, XmssAggregateError, xmss_aggregate_signatures,
+    xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
+    xmss_verify_aggregated_signatures,
 };
-use leansig::serialization::Serializable;
 use rec_aggregation::xmss_aggregate::config::{LeanSigPubKey, LeanSigSignature};
 use thiserror::Error;
 
@@ -39,17 +37,11 @@ pub enum AggregationError {
     #[error("public key count ({0}) does not match signature count ({1})")]
     CountMismatch(usize, usize),
 
-    #[error("failed to convert public key at index {index}: {reason}")]
-    PublicKeyConversion { index: usize, reason: String },
-
-    #[error("failed to convert signature at index {index}: {reason}")]
-    SignatureConversion { index: usize, reason: String },
-
     #[error("aggregation failed: {0:?}")]
     AggregationFailed(XmssAggregateError),
 
-    #[error("proof serialization failed")]
-    SerializationFailed,
+    #[error("proof size too big: {0} bytes")]
+    ProofTooBig(usize),
 }
 
 /// Error type for signature verification operations.
@@ -63,46 +55,6 @@ pub enum VerificationError {
 
     #[error("verification failed: {0}")]
     ProofError(#[from] ProofError),
-}
-
-/// Convert a ValidatorPublicKey to lean-multisig's LeanSigPubKey.
-fn convert_pubkey(
-    pk: &ValidatorPublicKey,
-    index: usize,
-) -> Result<LeanSigPubKey, AggregationError> {
-    let bytes = pk.to_bytes();
-    LeanSigPubKey::from_bytes(&bytes).map_err(|e| AggregationError::PublicKeyConversion {
-        index,
-        reason: format!("{:?}", e),
-    })
-}
-
-/// Convert a ValidatorSignature to lean-multisig's LeanSigSignature.
-fn convert_signature(
-    sig: &ValidatorSignature,
-    index: usize,
-) -> Result<LeanSigSignature, AggregationError> {
-    let bytes = sig.to_bytes();
-    LeanSigSignature::from_bytes(&bytes).map_err(|e| AggregationError::SignatureConversion {
-        index,
-        reason: format!("{:?}", e),
-    })
-}
-
-/// Serialize a Devnet2XmssAggregateSignature to ByteListMiB.
-fn serialize_aggregate(
-    agg: &Devnet2XmssAggregateSignature,
-) -> Result<ByteListMiB, AggregationError> {
-    let bytes = agg.as_ssz_bytes();
-    VariableList::new(bytes).map_err(|_| AggregationError::SerializationFailed)
-}
-
-/// Deserialize a ByteListMiB to Devnet2XmssAggregateSignature.
-fn deserialize_aggregate(
-    bytes: &ByteListMiB,
-) -> Result<Devnet2XmssAggregateSignature, VerificationError> {
-    Devnet2XmssAggregateSignature::from_ssz_bytes(bytes.iter().as_slice())
-        .map_err(|_| VerificationError::DeserializationFailed)
 }
 
 /// Aggregate multiple XMSS signatures into a single proof.
@@ -123,8 +75,8 @@ fn deserialize_aggregate(
 ///
 /// The serialized aggregated proof as `ByteListMiB`, or an error if aggregation fails.
 pub fn aggregate_signatures(
-    public_keys: &[ValidatorPublicKey],
-    signatures: &[ValidatorSignature],
+    public_keys: Vec<ValidatorPublicKey>,
+    signatures: Vec<ValidatorSignature>,
     message: &H256,
     epoch: u32,
 ) -> Result<ByteListMiB, AggregationError> {
@@ -144,23 +96,23 @@ pub fn aggregate_signatures(
 
     // Convert public keys
     let lean_pubkeys: Vec<LeanSigPubKey> = public_keys
-        .iter()
-        .enumerate()
-        .map(|(i, pk)| convert_pubkey(pk, i))
-        .collect::<Result<_, _>>()?;
+        .into_iter()
+        .map(ValidatorPublicKey::into_inner)
+        .collect();
 
     // Convert signatures
     let lean_sigs: Vec<LeanSigSignature> = signatures
-        .iter()
-        .enumerate()
-        .map(|(i, sig)| convert_signature(sig, i))
-        .collect::<Result<_, _>>()?;
+        .into_iter()
+        .map(ValidatorSignature::into_inner)
+        .collect();
 
     // Aggregate using lean-multisig
-    let aggregate = lean_xmss_aggregate_signatures(&lean_pubkeys, &lean_sigs, message, epoch)
+    let aggregate = xmss_aggregate_signatures(&lean_pubkeys, &lean_sigs, message, epoch)
         .map_err(AggregationError::AggregationFailed)?;
 
-    serialize_aggregate(&aggregate)
+    let serialized = aggregate.as_ssz_bytes();
+    let serialized_len = serialized.len();
+    ByteListMiB::new(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
 }
 
 /// Verify an aggregated signature proof.
@@ -180,7 +132,7 @@ pub fn aggregate_signatures(
 /// `Ok(())` if verification succeeds, or an error describing why it failed.
 pub fn verify_aggregated_signature(
     proof_data: &ByteListMiB,
-    public_keys: &[ValidatorPublicKey],
+    public_keys: Vec<ValidatorPublicKey>,
     message: &H256,
     epoch: u32,
 ) -> Result<(), VerificationError> {
@@ -188,22 +140,16 @@ pub fn verify_aggregated_signature(
 
     // Convert public keys
     let lean_pubkeys: Vec<LeanSigPubKey> = public_keys
-        .iter()
-        .enumerate()
-        .map(|(i, pk)| {
-            let bytes = pk.to_bytes();
-            LeanSigPubKey::from_bytes(&bytes).map_err(|e| VerificationError::PublicKeyConversion {
-                index: i,
-                reason: format!("{:?}", e),
-            })
-        })
-        .collect::<Result<_, _>>()?;
+        .into_iter()
+        .map(ValidatorPublicKey::into_inner)
+        .collect();
 
     // Deserialize the aggregate proof
-    let aggregate = deserialize_aggregate(proof_data)?;
+    let aggregate = Devnet2XmssAggregateSignature::from_ssz_bytes(proof_data.iter().as_slice())
+        .map_err(|_| VerificationError::DeserializationFailed)?;
 
     // Verify using lean-multisig
-    lean_xmss_verify_aggregated_signatures(&lean_pubkeys, message, &aggregate, epoch)?;
+    xmss_verify_aggregated_signatures(&lean_pubkeys, message, &aggregate, epoch)?;
 
     Ok(())
 }
@@ -211,7 +157,10 @@ pub fn verify_aggregated_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leansig::signature::{SignatureScheme, SignatureSchemeSecretKey};
+    use leansig::{
+        serialization::Serializable,
+        signature::{SignatureScheme, SignatureSchemeSecretKey},
+    };
     use rand::{SeedableRng, rngs::StdRng};
 
     // The signature scheme type used in ethlambda-types
@@ -274,14 +223,14 @@ mod tests {
 
         let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, epoch, &message);
 
-        let result = aggregate_signatures(std::slice::from_ref(&pk), &[sig], &message, epoch);
+        let result = aggregate_signatures(vec![pk.clone()], vec![sig], &message, epoch);
         assert!(result.is_ok(), "Aggregation failed: {:?}", result.err());
 
         let proof_data = result.unwrap();
 
         // Verify the aggregated signature
         let verify_result =
-            verify_aggregated_signature(&proof_data, std::slice::from_ref(&pk), &message, epoch);
+            verify_aggregated_signature(&proof_data, vec![pk.clone()], &message, epoch);
         assert!(
             verify_result.is_ok(),
             "Verification failed: {:?}",
@@ -310,13 +259,13 @@ mod tests {
             signatures.push(sig);
         }
 
-        let result = aggregate_signatures(&pubkeys, &signatures, &message, epoch);
+        let result = aggregate_signatures(pubkeys.clone(), signatures, &message, epoch);
         assert!(result.is_ok(), "Aggregation failed: {:?}", result.err());
 
         let proof_data = result.unwrap();
 
         // Verify the aggregated signature
-        let verify_result = verify_aggregated_signature(&proof_data, &pubkeys, &message, epoch);
+        let verify_result = verify_aggregated_signature(&proof_data, pubkeys, &message, epoch);
         assert!(
             verify_result.is_ok(),
             "Verification failed: {:?}",
@@ -334,15 +283,11 @@ mod tests {
         let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, epoch, &message);
 
         let proof_data =
-            aggregate_signatures(std::slice::from_ref(&pk), &[sig], &message, epoch).unwrap();
+            aggregate_signatures(vec![pk.clone()], vec![sig], &message, epoch).unwrap();
 
         // Verify with wrong message should fail
-        let verify_result = verify_aggregated_signature(
-            &proof_data,
-            std::slice::from_ref(&pk),
-            &wrong_message,
-            epoch,
-        );
+        let verify_result =
+            verify_aggregated_signature(&proof_data, vec![pk.clone()], &wrong_message, epoch);
         assert!(
             verify_result.is_err(),
             "Verification should have failed with wrong message"
@@ -359,15 +304,11 @@ mod tests {
         let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, epoch, &message);
 
         let proof_data =
-            aggregate_signatures(std::slice::from_ref(&pk), &[sig], &message, epoch).unwrap();
+            aggregate_signatures(vec![pk.clone()], vec![sig], &message, epoch).unwrap();
 
         // Verify with wrong epoch should fail
-        let verify_result = verify_aggregated_signature(
-            &proof_data,
-            std::slice::from_ref(&pk),
-            &message,
-            wrong_epoch,
-        );
+        let verify_result =
+            verify_aggregated_signature(&proof_data, vec![pk.clone()], &message, wrong_epoch);
         assert!(
             verify_result.is_err(),
             "Verification should have failed with wrong epoch"
