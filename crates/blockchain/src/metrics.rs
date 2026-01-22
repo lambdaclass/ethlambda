@@ -129,3 +129,58 @@ pub fn inc_fork_choice_reorgs() {
         });
     LEAN_FORK_CHOICE_REORGS_TOTAL.inc();
 }
+
+/// Increment the PQ aggregated signatures counter.
+pub fn inc_pq_sig_aggregated_signatures() {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_TOTAL: std::sync::LazyLock<prometheus::IntCounter> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_counter!(
+                "lean_pq_sig_aggregated_signatures_total",
+                "Count of aggregated signatures created"
+            )
+            .unwrap()
+        });
+    LEAN_PQ_SIG_AGGREGATED_SIGNATURES_TOTAL.inc();
+}
+
+/// Increment the attestations in aggregated signatures counter.
+pub fn inc_pq_sig_attestations_in_aggregated_signatures(count: u64) {
+    static LEAN_PQ_SIG_ATTESTATIONS_IN_AGGREGATED_SIGNATURES_TOTAL: std::sync::LazyLock<
+        prometheus::IntCounter,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_int_counter!(
+            "lean_pq_sig_attestations_in_aggregated_signatures_total",
+            "Count of attestations included in aggregated signatures"
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_ATTESTATIONS_IN_AGGREGATED_SIGNATURES_TOTAL.inc_by(count);
+}
+
+/// Increment the valid aggregated signatures counter.
+pub fn inc_pq_sig_aggregated_signatures_valid() {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VALID_TOTAL: std::sync::LazyLock<
+        prometheus::IntCounter,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_int_counter!(
+            "lean_pq_sig_aggregated_signatures_valid_total",
+            "Count of valid aggregated signatures"
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VALID_TOTAL.inc();
+}
+
+/// Increment the invalid aggregated signatures counter.
+pub fn inc_pq_sig_aggregated_signatures_invalid() {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<
+        prometheus::IntCounter,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_int_counter!(
+            "lean_pq_sig_aggregated_signatures_invalid_total",
+            "Count of invalid aggregated signatures"
+        )
+        .unwrap()
+    });
+    LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL.inc();
+}
