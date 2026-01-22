@@ -856,19 +856,19 @@ fn build_block(
     available_attestations: &[Attestation],
     known_block_roots: &HashSet<H256>,
     gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
-    _aggregated_payloads: &HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
+    aggregated_payloads: &HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
 ) -> Result<(Block, State, Vec<AggregatedSignatureProof>), StoreError> {
     // Start with empty attestation set
-    let mut attestations: Vec<Attestation> = Vec::new();
+    let mut included_attestations: Vec<Attestation> = Vec::new();
 
     // Track which attestations we've already considered (by validator_id, data_root)
     let mut included_keys: HashSet<SignatureKey> = HashSet::new();
 
     // Fixed-point loop: collect attestations until no new ones can be added
-    let (post_state, aggregated_attestations) = loop {
+    let post_state = loop {
         // Aggregate attestations by data for the candidate block
-        let aggregated = aggregate_attestations_by_data(&attestations);
-        let aggregated_attestations: AggregatedAttestations = aggregated
+        let aggregated = aggregate_attestations_by_data(&included_attestations);
+        let attestations: AggregatedAttestations = aggregated
             .clone()
             .try_into()
             .expect("attestation count exceeds limit");
@@ -879,9 +879,7 @@ fn build_block(
             proposer_index,
             parent_root,
             state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: aggregated_attestations,
-            },
+            body: BlockBody { attestations },
         };
 
         // Apply state transition: process_slots + process_block
@@ -889,17 +887,17 @@ fn build_block(
         process_slots(&mut post_state, slot)?;
         process_block(&mut post_state, &candidate_block)?;
 
+        // No attestation source provided: done after computing post_state
+        if available_attestations.is_empty() || known_block_roots.is_empty() {
+            break post_state;
+        }
+
         // Find new valid attestations matching post-state requirements
         let mut new_attestations: Vec<Attestation> = Vec::new();
 
         for attestation in available_attestations {
             let data_root = attestation.data.tree_hash_root();
             let sig_key: SignatureKey = (attestation.validator_id, data_root);
-
-            // Skip if already included
-            if included_keys.contains(&sig_key) {
-                continue;
-            }
 
             // Skip if target block is unknown
             if !known_block_roots.contains(&attestation.data.head.root) {
@@ -911,9 +909,16 @@ fn build_block(
                 continue;
             }
 
+            // Avoid adding duplicates of attestations already in the candidate set
+            if included_keys.contains(&sig_key) {
+                continue;
+            }
+
             // Only include if we have a signature for this attestation
-            // TODO: consider aggregated payloads as well
-            if gossip_signatures.contains_key(&sig_key) {
+            let has_gossip_sig = gossip_signatures.contains_key(&sig_key);
+            let has_block_proof = aggregated_payloads.contains_key(&sig_key);
+
+            if has_gossip_sig || has_block_proof {
                 new_attestations.push(attestation.clone());
                 included_keys.insert(sig_key);
             }
@@ -921,21 +926,21 @@ fn build_block(
 
         // Fixed point reached: no new attestations found
         if new_attestations.is_empty() {
-            break (post_state, aggregated);
+            break post_state;
         }
 
         // Add new attestations and continue iteration
-        attestations.extend(new_attestations);
+        included_attestations.extend(new_attestations);
     };
 
-    // Compute aggregated signature proofs for each aggregated attestation
-    let signatures: Vec<AggregatedSignatureProof> = aggregated_attestations
-        .iter()
-        .map(|agg_att| aggregate_attestation_signatures(agg_att, head_state, gossip_signatures))
-        .collect::<Result<_, _>>()?;
+    // Compute the aggregated signatures for the attestations.
+    let (aggregated_attestations, aggregated_signatures) = compute_aggregated_signatures(
+        included_attestations,
+        gossip_signatures,
+        aggregated_payloads,
+    );
 
-    // Build final block with correct state root
-    let final_aggregated: AggregatedAttestations = aggregated_attestations
+    let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
         .expect("attestation count exceeds limit");
 
@@ -944,63 +949,19 @@ fn build_block(
         proposer_index,
         parent_root,
         state_root: post_state.tree_hash_root(),
-        body: BlockBody {
-            attestations: final_aggregated,
-        },
+        body: BlockBody { attestations },
     };
 
-    Ok((final_block, post_state, signatures))
+    Ok((final_block, post_state, aggregated_signatures))
 }
 
-/// Aggregate individual validator signatures for an attestation into a single proof.
-///
-/// Collects the signatures from gossip for each participating validator,
-/// retrieves their public keys, and calls the crypto aggregation function.
-fn aggregate_attestation_signatures(
-    agg_att: &AggregatedAttestation,
-    state: &State,
-    gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
-) -> Result<AggregatedSignatureProof, StoreError> {
-    use ethlambda_crypto::aggregate_signatures;
-    use ethlambda_types::signature::ValidatorSignature;
-
-    let validator_ids = aggregation_bits_to_validator_indices(&agg_att.aggregation_bits);
-    let data_root = agg_att.data.tree_hash_root();
-    let epoch: u32 = agg_att.data.slot.try_into().expect("slot exceeds u32");
-
-    // Collect public keys and signatures for all participating validators
-    let mut public_keys = Vec::with_capacity(validator_ids.len());
-    let mut signatures = Vec::with_capacity(validator_ids.len());
-
-    for &vid in &validator_ids {
-        // Get validator's public key
-        let validator = state
-            .validators
-            .get(vid as usize)
-            .ok_or(StoreError::InvalidValidatorIndex)?;
-        let pubkey = validator
-            .get_pubkey()
-            .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
-        public_keys.push(pubkey);
-
-        // Get validator's signature from gossip
-        let sig_key: SignatureKey = (vid, data_root);
-        let sig_bytes = gossip_signatures
-            .get(&sig_key)
-            .ok_or(StoreError::SignatureDecodingFailed)?;
-        let signature = ValidatorSignature::from_bytes(sig_bytes)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        signatures.push(signature);
-    }
-
-    // Aggregate using lean-multisig
-    let proof_data = aggregate_signatures(&public_keys, &signatures, &data_root, epoch)
-        .map_err(|e| StoreError::SignatureAggregationFailed(format!("{e}")))?;
-
-    Ok(AggregatedSignatureProof::new(
-        agg_att.aggregation_bits.clone(),
-        proof_data,
-    ))
+/// Compute aggregated signatures for a set of attestations.
+fn compute_aggregated_signatures(
+    _attestations: Vec<Attestation>,
+    _gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
+    _aggregated_payloads: &HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
+) -> (Vec<AggregatedAttestation>, Vec<AggregatedSignatureProof>) {
+    todo!()
 }
 
 /// Verify all signatures in a signed block.
@@ -1034,13 +995,6 @@ fn verify_signatures(
             return Err(StoreError::InvalidValidatorIndex);
         }
 
-        // Verify participants bitfield matches attestation aggregation bits
-        let proof_validator_ids =
-            aggregation_bits_to_validator_indices(aggregated_proof.participants());
-        if validator_ids != proof_validator_ids {
-            return Err(StoreError::ParticipantsMismatch);
-        }
-
         let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.tree_hash_root();
 
@@ -1048,34 +1002,14 @@ fn verify_signatures(
         let public_keys: Vec<_> = validator_ids
             .iter()
             .map(|&vid| {
-                validators
-                    .get(vid as usize)
-                    .ok_or(StoreError::InvalidValidatorIndex)
-                    .and_then(|v| {
-                        v.get_pubkey()
-                            .map_err(|_| StoreError::PubkeyDecodingFailed(v.index))
-                    })
+                validators[vid as usize]
+                    .get_pubkey()
+                    .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
             })
             .collect::<Result<_, _>>()?;
 
-        // Verify the aggregated proof using lean-multisig
-        // Skip verification for placeholder proofs (too small to be valid)
-        // A valid lean-multisig proof is much larger than 100 bytes
-        const MIN_VALID_PROOF_SIZE: usize = 100;
-        if aggregated_proof.proof_data.len() < MIN_VALID_PROOF_SIZE {
-            warn!(
-                proof_size = aggregated_proof.proof_data.len(),
-                "Skipping aggregated signature verification: proof too small (placeholder?)"
-            );
-        } else {
-            verify_aggregated_signature(
-                &public_keys,
-                &message,
-                &aggregated_proof.proof_data,
-                epoch,
-            )
+        verify_aggregated_signature(&aggregated_proof.proof_data, &public_keys, &message, epoch)
             .map_err(|e| StoreError::AggregatedSignatureVerificationFailed(format!("{e}")))?;
-        }
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;

@@ -176,9 +176,9 @@ pub fn aggregate_signatures(
 ///
 /// `Ok(())` if verification succeeds, or an error describing why it failed.
 pub fn verify_aggregated_signature(
+    proof_data: &ByteListMiB,
     public_keys: &[ValidatorPublicKey],
     message: &H256,
-    proof_data: &ByteListMiB,
     epoch: u32,
 ) -> Result<(), VerificationError> {
     ensure_verifier_ready();
@@ -287,7 +287,7 @@ mod tests {
 
         // Verify the aggregated signature
         let verify_result =
-            verify_aggregated_signature(std::slice::from_ref(&pk), &message, &proof_data, epoch);
+            verify_aggregated_signature(&proof_data, std::slice::from_ref(&pk), &message, epoch);
         assert!(
             verify_result.is_ok(),
             "Verification failed: {:?}",
@@ -323,7 +323,7 @@ mod tests {
         let proof_data = result.unwrap();
 
         // Verify the aggregated signature
-        let verify_result = verify_aggregated_signature(&pubkeys, &message, &proof_data, epoch);
+        let verify_result = verify_aggregated_signature(&proof_data, &pubkeys, &message, epoch);
         assert!(
             verify_result.is_ok(),
             "Verification failed: {:?}",
@@ -346,9 +346,9 @@ mod tests {
 
         // Verify with wrong message should fail
         let verify_result = verify_aggregated_signature(
+            &proof_data,
             std::slice::from_ref(&pk),
             &wrong_message,
-            &proof_data,
             epoch,
         );
         assert!(
@@ -372,9 +372,9 @@ mod tests {
 
         // Verify with wrong epoch should fail
         let verify_result = verify_aggregated_signature(
+            &proof_data,
             std::slice::from_ref(&pk),
             &message,
-            &proof_data,
             wrong_epoch,
         );
         assert!(
