@@ -7,7 +7,8 @@ lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
 test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
-	cargo test --workspace
+	# Tests need to be run on release to avoid stack overflows during signature aggregation
+	cargo test --workspace --release
 	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
 
 GIT_COMMIT=$(shell git rev-parse HEAD)

@@ -33,6 +33,9 @@ pub fn ensure_verifier_ready() {
 /// Error type for signature aggregation operations.
 #[derive(Debug, Error)]
 pub enum AggregationError {
+    #[error("empty input")]
+    EmptyInput,
+
     #[error("public key count ({0}) does not match signature count ({1})")]
     CountMismatch(usize, usize),
 
@@ -134,7 +137,7 @@ pub fn aggregate_signatures(
 
     // Handle empty input
     if public_keys.is_empty() {
-        return Err(AggregationError::CountMismatch(0, 0));
+        return Err(AggregationError::EmptyInput);
     }
 
     ensure_prover_ready();
@@ -255,7 +258,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: requires lean-multisig setup with large stack"]
     fn test_setup_is_idempotent() {
         // Should not panic when called multiple times
         ensure_prover_ready();
@@ -265,14 +267,6 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_mismatched_counts_fails() {
-        // This test verifies the count check - we don't need valid keys
-        let result = aggregate_signatures(&[], &[], &H256::ZERO, 10);
-        assert!(matches!(result, Err(AggregationError::CountMismatch(0, 0))));
-    }
-
-    #[test]
-    #[ignore = "expensive: requires XMSS key generation and proof generation"]
     fn test_aggregate_single_signature() {
         let message = H256::from([42u8; 32]);
         let epoch = 10u32;
@@ -296,7 +290,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: requires XMSS key generation and proof generation"]
     fn test_aggregate_multiple_signatures() {
         let message = H256::from([42u8; 32]);
         let epoch = 15u32;
@@ -332,7 +325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: requires XMSS key generation and proof generation"]
     fn test_verify_wrong_message_fails() {
         let message = H256::from([42u8; 32]);
         let wrong_message = H256::from([43u8; 32]);
@@ -358,7 +350,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "expensive: requires XMSS key generation and proof generation"]
     fn test_verify_wrong_epoch_fails() {
         let message = H256::from([42u8; 32]);
         let epoch = 10u32;
