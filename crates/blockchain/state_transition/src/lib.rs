@@ -29,6 +29,8 @@ pub enum Error {
 ///
 /// Similar to the spec's `State.state_transition`: https://github.com/leanEthereum/leanSpec/blob/bf0f606a75095cf1853529bc770516b1464d9716/src/lean_spec/subspecs/containers/state/state.py#L569
 pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
+    let start = std::time::Instant::now();
+
     process_slots(state, block.slot)?;
     process_block(state, block)?;
 
@@ -51,11 +53,14 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
             computed: computed_state_root,
         });
     }
+    metrics::observe_state_transition_time(start.elapsed().as_secs_f64());
     Ok(())
 }
 
 /// Advance the state through empty slots up to, but not including, target_slot.
 pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
+    let start = std::time::Instant::now();
+
     if state.slot >= target_slot {
         return Err(Error::StateSlotIsNewer {
             target_slot,
@@ -69,13 +74,18 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
     let slots_processed = target_slot - state.slot;
     state.slot = target_slot;
     metrics::inc_slots_processed(slots_processed);
+    metrics::observe_slots_processing_time(start.elapsed().as_secs_f64());
     Ok(())
 }
 
 /// Apply full block processing including header and body.
 pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
+    let start = std::time::Instant::now();
+
     process_block_header(state, block)?;
     process_attestations(state, &block.body.attestations)?;
+
+    metrics::observe_block_processing_time(start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -184,6 +194,7 @@ fn process_attestations(
     state: &mut State,
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
+    let start = std::time::Instant::now();
     let validator_count = state.validators.len();
     let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
@@ -338,6 +349,7 @@ fn process_attestations(
         .expect("justifications_roots limit exceeded");
     state.justifications_validators = justifications_validators;
     metrics::inc_attestations_processed(attestations_processed);
+    metrics::observe_attestations_processing_time(start.elapsed().as_secs_f64());
     Ok(())
 }
 
