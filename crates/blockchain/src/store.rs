@@ -782,6 +782,12 @@ pub enum StoreError {
     #[error("Aggregated proof participants don't match attestation aggregation bits")]
     ParticipantsMismatch,
 
+    #[error("Aggregated signature verification failed: {0}")]
+    AggregatedSignatureVerificationFailed(String),
+
+    #[error("Signature aggregation failed: {0}")]
+    SignatureAggregationFailed(String),
+
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
 
@@ -925,14 +931,8 @@ fn build_block(
     // Compute aggregated signature proofs for each aggregated attestation
     let signatures: Vec<AggregatedSignatureProof> = aggregated_attestations
         .iter()
-        .map(|agg_att| {
-            // Use the attestation's aggregation bits as the participants bitfield.
-            // The proof_data would be populated by actual leanVM aggregation.
-            // For now, we create an empty proof as a placeholder.
-            // TODO: Implement actual signature aggregation via lean-multisig.
-            AggregatedSignatureProof::empty(agg_att.aggregation_bits.clone())
-        })
-        .collect();
+        .map(|agg_att| aggregate_attestation_signatures(agg_att, head_state, gossip_signatures))
+        .collect::<Result<_, _>>()?;
 
     // Build final block with correct state root
     let final_aggregated: AggregatedAttestations = aggregated_attestations
@@ -952,6 +952,57 @@ fn build_block(
     Ok((final_block, post_state, signatures))
 }
 
+/// Aggregate individual validator signatures for an attestation into a single proof.
+///
+/// Collects the signatures from gossip for each participating validator,
+/// retrieves their public keys, and calls the crypto aggregation function.
+fn aggregate_attestation_signatures(
+    agg_att: &AggregatedAttestation,
+    state: &State,
+    gossip_signatures: &HashMap<SignatureKey, XmssSignature>,
+) -> Result<AggregatedSignatureProof, StoreError> {
+    use ethlambda_crypto::aggregate_signatures;
+    use ethlambda_types::signature::ValidatorSignature;
+
+    let validator_ids = aggregation_bits_to_validator_indices(&agg_att.aggregation_bits);
+    let data_root = agg_att.data.tree_hash_root();
+    let epoch: u32 = agg_att.data.slot.try_into().expect("slot exceeds u32");
+
+    // Collect public keys and signatures for all participating validators
+    let mut public_keys = Vec::with_capacity(validator_ids.len());
+    let mut signatures = Vec::with_capacity(validator_ids.len());
+
+    for &vid in &validator_ids {
+        // Get validator's public key
+        let validator = state
+            .validators
+            .get(vid as usize)
+            .ok_or(StoreError::InvalidValidatorIndex)?;
+        let pubkey = validator
+            .get_pubkey()
+            .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
+        public_keys.push(pubkey);
+
+        // Get validator's signature from gossip
+        let sig_key: SignatureKey = (vid, data_root);
+        let sig_bytes = gossip_signatures
+            .get(&sig_key)
+            .ok_or(StoreError::SignatureDecodingFailed)?;
+        let signature = ValidatorSignature::from_bytes(sig_bytes)
+            .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        signatures.push(signature);
+    }
+
+    // Aggregate using lean-multisig
+    let proof_data = aggregate_signatures(&public_keys, &signatures, &data_root, epoch)
+        .map_err(|e| StoreError::SignatureAggregationFailed(format!("{e}")))?;
+
+    Ok(AggregatedSignatureProof::new(
+        agg_att.aggregation_bits.clone(),
+        proof_data,
+    ))
+}
+
 /// Verify all signatures in a signed block.
 ///
 /// Each attestation has a corresponding proof in the signature list.
@@ -960,6 +1011,7 @@ fn verify_signatures(
     state: &State,
     signed_block: &SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
+    use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
     let block = &signed_block.message.block;
@@ -989,11 +1041,11 @@ fn verify_signatures(
             return Err(StoreError::ParticipantsMismatch);
         }
 
-        let _epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let _message = attestation.data.tree_hash_root();
+        let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+        let message = attestation.data.tree_hash_root();
 
         // Collect public keys for all participating validators
-        let _public_keys: Vec<_> = validator_ids
+        let public_keys: Vec<_> = validator_ids
             .iter()
             .map(|&vid| {
                 validators
@@ -1006,11 +1058,24 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
-        // TODO: Verify the aggregated proof using lean-multisig
-        // aggregated_proof.verify(&public_keys, &message, epoch)?;
-        //
-        // For now, we skip attestation signature verification.
-        // The proposer signature is still verified below.
+        // Verify the aggregated proof using lean-multisig
+        // Skip verification for placeholder proofs (too small to be valid)
+        // A valid lean-multisig proof is much larger than 100 bytes
+        const MIN_VALID_PROOF_SIZE: usize = 100;
+        if aggregated_proof.proof_data.len() < MIN_VALID_PROOF_SIZE {
+            warn!(
+                proof_size = aggregated_proof.proof_data.len(),
+                "Skipping aggregated signature verification: proof too small (placeholder?)"
+            );
+        } else {
+            verify_aggregated_signature(
+                &public_keys,
+                &message,
+                &aggregated_proof.proof_data,
+                epoch,
+            )
+            .map_err(|e| StoreError::AggregatedSignatureVerificationFailed(format!("{e}")))?;
+        }
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;

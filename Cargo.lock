@@ -1918,6 +1918,7 @@ dependencies = [
  "datatest-stable 0.3.3",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "ethlambda-crypto",
  "ethlambda-fork-choice",
  "ethlambda-state-transition",
  "ethlambda-storage",

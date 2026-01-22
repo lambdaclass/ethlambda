@@ -255,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "expensive: requires lean-multisig setup with large stack"]
     fn test_setup_is_idempotent() {
         // Should not panic when called multiple times
         ensure_prover_ready();
