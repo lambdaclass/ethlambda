@@ -188,11 +188,52 @@ impl Store {
             && let Some(new_head_block) = self.blocks.get(&new_head)
             && new_head_block.parent_root != old_head
         {
+            // Calculate reorg depth by finding common ancestor
+            let old_head_slot = self.blocks.get(&old_head).map(|b| b.slot).unwrap_or(0);
+            let depth = self.find_reorg_depth(old_head, new_head, old_head_slot);
+
             metrics::inc_fork_choice_reorgs();
-            info!(%old_head, %new_head, "Fork choice reorg detected");
+            metrics::observe_fork_choice_reorg_depth(depth);
+            info!(%old_head, %new_head, %depth, "Fork choice reorg detected");
         }
 
         self.head = new_head;
+    }
+
+    /// Find the depth of a reorg by walking back from old head to find common ancestor.
+    ///
+    /// Returns the number of slots the old head is ahead of the common ancestor.
+    fn find_reorg_depth(&self, old_head: H256, new_head: H256, old_head_slot: u64) -> u64 {
+        use std::collections::HashSet;
+
+        // Collect all ancestors of new_head
+        let mut new_ancestors: HashSet<H256> = HashSet::new();
+        let mut current = new_head;
+        while let Some(block) = self.blocks.get(&current) {
+            new_ancestors.insert(current);
+            if block.parent_root == H256::ZERO {
+                break;
+            }
+            current = block.parent_root;
+        }
+
+        // Walk back from old_head until we find a common ancestor
+        let mut current = old_head;
+        let mut depth = 0u64;
+        while let Some(block) = self.blocks.get(&current) {
+            if new_ancestors.contains(&current) {
+                // Found common ancestor
+                return old_head_slot.saturating_sub(block.slot);
+            }
+            depth += 1;
+            if block.parent_root == H256::ZERO {
+                break;
+            }
+            current = block.parent_root;
+        }
+
+        // If no common ancestor found, return 0
+        depth
     }
 
     pub fn update_safe_target(&mut self) {
@@ -217,6 +258,13 @@ impl Store {
     ///     2. A vote cannot span backwards in time (source > target).
     ///     3. A vote cannot be for a future slot.
     pub fn validate_attestation(&self, attestation: &Attestation) -> Result<(), StoreError> {
+        let start = std::time::Instant::now();
+        let result = self.validate_attestation_inner(attestation);
+        metrics::observe_attestation_validation_time(start.elapsed().as_secs_f64());
+        result
+    }
+
+    fn validate_attestation_inner(&self, attestation: &Attestation) -> Result<(), StoreError> {
         let data = &attestation.data;
 
         // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
@@ -436,6 +484,8 @@ impl Store {
     /// 4. Updating the forkchoice head
     /// 5. Processing the proposer's attestation (as if gossiped)
     pub fn on_block(&mut self, signed_block: SignedBlockWithAttestation) -> Result<(), StoreError> {
+        let start = std::time::Instant::now();
+
         // Unpack block components
         let block = signed_block.message.block.clone();
         let proposer_attestation = signed_block.message.proposer_attestation.clone();
@@ -551,6 +601,7 @@ impl Store {
             warn!(%slot, %err, "Invalid proposer attestation in block");
         }
 
+        metrics::observe_fork_choice_block_processing_time(start.elapsed().as_secs_f64());
         info!(%slot, %block_root, %state_root, "Processed new block");
         Ok(())
     }
