@@ -98,7 +98,9 @@ async fn main() {
         p2p_rx,
     ));
 
-    start_prometheus_metrics_api(metrics_socket).await.unwrap();
+    ethlambda_rpc::start_rpc_server(metrics_socket)
+        .await
+        .unwrap();
 
     info!("Node initialized");
 
