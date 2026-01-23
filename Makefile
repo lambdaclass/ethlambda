@@ -32,6 +32,8 @@ leanSpec/fixtures: leanSpec
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
+
+# TODO: start metrics too
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
 	# Go to lean-quickstart/local-devnet/genesis/validator-config.yaml to modify
 	# the validator configuration for the local devnet.
