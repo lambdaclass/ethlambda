@@ -31,23 +31,27 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .unwrap()
 });
 
-/// Set the connected peers gauge for a specific client type.
-pub fn set_connected_peers(client: &str, count: u64) {
-    LEAN_CONNECTED_PEERS
-        .with_label_values(&[client])
-        .set(count as i64);
-}
-
-/// Increment the peer connection events counter.
-pub fn inc_peer_connection_events(direction: &str, result: &str) {
+/// Notify that a peer connection event occurred.
+///
+/// If `result` is "success", the connected peer count is incremented.
+/// The connection event counter is always incremented.
+pub fn notify_peer_connected(direction: &str, result: &str) {
     LEAN_PEER_CONNECTION_EVENTS_TOTAL
         .with_label_values(&[direction, result])
         .inc();
+
+    if result == "success" {
+        LEAN_CONNECTED_PEERS.with_label_values(&["unknown"]).inc();
+    }
 }
 
-/// Increment the peer disconnection events counter.
-pub fn inc_peer_disconnection_events(direction: &str, reason: &str) {
+/// Notify that a peer disconnected.
+///
+/// Decrements the connected peer count and increments the disconnection event counter.
+pub fn notify_peer_disconnected(direction: &str, reason: &str) {
     LEAN_PEER_DISCONNECTION_EVENTS_TOTAL
         .with_label_values(&[direction, reason])
         .inc();
+
+    LEAN_CONNECTED_PEERS.with_label_values(&["unknown"]).dec();
 }

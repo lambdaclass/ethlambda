@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -20,7 +19,7 @@ use libp2p::{
 use sha2::Digest;
 use ssz::Encode;
 use tokio::sync::mpsc;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
@@ -156,9 +155,6 @@ async fn event_loop(
     attestation_topic: libp2p::gossipsub::IdentTopic,
     block_topic: libp2p::gossipsub::IdentTopic,
 ) {
-    // Track connected peers for metrics
-    let mut connected_peers: HashSet<PeerId> = HashSet::new();
-
     loop {
         tokio::select! {
             biased;
@@ -189,15 +185,8 @@ async fn event_loop(
                         endpoint,
                         ..
                     } => {
-                        let direction = if endpoint.is_dialer() {
-                            "outbound"
-                        } else {
-                            "inbound"
-                        };
-                        connected_peers.insert(peer_id);
-                        metrics::inc_peer_connection_events(direction, "success");
-                        // Use "unknown" as client label since we don't know the client type yet
-                        metrics::set_connected_peers("unknown", connected_peers.len() as u64);
+                        let direction = connection_direction(&endpoint);
+                        metrics::notify_peer_connected(direction, "success");
                         info!(%peer_id, %direction, "Peer connected");
                     }
                     SwarmEvent::ConnectionClosed {
@@ -206,11 +195,7 @@ async fn event_loop(
                         cause,
                         ..
                     } => {
-                        let direction = if endpoint.is_dialer() {
-                            "outbound"
-                        } else {
-                            "inbound"
-                        };
+                        let direction = connection_direction(&endpoint);
                         let reason = match cause {
                             Some(err) => {
                                 // Categorize disconnection reasons
@@ -225,18 +210,21 @@ async fn event_loop(
                             }
                             None => "local_close",
                         };
-                        connected_peers.remove(&peer_id);
-                        metrics::inc_peer_disconnection_events(direction, reason);
-                        metrics::set_connected_peers("unknown", connected_peers.len() as u64);
+                        metrics::notify_peer_disconnected(direction, reason);
                         info!(%peer_id, %direction, %reason, "Peer disconnected");
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        metrics::inc_peer_connection_events("outbound", "error");
-                        trace!(?peer_id, %error, "Outgoing connection error");
+                        let result = if error.to_string().to_lowercase().contains("timed out") {
+                            "timeout"
+                        } else {
+                            "error"
+                        };
+                        metrics::notify_peer_connected("outbound", result);
+                        warn!(?peer_id, %error, "Outgoing connection error");
                     }
                     SwarmEvent::IncomingConnectionError { error, .. } => {
-                        metrics::inc_peer_connection_events("inbound", "error");
-                        trace!(%error, "Incoming connection error");
+                        metrics::notify_peer_connected("inbound", "error");
+                        warn!(%error, "Incoming connection error");
                     }
                     _ => {
                         trace!(?event, "Ignored swarm event");
@@ -367,6 +355,14 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
         });
     }
     bootnodes
+}
+
+fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
+    if endpoint.is_dialer() {
+        "outbound"
+    } else {
+        "inbound"
+    }
 }
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
