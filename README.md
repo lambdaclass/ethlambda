@@ -17,15 +17,8 @@ Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful 
 To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):
 
 ```sh
-# Clone lean-quickstart (if not already present)
-git clone https://github.com/blockblaz/lean-quickstart.git
-
-# Build the ethlambda Docker image
-make docker-build
-
-# Run a 3-client devnet (zeam, ream, ethlambda)
-cd lean-quickstart
-NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ream_0,ethlambda_0 --generateGenesis --metrics
+# This will clone lean-quickstart, build the docker image, and start a local devnet
+make run-devnet
 ```
 
 This generates fresh genesis files and starts all three clients with metrics enabled.

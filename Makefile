@@ -34,6 +34,8 @@ lean-quickstart:
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
 	# Go to lean-quickstart/local-devnet/genesis/validator-config.yaml to modify
-	# the validator configuration for the local devnet
+	# the validator configuration for the local devnet.
+	# NOTE: to run the local image of ethlambda, make sure to set the image tag
+	# in lean-quickstart/client-cmds/ethlambda-cmd.sh to "ghcr.io/lambdaclass/ethlambda:local"
 	cd lean-quickstart \
 	&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics
