@@ -22,13 +22,13 @@ use crate::SECONDS_PER_SLOT;
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Accept new attestations, moving them from pending to known.
-pub fn accept_new_attestations(store: &mut Store) {
+fn accept_new_attestations(store: &mut Store) {
     store.promote_new_attestations();
     update_head(store);
 }
 
 /// Update the head based on the fork choice rule.
-pub fn update_head(store: &mut Store) {
+fn update_head(store: &mut Store) {
     let head = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         store.blocks(),
@@ -39,7 +39,7 @@ pub fn update_head(store: &mut Store) {
 }
 
 /// Update the safe target for attestation.
-pub fn update_safe_target(store: &mut Store) {
+fn update_safe_target(store: &mut Store) {
     let head_state = store.get_state(&store.head()).expect("head state exists");
     let num_validators = head_state.validators.len() as u64;
 
@@ -60,7 +60,7 @@ pub fn update_safe_target(store: &mut Store) {
 ///     1. The blocks voted for must exist in our store.
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. A vote cannot be for a future slot.
-pub fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), StoreError> {
+fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), StoreError> {
     let data = &attestation.data;
 
     // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
@@ -459,7 +459,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 ///
 /// Ensures store is up-to-date and processes any pending attestations
 /// before returning the canonical head.
-pub fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
+fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time = store.config().genesis_time + slot * SECONDS_PER_SLOT;
 
