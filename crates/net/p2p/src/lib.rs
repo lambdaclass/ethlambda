@@ -101,12 +101,17 @@ pub async fn start_p2p(
             config.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
         })
         .build();
+    let local_peer_id = *swarm.local_peer_id();
     for bootnode in bootnodes {
+        let peer_id = PeerId::from_public_key(&bootnode.public_key);
+        if peer_id == local_peer_id {
+            continue;
+        }
         let addr = Multiaddr::empty()
             .with(bootnode.ip.into())
             .with(Protocol::Udp(bootnode.quic_port))
             .with(Protocol::QuicV1)
-            .with_p2p(PeerId::from_public_key(&bootnode.public_key))
+            .with_p2p(peer_id)
             .expect("failed to add peer ID to multiaddr");
         swarm.dial(addr).unwrap();
     }
