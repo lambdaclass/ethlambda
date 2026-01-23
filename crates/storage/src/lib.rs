@@ -349,4 +349,19 @@ impl Store {
     pub fn push_aggregated_payload(&mut self, key: SignatureKey, proof: AggregatedSignatureProof) {
         self.aggregated_payloads.entry(key).or_default().push(proof);
     }
+
+    // ============ Derived Accessors ============
+
+    /// Returns the slot of the current safe target block.
+    pub fn safe_target_slot(&self) -> u64 {
+        self.get_block(&self.safe_target)
+            .expect("safe target exists")
+            .slot
+    }
+
+    /// Returns a reference to the head state.
+    pub fn head_state(&self) -> &State {
+        self.get_state(&self.head)
+            .expect("head state is always available")
+    }
 }

@@ -528,21 +528,6 @@ pub fn produce_block_with_signatures(
     Ok((block, signatures))
 }
 
-/// Returns the slot of the current safe target block.
-pub fn safe_target_slot(store: &Store) -> u64 {
-    store
-        .get_block(&store.safe_target())
-        .expect("safe target exists")
-        .slot
-}
-
-/// Returns a reference to the head state if it exists.
-pub fn head_state(store: &Store) -> &State {
-    store
-        .get_state(&store.head())
-        .expect("head state is always available")
-}
-
 /// Errors that can occur during Store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

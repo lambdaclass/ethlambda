@@ -122,12 +122,12 @@ impl BlockChainServer {
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 2)
-        metrics::update_safe_target_slot(store::safe_target_slot(&self.store));
+        metrics::update_safe_target_slot(self.store.safe_target_slot());
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
     fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = store::head_state(&self.store);
+        let head_state = self.store.head_state();
         let num_validators = head_state.validators.len() as u64;
 
         self.key_manager
@@ -138,7 +138,7 @@ impl BlockChainServer {
 
     fn produce_attestations(&mut self, slot: u64) {
         // Get the head state to determine number of validators
-        let head_state = store::head_state(&self.store);
+        let head_state = self.store.head_state();
 
         let num_validators = head_state.validators.len() as u64;
 
