@@ -48,3 +48,10 @@ To remove all data volumes:
 ```bash
 docker compose -f docker-compose-metrics.yaml down -v
 ```
+
+## Troubleshooting
+
+### Docker Desktop on MacOS
+
+lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.
+To work around this, enable the ["Enable host networking" option](https://docs.docker.com/enterprise/security/hardened-desktop/settings-management/settings-reference/#enable-host-networking) in Docker Desktop settings under Resources > Network.
