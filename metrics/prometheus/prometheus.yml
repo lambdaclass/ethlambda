@@ -5,27 +5,27 @@ global:
     monitor: "ethlambda-metrics"
 
 scrape_configs:
-  - job_name: "ethlambda"
+  - job_name: "ethlambda_0"
     static_configs:
-      - targets: ["host.docker.internal:8008"]
+      - targets: ["host.docker.internal:8087"]
         labels:
-          client: "ethlambda"
+          client: "ethlambda_0"
           instance: "local"
 
   # Add additional scrape targets for other Lean Ethereum clients
-  # - job_name: 'ream'
+  # - job_name: "ream_0"
   #   static_configs:
-  #     - targets: ['host.docker.internal:8009']
+  #     - targets: ["host.docker.internal:8082"]
   #       labels:
-  #         client: 'ream'
-  #         instance: 'local'
+  #         client: "ream_0"
+  #         instance: "local"
 
-  # - job_name: 'zeam'
+  # - job_name: "zeam_0"
   #   static_configs:
-  #     - targets: ['host.docker.internal:8010']
+  #     - targets: ["host.docker.internal:8081"]
   #       labels:
-  #         client: 'zeam'
-  #         instance: 'local'
+  #         client: "zeam_0"
+  #         instance: "local"
 
   # Prometheus self-monitoring
   - job_name: "prometheus"
