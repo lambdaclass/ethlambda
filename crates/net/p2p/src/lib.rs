@@ -206,18 +206,18 @@ async fn event_loop(
                     } => {
                         let direction = connection_direction(&endpoint);
                         let reason = match cause {
+                            None => "remote_close",
                             Some(err) => {
                                 // Categorize disconnection reasons
                                 let err_str = err.to_string().to_lowercase();
-                                if err_str.contains("timeout") || err_str.contains("keep alive") {
+                                if err_str.contains("timeout") || err_str.contains("timedout") || err_str.contains("keepalive") {
                                     "timeout"
-                                } else if err_str.contains("reset") || err_str.contains("refused") {
+                                } else if err_str.contains("reset") || err_str.contains("connectionreset") {
                                     "remote_close"
                                 } else {
                                     "error"
                                 }
                             }
-                            None => "local_close",
                         };
                         if num_established == 0 {
                             metrics::notify_peer_disconnected(direction, reason);
