@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
+use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -12,7 +13,6 @@ use ethlambda_types::{
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
-use store::Store;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -45,7 +45,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
         let genesis_time = genesis_state.config.genesis_time;
-        let store = Store::from_genesis(genesis_state);
+        let store = store::from_genesis(genesis_state);
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
             store,
@@ -109,8 +109,7 @@ impl BlockChainServer {
             .flatten();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        self.store
-            .on_tick(timestamp, proposer_validator_id.is_some());
+        store::on_tick(&mut self.store, timestamp, proposer_validator_id.is_some());
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
@@ -123,12 +122,12 @@ impl BlockChainServer {
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 2)
-        metrics::update_safe_target_slot(self.store.safe_target_slot());
+        metrics::update_safe_target_slot(store::safe_target_slot(&self.store));
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
     fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = self.store.head_state();
+        let head_state = store::head_state(&self.store);
         let num_validators = head_state.validators.len() as u64;
 
         self.key_manager
@@ -139,12 +138,12 @@ impl BlockChainServer {
 
     fn produce_attestations(&mut self, slot: u64) {
         // Get the head state to determine number of validators
-        let head_state = self.store.head_state();
+        let head_state = store::head_state(&self.store);
 
         let num_validators = head_state.validators.len() as u64;
 
         // Produce attestation data once for all validators
-        let attestation_data = self.store.produce_attestation_data(slot);
+        let attestation_data = store::produce_attestation_data(&self.store, slot);
 
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
@@ -191,10 +190,9 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures)) = self
-            .store
-            .produce_block_with_signatures(slot, validator_id)
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+        let Ok((block, attestation_signatures)) =
+            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
+                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
             return;
         };
@@ -208,7 +206,7 @@ impl BlockChainServer {
                     root: block.tree_hash_root(),
                     slot: block.slot,
                 },
-                target: self.store.get_attestation_target(),
+                target: store::get_attestation_target(&self.store),
                 source: *self.store.latest_justified(),
             },
         };
@@ -261,7 +259,7 @@ impl BlockChainServer {
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
         let slot = signed_block.message.block.slot;
-        self.store.on_block(signed_block)?;
+        store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(slot);
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
@@ -277,7 +275,7 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
-        if let Err(err) = self.store.on_gossip_attestation(attestation) {
+        if let Err(err) = store::on_gossip_attestation(&mut self.store, attestation) {
             warn!(%err, "Failed to process gossiped attestation");
         }
     }

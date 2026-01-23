@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
+use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
 use ethlambda_types::{
     block::{Block, SignedBlockWithAttestation},
     primitives::TreeHash,
@@ -40,17 +40,17 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Initialize the store with the anchor state and block
         let genesis_time = anchor_state.config.genesis_time;
-        let mut store = Store::get_forkchoice_store(anchor_state, anchor_block);
+        let mut st = store::get_forkchoice_store(anchor_state, anchor_block);
 
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlockWithAttestation = test.signed_block_with_attestation.into();
 
         // Advance time to the block's slot
         let block_time = signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
-        store.on_tick(block_time, true);
+        store::on_tick(&mut st, block_time, true);
 
         // Process the block (this includes signature verification)
-        let result = store.on_block(signed_block);
+        let result = store::on_block(&mut st, signed_block);
 
         // Step 3: Check that it succeeded or failed as expected
         match (result.is_ok(), test.expect_exception.as_ref()) {
