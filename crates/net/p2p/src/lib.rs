@@ -183,15 +183,19 @@ async fn event_loop(
                     SwarmEvent::ConnectionEstablished {
                         peer_id,
                         endpoint,
+                        num_established,
                         ..
                     } => {
                         let direction = connection_direction(&endpoint);
-                        metrics::notify_peer_connected(direction, "success");
+                        if num_established.get() == 1 {
+                            metrics::notify_peer_connected(direction, "success");
+                        }
                         info!(%peer_id, %direction, "Peer connected");
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
                         endpoint,
+                        num_established,
                         cause,
                         ..
                     } => {
@@ -210,7 +214,9 @@ async fn event_loop(
                             }
                             None => "local_close",
                         };
-                        metrics::notify_peer_disconnected(direction, reason);
+                        if num_established == 0 {
+                            metrics::notify_peer_disconnected(direction, reason);
+                        }
                         info!(%peer_id, %direction, %reason, "Peer disconnected");
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
