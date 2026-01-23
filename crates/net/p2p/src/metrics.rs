@@ -38,8 +38,7 @@ fn resolve(peer_id: &Option<PeerId>) -> &'static str {
     let registry = NODE_NAME_REGISTRY.read().unwrap();
     peer_id
         .as_ref()
-        .map(|peer_id| registry.get(peer_id))
-        .flatten()
+        .and_then(|peer_id| registry.get(peer_id))
         .unwrap_or(&"unknown")
 }
 
