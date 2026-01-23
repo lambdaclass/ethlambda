@@ -33,6 +33,8 @@ mod gossipsub;
 mod messages;
 pub mod metrics;
 
+pub use metrics::populate_name_registry;
+
 pub async fn start_p2p(
     node_key: Vec<u8>,
     bootnodes: Vec<Bootnode>,
@@ -67,7 +69,6 @@ pub async fn start_p2p(
         .build()
         .expect("invalid gossipsub config");
 
-    // TODO: setup custom message ID function
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
 
@@ -193,7 +194,7 @@ async fn event_loop(
                     } => {
                         let direction = connection_direction(&endpoint);
                         if num_established.get() == 1 {
-                            metrics::notify_peer_connected(direction, "success");
+                            metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                         }
                         info!(%peer_id, %direction, "Peer connected");
                     }
@@ -220,7 +221,7 @@ async fn event_loop(
                             }
                         };
                         if num_established == 0 {
-                            metrics::notify_peer_disconnected(direction, reason);
+                            metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
                         }
                         info!(%peer_id, %direction, %reason, "Peer disconnected");
                     }
@@ -230,11 +231,11 @@ async fn event_loop(
                         } else {
                             "error"
                         };
-                        metrics::notify_peer_connected("outbound", result);
+                        metrics::notify_peer_connected(&peer_id, "outbound", result);
                         warn!(?peer_id, %error, "Outgoing connection error");
                     }
-                    SwarmEvent::IncomingConnectionError { error, .. } => {
-                        metrics::notify_peer_connected("inbound", "error");
+                    SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
+                        metrics::notify_peer_connected(&peer_id, "inbound", "error");
                         warn!(%error, "Incoming connection error");
                     }
                     _ => {

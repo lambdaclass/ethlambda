@@ -9,6 +9,7 @@ use std::{
 use clap::Parser;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_rpc::metrics::start_prometheus_metrics_api;
+use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     genesis::Genesis,
     signature::ValidatorSecretKey,
@@ -73,12 +74,16 @@ async fn main() {
     let validators_path = options
         .custom_network_config_dir
         .join("annotated_validators.yaml");
+    let validator_config = options
+        .custom_network_config_dir
+        .join("validator-config.yaml");
     let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
 
     let genesis_json = std::fs::read_to_string(&genesis_path).expect("Failed to read genesis.json");
     let genesis: Genesis =
         serde_json::from_str(&genesis_json).expect("Failed to parse genesis.json");
 
+    populate_name_registry(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validators = read_validators(&validators_path);
@@ -111,6 +116,31 @@ async fn main() {
         }
     }
     println!("Shutting down...");
+}
+
+fn populate_name_registry(validator_config: impl AsRef<Path>) {
+    #[derive(Deserialize)]
+    struct Validator {
+        name: String,
+        privkey: H256,
+    }
+    #[derive(Deserialize)]
+    struct Config {
+        validators: Vec<Validator>,
+    }
+    let config_yaml =
+        std::fs::read_to_string(&validator_config).expect("Failed to read validator config file");
+    let config: Config =
+        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse validator config file");
+
+    let names_and_privkeys = config
+        .validators
+        .into_iter()
+        .map(|v| (v.name, v.privkey))
+        .collect();
+
+    // Populates a dictionary used for labeling metrics with node names
+    ethlambda_p2p::metrics::populate_name_registry(names_and_privkeys);
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {

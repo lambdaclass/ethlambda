@@ -1892,7 +1892,6 @@ name = "ethlambda"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ethereum-types",
  "ethlambda-blockchain",
  "ethlambda-p2p",
  "ethlambda-rpc",
