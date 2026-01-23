@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 
-use axum::{Router, routing::get};
+use axum::{Router, http::HeaderValue, response::IntoResponse, routing::get};
 use thiserror::Error;
 use tracing::warn;
 
 pub async fn start_prometheus_metrics_api(address: SocketAddr) -> Result<(), std::io::Error> {
     let app = Router::new()
         .route("/metrics", get(get_metrics))
-        .route("/health", get("Service Up"));
+        .route("/health", get(get_health));
 
     // Start the axum app
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -16,12 +16,20 @@ pub async fn start_prometheus_metrics_api(address: SocketAddr) -> Result<(), std
     Ok(())
 }
 
-pub(crate) async fn get_metrics() -> String {
-    gather_default_metrics()
+pub(crate) async fn get_health() -> impl IntoResponse {
+    r#"{"status": "healthy", "service": "lean-spec-api"}"#
+}
+
+pub(crate) async fn get_metrics() -> impl IntoResponse {
+    let mut response = gather_default_metrics()
         .inspect_err(|err| {
             warn!(%err, "Failed to gather Prometheus metrics");
         })
         .unwrap_or_default()
+        .into_response();
+    let content_type = HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8");
+    response.headers_mut().insert("content-type", content_type);
+    response
 }
 
 #[derive(Debug, Error)]
