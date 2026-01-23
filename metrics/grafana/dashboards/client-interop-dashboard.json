@@ -2418,7 +2418,7 @@
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,
-        "regex": ".*ream.*|.*zeam.*|.*qlean.*|.*lantern.*",
+        "regex": ".*ream.*|.*zeam.*|.*qlean.*|.*lantern.*|.*ethlambda.*",
         "type": "query"
       }
     ]
