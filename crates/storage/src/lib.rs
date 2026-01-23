@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{AggregatedSignatureProof, Block},
-    primitives::H256,
+    block::{AggregatedSignatureProof, Block, BlockBody},
+    primitives::{H256, TreeHash},
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
+use tracing::info;
 
 /// Key for looking up individual validator signatures.
 /// Used to index signature caches by (validator, message) pairs.
@@ -105,6 +106,56 @@ pub struct Store {
 }
 
 impl Store {
+    /// Initialize a Store from a genesis state.
+    pub fn from_genesis(mut genesis_state: State) -> Self {
+        // Ensure the header state root is zero before computing the state root
+        genesis_state.latest_block_header.state_root = H256::ZERO;
+
+        let genesis_state_root = genesis_state.tree_hash_root();
+        let genesis_block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: genesis_state_root,
+            body: BlockBody::default(),
+        };
+        Self::get_forkchoice_store(genesis_state, genesis_block)
+    }
+
+    /// Initialize a Store from an anchor state and block.
+    pub fn get_forkchoice_store(anchor_state: State, anchor_block: Block) -> Self {
+        let anchor_state_root = anchor_state.tree_hash_root();
+        let anchor_block_root = anchor_block.tree_hash_root();
+
+        let mut blocks = HashMap::new();
+        blocks.insert(anchor_block_root, anchor_block);
+
+        let mut states = HashMap::new();
+        states.insert(anchor_block_root, anchor_state.clone());
+
+        let anchor_checkpoint = Checkpoint {
+            root: anchor_block_root,
+            slot: 0,
+        };
+
+        info!(%anchor_state_root, %anchor_block_root, "Initialized store");
+
+        Self {
+            time: 0,
+            config: anchor_state.config.clone(),
+            head: anchor_block_root,
+            safe_target: anchor_block_root,
+            latest_justified: anchor_checkpoint,
+            latest_finalized: anchor_checkpoint,
+            blocks,
+            states,
+            latest_known_attestations: HashMap::new(),
+            latest_new_attestations: HashMap::new(),
+            gossip_signatures: HashMap::new(),
+            aggregated_payloads: HashMap::new(),
+        }
+    }
+
     /// Creates a new Store with the given initial values.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -235,13 +286,6 @@ impl Store {
         self.latest_known_attestations.insert(validator_id, data);
     }
 
-    pub fn extend_known_attestations<I>(&mut self, iter: I)
-    where
-        I: IntoIterator<Item = (u64, AttestationData)>,
-    {
-        self.latest_known_attestations.extend(iter);
-    }
-
     // ============ Latest New Attestations ============
 
     pub fn latest_new_attestations(&self) -> &HashMap<u64, AttestationData> {
@@ -260,14 +304,15 @@ impl Store {
         self.latest_new_attestations.remove(validator_id);
     }
 
-    /// Takes all new attestations, leaving an empty map in their place.
-    pub fn take_new_attestations(&mut self) -> HashMap<u64, AttestationData> {
-        std::mem::take(&mut self.latest_new_attestations)
-    }
-
-    /// Restores new attestations (used after take_new_attestations).
-    pub fn restore_new_attestations(&mut self, attestations: HashMap<u64, AttestationData>) {
-        self.latest_new_attestations = attestations;
+    /// Promotes all new attestations to known attestations.
+    ///
+    /// Takes all attestations from `latest_new_attestations` and moves them
+    /// to `latest_known_attestations`, making them count for fork choice.
+    pub fn promote_new_attestations(&mut self) {
+        let mut new_attestations = std::mem::take(&mut self.latest_new_attestations);
+        self.latest_known_attestations
+            .extend(new_attestations.drain());
+        self.latest_new_attestations = new_attestations;
     }
 
     // ============ Gossip Signatures ============

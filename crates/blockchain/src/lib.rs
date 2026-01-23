@@ -45,7 +45,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
         let genesis_time = genesis_state.config.genesis_time;
-        let store = store::from_genesis(genesis_state);
+        let store = Store::from_genesis(genesis_state);
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
             store,

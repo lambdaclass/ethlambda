@@ -21,58 +21,9 @@ use crate::SECONDS_PER_SLOT;
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
-/// Initialize a Store from a genesis state.
-pub fn from_genesis(mut genesis_state: State) -> Store {
-    // Ensure the header state root is zero before computing the state root
-    genesis_state.latest_block_header.state_root = H256::ZERO;
-
-    let genesis_state_root = genesis_state.tree_hash_root();
-    let genesis_block = Block {
-        slot: 0,
-        proposer_index: 0,
-        parent_root: H256::ZERO,
-        state_root: genesis_state_root,
-        body: Default::default(),
-    };
-    get_forkchoice_store(genesis_state, genesis_block)
-}
-
-/// Initialize a Store from an anchor state and block.
-pub fn get_forkchoice_store(anchor_state: State, anchor_block: Block) -> Store {
-    let anchor_state_root = anchor_state.tree_hash_root();
-    let anchor_block_root = anchor_block.tree_hash_root();
-
-    let mut blocks = HashMap::new();
-    blocks.insert(anchor_block_root, anchor_block.clone());
-
-    let mut states = HashMap::new();
-    states.insert(anchor_block_root, anchor_state.clone());
-
-    let anchor_checkpoint = Checkpoint {
-        root: anchor_block_root,
-        slot: 0,
-    };
-
-    info!(%anchor_state_root, %anchor_block_root, "Initialized store");
-
-    Store::new(
-        0,
-        anchor_state.config.clone(),
-        anchor_block_root,
-        anchor_block_root,
-        anchor_checkpoint,
-        anchor_checkpoint,
-        blocks,
-        states,
-    )
-}
-
 /// Accept new attestations, moving them from pending to known.
 pub fn accept_new_attestations(store: &mut Store) {
-    let mut latest_new_attestations = store.take_new_attestations();
-    store.extend_known_attestations(latest_new_attestations.drain());
-    store.restore_new_attestations(latest_new_attestations);
-
+    store.promote_new_attestations();
     update_head(store);
 }
 
