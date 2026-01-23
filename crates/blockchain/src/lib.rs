@@ -265,7 +265,7 @@ impl BlockChainServer {
         metrics::update_head_slot(slot);
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
-        metrics::update_validators_count(self.store.head_state().validators.len() as u64);
+        metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
         Ok(())
     }
 
