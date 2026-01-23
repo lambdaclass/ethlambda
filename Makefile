@@ -29,10 +29,11 @@ leanSpec:
 leanSpec/fixtures: leanSpec
 	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures
 
-# lean-quickstart:
-# 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
+lean-quickstart:
+	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
-	cargo build \
-	&& cd lean-quickstart \
-	&& NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ethlambda_0 --generateGenesis --metrics
+	# Go to lean-quickstart/local-devnet/genesis/validator-config.yaml to modify
+	# the validator configuration for the local devnet
+	cd lean-quickstart \
+	&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics
