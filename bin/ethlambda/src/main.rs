@@ -8,7 +8,6 @@ use std::{
 
 use clap::Parser;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
-use ethlambda_rpc::metrics::start_prometheus_metrics_api;
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     genesis::Genesis,

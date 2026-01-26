@@ -9,8 +9,11 @@ pub async fn start_rpc_server(address: SocketAddr) -> Result<(), std::io::Error>
 
     let app = Router::new()
         .merge(metrics_router)
-        .route("/lean/states/finalized", get(get_latest_finalized_state))
-        .route("/lean/states/justified", get(get_latest_justified_state));
+        .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
+        .route(
+            "/lean/v0/checkpoints/justified",
+            get(get_latest_justified_state),
+        );
 
     // Start the axum app
     let listener = tokio::net::TcpListener::bind(address).await?;
