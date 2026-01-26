@@ -7,6 +7,7 @@ members = [
     "crates/blockchain/fork_choice",
     "crates/blockchain/state_transition",
     "crates/common/crypto",
+    "crates/common/metrics",
     "crates/common/types",
     "crates/net/p2p",
     "crates/net/rpc",
@@ -28,6 +29,7 @@ ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
 ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
+ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }

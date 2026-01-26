@@ -1,80 +1,71 @@
 //! Prometheus metrics for the blockchain module.
 
-use std::time::Instant;
+use ethlambda_metrics::*;
 
 pub fn update_head_slot(slot: u64) {
-    static LEAN_HEAD_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_head_slot", "Latest slot of the lean chain")
-                .unwrap()
-        });
+    static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!("lean_head_slot", "Latest slot of the lean chain").unwrap()
+    });
     LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
 }
 
 pub fn update_latest_justified_slot(slot: u64) {
-    static LEAN_LATEST_JUSTIFIED_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
+    static LEAN_LATEST_JUSTIFIED_SLOT: std::sync::LazyLock<IntGauge> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_latest_justified_slot", "Latest justified slot")
-                .unwrap()
+            register_int_gauge!("lean_latest_justified_slot", "Latest justified slot").unwrap()
         });
     LEAN_LATEST_JUSTIFIED_SLOT.set(slot.try_into().unwrap());
 }
 
 pub fn update_latest_finalized_slot(slot: u64) {
-    static LEAN_LATEST_FINALIZED_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
+    static LEAN_LATEST_FINALIZED_SLOT: std::sync::LazyLock<IntGauge> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_latest_finalized_slot", "Latest finalized slot")
-                .unwrap()
+            register_int_gauge!("lean_latest_finalized_slot", "Latest finalized slot").unwrap()
         });
     LEAN_LATEST_FINALIZED_SLOT.set(slot.try_into().unwrap());
 }
 
 pub fn update_current_slot(slot: u64) {
-    static LEAN_CURRENT_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_current_slot", "Current slot of the lean chain")
-                .unwrap()
-        });
+    static LEAN_CURRENT_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!("lean_current_slot", "Current slot of the lean chain").unwrap()
+    });
     LEAN_CURRENT_SLOT.set(slot.try_into().unwrap());
 }
 
 pub fn update_validators_count(count: u64) {
-    static LEAN_VALIDATORS_COUNT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!(
-                "lean_validators_count",
-                "Number of validators managed by a node"
-            )
-            .unwrap()
-        });
+    static LEAN_VALIDATORS_COUNT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_validators_count",
+            "Number of validators managed by a node"
+        )
+        .unwrap()
+    });
     LEAN_VALIDATORS_COUNT.set(count.try_into().unwrap());
 }
 
 pub fn update_safe_target_slot(slot: u64) {
-    static LEAN_SAFE_TARGET_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!("lean_safe_target_slot", "Safe target slot").unwrap()
-        });
+    static LEAN_SAFE_TARGET_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!("lean_safe_target_slot", "Safe target slot").unwrap()
+    });
     LEAN_SAFE_TARGET_SLOT.set(slot.try_into().unwrap());
 }
 
 pub fn set_node_info(name: &str, version: &str) {
-    static LEAN_NODE_INFO: std::sync::LazyLock<prometheus::IntGaugeVec> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge_vec!(
-                "lean_node_info",
-                "Node information (always 1)",
-                &["name", "version"]
-            )
-            .unwrap()
-        });
+    static LEAN_NODE_INFO: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_node_info",
+            "Node information (always 1)",
+            &["name", "version"]
+        )
+        .unwrap()
+    });
     LEAN_NODE_INFO.with_label_values(&[name, version]).set(1);
 }
 
 pub fn set_node_start_time() {
-    static LEAN_NODE_START_TIME_SECONDS: std::sync::LazyLock<prometheus::IntGauge> =
+    static LEAN_NODE_START_TIME_SECONDS: std::sync::LazyLock<IntGauge> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_gauge!(
+            register_int_gauge!(
                 "lean_node_start_time_seconds",
                 "Timestamp when node started"
             )
@@ -89,9 +80,9 @@ pub fn set_node_start_time() {
 
 /// Increment the valid attestations counter.
 pub fn inc_attestations_valid(source: &str) {
-    static LEAN_ATTESTATIONS_VALID_TOTAL: std::sync::LazyLock<prometheus::IntCounterVec> =
+    static LEAN_ATTESTATIONS_VALID_TOTAL: std::sync::LazyLock<IntCounterVec> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_counter_vec!(
+            register_int_counter_vec!(
                 "lean_attestations_valid_total",
                 "Count of valid attestations",
                 &["source"]
@@ -105,9 +96,9 @@ pub fn inc_attestations_valid(source: &str) {
 
 /// Increment the invalid attestations counter.
 pub fn inc_attestations_invalid(source: &str) {
-    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<prometheus::IntCounterVec> =
+    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<IntCounterVec> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_counter_vec!(
+            register_int_counter_vec!(
                 "lean_attestations_invalid_total",
                 "Count of invalid attestations",
                 &["source"]
@@ -121,9 +112,9 @@ pub fn inc_attestations_invalid(source: &str) {
 
 /// Increment the fork choice reorgs counter.
 pub fn inc_fork_choice_reorgs() {
-    static LEAN_FORK_CHOICE_REORGS_TOTAL: std::sync::LazyLock<prometheus::IntCounter> =
+    static LEAN_FORK_CHOICE_REORGS_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_int_counter!(
+            register_int_counter!(
                 "lean_fork_choice_reorgs_total",
                 "Count of fork choice reorganizations"
             )
@@ -132,47 +123,25 @@ pub fn inc_fork_choice_reorgs() {
     LEAN_FORK_CHOICE_REORGS_TOTAL.inc();
 }
 
-/// A guard that records elapsed time to a histogram when dropped.
-pub struct TimingGuard {
-    histogram: &'static prometheus::Histogram,
-    start: Instant,
-}
-
-impl TimingGuard {
-    fn new(histogram: &'static prometheus::Histogram) -> Self {
-        Self {
-            histogram,
-            start: Instant::now(),
-        }
-    }
-}
-
-impl Drop for TimingGuard {
-    fn drop(&mut self) {
-        self.histogram.observe(self.start.elapsed().as_secs_f64());
-    }
-}
-
 /// Start timing fork choice block processing. Records duration when the guard is dropped.
 pub fn time_fork_choice_block_processing() -> TimingGuard {
-    static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<
-        prometheus::Histogram,
-    > = std::sync::LazyLock::new(|| {
-        prometheus::register_histogram!(
-            "lean_fork_choice_block_processing_time_seconds",
-            "Duration to process a block",
-            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
-        )
-        .unwrap()
-    });
+    static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_fork_choice_block_processing_time_seconds",
+                "Duration to process a block",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
     TimingGuard::new(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS)
 }
 
 /// Start timing attestation validation. Records duration when the guard is dropped.
 pub fn time_attestation_validation() -> TimingGuard {
-    static LEAN_ATTESTATION_VALIDATION_TIME_SECONDS: std::sync::LazyLock<prometheus::Histogram> =
+    static LEAN_ATTESTATION_VALIDATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         std::sync::LazyLock::new(|| {
-            prometheus::register_histogram!(
+            register_histogram!(
                 "lean_attestation_validation_time_seconds",
                 "Duration to validate an attestation",
                 vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]

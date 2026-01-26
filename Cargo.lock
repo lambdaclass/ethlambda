@@ -1918,11 +1918,11 @@ dependencies = [
  "ethereum_ssz_derive",
  "ethlambda-crypto",
  "ethlambda-fork-choice",
+ "ethlambda-metrics",
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
  "hex",
- "prometheus",
  "serde",
  "serde_json",
  "spawned-concurrency",
@@ -1950,6 +1950,13 @@ name = "ethlambda-fork-choice"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
+]
+
+[[package]]
+name = "ethlambda-metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
 ]
 
 [[package]]
@@ -1996,9 +2003,9 @@ name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
+ "ethlambda-metrics",
  "ethlambda-types",
  "hex",
- "prometheus",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
