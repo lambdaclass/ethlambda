@@ -20,12 +20,12 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|---------|-----------|
 | `lean_pq_sig_attestation_signing_time_seconds` | Histogram | Time taken to sign an attestation | On each attestation signing | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
 | `lean_pq_sig_attestation_verification_time_seconds` | Histogram | Time taken to verify an attestation signature | On each `signature.verify()` on an attestation | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
-| `lean_pq_sig_aggregated_signatures_total` | Counter | Total number of aggregated signatures | On `build_attestation_signatures()` | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
-| `lean_pq_sig_attestations_in_aggregated_signatures_total` | Counter | Total number of attestations included into aggregated signatures | On `build_attestation_signatures()` | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
+| `lean_pq_sig_aggregated_signatures_total` | Counter | Total number of aggregated signatures | On `build_attestation_signatures()` | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | ✅ |
+| `lean_pq_sig_attestations_in_aggregated_signatures_total` | Counter | Total number of attestations included into aggregated signatures | On `build_attestation_signatures()` | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | ✅ |
 | `lean_pq_sig_attestation_signatures_building_time_seconds` | Histogram | Time taken to verify an aggregated attestation signature | On `build_attestation_signatures()` | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
 | `lean_pq_sig_aggregated_signatures_verification_time_seconds` | Histogram | Time taken to verify an aggregated attestation signature | On validate aggregated signature | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
-| `lean_pq_sig_aggregated_signatures_valid_total`| Counter | Total number of valid aggregated signatures | On validate aggregated signature | | | □ |
-| `lean_pq_sig_aggregated_signatures_invalid_total`| Counter | Total number of invalid aggregated signatures | On validate aggregated signature | | | □ |
+| `lean_pq_sig_aggregated_signatures_valid_total`| Counter | Total number of valid aggregated signatures | On validate aggregated signature | | | ✅ |
+| `lean_pq_sig_aggregated_signatures_invalid_total`| Counter | Total number of invalid aggregated signatures | On validate aggregated signature | | | ✅ |
 
 ## Fork-Choice Metrics
 
@@ -34,10 +34,10 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_head_slot` | Gauge | Latest slot of the lean chain | On get fork choice head | | | ✅ |
 | `lean_current_slot` | Gauge | Current slot of the lean chain | On scrape | | | ✅(*) |
 | `lean_safe_target_slot` | Gauge | Safe target slot | On safe target update | | | ✅ |
-|`lean_fork_choice_block_processing_time_seconds`| Histogram | Time taken to process block | On fork choice process block | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
+|`lean_fork_choice_block_processing_time_seconds`| Histogram | Time taken to process block | On fork choice process block | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | ✅ |
 |`lean_attestations_valid_total`| Counter | Total number of valid attestations | On validate attestation | source=block,gossip | | ✅ |
 |`lean_attestations_invalid_total`| Counter | Total number of invalid attestations | On validate attestation | source=block,gossip | | ✅ |
-|`lean_attestation_validation_time_seconds`| Histogram | Time taken to validate attestation | On validate attestation | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | □ |
+|`lean_attestation_validation_time_seconds`| Histogram | Time taken to validate attestation | On validate attestation | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | ✅ |
 | `lean_fork_choice_reorgs_total` | Counter | Total number of fork choice reorgs | On fork choice reorg | | | ✅ |
 | `lean_fork_choice_reorg_depth` | Histogram | Depth of fork choice reorgs (in blocks) | On fork choice reorg | | 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 | □ |
 
