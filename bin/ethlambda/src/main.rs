@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use clap::Parser;
@@ -19,7 +20,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
-use ethlambda_storage::Store;
+use ethlambda_storage::{Store, backend::InMemoryBackend};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -91,7 +92,8 @@ async fn main() {
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
     let genesis_state = State::from_genesis(&genesis, validators);
-    let store = Store::from_genesis(genesis_state);
+    let backend = Arc::new(InMemoryBackend::new());
+    let store = Store::from_genesis(backend, genesis_state);
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);

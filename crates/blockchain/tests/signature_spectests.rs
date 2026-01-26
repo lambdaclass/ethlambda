@@ -1,7 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
-use ethlambda_storage::Store;
+use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     block::{Block, SignedBlockWithAttestation},
     primitives::TreeHash,
@@ -41,7 +42,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Initialize the store with the anchor state and block
         let genesis_time = anchor_state.config.genesis_time;
-        let mut st = Store::get_forkchoice_store(anchor_state, anchor_block);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
 
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlockWithAttestation = test.signed_block_with_attestation.into();
