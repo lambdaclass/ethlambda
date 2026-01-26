@@ -1,5 +1,5 @@
-use axum::{Router, http::HeaderValue, response::IntoResponse, routing::get};
-use thiserror::Error;
+use axum::{Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
+use ethlambda_metrics::gather_default_metrics;
 use tracing::warn;
 
 pub fn start_prometheus_metrics_api() -> Router {
@@ -9,7 +9,12 @@ pub fn start_prometheus_metrics_api() -> Router {
 }
 
 pub(crate) async fn get_health() -> impl IntoResponse {
-    r#"{"status": "healthy", "service": "lean-spec-api"}"#
+    let mut response = r#"{"status":"healthy","service":"lean-spec-api"}"#.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(crate::JSON_CONTENT_TYPE),
+    );
+    response
 }
 
 pub(crate) async fn get_metrics() -> impl IntoResponse {
@@ -20,32 +25,8 @@ pub(crate) async fn get_metrics() -> impl IntoResponse {
         .unwrap_or_default()
         .into_response();
     let content_type = HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8");
-    response.headers_mut().insert("content-type", content_type);
     response
-}
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("Prometheus error: {0}")]
-    Prometheus(#[from] prometheus::Error),
-    #[error("UTF-8 conversion error: {0}")]
-    FromUtf8(#[from] std::string::FromUtf8Error),
-}
-
-/// Returns all metrics currently registered in Prometheus' default registry.
-///
-/// Both profiling and RPC metrics register with this default registry, and the
-/// metrics API surfaces them by calling this helper.
-pub fn gather_default_metrics() -> Result<String, Error> {
-    use prometheus::{Encoder, TextEncoder};
-
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer)?;
-
-    let res = String::from_utf8(buffer)?;
-
-    Ok(res)
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
 }

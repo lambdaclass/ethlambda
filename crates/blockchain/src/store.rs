@@ -70,6 +70,7 @@ fn update_safe_target(store: &mut Store) {
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. A vote cannot be for a future slot.
 fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), StoreError> {
+    let _timing = metrics::time_attestation_validation();
     let data = &attestation.data;
 
     // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
@@ -285,6 +286,8 @@ pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
+    let _timing = metrics::time_fork_choice_block_processing();
+
     // Unpack block components
     let block = signed_block.message.block.clone();
     let proposer_attestation = signed_block.message.proposer_attestation.clone();
@@ -1027,6 +1030,6 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
     }
 
     // Couldn't walk back far enough (missing blocks in chain)
-    // Conservative: assume no reorg if we can't determine
+    // Assume the ancestor is behind the latest finalized block
     false
 }

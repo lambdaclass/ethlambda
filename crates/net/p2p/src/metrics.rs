@@ -5,12 +5,12 @@ use std::{
     sync::{LazyLock, RwLock},
 };
 
+use ethlambda_metrics::*;
 use ethlambda_types::primitives::H256;
 use libp2p::{
     PeerId,
     identity::{Keypair, secp256k1},
 };
-use prometheus::{IntCounterVec, IntGaugeVec, register_int_counter_vec, register_int_gauge_vec};
 
 static NODE_NAME_REGISTRY: LazyLock<RwLock<HashMap<PeerId, &'static str>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
