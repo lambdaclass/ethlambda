@@ -209,10 +209,10 @@ async fn event_loop(
                             metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                             // Send status request on first connection to this peer
                             let our_status = build_status(&store);
-                            info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Peer connected, sending status request");
+                            info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
                             swarm.behaviour_mut().req_resp.send_request(&peer_id, our_status);
                         } else {
-                            info!(%peer_id, %direction, "Peer connected");
+                            info!(%peer_id, %direction, "Added peer connection");
                         }
                     }
                     SwarmEvent::ConnectionClosed {
