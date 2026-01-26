@@ -4,6 +4,8 @@ use std::{
 };
 
 use ethlambda_blockchain::{BlockChain, OutboundGossip};
+use ethlambda_storage::Store;
+use ethlambda_types::state::Checkpoint;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -41,6 +43,7 @@ pub async fn start_p2p(
     listening_socket: SocketAddr,
     blockchain: BlockChain,
     p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    store: Store,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
@@ -142,7 +145,15 @@ pub async fn start_p2p(
 
     info!("P2P node started on {listening_socket}");
 
-    event_loop(swarm, blockchain, p2p_rx, attestation_topic, block_topic).await;
+    event_loop(
+        swarm,
+        blockchain,
+        p2p_rx,
+        attestation_topic,
+        block_topic,
+        store,
+    )
+    .await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -160,6 +171,7 @@ async fn event_loop(
     mut p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
     attestation_topic: libp2p::gossipsub::IdentTopic,
     block_topic: libp2p::gossipsub::IdentTopic,
+    store: Store,
 ) {
     loop {
         tokio::select! {
@@ -179,7 +191,7 @@ async fn event_loop(
                     SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
                         message @ request_response::Event::Message { .. },
                     )) => {
-                        handle_req_resp_message(&mut swarm, message).await;
+                        handle_req_resp_message(&mut swarm, message, &store).await;
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
                         message @ libp2p::gossipsub::Event::Message { .. },
@@ -195,8 +207,13 @@ async fn event_loop(
                         let direction = connection_direction(&endpoint);
                         if num_established.get() == 1 {
                             metrics::notify_peer_connected(&Some(peer_id), direction, "success");
+                            // Send status request on first connection to this peer
+                            let our_status = build_status(&store);
+                            info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
+                            swarm.behaviour_mut().req_resp.send_request(&peer_id, our_status);
+                        } else {
+                            info!(%peer_id, %direction, "Added peer connection");
                         }
-                        info!(%peer_id, %direction, "Peer connected");
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -296,6 +313,7 @@ async fn handle_outgoing_gossip(
 async fn handle_req_resp_message(
     swarm: &mut libp2p::Swarm<Behaviour>,
     event: request_response::Event<Status, Status>,
+    store: &Store,
 ) {
     let request_response::Event::Message {
         peer,
@@ -312,13 +330,12 @@ async fn handle_req_resp_message(
             channel,
         } => {
             info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-            // TODO: send real status
+            let our_status = build_status(store);
             swarm
                 .behaviour_mut()
                 .req_resp
-                .send_response(channel, request.clone())
+                .send_response(channel, our_status)
                 .unwrap();
-            swarm.behaviour_mut().req_resp.send_request(&peer, request);
         }
         request_response::Message::Response {
             request_id: _,
@@ -374,6 +391,20 @@ fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str
         "outbound"
     } else {
         "inbound"
+    }
+}
+
+/// Build a Status message from the current Store state.
+fn build_status(store: &Store) -> Status {
+    let finalized = store.latest_finalized();
+    let head_root = store.head();
+    let head_slot = store.get_block(&head_root).expect("head block exists").slot;
+    Status {
+        finalized,
+        head: Checkpoint {
+            root: head_root,
+            slot: head_slot,
+        },
     }
 }
 

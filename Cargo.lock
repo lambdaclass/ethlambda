@@ -1960,6 +1960,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "ethlambda-blockchain",
+ "ethlambda-storage",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",
