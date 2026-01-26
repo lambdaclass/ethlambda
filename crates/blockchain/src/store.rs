@@ -17,7 +17,7 @@ use ethlambda_types::{
 };
 use tracing::{info, trace, warn};
 
-use crate::SECONDS_PER_SLOT;
+use crate::{SECONDS_PER_SLOT, metrics};
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
@@ -31,13 +31,18 @@ fn accept_new_attestations(store: &mut Store) {
 fn update_head(store: &mut Store) {
     let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
     let attestations: HashMap<u64, AttestationData> = store.iter_known_attestations().collect();
-    let head = ethlambda_fork_choice::compute_lmd_ghost_head(
+    let old_head = store.head();
+    let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
         &attestations,
         0,
     );
-    store.update_checkpoints(ForkCheckpoints::head_only(head));
+    if is_reorg(old_head, new_head, &store) {
+        metrics::inc_fork_choice_reorgs();
+        info!(%old_head, %new_head, "Fork choice reorg detected");
+    }
+    store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 }
 
 /// Update the safe target for attestation.
@@ -167,7 +172,8 @@ pub fn on_gossip_attestation(
         validator_id,
         data: signed_attestation.message,
     };
-    validate_attestation(store, &attestation)?;
+    validate_attestation(store, &attestation)
+        .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
     let target = attestation.data.target;
     let target_state = store
         .get_state(&target.root)
@@ -198,6 +204,7 @@ pub fn on_gossip_attestation(
             .map_err(|_| StoreError::SignatureDecodingFailed)?;
         store.insert_gossip_signature(signature_key, signature);
     }
+    metrics::inc_attestations_valid("gossip");
     Ok(())
 }
 
@@ -355,6 +362,9 @@ pub fn on_block(
             // TODO: validate attestations before processing
             if let Err(err) = on_attestation(store, attestation, true) {
                 warn!(%slot, %validator_id, %err, "Invalid attestation in block");
+                metrics::inc_attestations_invalid("block");
+            } else {
+                metrics::inc_attestations_valid("block");
             }
         }
     }
@@ -383,7 +393,10 @@ pub fn on_block(
     // Process proposer attestation (enters "new" stage, not "known")
     // TODO: validate attestations before processing
     if let Err(err) = on_attestation(store, proposer_attestation, false) {
+        metrics::inc_attestations_invalid("block");
         warn!(%slot, %err, "Invalid proposer attestation in block");
+    } else {
+        metrics::inc_attestations_valid("gossip");
     }
 
     info!(%slot, %block_root, %state_root, "Processed new block");
@@ -975,4 +988,45 @@ fn verify_signatures(
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
     Ok(())
+}
+
+/// Check if a head change represents a reorg.
+///
+/// A reorg occurs when the chains diverge - i.e., when walking back from the higher
+/// slot head to the lower slot head's slot, we don't arrive at the lower slot head.
+fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
+    if new_head == old_head {
+        return false;
+    }
+
+    let Some(old_head_block) = store.get_block(&old_head) else {
+        return false;
+    };
+
+    let Some(new_head_block) = store.get_block(&new_head) else {
+        return false;
+    };
+
+    let old_slot = old_head_block.slot;
+    let new_slot = new_head_block.slot;
+
+    // Determine which head has the higher slot and walk back from it
+    let (mut current_root, target_slot, target_root) = if new_slot >= old_slot {
+        (new_head, old_slot, old_head)
+    } else {
+        (old_head, new_slot, new_head)
+    };
+
+    // Walk back through the chain until we reach the target slot
+    while let Some(current_block) = store.get_block(&current_root) {
+        if current_block.slot <= target_slot {
+            // We've reached the target slot - check if we're at the target block
+            return current_root != target_root;
+        }
+        current_root = current_block.parent_root;
+    }
+
+    // Couldn't walk back far enough (missing blocks in chain)
+    // Conservative: assume no reorg if we can't determine
+    false
 }
