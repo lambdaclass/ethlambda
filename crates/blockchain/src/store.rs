@@ -29,10 +29,12 @@ fn accept_new_attestations(store: &mut Store) {
 
 /// Update the head based on the fork choice rule.
 fn update_head(store: &mut Store) {
+    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let attestations: HashMap<u64, AttestationData> = store.iter_known_attestations().collect();
     let head = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
-        store.blocks(),
-        store.latest_known_attestations(),
+        &blocks,
+        &attestations,
         0,
     );
     store.update_checkpoints(ForkCheckpoints::head_only(head));
@@ -45,10 +47,12 @@ fn update_safe_target(store: &mut Store) {
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
+    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let attestations: HashMap<u64, AttestationData> = store.iter_new_attestations().collect();
     let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
-        store.blocks(),
-        store.latest_new_attestations(),
+        &blocks,
+        &attestations,
         min_target_score,
     );
     store.set_safe_target(safe_target);
@@ -299,7 +303,7 @@ pub fn on_block(
     // TODO: extract signature verification to a pre-checks function
     // to avoid the need for this
     if cfg!(not(feature = "skip-signature-verification")) {
-        verify_signatures(parent_state, &signed_block)?;
+        verify_signatures(&parent_state, &signed_block)?;
     }
 
     // Execute state transition function to compute post-block state
@@ -502,16 +506,18 @@ pub fn produce_block_with_signatures(
 
     // Convert AttestationData to Attestation objects for build_block
     let available_attestations: Vec<Attestation> = store
-        .latest_known_attestations()
-        .iter()
-        .map(|(&validator_id, data)| Attestation {
-            validator_id,
-            data: data.clone(),
-        })
+        .iter_known_attestations()
+        .map(|(validator_id, data)| Attestation { validator_id, data })
         .collect();
 
     // Get known block roots for attestation validation
-    let known_block_roots: HashSet<H256> = store.blocks().keys().copied().collect();
+    let known_block_roots: HashSet<H256> = store.iter_blocks().map(|(root, _)| root).collect();
+
+    // Collect signature data for block building
+    let gossip_signatures: HashMap<SignatureKey, ValidatorSignature> =
+        store.iter_gossip_signatures().collect();
+    let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> =
+        store.iter_aggregated_payloads().collect();
 
     // Build the block using fixed-point attestation collection
     let (block, _post_state, signatures) = build_block(
@@ -521,8 +527,8 @@ pub fn produce_block_with_signatures(
         head_root,
         &available_attestations,
         &known_block_roots,
-        store.gossip_signatures(),
-        store.aggregated_payloads(),
+        &gossip_signatures,
+        &aggregated_payloads,
     )?;
 
     Ok((block, signatures))

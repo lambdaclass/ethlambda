@@ -1,12 +1,13 @@
 mod api;
 mod backend;
 
-use std::collections::HashMap;
+use api::{StorageBackend, Table};
+use backend::InMemoryBackend;
 
 use ethlambda_types::{
     attestation::AttestationData,
     block::{AggregatedSignatureProof, Block, BlockBody},
-    primitives::{H256, TreeHash},
+    primitives::{Decode, Encode, H256, TreeHash},
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
@@ -48,6 +49,23 @@ impl ForkCheckpoints {
             finalized,
         }
     }
+}
+
+// ============ Key Encoding Helpers ============
+
+/// Encode a SignatureKey (validator_id, root) to bytes.
+/// Layout: validator_id (8 bytes SSZ) || root (32 bytes SSZ)
+fn encode_signature_key(key: &SignatureKey) -> Vec<u8> {
+    let mut result = key.0.as_ssz_bytes();
+    result.extend(key.1.as_ssz_bytes());
+    result
+}
+
+/// Decode a SignatureKey from bytes.
+fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
+    let validator_id = u64::from_ssz_bytes(&bytes[..8]).expect("valid validator_id");
+    let root = H256::from_ssz_bytes(&bytes[8..]).expect("valid root");
+    (validator_id, root)
 }
 
 /// Forkchoice store tracking chain state and validator attestations.
@@ -98,46 +116,8 @@ pub struct Store {
     /// Fork choice will never revert finalized history.
     latest_finalized: Checkpoint,
 
-    /// Mapping from block root to Block objects.
-    ///
-    /// This is the set of blocks that the node currently knows about.
-    ///
-    /// Every block that might participate in fork choice must appear here.
-    blocks: HashMap<H256, Block>,
-
-    /// Mapping from block root to State objects.
-    ///
-    /// For each known block, we keep its post-state.
-    ///
-    /// These states carry justified and finalized checkpoints that we use to update the
-    /// `Store`'s latest justified and latest finalized checkpoints.
-    states: HashMap<H256, State>,
-
-    /// Latest signed attestations by validator that have been processed.
-    ///
-    /// - These attestations are "known" and contribute to fork choice weights.
-    /// - Keyed by validator index to enforce one attestation per validator.
-    latest_known_attestations: HashMap<u64, AttestationData>,
-
-    /// Latest signed attestations by validator that are pending processing.
-    ///
-    /// - These attestations are "new" and do not yet contribute to fork choice.
-    /// - They migrate to `latest_known_attestations` via interval ticks.
-    /// - Keyed by validator index to enforce one attestation per validator.
-    latest_new_attestations: HashMap<u64, AttestationData>,
-
-    /// Per-validator XMSS signatures learned from gossip.
-    ///
-    /// Keyed by SignatureKey(validator_id, attestation_data_root).
-    gossip_signatures: HashMap<SignatureKey, ValidatorSignature>,
-
-    /// Aggregated signature proofs learned from blocks.
-    /// - Keyed by SignatureKey(validator_id, attestation_data_root).
-    /// - Values are lists of AggregatedSignatureProof, each containing the participants
-    ///   bitfield indicating which validators signed.
-    /// - Used for recursive signature aggregation when building blocks.
-    /// - Populated by on_block.
-    aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>>,
+    /// Storage backend for blocks, states, attestations, and signatures.
+    backend: InMemoryBackend,
 }
 
 impl Store {
@@ -162,11 +142,31 @@ impl Store {
         let anchor_state_root = anchor_state.tree_hash_root();
         let anchor_block_root = anchor_block.tree_hash_root();
 
-        let mut blocks = HashMap::new();
-        blocks.insert(anchor_block_root, anchor_block);
+        let backend = InMemoryBackend::new();
 
-        let mut states = HashMap::new();
-        states.insert(anchor_block_root, anchor_state.clone());
+        // Insert initial block and state
+        {
+            let mut batch = backend.begin_write().expect("write batch");
+            batch
+                .put_batch(
+                    Table::Blocks,
+                    vec![(
+                        anchor_block_root.as_ssz_bytes(),
+                        anchor_block.as_ssz_bytes(),
+                    )],
+                )
+                .expect("put block");
+            batch
+                .put_batch(
+                    Table::States,
+                    vec![(
+                        anchor_block_root.as_ssz_bytes(),
+                        anchor_state.as_ssz_bytes(),
+                    )],
+                )
+                .expect("put state");
+            batch.commit().expect("commit");
+        }
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
@@ -182,12 +182,7 @@ impl Store {
             safe_target: anchor_block_root,
             latest_justified: anchor_checkpoint,
             latest_finalized: anchor_checkpoint,
-            blocks,
-            states,
-            latest_known_attestations: HashMap::new(),
-            latest_new_attestations: HashMap::new(),
-            gossip_signatures: HashMap::new(),
-            aggregated_payloads: HashMap::new(),
+            backend,
         }
     }
 
@@ -200,9 +195,35 @@ impl Store {
         safe_target: H256,
         latest_justified: Checkpoint,
         latest_finalized: Checkpoint,
-        blocks: HashMap<H256, Block>,
-        states: HashMap<H256, State>,
+        blocks: impl IntoIterator<Item = (H256, Block)>,
+        states: impl IntoIterator<Item = (H256, State)>,
     ) -> Self {
+        let backend = InMemoryBackend::new();
+
+        // Insert blocks and states
+        {
+            let mut batch = backend.begin_write().expect("write batch");
+            let block_entries: Vec<_> = blocks
+                .into_iter()
+                .map(|(k, v)| (k.as_ssz_bytes(), v.as_ssz_bytes()))
+                .collect();
+            if !block_entries.is_empty() {
+                batch
+                    .put_batch(Table::Blocks, block_entries)
+                    .expect("put blocks");
+            }
+            let state_entries: Vec<_> = states
+                .into_iter()
+                .map(|(k, v)| (k.as_ssz_bytes(), v.as_ssz_bytes()))
+                .collect();
+            if !state_entries.is_empty() {
+                batch
+                    .put_batch(Table::States, state_entries)
+                    .expect("put states");
+            }
+            batch.commit().expect("commit");
+        }
+
         Self {
             time,
             config,
@@ -210,12 +231,7 @@ impl Store {
             safe_target,
             latest_justified,
             latest_finalized,
-            blocks,
-            states,
-            latest_known_attestations: HashMap::new(),
-            latest_new_attestations: HashMap::new(),
-            gossip_signatures: HashMap::new(),
-            aggregated_payloads: HashMap::new(),
+            backend,
         }
     }
 
@@ -284,66 +300,164 @@ impl Store {
 
     // ============ Blocks ============
 
-    pub fn blocks(&self) -> &HashMap<H256, Block> {
-        &self.blocks
+    /// Iterate over all (root, block) pairs.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = (H256, Block)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::Blocks, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let root = H256::from_ssz_bytes(&k).expect("valid root");
+                let block = Block::from_ssz_bytes(&v).expect("valid block");
+                (root, block)
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    pub fn get_block(&self, root: &H256) -> Option<&Block> {
-        self.blocks.get(root)
+    pub fn get_block(&self, root: &H256) -> Option<Block> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::Blocks, &root.as_ssz_bytes())
+            .expect("get")
+            .map(|bytes| Block::from_ssz_bytes(&bytes).expect("valid block"))
     }
 
     pub fn contains_block(&self, root: &H256) -> bool {
-        self.blocks.contains_key(root)
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::Blocks, &root.as_ssz_bytes())
+            .expect("get")
+            .is_some()
     }
 
     pub fn insert_block(&mut self, root: H256, block: Block) {
-        self.blocks.insert(root, block);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Blocks,
+                vec![(root.as_ssz_bytes(), block.as_ssz_bytes())],
+            )
+            .expect("put block");
+        batch.commit().expect("commit");
     }
 
     // ============ States ============
 
-    pub fn states(&self) -> &HashMap<H256, State> {
-        &self.states
+    /// Iterate over all (root, state) pairs.
+    pub fn iter_states(&self) -> impl Iterator<Item = (H256, State)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::States, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let root = H256::from_ssz_bytes(&k).expect("valid root");
+                let state = State::from_ssz_bytes(&v).expect("valid state");
+                (root, state)
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    pub fn get_state(&self, root: &H256) -> Option<&State> {
-        self.states.get(root)
+    pub fn get_state(&self, root: &H256) -> Option<State> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::States, &root.as_ssz_bytes())
+            .expect("get")
+            .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
     }
 
     pub fn insert_state(&mut self, root: H256, state: State) {
-        self.states.insert(root, state);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::States,
+                vec![(root.as_ssz_bytes(), state.as_ssz_bytes())],
+            )
+            .expect("put state");
+        batch.commit().expect("commit");
     }
 
     // ============ Latest Known Attestations ============
 
-    pub fn latest_known_attestations(&self) -> &HashMap<u64, AttestationData> {
-        &self.latest_known_attestations
+    /// Iterate over all (validator_id, attestation_data) pairs for known attestations.
+    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LatestKnownAttestations, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
+                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
+                (validator_id, data)
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<&AttestationData> {
-        self.latest_known_attestations.get(validator_id)
+    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::LatestKnownAttestations, &validator_id.as_ssz_bytes())
+            .expect("get")
+            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
     pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
-        self.latest_known_attestations.insert(validator_id, data);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::LatestKnownAttestations,
+                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
+            )
+            .expect("put attestation");
+        batch.commit().expect("commit");
     }
 
     // ============ Latest New Attestations ============
 
-    pub fn latest_new_attestations(&self) -> &HashMap<u64, AttestationData> {
-        &self.latest_new_attestations
+    /// Iterate over all (validator_id, attestation_data) pairs for new attestations.
+    pub fn iter_new_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LatestNewAttestations, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
+                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
+                (validator_id, data)
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    pub fn get_new_attestation(&self, validator_id: &u64) -> Option<&AttestationData> {
-        self.latest_new_attestations.get(validator_id)
+    pub fn get_new_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::LatestNewAttestations, &validator_id.as_ssz_bytes())
+            .expect("get")
+            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
-        self.latest_new_attestations.insert(validator_id, data);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::LatestNewAttestations,
+                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
+            )
+            .expect("put attestation");
+        batch.commit().expect("commit");
     }
 
     pub fn remove_new_attestation(&mut self, validator_id: &u64) {
-        self.latest_new_attestations.remove(validator_id);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(
+                Table::LatestNewAttestations,
+                vec![validator_id.as_ssz_bytes()],
+            )
+            .expect("delete attestation");
+        batch.commit().expect("commit");
     }
 
     /// Promotes all new attestations to known attestations.
@@ -351,45 +465,124 @@ impl Store {
     /// Takes all attestations from `latest_new_attestations` and moves them
     /// to `latest_known_attestations`, making them count for fork choice.
     pub fn promote_new_attestations(&mut self) {
-        let mut new_attestations = std::mem::take(&mut self.latest_new_attestations);
-        self.latest_known_attestations
-            .extend(new_attestations.drain());
-        self.latest_new_attestations = new_attestations;
+        // Read all new attestations
+        let view = self.backend.begin_read().expect("read view");
+        let new_attestations: Vec<(Vec<u8>, Vec<u8>)> = view
+            .prefix_iterator(Table::LatestNewAttestations, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        drop(view);
+
+        if new_attestations.is_empty() {
+            return;
+        }
+
+        // Delete from new and insert to known in a single batch
+        let mut batch = self.backend.begin_write().expect("write batch");
+        let keys_to_delete: Vec<_> = new_attestations.iter().map(|(k, _)| k.clone()).collect();
+        batch
+            .delete_batch(Table::LatestNewAttestations, keys_to_delete)
+            .expect("delete new attestations");
+        batch
+            .put_batch(Table::LatestKnownAttestations, new_attestations)
+            .expect("put known attestations");
+        batch.commit().expect("commit");
     }
 
     // ============ Gossip Signatures ============
 
-    pub fn gossip_signatures(&self) -> &HashMap<SignatureKey, ValidatorSignature> {
-        &self.gossip_signatures
+    /// Iterate over all (signature_key, signature) pairs.
+    pub fn iter_gossip_signatures(
+        &self,
+    ) -> impl Iterator<Item = (SignatureKey, ValidatorSignature)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::GossipSignatures, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .filter_map(|(k, v)| {
+                let key = decode_signature_key(&k);
+                ValidatorSignature::from_bytes(&v)
+                    .ok()
+                    .map(|sig| (key, sig))
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<&ValidatorSignature> {
-        self.gossip_signatures.get(key)
+    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<ValidatorSignature> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::GossipSignatures, &encode_signature_key(key))
+            .expect("get")
+            .and_then(|bytes| ValidatorSignature::from_bytes(&bytes).ok())
     }
 
     pub fn contains_gossip_signature(&self, key: &SignatureKey) -> bool {
-        self.gossip_signatures.contains_key(key)
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::GossipSignatures, &encode_signature_key(key))
+            .expect("get")
+            .is_some()
     }
 
     pub fn insert_gossip_signature(&mut self, key: SignatureKey, signature: ValidatorSignature) {
-        self.gossip_signatures.insert(key, signature);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::GossipSignatures,
+                vec![(encode_signature_key(&key), signature.to_bytes())],
+            )
+            .expect("put signature");
+        batch.commit().expect("commit");
     }
 
     // ============ Aggregated Payloads ============
 
-    pub fn aggregated_payloads(&self) -> &HashMap<SignatureKey, Vec<AggregatedSignatureProof>> {
-        &self.aggregated_payloads
+    /// Iterate over all (signature_key, proofs) pairs.
+    pub fn iter_aggregated_payloads(
+        &self,
+    ) -> impl Iterator<Item = (SignatureKey, Vec<AggregatedSignatureProof>)> + '_ {
+        let view = self.backend.begin_read().expect("read view");
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::AggregatedPayloads, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let key = decode_signature_key(&k);
+                let proofs =
+                    Vec::<AggregatedSignatureProof>::from_ssz_bytes(&v).expect("valid proofs");
+                (key, proofs)
+            })
+            .collect();
+        entries.into_iter()
     }
 
     pub fn get_aggregated_payloads(
         &self,
         key: &SignatureKey,
-    ) -> Option<&Vec<AggregatedSignatureProof>> {
-        self.aggregated_payloads.get(key)
+    ) -> Option<Vec<AggregatedSignatureProof>> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::AggregatedPayloads, &encode_signature_key(key))
+            .expect("get")
+            .map(|bytes| {
+                Vec::<AggregatedSignatureProof>::from_ssz_bytes(&bytes).expect("valid proofs")
+            })
     }
 
     pub fn push_aggregated_payload(&mut self, key: SignatureKey, proof: AggregatedSignatureProof) {
-        self.aggregated_payloads.entry(key).or_default().push(proof);
+        // Read existing, add new, write back
+        let mut proofs = self.get_aggregated_payloads(&key).unwrap_or_default();
+        proofs.push(proof);
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::AggregatedPayloads,
+                vec![(encode_signature_key(&key), proofs.as_ssz_bytes())],
+            )
+            .expect("put proofs");
+        batch.commit().expect("commit");
     }
 
     // ============ Derived Accessors ============
@@ -401,8 +594,8 @@ impl Store {
             .slot
     }
 
-    /// Returns a reference to the head state.
-    pub fn head_state(&self) -> &State {
+    /// Returns a clone of the head state.
+    pub fn head_state(&self) -> State {
         self.get_state(&self.head)
             .expect("head state is always available")
     }

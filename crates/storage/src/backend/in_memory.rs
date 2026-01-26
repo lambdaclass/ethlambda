@@ -1,10 +1,8 @@
-#![allow(dead_code)] // Infrastructure not yet integrated with Store
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::api::{
-    Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table, ALL_TABLES,
+    ALL_TABLES, Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table,
 };
 
 type TableData = HashMap<Vec<u8>, Vec<u8>>;

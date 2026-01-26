@@ -163,14 +163,13 @@ fn validate_checks(
         }
 
         // Also validate the root matches a block at this slot
-        let block_found = st
-            .blocks()
+        let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+        let block_found = blocks
             .iter()
             .any(|(root, block)| block.slot == expected_slot && *root == target.root);
 
         if !block_found {
-            let available: Vec<_> = st
-                .blocks()
+            let available: Vec<_> = blocks
                 .iter()
                 .filter(|(_, block)| block.slot == expected_slot)
                 .map(|(root, _)| format!("{:?}", root))
@@ -187,8 +186,7 @@ fn validate_checks(
     if let Some(expected_slot) = checks.head_slot {
         let head_root = st.head();
         let head_block = st
-            .blocks()
-            .get(&head_root)
+            .get_block(&head_root)
             .ok_or_else(|| format!("Step {}: head block not found", step_idx))?;
         if head_block.slot != expected_slot {
             return Err(format!(
@@ -279,12 +277,14 @@ fn validate_attestation_check(
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
+    use ethlambda_types::attestation::AttestationData;
+
     let validator_id = check.validator;
     let location = check.location.as_str();
 
-    let attestations = match location {
-        "new" => st.latest_new_attestations(),
-        "known" => st.latest_known_attestations(),
+    let attestations: HashMap<u64, AttestationData> = match location {
+        "new" => st.iter_new_attestations().collect(),
+        "known" => st.iter_known_attestations().collect(),
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -351,6 +351,8 @@ fn validate_lexicographic_head_among(
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
+    use ethlambda_types::attestation::AttestationData;
+
     // Require at least 2 forks to test tiebreaker
     if fork_labels.len() < 2 {
         return Err(format!(
@@ -361,7 +363,8 @@ fn validate_lexicographic_head_among(
         .into());
     }
 
-    let blocks = st.blocks();
+    let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+    let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)
@@ -386,7 +389,7 @@ fn validate_lexicographic_head_among(
         // Calculate attestation weight: count attestations voting for this fork
         // An attestation votes for this fork if its head is this block or a descendant
         let mut weight = 0;
-        for attestation in st.latest_known_attestations().values() {
+        for attestation in known_attestations.values() {
             let att_head_root = attestation.head.root;
             // Check if attestation head is this block or a descendant
             if att_head_root == *root {
