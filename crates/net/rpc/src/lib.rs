@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 
-use axum::{Json, Router, response::IntoResponse, routing::get};
+use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
+
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 pub mod metrics;
 
@@ -35,14 +37,23 @@ async fn get_latest_finalized_state(
     let state = store
         .get_state(&finalized.root)
         .expect("finalized state exists");
-    Json(state)
+    json_response(state)
 }
 
 async fn get_latest_justified_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let checkpoint = store.latest_justified();
-    Json(checkpoint)
+    json_response(checkpoint)
+}
+
+fn json_response<T: serde::Serialize>(value: T) -> axum::response::Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(JSON_CONTENT_TYPE),
+    );
+    response
 }
 
 #[cfg(test)]
