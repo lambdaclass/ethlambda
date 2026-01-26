@@ -13,7 +13,6 @@ version.workspace = true
 axum = "0.8.1"
 tokio.workspace = true
 ethlambda-metrics.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 ethlambda-storage.workspace = true
 serde.workspace = true

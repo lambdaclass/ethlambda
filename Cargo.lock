@@ -1957,6 +1957,7 @@ name = "ethlambda-metrics"
 version = "0.1.0"
 dependencies = [
  "prometheus",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -1993,7 +1994,6 @@ dependencies = [
  "serde",
  "serde_json",
  "ethlambda-metrics",
- "thiserror 2.0.17",
  "tokio",
  "tracing",
 ]

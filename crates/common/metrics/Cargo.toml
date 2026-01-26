@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 prometheus.workspace = true
+thiserror.workspace = true

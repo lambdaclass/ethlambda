@@ -1,6 +1,7 @@
 //! Metrics utilities and prometheus re-exports for ethlambda.
 
-use std::time::Instant;
+pub mod gather;
+pub mod timing;
 
 // Re-export prometheus types and macros we use
 pub use prometheus::{
@@ -9,23 +10,6 @@ pub use prometheus::{
     register_int_gauge, register_int_gauge_vec,
 };
 
-/// A guard that records elapsed time to a histogram when dropped.
-pub struct TimingGuard {
-    histogram: &'static Histogram,
-    start: Instant,
-}
-
-impl TimingGuard {
-    pub fn new(histogram: &'static Histogram) -> Self {
-        Self {
-            histogram,
-            start: Instant::now(),
-        }
-    }
-}
-
-impl Drop for TimingGuard {
-    fn drop(&mut self) {
-        self.histogram.observe(self.start.elapsed().as_secs_f64());
-    }
-}
+// Re-export commonly used items
+pub use gather::{GatherError, gather_default_metrics};
+pub use timing::TimingGuard;
