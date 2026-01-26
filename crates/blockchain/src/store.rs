@@ -38,7 +38,7 @@ fn update_head(store: &mut Store) {
         &attestations,
         0,
     );
-    if is_reorg(old_head, new_head, &store) {
+    if is_reorg(old_head, new_head, store) {
         metrics::inc_fork_choice_reorgs();
         info!(%old_head, %new_head, "Fork choice reorg detected");
     }
