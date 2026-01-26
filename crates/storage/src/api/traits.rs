@@ -7,7 +7,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type PrefixResult = Result<(Box<[u8]>, Box<[u8]>), Error>;
 
 /// A storage backend that can create read views and write batches.
-pub trait StorageBackend {
+pub trait StorageBackend: Send + Sync {
     /// Begin a read-only transaction.
     fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, Error>;
 

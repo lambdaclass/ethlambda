@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::api::{StorageBackend, Table};
 use crate::backend::InMemoryBackend;
 
@@ -94,7 +96,7 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
 #[derive(Clone)]
 pub struct Store {
     /// Storage backend for all store data.
-    backend: InMemoryBackend,
+    backend: Arc<dyn StorageBackend>,
 }
 
 impl Store {
@@ -119,7 +121,7 @@ impl Store {
         let anchor_state_root = anchor_state.tree_hash_root();
         let anchor_block_root = anchor_block.tree_hash_root();
 
-        let backend = InMemoryBackend::new();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
@@ -191,7 +193,7 @@ impl Store {
         blocks: impl IntoIterator<Item = (H256, Block)>,
         states: impl IntoIterator<Item = (H256, State)>,
     ) -> Self {
-        let backend = InMemoryBackend::new();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
         // Insert all data
         {
