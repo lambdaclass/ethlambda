@@ -875,6 +875,9 @@ fn compute_aggregated_signatures(
             };
             let aggregate_proof = AggregatedSignatureProof::new(participants, proof_data);
             results.push((aggregated_attestation, aggregate_proof));
+
+            metrics::inc_pq_sig_aggregated_signatures();
+            metrics::inc_pq_sig_attestations_in_aggregated_signatures(gossip_ids.len() as u64);
         }
 
         // Phase 2: Fallback to existing proofs
@@ -910,6 +913,10 @@ fn compute_aggregated_signatures(
                 data: data.clone(),
             };
             results.push((aggregate, proof.clone()));
+
+            metrics::inc_pq_sig_aggregated_signatures();
+            metrics::inc_pq_sig_attestations_in_aggregated_signatures(covered.len() as u64);
+
             for vid in covered {
                 remaining.remove(&vid);
             }
@@ -962,8 +969,18 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
-        verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, epoch)
-            .map_err(StoreError::AggregateVerificationFailed)?;
+        match verify_aggregated_signature(
+            &aggregated_proof.proof_data,
+            public_keys,
+            &message,
+            epoch,
+        ) {
+            Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
+            Err(e) => {
+                metrics::inc_pq_sig_aggregated_signatures_invalid();
+                return Err(StoreError::AggregateVerificationFailed(e));
+            }
+        }
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
