@@ -181,17 +181,3 @@ pub fn time_attestation_validation() -> TimingGuard {
         });
     TimingGuard::new(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS)
 }
-
-/// Record fork choice reorg depth.
-pub fn observe_fork_choice_reorg_depth(depth: u64) {
-    static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<prometheus::Histogram> =
-        std::sync::LazyLock::new(|| {
-            prometheus::register_histogram!(
-                "lean_fork_choice_reorg_depth",
-                "Depth of reorganizations in blocks",
-                vec![1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0, 50.0, 100.0]
-            )
-            .unwrap()
-        });
-    LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
-}

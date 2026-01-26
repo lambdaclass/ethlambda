@@ -39,13 +39,8 @@ fn update_head(store: &mut Store) {
         0,
     );
     if is_reorg(old_head, new_head, store) {
-        // Calculate reorg depth by finding common ancestor
-        let old_head_slot = store.get_block(&old_head).map(|b| b.slot).unwrap_or(0);
-        let depth = find_reorg_depth(old_head, new_head, old_head_slot, store);
-
         metrics::inc_fork_choice_reorgs();
-        metrics::observe_fork_choice_reorg_depth(depth);
-        info!(%old_head, %new_head, %depth, "Fork choice reorg detected");
+        info!(%old_head, %new_head, "Fork choice reorg detected");
     }
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 }
@@ -1035,40 +1030,6 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
     }
 
     // Couldn't walk back far enough (missing blocks in chain)
-    // Conservative: assume no reorg if we can't determine
+    // Assume the ancestor is behind the latest finalized block
     false
-}
-
-/// Find the depth of a reorg by walking back from old head to find common ancestor.
-///
-/// Returns the number of slots the old head is ahead of the common ancestor.
-fn find_reorg_depth(old_head: H256, new_head: H256, old_head_slot: u64, store: &Store) -> u64 {
-    // Collect all ancestors of new_head
-    let mut new_ancestors: HashSet<H256> = HashSet::new();
-    let mut current = new_head;
-    while let Some(block) = store.get_block(&current) {
-        new_ancestors.insert(current);
-        if block.parent_root == H256::ZERO {
-            break;
-        }
-        current = block.parent_root;
-    }
-
-    // Walk back from old_head until we find a common ancestor
-    let mut current = old_head;
-    let mut depth = 0u64;
-    while let Some(block) = store.get_block(&current) {
-        if new_ancestors.contains(&current) {
-            // Found common ancestor
-            return old_head_slot.saturating_sub(block.slot);
-        }
-        depth += 1;
-        if block.parent_root == H256::ZERO {
-            break;
-        }
-        current = block.parent_root;
-    }
-
-    // If no common ancestor found, return 0
-    depth
 }
