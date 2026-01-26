@@ -7,6 +7,7 @@ use ethlambda_types::{
 };
 
 mod justified_slots_ops;
+pub mod metrics;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -65,7 +66,9 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
         // Special case: cache the state root if not already set.
         state.latest_block_header.state_root = state.tree_hash_root();
     }
+    let slots_processed = target_slot - state.slot;
     state.slot = target_slot;
+    metrics::inc_slots_processed(slots_processed);
     Ok(())
 }
 
@@ -182,6 +185,7 @@ fn process_attestations(
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
     let validator_count = state.validators.len();
+    let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
         .iter()
@@ -259,6 +263,7 @@ fn process_attestations(
         }
 
         // Record the vote
+        attestations_processed += 1;
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
@@ -292,6 +297,7 @@ fn process_attestations(
             {
                 let old_finalized_slot = state.latest_finalized.slot;
                 state.latest_finalized = source;
+                metrics::inc_finalizations("success");
 
                 // Shift window to drop finalized slots from the front
                 let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
@@ -331,6 +337,7 @@ fn process_attestations(
         .try_into()
         .expect("justifications_roots limit exceeded");
     state.justifications_validators = justifications_validators;
+    metrics::inc_attestations_processed(attestations_processed);
     Ok(())
 }
 

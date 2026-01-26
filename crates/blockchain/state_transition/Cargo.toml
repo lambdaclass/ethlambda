@@ -13,6 +13,7 @@ version.workspace = true
 ethlambda-types.workspace = true
 
 thiserror.workspace = true
+prometheus.workspace = true
 
 [dev-dependencies]
 serde.workspace = true
