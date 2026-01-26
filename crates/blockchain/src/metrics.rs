@@ -1,5 +1,7 @@
 //! Prometheus metrics for the blockchain module.
 
+use std::time::Instant;
+
 pub fn update_head_slot(slot: u64) {
     static LEAN_HEAD_SLOT: std::sync::LazyLock<prometheus::IntGauge> =
         std::sync::LazyLock::new(|| {
@@ -128,4 +130,68 @@ pub fn inc_fork_choice_reorgs() {
             .unwrap()
         });
     LEAN_FORK_CHOICE_REORGS_TOTAL.inc();
+}
+
+/// A guard that records elapsed time to a histogram when dropped.
+pub struct TimingGuard {
+    histogram: &'static prometheus::Histogram,
+    start: Instant,
+}
+
+impl TimingGuard {
+    fn new(histogram: &'static prometheus::Histogram) -> Self {
+        Self {
+            histogram,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TimingGuard {
+    fn drop(&mut self) {
+        self.histogram.observe(self.start.elapsed().as_secs_f64());
+    }
+}
+
+/// Start timing fork choice block processing. Records duration when the guard is dropped.
+pub fn time_fork_choice_block_processing() -> TimingGuard {
+    static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<
+        prometheus::Histogram,
+    > = std::sync::LazyLock::new(|| {
+        prometheus::register_histogram!(
+            "lean_fork_choice_block_processing_time_seconds",
+            "Duration to process a block",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    TimingGuard::new(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS)
+}
+
+/// Start timing attestation validation. Records duration when the guard is dropped.
+pub fn time_attestation_validation() -> TimingGuard {
+    static LEAN_ATTESTATION_VALIDATION_TIME_SECONDS: std::sync::LazyLock<prometheus::Histogram> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_histogram!(
+                "lean_attestation_validation_time_seconds",
+                "Duration to validate an attestation",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS)
+}
+
+/// Record fork choice reorg depth.
+pub fn observe_fork_choice_reorg_depth(depth: u64) {
+    static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<prometheus::Histogram> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_histogram!(
+                "lean_fork_choice_reorg_depth",
+                "Depth of reorganizations in blocks",
+                vec![1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0, 50.0, 100.0]
+            )
+            .unwrap()
+        });
+    LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
 }
