@@ -23,9 +23,7 @@ serde_json.workspace = true
 serde_yaml_ng = "0.10"
 hex.workspace = true
 
-ethereum-types.workspace = true
 clap.workspace = true
 
 [build-dependencies]
-vergen.workspace = true
 vergen-git2.workspace = true

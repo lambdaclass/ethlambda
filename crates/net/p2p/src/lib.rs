@@ -19,7 +19,7 @@ use libp2p::{
 use sha2::Digest;
 use ssz::Encode;
 use tokio::sync::mpsc;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
@@ -31,6 +31,9 @@ use crate::{
 
 mod gossipsub;
 mod messages;
+pub mod metrics;
+
+pub use metrics::populate_name_registry;
 
 pub async fn start_p2p(
     node_key: Vec<u8>,
@@ -66,7 +69,6 @@ pub async fn start_p2p(
         .build()
         .expect("invalid gossipsub config");
 
-    // TODO: setup custom message ID function
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
 
@@ -100,12 +102,17 @@ pub async fn start_p2p(
             config.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
         })
         .build();
+    let local_peer_id = *swarm.local_peer_id();
     for bootnode in bootnodes {
+        let peer_id = PeerId::from_public_key(&bootnode.public_key);
+        if peer_id == local_peer_id {
+            continue;
+        }
         let addr = Multiaddr::empty()
             .with(bootnode.ip.into())
             .with(Protocol::Udp(bootnode.quic_port))
             .with(Protocol::QuicV1)
-            .with_p2p(PeerId::from_public_key(&bootnode.public_key))
+            .with_p2p(peer_id)
             .expect("failed to add peer ID to multiaddr");
         swarm.dial(addr).unwrap();
     }
@@ -178,6 +185,58 @@ async fn event_loop(
                         message @ libp2p::gossipsub::Event::Message { .. },
                     )) => {
                         gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
+                    }
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        endpoint,
+                        num_established,
+                        ..
+                    } => {
+                        let direction = connection_direction(&endpoint);
+                        if num_established.get() == 1 {
+                            metrics::notify_peer_connected(&Some(peer_id), direction, "success");
+                        }
+                        info!(%peer_id, %direction, "Peer connected");
+                    }
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        endpoint,
+                        num_established,
+                        cause,
+                        ..
+                    } => {
+                        let direction = connection_direction(&endpoint);
+                        let reason = match cause {
+                            None => "remote_close",
+                            Some(err) => {
+                                // Categorize disconnection reasons
+                                let err_str = err.to_string().to_lowercase();
+                                if err_str.contains("timeout") || err_str.contains("timedout") || err_str.contains("keepalive") {
+                                    "timeout"
+                                } else if err_str.contains("reset") || err_str.contains("connectionreset") {
+                                    "remote_close"
+                                } else {
+                                    "error"
+                                }
+                            }
+                        };
+                        if num_established == 0 {
+                            metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+                        }
+                        info!(%peer_id, %direction, %reason, "Peer disconnected");
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        let result = if error.to_string().to_lowercase().contains("timed out") {
+                            "timeout"
+                        } else {
+                            "error"
+                        };
+                        metrics::notify_peer_connected(&peer_id, "outbound", result);
+                        warn!(?peer_id, %error, "Outgoing connection error");
+                    }
+                    SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
+                        metrics::notify_peer_connected(&peer_id, "inbound", "error");
+                        warn!(%error, "Incoming connection error");
                     }
                     _ => {
                         trace!(?event, "Ignored swarm event");
@@ -308,6 +367,14 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
         });
     }
     bootnodes
+}
+
+fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
+    if endpoint.is_dialer() {
+        "outbound"
+    } else {
+        "inbound"
+    }
 }
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {

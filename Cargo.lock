@@ -1892,7 +1892,6 @@ name = "ethlambda"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ethereum-types",
  "ethlambda-blockchain",
  "ethlambda-p2p",
  "ethlambda-rpc",
@@ -1907,7 +1906,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vergen",
  "vergen-git2",
 ]
 
@@ -1996,6 +1994,7 @@ dependencies = [
  "datatest-stable 0.3.3",
  "ethlambda-types",
  "hex",
+ "prometheus",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -7363,7 +7362,6 @@ dependencies = [
  "derive_builder",
  "rustc_version 0.4.1",
  "rustversion",
- "time",
  "vergen-lib",
 ]
 
