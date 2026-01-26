@@ -74,7 +74,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use ethlambda_storage::Store;
+    use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
         primitives::TreeHash,
@@ -82,6 +82,7 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use serde_json::json;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     /// Create a minimal test state for testing.
@@ -116,7 +117,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_justified_checkpoint() {
         let state = create_test_state();
-        let store = Store::from_genesis(state);
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_genesis(backend, state);
 
         let app = build_api_router(store.clone());
 
@@ -151,7 +153,8 @@ mod tests {
         use ethlambda_types::primitives::Encode;
 
         let state = create_test_state();
-        let store = Store::from_genesis(state);
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_genesis(backend, state);
 
         // Get the expected state from the store
         let finalized = store.latest_finalized();

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::api::{StorageBackend, Table};
-use crate::backend::InMemoryBackend;
 
 use ethlambda_types::{
     attestation::AttestationData,
@@ -95,7 +94,7 @@ pub struct Store {
 
 impl Store {
     /// Initialize a Store from a genesis state.
-    pub fn from_genesis(mut genesis_state: State) -> Self {
+    pub fn from_genesis(backend: Arc<dyn StorageBackend>, mut genesis_state: State) -> Self {
         // Ensure the header state root is zero before computing the state root
         genesis_state.latest_block_header.state_root = H256::ZERO;
 
@@ -107,15 +106,17 @@ impl Store {
             state_root: genesis_state_root,
             body: BlockBody::default(),
         };
-        Self::get_forkchoice_store(genesis_state, genesis_block)
+        Self::get_forkchoice_store(backend, genesis_state, genesis_block)
     }
 
     /// Initialize a Store from an anchor state and block.
-    pub fn get_forkchoice_store(anchor_state: State, anchor_block: Block) -> Self {
+    pub fn get_forkchoice_store(
+        backend: Arc<dyn StorageBackend>,
+        anchor_state: State,
+        anchor_block: Block,
+    ) -> Self {
         let anchor_state_root = anchor_state.tree_hash_root();
         let anchor_block_root = anchor_block.tree_hash_root();
-
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,

@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
-use ethlambda_storage::Store;
+use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -35,7 +36,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let anchor_state: State = test.anchor_state.into();
         let anchor_block: Block = test.anchor_block.into();
         let genesis_time = anchor_state.config.genesis_time;
-        let mut store = Store::get_forkchoice_store(anchor_state, anchor_block);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
