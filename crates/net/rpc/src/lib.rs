@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
-use ethlambda_blockchain::store::Store;
+use ethlambda_storage::Store;
 
 pub mod metrics;
 
@@ -32,14 +32,14 @@ async fn get_latest_finalized_state(
 ) -> impl IntoResponse {
     let finalized = store.latest_finalized();
     let state = store
-        .get_state(finalized.root)
+        .get_state(&finalized.root)
         .expect("finalized state exists");
-    Json(state.clone())
+    Json(state)
 }
 
 async fn get_latest_justified_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let checkpoint = *store.latest_justified();
+    let checkpoint = store.latest_justified();
     Json(checkpoint)
 }

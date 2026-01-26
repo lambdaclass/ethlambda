@@ -1981,7 +1981,7 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
- "ethlambda-blockchain",
+ "ethlambda-storage",
  "prometheus",
  "serde",
  "serde_json",

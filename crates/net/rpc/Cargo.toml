@@ -15,6 +15,6 @@ tokio.workspace = true
 prometheus.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-ethlambda-blockchain.workspace = true
+ethlambda-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -18,7 +18,8 @@ use serde::Deserialize;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::{BlockChain, store::Store};
+use ethlambda_blockchain::BlockChain;
+use ethlambda_storage::Store;
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
