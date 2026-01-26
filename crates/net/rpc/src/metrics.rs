@@ -1,4 +1,5 @@
 use axum::{Router, http::HeaderValue, response::IntoResponse, routing::get};
+use ethlambda_metrics::*;
 use thiserror::Error;
 use tracing::warn;
 
@@ -27,7 +28,7 @@ pub(crate) async fn get_metrics() -> impl IntoResponse {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Prometheus error: {0}")]
-    Prometheus(#[from] prometheus::Error),
+    Prometheus(#[from] PrometheusError),
     #[error("UTF-8 conversion error: {0}")]
     FromUtf8(#[from] std::string::FromUtf8Error),
 }
@@ -37,10 +38,8 @@ pub enum Error {
 /// Both profiling and RPC metrics register with this default registry, and the
 /// metrics API surfaces them by calling this helper.
 pub fn gather_default_metrics() -> Result<String, Error> {
-    use prometheus::{Encoder, TextEncoder};
-
     let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
+    let metric_families = gather();
 
     let mut buffer = Vec::new();
     encoder.encode(&metric_families, &mut buffer)?;
