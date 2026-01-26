@@ -207,7 +207,7 @@ impl BlockChainServer {
                     slot: block.slot,
                 },
                 target: store::get_attestation_target(&self.store),
-                source: *self.store.latest_justified(),
+                source: self.store.latest_justified(),
             },
         };
 

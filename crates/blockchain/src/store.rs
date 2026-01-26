@@ -455,7 +455,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: *store.latest_justified(),
+        source: store.latest_justified(),
     }
 }
 

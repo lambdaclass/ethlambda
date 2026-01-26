@@ -48,6 +48,15 @@ impl ForkCheckpoints {
     }
 }
 
+// ============ Metadata Keys ============
+
+const KEY_TIME: &[u8] = b"time";
+const KEY_CONFIG: &[u8] = b"config";
+const KEY_HEAD: &[u8] = b"head";
+const KEY_SAFE_TARGET: &[u8] = b"safe_target";
+const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
+const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
+
 // ============ Key Encoding Helpers ============
 
 /// Encode a SignatureKey (validator_id, root) to bytes.
@@ -79,41 +88,12 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
 /// - an attestation is received (via a block or gossip),
 /// - an interval tick occurs (activating new attestations),
 /// - or when the head is recomputed.
+///
+/// All data is stored in the backend. Metadata fields (time, config, head, etc.)
+/// are stored in the Metadata table with their field name as the key.
 #[derive(Clone)]
 pub struct Store {
-    /// Current time in intervals since genesis.
-    time: u64,
-
-    /// Chain configuration parameters.
-    config: ChainConfig,
-
-    /// Root of the current canonical chain head block.
-    ///
-    /// This is the result of running the fork choice algorithm on the current contents of the `Store`.
-    head: H256,
-
-    /// Root of the current safe target for attestation.
-    ///
-    /// This can be used by higher-level logic to restrict which blocks are
-    /// considered safe to attest to, based on additional safety conditions.
-    ///
-    safe_target: H256,
-
-    /// Highest slot justified checkpoint known to the store.
-    ///
-    /// LMD GHOST starts from this checkpoint when computing the head.
-    ///
-    /// Only descendants of this checkpoint are considered viable.
-    latest_justified: Checkpoint,
-
-    /// Highest slot finalized checkpoint known to the store.
-    ///
-    /// Everything strictly before this checkpoint can be considered immutable.
-    ///
-    /// Fork choice will never revert finalized history.
-    latest_finalized: Checkpoint,
-
-    /// Storage backend for blocks, states, attestations, and signatures.
+    /// Storage backend for all store data.
     backend: InMemoryBackend,
 }
 
@@ -141,9 +121,37 @@ impl Store {
 
         let backend = InMemoryBackend::new();
 
-        // Insert initial block and state
+        let anchor_checkpoint = Checkpoint {
+            root: anchor_block_root,
+            slot: 0,
+        };
+
+        // Insert initial data
         {
             let mut batch = backend.begin_write().expect("write batch");
+
+            // Metadata
+            batch
+                .put_batch(
+                    Table::Metadata,
+                    vec![
+                        (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
+                        (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
+                        (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
+                        (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
+                        (
+                            KEY_LATEST_JUSTIFIED.to_vec(),
+                            anchor_checkpoint.as_ssz_bytes(),
+                        ),
+                        (
+                            KEY_LATEST_FINALIZED.to_vec(),
+                            anchor_checkpoint.as_ssz_bytes(),
+                        ),
+                    ],
+                )
+                .expect("put metadata");
+
+            // Block and state
             batch
                 .put_batch(
                     Table::Blocks,
@@ -162,25 +170,13 @@ impl Store {
                     )],
                 )
                 .expect("put state");
+
             batch.commit().expect("commit");
         }
 
-        let anchor_checkpoint = Checkpoint {
-            root: anchor_block_root,
-            slot: 0,
-        };
-
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self {
-            time: 0,
-            config: anchor_state.config.clone(),
-            head: anchor_block_root,
-            safe_target: anchor_block_root,
-            latest_justified: anchor_checkpoint,
-            latest_finalized: anchor_checkpoint,
-            backend,
-        }
+        Self { backend }
     }
 
     /// Creates a new Store with the given initial values.
@@ -197,9 +193,32 @@ impl Store {
     ) -> Self {
         let backend = InMemoryBackend::new();
 
-        // Insert blocks and states
+        // Insert all data
         {
             let mut batch = backend.begin_write().expect("write batch");
+
+            // Metadata
+            batch
+                .put_batch(
+                    Table::Metadata,
+                    vec![
+                        (KEY_TIME.to_vec(), time.as_ssz_bytes()),
+                        (KEY_CONFIG.to_vec(), config.as_ssz_bytes()),
+                        (KEY_HEAD.to_vec(), head.as_ssz_bytes()),
+                        (KEY_SAFE_TARGET.to_vec(), safe_target.as_ssz_bytes()),
+                        (
+                            KEY_LATEST_JUSTIFIED.to_vec(),
+                            latest_justified.as_ssz_bytes(),
+                        ),
+                        (
+                            KEY_LATEST_FINALIZED.to_vec(),
+                            latest_finalized.as_ssz_bytes(),
+                        ),
+                    ],
+                )
+                .expect("put metadata");
+
+            // Blocks
             let block_entries: Vec<_> = blocks
                 .into_iter()
                 .map(|(k, v)| (k.as_ssz_bytes(), v.as_ssz_bytes()))
@@ -209,6 +228,8 @@ impl Store {
                     .put_batch(Table::Blocks, block_entries)
                     .expect("put blocks");
             }
+
+            // States
             let state_entries: Vec<_> = states
                 .into_iter()
                 .map(|(k, v)| (k.as_ssz_bytes(), v.as_ssz_bytes()))
@@ -218,62 +239,74 @@ impl Store {
                     .put_batch(Table::States, state_entries)
                     .expect("put states");
             }
+
             batch.commit().expect("commit");
         }
 
-        Self {
-            time,
-            config,
-            head,
-            safe_target,
-            latest_justified,
-            latest_finalized,
-            backend,
-        }
+        Self { backend }
+    }
+
+    // ============ Metadata Helpers ============
+
+    fn get_metadata<T: Decode>(&self, key: &[u8]) -> T {
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view
+            .get(Table::Metadata, key)
+            .expect("get")
+            .expect("metadata key exists");
+        T::from_ssz_bytes(&bytes).expect("valid encoding")
+    }
+
+    fn set_metadata<T: Encode>(&self, key: &[u8], value: &T) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::Metadata, vec![(key.to_vec(), value.as_ssz_bytes())])
+            .expect("put metadata");
+        batch.commit().expect("commit");
     }
 
     // ============ Time ============
 
     pub fn time(&self) -> u64 {
-        self.time
+        self.get_metadata(KEY_TIME)
     }
 
     pub fn set_time(&mut self, time: u64) {
-        self.time = time;
+        self.set_metadata(KEY_TIME, &time);
     }
 
     // ============ Config ============
 
-    pub fn config(&self) -> &ChainConfig {
-        &self.config
+    pub fn config(&self) -> ChainConfig {
+        self.get_metadata(KEY_CONFIG)
     }
 
     // ============ Head ============
 
     pub fn head(&self) -> H256 {
-        self.head
+        self.get_metadata(KEY_HEAD)
     }
 
     // ============ Safe Target ============
 
     pub fn safe_target(&self) -> H256 {
-        self.safe_target
+        self.get_metadata(KEY_SAFE_TARGET)
     }
 
     pub fn set_safe_target(&mut self, safe_target: H256) {
-        self.safe_target = safe_target;
+        self.set_metadata(KEY_SAFE_TARGET, &safe_target);
     }
 
     // ============ Latest Justified ============
 
-    pub fn latest_justified(&self) -> &Checkpoint {
-        &self.latest_justified
+    pub fn latest_justified(&self) -> Checkpoint {
+        self.get_metadata(KEY_LATEST_JUSTIFIED)
     }
 
     // ============ Latest Finalized ============
 
-    pub fn latest_finalized(&self) -> &Checkpoint {
-        &self.latest_finalized
+    pub fn latest_finalized(&self) -> Checkpoint {
+        self.get_metadata(KEY_LATEST_FINALIZED)
     }
 
     // ============ Checkpoint Updates ============
@@ -284,15 +317,19 @@ impl Store {
     /// - Justified is updated if provided.
     /// - Finalized is updated if provided.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
-        self.head = checkpoints.head;
+        let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.as_ssz_bytes())];
 
         if let Some(justified) = checkpoints.justified {
-            self.latest_justified = justified;
+            entries.push((KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()));
         }
 
         if let Some(finalized) = checkpoints.finalized {
-            self.latest_finalized = finalized;
+            entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()));
         }
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch.put_batch(Table::Metadata, entries).expect("put");
+        batch.commit().expect("commit");
     }
 
     // ============ Blocks ============
@@ -586,14 +623,14 @@ impl Store {
 
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
-        self.get_block(&self.safe_target)
+        self.get_block(&self.safe_target())
             .expect("safe target exists")
             .slot
     }
 
     /// Returns a clone of the head state.
     pub fn head_state(&self) -> State {
-        self.get_state(&self.head)
+        self.get_state(&self.head())
             .expect("head state is always available")
     }
 }
