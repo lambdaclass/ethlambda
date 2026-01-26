@@ -29,6 +29,8 @@ pub enum Error {
 ///
 /// Similar to the spec's `State.state_transition`: https://github.com/leanEthereum/leanSpec/blob/bf0f606a75095cf1853529bc770516b1464d9716/src/lean_spec/subspecs/containers/state/state.py#L569
 pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
+    let _timing = metrics::time_state_transition();
+
     process_slots(state, block.slot)?;
     process_block(state, block)?;
 
@@ -56,6 +58,8 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
 
 /// Advance the state through empty slots up to, but not including, target_slot.
 pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
+    let _timing = metrics::time_slots_processing();
+
     if state.slot >= target_slot {
         return Err(Error::StateSlotIsNewer {
             target_slot,
@@ -74,8 +78,11 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
 
 /// Apply full block processing including header and body.
 pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
+    let _timing = metrics::time_block_processing();
+
     process_block_header(state, block)?;
     process_attestations(state, &block.body.attestations)?;
+
     Ok(())
 }
 
@@ -184,6 +191,7 @@ fn process_attestations(
     state: &mut State,
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
+    let _timing = metrics::time_attestations_processing();
     let validator_count = state.validators.len();
     let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
@@ -308,6 +316,8 @@ fn process_attestations(
                     let slot = root_to_slot[root];
                     slot > state.latest_finalized.slot
                 });
+            } else {
+                metrics::inc_finalizations("error");
             }
         }
     }

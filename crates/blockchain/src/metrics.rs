@@ -84,3 +84,48 @@ pub fn set_node_start_time() {
         .as_secs();
     LEAN_NODE_START_TIME_SECONDS.set(timestamp as i64);
 }
+
+/// Increment the valid attestations counter.
+pub fn inc_attestations_valid(source: &str) {
+    static LEAN_ATTESTATIONS_VALID_TOTAL: std::sync::LazyLock<prometheus::IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_counter_vec!(
+                "lean_attestations_valid_total",
+                "Count of valid attestations",
+                &["source"]
+            )
+            .unwrap()
+        });
+    LEAN_ATTESTATIONS_VALID_TOTAL
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Increment the invalid attestations counter.
+pub fn inc_attestations_invalid(source: &str) {
+    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<prometheus::IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_counter_vec!(
+                "lean_attestations_invalid_total",
+                "Count of invalid attestations",
+                &["source"]
+            )
+            .unwrap()
+        });
+    LEAN_ATTESTATIONS_INVALID_TOTAL
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Increment the fork choice reorgs counter.
+pub fn inc_fork_choice_reorgs() {
+    static LEAN_FORK_CHOICE_REORGS_TOTAL: std::sync::LazyLock<prometheus::IntCounter> =
+        std::sync::LazyLock::new(|| {
+            prometheus::register_int_counter!(
+                "lean_fork_choice_reorgs_total",
+                "Count of fork choice reorganizations"
+            )
+            .unwrap()
+        });
+    LEAN_FORK_CHOICE_REORGS_TOTAL.inc();
+}

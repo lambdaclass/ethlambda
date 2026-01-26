@@ -1,0 +1,316 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use crate::api::{
+    ALL_TABLES, Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table,
+};
+
+type TableData = HashMap<Vec<u8>, Vec<u8>>;
+type StorageData = HashMap<Table, TableData>;
+
+/// Pending operation for a key - last operation wins.
+enum PendingOp {
+    Put(Vec<u8>),
+    Delete,
+}
+
+type PendingOps = HashMap<Table, HashMap<Vec<u8>, PendingOp>>;
+
+/// In-memory storage backend using HashMaps.
+///
+/// All tables are created (empty) on initialization.
+#[derive(Clone)]
+pub struct InMemoryBackend {
+    data: Arc<RwLock<StorageData>>,
+}
+
+impl Default for InMemoryBackend {
+    fn default() -> Self {
+        let mut data = StorageData::new();
+        for table in ALL_TABLES {
+            data.insert(table, TableData::new());
+        }
+        Self {
+            data: Arc::new(RwLock::new(data)),
+        }
+    }
+}
+
+impl InMemoryBackend {
+    /// Create a new in-memory backend with all tables initialized empty.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl StorageBackend for InMemoryBackend {
+    fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, Error> {
+        let guard = self.data.read().map_err(|e| e.to_string())?;
+        Ok(Box::new(InMemoryReadView { guard }))
+    }
+
+    fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, Error> {
+        Ok(Box::new(InMemoryWriteBatch {
+            data: Arc::clone(&self.data),
+            ops: HashMap::new(),
+        }))
+    }
+}
+
+/// Read view holding a read lock on the storage data.
+struct InMemoryReadView<'a> {
+    guard: std::sync::RwLockReadGuard<'a, StorageData>,
+}
+
+impl StorageReadView for InMemoryReadView<'_> {
+    fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self
+            .guard
+            .get(&table)
+            .expect("table exists")
+            .get(key)
+            .cloned())
+    }
+
+    fn prefix_iterator(
+        &self,
+        table: Table,
+        prefix: &[u8],
+    ) -> Result<Box<dyn Iterator<Item = PrefixResult> + '_>, Error> {
+        let table_data = self.guard.get(&table).expect("table exists");
+        let prefix_owned = prefix.to_vec();
+
+        let iter = table_data
+            .iter()
+            .filter(move |(k, _)| k.starts_with(&prefix_owned))
+            .map(|(k, v)| Ok((k.clone().into_boxed_slice(), v.clone().into_boxed_slice())));
+
+        Ok(Box::new(iter))
+    }
+}
+
+/// Write batch that accumulates changes before committing.
+struct InMemoryWriteBatch {
+    data: Arc<RwLock<StorageData>>,
+    ops: PendingOps,
+}
+
+impl StorageWriteBatch for InMemoryWriteBatch {
+    fn put_batch(&mut self, table: Table, batch: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error> {
+        let table_ops = self.ops.entry(table).or_default();
+        for (key, value) in batch {
+            table_ops.insert(key, PendingOp::Put(value));
+        }
+        Ok(())
+    }
+
+    fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error> {
+        let table_ops = self.ops.entry(table).or_default();
+        for key in keys {
+            table_ops.insert(key, PendingOp::Delete);
+        }
+        Ok(())
+    }
+
+    fn commit(self: Box<Self>) -> Result<(), Error> {
+        let mut guard = self.data.write().map_err(|e| e.to_string())?;
+
+        for (table, ops) in self.ops {
+            let table_data = guard.get_mut(&table).expect("table exists");
+            for (key, op) in ops {
+                match op {
+                    PendingOp::Put(value) => {
+                        table_data.insert(key, value);
+                    }
+                    PendingOp::Delete => {
+                        table_data.remove(&key);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_put_and_get() {
+        let backend = InMemoryBackend::new();
+
+        // Write data
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key1".to_vec(), b"value1".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Read data
+        {
+            let view = backend.begin_read().unwrap();
+            let value = view.get(Table::Blocks, b"key1").unwrap();
+            assert_eq!(value, Some(b"value1".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_delete() {
+        let backend = InMemoryBackend::new();
+
+        // Write data
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key1".to_vec(), b"value1".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Delete data
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .delete_batch(Table::Blocks, vec![b"key1".to_vec()])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Verify deleted
+        {
+            let view = backend.begin_read().unwrap();
+            let value = view.get(Table::Blocks, b"key1").unwrap();
+            assert_eq!(value, None);
+        }
+    }
+
+    #[test]
+    fn test_prefix_iterator() {
+        let backend = InMemoryBackend::new();
+
+        // Write data with common prefix
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(
+                    Table::Metadata,
+                    vec![
+                        (b"config:a".to_vec(), b"1".to_vec()),
+                        (b"config:b".to_vec(), b"2".to_vec()),
+                        (b"other:x".to_vec(), b"3".to_vec()),
+                    ],
+                )
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Query by prefix
+        {
+            let view = backend.begin_read().unwrap();
+            let mut results: Vec<_> = view
+                .prefix_iterator(Table::Metadata, b"config:")
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(results.len(), 2);
+            assert_eq!(&*results[0].0, b"config:a");
+            assert_eq!(&*results[1].0, b"config:b");
+        }
+    }
+
+    #[test]
+    fn test_nonexistent_key() {
+        let backend = InMemoryBackend::new();
+        let view = backend.begin_read().unwrap();
+        let value = view.get(Table::Blocks, b"nonexistent").unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_delete_then_put() {
+        let backend = InMemoryBackend::new();
+
+        // Initial value
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"old".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Delete then put in same batch - put should win
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .delete_batch(Table::Blocks, vec![b"key".to_vec()])
+                .unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"new".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        let view = backend.begin_read().unwrap();
+        assert_eq!(
+            view.get(Table::Blocks, b"key").unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_put_then_delete() {
+        let backend = InMemoryBackend::new();
+
+        // Put then delete in same batch - delete should win
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"value".to_vec())])
+                .unwrap();
+            batch
+                .delete_batch(Table::Blocks, vec![b"key".to_vec()])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        let view = backend.begin_read().unwrap();
+        assert_eq!(view.get(Table::Blocks, b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_multiple_tables() {
+        let backend = InMemoryBackend::new();
+
+        // Write to different tables
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"block".to_vec())])
+                .unwrap();
+            batch
+                .put_batch(Table::States, vec![(b"key".to_vec(), b"state".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Verify isolation
+        {
+            let view = backend.begin_read().unwrap();
+            assert_eq!(
+                view.get(Table::Blocks, b"key").unwrap(),
+                Some(b"block".to_vec())
+            );
+            assert_eq!(
+                view.get(Table::States, b"key").unwrap(),
+                Some(b"state".to_vec())
+            );
+        }
+    }
+}

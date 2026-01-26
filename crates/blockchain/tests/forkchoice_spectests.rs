@@ -3,7 +3,8 @@ use std::{
     path::Path,
 };
 
-use ethlambda_blockchain::{SECONDS_PER_SLOT, store::Store};
+use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
+use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -58,8 +59,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store.on_tick(block_time, true);
-                    let result = store.on_block(signed_block);
+                    store::on_tick(&mut store, block_time, true);
+                    let result = store::on_block(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
                         (true, false) => {
@@ -83,7 +84,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 "tick" => {
                     let timestamp = step.time.expect("tick step missing time");
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store.on_tick(timestamp, false);
+                    store::on_tick(&mut store, timestamp, false);
                 }
                 other => {
                     // Fail for unsupported step types for now
@@ -117,7 +118,7 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttest
 }
 
 fn validate_checks(
-    store: &Store,
+    st: &Store,
     checks: &StoreChecks,
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
@@ -152,7 +153,7 @@ fn validate_checks(
     }
     // Validate attestationTargetSlot
     if let Some(expected_slot) = checks.attestation_target_slot {
-        let target = store.get_attestation_target();
+        let target = store::get_attestation_target(st);
         if target.slot != expected_slot {
             return Err(format!(
                 "Step {}: attestationTargetSlot mismatch: expected {}, got {}",
@@ -162,14 +163,13 @@ fn validate_checks(
         }
 
         // Also validate the root matches a block at this slot
-        let block_found = store
-            .blocks()
+        let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+        let block_found = blocks
             .iter()
             .any(|(root, block)| block.slot == expected_slot && *root == target.root);
 
         if !block_found {
-            let available: Vec<_> = store
-                .blocks()
+            let available: Vec<_> = blocks
                 .iter()
                 .filter(|(_, block)| block.slot == expected_slot)
                 .map(|(root, _)| format!("{:?}", root))
@@ -184,10 +184,9 @@ fn validate_checks(
 
     // Validate headSlot
     if let Some(expected_slot) = checks.head_slot {
-        let head_root = store.head();
-        let head_block = store
-            .blocks()
-            .get(&head_root)
+        let head_root = st.head();
+        let head_block = st
+            .get_block(&head_root)
             .ok_or_else(|| format!("Step {}: head block not found", step_idx))?;
         if head_block.slot != expected_slot {
             return Err(format!(
@@ -200,7 +199,7 @@ fn validate_checks(
 
     // Validate headRoot
     if let Some(ref expected_root) = checks.head_root {
-        let head_root = store.head();
+        let head_root = st.head();
         if head_root != *expected_root {
             return Err(format!(
                 "Step {}: headRoot mismatch: expected {:?}, got {:?}",
@@ -212,7 +211,7 @@ fn validate_checks(
 
     // Validate latestJustifiedSlot
     if let Some(expected_slot) = checks.latest_justified_slot {
-        let justified = store.latest_justified();
+        let justified = st.latest_justified();
         if justified.slot != expected_slot {
             return Err(format!(
                 "Step {}: latestJustifiedSlot mismatch: expected {}, got {}",
@@ -224,7 +223,7 @@ fn validate_checks(
 
     // Validate latestJustifiedRoot
     if let Some(ref expected_root) = checks.latest_justified_root {
-        let justified = store.latest_justified();
+        let justified = st.latest_justified();
         if justified.root != *expected_root {
             return Err(format!(
                 "Step {}: latestJustifiedRoot mismatch: expected {:?}, got {:?}",
@@ -236,7 +235,7 @@ fn validate_checks(
 
     // Validate latestFinalizedSlot
     if let Some(expected_slot) = checks.latest_finalized_slot {
-        let finalized = store.latest_finalized();
+        let finalized = st.latest_finalized();
         if finalized.slot != expected_slot {
             return Err(format!(
                 "Step {}: latestFinalizedSlot mismatch: expected {}, got {}",
@@ -248,7 +247,7 @@ fn validate_checks(
 
     // Validate latestFinalizedRoot
     if let Some(ref expected_root) = checks.latest_finalized_root {
-        let finalized = store.latest_finalized();
+        let finalized = st.latest_finalized();
         if finalized.root != *expected_root {
             return Err(format!(
                 "Step {}: latestFinalizedRoot mismatch: expected {:?}, got {:?}",
@@ -261,29 +260,31 @@ fn validate_checks(
     // Validate attestationChecks
     if let Some(ref att_checks) = checks.attestation_checks {
         for att_check in att_checks {
-            validate_attestation_check(store, att_check, step_idx)?;
+            validate_attestation_check(st, att_check, step_idx)?;
         }
     }
 
     // Validate lexicographicHeadAmong
     if let Some(ref fork_labels) = checks.lexicographic_head_among {
-        validate_lexicographic_head_among(store, fork_labels, step_idx, block_registry)?;
+        validate_lexicographic_head_among(st, fork_labels, step_idx, block_registry)?;
     }
 
     Ok(())
 }
 
 fn validate_attestation_check(
-    store: &Store,
+    st: &Store,
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
+    use ethlambda_types::attestation::AttestationData;
+
     let validator_id = check.validator;
     let location = check.location.as_str();
 
-    let attestations = match location {
-        "new" => store.latest_new_attestations(),
-        "known" => store.latest_known_attestations(),
+    let attestations: HashMap<u64, AttestationData> = match location {
+        "new" => st.iter_new_attestations().collect(),
+        "known" => st.iter_known_attestations().collect(),
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -345,11 +346,13 @@ fn validate_attestation_check(
 }
 
 fn validate_lexicographic_head_among(
-    store: &Store,
+    st: &Store,
     fork_labels: &[String],
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
+    use ethlambda_types::attestation::AttestationData;
+
     // Require at least 2 forks to test tiebreaker
     if fork_labels.len() < 2 {
         return Err(format!(
@@ -360,7 +363,8 @@ fn validate_lexicographic_head_among(
         .into());
     }
 
-    let blocks = store.blocks();
+    let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+    let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)
@@ -385,7 +389,7 @@ fn validate_lexicographic_head_among(
         // Calculate attestation weight: count attestations voting for this fork
         // An attestation votes for this fork if its head is this block or a descendant
         let mut weight = 0;
-        for attestation in store.latest_known_attestations().values() {
+        for attestation in known_attestations.values() {
             let att_head_root = attestation.head.root;
             // Check if attestation head is this block or a descendant
             if att_head_root == *root {
@@ -451,7 +455,7 @@ fn validate_lexicographic_head_among(
         .expect("fork_data is not empty");
 
     // Verify the current head matches the lexicographically highest root
-    let actual_head_root = store.head();
+    let actual_head_root = st.head();
     if actual_head_root != expected_head_root {
         let highest_label = fork_data
             .iter()
