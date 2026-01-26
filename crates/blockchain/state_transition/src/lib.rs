@@ -184,8 +184,8 @@ fn process_attestations(
     state: &mut State,
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
-    metrics::inc_attestations_processed(attestations.len() as u64);
     let validator_count = state.validators.len();
+    let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
         .iter()
@@ -263,6 +263,7 @@ fn process_attestations(
         }
 
         // Record the vote
+        attestations_processed += 1;
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
@@ -336,6 +337,7 @@ fn process_attestations(
         .try_into()
         .expect("justifications_roots limit exceeded");
     state.justifications_validators = justifications_validators;
+    metrics::inc_attestations_processed(attestations_processed);
     Ok(())
 }
 
