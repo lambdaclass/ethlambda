@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ethlambda-blockchain.workspace = true
+ethlambda-storage.workspace = true
 ethlambda-types.workspace = true
 
 async-trait = "0.1"
