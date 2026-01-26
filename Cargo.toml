@@ -66,3 +66,4 @@ tree_hash_derive = "0.9.1"
 vergen-git2 = { version = "9", features = ["rustc"] }
 
 rand = "0.9"
+rocksdb = "0.24"

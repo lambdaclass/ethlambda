@@ -13,3 +13,11 @@ version.workspace = true
 ethlambda-types.workspace = true
 
 tracing.workspace = true
+rocksdb = { workspace = true, optional = true }
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]
+
+[dev-dependencies]
+tempfile = "3"
