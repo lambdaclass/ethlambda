@@ -1918,11 +1918,11 @@ dependencies = [
  "ethereum_ssz_derive",
  "ethlambda-crypto",
  "ethlambda-fork-choice",
+ "ethlambda-metrics",
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
  "hex",
- "prometheus",
  "serde",
  "serde_json",
  "spawned-concurrency",
@@ -1953,6 +1953,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-metrics"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
@@ -1960,6 +1968,7 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "ethlambda-blockchain",
+ "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-types",
  "ethrex-common",
@@ -1967,7 +1976,6 @@ dependencies = [
  "ethrex-rlp",
  "hex",
  "libp2p",
- "prometheus",
  "sha2",
  "snap",
  "ssz_types",
@@ -1982,11 +1990,10 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-metrics",
  "ethlambda-storage",
- "prometheus",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
  "tokio",
  "tracing",
 ]
@@ -1996,9 +2003,9 @@ name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
+ "ethlambda-metrics",
  "ethlambda-types",
  "hex",
- "prometheus",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

@@ -18,6 +18,7 @@ ethlambda-storage.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-crypto.workspace = true
+ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 
 spawned-concurrency.workspace = true
@@ -27,7 +28,6 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-prometheus.workspace = true
 hex.workspace = true
 
 [dev-dependencies]

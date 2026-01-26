@@ -12,8 +12,7 @@ version.workspace = true
 [dependencies]
 axum = "0.8.1"
 tokio.workspace = true
-prometheus.workspace = true
-thiserror.workspace = true
+ethlambda-metrics.workspace = true
 tracing.workspace = true
 ethlambda-storage.workspace = true
 serde.workspace = true
