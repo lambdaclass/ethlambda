@@ -6,9 +6,9 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Result type for prefix iterator operations.
 pub type PrefixResult = Result<(Box<[u8]>, Box<[u8]>), Error>;
 
-/// A storage backend that can create read views and write batches.
+/// A storage backend that can read and write data through views and batches.
 pub trait StorageBackend: Send + Sync {
-    /// Begin a read-only transaction.
+    /// Begin a read-only view.
     fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, Error>;
 
     /// Begin a write batch.
