@@ -316,6 +316,8 @@ fn process_attestations(
                     let slot = root_to_slot[root];
                     slot > state.latest_finalized.slot
                 });
+            } else {
+                metrics::inc_finalizations("error");
             }
         }
     }
