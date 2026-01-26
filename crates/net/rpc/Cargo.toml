@@ -17,3 +17,8 @@ tracing.workspace = true
 ethlambda-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ethlambda-types.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

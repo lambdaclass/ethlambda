@@ -1992,9 +1992,12 @@ dependencies = [
  "axum",
  "ethlambda-metrics",
  "ethlambda-storage",
+ "ethlambda-types",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
 ]
 
