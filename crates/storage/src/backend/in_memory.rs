@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::api::{Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table};
+use crate::api::{
+    Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table, ALL_TABLES,
+};
 
 type TableData = HashMap<Vec<u8>, Vec<u8>>;
 type StorageData = HashMap<Table, TableData>;
@@ -17,13 +19,27 @@ enum PendingOp {
 type PendingOps = HashMap<Table, HashMap<Vec<u8>, PendingOp>>;
 
 /// In-memory storage backend using HashMaps.
-#[derive(Clone, Default)]
+///
+/// All tables are created (empty) on initialization.
+#[derive(Clone)]
 pub struct InMemoryBackend {
     data: Arc<RwLock<StorageData>>,
 }
 
+impl Default for InMemoryBackend {
+    fn default() -> Self {
+        let mut data = StorageData::new();
+        for table in ALL_TABLES {
+            data.insert(table, TableData::new());
+        }
+        Self {
+            data: Arc::new(RwLock::new(data)),
+        }
+    }
+}
+
 impl InMemoryBackend {
-    /// Create a new empty in-memory backend.
+    /// Create a new in-memory backend with all tables initialized empty.
     pub fn new() -> Self {
         Self::default()
     }
@@ -50,7 +66,12 @@ struct InMemoryReadView<'a> {
 
 impl StorageReadView for InMemoryReadView<'_> {
     fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self.guard.get(&table).and_then(|t| t.get(key)).cloned())
+        Ok(self
+            .guard
+            .get(&table)
+            .expect("table exists")
+            .get(key)
+            .cloned())
     }
 
     fn prefix_iterator(
@@ -58,19 +79,15 @@ impl StorageReadView for InMemoryReadView<'_> {
         table: Table,
         prefix: &[u8],
     ) -> Result<Box<dyn Iterator<Item = PrefixResult> + '_>, Error> {
-        let table_data = self.guard.get(&table);
+        let table_data = self.guard.get(&table).expect("table exists");
         let prefix_owned = prefix.to_vec();
 
-        let iter: Box<dyn Iterator<Item = PrefixResult> + '_> = match table_data {
-            Some(data) => Box::new(
-                data.iter()
-                    .filter(move |(k, _)| k.starts_with(&prefix_owned))
-                    .map(|(k, v)| Ok((k.clone().into_boxed_slice(), v.clone().into_boxed_slice()))),
-            ),
-            None => Box::new(std::iter::empty()),
-        };
+        let iter = table_data
+            .iter()
+            .filter(move |(k, _)| k.starts_with(&prefix_owned))
+            .map(|(k, v)| Ok((k.clone().into_boxed_slice(), v.clone().into_boxed_slice())));
 
-        Ok(iter)
+        Ok(Box::new(iter))
     }
 }
 
@@ -101,7 +118,7 @@ impl StorageWriteBatch for InMemoryWriteBatch {
         let mut guard = self.data.write().map_err(|e| e.to_string())?;
 
         for (table, ops) in self.ops {
-            let table_data = guard.entry(table).or_default();
+            let table_data = guard.get_mut(&table).expect("table exists");
             for (key, op) in ops {
                 match op {
                     PendingOp::Put(value) => {
