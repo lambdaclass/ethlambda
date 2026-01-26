@@ -4,7 +4,7 @@ use ethlambda_crypto::aggregate_signatures;
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
-use ethlambda_storage::{SignatureKey, Store};
+use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store};
 use ethlambda_types::{
     attestation::{AggregatedAttestation, Attestation, AttestationData, SignedAttestation},
     block::{
@@ -35,7 +35,7 @@ fn update_head(store: &mut Store) {
         store.latest_known_attestations(),
         0,
     );
-    store.set_head(head);
+    store.update_checkpoints(ForkCheckpoints::head_only(head));
 }
 
 /// Update the safe target for attestation.
@@ -310,14 +310,14 @@ pub fn on_block(
     let state_root = block.state_root;
     post_state.latest_block_header.state_root = state_root;
 
-    // If post-state has a higher justified checkpoint, update the store
-    if post_state.latest_justified.slot > store.latest_justified().slot {
-        store.set_latest_justified(post_state.latest_justified);
-    }
+    // Update justified/finalized checkpoints if they have higher slots
+    let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
+        .then_some(post_state.latest_justified);
+    let finalized = (post_state.latest_finalized.slot > store.latest_finalized().slot)
+        .then_some(post_state.latest_finalized);
 
-    // If post-state has a higher finalized checkpoint, update the store
-    if post_state.latest_finalized.slot > store.latest_finalized().slot {
-        store.set_latest_finalized(post_state.latest_finalized);
+    if justified.is_some() || finalized.is_some() {
+        store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
     }
 
     // Store block and state

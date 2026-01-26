@@ -15,6 +15,38 @@ use tracing::info;
 /// Values are (validator_index, attestation_data_root).
 pub type SignatureKey = (u64, H256);
 
+/// Checkpoints to update in the forkchoice store.
+///
+/// Used with `Store::update_checkpoints` to update head and optionally
+/// update justified/finalized checkpoints (only if higher slot).
+pub struct ForkCheckpoints {
+    head: H256,
+    justified: Option<Checkpoint>,
+    finalized: Option<Checkpoint>,
+}
+
+impl ForkCheckpoints {
+    /// Create checkpoints update with only the head.
+    pub fn head_only(head: H256) -> Self {
+        Self {
+            head,
+            justified: None,
+            finalized: None,
+        }
+    }
+
+    /// Create checkpoints update with optional justified and finalized.
+    ///
+    /// The head is passed through unchanged.
+    pub fn new(head: H256, justified: Option<Checkpoint>, finalized: Option<Checkpoint>) -> Self {
+        Self {
+            head,
+            justified,
+            finalized,
+        }
+    }
+}
+
 /// Forkchoice store tracking chain state and validator attestations.
 ///
 /// This is the "local view" that a node uses to run LMD GHOST. It contains:
@@ -206,10 +238,6 @@ impl Store {
         self.head
     }
 
-    pub fn set_head(&mut self, head: H256) {
-        self.head = head;
-    }
-
     // ============ Safe Target ============
 
     pub fn safe_target(&self) -> H256 {
@@ -226,18 +254,29 @@ impl Store {
         &self.latest_justified
     }
 
-    pub fn set_latest_justified(&mut self, checkpoint: Checkpoint) {
-        self.latest_justified = checkpoint;
-    }
-
     // ============ Latest Finalized ============
 
     pub fn latest_finalized(&self) -> &Checkpoint {
         &self.latest_finalized
     }
 
-    pub fn set_latest_finalized(&mut self, checkpoint: Checkpoint) {
-        self.latest_finalized = checkpoint;
+    // ============ Checkpoint Updates ============
+
+    /// Updates head, justified, and finalized checkpoints.
+    ///
+    /// - Head is always updated to the new value.
+    /// - Justified is updated if provided.
+    /// - Finalized is updated if provided.
+    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+        self.head = checkpoints.head;
+
+        if let Some(justified) = checkpoints.justified {
+            self.latest_justified = justified;
+        }
+
+        if let Some(finalized) = checkpoints.finalized {
+            self.latest_finalized = finalized;
+        }
     }
 
     // ============ Blocks ============
