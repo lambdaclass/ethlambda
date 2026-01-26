@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 
 use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
+use ethlambda_types::primitives::Encode;
 
-const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 pub mod metrics;
 
@@ -37,7 +39,7 @@ async fn get_latest_finalized_state(
     let state = store
         .get_state(&finalized.root)
         .expect("finalized state exists");
-    json_response(state)
+    ssz_response(state.as_ssz_bytes())
 }
 
 async fn get_latest_justified_state(
@@ -52,6 +54,15 @@ fn json_response<T: serde::Serialize>(value: T) -> axum::response::Response {
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(JSON_CONTENT_TYPE),
+    );
+    response
+}
+
+fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(SSZ_CONTENT_TYPE),
     );
     response
 }
@@ -137,12 +148,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_latest_finalized_state() {
+        use ethlambda_types::primitives::Encode;
+
         let state = create_test_state();
         let store = Store::from_genesis(state);
 
-        // Get the expected state from the store to build expected JSON
+        // Get the expected state from the store
         let finalized = store.latest_finalized();
         let expected_state = store.get_state(&finalized.root).unwrap();
+        let expected_ssz = expected_state.as_ssz_bytes();
 
         let app = build_api_router(store);
 
@@ -157,39 +171,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            SSZ_CONTENT_TYPE
+        );
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let returned_state: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let header = &expected_state.latest_block_header;
-        assert_eq!(
-            returned_state,
-            json!({
-                "config": {
-                    "genesis_time": expected_state.config.genesis_time
-                },
-                "slot": expected_state.slot,
-                "latest_block_header": {
-                    "slot": header.slot,
-                    "proposer_index": header.proposer_index,
-                    "parent_root": format!("{:#x}", header.parent_root),
-                    "state_root": format!("{:#x}", header.state_root),
-                    "body_root": format!("{:#x}", header.body_root)
-                },
-                "latest_justified": {
-                    "slot": expected_state.latest_justified.slot,
-                    "root": format!("{:#x}", expected_state.latest_justified.root)
-                },
-                "latest_finalized": {
-                    "slot": expected_state.latest_finalized.slot,
-                    "root": format!("{:#x}", expected_state.latest_finalized.root)
-                },
-                "historical_block_hashes": [],
-                "justified_slots": "0x01",
-                "validators": [],
-                "justifications_roots": [],
-                "justifications_validators": "0x01"
-            })
-        );
+        assert_eq!(body.as_ref(), expected_ssz.as_slice());
     }
 }

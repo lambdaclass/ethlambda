@@ -15,6 +15,7 @@ tokio.workspace = true
 ethlambda-metrics.workspace = true
 tracing.workspace = true
 ethlambda-storage.workspace = true
+ethlambda-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
