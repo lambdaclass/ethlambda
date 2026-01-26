@@ -1982,7 +1982,10 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-storage",
  "prometheus",
+ "serde",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -2016,6 +2019,7 @@ dependencies = [
  "ethereum-types",
  "ethereum_ssz",
  "ethereum_ssz_derive",
+ "hex",
  "leansig",
  "serde",
  "ssz_types",

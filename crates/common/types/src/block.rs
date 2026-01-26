@@ -1,3 +1,4 @@
+use serde::Serialize;
 use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::U1048576;
 use tree_hash_derive::TreeHash;
@@ -136,7 +137,7 @@ pub struct BlockWithAttestation {
 ///
 /// Headers are smaller than full blocks. They're useful for tracking the chain
 /// without storing everything.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
     pub slot: u64,

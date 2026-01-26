@@ -1,19 +1,11 @@
-use std::net::SocketAddr;
-
 use axum::{Router, http::HeaderValue, response::IntoResponse, routing::get};
 use thiserror::Error;
 use tracing::warn;
 
-pub async fn start_prometheus_metrics_api(address: SocketAddr) -> Result<(), std::io::Error> {
-    let app = Router::new()
+pub fn start_prometheus_metrics_api() -> Router {
+    Router::new()
         .route("/metrics", get(get_metrics))
-        .route("/health", get(get_health));
-
-    // Start the axum app
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .route("/lean/v0/health", get(get_health))
 }
 
 pub(crate) async fn get_health() -> impl IntoResponse {

@@ -18,7 +18,7 @@ use crate::{
 pub type ValidatorRegistryLimit = U4096;
 
 /// The main consensus state object
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
 pub struct State {
     /// The chain's configuration parameters
     pub config: ChainConfig,
@@ -62,12 +62,20 @@ pub type JustificationValidators =
     ssz_types::BitList<ssz_types::typenum::Prod<HistoricalRootsLimit, ValidatorRegistryLimit>>;
 
 /// Represents a validator's static metadata and operational interface.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
 pub struct Validator {
     /// XMSS one-time signature public key.
+    #[serde(serialize_with = "serialize_pubkey_hex")]
     pub pubkey: ValidatorPubkeyBytes,
     /// Validator index in the registry.
     pub index: u64,
+}
+
+fn serialize_pubkey_hex<S>(pubkey: &ValidatorPubkeyBytes, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&hex::encode(pubkey))
 }
 
 impl Validator {
