@@ -52,11 +52,17 @@ impl ForkCheckpoints {
 
 // ============ Metadata Keys ============
 
+/// Key for "time" field of the Store. Its value has type [`u64`] and it's SSZ-encoded.
 const KEY_TIME: &[u8] = b"time";
+/// Key for "config" field of the Store. Its value has type [`ChainConfig`] and it's SSZ-encoded.
 const KEY_CONFIG: &[u8] = b"config";
+/// Key for "head" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
 const KEY_HEAD: &[u8] = b"head";
+/// Key for "safe_target" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
 const KEY_SAFE_TARGET: &[u8] = b"safe_target";
+/// Key for "latest_justified" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
+/// Key for "latest_finalized" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 
 // ============ Key Encoding Helpers ============
@@ -76,20 +82,8 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
     (validator_id, root)
 }
 
-/// Forkchoice store tracking chain state and validator attestations.
-///
-/// This is the "local view" that a node uses to run LMD GHOST. It contains:
-///
-/// - which blocks and states are known,
-/// - which checkpoints are justified and finalized,
-/// - which block is currently considered the head,
-/// - and, for each validator, their latest attestation that should influence fork choice.
-///
-/// The `Store` is updated whenever:
-/// - a new block is processed,
-/// - an attestation is received (via a block or gossip),
-/// - an interval tick occurs (activating new attestations),
-/// - or when the head is recomputed.
+/// Underlying storage of the node.
+/// Similar to the spec's `Store`, but backed by a pluggable storage backend.
 ///
 /// All data is stored in the backend. Metadata fields (time, config, head, etc.)
 /// are stored in the Metadata table with their field name as the key.
