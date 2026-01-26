@@ -7,7 +7,7 @@ use ethlambda_types::{
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::TreeHash,
     signature::ValidatorSecretKey,
-    state::{Checkpoint, State},
+    state::Checkpoint,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
@@ -40,12 +40,11 @@ pub const SECONDS_PER_SLOT: u64 = 4;
 
 impl BlockChain {
     pub fn spawn(
-        genesis_state: State,
+        store: Store,
         p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
         validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
-        let genesis_time = genesis_state.config.genesis_time;
-        let store = Store::from_genesis(genesis_state);
+        let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
             store,

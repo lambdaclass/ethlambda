@@ -710,6 +710,11 @@ impl Store {
             .expect("head state is always available")
     }
 
+    /// Returns a reference to the state for the given block root, if it exists.
+    pub fn get_state(&self, root: H256) -> Option<&State> {
+        self.states.get(&root)
+    }
+
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
         self.blocks[&self.safe_target].slot
