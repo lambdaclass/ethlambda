@@ -7,8 +7,14 @@ use crate::api::{Error, PrefixResult, StorageBackend, StorageReadView, StorageWr
 
 type TableData = HashMap<Vec<u8>, Vec<u8>>;
 type StorageData = HashMap<Table, TableData>;
-type PendingEntries = HashMap<Table, Vec<(Vec<u8>, Vec<u8>)>>;
-type PendingDeletes = HashMap<Table, Vec<Vec<u8>>>;
+
+/// Pending operation for a key - last operation wins.
+enum PendingOp {
+    Put(Vec<u8>),
+    Delete,
+}
+
+type PendingOps = HashMap<Table, HashMap<Vec<u8>, PendingOp>>;
 
 /// In-memory storage backend using HashMaps.
 #[derive(Clone, Default)]
@@ -32,8 +38,7 @@ impl StorageBackend for InMemoryBackend {
     fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, Error> {
         Ok(Box::new(InMemoryWriteBatch {
             data: Arc::clone(&self.data),
-            pending: HashMap::new(),
-            deletes: HashMap::new(),
+            ops: HashMap::new(),
         }))
     }
 }
@@ -72,37 +77,39 @@ impl StorageReadView for InMemoryReadView<'_> {
 /// Write batch that accumulates changes before committing.
 struct InMemoryWriteBatch {
     data: Arc<RwLock<StorageData>>,
-    pending: PendingEntries,
-    deletes: PendingDeletes,
+    ops: PendingOps,
 }
 
 impl StorageWriteBatch for InMemoryWriteBatch {
     fn put_batch(&mut self, table: Table, batch: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error> {
-        self.pending.entry(table).or_default().extend(batch);
+        let table_ops = self.ops.entry(table).or_default();
+        for (key, value) in batch {
+            table_ops.insert(key, PendingOp::Put(value));
+        }
         Ok(())
     }
 
     fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error> {
-        self.deletes.entry(table).or_default().extend(keys);
+        let table_ops = self.ops.entry(table).or_default();
+        for key in keys {
+            table_ops.insert(key, PendingOp::Delete);
+        }
         Ok(())
     }
 
     fn commit(self: Box<Self>) -> Result<(), Error> {
         let mut guard = self.data.write().map_err(|e| e.to_string())?;
 
-        // Apply puts
-        for (table, entries) in self.pending {
+        for (table, ops) in self.ops {
             let table_data = guard.entry(table).or_default();
-            for (key, value) in entries {
-                table_data.insert(key, value);
-            }
-        }
-
-        // Apply deletes
-        for (table, keys) in self.deletes {
-            if let Some(table_data) = guard.get_mut(&table) {
-                for key in keys {
-                    table_data.remove(&key);
+            for (key, op) in ops {
+                match op {
+                    PendingOp::Put(value) => {
+                        table_data.insert(key, value);
+                    }
+                    PendingOp::Delete => {
+                        table_data.remove(&key);
+                    }
                 }
             }
         }
@@ -208,6 +215,58 @@ mod tests {
         let view = backend.begin_read().unwrap();
         let value = view.get(Table::Blocks, b"nonexistent").unwrap();
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_delete_then_put() {
+        let backend = InMemoryBackend::new();
+
+        // Initial value
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"old".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        // Delete then put in same batch - put should win
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .delete_batch(Table::Blocks, vec![b"key".to_vec()])
+                .unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"new".to_vec())])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        let view = backend.begin_read().unwrap();
+        assert_eq!(
+            view.get(Table::Blocks, b"key").unwrap(),
+            Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_put_then_delete() {
+        let backend = InMemoryBackend::new();
+
+        // Put then delete in same batch - delete should win
+        {
+            let mut batch = backend.begin_write().unwrap();
+            batch
+                .put_batch(Table::Blocks, vec![(b"key".to_vec(), b"value".to_vec())])
+                .unwrap();
+            batch
+                .delete_batch(Table::Blocks, vec![b"key".to_vec()])
+                .unwrap();
+            batch.commit().unwrap();
+        }
+
+        let view = backend.begin_read().unwrap();
+        assert_eq!(view.get(Table::Blocks, b"key").unwrap(), None);
     }
 
     #[test]
