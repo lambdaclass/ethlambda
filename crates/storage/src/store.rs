@@ -125,7 +125,7 @@ impl Store {
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
-            slot: 0,
+            slot: anchor_block.slot,
         };
 
         // Insert initial data
