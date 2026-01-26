@@ -102,7 +102,7 @@ async fn main() {
         p2p_socket,
         blockchain,
         p2p_rx,
-        store,
+        store.clone(),
     ));
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
