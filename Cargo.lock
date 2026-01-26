@@ -1968,8 +1968,8 @@ dependencies = [
  "ethereum_ssz",
  "ethereum_ssz_derive",
  "ethlambda-blockchain",
- "ethlambda-storage",
  "ethlambda-metrics",
+ "ethlambda-storage",
  "ethlambda-types",
  "ethrex-common",
  "ethrex-p2p",
@@ -1990,10 +1990,10 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-metrics",
  "ethlambda-storage",
  "serde",
  "serde_json",
- "ethlambda-metrics",
  "tokio",
  "tracing",
 ]
