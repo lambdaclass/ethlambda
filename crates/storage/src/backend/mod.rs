@@ -13,8 +13,9 @@
 mod in_memory;
 #[cfg(feature = "rocksdb")]
 mod rocksdb;
+#[cfg(test)]
+mod tests;
 
 pub use in_memory::InMemoryBackend;
 #[cfg(feature = "rocksdb")]
-#[allow(unused_imports)] // RocksDBBackend is not yet connected to Store
 pub use rocksdb::RocksDBBackend;
