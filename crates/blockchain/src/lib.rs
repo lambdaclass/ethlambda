@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
+use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -30,7 +31,7 @@ pub enum P2PMessage {
     /// Publish a block to the gossip network.
     PublishBlock(SignedBlockWithAttestation),
     /// Fetch a block by its root hash.
-    FetchBlock(ethlambda_types::primitives::H256),
+    FetchBlock(H256),
 }
 
 pub struct BlockChain {
@@ -92,10 +93,10 @@ struct BlockChainServer {
     key_manager: key_manager::KeyManager,
 
     // Pending blocks waiting for their parent
-    pending_blocks: HashMap<ethlambda_types::primitives::H256, Vec<SignedBlockWithAttestation>>,
+    pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
 
     // Track in-flight block requests (prevent duplicates)
-    in_flight_requests: HashSet<ethlambda_types::primitives::H256>,
+    in_flight_requests: HashSet<H256>,
 }
 
 impl BlockChainServer {
@@ -305,7 +306,7 @@ impl BlockChainServer {
         }
     }
 
-    fn request_missing_block(&mut self, block_root: ethlambda_types::primitives::H256) {
+    fn request_missing_block(&mut self, block_root: H256) {
         // Check if already requested (avoid duplicate requests)
         if self.in_flight_requests.contains(&block_root) {
             trace!(%block_root, "Block already requested, skipping duplicate");
@@ -324,7 +325,7 @@ impl BlockChainServer {
         }
     }
 
-    fn process_pending_children(&mut self, parent_root: ethlambda_types::primitives::H256) {
+    fn process_pending_children(&mut self, parent_root: H256) {
         // Remove and process all blocks that were waiting for this parent
         if let Some(children) = self.pending_blocks.remove(&parent_root) {
             info!(%parent_root, num_children=%children.len(),
