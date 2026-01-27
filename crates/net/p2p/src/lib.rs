@@ -20,12 +20,12 @@ use libp2p::{
 };
 use sha2::Digest;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
     req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
-        build_status,
+        build_status, fetch_block_from_peer,
     },
 };
 
@@ -309,42 +309,6 @@ async fn handle_p2p_message(
             fetch_block_from_peer(swarm, root, connected_peers).await;
         }
     }
-}
-
-async fn fetch_block_from_peer(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    root: ethlambda_types::primitives::H256,
-    connected_peers: &HashSet<PeerId>,
-) {
-    use rand::seq::SliceRandom;
-
-    if connected_peers.is_empty() {
-        warn!(%root, "Cannot fetch block: no connected peers");
-        return;
-    }
-
-    // Select random peer
-    let peers: Vec<_> = connected_peers.iter().copied().collect();
-    let peer = match peers.choose(&mut rand::thread_rng()) {
-        Some(&p) => p,
-        None => {
-            warn!(%root, "Failed to select random peer");
-            return;
-        }
-    };
-
-    // Create BlocksByRoot request with single root
-    let mut request = req_resp::BlocksByRootRequest::empty();
-    if let Err(err) = request.push(root) {
-        error!(%root, ?err, "Failed to create BlocksByRoot request");
-        return;
-    }
-
-    info!(%peer, %root, "Sending BlocksByRoot request for missing block");
-    swarm
-        .behaviour_mut()
-        .req_resp
-        .send_request(&peer, Request::BlocksByRoot(request));
 }
 
 pub struct Bootnode {

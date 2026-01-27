@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use ethlambda_blockchain::BlockChain;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
-use tracing::{info, warn};
+use rand::seq::SliceRandom;
+use tracing::{error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
 
@@ -100,4 +103,39 @@ pub fn build_status(store: &Store) -> Status {
             slot: head_slot,
         },
     }
+}
+
+/// Fetch a missing block from a random connected peer.
+pub async fn fetch_block_from_peer(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    root: ethlambda_types::primitives::H256,
+    connected_peers: &HashSet<PeerId>,
+) {
+    if connected_peers.is_empty() {
+        warn!(%root, "Cannot fetch block: no connected peers");
+        return;
+    }
+
+    // Select random peer
+    let peers: Vec<_> = connected_peers.iter().copied().collect();
+    let peer = match peers.choose(&mut rand::thread_rng()) {
+        Some(&p) => p,
+        None => {
+            warn!(%root, "Failed to select random peer");
+            return;
+        }
+    };
+
+    // Create BlocksByRoot request with single root
+    let mut request = BlocksByRootRequest::empty();
+    if let Err(err) = request.push(root) {
+        error!(%root, ?err, "Failed to create BlocksByRoot request");
+        return;
+    }
+
+    info!(%peer, %root, "Sending BlocksByRoot request for missing block");
+    swarm
+        .behaviour_mut()
+        .req_resp
+        .send_request(&peer, Request::BlocksByRoot(request));
 }
