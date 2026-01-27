@@ -68,7 +68,7 @@ async fn handle_status_request(
     server
         .swarm
         .behaviour_mut()
-        .status_req_resp
+        .req_resp
         .send_response(
             channel,
             Response::new(ResponseResult::Success, ResponsePayload::Status(our_status)),
@@ -153,6 +153,6 @@ pub async fn fetch_block_from_peer(
     server
         .swarm
         .behaviour_mut()
-        .blocks_by_root_req_resp
+        .req_resp
         .send_request(&peer, Request::BlocksByRoot(request));
 }

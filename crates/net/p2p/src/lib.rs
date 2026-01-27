@@ -73,26 +73,23 @@ pub async fn start_p2p(
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
 
-    let status_req_resp = request_response::Behaviour::new(
-        vec![(
-            StreamProtocol::new(STATUS_PROTOCOL_V1),
-            request_response::ProtocolSupport::Full,
-        )],
-        Default::default(),
-    );
-
-    let blocks_by_root_req_resp = request_response::Behaviour::new(
-        vec![(
-            StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-            request_response::ProtocolSupport::Full,
-        )],
+    let req_resp = request_response::Behaviour::new(
+        vec![
+            (
+                StreamProtocol::new(STATUS_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
+            (
+                StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
+        ],
         Default::default(),
     );
 
     let behavior = Behaviour {
         gossipsub,
-        status_req_resp,
-        blocks_by_root_req_resp,
+        req_resp,
     };
 
     // TODO: set peer scoring params
@@ -169,8 +166,7 @@ pub async fn start_p2p(
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
     gossipsub: libp2p::gossipsub::Behaviour,
-    status_req_resp: request_response::Behaviour<Codec>,
-    blocks_by_root_req_resp: request_response::Behaviour<req_resp::Codec>,
+    req_resp: request_response::Behaviour<Codec>,
 }
 
 pub(crate) struct P2PServer {
@@ -208,10 +204,7 @@ async fn event_loop(mut server: P2PServer) {
 
 async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourEvent>) {
     match event {
-        SwarmEvent::Behaviour(BehaviourEvent::StatusReqResp(req_resp_event)) => {
-            req_resp::handle_req_resp_message(server, req_resp_event).await;
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::BlocksByRootReqResp(req_resp_event)) => {
+        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
             req_resp::handle_req_resp_message(server, req_resp_event).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
@@ -235,7 +228,7 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                 server
                     .swarm
                     .behaviour_mut()
-                    .status_req_resp
+                    .req_resp
                     .send_request(&peer_id, Request::Status(our_status));
             } else {
                 info!(%peer_id, %direction, "Added peer connection");
