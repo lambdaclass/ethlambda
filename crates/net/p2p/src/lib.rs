@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -19,7 +20,7 @@ use libp2p::{
 };
 use sha2::Digest;
 use tokio::sync::mpsc;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
@@ -176,6 +177,9 @@ async fn event_loop(
     block_topic: libp2p::gossipsub::IdentTopic,
     store: Store,
 ) {
+    // Track connected peers for block requests
+    let mut connected_peers: HashSet<PeerId> = HashSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -184,13 +188,13 @@ async fn event_loop(
                 let Some(message) = message else {
                     break;
                 };
-                handle_p2p_message(&mut swarm, message, &attestation_topic, &block_topic).await;
+                handle_p2p_message(&mut swarm, message, &attestation_topic, &block_topic, &connected_peers).await;
             }
             event = swarm.next() => {
                 let Some(event) = event else {
                     break;
                 };
-                handle_swarm_event(event, &mut swarm, &mut blockchain, &store).await;
+                handle_swarm_event(event, &mut swarm, &mut blockchain, &store, &mut connected_peers).await;
             }
         }
     }
@@ -201,6 +205,7 @@ async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<Behaviour>,
     blockchain: &mut BlockChain,
     store: &Store,
+    connected_peers: &mut HashSet<PeerId>,
 ) {
     match event {
         SwarmEvent::Behaviour(BehaviourEvent::ReqResp(request_response::Event::Message {
@@ -223,6 +228,7 @@ async fn handle_swarm_event(
         } => {
             let direction = connection_direction(&endpoint);
             if num_established.get() == 1 {
+                connected_peers.insert(peer_id);
                 metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                 // Send status request on first connection to this peer
                 let our_status = build_status(store);
@@ -261,6 +267,7 @@ async fn handle_swarm_event(
                 }
             };
             if num_established == 0 {
+                connected_peers.remove(&peer_id);
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
             }
             info!(%peer_id, %direction, %reason, "Peer disconnected");
@@ -289,6 +296,7 @@ async fn handle_p2p_message(
     message: P2PMessage,
     attestation_topic: &libp2p::gossipsub::IdentTopic,
     block_topic: &libp2p::gossipsub::IdentTopic,
+    connected_peers: &HashSet<PeerId>,
 ) {
     match message {
         P2PMessage::PublishAttestation(attestation) => {
@@ -297,12 +305,46 @@ async fn handle_p2p_message(
         P2PMessage::PublishBlock(signed_block) => {
             publish_block(swarm, signed_block, block_topic).await;
         }
-        P2PMessage::FetchBlock(_root) => {
-            // TODO: Implement BlocksByRoot request
-            // Need to send a BlocksByRoot request to peers
-            warn!("FetchBlock message received but not yet implemented");
+        P2PMessage::FetchBlock(root) => {
+            fetch_block_from_peer(swarm, root, connected_peers).await;
         }
     }
+}
+
+async fn fetch_block_from_peer(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    root: ethlambda_types::primitives::H256,
+    connected_peers: &HashSet<PeerId>,
+) {
+    use rand::seq::SliceRandom;
+
+    if connected_peers.is_empty() {
+        warn!(%root, "Cannot fetch block: no connected peers");
+        return;
+    }
+
+    // Select random peer
+    let peers: Vec<_> = connected_peers.iter().copied().collect();
+    let peer = match peers.choose(&mut rand::thread_rng()) {
+        Some(&p) => p,
+        None => {
+            warn!(%root, "Failed to select random peer");
+            return;
+        }
+    };
+
+    // Create BlocksByRoot request with single root
+    let mut request = req_resp::BlocksByRootRequest::empty();
+    if let Err(err) = request.push(root) {
+        error!(%root, ?err, "Failed to create BlocksByRoot request");
+        return;
+    }
+
+    info!(%peer, %root, "Sending BlocksByRoot request for missing block");
+    swarm
+        .behaviour_mut()
+        .req_resp
+        .send_request(&peer, Request::BlocksByRoot(request));
 }
 
 pub struct Bootnode {

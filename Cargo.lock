@@ -2024,6 +2024,7 @@ dependencies = [
  "ethrex-rlp",
  "hex",
  "libp2p",
+ "rand 0.8.5",
  "sha2",
  "snap",
  "ssz_types",
