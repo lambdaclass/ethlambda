@@ -25,7 +25,7 @@ use tracing::{info, trace, warn};
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
     req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
-        build_status, handle_req_resp_message,
+        build_status,
     },
 };
 
@@ -209,7 +209,7 @@ async fn handle_swarm_event(
             message,
             ..
         })) => {
-            handle_req_resp_message(message, peer, swarm, blockchain, store).await;
+            req_resp::handle_req_resp_message(message, peer, swarm, blockchain, store).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },

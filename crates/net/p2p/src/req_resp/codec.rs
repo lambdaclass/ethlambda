@@ -7,10 +7,12 @@ use tracing::trace;
 use super::{
     encoding::{decode_payload, write_payload},
     messages::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse, Request, Response,
-        STATUS_PROTOCOL_V1, Status,
+        BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, STATUS_PROTOCOL_V1,
+        Status,
     },
 };
+
+use ethlambda_types::block::SignedBlockWithAttestation;
 
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
@@ -95,12 +97,13 @@ impl libp2p::request_response::Codec for Codec {
                 ))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let blocks = BlocksByRootResponse::from_ssz_bytes(&payload).map_err(|err| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                })?;
+                let block =
+                    SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                    })?;
                 Ok(Response::new(
                     result_code,
-                    super::messages::ResponsePayload::BlocksByRoot(blocks),
+                    super::messages::ResponsePayload::BlocksByRoot(block),
                 ))
             }
             _ => Err(io::Error::new(

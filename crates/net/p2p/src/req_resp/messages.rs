@@ -30,9 +30,12 @@ pub enum ResponseResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-    BlocksByRoot(BlocksByRootResponse),
+
+    // TODO: here we assume there's a single block per request
+    BlocksByRoot(SignedBlockWithAttestation),
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -44,5 +47,3 @@ pub struct Status {
 type MaxRequestBlocks = typenum::U1024;
 
 pub type BlocksByRootRequest = ssz_types::VariableList<H256, MaxRequestBlocks>;
-pub type BlocksByRootResponse =
-    ssz_types::VariableList<SignedBlockWithAttestation, MaxRequestBlocks>;
