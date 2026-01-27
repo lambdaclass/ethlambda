@@ -1,4 +1,3 @@
-use ethlambda_blockchain::BlockChain;
 use ethlambda_types::{attestation::SignedAttestation, block::SignedBlockWithAttestation};
 use libp2p::gossipsub::Event;
 use ssz::{Decode, Encode};
@@ -8,9 +7,9 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
 };
-use crate::Behaviour;
+use crate::P2PServer;
 
-pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event) {
+pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
         propagation_source: _,
         message_id: _,
@@ -34,7 +33,7 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
             };
             let slot = signed_block.message.block.slot;
             info!(%slot, "Received new block from gossipsub, sending for processing");
-            blockchain.notify_new_block(signed_block).await;
+            server.blockchain.notify_new_block(signed_block).await;
         }
         Some(ATTESTATION_TOPIC_KIND) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -51,7 +50,10 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
             let slot = signed_attestation.message.slot;
             let validator = signed_attestation.validator_id;
             info!(%slot, %validator, "Received new attestation from gossipsub, sending for processing");
-            blockchain.notify_new_attestation(signed_attestation).await;
+            server
+                .blockchain
+                .notify_new_attestation(signed_attestation)
+                .await;
         }
         _ => {
             trace!("Received message on unknown topic: {}", message.topic);
@@ -59,11 +61,7 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
     }
 }
 
-pub async fn publish_attestation(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    attestation: SignedAttestation,
-    topic: &libp2p::gossipsub::IdentTopic,
-) {
+pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
     let slot = attestation.message.slot;
     let validator = attestation.validator_id;
 
@@ -74,21 +72,18 @@ pub async fn publish_attestation(
     let compressed = compress_message(&ssz_bytes);
 
     // Publish to gossipsub
-    let _ = swarm
+    let _ = server
+        .swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic.clone(), compressed)
+        .publish(server.attestation_topic.clone(), compressed)
         .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
         .inspect_err(|err| {
             tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub")
         });
 }
 
-pub async fn publish_block(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    signed_block: SignedBlockWithAttestation,
-    topic: &libp2p::gossipsub::IdentTopic,
-) {
+pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
     let slot = signed_block.message.block.slot;
     let proposer = signed_block.message.block.proposer_index;
 
@@ -99,10 +94,11 @@ pub async fn publish_block(
     let compressed = compress_message(&ssz_bytes);
 
     // Publish to gossipsub
-    let _ = swarm
+    let _ = server
+        .swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic.clone(), compressed)
+        .publish(server.block_topic.clone(), compressed)
         .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
         .inspect_err(
             |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),

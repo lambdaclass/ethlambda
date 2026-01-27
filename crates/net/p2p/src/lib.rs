@@ -149,15 +149,17 @@ pub async fn start_p2p(
 
     info!("P2P node started on {listening_socket}");
 
-    event_loop(
+    let server = P2PServer {
         swarm,
         blockchain,
+        store,
         p2p_rx,
         attestation_topic,
         block_topic,
-        store,
-    )
-    .await;
+        connected_peers: HashSet::new(),
+    };
+
+    event_loop(server).await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -167,58 +169,52 @@ pub(crate) struct Behaviour {
     req_resp: request_response::Behaviour<Codec>,
 }
 
+pub(crate) struct P2PServer {
+    pub(crate) swarm: libp2p::Swarm<Behaviour>,
+    pub(crate) blockchain: BlockChain,
+    pub(crate) store: Store,
+    pub(crate) p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
+    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) connected_peers: HashSet<PeerId>,
+}
+
 /// Event loop for the P2P crate.
 /// Processes swarm events, incoming requests, responses, gossip, and outgoing messages from blockchain.
-async fn event_loop(
-    mut swarm: libp2p::Swarm<Behaviour>,
-    mut blockchain: BlockChain,
-    mut p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
-    attestation_topic: libp2p::gossipsub::IdentTopic,
-    block_topic: libp2p::gossipsub::IdentTopic,
-    store: Store,
-) {
-    // Track connected peers for block requests
-    let mut connected_peers: HashSet<PeerId> = HashSet::new();
-
+async fn event_loop(mut server: P2PServer) {
     loop {
         tokio::select! {
             biased;
 
-            message = p2p_rx.recv() => {
+            message = server.p2p_rx.recv() => {
                 let Some(message) = message else {
                     break;
                 };
-                handle_p2p_message(&mut swarm, message, &attestation_topic, &block_topic, &connected_peers).await;
+                handle_p2p_message(&mut server, message).await;
             }
-            event = swarm.next() => {
+            event = server.swarm.next() => {
                 let Some(event) = event else {
                     break;
                 };
-                handle_swarm_event(event, &mut swarm, &mut blockchain, &store, &mut connected_peers).await;
+                handle_swarm_event(&mut server, event).await;
             }
         }
     }
 }
 
-async fn handle_swarm_event(
-    event: SwarmEvent<BehaviourEvent>,
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    blockchain: &mut BlockChain,
-    store: &Store,
-    connected_peers: &mut HashSet<PeerId>,
-) {
+async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourEvent>) {
     match event {
         SwarmEvent::Behaviour(BehaviourEvent::ReqResp(request_response::Event::Message {
             peer,
             message,
             ..
         })) => {
-            req_resp::handle_req_resp_message(message, peer, swarm, blockchain, store).await;
+            req_resp::handle_req_resp_message(server, message, peer).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },
         )) => {
-            gossipsub::handle_gossipsub_message(blockchain, message).await;
+            gossipsub::handle_gossipsub_message(server, message).await;
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -228,12 +224,13 @@ async fn handle_swarm_event(
         } => {
             let direction = connection_direction(&endpoint);
             if num_established.get() == 1 {
-                connected_peers.insert(peer_id);
+                server.connected_peers.insert(peer_id);
                 metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                 // Send status request on first connection to this peer
-                let our_status = build_status(store);
+                let our_status = build_status(&server.store);
                 info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
-                swarm
+                server
+                    .swarm
                     .behaviour_mut()
                     .req_resp
                     .send_request(&peer_id, Request::Status(our_status));
@@ -267,7 +264,7 @@ async fn handle_swarm_event(
                 }
             };
             if num_established == 0 {
-                connected_peers.remove(&peer_id);
+                server.connected_peers.remove(&peer_id);
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
             }
             info!(%peer_id, %direction, %reason, "Peer disconnected");
@@ -291,22 +288,16 @@ async fn handle_swarm_event(
     }
 }
 
-async fn handle_p2p_message(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    message: P2PMessage,
-    attestation_topic: &libp2p::gossipsub::IdentTopic,
-    block_topic: &libp2p::gossipsub::IdentTopic,
-    connected_peers: &HashSet<PeerId>,
-) {
+async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
     match message {
         P2PMessage::PublishAttestation(attestation) => {
-            publish_attestation(swarm, attestation, attestation_topic).await;
+            publish_attestation(server, attestation).await;
         }
         P2PMessage::PublishBlock(signed_block) => {
-            publish_block(swarm, signed_block, block_topic).await;
+            publish_block(server, signed_block).await;
         }
         P2PMessage::FetchBlock(root) => {
-            fetch_block_from_peer(swarm, root, connected_peers).await;
+            fetch_block_from_peer(server, root).await;
         }
     }
 }

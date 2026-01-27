@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-
-use ethlambda_blockchain::BlockChain;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -9,24 +6,22 @@ use tracing::{error, info, warn};
 use ethlambda_types::block::SignedBlockWithAttestation;
 
 use super::{BlocksByRootRequest, Request, Response, ResponsePayload, ResponseResult, Status};
-use crate::Behaviour;
+use crate::P2PServer;
 
 pub async fn handle_req_resp_message(
+    server: &mut P2PServer,
     message: request_response::Message<Request, Response>,
     peer: PeerId,
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    blockchain: &mut BlockChain,
-    store: &Store,
 ) {
     match message {
         request_response::Message::Request {
             request, channel, ..
         } => match request {
             Request::Status(status) => {
-                handle_status_request(swarm, status, channel, peer, store).await;
+                handle_status_request(server, status, channel, peer).await;
             }
             Request::BlocksByRoot(request) => {
-                handle_blocks_by_root_request(swarm, request, channel, peer).await;
+                handle_blocks_by_root_request(server, request, channel, peer).await;
             }
         },
         request_response::Message::Response { response, .. } => match response.payload {
@@ -34,22 +29,22 @@ pub async fn handle_req_resp_message(
                 handle_status_response(status, peer).await;
             }
             ResponsePayload::BlocksByRoot(blocks) => {
-                handle_blocks_by_root_response(blocks, blockchain, peer).await;
+                handle_blocks_by_root_response(server, blocks, peer).await;
             }
         },
     }
 }
 
 async fn handle_status_request(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    server: &mut P2PServer,
     request: Status,
     channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
-    store: &Store,
 ) {
     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-    let our_status = build_status(store);
-    swarm
+    let our_status = build_status(&server.store);
+    server
+        .swarm
         .behaviour_mut()
         .req_resp
         .send_response(
@@ -64,7 +59,7 @@ async fn handle_status_response(status: Status, peer: PeerId) {
 }
 
 async fn handle_blocks_by_root_request(
-    _swarm: &mut libp2p::Swarm<Behaviour>,
+    _server: &mut P2PServer,
     request: BlocksByRootRequest,
     _channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
@@ -82,13 +77,13 @@ async fn handle_blocks_by_root_request(
 }
 
 async fn handle_blocks_by_root_response(
+    server: &mut P2PServer,
     block: SignedBlockWithAttestation,
-    blockchain: &mut BlockChain,
     peer: PeerId,
 ) {
     let slot = block.message.block.slot;
     info!(%peer, %slot, "Received BlocksByRoot response chunk");
-    blockchain.notify_new_block(block).await;
+    server.blockchain.notify_new_block(block).await;
 }
 
 /// Build a Status message from the current Store state.
@@ -107,17 +102,16 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 pub async fn fetch_block_from_peer(
-    swarm: &mut libp2p::Swarm<Behaviour>,
+    server: &mut P2PServer,
     root: ethlambda_types::primitives::H256,
-    connected_peers: &HashSet<PeerId>,
 ) {
-    if connected_peers.is_empty() {
+    if server.connected_peers.is_empty() {
         warn!(%root, "Cannot fetch block: no connected peers");
         return;
     }
 
     // Select random peer
-    let peers: Vec<_> = connected_peers.iter().copied().collect();
+    let peers: Vec<_> = server.connected_peers.iter().copied().collect();
     let peer = match peers.choose(&mut rand::thread_rng()) {
         Some(&p) => p,
         None => {
@@ -134,7 +128,8 @@ pub async fn fetch_block_from_peer(
     }
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
-    swarm
+    server
+        .swarm
         .behaviour_mut()
         .req_resp
         .send_request(&peer, Request::BlocksByRoot(request));
