@@ -1,32 +1,41 @@
 use std::io;
 
-use ethlambda_types::state::Checkpoint;
+use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use snap::read::FrameEncoder;
 use ssz::{Decode, Encode};
-use ssz_derive::{Decode, Encode};
+use ssz_types::typenum;
 use tracing::trace;
 
 use crate::messages::{decode_payload, encode_varint};
 
-pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
+pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+
+#[allow(dead_code)]
+const MAX_REQUEST_BLOCKS: usize = 1024;
+type MaxRequestBlocks = typenum::U1024;
+
+pub type BlocksByRootRequest = ssz_types::VariableList<H256, MaxRequestBlocks>;
+pub type BlocksByRootResponse =
+    ssz_types::VariableList<SignedBlockWithAttestation, MaxRequestBlocks>;
 
 #[derive(Debug, Clone, Default)]
-pub struct StatusCodec;
+pub struct BlocksByRootCodec;
 
 #[async_trait::async_trait]
-impl libp2p::request_response::Codec for StatusCodec {
+impl libp2p::request_response::Codec for BlocksByRootCodec {
     type Protocol = libp2p::StreamProtocol;
-    type Request = Status;
-    type Response = Status;
+    type Request = BlocksByRootRequest;
+    type Response = BlocksByRootResponse;
 
     async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
         let payload = decode_payload(io).await?;
-        let status = deserialize_payload(payload)?;
-        Ok(status)
+        let request = BlocksByRootRequest::from_ssz_bytes(&payload)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
+        Ok(request)
     }
 
     async fn read_response<T>(
@@ -49,8 +58,9 @@ impl libp2p::request_response::Codec for StatusCodec {
         }
 
         let payload = decode_payload(io).await?;
-        let status = deserialize_payload(payload)?;
-        Ok(status)
+        let response = BlocksByRootResponse::from_ssz_bytes(&payload)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
+        Ok(response)
     }
 
     async fn write_request<T>(
@@ -62,7 +72,7 @@ impl libp2p::request_response::Codec for StatusCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        trace!(?req, "Writing status request");
+        trace!(?req, "Writing BlocksByRoot request");
 
         let encoded = req.as_ssz_bytes();
         let mut compressor = FrameEncoder::new(&encoded[..]);
@@ -103,17 +113,4 @@ impl libp2p::request_response::Codec for StatusCodec {
 
         Ok(())
     }
-}
-
-fn deserialize_payload(payload: Vec<u8>) -> io::Result<Status> {
-    let status = Status::from_ssz_bytes(&payload)
-        // We turn to string since DecodeError does not implement std::error::Error
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
-    Ok(status)
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Status {
-    pub finalized: Checkpoint,
-    pub head: Checkpoint,
 }

@@ -27,7 +27,11 @@ use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
     messages::{
         MAX_COMPRESSED_PAYLOAD_SIZE,
-        status::{STATUS_PROTOCOL_V1, Status},
+        blocks_by_root::{
+            BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootCodec, BlocksByRootRequest,
+            BlocksByRootResponse,
+        },
+        status::{STATUS_PROTOCOL_V1, Status, StatusCodec},
     },
 };
 
@@ -75,7 +79,7 @@ pub async fn start_p2p(
     let gossipsub = libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, config)
         .expect("failed to initiate behaviour");
 
-    let req_resp = request_response::Behaviour::new(
+    let status = request_response::Behaviour::new(
         vec![(
             StreamProtocol::new(STATUS_PROTOCOL_V1),
             request_response::ProtocolSupport::Full,
@@ -83,9 +87,18 @@ pub async fn start_p2p(
         Default::default(),
     );
 
+    let blocks_by_root = request_response::Behaviour::new(
+        vec![(
+            StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+            request_response::ProtocolSupport::Full,
+        )],
+        Default::default(),
+    );
+
     let behavior = Behaviour {
         gossipsub,
-        req_resp,
+        status,
+        blocks_by_root,
     };
 
     // TODO: set peer scoring params
@@ -160,7 +173,8 @@ pub async fn start_p2p(
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: request_response::Behaviour<messages::status::StatusCodec>,
+    status: request_response::Behaviour<StatusCodec>,
+    blocks_by_root: request_response::Behaviour<BlocksByRootCodec>,
 }
 
 /// Event loop for the P2P crate.
@@ -188,10 +202,29 @@ async fn event_loop(
                     break;
                 };
                 match event {
-                    SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
+                    SwarmEvent::Behaviour(BehaviourEvent::Status(
                         message @ request_response::Event::Message { .. },
                     )) => {
-                        handle_req_resp_message(&mut swarm, message, &store).await;
+                        handle_status_message(&mut swarm, message, &store).await;
+                    }
+                    SwarmEvent::Behaviour(BehaviourEvent::BlocksByRoot(
+                        request_response::Event::Message { peer, message, .. },
+                    )) => {
+                        match message {
+                            request_response::Message::Request {
+                                request,
+                                channel,
+                                ..
+                            } => {
+                                handle_blocks_by_root_request(&mut swarm, request, channel, peer).await;
+                            }
+                            request_response::Message::Response {
+                                response,
+                                ..
+                            } => {
+                                handle_blocks_by_root_response(response, &mut blockchain, peer).await;
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
                         message @ libp2p::gossipsub::Event::Message { .. },
@@ -210,7 +243,7 @@ async fn event_loop(
                             // Send status request on first connection to this peer
                             let our_status = build_status(&store);
                             info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
-                            swarm.behaviour_mut().req_resp.send_request(&peer_id, our_status);
+                            swarm.behaviour_mut().status.send_request(&peer_id, our_status);
                         } else {
                             info!(%peer_id, %direction, "Added peer connection");
                         }
@@ -310,7 +343,7 @@ async fn handle_outgoing_gossip(
     }
 }
 
-async fn handle_req_resp_message(
+async fn handle_status_message(
     swarm: &mut libp2p::Swarm<Behaviour>,
     event: request_response::Event<Status, Status>,
     store: &Store,
@@ -333,7 +366,7 @@ async fn handle_req_resp_message(
             let our_status = build_status(store);
             swarm
                 .behaviour_mut()
-                .req_resp
+                .status
                 .send_response(channel, our_status)
                 .unwrap();
         }
@@ -391,6 +424,44 @@ fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str
         "outbound"
     } else {
         "inbound"
+    }
+}
+
+async fn handle_blocks_by_root_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    request: BlocksByRootRequest,
+    channel: request_response::ResponseChannel<BlocksByRootResponse>,
+    peer: PeerId,
+) {
+    let num_roots = request.len();
+    info!(%peer, num_roots, "Received BlocksByRoot request");
+
+    // TODO: Implement signed block storage to serve BlocksByRoot requests
+    // For now, return empty response
+    let blocks: Vec<_> = vec![];
+    let num_blocks = blocks.len();
+    let response = BlocksByRootResponse::new(blocks).expect("within limit");
+
+    info!(%peer, num_roots, num_blocks, "Sending BlocksByRoot response (no signed blocks available)");
+    let _ = swarm
+        .behaviour_mut()
+        .blocks_by_root
+        .send_response(channel, response)
+        .inspect_err(|_| warn!(%peer, "Failed to send BlocksByRoot response"));
+}
+
+async fn handle_blocks_by_root_response(
+    response: BlocksByRootResponse,
+    blockchain: &mut BlockChain,
+    peer: PeerId,
+) {
+    let num_blocks = response.len();
+    info!(%peer, num_blocks, "Received BlocksByRoot response");
+
+    for signed_block in response.iter() {
+        let slot = signed_block.message.block.slot;
+        trace!(%peer, %slot, "Processing block from BlocksByRoot response");
+        blockchain.notify_new_block(signed_block.clone()).await;
     }
 }
 
