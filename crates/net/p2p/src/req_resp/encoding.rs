@@ -13,33 +13,36 @@ pub async fn decode_payload<T>(io: &mut T) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
-    // TODO: limit bytes received
-    let mut varint_buf = [0; 5];
-
+    let mut buf = vec![];
     let read = io
-        .take(varint_buf.len() as u64)
-        .read(&mut varint_buf)
+        .take(MAX_COMPRESSED_PAYLOAD_SIZE as u64)
+        .read_to_end(&mut buf)
         .await?;
-    let (size, rest) = decode_varint(&varint_buf[..read])?;
 
-    if (size as usize) < rest.len() || size as usize > MAX_COMPRESSED_PAYLOAD_SIZE {
+    if read < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid message size",
+            "message too short",
+        ));
+    }
+    let (size, rest) = decode_varint(&buf)?;
+
+    if size as usize > MAX_PAYLOAD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message size exceeds maximum allowed",
         ));
     }
 
-    let mut message = vec![0; size as usize];
-    if rest.is_empty() {
-        io.read_exact(&mut message).await?;
-    } else {
-        message[..rest.len()].copy_from_slice(rest);
-        io.read_exact(&mut message[rest.len()..]).await?;
-    }
-
-    let mut decoder = snap::read::FrameDecoder::new(&message[..]);
+    let mut decoder = snap::read::FrameDecoder::new(rest);
     let mut uncompressed = Vec::new();
     io::Read::read_to_end(&mut decoder, &mut uncompressed)?;
+    if uncompressed.len() != size as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "uncompressed size does not match received size",
+        ));
+    }
 
     Ok(uncompressed)
 }
@@ -48,13 +51,14 @@ pub async fn write_payload<T>(io: &mut T, encoded: &[u8]) -> io::Result<()>
 where
     T: AsyncWrite + Unpin,
 {
+    let uncompressed_size = encoded.len();
     let mut compressor = FrameEncoder::new(encoded);
 
     let mut buf = Vec::new();
     io::Read::read_to_end(&mut compressor, &mut buf)?;
 
     let mut size_buf = [0; 5];
-    let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
+    let varint_buf = encode_varint(uncompressed_size as u32, &mut size_buf);
     io.write_all(varint_buf).await?;
     io.write_all(&buf).await?;
 
