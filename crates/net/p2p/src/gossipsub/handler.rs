@@ -1,4 +1,4 @@
-use ethlambda_blockchain::{BlockChain, OutboundGossip};
+use ethlambda_blockchain::BlockChain;
 use ethlambda_types::{attestation::SignedAttestation, block::SignedBlockWithAttestation};
 use libp2p::gossipsub::Event;
 use ssz::{Decode, Encode};
@@ -59,52 +59,52 @@ pub async fn handle_gossipsub_message(blockchain: &mut BlockChain, event: Event)
     }
 }
 
-pub async fn handle_outgoing_gossip(
+pub async fn publish_attestation(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    message: OutboundGossip,
-    attestation_topic: &libp2p::gossipsub::IdentTopic,
-    block_topic: &libp2p::gossipsub::IdentTopic,
+    attestation: SignedAttestation,
+    topic: &libp2p::gossipsub::IdentTopic,
 ) {
-    match message {
-        OutboundGossip::PublishAttestation(attestation) => {
-            let slot = attestation.message.slot;
-            let validator = attestation.validator_id;
+    let slot = attestation.message.slot;
+    let validator = attestation.validator_id;
 
-            // Encode to SSZ
-            let ssz_bytes = attestation.as_ssz_bytes();
+    // Encode to SSZ
+    let ssz_bytes = attestation.as_ssz_bytes();
 
-            // Compress with raw snappy
-            let compressed = compress_message(&ssz_bytes);
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
 
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(attestation_topic.clone(), compressed)
-                .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
-                .inspect_err(|err| {
-                    tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub")
-                });
-        }
-        OutboundGossip::PublishBlock(signed_block) => {
-            let slot = signed_block.message.block.slot;
-            let proposer = signed_block.message.block.proposer_index;
+    // Publish to gossipsub
+    let _ = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), compressed)
+        .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
+        .inspect_err(|err| {
+            tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub")
+        });
+}
 
-            // Encode to SSZ
-            let ssz_bytes = signed_block.as_ssz_bytes();
+pub async fn publish_block(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    signed_block: SignedBlockWithAttestation,
+    topic: &libp2p::gossipsub::IdentTopic,
+) {
+    let slot = signed_block.message.block.slot;
+    let proposer = signed_block.message.block.proposer_index;
 
-            // Compress with raw snappy
-            let compressed = compress_message(&ssz_bytes);
+    // Encode to SSZ
+    let ssz_bytes = signed_block.as_ssz_bytes();
 
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(block_topic.clone(), compressed)
-                .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
-                .inspect_err(|err| {
-                    tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub")
-                });
-        }
-    }
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
+
+    // Publish to gossipsub
+    let _ = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), compressed)
+        .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
+        .inspect_err(
+            |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),
+        );
 }

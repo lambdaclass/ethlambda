@@ -22,13 +22,15 @@ pub mod key_manager;
 pub mod metrics;
 pub mod store;
 
-/// Messages sent from the blockchain to the P2P layer for publishing.
+/// Messages sent from the blockchain to the P2P layer.
 #[derive(Clone, Debug)]
-pub enum OutboundGossip {
+pub enum P2PMessage {
     /// Publish an attestation to the gossip network.
     PublishAttestation(SignedAttestation),
     /// Publish a block to the gossip network.
     PublishBlock(SignedBlockWithAttestation),
+    /// Fetch a block by its root hash.
+    FetchBlock(ethlambda_types::primitives::H256),
 }
 
 pub struct BlockChain {
@@ -41,7 +43,7 @@ pub const SECONDS_PER_SLOT: u64 = 4;
 impl BlockChain {
     pub fn spawn(
         store: Store,
-        p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+        p2p_tx: mpsc::UnboundedSender<P2PMessage>,
         validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
@@ -84,7 +86,7 @@ impl BlockChain {
 
 struct BlockChainServer {
     store: Store,
-    p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+    p2p_tx: mpsc::UnboundedSender<P2PMessage>,
     key_manager: key_manager::KeyManager,
 }
 
@@ -173,7 +175,7 @@ impl BlockChainServer {
             // Publish to gossip network
             let Ok(_) = self
                 .p2p_tx
-                .send(OutboundGossip::PublishAttestation(signed_attestation))
+                .send(P2PMessage::PublishAttestation(signed_attestation))
                 .inspect_err(
                     |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
                 )
@@ -244,7 +246,7 @@ impl BlockChainServer {
         // Publish to gossip network
         let Ok(()) = self
             .p2p_tx
-            .send(OutboundGossip::PublishBlock(signed_block))
+            .send(P2PMessage::PublishBlock(signed_block))
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"))
         else {
             return;

@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use ethlambda_blockchain::{BlockChain, OutboundGossip};
+use ethlambda_blockchain::{BlockChain, P2PMessage};
 use ethlambda_storage::Store;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 use crate::{
-    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, handle_outgoing_gossip},
+    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
     req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
         build_status,
     },
@@ -39,7 +39,7 @@ pub async fn start_p2p(
     bootnodes: Vec<Bootnode>,
     listening_socket: SocketAddr,
     blockchain: BlockChain,
-    p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
@@ -171,7 +171,7 @@ pub(crate) struct Behaviour {
 async fn event_loop(
     mut swarm: libp2p::Swarm<Behaviour>,
     mut blockchain: BlockChain,
-    mut p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    mut p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     attestation_topic: libp2p::gossipsub::IdentTopic,
     block_topic: libp2p::gossipsub::IdentTopic,
     store: Store,
@@ -280,6 +280,27 @@ async fn handle_swarm_event(
         }
         _ => {
             trace!(?event, "Ignored swarm event");
+        }
+    }
+}
+
+async fn handle_outgoing_gossip(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    message: ethlambda_blockchain::P2PMessage,
+    attestation_topic: &libp2p::gossipsub::IdentTopic,
+    block_topic: &libp2p::gossipsub::IdentTopic,
+) {
+    match message {
+        ethlambda_blockchain::P2PMessage::PublishAttestation(attestation) => {
+            publish_attestation(swarm, attestation, attestation_topic).await;
+        }
+        ethlambda_blockchain::P2PMessage::PublishBlock(signed_block) => {
+            publish_block(swarm, signed_block, block_topic).await;
+        }
+        ethlambda_blockchain::P2PMessage::FetchBlock(_root) => {
+            // TODO: Implement BlocksByRoot request
+            // Need to send a BlocksByRoot request to peers
+            warn!("FetchBlock message received but not yet implemented");
         }
     }
 }
