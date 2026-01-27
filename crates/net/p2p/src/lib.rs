@@ -184,7 +184,7 @@ async fn event_loop(
                 let Some(message) = message else {
                     break;
                 };
-                handle_outgoing_gossip(&mut swarm, message, &attestation_topic, &block_topic).await;
+                handle_p2p_message(&mut swarm, message, &attestation_topic, &block_topic).await;
             }
             event = swarm.next() => {
                 let Some(event) = event else {
@@ -284,20 +284,20 @@ async fn handle_swarm_event(
     }
 }
 
-async fn handle_outgoing_gossip(
+async fn handle_p2p_message(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    message: ethlambda_blockchain::P2PMessage,
+    message: P2PMessage,
     attestation_topic: &libp2p::gossipsub::IdentTopic,
     block_topic: &libp2p::gossipsub::IdentTopic,
 ) {
     match message {
-        ethlambda_blockchain::P2PMessage::PublishAttestation(attestation) => {
+        P2PMessage::PublishAttestation(attestation) => {
             publish_attestation(swarm, attestation, attestation_topic).await;
         }
-        ethlambda_blockchain::P2PMessage::PublishBlock(signed_block) => {
+        P2PMessage::PublishBlock(signed_block) => {
             publish_block(swarm, signed_block, block_topic).await;
         }
-        ethlambda_blockchain::P2PMessage::FetchBlock(_root) => {
+        P2PMessage::FetchBlock(_root) => {
             // TODO: Implement BlocksByRoot request
             // Need to send a BlocksByRoot request to peers
             warn!("FetchBlock message received but not yet implemented");
