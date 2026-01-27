@@ -13,21 +13,13 @@ pub enum Request {
 
 #[derive(Debug, Clone)]
 pub struct Response {
-    result: ResponseResult,
-    payload: ResponsePayload,
+    pub result: ResponseResult,
+    pub payload: ResponsePayload,
 }
 
 impl Response {
     pub fn new(result: ResponseResult, payload: ResponsePayload) -> Self {
         Self { result, payload }
-    }
-
-    pub fn result(&self) -> ResponseResult {
-        self.result
-    }
-
-    pub fn payload(&self) -> &ResponsePayload {
-        &self.payload
     }
 }
 

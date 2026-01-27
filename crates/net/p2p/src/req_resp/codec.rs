@@ -138,9 +138,9 @@ impl libp2p::request_response::Codec for Codec {
         T: AsyncWrite + Unpin + Send,
     {
         // Send result byte
-        io.write_all(&[resp.result() as u8]).await?;
+        io.write_all(&[resp.result as u8]).await?;
 
-        let encoded = match resp.payload() {
+        let encoded = match &resp.payload {
             super::messages::ResponsePayload::Status(status) => status.as_ssz_bytes(),
             super::messages::ResponsePayload::BlocksByRoot(response) => response.as_ssz_bytes(),
         };
