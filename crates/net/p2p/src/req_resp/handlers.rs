@@ -5,7 +5,10 @@ use tracing::{debug, error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
 
-use super::{BlocksByRootRequest, Request, Response, ResponsePayload, ResponseResult, Status};
+use super::{
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
+    ResponseResult, Status,
+};
 use crate::P2PServer;
 
 pub async fn handle_req_resp_message(
@@ -154,5 +157,9 @@ pub async fn fetch_block_from_peer(
         .swarm
         .behaviour_mut()
         .req_resp
-        .send_request(&peer, Request::BlocksByRoot(request));
+        .send_request_with_protocol(
+            &peer,
+            Request::BlocksByRoot(request),
+            libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+        );
 }

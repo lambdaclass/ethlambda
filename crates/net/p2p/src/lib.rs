@@ -24,8 +24,9 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
-    req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
-        build_status, fetch_block_from_peer,
+    req_resp::{
+        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
+        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
     },
 };
 
@@ -229,7 +230,11 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                     .swarm
                     .behaviour_mut()
                     .req_resp
-                    .send_request(&peer_id, Request::Status(our_status));
+                    .send_request_with_protocol(
+                        &peer_id,
+                        Request::Status(our_status),
+                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                    );
             } else {
                 info!(%peer_id, %direction, "Added peer connection");
             }
