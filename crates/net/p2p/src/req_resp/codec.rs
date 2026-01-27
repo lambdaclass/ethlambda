@@ -4,15 +4,12 @@ use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ssz::{Decode, Encode};
 use tracing::trace;
 
-use crate::messages::{
-    blocks_by_root::{BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse},
-    decode_payload,
-    status::STATUS_PROTOCOL_V1,
-};
-
 use super::{
-    encoding::write_payload,
-    messages::{Request, Response, Status},
+    encoding::{decode_payload, write_payload},
+    messages::{
+        BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse, Request, Response,
+        STATUS_PROTOCOL_V1, Status,
+    },
 };
 
 #[derive(Debug, Clone, Default)]

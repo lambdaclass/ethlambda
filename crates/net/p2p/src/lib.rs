@@ -25,16 +25,11 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
-    messages::{
-        MAX_COMPRESSED_PAYLOAD_SIZE,
-        blocks_by_root::{BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse},
-        status::STATUS_PROTOCOL_V1,
+    req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse, MAX_COMPRESSED_PAYLOAD_SIZE, Request, Response, STATUS_PROTOCOL_V1, Status,
     },
-    req_resp::{Codec, Request, Response, Status},
 };
 
 mod gossipsub;
-mod messages;
 pub mod metrics;
 mod req_resp;
 
