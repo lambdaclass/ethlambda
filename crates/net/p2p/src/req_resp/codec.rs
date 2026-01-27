@@ -62,11 +62,22 @@ impl libp2p::request_response::Codec for Codec {
         let mut result = 0_u8;
         io.read_exact(std::slice::from_mut(&mut result)).await?;
 
-        // TODO: send errors to event loop?
-        if result != 0 {
+        let result_code = match result {
+            0 => super::messages::ResponseResult::Success,
+            1 => super::messages::ResponseResult::InvalidRequest,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid result code: {}", result),
+                ));
+            }
+        };
+
+        // TODO: send errors to event loop when result != Success?
+        if result_code != super::messages::ResponseResult::Success {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "non-zero result in response",
+                "non-success result in response",
             ));
         }
 
@@ -77,13 +88,19 @@ impl libp2p::request_response::Codec for Codec {
                 let status = Status::from_ssz_bytes(&payload).map_err(|err| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
                 })?;
-                Ok(Response::Status(status))
+                Ok(Response::new(
+                    result_code,
+                    super::messages::ResponsePayload::Status(status),
+                ))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let response = BlocksByRootResponse::from_ssz_bytes(&payload).map_err(|err| {
+                let blocks = BlocksByRootResponse::from_ssz_bytes(&payload).map_err(|err| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
                 })?;
-                Ok(Response::BlocksByRoot(response))
+                Ok(Response::new(
+                    result_code,
+                    super::messages::ResponsePayload::BlocksByRoot(blocks),
+                ))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -121,11 +138,11 @@ impl libp2p::request_response::Codec for Codec {
         T: AsyncWrite + Unpin + Send,
     {
         // Send result byte
-        io.write_all(&[0]).await?;
+        io.write_all(&[resp.result() as u8]).await?;
 
-        let encoded = match resp {
-            Response::Status(status) => status.as_ssz_bytes(),
-            Response::BlocksByRoot(response) => response.as_ssz_bytes(),
+        let encoded = match resp.payload() {
+            super::messages::ResponsePayload::Status(status) => status.as_ssz_bytes(),
+            super::messages::ResponsePayload::BlocksByRoot(response) => response.as_ssz_bytes(),
         };
 
         write_payload(io, &encoded).await

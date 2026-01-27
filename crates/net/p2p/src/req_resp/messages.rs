@@ -12,7 +12,33 @@ pub enum Request {
 }
 
 #[derive(Debug, Clone)]
-pub enum Response {
+pub struct Response {
+    result: ResponseResult,
+    payload: ResponsePayload,
+}
+
+impl Response {
+    pub fn new(result: ResponseResult, payload: ResponsePayload) -> Self {
+        Self { result, payload }
+    }
+
+    pub fn result(&self) -> ResponseResult {
+        self.result
+    }
+
+    pub fn payload(&self) -> &ResponsePayload {
+        &self.payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseResult {
+    Success = 0,
+    InvalidRequest = 1,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResponsePayload {
     Status(Status),
     BlocksByRoot(BlocksByRootResponse),
 }

@@ -215,12 +215,12 @@ async fn handle_req_resp_message(
                 handle_blocks_by_root_request(swarm, request, channel, peer).await;
             }
         },
-        request_response::Message::Response { response, .. } => match response {
-            Response::Status(status) => {
-                handle_status_response(status, peer).await;
+        request_response::Message::Response { response, .. } => match response.payload() {
+            req_resp::ResponsePayload::Status(status) => {
+                handle_status_response(status.clone(), peer).await;
             }
-            Response::BlocksByRoot(response) => {
-                handle_blocks_by_root_response(response, blockchain, peer).await;
+            req_resp::ResponsePayload::BlocksByRoot(blocks) => {
+                handle_blocks_by_root_response(blocks.clone(), blockchain, peer).await;
             }
         },
     }
@@ -372,7 +372,13 @@ async fn handle_status_request(
     swarm
         .behaviour_mut()
         .req_resp
-        .send_response(channel, Response::Status(our_status))
+        .send_response(
+            channel,
+            Response::new(
+                req_resp::ResponseResult::Success,
+                req_resp::ResponsePayload::Status(our_status),
+            ),
+        )
         .unwrap();
 }
 
@@ -447,7 +453,13 @@ async fn handle_blocks_by_root_request(
     let _ = swarm
         .behaviour_mut()
         .req_resp
-        .send_response(channel, Response::BlocksByRoot(response))
+        .send_response(
+            channel,
+            Response::new(
+                req_resp::ResponseResult::Success,
+                req_resp::ResponsePayload::BlocksByRoot(response),
+            ),
+        )
         .inspect_err(|_| warn!(%peer, "Failed to send BlocksByRoot response"));
 }
 
