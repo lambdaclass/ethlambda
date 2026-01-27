@@ -202,6 +202,35 @@ async fn event_loop(
     }
 }
 
+async fn handle_req_resp_message(
+    message: request_response::Message<Request, Response>,
+    peer: PeerId,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    blockchain: &mut BlockChain,
+    store: &Store,
+) {
+    match message {
+        request_response::Message::Request {
+            request, channel, ..
+        } => match request {
+            Request::Status(status) => {
+                handle_status_request(swarm, status, channel, peer, store).await;
+            }
+            Request::BlocksByRoot(request) => {
+                handle_blocks_by_root_request(swarm, request, channel, peer).await;
+            }
+        },
+        request_response::Message::Response { response, .. } => match response {
+            Response::Status(status) => {
+                handle_status_response(status, peer).await;
+            }
+            Response::BlocksByRoot(response) => {
+                handle_blocks_by_root_response(response, blockchain, peer).await;
+            }
+        },
+    }
+}
+
 async fn handle_swarm_event(
     event: SwarmEvent<BehaviourEvent>,
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -209,35 +238,12 @@ async fn handle_swarm_event(
     store: &Store,
 ) {
     match event {
-        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
-            request_response::Event::Message { peer, message, .. },
-        )) => {
-            match message {
-                request_response::Message::Request {
-                    request,
-                    channel,
-                    ..
-                } => {
-                    match request {
-                        Request::Status(status) => {
-                            handle_status_request(swarm, status, channel, peer, store).await;
-                        }
-                        Request::BlocksByRoot(request) => {
-                            handle_blocks_by_root_request(swarm, request, channel, peer).await;
-                        }
-                    }
-                }
-                request_response::Message::Response { response, .. } => {
-                    match response {
-                        Response::Status(status) => {
-                            handle_status_response(status, peer).await;
-                        }
-                        Response::BlocksByRoot(response) => {
-                            handle_blocks_by_root_response(response, blockchain, peer).await;
-                        }
-                    }
-                }
-            }
+        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(request_response::Event::Message {
+            peer,
+            message,
+            ..
+        })) => {
+            handle_req_resp_message(message, peer, swarm, blockchain, store).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },

@@ -1,29 +1,19 @@
 use std::io;
 
-use ethlambda_types::state::Checkpoint;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use snap::read::FrameEncoder;
 use ssz::{Decode, Encode};
-use ssz_derive::{Decode, Encode};
 use tracing::trace;
 
 use crate::messages::{
     blocks_by_root::{BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse},
-    decode_payload, encode_varint,
+    decode_payload,
     status::STATUS_PROTOCOL_V1,
 };
 
-#[derive(Debug, Clone)]
-pub enum Request {
-    Status(Status),
-    BlocksByRoot(BlocksByRootRequest),
-}
-
-#[derive(Debug, Clone)]
-pub enum Response {
-    Status(Status),
-    BlocksByRoot(BlocksByRootResponse),
-}
+use super::{
+    encoding::write_payload,
+    messages::{Request, Response, Status},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
@@ -143,27 +133,4 @@ impl libp2p::request_response::Codec for Codec {
 
         write_payload(io, &encoded).await
     }
-}
-
-async fn write_payload<T>(io: &mut T, encoded: &[u8]) -> io::Result<()>
-where
-    T: AsyncWrite + Unpin,
-{
-    let mut compressor = FrameEncoder::new(encoded);
-
-    let mut buf = Vec::new();
-    io::Read::read_to_end(&mut compressor, &mut buf)?;
-
-    let mut size_buf = [0; 5];
-    let varint_buf = encode_varint(buf.len() as u32, &mut size_buf);
-    io.write_all(varint_buf).await?;
-    io.write_all(&buf).await?;
-
-    Ok(())
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Status {
-    pub finalized: Checkpoint,
-    pub head: Checkpoint,
 }
