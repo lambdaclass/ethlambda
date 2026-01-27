@@ -134,6 +134,40 @@ fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), 
     Ok(())
 }
 
+/// Verify all cryptographic signatures in a block before processing.
+///
+/// This is a pre-check that can be called before `on_block()` to validate signatures early.
+/// It verifies:
+/// 1. Each attestation's aggregated signature proof
+/// 2. The proposer attestation signature
+///
+/// Returns `Ok(())` if all signatures are valid, otherwise returns an error.
+///
+/// If the feature `skip-signature-verification` is enabled, this function returns `Ok(())` immediately.
+pub fn precheck_block_signatures(
+    store: &Store,
+    signed_block: &SignedBlockWithAttestation,
+) -> Result<(), StoreError> {
+    // Skip verification if feature flag is enabled
+    if cfg!(feature = "skip-signature-verification") {
+        return Ok(());
+    }
+
+    let block = &signed_block.message.block;
+    let parent_root = block.parent_root;
+    let slot = block.slot;
+
+    // Retrieve parent state for validator pubkeys
+    let parent_state = store
+        .get_state(&parent_root)
+        .ok_or(StoreError::MissingParentState { parent_root, slot })?;
+
+    // Verify all cryptographic signatures
+    verify_signatures(&parent_state, signed_block)?;
+
+    Ok(())
+}
+
 /// Process a tick event.
 pub fn on_tick(store: &mut Store, timestamp: u64, has_proposal: bool) {
     let time = timestamp - store.config().genesis_time;
@@ -339,13 +373,6 @@ pub fn on_block(
                 parent_root: block.parent_root,
                 slot,
             })?;
-
-    // Validate cryptographic signatures
-    // TODO: extract signature verification to a pre-checks function
-    // to avoid the need for this
-    if cfg!(not(feature = "skip-signature-verification")) {
-        verify_signatures(&parent_state, &signed_block)?;
-    }
 
     // Execute state transition function to compute post-block state
     let mut post_state = parent_state.clone();

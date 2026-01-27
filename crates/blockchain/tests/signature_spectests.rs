@@ -52,8 +52,16 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let block_time = signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
         store::on_tick(&mut st, block_time, true);
 
-        // Process the block (this includes signature verification)
-        let result = store::on_block(&mut st, signed_block);
+        // Pre-check signatures before processing the block
+        let precheck_result = store::precheck_block_signatures(&st, &signed_block);
+
+        // If pre-check failed, use that as the result
+        let result = if precheck_result.is_err() {
+            precheck_result
+        } else {
+            // Otherwise, process the block
+            store::on_block(&mut st, signed_block)
+        };
 
         // Step 3: Check that it succeeded or failed as expected
         match (result.is_ok(), test.expect_exception.as_ref()) {
