@@ -62,6 +62,7 @@ impl libp2p::request_response::Codec for Codec {
         let mut result = 0_u8;
         io.read_exact(std::slice::from_mut(&mut result)).await?;
 
+        // TODO: move matching to ResponseResult impl
         let result_code = match result {
             0 => super::messages::ResponseResult::Success,
             1 => super::messages::ResponseResult::InvalidRequest,

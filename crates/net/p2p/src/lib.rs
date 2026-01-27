@@ -5,7 +5,6 @@ use std::{
 
 use ethlambda_blockchain::{BlockChain, OutboundGossip};
 use ethlambda_storage::Store;
-use ethlambda_types::state::Checkpoint;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -25,7 +24,8 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
-    req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, BlocksByRootResponse, MAX_COMPRESSED_PAYLOAD_SIZE, Request, Response, STATUS_PROTOCOL_V1, Status,
+    req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
+        build_status, handle_req_resp_message,
     },
 };
 
@@ -162,7 +162,7 @@ pub async fn start_p2p(
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
 #[derive(NetworkBehaviour)]
-struct Behaviour {
+pub(crate) struct Behaviour {
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<Codec>,
 }
@@ -194,35 +194,6 @@ async fn event_loop(
                 handle_swarm_event(event, &mut swarm, &mut blockchain, &store).await;
             }
         }
-    }
-}
-
-async fn handle_req_resp_message(
-    message: request_response::Message<Request, Response>,
-    peer: PeerId,
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    blockchain: &mut BlockChain,
-    store: &Store,
-) {
-    match message {
-        request_response::Message::Request {
-            request, channel, ..
-        } => match request {
-            Request::Status(status) => {
-                handle_status_request(swarm, status, channel, peer, store).await;
-            }
-            Request::BlocksByRoot(request) => {
-                handle_blocks_by_root_request(swarm, request, channel, peer).await;
-            }
-        },
-        request_response::Message::Response { response, .. } => match response.payload {
-            req_resp::ResponsePayload::Status(status) => {
-                handle_status_response(status, peer).await;
-            }
-            req_resp::ResponsePayload::BlocksByRoot(blocks) => {
-                handle_blocks_by_root_response(blocks, blockchain, peer).await;
-            }
-        },
     }
 }
 
@@ -360,32 +331,6 @@ async fn handle_outgoing_gossip(
     }
 }
 
-async fn handle_status_request(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    request: Status,
-    channel: request_response::ResponseChannel<Response>,
-    peer: PeerId,
-    store: &Store,
-) {
-    info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-    let our_status = build_status(store);
-    swarm
-        .behaviour_mut()
-        .req_resp
-        .send_response(
-            channel,
-            Response::new(
-                req_resp::ResponseResult::Success,
-                req_resp::ResponsePayload::Status(our_status),
-            ),
-        )
-        .unwrap();
-}
-
-async fn handle_status_response(status: Status, peer: PeerId) {
-    info!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
-}
-
 pub struct Bootnode {
     ip: IpAddr,
     quic_port: u16,
@@ -431,64 +376,6 @@ fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str
         "outbound"
     } else {
         "inbound"
-    }
-}
-
-async fn handle_blocks_by_root_request(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    request: BlocksByRootRequest,
-    channel: request_response::ResponseChannel<Response>,
-    peer: PeerId,
-) {
-    let num_roots = request.len();
-    info!(%peer, num_roots, "Received BlocksByRoot request");
-
-    // TODO: Implement signature storage to serve BlocksByRoot requests
-    // For now, return empty response
-    let blocks: Vec<_> = vec![];
-    let num_blocks = blocks.len();
-    let response = BlocksByRootResponse::new(blocks).expect("within limit");
-
-    info!(%peer, num_roots, num_blocks, "Sending BlocksByRoot response (no signed blocks available)");
-    let _ = swarm
-        .behaviour_mut()
-        .req_resp
-        .send_response(
-            channel,
-            Response::new(
-                req_resp::ResponseResult::Success,
-                req_resp::ResponsePayload::BlocksByRoot(response),
-            ),
-        )
-        .inspect_err(|_| warn!(%peer, "Failed to send BlocksByRoot response"));
-}
-
-async fn handle_blocks_by_root_response(
-    response: BlocksByRootResponse,
-    blockchain: &mut BlockChain,
-    peer: PeerId,
-) {
-    let num_blocks = response.len();
-    info!(%peer, num_blocks, "Received BlocksByRoot response");
-
-    for signed_block in response.iter() {
-        let slot = signed_block.message.block.slot;
-        trace!(%peer, %slot, "Processing block from BlocksByRoot response");
-        blockchain.notify_new_block(signed_block.clone()).await;
-    }
-}
-
-/// Build a Status message from the current Store state.
-fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
-    let head_slot = store.get_block(&head_root).expect("head block exists").slot;
-    Status {
-        finalized,
-        head: Checkpoint {
-            root: head_root,
-            slot: head_slot,
-        },
     }
 }
 
