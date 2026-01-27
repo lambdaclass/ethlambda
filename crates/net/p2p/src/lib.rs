@@ -204,12 +204,8 @@ async fn event_loop(mut server: P2PServer) {
 
 async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourEvent>) {
     match event {
-        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(request_response::Event::Message {
-            peer,
-            message,
-            ..
-        })) => {
-            req_resp::handle_req_resp_message(server, message, peer).await;
+        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
+            req_resp::handle_req_resp_message(server, req_resp_event).await;
         }
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },

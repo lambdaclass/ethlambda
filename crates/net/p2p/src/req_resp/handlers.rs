@@ -1,7 +1,7 @@
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
 
@@ -10,28 +10,50 @@ use crate::P2PServer;
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
-    message: request_response::Message<Request, Response>,
-    peer: PeerId,
+    event: request_response::Event<Request, Response>,
 ) {
-    match message {
-        request_response::Message::Request {
-            request, channel, ..
-        } => match request {
-            Request::Status(status) => {
-                handle_status_request(server, status, channel, peer).await;
-            }
-            Request::BlocksByRoot(request) => {
-                handle_blocks_by_root_request(server, request, channel, peer).await;
-            }
+    match event {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => match request {
+                Request::Status(status) => {
+                    handle_status_request(server, status, channel, peer).await;
+                }
+                Request::BlocksByRoot(request) => {
+                    handle_blocks_by_root_request(server, request, channel, peer).await;
+                }
+            },
+            request_response::Message::Response { response, .. } => match response.payload {
+                ResponsePayload::Status(status) => {
+                    handle_status_response(status, peer).await;
+                }
+                ResponsePayload::BlocksByRoot(blocks) => {
+                    handle_blocks_by_root_response(server, blocks, peer).await;
+                }
+            },
         },
-        request_response::Message::Response { response, .. } => match response.payload {
-            ResponsePayload::Status(status) => {
-                handle_status_response(status, peer).await;
-            }
-            ResponsePayload::BlocksByRoot(blocks) => {
-                handle_blocks_by_root_response(server, blocks, peer).await;
-            }
-        },
+        request_response::Event::OutboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        } => {
+            warn!(%peer, ?request_id, %error, "Outbound request failed");
+        }
+        request_response::Event::InboundFailure {
+            peer,
+            request_id,
+            error,
+            ..
+        } => {
+            warn!(%peer, ?request_id, %error, "Inbound request failed");
+        }
+        request_response::Event::ResponseSent {
+            peer, request_id, ..
+        } => {
+            debug!(%peer, ?request_id, "Response sent successfully");
+        }
     }
 }
 
