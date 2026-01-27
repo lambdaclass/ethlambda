@@ -18,12 +18,11 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
-use ssz::Encode;
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 use crate::{
-    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
+    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, handle_outgoing_gossip},
     req_resp::{Codec, BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1,
         build_status,
     },
@@ -281,52 +280,6 @@ async fn handle_swarm_event(
         }
         _ => {
             trace!(?event, "Ignored swarm event");
-        }
-    }
-}
-
-async fn handle_outgoing_gossip(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    message: OutboundGossip,
-    attestation_topic: &libp2p::gossipsub::IdentTopic,
-    block_topic: &libp2p::gossipsub::IdentTopic,
-) {
-    match message {
-        OutboundGossip::PublishAttestation(attestation) => {
-            let slot = attestation.message.slot;
-            let validator = attestation.validator_id;
-
-            // Encode to SSZ
-            let ssz_bytes = attestation.as_ssz_bytes();
-
-            // Compress with raw snappy
-            let compressed = gossipsub::compress_message(&ssz_bytes);
-
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(attestation_topic.clone(), compressed)
-                .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
-                .inspect_err(|err| tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub"));
-        }
-        OutboundGossip::PublishBlock(signed_block) => {
-            let slot = signed_block.message.block.slot;
-            let proposer = signed_block.message.block.proposer_index;
-
-            // Encode to SSZ
-            let ssz_bytes = signed_block.as_ssz_bytes();
-
-            // Compress with raw snappy
-            let compressed = gossipsub::compress_message(&ssz_bytes);
-
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(block_topic.clone(), compressed)
-                .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
-                .inspect_err(|err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"));
         }
     }
 }
