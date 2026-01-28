@@ -6,7 +6,7 @@ help: ## 📚 Show help for each of the Makefile recipes
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
-test: ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
+test: leanSpec/fixtures ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
 	cargo test --workspace --release
 	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
@@ -20,7 +20,7 @@ docker-build: ## 🐳 Build the Docker image
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
 		-t ghcr.io/lambdaclass/ethlambda:local .
 
-LEAN_SPEC_COMMIT_HASH:=4edcf7bc9271e6a70ded8aff17710d68beac4266
+LEAN_SPEC_COMMIT_HASH:=531c2c23c556354aca33c49fbf48558b8f1ec878
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
