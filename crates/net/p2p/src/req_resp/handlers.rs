@@ -11,7 +11,7 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
     ResponseResult, Status,
 };
-use crate::{P2PServer, PendingRequest};
+use crate::{BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest};
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -208,15 +208,14 @@ async fn handle_fetch_failure(
         return;
     };
 
-    if pending.attempts >= super::super::MAX_FETCH_RETRIES {
+    if pending.attempts >= MAX_FETCH_RETRIES {
         error!(%root, %peer, attempts=%pending.attempts, %error,
                "Block fetch failed after max retries, giving up");
         server.pending_requests.remove(&root);
         return;
     }
 
-    let backoff_ms = super::super::INITIAL_BACKOFF_MS
-        * super::super::BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
     let backoff = Duration::from_millis(backoff_ms);
 
     warn!(%root, %peer, attempts=%pending.attempts, ?backoff, %error,

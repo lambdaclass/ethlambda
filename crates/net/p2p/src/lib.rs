@@ -37,9 +37,10 @@ mod req_resp;
 
 pub use metrics::populate_name_registry;
 
-const MAX_FETCH_RETRIES: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 1000;
-const BACKOFF_MULTIPLIER: u64 = 2;
+// 10ms, 40ms, 160ms, 640ms, 2560ms
+const MAX_FETCH_RETRIES: u32 = 5;
+const INITIAL_BACKOFF_MS: u64 = 10;
+const BACKOFF_MULTIPLIER: u64 = 4;
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
