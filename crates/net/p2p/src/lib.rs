@@ -40,9 +40,9 @@ const MAX_FETCH_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const BACKOFF_MULTIPLIER: u64 = 2;
 
-struct PendingRequest {
-    attempts: u32,
-    last_peer: Option<PeerId>,
+pub(crate) struct PendingRequest {
+    pub(crate) attempts: u32,
+    pub(crate) last_peer: Option<PeerId>,
 }
 
 pub async fn start_p2p(
@@ -326,17 +326,8 @@ async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
                 return;
             }
 
-            // Send request and track it
-            if let Some(request_id) = fetch_block_from_peer(server, root).await {
-                server.pending_requests.insert(
-                    root,
-                    PendingRequest {
-                        attempts: 1,
-                        last_peer: None,
-                    },
-                );
-                server.request_id_map.insert(request_id, root);
-            }
+            // Send request and track it (tracking handled internally by fetch_block_from_peer)
+            fetch_block_from_peer(server, root).await;
         }
     }
 }
@@ -350,11 +341,9 @@ async fn handle_retry(server: &mut P2PServer, root: ethlambda_types::primitives:
 
     info!(%root, "Retrying block fetch after backoff");
 
-    // Retry the fetch (uses random peer selection)
-    if let Some(request_id) = fetch_block_from_peer(server, root).await {
-        server.request_id_map.insert(request_id, root);
-    } else {
-        tracing::error!(%root, "No peers available for retry, giving up");
+    // Retry the fetch (tracking handled internally by fetch_block_from_peer)
+    if !fetch_block_from_peer(server, root).await {
+        tracing::error!(%root, "Failed to retry block fetch, giving up");
         server.pending_requests.remove(&root);
     }
 }

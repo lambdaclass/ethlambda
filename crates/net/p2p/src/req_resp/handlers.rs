@@ -1,8 +1,5 @@
 use ethlambda_storage::Store;
-use libp2p::{
-    PeerId,
-    request_response::{self, OutboundRequestId},
-};
+use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -14,7 +11,7 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
     ResponseResult, Status,
 };
-use crate::P2PServer;
+use crate::{P2PServer, PendingRequest};
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -145,13 +142,14 @@ pub fn build_status(store: &Store) -> Status {
 }
 
 /// Fetch a missing block from a random connected peer.
+/// Handles tracking in both pending_requests and request_id_map.
 pub async fn fetch_block_from_peer(
     server: &mut P2PServer,
     root: ethlambda_types::primitives::H256,
-) -> Option<OutboundRequestId> {
+) -> bool {
     if server.connected_peers.is_empty() {
         warn!(%root, "Cannot fetch block: no connected peers");
-        return None;
+        return false;
     }
 
     // Select random peer
@@ -160,7 +158,7 @@ pub async fn fetch_block_from_peer(
         Some(&p) => p,
         None => {
             warn!(%root, "Failed to select random peer");
-            return None;
+            return false;
         }
     };
 
@@ -168,7 +166,7 @@ pub async fn fetch_block_from_peer(
     let mut request = BlocksByRootRequest::empty();
     if let Err(err) = request.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
-        return None;
+        return false;
     }
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
@@ -182,12 +180,22 @@ pub async fn fetch_block_from_peer(
             libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
         );
 
-    // Update last_peer in tracking
-    if let Some(pending) = server.pending_requests.get_mut(&root) {
-        pending.last_peer = Some(peer);
-    }
+    // Track the request if not already tracked (new request)
+    let pending = server
+        .pending_requests
+        .entry(root)
+        .or_insert(PendingRequest {
+            attempts: 1,
+            last_peer: None,
+        });
 
-    Some(request_id)
+    // Update last_peer
+    pending.last_peer = Some(peer);
+
+    // Map request_id to root for failure handling
+    server.request_id_map.insert(request_id, root);
+
+    true
 }
 
 async fn handle_fetch_failure(
