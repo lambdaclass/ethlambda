@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -15,7 +15,7 @@ use libp2p::{
     gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response,
+    request_response::{self, OutboundRequestId},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
@@ -35,6 +35,15 @@ pub mod metrics;
 mod req_resp;
 
 pub use metrics::populate_name_registry;
+
+const MAX_FETCH_RETRIES: u32 = 3;
+const INITIAL_BACKOFF_MS: u64 = 1000;
+const BACKOFF_MULTIPLIER: u64 = 2;
+
+struct PendingRequest {
+    attempts: u32,
+    last_peer: Option<PeerId>,
+}
 
 pub async fn start_p2p(
     node_key: Vec<u8>,
@@ -150,6 +159,8 @@ pub async fn start_p2p(
 
     info!("P2P node started on {listening_socket}");
 
+    let (retry_tx, retry_rx) = mpsc::unbounded_channel();
+
     let server = P2PServer {
         swarm,
         blockchain,
@@ -158,6 +169,10 @@ pub async fn start_p2p(
         attestation_topic,
         block_topic,
         connected_peers: HashSet::new(),
+        pending_requests: HashMap::new(),
+        request_id_map: HashMap::new(),
+        retry_tx,
+        retry_rx,
     };
 
     event_loop(server).await;
@@ -178,6 +193,10 @@ pub(crate) struct P2PServer {
     pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) connected_peers: HashSet<PeerId>,
+    pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
+    pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
+    retry_tx: mpsc::UnboundedSender<ethlambda_types::primitives::H256>,
+    retry_rx: mpsc::UnboundedReceiver<ethlambda_types::primitives::H256>,
 }
 
 /// Event loop for the P2P crate.
@@ -198,6 +217,9 @@ async fn event_loop(mut server: P2PServer) {
                     break;
                 };
                 handle_swarm_event(&mut server, event).await;
+            }
+            Some(root) = server.retry_rx.recv() => {
+                handle_retry(&mut server, root).await;
             }
         }
     }
@@ -298,8 +320,42 @@ async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
             publish_block(server, signed_block).await;
         }
         P2PMessage::FetchBlock(root) => {
-            fetch_block_from_peer(server, root).await;
+            // Deduplicate - if already pending, ignore
+            if server.pending_requests.contains_key(&root) {
+                trace!(%root, "Block fetch already in progress, ignoring duplicate");
+                return;
+            }
+
+            // Send request and track it
+            if let Some(request_id) = fetch_block_from_peer(server, root).await {
+                server.pending_requests.insert(
+                    root,
+                    PendingRequest {
+                        attempts: 1,
+                        last_peer: None,
+                    },
+                );
+                server.request_id_map.insert(request_id, root);
+            }
         }
+    }
+}
+
+async fn handle_retry(server: &mut P2PServer, root: ethlambda_types::primitives::H256) {
+    // Check if still pending (might have succeeded during backoff)
+    if !server.pending_requests.contains_key(&root) {
+        trace!(%root, "Block fetch completed during backoff, skipping retry");
+        return;
+    }
+
+    info!(%root, "Retrying block fetch after backoff");
+
+    // Retry the fetch (uses random peer selection)
+    if let Some(request_id) = fetch_block_from_peer(server, root).await {
+        server.request_id_map.insert(request_id, root);
+    } else {
+        tracing::error!(%root, "No peers available for retry, giving up");
+        server.pending_requests.remove(&root);
     }
 }
 

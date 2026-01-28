@@ -1,9 +1,14 @@
 use ethlambda_storage::Store;
-use libp2p::{PeerId, request_response};
+use libp2p::{
+    PeerId,
+    request_response::{self, OutboundRequestId},
+};
 use rand::seq::SliceRandom;
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
+use ethlambda_types::primitives::TreeHash;
 
 use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
@@ -43,6 +48,11 @@ pub async fn handle_req_resp_message(
             ..
         } => {
             warn!(%peer, ?request_id, %error, "Outbound request failed");
+
+            // Check if this was a block fetch request
+            if let Some(root) = server.request_id_map.remove(&request_id) {
+                handle_fetch_failure(server, root, peer, error).await;
+            }
         }
         request_response::Event::InboundFailure {
             peer,
@@ -107,7 +117,16 @@ async fn handle_blocks_by_root_response(
     peer: PeerId,
 ) {
     let slot = block.message.block.slot;
-    info!(%peer, %slot, "Received BlocksByRoot response chunk");
+    let root = block.message.block.tree_hash_root();
+
+    info!(%peer, %slot, %root, "Received BlocksByRoot response");
+
+    // Clean up tracking (success!)
+    if server.pending_requests.remove(&root).is_some() {
+        info!(%root, "Block fetch succeeded");
+        server.request_id_map.retain(|_, r| *r != root);
+    }
+
     server.blockchain.notify_new_block(block).await;
 }
 
@@ -129,10 +148,10 @@ pub fn build_status(store: &Store) -> Status {
 pub async fn fetch_block_from_peer(
     server: &mut P2PServer,
     root: ethlambda_types::primitives::H256,
-) {
+) -> Option<OutboundRequestId> {
     if server.connected_peers.is_empty() {
         warn!(%root, "Cannot fetch block: no connected peers");
-        return;
+        return None;
     }
 
     // Select random peer
@@ -141,7 +160,7 @@ pub async fn fetch_block_from_peer(
         Some(&p) => p,
         None => {
             warn!(%root, "Failed to select random peer");
-            return;
+            return None;
         }
     };
 
@@ -149,11 +168,11 @@ pub async fn fetch_block_from_peer(
     let mut request = BlocksByRootRequest::empty();
     if let Err(err) = request.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
-        return;
+        return None;
     }
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
-    server
+    let request_id = server
         .swarm
         .behaviour_mut()
         .req_resp
@@ -162,4 +181,44 @@ pub async fn fetch_block_from_peer(
             Request::BlocksByRoot(request),
             libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
         );
+
+    // Update last_peer in tracking
+    if let Some(pending) = server.pending_requests.get_mut(&root) {
+        pending.last_peer = Some(peer);
+    }
+
+    Some(request_id)
+}
+
+async fn handle_fetch_failure(
+    server: &mut P2PServer,
+    root: ethlambda_types::primitives::H256,
+    peer: PeerId,
+    error: request_response::OutboundFailure,
+) {
+    let Some(pending) = server.pending_requests.get_mut(&root) else {
+        return;
+    };
+
+    if pending.attempts >= super::super::MAX_FETCH_RETRIES {
+        error!(%root, %peer, attempts=%pending.attempts, %error,
+               "Block fetch failed after max retries, giving up");
+        server.pending_requests.remove(&root);
+        return;
+    }
+
+    let backoff_ms = super::super::INITIAL_BACKOFF_MS
+        * super::super::BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+    let backoff = Duration::from_millis(backoff_ms);
+
+    warn!(%root, %peer, attempts=%pending.attempts, ?backoff, %error,
+          "Block fetch failed, scheduling retry");
+
+    pending.attempts += 1;
+
+    let retry_tx = server.retry_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(backoff).await;
+        let _ = retry_tx.send(root);
+    });
 }
