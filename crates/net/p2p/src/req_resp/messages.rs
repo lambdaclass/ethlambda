@@ -46,4 +46,9 @@ pub struct Status {
 
 type MaxRequestBlocks = typenum::U1024;
 
-pub type BlocksByRootRequest = ssz_types::VariableList<H256, MaxRequestBlocks>;
+pub type RequestedBlockRoots = ssz_types::VariableList<H256, MaxRequestBlocks>;
+
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct BlocksByRootRequest {
+    pub roots: RequestedBlockRoots,
+}

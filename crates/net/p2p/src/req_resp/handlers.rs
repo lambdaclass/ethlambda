@@ -11,7 +11,10 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
     ResponseResult, Status,
 };
-use crate::{BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest};
+use crate::{
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
+    req_resp::RequestedBlockRoots,
+};
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -96,7 +99,7 @@ async fn handle_blocks_by_root_request(
     _channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
 ) {
-    let num_roots = request.len();
+    let num_roots = request.roots.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
     // TODO: Implement signed block storage and send response chunks
@@ -163,11 +166,12 @@ pub async fn fetch_block_from_peer(
     };
 
     // Create BlocksByRoot request with single root
-    let mut request = BlocksByRootRequest::empty();
-    if let Err(err) = request.push(root) {
+    let mut roots = RequestedBlockRoots::empty();
+    if let Err(err) = roots.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
         return false;
     }
+    let request = BlocksByRootRequest { roots };
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
     let request_id = server
