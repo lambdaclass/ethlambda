@@ -43,10 +43,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        with:
-          openai_engine: gpt-4o
-          language: en
-          review_comment_lgtm: false
+          MODEL: gpt-4o
+          LANGUAGE: English
           max_tokens: 4096
-          prompt: ${{ steps.prompt.outputs.content }}
-
+          PROMPT: ${{ steps.prompt.outputs.content }}
