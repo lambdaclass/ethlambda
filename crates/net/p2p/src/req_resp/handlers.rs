@@ -11,7 +11,10 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
     ResponseResult, Status,
 };
-use crate::{BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest};
+use crate::{
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
+    req_resp::RequestedBlockRoots,
+};
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -163,7 +166,7 @@ pub async fn fetch_block_from_peer(
     };
 
     // Create BlocksByRoot request with single root
-    let mut roots = super::RequestedBlockRoots::empty();
+    let mut roots = RequestedBlockRoots::empty();
     if let Err(err) = roots.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
         return false;
