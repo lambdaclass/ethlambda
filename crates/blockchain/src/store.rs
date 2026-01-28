@@ -299,8 +299,9 @@ pub fn on_block(
         return Ok(());
     }
 
-    // Verify parent chain is available
-    // TODO: sync parent chain if parent is missing
+    // Verify parent state is available
+    // Note: Parent block existence is checked by the caller before calling this function.
+    // This check ensures the state has been computed for the parent block.
     let parent_state =
         store
             .get_state(&block.parent_root)

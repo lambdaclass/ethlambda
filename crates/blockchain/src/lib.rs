@@ -276,25 +276,30 @@ impl BlockChainServer {
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
         let block_root = signed_block.message.block.tree_hash_root();
+        let parent_root = signed_block.message.block.parent_root;
 
-        match self.process_block(signed_block.clone()) {
+        // Check if parent block exists before attempting to process
+        if !self.store.contains_block(&parent_root) {
+            info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
+
+            // Store block for later processing
+            self.pending_blocks
+                .entry(parent_root)
+                .or_default()
+                .push(signed_block);
+
+            // Request missing parent from network
+            self.request_missing_block(parent_root);
+            return;
+        }
+
+        // Parent exists, proceed with processing
+        match self.process_block(signed_block) {
             Ok(_) => {
                 info!(%slot, "Block processed successfully");
 
                 // Check if any pending blocks can now be processed
                 self.process_pending_children(block_root);
-            }
-            Err(StoreError::MissingParentState { parent_root, .. }) => {
-                info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
-
-                // Store block for later processing
-                self.pending_blocks
-                    .entry(parent_root)
-                    .or_default()
-                    .push(signed_block);
-
-                // Request missing parent from network
-                self.request_missing_block(parent_root);
             }
             Err(err) => {
                 warn!(%slot, %err, "Failed to process block");
