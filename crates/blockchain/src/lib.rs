@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
@@ -54,7 +54,6 @@ impl BlockChain {
             p2p_tx,
             key_manager,
             pending_blocks: HashMap::new(),
-            in_flight_requests: HashSet::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -94,9 +93,6 @@ struct BlockChainServer {
 
     // Pending blocks waiting for their parent
     pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
-
-    // Track in-flight block requests (prevent duplicates)
-    in_flight_requests: HashSet<H256>,
 }
 
 impl BlockChainServer {
@@ -307,19 +303,9 @@ impl BlockChainServer {
     }
 
     fn request_missing_block(&mut self, block_root: H256) {
-        // Check if already requested (avoid duplicate requests)
-        if self.in_flight_requests.contains(&block_root) {
-            trace!(%block_root, "Block already requested, skipping duplicate");
-            return;
-        }
-
-        // Mark as requested
-        self.in_flight_requests.insert(block_root);
-
-        // Send request to P2P layer
+        // Send request to P2P layer (deduplication handled by P2P module)
         if let Err(err) = self.p2p_tx.send(P2PMessage::FetchBlock(block_root)) {
             error!(%block_root, %err, "Failed to send FetchBlock message to P2P");
-            self.in_flight_requests.remove(&block_root);
         } else {
             info!(%block_root, "Requested missing block from network");
         }
@@ -339,9 +325,6 @@ impl BlockChainServer {
                 self.on_block(child_block);
             }
         }
-
-        // Also clear the in-flight request for this block
-        self.in_flight_requests.remove(&parent_root);
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {

@@ -6,6 +6,7 @@ use std::{
 
 use ethlambda_blockchain::{BlockChain, P2PMessage};
 use ethlambda_storage::Store;
+use ethlambda_types::primitives::H256;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -332,7 +333,7 @@ async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
     }
 }
 
-async fn handle_retry(server: &mut P2PServer, root: ethlambda_types::primitives::H256) {
+async fn handle_retry(server: &mut P2PServer, root: H256) {
     // Check if still pending (might have succeeded during backoff)
     if !server.pending_requests.contains_key(&root) {
         trace!(%root, "Block fetch completed during backoff, skipping retry");
