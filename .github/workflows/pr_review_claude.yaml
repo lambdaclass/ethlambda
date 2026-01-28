@@ -39,10 +39,11 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Claude Code Review
-        uses: anthropics/claude-code-action@beta
+        uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          model: claude-sonnet-4-20250514
+          claude_args: |
+            --max-turns 5
+            --model claude-sonnet-4-20250514
           trigger_phrase: "@claude"
-          timeout_minutes: 30
-          direct_prompt: ${{ steps.prompt.outputs.content }}
+          prompt: ${{ steps.prompt.outputs.content }}
