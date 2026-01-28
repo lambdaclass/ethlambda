@@ -77,7 +77,7 @@ mod tests {
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
-        primitives::TreeHash,
+        primitives::{H256, TreeHash},
         state::{ChainConfig, Checkpoint, JustificationValidators, JustifiedSlots, State},
     };
     use http_body_util::BodyExt;
@@ -90,13 +90,13 @@ mod tests {
         let genesis_header = BlockHeader {
             slot: 0,
             proposer_index: 0,
-            parent_root: ethlambda_types::primitives::H256::ZERO,
-            state_root: ethlambda_types::primitives::H256::ZERO,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
             body_root: BlockBody::default().tree_hash_root(),
         };
 
         let genesis_checkpoint = Checkpoint {
-            root: ethlambda_types::primitives::H256::ZERO,
+            root: H256::ZERO,
             slot: 0,
         };
 

@@ -1,11 +1,12 @@
 use std::{
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
-use ethlambda_blockchain::{BlockChain, OutboundGossip};
+use ethlambda_blockchain::{BlockChain, P2PMessage};
 use ethlambda_storage::Store;
-use ethlambda_types::state::Checkpoint;
+use ethlambda_types::primitives::H256;
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -15,34 +16,43 @@ use libp2p::{
     gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response,
+    request_response::{self, OutboundRequestId},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha2::Digest;
-use ssz::Encode;
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 use crate::{
-    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
-    messages::{
-        MAX_COMPRESSED_PAYLOAD_SIZE,
-        status::{STATUS_PROTOCOL_V1, Status},
+    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
+    req_resp::{
+        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
+        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
     },
 };
 
 mod gossipsub;
-mod messages;
 pub mod metrics;
+mod req_resp;
 
 pub use metrics::populate_name_registry;
+
+// 10ms, 40ms, 160ms, 640ms, 2560ms
+const MAX_FETCH_RETRIES: u32 = 5;
+const INITIAL_BACKOFF_MS: u64 = 10;
+const BACKOFF_MULTIPLIER: u64 = 4;
+
+pub(crate) struct PendingRequest {
+    pub(crate) attempts: u32,
+    pub(crate) last_peer: Option<PeerId>,
+}
 
 pub async fn start_p2p(
     node_key: Vec<u8>,
     bootnodes: Vec<Bootnode>,
     listening_socket: SocketAddr,
     blockchain: BlockChain,
-    p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
+    p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
@@ -76,10 +86,16 @@ pub async fn start_p2p(
         .expect("failed to initiate behaviour");
 
     let req_resp = request_response::Behaviour::new(
-        vec![(
-            StreamProtocol::new(STATUS_PROTOCOL_V1),
-            request_response::ProtocolSupport::Full,
-        )],
+        vec![
+            (
+                StreamProtocol::new(STATUS_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
+            (
+                StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
+        ],
         Default::default(),
     );
 
@@ -145,204 +161,192 @@ pub async fn start_p2p(
 
     info!("P2P node started on {listening_socket}");
 
-    event_loop(
+    let (retry_tx, retry_rx) = mpsc::unbounded_channel();
+
+    let server = P2PServer {
         swarm,
         blockchain,
+        store,
         p2p_rx,
         attestation_topic,
         block_topic,
-        store,
-    )
-    .await;
+        connected_peers: HashSet::new(),
+        pending_requests: HashMap::new(),
+        request_id_map: HashMap::new(),
+        retry_tx,
+        retry_rx,
+    };
+
+    event_loop(server).await;
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
 #[derive(NetworkBehaviour)]
-struct Behaviour {
+pub(crate) struct Behaviour {
     gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: request_response::Behaviour<messages::status::StatusCodec>,
+    req_resp: request_response::Behaviour<Codec>,
+}
+
+pub(crate) struct P2PServer {
+    pub(crate) swarm: libp2p::Swarm<Behaviour>,
+    pub(crate) blockchain: BlockChain,
+    pub(crate) store: Store,
+    pub(crate) p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
+    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) connected_peers: HashSet<PeerId>,
+    pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
+    pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
+    retry_tx: mpsc::UnboundedSender<ethlambda_types::primitives::H256>,
+    retry_rx: mpsc::UnboundedReceiver<ethlambda_types::primitives::H256>,
 }
 
 /// Event loop for the P2P crate.
 /// Processes swarm events, incoming requests, responses, gossip, and outgoing messages from blockchain.
-async fn event_loop(
-    mut swarm: libp2p::Swarm<Behaviour>,
-    mut blockchain: BlockChain,
-    mut p2p_rx: mpsc::UnboundedReceiver<OutboundGossip>,
-    attestation_topic: libp2p::gossipsub::IdentTopic,
-    block_topic: libp2p::gossipsub::IdentTopic,
-    store: Store,
-) {
+async fn event_loop(mut server: P2PServer) {
     loop {
         tokio::select! {
             biased;
 
-            message = p2p_rx.recv() => {
+            message = server.p2p_rx.recv() => {
                 let Some(message) = message else {
                     break;
                 };
-                handle_outgoing_gossip(&mut swarm, message, &attestation_topic, &block_topic).await;
+                handle_p2p_message(&mut server, message).await;
             }
-            event = swarm.next() => {
+            event = server.swarm.next() => {
                 let Some(event) = event else {
                     break;
                 };
-                match event {
-                    SwarmEvent::Behaviour(BehaviourEvent::ReqResp(
-                        message @ request_response::Event::Message { .. },
-                    )) => {
-                        handle_req_resp_message(&mut swarm, message, &store).await;
-                    }
-                    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-                        message @ libp2p::gossipsub::Event::Message { .. },
-                    )) => {
-                        gossipsub::handle_gossipsub_message(&mut blockchain, message).await;
-                    }
-                    SwarmEvent::ConnectionEstablished {
-                        peer_id,
-                        endpoint,
-                        num_established,
-                        ..
-                    } => {
-                        let direction = connection_direction(&endpoint);
-                        if num_established.get() == 1 {
-                            metrics::notify_peer_connected(&Some(peer_id), direction, "success");
-                            // Send status request on first connection to this peer
-                            let our_status = build_status(&store);
-                            info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
-                            swarm.behaviour_mut().req_resp.send_request(&peer_id, our_status);
-                        } else {
-                            info!(%peer_id, %direction, "Added peer connection");
-                        }
-                    }
-                    SwarmEvent::ConnectionClosed {
-                        peer_id,
-                        endpoint,
-                        num_established,
-                        cause,
-                        ..
-                    } => {
-                        let direction = connection_direction(&endpoint);
-                        let reason = match cause {
-                            None => "remote_close",
-                            Some(err) => {
-                                // Categorize disconnection reasons
-                                let err_str = err.to_string().to_lowercase();
-                                if err_str.contains("timeout") || err_str.contains("timedout") || err_str.contains("keepalive") {
-                                    "timeout"
-                                } else if err_str.contains("reset") || err_str.contains("connectionreset") {
-                                    "remote_close"
-                                } else {
-                                    "error"
-                                }
-                            }
-                        };
-                        if num_established == 0 {
-                            metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
-                        }
-                        info!(%peer_id, %direction, %reason, "Peer disconnected");
-                    }
-                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        let result = if error.to_string().to_lowercase().contains("timed out") {
-                            "timeout"
-                        } else {
-                            "error"
-                        };
-                        metrics::notify_peer_connected(&peer_id, "outbound", result);
-                        warn!(?peer_id, %error, "Outgoing connection error");
-                    }
-                    SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-                        metrics::notify_peer_connected(&peer_id, "inbound", "error");
-                        warn!(%error, "Incoming connection error");
-                    }
-                    _ => {
-                        trace!(?event, "Ignored swarm event");
-                    }
-                }
+                handle_swarm_event(&mut server, event).await;
+            }
+            Some(root) = server.retry_rx.recv() => {
+                handle_retry(&mut server, root).await;
             }
         }
     }
 }
 
-async fn handle_outgoing_gossip(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    message: OutboundGossip,
-    attestation_topic: &libp2p::gossipsub::IdentTopic,
-    block_topic: &libp2p::gossipsub::IdentTopic,
-) {
-    match message {
-        OutboundGossip::PublishAttestation(attestation) => {
-            let slot = attestation.message.slot;
-            let validator = attestation.validator_id;
-
-            // Encode to SSZ
-            let ssz_bytes = attestation.as_ssz_bytes();
-
-            // Compress with raw snappy
-            let compressed = gossipsub::compress_message(&ssz_bytes);
-
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(attestation_topic.clone(), compressed)
-                .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
-                .inspect_err(|err| tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub"));
+async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourEvent>) {
+    match event {
+        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
+            req_resp::handle_req_resp_message(server, req_resp_event).await;
         }
-        OutboundGossip::PublishBlock(signed_block) => {
-            let slot = signed_block.message.block.slot;
-            let proposer = signed_block.message.block.proposer_index;
-
-            // Encode to SSZ
-            let ssz_bytes = signed_block.as_ssz_bytes();
-
-            // Compress with raw snappy
-            let compressed = gossipsub::compress_message(&ssz_bytes);
-
-            // Publish to gossipsub
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(block_topic.clone(), compressed)
-                .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
-                .inspect_err(|err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"));
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+            message @ libp2p::gossipsub::Event::Message { .. },
+        )) => {
+            gossipsub::handle_gossipsub_message(server, message).await;
+        }
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            endpoint,
+            num_established,
+            ..
+        } => {
+            let direction = connection_direction(&endpoint);
+            if num_established.get() == 1 {
+                server.connected_peers.insert(peer_id);
+                metrics::notify_peer_connected(&Some(peer_id), direction, "success");
+                // Send status request on first connection to this peer
+                let our_status = build_status(&server.store);
+                info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
+                server
+                    .swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .send_request_with_protocol(
+                        &peer_id,
+                        Request::Status(our_status),
+                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                    );
+            } else {
+                info!(%peer_id, %direction, "Added peer connection");
+            }
+        }
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            endpoint,
+            num_established,
+            cause,
+            ..
+        } => {
+            let direction = connection_direction(&endpoint);
+            let reason = match cause {
+                None => "remote_close",
+                Some(err) => {
+                    // Categorize disconnection reasons
+                    let err_str = err.to_string().to_lowercase();
+                    if err_str.contains("timeout")
+                        || err_str.contains("timedout")
+                        || err_str.contains("keepalive")
+                    {
+                        "timeout"
+                    } else if err_str.contains("reset") || err_str.contains("connectionreset") {
+                        "remote_close"
+                    } else {
+                        "error"
+                    }
+                }
+            };
+            if num_established == 0 {
+                server.connected_peers.remove(&peer_id);
+                metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+            }
+            info!(%peer_id, %direction, %reason, "Peer disconnected");
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            let result = if error.to_string().to_lowercase().contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            };
+            metrics::notify_peer_connected(&peer_id, "outbound", result);
+            warn!(?peer_id, %error, "Outgoing connection error");
+        }
+        SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
+            metrics::notify_peer_connected(&peer_id, "inbound", "error");
+            warn!(%error, "Incoming connection error");
+        }
+        _ => {
+            trace!(?event, "Ignored swarm event");
         }
     }
 }
 
-async fn handle_req_resp_message(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    event: request_response::Event<Status, Status>,
-    store: &Store,
-) {
-    let request_response::Event::Message {
-        peer,
-        connection_id: _,
-        message,
-    } = event
-    else {
-        unreachable!("we already matched on event_loop");
-    };
+async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
     match message {
-        request_response::Message::Request {
-            request_id: _,
-            request,
-            channel,
-        } => {
-            info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
-            let our_status = build_status(store);
-            swarm
-                .behaviour_mut()
-                .req_resp
-                .send_response(channel, our_status)
-                .unwrap();
+        P2PMessage::PublishAttestation(attestation) => {
+            publish_attestation(server, attestation).await;
         }
-        request_response::Message::Response {
-            request_id: _,
-            response,
-        } => {
-            info!(finalized_slot=%response.finalized.slot, head_slot=%response.head.slot, "Received status response from peer {peer}");
+        P2PMessage::PublishBlock(signed_block) => {
+            publish_block(server, signed_block).await;
         }
+        P2PMessage::FetchBlock(root) => {
+            // Deduplicate - if already pending, ignore
+            if server.pending_requests.contains_key(&root) {
+                trace!(%root, "Block fetch already in progress, ignoring duplicate");
+                return;
+            }
+
+            // Send request and track it (tracking handled internally by fetch_block_from_peer)
+            fetch_block_from_peer(server, root).await;
+        }
+    }
+}
+
+async fn handle_retry(server: &mut P2PServer, root: H256) {
+    // Check if still pending (might have succeeded during backoff)
+    if !server.pending_requests.contains_key(&root) {
+        trace!(%root, "Block fetch completed during backoff, skipping retry");
+        return;
+    }
+
+    info!(%root, "Retrying block fetch after backoff");
+
+    // Retry the fetch (tracking handled internally by fetch_block_from_peer)
+    if !fetch_block_from_peer(server, root).await {
+        tracing::error!(%root, "Failed to retry block fetch, giving up");
+        server.pending_requests.remove(&root);
     }
 }
 
@@ -391,20 +395,6 @@ fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str
         "outbound"
     } else {
         "inbound"
-    }
-}
-
-/// Build a Status message from the current Store state.
-fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
-    let head_slot = store.get_block(&head_root).expect("head block exists").slot;
-    Status {
-        finalized,
-        head: Checkpoint {
-            root: head_root,
-            slot: head_slot,
-        },
     }
 }
 

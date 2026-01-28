@@ -17,12 +17,17 @@ ethlambda-types.workspace = true
 
 async-trait = "0.1"
 
-libp2p = { version = "0.56", features = ["full"] }
+# Fork with request-response feature for outbound protocol selection
+libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "cd6cc3b1e5db2c5e23e133c2201c23b063fc4895", features = [
+    "full",
+] }
 
 snap = "1.1"
 
 tokio.workspace = true
 tracing.workspace = true
+
+rand = "0.8"
 
 # Required for NodeEnr parsing
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }

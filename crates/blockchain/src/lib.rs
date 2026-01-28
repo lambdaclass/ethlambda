@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
+use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
@@ -14,7 +15,7 @@ use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::store::StoreError;
 
@@ -22,13 +23,15 @@ pub mod key_manager;
 pub mod metrics;
 pub mod store;
 
-/// Messages sent from the blockchain to the P2P layer for publishing.
+/// Messages sent from the blockchain to the P2P layer.
 #[derive(Clone, Debug)]
-pub enum OutboundGossip {
+pub enum P2PMessage {
     /// Publish an attestation to the gossip network.
     PublishAttestation(SignedAttestation),
     /// Publish a block to the gossip network.
     PublishBlock(SignedBlockWithAttestation),
+    /// Fetch a block by its root hash.
+    FetchBlock(H256),
 }
 
 pub struct BlockChain {
@@ -41,7 +44,7 @@ pub const SECONDS_PER_SLOT: u64 = 4;
 impl BlockChain {
     pub fn spawn(
         store: Store,
-        p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+        p2p_tx: mpsc::UnboundedSender<P2PMessage>,
         validator_keys: HashMap<u64, ValidatorSecretKey>,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
@@ -50,6 +53,7 @@ impl BlockChain {
             store,
             p2p_tx,
             key_manager,
+            pending_blocks: HashMap::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -84,8 +88,11 @@ impl BlockChain {
 
 struct BlockChainServer {
     store: Store,
-    p2p_tx: mpsc::UnboundedSender<OutboundGossip>,
+    p2p_tx: mpsc::UnboundedSender<P2PMessage>,
     key_manager: key_manager::KeyManager,
+
+    // Pending blocks waiting for their parent
+    pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
 }
 
 impl BlockChainServer {
@@ -173,7 +180,7 @@ impl BlockChainServer {
             // Publish to gossip network
             let Ok(_) = self
                 .p2p_tx
-                .send(OutboundGossip::PublishAttestation(signed_attestation))
+                .send(P2PMessage::PublishAttestation(signed_attestation))
                 .inspect_err(
                     |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
                 )
@@ -244,7 +251,7 @@ impl BlockChainServer {
         // Publish to gossip network
         let Ok(()) = self
             .p2p_tx
-            .send(OutboundGossip::PublishBlock(signed_block))
+            .send(P2PMessage::PublishBlock(signed_block))
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"))
         else {
             return;
@@ -268,8 +275,60 @@ impl BlockChainServer {
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let slot = signed_block.message.block.slot;
-        if let Err(err) = self.process_block(signed_block) {
-            warn!(%slot, %err, "Failed to process block");
+        let block_root = signed_block.message.block.tree_hash_root();
+        let parent_root = signed_block.message.block.parent_root;
+
+        // Check if parent block exists before attempting to process
+        if !self.store.contains_block(&parent_root) {
+            info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
+
+            // Store block for later processing
+            self.pending_blocks
+                .entry(parent_root)
+                .or_default()
+                .push(signed_block);
+
+            // Request missing parent from network
+            self.request_missing_block(parent_root);
+            return;
+        }
+
+        // Parent exists, proceed with processing
+        match self.process_block(signed_block) {
+            Ok(_) => {
+                info!(%slot, "Block processed successfully");
+
+                // Check if any pending blocks can now be processed
+                self.process_pending_children(block_root);
+            }
+            Err(err) => {
+                warn!(%slot, %err, "Failed to process block");
+            }
+        }
+    }
+
+    fn request_missing_block(&mut self, block_root: H256) {
+        // Send request to P2P layer (deduplication handled by P2P module)
+        if let Err(err) = self.p2p_tx.send(P2PMessage::FetchBlock(block_root)) {
+            error!(%block_root, %err, "Failed to send FetchBlock message to P2P");
+        } else {
+            info!(%block_root, "Requested missing block from network");
+        }
+    }
+
+    fn process_pending_children(&mut self, parent_root: H256) {
+        // Remove and process all blocks that were waiting for this parent
+        if let Some(children) = self.pending_blocks.remove(&parent_root) {
+            info!(%parent_root, num_children=%children.len(),
+                  "Processing pending blocks after parent arrival");
+
+            for child_block in children {
+                let slot = child_block.message.block.slot;
+                trace!(%parent_root, %slot, "Processing pending child block");
+
+                // Process recursively - might unblock more descendants
+                self.on_block(child_block);
+            }
         }
     }
 
