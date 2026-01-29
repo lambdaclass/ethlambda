@@ -94,21 +94,41 @@ async fn handle_status_response(status: Status, peer: PeerId) {
 }
 
 async fn handle_blocks_by_root_request(
-    _server: &mut P2PServer,
+    server: &mut P2PServer,
     request: BlocksByRootRequest,
-    _channel: request_response::ResponseChannel<Response>,
+    channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
 ) {
     let num_roots = request.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
-    // TODO: Implement signed block storage and send response chunks
-    // For now, we don't send any response (drop the channel)
-    // In a full implementation, we would:
-    // 1. Look up each requested block root
-    // 2. Send a response chunk for each found block
-    // 3. Each chunk contains: result byte + encoded SignedBlockWithAttestation
-    warn!(%peer, num_roots, "BlocksByRoot request received but block storage not implemented");
+    // TODO: Support multiple blocks per request (currently only handles first root)
+    // The protocol supports up to 1024 roots, but our response type only holds one block.
+    let Some(root) = request.first() else {
+        debug!(%peer, "BlocksByRoot request with no roots");
+        return;
+    };
+
+    match server.store.get_signed_block(root) {
+        Some(signed_block) => {
+            let slot = signed_block.message.block.slot;
+            info!(%peer, %root, %slot, "Responding to BlocksByRoot request");
+
+            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
+                channel,
+                Response::new(
+                    ResponseResult::Success,
+                    ResponsePayload::BlocksByRoot(signed_block),
+                ),
+            ) {
+                warn!(%peer, %root, ?err, "Failed to send BlocksByRoot response");
+            }
+        }
+        None => {
+            debug!(%peer, %root, "Block not found for BlocksByRoot request");
+            // Drop channel without response - peer will timeout
+        }
+    }
 }
 
 async fn handle_blocks_by_root_response(

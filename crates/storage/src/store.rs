@@ -4,7 +4,10 @@ use crate::api::{StorageBackend, Table};
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{AggregatedSignatureProof, Block, BlockBody},
+    block::{
+        AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
+        SignedBlockWithAttestation,
+    },
     primitives::{Decode, Encode, H256, TreeHash},
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
@@ -303,6 +306,46 @@ impl Store {
             )
             .expect("put block");
         batch.commit().expect("commit");
+    }
+
+    // ============ Signed Blocks ============
+
+    /// Insert a signed block, storing the block and signatures separately.
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: &SignedBlockWithAttestation) {
+        let block = &signed_block.message.block;
+        let signatures = BlockSignaturesWithAttestation::from_signed_block(signed_block);
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Blocks,
+                vec![(root.as_ssz_bytes(), block.as_ssz_bytes())],
+            )
+            .expect("put block");
+        batch
+            .put_batch(
+                Table::BlockSignatures,
+                vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())],
+            )
+            .expect("put block signatures");
+        batch.commit().expect("commit");
+    }
+
+    /// Get a signed block by combining block and signatures.
+    ///
+    /// Returns None if either the block or signatures are not found.
+    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.as_ssz_bytes();
+
+        let block_bytes = view.get(Table::Blocks, &key).expect("get")?;
+        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
+
+        let block = Block::from_ssz_bytes(&block_bytes).expect("valid block");
+        let signatures =
+            BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+
+        Some(signatures.to_signed_block(block))
     }
 
     // ============ States ============
