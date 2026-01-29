@@ -10,6 +10,7 @@ use ethlambda_types::{
     primitives::TreeHash,
     signature::ValidatorSecretKey,
     state::Checkpoint,
+    ShortRoot,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
@@ -277,6 +278,7 @@ impl BlockChainServer {
         let slot = signed_block.message.block.slot;
         let block_root = signed_block.message.block.tree_hash_root();
         let parent_root = signed_block.message.block.parent_root;
+        let proposer = signed_block.message.block.proposer_index;
 
         // Check if parent block exists before attempting to process
         if !self.store.contains_block(&parent_root) {
@@ -296,13 +298,26 @@ impl BlockChainServer {
         // Parent exists, proceed with processing
         match self.process_block(signed_block) {
             Ok(_) => {
-                info!(%slot, "Block processed successfully");
+                info!(
+                    slot = %slot,
+                    block_root = %ShortRoot(&block_root.0),
+                    proposer = proposer,
+                    parent_root = %ShortRoot(&parent_root.0),
+                    "Block imported successfully"
+                );
 
                 // Check if any pending blocks can now be processed
                 self.process_pending_children(block_root);
             }
             Err(err) => {
-                warn!(%slot, %err, "Failed to process block");
+                warn!(
+                    slot = %slot,
+                    block_root = %ShortRoot(&block_root.0),
+                    proposer = proposer,
+                    parent_root = %ShortRoot(&parent_root.0),
+                    error = %err,
+                    "Failed to process block"
+                );
             }
         }
     }
