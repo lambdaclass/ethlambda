@@ -41,7 +41,7 @@ pub use metrics::populate_name_registry;
 const MAX_FETCH_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 10;
 const BACKOFF_MULTIPLIER: u64 = 4;
-const PEER_REDIAL_INTERVAL_SECS: u64 = 30;
+const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 enum RetryMessage {
     BlockFetch(H256),
