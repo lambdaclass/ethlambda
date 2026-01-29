@@ -246,10 +246,18 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             let direction = connection_direction(&endpoint);
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
+                let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                 // Send status request on first connection to this peer
                 let our_status = build_status(&server.store);
-                info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
+                info!(
+                    peer_id = %peer_id,
+                    direction = %direction,
+                    peer_count = peer_count,
+                    their_finalized_slot = our_status.finalized.slot,
+                    their_head_slot = our_status.head.slot,
+                    "Peer connected"
+                );
                 server
                     .swarm
                     .behaviour_mut()
@@ -290,9 +298,18 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             };
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
+                let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+                info!(
+                    peer_id = %peer_id,
+                    direction = %direction,
+                    reason = %reason,
+                    peer_count = peer_count,
+                    "Peer disconnected"
+                );
+            } else {
+                info!(%peer_id, %direction, %reason, "Peer connection closed but other connections remain");
             }
-            info!(%peer_id, %direction, %reason, "Peer disconnected");
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             let result = if error.to_string().to_lowercase().contains("timed out") {
