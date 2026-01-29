@@ -28,27 +28,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Run Codex
-        id: run_codex
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: .github/prompts/pr_review.md
-          output-file: codex-output.md
-          safety-strategy: drop-sudo
-          model: gpt-4o
-          sandbox: workspace-write
+      - name: Read review prompt
+        id: prompt
+        run: |
+          PROMPT=$(cat .github/prompts/pr_review.md)
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          echo "$PROMPT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Post Codex feedback
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: process.env.CODEX_FINAL_MESSAGE,
-            });
+      - name: ChatGPT Code Review
+        uses: anc95/ChatGPT-CodeReview@6fdbaeafc6f9e0eaebb844f8cfafff67cb2947f0
         env:
-          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: gpt-4o
+          LANGUAGE: English
+          max_tokens: 4096
+          PROMPT: ${{ steps.prompt.outputs.content }}
