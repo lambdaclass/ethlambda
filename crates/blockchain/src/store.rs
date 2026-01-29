@@ -6,6 +6,7 @@ use ethlambda_state_transition::{
 };
 use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store};
 use ethlambda_types::{
+    ShortRoot,
     attestation::{AggregatedAttestation, Attestation, AttestationData, SignedAttestation},
     block::{
         AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
@@ -43,6 +44,22 @@ fn update_head(store: &mut Store) {
         info!(%old_head, %new_head, "Fork choice reorg detected");
     }
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+
+    if old_head != new_head {
+        let old_slot = store.get_block(&old_head).map(|b| b.slot).unwrap_or(0);
+        let new_slot = store.get_block(&new_head).map(|b| b.slot).unwrap_or(0);
+        let justified_slot = store.latest_justified().slot;
+        let finalized_slot = store.latest_finalized().slot;
+        info!(
+            head_slot = new_slot,
+            head_root = %ShortRoot(&new_head.0),
+            previous_head_slot = old_slot,
+            previous_head_root = %ShortRoot(&old_head.0),
+            justified_slot,
+            finalized_slot,
+            "Fork choice head updated"
+        );
+    }
 }
 
 /// Update the safe target for attestation.
@@ -196,7 +213,7 @@ pub fn on_gossip_attestation(
             return Err(StoreError::SignatureVerificationFailed);
         }
     }
-    on_attestation(store, attestation, false)?;
+    on_attestation(store, attestation.clone(), false)?;
 
     if cfg!(not(feature = "skip-signature-verification")) {
         // Store signature for later lookup during block building
@@ -206,6 +223,20 @@ pub fn on_gossip_attestation(
         store.insert_gossip_signature(signature_key, signature);
     }
     metrics::inc_attestations_valid("gossip");
+
+    let slot = attestation.data.slot;
+    let target_slot = attestation.data.target.slot;
+    let source_slot = attestation.data.source.slot;
+    info!(
+        slot,
+        validator = validator_id,
+        target_slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        source_slot,
+        source_root = %ShortRoot(&attestation.data.source.root.0),
+        "Attestation processed"
+    );
+
     Ok(())
 }
 
