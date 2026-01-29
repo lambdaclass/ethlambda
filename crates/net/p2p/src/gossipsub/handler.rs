@@ -98,7 +98,13 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .behaviour_mut()
         .gossipsub
         .publish(server.attestation_topic.clone(), compressed)
-        .inspect(|_| trace!(%slot, %validator, "Published attestation to gossipsub"))
+        .inspect(|_| info!(
+            slot = %slot,
+            validator = validator,
+            target_slot = attestation.message.target.slot,
+            source_slot = attestation.message.source.slot,
+            "Published attestation to gossipsub"
+        ))
         .inspect_err(|err| {
             tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub")
         });
@@ -107,6 +113,9 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
     let slot = signed_block.message.block.slot;
     let proposer = signed_block.message.block.proposer_index;
+    let block_root = signed_block.message.block.tree_hash_root();
+    let parent_root = signed_block.message.block.parent_root;
+    let attestation_count = signed_block.message.block.body.attestations.len();
 
     // Encode to SSZ
     let ssz_bytes = signed_block.as_ssz_bytes();
@@ -120,7 +129,14 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWith
         .behaviour_mut()
         .gossipsub
         .publish(server.block_topic.clone(), compressed)
-        .inspect(|_| info!(%slot, %proposer, "Published block to gossipsub"))
+        .inspect(|_| info!(
+            slot = %slot,
+            proposer = proposer,
+            block_root = %ShortRoot(&block_root.0),
+            parent_root = %ShortRoot(&parent_root.0),
+            attestation_count = attestation_count,
+            "Published block to gossipsub"
+        ))
         .inspect_err(
             |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),
         );
