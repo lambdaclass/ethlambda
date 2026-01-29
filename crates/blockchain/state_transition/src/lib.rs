@@ -298,11 +298,13 @@ fn process_attestations(
                 target.slot,
             );
 
+            let justified_slot = target.slot;
+            let threshold = (2 * validator_count).div_ceil(3);
             info!(
-                justified_slot = target.slot,
+                justified_slot,
                 justified_root = %ShortRoot(&target.root.0),
-                vote_count = vote_count,
-                threshold = (2 * validator_count).div_ceil(3),
+                vote_count,
+                threshold,
                 "Checkpoint justified"
             );
 
@@ -317,11 +319,14 @@ fn process_attestations(
                 state.latest_finalized = source;
                 metrics::inc_finalizations("success");
 
+                let finalized_slot = source.slot;
+                let previous_finalized = old_finalized_slot;
+                let justified_slot = state.latest_justified.slot;
                 info!(
-                    finalized_slot = source.slot,
+                    finalized_slot,
                     finalized_root = %ShortRoot(&source.root.0),
-                    previous_finalized = old_finalized_slot,
-                    justified_slot = state.latest_justified.slot,
+                    previous_finalized,
+                    justified_slot,
                     "Checkpoint finalized"
                 );
 

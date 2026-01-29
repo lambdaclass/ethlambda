@@ -250,12 +250,14 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                 metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                 // Send status request on first connection to this peer
                 let our_status = build_status(&server.store);
+                let our_finalized_slot = our_status.finalized.slot;
+                let our_head_slot = our_status.head.slot;
                 info!(
-                    peer_id = %peer_id,
-                    direction = %direction,
-                    peer_count = peer_count,
-                    our_finalized_slot = our_status.finalized.slot,
-                    our_head_slot = our_status.head.slot,
+                    %peer_id,
+                    %direction,
+                    peer_count,
+                    our_finalized_slot,
+                    our_head_slot,
                     "Peer connected"
                 );
                 server
@@ -301,10 +303,10 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
                 info!(
-                    peer_id = %peer_id,
-                    direction = %direction,
-                    reason = %reason,
-                    peer_count = peer_count,
+                    %peer_id,
+                    %direction,
+                    %reason,
+                    peer_count,
                     "Peer disconnected"
                 );
             } else {

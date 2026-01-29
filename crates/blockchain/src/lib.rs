@@ -299,8 +299,8 @@ impl BlockChainServer {
         match self.process_block(signed_block) {
             Ok(_) => {
                 info!(
-                    slot = %slot,
-                    proposer = proposer,
+                    %slot,
+                    proposer,
                     block_root = %ShortRoot(&block_root.0),
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
@@ -311,11 +311,11 @@ impl BlockChainServer {
             }
             Err(err) => {
                 warn!(
-                    slot = %slot,
-                    proposer = proposer,
+                    %slot,
+                    proposer,
                     block_root = %ShortRoot(&block_root.0),
                     parent_root = %ShortRoot(&parent_root.0),
-                    error = %err,
+                    %err,
                     "Failed to process block"
                 );
             }

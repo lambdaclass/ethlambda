@@ -38,11 +38,11 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             let parent_root = signed_block.message.block.parent_root;
             let attestation_count = signed_block.message.block.body.attestations.len();
             info!(
-                slot = %slot,
-                proposer = proposer,
+                %slot,
+                proposer,
                 block_root = %ShortRoot(&block_root.0),
                 parent_root = %ShortRoot(&parent_root.0),
-                attestation_count = attestation_count,
+                attestation_count,
                 "Received block from gossip"
             );
             server.blockchain.notify_new_block(signed_block).await;
@@ -62,8 +62,8 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             let slot = signed_attestation.message.slot;
             let validator = signed_attestation.validator_id;
             info!(
-                slot = %slot,
-                validator = validator,
+                %slot,
+                validator,
                 head_root = %ShortRoot(&signed_attestation.message.head.root.0),
                 target_slot = signed_attestation.message.target.slot,
                 target_root = %ShortRoot(&signed_attestation.message.target.root.0),
@@ -99,8 +99,8 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .gossipsub
         .publish(server.attestation_topic.clone(), compressed)
         .inspect(|_| info!(
-            slot = %slot,
-            validator = validator,
+            %slot,
+            validator,
             target_slot = attestation.message.target.slot,
             target_root = %ShortRoot(&attestation.message.target.root.0),
             source_slot = attestation.message.source.slot,
@@ -132,11 +132,11 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWith
         .gossipsub
         .publish(server.block_topic.clone(), compressed)
         .inspect(|_| info!(
-            slot = %slot,
-            proposer = proposer,
+            %slot,
+            proposer,
             block_root = %ShortRoot(&block_root.0),
             parent_root = %ShortRoot(&parent_root.0),
-            attestation_count = attestation_count,
+            attestation_count,
             "Published block to gossipsub"
         ))
         .inspect_err(
