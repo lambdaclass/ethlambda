@@ -254,8 +254,8 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                     peer_id = %peer_id,
                     direction = %direction,
                     peer_count = peer_count,
-                    their_finalized_slot = our_status.finalized.slot,
-                    their_head_slot = our_status.head.slot,
+                    our_finalized_slot = our_status.finalized.slot,
+                    our_head_slot = our_status.head.slot,
                     "Peer connected"
                 );
                 server
