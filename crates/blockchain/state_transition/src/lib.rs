@@ -4,7 +4,9 @@ use ethlambda_types::{
     block::{AggregatedAttestations, Block, BlockHeader},
     primitives::{H256, TreeHash},
     state::{Checkpoint, JustificationValidators, State},
+    ShortRoot,
 };
+use tracing::info;
 
 mod justified_slots_ops;
 pub mod metrics;
@@ -306,6 +308,14 @@ fn process_attestations(
                 let old_finalized_slot = state.latest_finalized.slot;
                 state.latest_finalized = source;
                 metrics::inc_finalizations("success");
+
+                info!(
+                    finalized_slot = source.slot,
+                    finalized_root = %ShortRoot(&source.root.0),
+                    previous_finalized = old_finalized_slot,
+                    justified_slot = state.latest_justified.slot,
+                    "Checkpoint finalized"
+                );
 
                 // Shift window to drop finalized slots from the front
                 let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
