@@ -317,7 +317,7 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                 server.connected_peers.remove(&peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
-              
+
                 info!(
                     %peer_id,
                     %direction,
