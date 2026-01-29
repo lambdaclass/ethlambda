@@ -11,7 +11,10 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
     ResponseResult, Status,
 };
-use crate::{BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest};
+use crate::{
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
+    RetryMessage,
+};
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -226,6 +229,6 @@ async fn handle_fetch_failure(
     let retry_tx = server.retry_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(backoff).await;
-        let _ = retry_tx.send(root);
+        let _ = retry_tx.send(RetryMessage::BlockFetch(root));
     });
 }

@@ -41,6 +41,12 @@ pub use metrics::populate_name_registry;
 const MAX_FETCH_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 10;
 const BACKOFF_MULTIPLIER: u64 = 4;
+const PEER_REDIAL_INTERVAL_SECS: u64 = 30;
+
+enum RetryMessage {
+    BlockFetch(H256),
+    PeerRedial(PeerId),
+}
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
@@ -122,6 +128,7 @@ pub async fn start_p2p(
         })
         .build();
     let local_peer_id = *swarm.local_peer_id();
+    let mut bootnode_addrs = HashMap::new();
     for bootnode in bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
@@ -133,6 +140,7 @@ pub async fn start_p2p(
             .with(Protocol::QuicV1)
             .with_p2p(peer_id)
             .expect("failed to add peer ID to multiaddr");
+        bootnode_addrs.insert(peer_id, addr.clone());
         swarm.dial(addr).unwrap();
     }
     let addr = Multiaddr::empty()
@@ -159,7 +167,7 @@ pub async fn start_p2p(
         "/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy"
     ));
 
-    info!("P2P node started on {listening_socket}");
+    info!(socket=%listening_socket, "P2P node started");
 
     let (retry_tx, retry_rx) = mpsc::unbounded_channel();
 
@@ -173,6 +181,7 @@ pub async fn start_p2p(
         connected_peers: HashSet::new(),
         pending_requests: HashMap::new(),
         request_id_map: HashMap::new(),
+        bootnode_addrs,
         retry_tx,
         retry_rx,
     };
@@ -197,8 +206,11 @@ pub(crate) struct P2PServer {
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
-    retry_tx: mpsc::UnboundedSender<ethlambda_types::primitives::H256>,
-    retry_rx: mpsc::UnboundedReceiver<ethlambda_types::primitives::H256>,
+    /// Bootnode addresses for redialing when disconnected
+    bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    /// Channel for scheduling retries (block fetches and peer redials)
+    pub(crate) retry_tx: mpsc::UnboundedSender<RetryMessage>,
+    retry_rx: mpsc::UnboundedReceiver<RetryMessage>,
 }
 
 /// Event loop for the P2P crate.
@@ -220,8 +232,11 @@ async fn event_loop(mut server: P2PServer) {
                 };
                 handle_swarm_event(&mut server, event).await;
             }
-            Some(root) = server.retry_rx.recv() => {
-                handle_retry(&mut server, root).await;
+            Some(msg) = server.retry_rx.recv() => {
+                match msg {
+                    RetryMessage::BlockFetch(root) => handle_retry(&mut server, root).await,
+                    RetryMessage::PeerRedial(peer_id) => handle_peer_redial(&mut server, peer_id).await,
+                }
             }
         }
     }
@@ -291,6 +306,16 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+
+                // Schedule redial if this is a bootnode
+                if server.bootnode_addrs.contains_key(&peer_id) {
+                    let retry_tx = server.retry_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
+                        let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
+                    });
+                    info!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
+                }
             }
             info!(%peer_id, %direction, %reason, "Peer disconnected");
         }
@@ -302,6 +327,19 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             };
             metrics::notify_peer_connected(&peer_id, "outbound", result);
             warn!(?peer_id, %error, "Outgoing connection error");
+
+            // Schedule redial if this was a bootnode
+            if let Some(pid) = peer_id
+                && server.bootnode_addrs.contains_key(&pid)
+                && !server.connected_peers.contains(&pid)
+            {
+                let retry_tx = server.retry_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
+                    let _ = retry_tx.send(RetryMessage::PeerRedial(pid));
+                });
+                info!(%pid, "Scheduled bootnode redial after connection error");
+            }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
             metrics::notify_peer_connected(&peer_id, "inbound", "error");
@@ -347,6 +385,27 @@ async fn handle_retry(server: &mut P2PServer, root: H256) {
     if !fetch_block_from_peer(server, root).await {
         tracing::error!(%root, "Failed to retry block fetch, giving up");
         server.pending_requests.remove(&root);
+    }
+}
+
+async fn handle_peer_redial(server: &mut P2PServer, peer_id: PeerId) {
+    // Skip if already reconnected
+    if server.connected_peers.contains(&peer_id) {
+        trace!(%peer_id, "Bootnode reconnected during redial delay, skipping");
+        return;
+    }
+
+    if let Some(addr) = server.bootnode_addrs.get(&peer_id) {
+        info!(%peer_id, "Redialing disconnected bootnode");
+        if let Err(e) = server.swarm.dial(addr.clone()) {
+            warn!(%peer_id, %e, "Failed to redial bootnode, will retry");
+            // Schedule another redial attempt
+            let retry_tx = server.retry_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
+                let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
+            });
+        }
     }
 }
 
