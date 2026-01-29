@@ -211,7 +211,7 @@ pub fn on_gossip_attestation(
             return Err(StoreError::SignatureVerificationFailed);
         }
     }
-    on_attestation(store, attestation, false)?;
+    on_attestation(store, attestation.clone(), false)?;
 
     if cfg!(not(feature = "skip-signature-verification")) {
         // Store signature for later lookup during block building
@@ -221,6 +221,17 @@ pub fn on_gossip_attestation(
         store.insert_gossip_signature(signature_key, signature);
     }
     metrics::inc_attestations_valid("gossip");
+
+    info!(
+        slot = attestation.data.slot,
+        validator = validator_id,
+        target_slot = attestation.data.target.slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        source_slot = attestation.data.source.slot,
+        source_root = %ShortRoot(&attestation.data.source.root.0),
+        "Attestation processed"
+    );
+
     Ok(())
 }
 
