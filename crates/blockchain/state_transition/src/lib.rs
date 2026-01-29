@@ -298,6 +298,14 @@ fn process_attestations(
                 target.slot,
             );
 
+            info!(
+                justified_slot = target.slot,
+                justified_root = %ShortRoot(&target.root.0),
+                vote_count = vote_count,
+                threshold = (2 * validator_count + 2) / 3,
+                "Checkpoint justified"
+            );
+
             justifications.remove(&target.root);
 
             // Consider whether finalization can advance.

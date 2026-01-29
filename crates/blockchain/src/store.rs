@@ -14,6 +14,7 @@ use ethlambda_types::{
     primitives::{H256, TreeHash},
     signature::ValidatorSignature,
     state::{Checkpoint, State, Validator},
+    ShortRoot,
 };
 use tracing::{info, trace, warn};
 
@@ -43,6 +44,20 @@ fn update_head(store: &mut Store) {
         info!(%old_head, %new_head, "Fork choice reorg detected");
     }
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+
+    if old_head != new_head {
+        let old_slot = store.get_block(&old_head).map(|b| b.slot).unwrap_or(0);
+        let new_slot = store.get_block(&new_head).map(|b| b.slot).unwrap_or(0);
+        info!(
+            head_slot = new_slot,
+            head_root = %ShortRoot(&new_head.0),
+            previous_head_slot = old_slot,
+            previous_head_root = %ShortRoot(&old_head.0),
+            justified_slot = store.latest_justified().slot,
+            finalized_slot = store.latest_finalized().slot,
+            "Fork choice head updated"
+        );
+    }
 }
 
 /// Update the safe target for attestation.
