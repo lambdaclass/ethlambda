@@ -61,7 +61,16 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             };
             let slot = signed_attestation.message.slot;
             let validator = signed_attestation.validator_id;
-            info!(%slot, %validator, "Received new attestation from gossipsub, sending for processing");
+            info!(
+                slot = %slot,
+                validator = validator,
+                head_root = %ShortRoot(&signed_attestation.message.head.root.0),
+                target_slot = signed_attestation.message.target.slot,
+                target_root = %ShortRoot(&signed_attestation.message.target.root.0),
+                source_slot = signed_attestation.message.source.slot,
+                source_root = %ShortRoot(&signed_attestation.message.source.root.0),
+                "Received attestation from gossip"
+            );
             server
                 .blockchain
                 .notify_new_attestation(signed_attestation)
