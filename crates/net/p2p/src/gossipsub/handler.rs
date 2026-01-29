@@ -102,7 +102,9 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
             slot = %slot,
             validator = validator,
             target_slot = attestation.message.target.slot,
+            target_root = %ShortRoot(&attestation.message.target.root.0),
             source_slot = attestation.message.source.slot,
+            source_root = %ShortRoot(&attestation.message.source.root.0),
             "Published attestation to gossipsub"
         ))
         .inspect_err(|err| {
