@@ -300,8 +300,8 @@ impl BlockChainServer {
             Ok(_) => {
                 info!(
                     slot = %slot,
-                    block_root = %ShortRoot(&block_root.0),
                     proposer = proposer,
+                    block_root = %ShortRoot(&block_root.0),
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
                 );
@@ -312,8 +312,8 @@ impl BlockChainServer {
             Err(err) => {
                 warn!(
                     slot = %slot,
-                    block_root = %ShortRoot(&block_root.0),
                     proposer = proposer,
+                    block_root = %ShortRoot(&block_root.0),
                     parent_root = %ShortRoot(&parent_root.0),
                     error = %err,
                     "Failed to process block"
