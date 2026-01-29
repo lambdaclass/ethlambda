@@ -1,7 +1,8 @@
-use ethlambda_types::{attestation::SignedAttestation, block::SignedBlockWithAttestation};
+use ethlambda_types::{attestation::SignedAttestation, block::SignedBlockWithAttestation, ShortRoot};
 use libp2p::gossipsub::Event;
 use ssz::{Decode, Encode};
 use tracing::{error, info, trace};
+use tree_hash::TreeHash;
 
 use super::{
     encoding::{compress_message, decompress_message},
@@ -32,7 +33,18 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 return;
             };
             let slot = signed_block.message.block.slot;
-            info!(%slot, "Received new block from gossipsub, sending for processing");
+            let block_root = signed_block.message.block.tree_hash_root();
+            let proposer = signed_block.message.block.proposer_index;
+            let parent_root = signed_block.message.block.parent_root;
+            let attestation_count = signed_block.message.block.body.attestations.len();
+            info!(
+                slot = %slot,
+                proposer = proposer,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                attestation_count = attestation_count,
+                "Received block from gossip"
+            );
             server.blockchain.notify_new_block(signed_block).await;
         }
         Some(ATTESTATION_TOPIC_KIND) => {
