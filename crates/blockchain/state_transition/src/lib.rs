@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
+    ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
     primitives::{H256, TreeHash},
     state::{Checkpoint, JustificationValidators, State},
-    ShortRoot,
 };
 use tracing::info;
 

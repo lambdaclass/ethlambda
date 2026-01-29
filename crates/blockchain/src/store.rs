@@ -6,6 +6,7 @@ use ethlambda_state_transition::{
 };
 use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store};
 use ethlambda_types::{
+    ShortRoot,
     attestation::{AggregatedAttestation, Attestation, AttestationData, SignedAttestation},
     block::{
         AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
@@ -14,7 +15,6 @@ use ethlambda_types::{
     primitives::{H256, TreeHash},
     signature::ValidatorSignature,
     state::{Checkpoint, State, Validator},
-    ShortRoot,
 };
 use tracing::{info, trace, warn};
 

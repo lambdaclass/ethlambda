@@ -1,4 +1,6 @@
-use ethlambda_types::{attestation::SignedAttestation, block::SignedBlockWithAttestation, ShortRoot};
+use ethlambda_types::{
+    ShortRoot, attestation::SignedAttestation, block::SignedBlockWithAttestation,
+};
 use libp2p::gossipsub::Event;
 use ssz::{Decode, Encode};
 use tracing::{error, info, trace};
@@ -131,14 +133,16 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWith
         .behaviour_mut()
         .gossipsub
         .publish(server.block_topic.clone(), compressed)
-        .inspect(|_| info!(
-            %slot,
-            proposer,
-            block_root = %ShortRoot(&block_root.0),
-            parent_root = %ShortRoot(&parent_root.0),
-            attestation_count,
-            "Published block to gossipsub"
-        ))
+        .inspect(|_| {
+            info!(
+                %slot,
+                proposer,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                attestation_count,
+                "Published block to gossipsub"
+            )
+        })
         .inspect_err(
             |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),
         );

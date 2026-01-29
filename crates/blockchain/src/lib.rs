@@ -5,12 +5,12 @@ use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
+    ShortRoot,
     attestation::{Attestation, AttestationData, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::TreeHash,
     signature::ValidatorSecretKey,
     state::Checkpoint,
-    ShortRoot,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
