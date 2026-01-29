@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use ethlambda_types::{
+    ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
     primitives::{H256, TreeHash},
     state::{Checkpoint, JustificationValidators, State},
 };
+use tracing::info;
 
 mod justified_slots_ops;
 pub mod metrics;
@@ -296,6 +298,16 @@ fn process_attestations(
                 target.slot,
             );
 
+            let justified_slot = target.slot;
+            let threshold = (2 * validator_count).div_ceil(3);
+            info!(
+                justified_slot,
+                justified_root = %ShortRoot(&target.root.0),
+                vote_count,
+                threshold,
+                "Checkpoint justified"
+            );
+
             justifications.remove(&target.root);
 
             // Consider whether finalization can advance.
@@ -306,6 +318,17 @@ fn process_attestations(
                 let old_finalized_slot = state.latest_finalized.slot;
                 state.latest_finalized = source;
                 metrics::inc_finalizations("success");
+
+                let finalized_slot = source.slot;
+                let previous_finalized = old_finalized_slot;
+                let justified_slot = state.latest_justified.slot;
+                info!(
+                    finalized_slot,
+                    finalized_root = %ShortRoot(&source.root.0),
+                    previous_finalized,
+                    justified_slot,
+                    "Checkpoint finalized"
+                );
 
                 // Shift window to drop finalized slots from the front
                 let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;

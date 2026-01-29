@@ -87,6 +87,51 @@ rm -rf leanSpec && make leanSpec/fixtures    # Regenerate test fixtures (require
 let _timing = metrics::time_state_transition();
 ```
 
+### Logging Patterns
+
+**Use tracing shorthand syntax for cleaner logs:**
+```rust
+// ✅ GOOD: Shorthand for simple variables
+let slot = block.slot;
+let proposer = block.proposer_index;
+info!(
+    %slot,              // Shorthand for slot = %slot (Display)
+    proposer,           // Shorthand for proposer = proposer
+    block_root = %ShortRoot(&block_root.0),  // Named expression
+    "Block imported"
+);
+
+// ❌ BAD: Verbose
+info!(
+    slot = %slot,
+    proposer = proposer,
+    ...
+);
+```
+
+**Standardized field ordering (temporal → identity → identifiers → context → metadata):**
+```rust
+// Block logs
+info!(%slot, proposer, block_root = ..., parent_root = ..., attestation_count, "...");
+
+// Attestation logs
+info!(%slot, validator, target_slot, target_root = ..., source_slot, source_root = ..., "...");
+
+// Consensus events
+info!(finalized_slot, finalized_root = ..., previous_finalized, justified_slot, "...");
+
+// Peer events
+info!(%peer_id, %direction, peer_count, our_finalized_slot, our_head_slot, "...");
+```
+
+**Root hash truncation:**
+```rust
+use ethlambda_types::ShortRoot;
+
+// Always use ShortRoot for consistent 8-char display (4 bytes)
+info!(block_root = %ShortRoot(&root.0), "...");
+```
+
 ### Relative Indexing (justified_slots)
 ```rust
 // Bounded storage: index relative to finalized_slot

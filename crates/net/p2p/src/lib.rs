@@ -261,10 +261,20 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             let direction = connection_direction(&endpoint);
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
+                let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(&Some(peer_id), direction, "success");
                 // Send status request on first connection to this peer
                 let our_status = build_status(&server.store);
-                info!(%peer_id, %direction, finalized_slot=%our_status.finalized.slot, head_slot=%our_status.head.slot, "Added connection to new peer, sending status request");
+                let our_finalized_slot = our_status.finalized.slot;
+                let our_head_slot = our_status.head.slot;
+                info!(
+                    %peer_id,
+                    %direction,
+                    peer_count,
+                    our_finalized_slot,
+                    our_head_slot,
+                    "Peer connected"
+                );
                 server
                     .swarm
                     .behaviour_mut()
@@ -305,15 +315,25 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             };
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
+                let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+              
+                info!(
+                    %peer_id,
+                    %direction,
+                    %reason,
+                    peer_count,
+                    "Peer disconnected"
+                );
 
                 // Schedule redial if this is a bootnode
                 if server.bootnode_addrs.contains_key(&peer_id) {
                     schedule_peer_redial(server.retry_tx.clone(), peer_id);
                     info!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
                 }
+            } else {
+                info!(%peer_id, %direction, %reason, "Peer connection closed but other connections remain");
             }
-            info!(%peer_id, %direction, %reason, "Peer disconnected");
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             let result = if error.to_string().to_lowercase().contains("timed out") {
