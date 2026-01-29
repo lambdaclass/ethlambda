@@ -43,5 +43,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MODEL: gpt-4o
           LANGUAGE: English
+          MAX_PATCH_LENGTH: 100000
           max_tokens: 4096
           PROMPT: ${{ steps.prompt.outputs.content }}
