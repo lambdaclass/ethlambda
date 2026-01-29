@@ -309,11 +309,7 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
 
                 // Schedule redial if this is a bootnode
                 if server.bootnode_addrs.contains_key(&peer_id) {
-                    let retry_tx = server.retry_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
-                        let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
-                    });
+                    schedule_peer_redial(server.retry_tx.clone(), peer_id);
                     info!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
                 }
             }
@@ -333,11 +329,7 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
                 && server.bootnode_addrs.contains_key(&pid)
                 && !server.connected_peers.contains(&pid)
             {
-                let retry_tx = server.retry_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
-                    let _ = retry_tx.send(RetryMessage::PeerRedial(pid));
-                });
+                schedule_peer_redial(server.retry_tx.clone(), pid);
                 info!(%pid, "Scheduled bootnode redial after connection error");
             }
         }
@@ -402,13 +394,17 @@ async fn handle_peer_redial(server: &mut P2PServer, peer_id: PeerId) {
         if let Err(e) = server.swarm.dial(addr.clone()) {
             warn!(%peer_id, %e, "Failed to redial bootnode, will retry");
             // Schedule another redial attempt
-            let retry_tx = server.retry_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
-                let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
-            });
+            schedule_peer_redial(server.retry_tx.clone(), peer_id);
         }
     }
+}
+
+/// Schedules a peer redial after the configured delay interval.
+pub(crate) fn schedule_peer_redial(retry_tx: mpsc::UnboundedSender<RetryMessage>, peer_id: PeerId) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
+        let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
+    });
 }
 
 pub struct Bootnode {
