@@ -302,7 +302,7 @@ fn process_attestations(
                 justified_slot = target.slot,
                 justified_root = %ShortRoot(&target.root.0),
                 vote_count = vote_count,
-                threshold = (2 * validator_count + 2) / 3,
+                threshold = (2 * validator_count).div_ceil(3),
                 "Checkpoint justified"
             );
 
