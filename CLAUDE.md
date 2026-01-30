@@ -81,6 +81,17 @@ rm -rf leanSpec && make leanSpec/fixtures    # Regenerate test fixtures (require
 
 ## Important Patterns & Idioms
 
+### Trait Implementations
+```rust
+// Prefer From/Into traits over custom from_x/to_x methods
+impl From<u8> for ResponseCode { fn from(code: u8) -> Self { Self(code) } }
+impl From<ResponseCode> for u8 { fn from(code: ResponseCode) -> Self { code.0 } }
+
+// Enables idiomatic .into() usage
+let code: ResponseCode = byte.into();
+let byte: u8 = code.into();
+```
+
 ### Ownership for Large Structures
 ```rust
 // Prefer taking ownership to avoid cloning large data (signatures ~3KB)
