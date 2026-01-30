@@ -42,8 +42,8 @@ impl Response {
 /// - On failure (codes 1-3), the payload contains an error message.
 ///
 /// Unknown codes are handled gracefully:
-/// - Codes 4-127: Treated as SERVER_ERROR (reserved for future use).
-/// - Codes 128-255: Treated as INVALID_REQUEST (invalid range).
+/// - Codes 4-127: Reserved for future use, treat as SERVER_ERROR.
+/// - Codes 128-255: Invalid range, treat as INVALID_REQUEST.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ResponseCode(pub u8);
 
@@ -56,24 +56,17 @@ impl ResponseCode {
     pub const SERVER_ERROR: Self = Self(2);
     /// Requested resource (block, blob, etc.) is not available.
     pub const RESOURCE_UNAVAILABLE: Self = Self(3);
+}
 
-    /// Parse a response code byte, mapping unknown codes gracefully per spec.
-    pub fn from_u8(code: u8) -> Self {
-        match code {
-            0 => Self::SUCCESS,
-            1 => Self::INVALID_REQUEST,
-            2 => Self::SERVER_ERROR,
-            3 => Self::RESOURCE_UNAVAILABLE,
-            // Codes 4-127: Reserved for future use, treat as SERVER_ERROR
-            4..=127 => Self::SERVER_ERROR,
-            // Codes 128-255: Invalid range, treat as INVALID_REQUEST
-            128..=255 => Self::INVALID_REQUEST,
-        }
+impl From<u8> for ResponseCode {
+    fn from(code: u8) -> Self {
+        Self(code)
     }
+}
 
-    /// Convert to the wire format byte representation.
-    pub fn to_u8(self) -> u8 {
-        self.0
+impl From<ResponseCode> for u8 {
+    fn from(code: ResponseCode) -> Self {
+        code.0
     }
 }
 
@@ -84,7 +77,9 @@ impl std::fmt::Debug for ResponseCode {
             Self::INVALID_REQUEST => write!(f, "INVALID_REQUEST(1)"),
             Self::SERVER_ERROR => write!(f, "SERVER_ERROR(2)"),
             Self::RESOURCE_UNAVAILABLE => write!(f, "RESOURCE_UNAVAILABLE(3)"),
-            Self(code) => write!(f, "ResponseCode({code})"),
+            // Unknown codes: treat 4-127 as SERVER_ERROR, 128-255 as INVALID_REQUEST
+            Self(code @ 4..=127) => write!(f, "SERVER_ERROR({code})"),
+            Self(code @ 128..=255) => write!(f, "INVALID_REQUEST({code})"),
         }
     }
 }

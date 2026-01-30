@@ -65,7 +65,7 @@ impl libp2p::request_response::Codec for Codec {
         io.read_exact(std::slice::from_mut(&mut result_byte))
             .await?;
 
-        let code = ResponseCode::from_u8(result_byte);
+        let code = ResponseCode::from(result_byte);
 
         let payload = decode_payload(io).await?;
 
@@ -135,7 +135,7 @@ impl libp2p::request_response::Codec for Codec {
         match resp {
             Response::Success { payload } => {
                 // Send success code (0)
-                io.write_all(&[ResponseCode::SUCCESS.to_u8()]).await?;
+                io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
 
                 let encoded = match &payload {
                     ResponsePayload::Status(status) => status.as_ssz_bytes(),
@@ -146,7 +146,7 @@ impl libp2p::request_response::Codec for Codec {
             }
             Response::Error { code, message } => {
                 // Send error code
-                io.write_all(&[code.to_u8()]).await?;
+                io.write_all(&[code.into()]).await?;
 
                 // Error messages are SSZ-encoded as List[byte, 256]
                 let encoded = message.as_ssz_bytes();
