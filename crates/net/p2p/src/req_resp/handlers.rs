@@ -8,8 +8,8 @@ use ethlambda_types::block::SignedBlockWithAttestation;
 use ethlambda_types::primitives::TreeHash;
 
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
-    ResponseResult, Status, error_message,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponseCode,
+    ResponsePayload, Status, error_message,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
@@ -32,30 +32,20 @@ pub async fn handle_req_resp_message(
                     handle_blocks_by_root_request(server, request, channel, peer).await;
                 }
             },
-            request_response::Message::Response { response, .. } => {
-                // Check for error responses
-                if response.result != ResponseResult::Success {
-                    if let ResponsePayload::Error(error_msg) = response.payload {
-                        let error_str = String::from_utf8_lossy(&error_msg);
-                        warn!(%peer, result = ?response.result, %error_str, "Received error response");
-                    } else {
-                        warn!(%peer, result = ?response.result, "Received error response");
-                    }
-                    return;
-                }
-
-                match response.payload {
+            request_response::Message::Response { response, .. } => match response {
+                Response::Success { payload } => match payload {
                     ResponsePayload::Status(status) => {
                         handle_status_response(status, peer).await;
                     }
-                    ResponsePayload::BlocksByRoot(blocks) => {
-                        handle_blocks_by_root_response(server, blocks, peer).await;
+                    ResponsePayload::BlocksByRoot(block) => {
+                        handle_blocks_by_root_response(server, block, peer).await;
                     }
-                    ResponsePayload::Error(_) => {
-                        unreachable!("already handled above");
-                    }
+                },
+                Response::Error { code, message } => {
+                    let error_str = String::from_utf8_lossy(&message);
+                    warn!(%peer, ?code, %error_str, "Received error response");
                 }
-            }
+            },
         },
         request_response::Event::OutboundFailure {
             peer,
@@ -100,7 +90,7 @@ async fn handle_status_request(
         .req_resp
         .send_response(
             channel,
-            Response::new(ResponseResult::Success, ResponsePayload::Status(our_status)),
+            Response::success(ResponsePayload::Status(our_status)),
         )
         .unwrap();
 }
@@ -132,10 +122,7 @@ async fn handle_blocks_by_root_request(
 
             if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
                 channel,
-                Response::new(
-                    ResponseResult::Success,
-                    ResponsePayload::BlocksByRoot(signed_block),
-                ),
+                Response::success(ResponsePayload::BlocksByRoot(signed_block)),
             ) {
                 warn!(%peer, %root, ?err, "Failed to send BlocksByRoot response");
             }
@@ -145,9 +132,9 @@ async fn handle_blocks_by_root_request(
 
             if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
                 channel,
-                Response::new(
-                    ResponseResult::ResourceUnavailable,
-                    ResponsePayload::Error(error_message(format!("Block {} not found", root))),
+                Response::error(
+                    ResponseCode::ResourceUnavailable,
+                    error_message("Block not found"),
                 ),
             ) {
                 warn!(%peer, %root, ?err, "Failed to send RESOURCE_UNAVAILABLE response");

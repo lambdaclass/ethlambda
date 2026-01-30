@@ -8,7 +8,7 @@ use super::{
     encoding::{decode_payload, write_payload},
     messages::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, ErrorMessage, Request, Response,
-        ResponsePayload, ResponseResult, STATUS_PROTOCOL_V1, Status,
+        ResponseCode, ResponsePayload, STATUS_PROTOCOL_V1, Status,
     },
 };
 
@@ -65,24 +65,21 @@ impl libp2p::request_response::Codec for Codec {
         io.read_exact(std::slice::from_mut(&mut result_byte))
             .await?;
 
-        let result_code = ResponseResult::from_u8(result_byte);
+        let code = ResponseCode::from_u8(result_byte);
 
         let payload = decode_payload(io).await?;
 
         // For non-success responses, the payload contains an SSZ-encoded error message
-        if result_code != ResponseResult::Success {
-            let error_msg = ErrorMessage::from_ssz_bytes(&payload).map_err(|err| {
+        if code != ResponseCode::Success {
+            let message = ErrorMessage::from_ssz_bytes(&payload).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Invalid error message: {err:?}"),
                 )
             })?;
-            let error_str = String::from_utf8_lossy(&error_msg).to_string();
-            trace!(?result_code, %error_str, "Received error response");
-            return Ok(Response::new(
-                result_code,
-                ResponsePayload::Error(error_msg),
-            ));
+            let error_str = String::from_utf8_lossy(&message).to_string();
+            trace!(?code, %error_str, "Received error response");
+            return Ok(Response::error(code, message));
         }
 
         // Success responses contain the actual data
@@ -91,17 +88,14 @@ impl libp2p::request_response::Codec for Codec {
                 let status = Status::from_ssz_bytes(&payload).map_err(|err| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
                 })?;
-                Ok(Response::new(result_code, ResponsePayload::Status(status)))
+                Ok(Response::success(ResponsePayload::Status(status)))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
                 let block =
                     SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
                         io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
                     })?;
-                Ok(Response::new(
-                    result_code,
-                    ResponsePayload::BlocksByRoot(block),
-                ))
+                Ok(Response::success(ResponsePayload::BlocksByRoot(block)))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -138,16 +132,27 @@ impl libp2p::request_response::Codec for Codec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // Send result byte
-        io.write_all(&[resp.result as u8]).await?;
+        match resp {
+            Response::Success { payload } => {
+                // Send success code (0)
+                io.write_all(&[ResponseCode::Success.to_u8()]).await?;
 
-        let encoded = match &resp.payload {
-            ResponsePayload::Status(status) => status.as_ssz_bytes(),
-            ResponsePayload::BlocksByRoot(response) => response.as_ssz_bytes(),
-            // Error messages are SSZ-encoded as List[byte, 256]
-            ResponsePayload::Error(error_msg) => error_msg.as_ssz_bytes(),
-        };
+                let encoded = match &payload {
+                    ResponsePayload::Status(status) => status.as_ssz_bytes(),
+                    ResponsePayload::BlocksByRoot(block) => block.as_ssz_bytes(),
+                };
 
-        write_payload(io, &encoded).await
+                write_payload(io, &encoded).await
+            }
+            Response::Error { code, message } => {
+                // Send error code
+                io.write_all(&[code.to_u8()]).await?;
+
+                // Error messages are SSZ-encoded as List[byte, 256]
+                let encoded = message.as_ssz_bytes();
+
+                write_payload(io, &encoded).await
+            }
+        }
     }
 }

@@ -12,14 +12,26 @@ pub enum Request {
 }
 
 #[derive(Debug, Clone)]
-pub struct Response {
-    pub result: ResponseResult,
-    pub payload: ResponsePayload,
+#[allow(clippy::large_enum_variant)]
+pub enum Response {
+    Success {
+        payload: ResponsePayload,
+    },
+    Error {
+        code: ResponseCode,
+        message: ErrorMessage,
+    },
 }
 
 impl Response {
-    pub fn new(result: ResponseResult, payload: ResponsePayload) -> Self {
-        Self { result, payload }
+    /// Create a success response with the given payload.
+    pub fn success(payload: ResponsePayload) -> Self {
+        Self::Success { payload }
+    }
+
+    /// Create an error response with the given code and message.
+    pub fn error(code: ResponseCode, message: ErrorMessage) -> Self {
+        Self::Error { code, message }
     }
 }
 
@@ -34,7 +46,7 @@ impl Response {
 /// - Codes 128-255: Treated as INVALID_REQUEST (invalid range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ResponseResult {
+pub enum ResponseCode {
     /// Request completed successfully. Payload contains the response data.
     Success = 0,
     /// Request was malformed or violated protocol rules.
@@ -45,7 +57,7 @@ pub enum ResponseResult {
     ResourceUnavailable = 3,
 }
 
-impl ResponseResult {
+impl ResponseCode {
     /// Parse a response code byte, mapping unknown codes gracefully per spec.
     pub fn from_u8(code: u8) -> Self {
         match code {
@@ -59,6 +71,11 @@ impl ResponseResult {
             128..=255 => Self::InvalidRequest,
         }
     }
+
+    /// Convert to the wire format byte representation.
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,10 +85,6 @@ pub enum ResponsePayload {
 
     // TODO: here we assume there's a single block per request
     BlocksByRoot(SignedBlockWithAttestation),
-
-    /// Error message for non-success responses.
-    /// SSZ-encoded as List[byte, 256] per spec.
-    Error(ErrorMessage),
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
