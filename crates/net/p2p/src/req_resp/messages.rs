@@ -110,17 +110,24 @@ pub type RequestedBlockRoots = ssz_types::VariableList<H256, MaxRequestBlocks>;
 pub type ErrorMessage = ssz_types::VariableList<u8, MaxErrorMessageLength>;
 
 /// Helper to create an ErrorMessage from a string.
-/// Truncates to 256 bytes if necessary.
+/// Debug builds panic if message exceeds 256 bytes (programming error).
+/// Release builds truncate to 256 bytes.
 pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     let bytes = msg.as_ref().as_bytes();
+    debug_assert!(
+        bytes.len() <= 256,
+        "Error message exceeds 256 byte protocol limit: {} bytes. Message: '{}'",
+        bytes.len(),
+        msg.as_ref()
+    );
+
     let truncated = if bytes.len() > 256 {
         &bytes[..256]
     } else {
         bytes
     };
 
-    let vec = truncated.to_vec();
-    ErrorMessage::new(vec).expect("error message fits in 256 bytes")
+    ErrorMessage::new(truncated.to_vec()).expect("error message fits in 256 bytes")
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
