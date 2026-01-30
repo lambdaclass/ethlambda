@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    RetryMessage,
+    RetryMessage, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -105,7 +105,7 @@ async fn handle_blocks_by_root_request(
     channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
 ) {
-    let num_roots = request.len();
+    let num_roots = request.roots.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
     // TODO: Support multiple blocks per request (currently only handles first root)
@@ -198,11 +198,12 @@ pub async fn fetch_block_from_peer(
     };
 
     // Create BlocksByRoot request with single root
-    let mut request = BlocksByRootRequest::empty();
-    if let Err(err) = request.push(root) {
+    let mut roots = RequestedBlockRoots::empty();
+    if let Err(err) = roots.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
         return false;
     }
+    let request = BlocksByRootRequest { roots };
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
     let request_id = server
