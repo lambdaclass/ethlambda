@@ -4,6 +4,9 @@ pub enum Table {
     /// Block storage: H256 -> Block
     Blocks,
     /// Block signatures storage: H256 -> BlockSignaturesWithAttestation
+    ///
+    /// Stored separately from blocks because the genesis block has no signatures.
+    /// All other blocks must have an entry in this table.
     BlockSignatures,
     /// State storage: H256 -> State
     States,
