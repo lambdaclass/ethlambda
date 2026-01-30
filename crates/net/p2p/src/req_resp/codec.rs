@@ -41,9 +41,10 @@ impl libp2p::request_response::Codec for Codec {
                 Ok(Request::Status(status))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let request = BlocksByRootRequest::from_ssz_bytes(&payload).map_err(|err| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                })?;
+                let request =
+                    BlocksByRootRequest::from_ssz_bytes_compat(&payload).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                    })?;
                 Ok(Request::BlocksByRoot(request))
             }
             _ => Err(io::Error::new(
