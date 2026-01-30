@@ -49,8 +49,6 @@ type MaxRequestBlocks = typenum::U1024;
 pub type RequestedBlockRoots = ssz_types::VariableList<H256, MaxRequestBlocks>;
 
 #[derive(Debug, Clone, Encode, Decode)]
-// TODO: remove this for devnet 3
-#[ssz(struct_behaviour = "transparent")]
 pub struct BlocksByRootRequest {
     pub roots: RequestedBlockRoots,
 }
