@@ -71,13 +71,13 @@ make test                                    # All tests + forkchoice (with skip
 
 ### Common Operations
 ```bash
-make run-devnet                              # Docker build → lean-quickstart local devnet
-rm -rf leanSpec && make leanSpec/fixtures    # Regenerate test fixtures (requires uv)
+.claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
+rm -rf leanSpec && make leanSpec/fixtures                # Regenerate test fixtures (requires uv)
 ```
 
-### Debugging
+### Testing with Local Devnet
 
-<!-- TODO: fill this part after a debug session -->
+See `.claude/skills/test-pr-devnet/SKILL.md` for multi-client devnet testing workflows.
 
 ## Important Patterns & Idioms
 
