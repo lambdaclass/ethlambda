@@ -70,7 +70,7 @@ impl libp2p::request_response::Codec for Codec {
         let payload = decode_payload(io).await?;
 
         // For non-success responses, the payload contains an SSZ-encoded error message
-        if code != ResponseCode::Success {
+        if code != ResponseCode::SUCCESS {
             let message = ErrorMessage::from_ssz_bytes(&payload).map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -135,7 +135,7 @@ impl libp2p::request_response::Codec for Codec {
         match resp {
             Response::Success { payload } => {
                 // Send success code (0)
-                io.write_all(&[ResponseCode::Success.to_u8()]).await?;
+                io.write_all(&[ResponseCode::SUCCESS.to_u8()]).await?;
 
                 let encoded = match &payload {
                     ResponsePayload::Status(status) => status.as_ssz_bytes(),

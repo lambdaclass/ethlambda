@@ -133,7 +133,7 @@ async fn handle_blocks_by_root_request(
             if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
                 channel,
                 Response::error(
-                    ResponseCode::ResourceUnavailable,
+                    ResponseCode::RESOURCE_UNAVAILABLE,
                     error_message("Block not found"),
                 ),
             ) {

@@ -44,37 +44,48 @@ impl Response {
 /// Unknown codes are handled gracefully:
 /// - Codes 4-127: Treated as SERVER_ERROR (reserved for future use).
 /// - Codes 128-255: Treated as INVALID_REQUEST (invalid range).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ResponseCode {
-    /// Request completed successfully. Payload contains the response data.
-    Success = 0,
-    /// Request was malformed or violated protocol rules.
-    InvalidRequest = 1,
-    /// Server encountered an internal error processing the request.
-    ServerError = 2,
-    /// Requested resource (block, blob, etc.) is not available.
-    ResourceUnavailable = 3,
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ResponseCode(pub u8);
 
 impl ResponseCode {
+    /// Request completed successfully. Payload contains the response data.
+    pub const SUCCESS: Self = Self(0);
+    /// Request was malformed or violated protocol rules.
+    pub const INVALID_REQUEST: Self = Self(1);
+    /// Server encountered an internal error processing the request.
+    pub const SERVER_ERROR: Self = Self(2);
+    /// Requested resource (block, blob, etc.) is not available.
+    pub const RESOURCE_UNAVAILABLE: Self = Self(3);
+
     /// Parse a response code byte, mapping unknown codes gracefully per spec.
     pub fn from_u8(code: u8) -> Self {
         match code {
-            0 => Self::Success,
-            1 => Self::InvalidRequest,
-            2 => Self::ServerError,
-            3 => Self::ResourceUnavailable,
+            0 => Self::SUCCESS,
+            1 => Self::INVALID_REQUEST,
+            2 => Self::SERVER_ERROR,
+            3 => Self::RESOURCE_UNAVAILABLE,
             // Codes 4-127: Reserved for future use, treat as SERVER_ERROR
-            4..=127 => Self::ServerError,
+            4..=127 => Self::SERVER_ERROR,
             // Codes 128-255: Invalid range, treat as INVALID_REQUEST
-            128..=255 => Self::InvalidRequest,
+            128..=255 => Self::INVALID_REQUEST,
         }
     }
 
     /// Convert to the wire format byte representation.
     pub fn to_u8(self) -> u8 {
-        self as u8
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ResponseCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::SUCCESS => write!(f, "SUCCESS(0)"),
+            Self::INVALID_REQUEST => write!(f, "INVALID_REQUEST(1)"),
+            Self::SERVER_ERROR => write!(f, "SERVER_ERROR(2)"),
+            Self::RESOURCE_UNAVAILABLE => write!(f, "RESOURCE_UNAVAILABLE(3)"),
+            Self(code) => write!(f, "ResponseCode({code})"),
+        }
     }
 }
 
