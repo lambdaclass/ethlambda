@@ -13,8 +13,7 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    req_resp::RequestedBlockRoots,
-    RetryMessage,
+    RetryMessage, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
