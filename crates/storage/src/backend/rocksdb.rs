@@ -13,6 +13,7 @@ use std::sync::Arc;
 fn cf_name(table: Table) -> &'static str {
     match table {
         Table::Blocks => "blocks",
+        Table::BlockSignatures => "block_signatures",
         Table::States => "states",
         Table::LatestKnownAttestations => "latest_known_attestations",
         Table::LatestNewAttestations => "latest_new_attestations",

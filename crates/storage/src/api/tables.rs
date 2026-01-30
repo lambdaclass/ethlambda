@@ -3,6 +3,8 @@
 pub enum Table {
     /// Block storage: H256 -> Block
     Blocks,
+    /// Block signatures storage: H256 -> BlockSignaturesWithAttestation
+    BlockSignatures,
     /// State storage: H256 -> State
     States,
     /// Known attestations: u64 -> AttestationData
@@ -18,8 +20,9 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 7] = [
+pub const ALL_TABLES: [Table; 8] = [
     Table::Blocks,
+    Table::BlockSignatures,
     Table::States,
     Table::LatestKnownAttestations,
     Table::LatestNewAttestations,

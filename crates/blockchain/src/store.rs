@@ -366,8 +366,8 @@ pub fn on_block(
         store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
     }
 
-    // Store block and state
-    store.insert_block(block_root, block.clone());
+    // Store signed block and state
+    store.insert_signed_block(block_root, &signed_block);
     store.insert_state(block_root, post_state);
 
     // Process block body attestations and their signatures

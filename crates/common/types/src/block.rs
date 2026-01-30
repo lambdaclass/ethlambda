@@ -129,6 +129,40 @@ pub struct BlockWithAttestation {
     pub proposer_attestation: Attestation,
 }
 
+/// Stored block signatures and proposer attestation.
+///
+/// This type stores the data needed to reconstruct a `SignedBlockWithAttestation`
+/// when combined with a `Block` from the blocks table.
+#[derive(Clone, Encode, Decode)]
+pub struct BlockSignaturesWithAttestation {
+    /// The proposer's attestation for this block.
+    pub proposer_attestation: Attestation,
+
+    /// The aggregated signatures for the block.
+    pub signatures: BlockSignatures,
+}
+
+impl BlockSignaturesWithAttestation {
+    /// Create from a SignedBlockWithAttestation.
+    pub fn from_signed_block(signed_block: &SignedBlockWithAttestation) -> Self {
+        Self {
+            proposer_attestation: signed_block.message.proposer_attestation.clone(),
+            signatures: signed_block.signature.clone(),
+        }
+    }
+
+    /// Reconstruct a SignedBlockWithAttestation given the block.
+    pub fn to_signed_block(&self, block: Block) -> SignedBlockWithAttestation {
+        SignedBlockWithAttestation {
+            message: BlockWithAttestation {
+                block,
+                proposer_attestation: self.proposer_attestation.clone(),
+            },
+            signature: self.signatures.clone(),
+        }
+    }
+}
+
 /// The header of a block, containing metadata.
 ///
 /// Block headers summarize blocks without storing full content. The header
