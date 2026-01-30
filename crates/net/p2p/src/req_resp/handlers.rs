@@ -110,7 +110,7 @@ async fn handle_blocks_by_root_request(
 
     // TODO: Support multiple blocks per request (currently only handles first root)
     // The protocol supports up to 1024 roots, but our response type only holds one block.
-    let Some(root) = request.first() else {
+    let Some(root) = request.roots.first() else {
         debug!(%peer, "BlocksByRoot request with no roots");
         return;
     };
