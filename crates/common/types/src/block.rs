@@ -143,22 +143,26 @@ pub struct BlockSignaturesWithAttestation {
 }
 
 impl BlockSignaturesWithAttestation {
-    /// Create from a SignedBlockWithAttestation.
-    pub fn from_signed_block(signed_block: &SignedBlockWithAttestation) -> Self {
+    /// Create from a SignedBlockWithAttestation by consuming it.
+    ///
+    /// Takes ownership to avoid cloning large signature data.
+    pub fn from_signed_block(signed_block: SignedBlockWithAttestation) -> Self {
         Self {
-            proposer_attestation: signed_block.message.proposer_attestation.clone(),
-            signatures: signed_block.signature.clone(),
+            proposer_attestation: signed_block.message.proposer_attestation,
+            signatures: signed_block.signature,
         }
     }
 
     /// Reconstruct a SignedBlockWithAttestation given the block.
-    pub fn to_signed_block(&self, block: Block) -> SignedBlockWithAttestation {
+    ///
+    /// Consumes self to avoid cloning large signature data.
+    pub fn to_signed_block(self, block: Block) -> SignedBlockWithAttestation {
         SignedBlockWithAttestation {
             message: BlockWithAttestation {
                 block,
-                proposer_attestation: self.proposer_attestation.clone(),
+                proposer_attestation: self.proposer_attestation,
             },
-            signature: self.signatures.clone(),
+            signature: self.signatures,
         }
     }
 }

@@ -6,7 +6,7 @@ use ethlambda_types::{
     attestation::AttestationData,
     block::{
         AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
-        SignedBlockWithAttestation,
+        BlockWithAttestation, SignedBlockWithAttestation,
     },
     primitives::{Decode, Encode, H256, TreeHash},
     signature::ValidatorSignature,
@@ -311,9 +311,22 @@ impl Store {
     // ============ Signed Blocks ============
 
     /// Insert a signed block, storing the block and signatures separately.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: &SignedBlockWithAttestation) {
-        let block = &signed_block.message.block;
-        let signatures = BlockSignaturesWithAttestation::from_signed_block(signed_block);
+    ///
+    /// Takes ownership to avoid cloning large signature data.
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        // Destructure to extract all components without cloning
+        let SignedBlockWithAttestation {
+            message: BlockWithAttestation {
+                block,
+                proposer_attestation,
+            },
+            signature,
+        } = signed_block;
+
+        let signatures = BlockSignaturesWithAttestation {
+            proposer_attestation,
+            signatures: signature,
+        };
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch

@@ -367,7 +367,7 @@ pub fn on_block(
     }
 
     // Store signed block and state
-    store.insert_signed_block(block_root, &signed_block);
+    store.insert_signed_block(block_root, signed_block.clone());
     store.insert_state(block_root, post_state);
 
     // Process block body attestations and their signatures
