@@ -63,8 +63,22 @@ impl libp2p::request_response::Codec for Codec {
         T: AsyncRead + Unpin + Send,
     {
         let mut result_byte = 0_u8;
-        io.read_exact(std::slice::from_mut(&mut result_byte))
-            .await?;
+
+        // Try to read first chunk's result code
+        // For BlocksByRoot, EOF here means empty response (all blocks unavailable)
+        match io.read_exact(std::slice::from_mut(&mut result_byte)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // EOF before any chunks = valid empty response for BlocksByRoot
+                // Status protocol requires at least one response, so EOF is an error
+                if protocol.as_ref() == BLOCKS_BY_ROOT_PROTOCOL_V1 {
+                    return Ok(Response::success(ResponsePayload::BlocksByRoot(Vec::new())));
+                } else {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
 
         let code = ResponseCode::from(result_byte);
 
@@ -92,16 +106,13 @@ impl libp2p::request_response::Codec for Codec {
                 Ok(Response::success(ResponsePayload::Status(status)))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let mut blocks = Vec::new();
+                // First chunk (guaranteed SUCCESS if we reach here)
+                let first_block =
+                    SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                    })?;
 
-                // First chunk already read (result_byte, payload from above)
-                if code == ResponseCode::SUCCESS {
-                    let block =
-                        SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
-                            io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                        })?;
-                    blocks.push(block);
-                }
+                let mut blocks = vec![first_block];
 
                 // Read remaining chunks until EOF
                 loop {
