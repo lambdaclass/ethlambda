@@ -73,7 +73,7 @@ pub type AttestationSignatures =
 /// The proof can verify that all participants signed the same message in the
 /// same epoch, using a single verification operation instead of checking
 /// each signature individually.
-#[derive(Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,

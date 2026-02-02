@@ -10,7 +10,7 @@ use ethlambda_types::{
         BlockWithAttestation, SignedBlockWithAttestation,
     },
     primitives::{Decode, Encode, H256, TreeHash},
-    signature::ValidatorSignature,
+    signature::{StoredAggregatedPayload, StoredSignature, ValidatorSignature},
     state::{ChainConfig, Checkpoint, State},
 };
 use tracing::info;
@@ -303,6 +303,16 @@ impl Store {
             && new_slot > old_slot
         {
             self.prune_non_finalized_chain(new_slot);
+
+            // Prune signatures and payloads for finalized slots
+            let pruned_sigs = self.prune_gossip_signatures(new_slot);
+            let pruned_payloads = self.prune_aggregated_payloads(new_slot);
+            if pruned_sigs > 0 || pruned_payloads > 0 {
+                info!(
+                    finalized_slot = new_slot,
+                    pruned_sigs, pruned_payloads, "Pruned finalized signatures"
+                );
+            }
         }
     }
 
@@ -370,6 +380,82 @@ impl Store {
             .delete_batch(Table::NonFinalizedChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
+    }
+
+    /// Prune gossip signatures for slots <= finalized_slot.
+    ///
+    /// Returns the number of signatures pruned.
+    pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut to_delete = vec![];
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(Table::GossipSignatures, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Ok(stored) = StoredSignature::from_ssz_bytes(&value_bytes)
+                && stored.slot <= finalized_slot
+            {
+                to_delete.push(key_bytes.to_vec());
+            }
+        }
+        drop(view);
+
+        let count = to_delete.len();
+        if !to_delete.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::GossipSignatures, to_delete)
+                .expect("delete");
+            batch.commit().expect("commit");
+        }
+        count
+    }
+
+    /// Prune aggregated payloads for slots <= finalized_slot.
+    ///
+    /// Returns the number of payloads pruned.
+    pub fn prune_aggregated_payloads(&mut self, finalized_slot: u64) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut updates = vec![];
+        let mut deletes = vec![];
+        let mut removed_count = 0;
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(Table::AggregatedPayloads, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Ok(mut payloads) = Vec::<StoredAggregatedPayload>::from_ssz_bytes(&value_bytes) {
+                let original_len = payloads.len();
+                payloads.retain(|p| p.slot > finalized_slot);
+                removed_count += original_len - payloads.len();
+
+                if payloads.is_empty() {
+                    deletes.push(key_bytes.to_vec());
+                } else if payloads.len() < original_len {
+                    updates.push((key_bytes.to_vec(), payloads.as_ssz_bytes()));
+                }
+            }
+        }
+        drop(view);
+
+        if !updates.is_empty() || !deletes.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            if !updates.is_empty() {
+                batch
+                    .put_batch(Table::AggregatedPayloads, updates)
+                    .expect("put");
+            }
+            if !deletes.is_empty() {
+                batch
+                    .delete_batch(Table::AggregatedPayloads, deletes)
+                    .expect("delete");
+            }
+            batch.commit().expect("commit");
+        }
+        removed_count
     }
 
     pub fn get_block(&self, root: &H256) -> Option<Block> {
@@ -614,10 +700,10 @@ impl Store {
 
     // ============ Gossip Signatures ============
 
-    /// Iterate over all (signature_key, signature) pairs.
+    /// Iterate over all (signature_key, stored_signature) pairs.
     pub fn iter_gossip_signatures(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, ValidatorSignature)> + '_ {
+    ) -> impl Iterator<Item = (SignatureKey, StoredSignature)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
             .prefix_iterator(Table::GossipSignatures, &[])
@@ -625,19 +711,19 @@ impl Store {
             .filter_map(|res| res.ok())
             .filter_map(|(k, v)| {
                 let key = decode_signature_key(&k);
-                ValidatorSignature::from_bytes(&v)
+                StoredSignature::from_ssz_bytes(&v)
                     .ok()
-                    .map(|sig| (key, sig))
+                    .map(|stored| (key, stored))
             })
             .collect();
         entries.into_iter()
     }
 
-    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<ValidatorSignature> {
+    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<StoredSignature> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::GossipSignatures, &encode_signature_key(key))
             .expect("get")
-            .and_then(|bytes| ValidatorSignature::from_bytes(&bytes).ok())
+            .and_then(|bytes| StoredSignature::from_ssz_bytes(&bytes).ok())
     }
 
     pub fn contains_gossip_signature(&self, key: &SignatureKey) -> bool {
@@ -647,9 +733,19 @@ impl Store {
             .is_some()
     }
 
-    pub fn insert_gossip_signature(&mut self, key: SignatureKey, signature: ValidatorSignature) {
+    pub fn insert_gossip_signature(
+        &mut self,
+        attestation_data: &AttestationData,
+        validator_id: u64,
+        signature: ValidatorSignature,
+    ) {
+        let slot = attestation_data.slot;
+        let data_root = attestation_data.tree_hash_root();
+        let key = (validator_id, data_root);
+
+        let stored = StoredSignature::new(slot, signature);
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encode_signature_key(&key), signature.to_bytes())];
+        let entries = vec![(encode_signature_key(&key), stored.as_ssz_bytes())];
         batch
             .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
@@ -658,10 +754,10 @@ impl Store {
 
     // ============ Aggregated Payloads ============
 
-    /// Iterate over all (signature_key, proofs) pairs.
+    /// Iterate over all (signature_key, stored_payloads) pairs.
     pub fn iter_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<AggregatedSignatureProof>)> + '_ {
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
             .prefix_iterator(Table::AggregatedPayloads, &[])
@@ -669,9 +765,9 @@ impl Store {
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
                 let key = decode_signature_key(&k);
-                let proofs =
-                    Vec::<AggregatedSignatureProof>::from_ssz_bytes(&v).expect("valid proofs");
-                (key, proofs)
+                let payloads =
+                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
+                (key, payloads)
             })
             .collect();
         entries.into_iter()
@@ -680,22 +776,31 @@ impl Store {
     pub fn get_aggregated_payloads(
         &self,
         key: &SignatureKey,
-    ) -> Option<Vec<AggregatedSignatureProof>> {
+    ) -> Option<Vec<StoredAggregatedPayload>> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::AggregatedPayloads, &encode_signature_key(key))
             .expect("get")
             .map(|bytes| {
-                Vec::<AggregatedSignatureProof>::from_ssz_bytes(&bytes).expect("valid proofs")
+                Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid payloads")
             })
     }
 
-    pub fn push_aggregated_payload(&mut self, key: SignatureKey, proof: AggregatedSignatureProof) {
+    pub fn insert_aggregated_payload(
+        &mut self,
+        attestation_data: &AttestationData,
+        validator_id: u64,
+        proof: AggregatedSignatureProof,
+    ) {
+        let slot = attestation_data.slot;
+        let data_root = attestation_data.tree_hash_root();
+        let key = (validator_id, data_root);
+
         // Read existing, add new, write back
-        let mut proofs = self.get_aggregated_payloads(&key).unwrap_or_default();
-        proofs.push(proof);
+        let mut payloads = self.get_aggregated_payloads(&key).unwrap_or_default();
+        payloads.push(StoredAggregatedPayload { slot, proof });
 
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encode_signature_key(&key), proofs.as_ssz_bytes())];
+        let entries = vec![(encode_signature_key(&key), payloads.as_ssz_bytes())];
         batch
             .put_batch(Table::AggregatedPayloads, entries)
             .expect("put proofs");

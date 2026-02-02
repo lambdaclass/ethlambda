@@ -3,9 +3,10 @@ use leansig::{
     signature::{SignatureScheme, SigningError},
 };
 use ssz::DecodeError;
+use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::{Diff, U488, U3600};
 
-use crate::primitives::H256;
+use crate::{block::AggregatedSignatureProof, primitives::H256};
 
 /// The XMSS signature scheme used for validator signatures.
 ///
@@ -90,4 +91,37 @@ impl ValidatorSecretKey {
         let sig = LeanSignatureScheme::sign(&self.inner, epoch, message)?;
         Ok(ValidatorSignature { inner: sig })
     }
+}
+
+/// Gossip signature stored with slot for pruning.
+///
+/// Signatures are stored alongside the slot they pertain to, enabling
+/// simple slot-based pruning when blocks become finalized.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct StoredSignature {
+    pub slot: u64,
+    pub signature_bytes: Vec<u8>,
+}
+
+impl StoredSignature {
+    pub fn new(slot: u64, signature: ValidatorSignature) -> Self {
+        Self {
+            slot,
+            signature_bytes: signature.to_bytes(),
+        }
+    }
+
+    pub fn to_validator_signature(&self) -> Result<ValidatorSignature, DecodeError> {
+        ValidatorSignature::from_bytes(&self.signature_bytes)
+    }
+}
+
+/// Aggregated payload stored with slot for pruning.
+///
+/// Aggregated signature proofs are stored with their slot to enable
+/// pruning when blocks become finalized.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct StoredAggregatedPayload {
+    pub slot: u64,
+    pub proof: AggregatedSignatureProof,
 }
