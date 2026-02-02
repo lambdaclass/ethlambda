@@ -92,11 +92,40 @@ impl libp2p::request_response::Codec for Codec {
                 Ok(Response::success(ResponsePayload::Status(status)))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let block =
-                    SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                    })?;
-                Ok(Response::success(ResponsePayload::BlocksByRoot(block)))
+                let mut blocks = Vec::new();
+
+                // First chunk already read (result_byte, payload from above)
+                if code == ResponseCode::SUCCESS {
+                    let block =
+                        SignedBlockWithAttestation::from_ssz_bytes(&payload).map_err(|err| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                        })?;
+                    blocks.push(block);
+                }
+
+                // Read remaining chunks until EOF
+                loop {
+                    let mut result_byte = 0_u8;
+                    match io.read_exact(std::slice::from_mut(&mut result_byte)).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(e),
+                    }
+
+                    let chunk_code = ResponseCode::from(result_byte);
+                    let chunk_payload = decode_payload(io).await?;
+
+                    if chunk_code == ResponseCode::SUCCESS {
+                        let block = SignedBlockWithAttestation::from_ssz_bytes(&chunk_payload)
+                            .map_err(|err| {
+                                io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                            })?;
+                        blocks.push(block);
+                    }
+                    // Non-success codes (RESOURCE_UNAVAILABLE) are skipped - block not available
+                }
+
+                Ok(Response::success(ResponsePayload::BlocksByRoot(blocks)))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -135,15 +164,24 @@ impl libp2p::request_response::Codec for Codec {
     {
         match resp {
             Response::Success { payload } => {
-                // Send success code (0)
-                io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
-
-                let encoded = match &payload {
-                    ResponsePayload::Status(status) => status.as_ssz_bytes(),
-                    ResponsePayload::BlocksByRoot(block) => block.as_ssz_bytes(),
-                };
-
-                write_payload(io, &encoded).await
+                match &payload {
+                    ResponsePayload::Status(status) => {
+                        // Send success code (0)
+                        io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
+                        let encoded = status.as_ssz_bytes();
+                        write_payload(io, &encoded).await
+                    }
+                    ResponsePayload::BlocksByRoot(blocks) => {
+                        // Write each block as separate chunk
+                        for block in blocks {
+                            io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
+                            let encoded = block.as_ssz_bytes();
+                            write_payload(io, &encoded).await?;
+                        }
+                        // Empty response if no blocks found (stream just ends)
+                        Ok(())
+                    }
+                }
             }
             Response::Error { code, message } => {
                 // Send error code
