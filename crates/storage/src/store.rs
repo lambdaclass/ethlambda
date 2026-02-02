@@ -308,28 +308,10 @@ impl Store {
 
     // ============ Blocks ============
 
-    /// Iterate over all (root, block) pairs.
-    ///
-    /// DEPRECATED: Use `get_non_finalized_chain()` for fork choice instead.
-    pub fn iter_blocks(&self) -> impl Iterator<Item = (H256, Block)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::Blocks, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let root = H256::from_ssz_bytes(&k).expect("valid root");
-                let block = Block::from_ssz_bytes(&v).expect("valid block");
-                (root, block)
-            })
-            .collect();
-        entries.into_iter()
-    }
-
     /// Get block data for fork choice: root -> (slot, parent_root).
     ///
     /// Iterates only the NonFinalizedChain table, avoiding Block deserialization.
-    /// Much faster than `iter_blocks()` for fork choice operations.
+    /// Returns only non-finalized blocks, automatically pruned on finalization.
     pub fn get_non_finalized_chain(&self) -> HashMap<H256, (u64, H256)> {
         let view = self.backend.begin_read().expect("read view");
         view.prefix_iterator(Table::NonFinalizedChain, &[])
