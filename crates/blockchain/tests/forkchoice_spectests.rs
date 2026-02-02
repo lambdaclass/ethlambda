@@ -9,7 +9,7 @@ use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::Attestation,
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::{H256, TreeHash, VariableList},
+    primitives::{H256, VariableList, ssz::TreeHash},
     state::State,
 };
 
