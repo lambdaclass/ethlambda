@@ -85,17 +85,17 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
     (validator_id, root)
 }
 
-/// Encode a NonFinalizedChain key (slot, root) to bytes.
+/// Encode a LiveChain key (slot, root) to bytes.
 /// Layout: slot (8 bytes big-endian) || root (32 bytes)
 /// Big-endian ensures lexicographic ordering matches numeric ordering.
-fn encode_non_finalized_chain_key(slot: u64, root: &H256) -> Vec<u8> {
+fn encode_live_chain_key(slot: u64, root: &H256) -> Vec<u8> {
     let mut result = slot.to_be_bytes().to_vec();
     result.extend_from_slice(&root.0);
     result
 }
 
-/// Decode a NonFinalizedChain key from bytes.
-fn decode_non_finalized_chain_key(bytes: &[u8]) -> (u64, H256) {
+/// Decode a LiveChain key from bytes.
+fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
     (slot, root)
@@ -185,11 +185,11 @@ impl Store {
 
             // Non-finalized chain index
             let index_entries = vec![(
-                encode_non_finalized_chain_key(anchor_block.slot, &anchor_block_root),
+                encode_live_chain_key(anchor_block.slot, &anchor_block_root),
                 anchor_block.parent_root.as_ssz_bytes(),
             )];
             batch
-                .put_batch(Table::NonFinalizedChain, index_entries)
+                .put_batch(Table::LiveChain, index_entries)
                 .expect("put non-finalized chain index");
 
             batch.commit().expect("commit");
@@ -271,7 +271,7 @@ impl Store {
     /// - Justified is updated if provided.
     /// - Finalized is updated if provided.
     ///
-    /// When finalization advances, prunes the NonFinalizedChain index.
+    /// When finalization advances, prunes the LiveChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
         // Check if we need to prune before updating metadata
         let should_prune = checkpoints.finalized.is_some();
@@ -302,7 +302,7 @@ impl Store {
         if let (Some(old_slot), Some(new_slot)) = (old_finalized_slot, new_finalized_slot)
             && new_slot > old_slot
         {
-            self.prune_non_finalized_chain(new_slot);
+            self.prune_live_chain(new_slot);
 
             // Prune signatures and payloads for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(new_slot);
@@ -320,15 +320,15 @@ impl Store {
 
     /// Get block data for fork choice: root -> (slot, parent_root).
     ///
-    /// Iterates only the NonFinalizedChain table, avoiding Block deserialization.
+    /// Iterates only the LiveChain table, avoiding Block deserialization.
     /// Returns only non-finalized blocks, automatically pruned on finalization.
-    pub fn get_non_finalized_chain(&self) -> HashMap<H256, (u64, H256)> {
+    pub fn get_live_chain(&self) -> HashMap<H256, (u64, H256)> {
         let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::NonFinalizedChain, &[])
+        view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
-                let (slot, root) = decode_non_finalized_chain_key(&k);
+                let (slot, root) = decode_live_chain_key(&k);
                 let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
                 (root, (slot, parent_root))
             })
@@ -340,11 +340,11 @@ impl Store {
     /// Useful for checking block existence without deserializing.
     pub fn get_block_roots(&self) -> HashSet<H256> {
         let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::NonFinalizedChain, &[])
+        view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, _)| {
-                let (_, root) = decode_non_finalized_chain_key(&k);
+                let (_, root) = decode_live_chain_key(&k);
                 root
             })
             .collect()
@@ -353,18 +353,18 @@ impl Store {
     /// Prune slot index entries with slot < finalized_slot.
     ///
     /// Blocks/states are retained for historical queries, only the
-    /// NonFinalizedChain index is pruned.
-    pub fn prune_non_finalized_chain(&mut self, finalized_slot: u64) {
+    /// LiveChain index is pruned.
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) {
         let view = self.backend.begin_read().expect("read view");
 
         // Collect keys to delete - stop once we hit finalized_slot
         // Keys are sorted by slot (big-endian encoding) so we can stop early
         let keys_to_delete: Vec<_> = view
-            .prefix_iterator(Table::NonFinalizedChain, &[])
+            .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .take_while(|(k, _)| {
-                let (slot, _) = decode_non_finalized_chain_key(k);
+                let (slot, _) = decode_live_chain_key(k);
                 slot < finalized_slot
             })
             .map(|(k, _)| k.to_vec())
@@ -377,7 +377,7 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
-            .delete_batch(Table::NonFinalizedChain, keys_to_delete)
+            .delete_batch(Table::LiveChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
     }
@@ -480,11 +480,11 @@ impl Store {
             .expect("put block");
 
         let index_entries = vec![(
-            encode_non_finalized_chain_key(block.slot, &root),
+            encode_live_chain_key(block.slot, &root),
             block.parent_root.as_ssz_bytes(),
         )];
         batch
-            .put_batch(Table::NonFinalizedChain, index_entries)
+            .put_batch(Table::LiveChain, index_entries)
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
@@ -528,11 +528,11 @@ impl Store {
             .expect("put block signatures");
 
         let index_entries = vec![(
-            encode_non_finalized_chain_key(block.slot, &root),
+            encode_live_chain_key(block.slot, &root),
             block.parent_root.as_ssz_bytes(),
         )];
         batch
-            .put_batch(Table::NonFinalizedChain, index_entries)
+            .put_batch(Table::LiveChain, index_entries)
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");

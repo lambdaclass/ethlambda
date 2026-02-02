@@ -165,7 +165,7 @@ fn validate_checks(
         }
 
         // Also validate the root matches a block at this slot
-        let blocks = st.get_non_finalized_chain();
+        let blocks = st.get_live_chain();
         let block_found = blocks
             .iter()
             .any(|(root, (slot, _))| *slot == expected_slot && *root == target.root);
@@ -365,7 +365,7 @@ fn validate_lexicographic_head_among(
         .into());
     }
 
-    let blocks = st.get_non_finalized_chain();
+    let blocks = st.get_live_chain();
     let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
 
     // Resolve all fork labels to roots and compute their weights

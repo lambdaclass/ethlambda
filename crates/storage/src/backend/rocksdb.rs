@@ -20,7 +20,7 @@ fn cf_name(table: Table) -> &'static str {
         Table::GossipSignatures => "gossip_signatures",
         Table::AggregatedPayloads => "aggregated_payloads",
         Table::Metadata => "metadata",
-        Table::NonFinalizedChain => "non_finalized_chain",
+        Table::LiveChain => "live_chain",
     }
 }
 
