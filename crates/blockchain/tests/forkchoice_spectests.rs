@@ -165,15 +165,15 @@ fn validate_checks(
         }
 
         // Also validate the root matches a block at this slot
-        let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+        let blocks = st.get_non_finalized_chain();
         let block_found = blocks
             .iter()
-            .any(|(root, block)| block.slot == expected_slot && *root == target.root);
+            .any(|(root, (slot, _))| *slot == expected_slot && *root == target.root);
 
         if !block_found {
             let available: Vec<_> = blocks
                 .iter()
-                .filter(|(_, block)| block.slot == expected_slot)
+                .filter(|(_, (slot, _))| *slot == expected_slot)
                 .map(|(root, _)| format!("{:?}", root))
                 .collect();
             return Err(format!(
@@ -365,7 +365,7 @@ fn validate_lexicographic_head_among(
         .into());
     }
 
-    let blocks: HashMap<H256, Block> = st.iter_blocks().collect();
+    let blocks = st.get_non_finalized_chain();
     let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
 
     // Resolve all fork labels to roots and compute their weights
@@ -380,13 +380,12 @@ fn validate_lexicographic_head_among(
             )
         })?;
 
-        let block = blocks.get(root).ok_or_else(|| {
+        let (slot, _parent_root) = blocks.get(root).ok_or_else(|| {
             format!(
                 "Step {}: block for label '{}' not found in store",
                 step_idx, label
             )
         })?;
-        let slot = block.slot;
 
         // Calculate attestation weight: count attestations voting for this fork
         // An attestation votes for this fork if its head is this block or a descendant
@@ -396,18 +395,18 @@ fn validate_lexicographic_head_among(
             // Check if attestation head is this block or a descendant
             if att_head_root == *root {
                 weight += 1;
-            } else if let Some(att_block) = blocks.get(&att_head_root) {
+            } else if let Some(&(att_slot, _)) = blocks.get(&att_head_root) {
                 // Walk back from attestation head to see if we reach this block
                 let mut current = att_head_root;
-                let mut current_slot = att_block.slot;
-                while current_slot > slot {
-                    if let Some(blk) = blocks.get(&current) {
-                        if blk.parent_root == *root {
+                let mut current_slot = att_slot;
+                while current_slot > *slot {
+                    if let Some(&(_, parent_root)) = blocks.get(&current) {
+                        if parent_root == *root {
                             weight += 1;
                             break;
                         }
-                        current = blk.parent_root;
-                        current_slot = blocks.get(&current).map(|b| b.slot).unwrap_or(0);
+                        current = parent_root;
+                        current_slot = blocks.get(&current).map(|(s, _)| *s).unwrap_or(0);
                     } else {
                         break;
                     }
@@ -415,7 +414,7 @@ fn validate_lexicographic_head_among(
             }
         }
 
-        fork_data.insert(label.as_str(), (*root, slot, weight));
+        fork_data.insert(label.as_str(), (*root, *slot, weight));
     }
 
     // Verify all forks are at the same slot

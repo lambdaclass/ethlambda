@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::{StorageBackend, Table};
@@ -84,6 +85,22 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
     (validator_id, root)
 }
 
+/// Encode a NonFinalizedChain key (slot, root) to bytes.
+/// Layout: slot (8 bytes big-endian) || root (32 bytes)
+/// Big-endian ensures lexicographic ordering matches numeric ordering.
+fn encode_non_finalized_chain_key(slot: u64, root: &H256) -> Vec<u8> {
+    let mut result = slot.to_be_bytes().to_vec();
+    result.extend_from_slice(&root.0);
+    result
+}
+
+/// Decode a NonFinalizedChain key from bytes.
+fn decode_non_finalized_chain_key(bytes: &[u8]) -> (u64, H256) {
+    let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
+    let root = H256::from_slice(&bytes[8..]);
+    (slot, root)
+}
+
 /// Underlying storage of the node.
 /// Similar to the spec's `Store`, but backed by a pluggable storage backend.
 ///
@@ -166,6 +183,15 @@ impl Store {
                 .put_batch(Table::States, state_entries)
                 .expect("put state");
 
+            // Non-finalized chain index
+            let index_entries = vec![(
+                encode_non_finalized_chain_key(anchor_block.slot, &anchor_block_root),
+                anchor_block.parent_root.as_ssz_bytes(),
+            )];
+            batch
+                .put_batch(Table::NonFinalizedChain, index_entries)
+                .expect("put non-finalized chain index");
+
             batch.commit().expect("commit");
         }
 
@@ -244,25 +270,47 @@ impl Store {
     /// - Head is always updated to the new value.
     /// - Justified is updated if provided.
     /// - Finalized is updated if provided.
+    ///
+    /// When finalization advances, prunes the NonFinalizedChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+        // Check if we need to prune before updating metadata
+        let should_prune = checkpoints.finalized.is_some();
+        let old_finalized_slot = if should_prune {
+            Some(self.latest_finalized().slot)
+        } else {
+            None
+        };
+
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.as_ssz_bytes())];
 
         if let Some(justified) = checkpoints.justified {
             entries.push((KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()));
         }
 
-        if let Some(finalized) = checkpoints.finalized {
+        let new_finalized_slot = if let Some(finalized) = checkpoints.finalized {
             entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()));
-        }
+            Some(finalized.slot)
+        } else {
+            None
+        };
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
         batch.commit().expect("commit");
+
+        // Prune after successful checkpoint update
+        if let (Some(old_slot), Some(new_slot)) = (old_finalized_slot, new_finalized_slot)
+            && new_slot > old_slot
+        {
+            self.prune_non_finalized_chain(new_slot);
+        }
     }
 
     // ============ Blocks ============
 
     /// Iterate over all (root, block) pairs.
+    ///
+    /// DEPRECATED: Use `get_non_finalized_chain()` for fork choice instead.
     pub fn iter_blocks(&self) -> impl Iterator<Item = (H256, Block)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
@@ -276,6 +324,72 @@ impl Store {
             })
             .collect();
         entries.into_iter()
+    }
+
+    /// Get block data for fork choice: root -> (slot, parent_root).
+    ///
+    /// Iterates only the NonFinalizedChain table, avoiding Block deserialization.
+    /// Much faster than `iter_blocks()` for fork choice operations.
+    pub fn get_non_finalized_chain(&self) -> HashMap<H256, (u64, H256)> {
+        let view = self.backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::NonFinalizedChain, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, v)| {
+                let (slot, root) = decode_non_finalized_chain_key(&k);
+                let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
+                (root, (slot, parent_root))
+            })
+            .collect()
+    }
+
+    /// Get all known block roots as HashSet.
+    ///
+    /// Useful for checking block existence without deserializing.
+    pub fn get_block_roots(&self) -> HashSet<H256> {
+        let view = self.backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::NonFinalizedChain, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, _)| {
+                let (_, root) = decode_non_finalized_chain_key(&k);
+                root
+            })
+            .collect()
+    }
+
+    /// Prune slot index entries with slot < finalized_slot.
+    ///
+    /// Blocks/states are retained for historical queries, only the
+    /// NonFinalizedChain index is pruned.
+    pub fn prune_non_finalized_chain(&mut self, finalized_slot: u64) {
+        let view = self.backend.begin_read().expect("read view");
+
+        // Collect keys to delete
+        let keys_to_delete: Vec<_> = view
+            .prefix_iterator(Table::NonFinalizedChain, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .filter_map(|(k, _)| {
+                let (slot, _) = decode_non_finalized_chain_key(&k);
+                if slot < finalized_slot {
+                    Some(k.to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(view);
+
+        if keys_to_delete.is_empty() {
+            return;
+        }
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::NonFinalizedChain, keys_to_delete)
+            .expect("delete non-finalized chain entries");
+        batch.commit().expect("commit");
     }
 
     pub fn get_block(&self, root: &H256) -> Option<Block> {
@@ -294,8 +408,19 @@ impl Store {
 
     pub fn insert_block(&mut self, root: H256, block: Block) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
-        batch.put_batch(Table::Blocks, entries).expect("put block");
+        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        batch
+            .put_batch(Table::Blocks, block_entries)
+            .expect("put block");
+
+        let index_entries = vec![(
+            encode_non_finalized_chain_key(block.slot, &root),
+            block.parent_root.as_ssz_bytes(),
+        )];
+        batch
+            .put_batch(Table::NonFinalizedChain, index_entries)
+            .expect("put non-finalized chain index");
+
         batch.commit().expect("commit");
     }
 
@@ -335,6 +460,14 @@ impl Store {
         batch
             .put_batch(Table::BlockSignatures, sig_entries)
             .expect("put block signatures");
+
+        let index_entries = vec![(
+            encode_non_finalized_chain_key(block.slot, &root),
+            block.parent_root.as_ssz_bytes(),
+        )];
+        batch
+            .put_batch(Table::NonFinalizedChain, index_entries)
+            .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
     }

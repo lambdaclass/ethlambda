@@ -30,7 +30,7 @@ fn accept_new_attestations(store: &mut Store) {
 
 /// Update the head based on the fork choice rule.
 fn update_head(store: &mut Store) {
-    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let blocks = store.get_non_finalized_chain();
     let attestations: HashMap<u64, AttestationData> = store.iter_known_attestations().collect();
     let old_head = store.head();
     let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
@@ -69,7 +69,7 @@ fn update_safe_target(store: &mut Store) {
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
-    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let blocks = store.get_non_finalized_chain();
     let attestations: HashMap<u64, AttestationData> = store.iter_new_attestations().collect();
     let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
@@ -559,7 +559,7 @@ pub fn produce_block_with_signatures(
         .collect();
 
     // Get known block roots for attestation validation
-    let known_block_roots: HashSet<H256> = store.iter_blocks().map(|(root, _)| root).collect();
+    let known_block_roots = store.get_block_roots();
 
     // Collect signature data for block building
     let gossip_signatures: HashMap<SignatureKey, ValidatorSignature> =
