@@ -1,3 +1,4 @@
+mod checkpoint_sync;
 mod version;
 
 use std::{
@@ -46,6 +47,10 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
+    /// URL of a peer to download checkpoint state from (e.g., http://peer:5052)
+    /// When set, skips genesis initialization and syncs from checkpoint.
+    #[arg(long)]
+    checkpoint_sync_url: Option<String>,
 }
 
 #[tokio::main]
@@ -93,9 +98,45 @@ async fn main() {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let genesis_state = State::from_genesis(&genesis, validators);
     let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
-    let store = Store::from_genesis(backend, genesis_state);
+
+    let store = if let Some(checkpoint_url) = &options.checkpoint_sync_url {
+        // Checkpoint sync path
+        info!(%checkpoint_url, "Starting checkpoint sync");
+
+        let state = match checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await {
+            Ok(state) => state,
+            Err(e) => {
+                error!(%checkpoint_url, %e, "Checkpoint sync failed");
+                std::process::exit(1);
+            }
+        };
+
+        // Verify against local genesis config
+        if let Err(e) = checkpoint_sync::verify_checkpoint_state(
+            &state,
+            genesis.config.genesis_time,
+            &validators,
+        ) {
+            error!(%e, "Checkpoint state verification failed");
+            std::process::exit(1);
+        }
+
+        let anchor_block = checkpoint_sync::construct_anchor_block(&state);
+
+        info!(
+            slot = state.slot,
+            validators = state.validators.len(),
+            finalized_slot = state.latest_finalized.slot,
+            "Checkpoint sync complete"
+        );
+
+        Store::get_forkchoice_store(backend, state, anchor_block)
+    } else {
+        // Genesis path (existing code)
+        let genesis_state = State::from_genesis(&genesis, validators);
+        Store::from_genesis(backend, genesis_state)
+    };
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
