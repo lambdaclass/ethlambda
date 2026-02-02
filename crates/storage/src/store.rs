@@ -291,19 +291,19 @@ impl Store {
         batch.commit().expect("commit");
 
         // Prune after successful checkpoint update
-        if let Some(finalized) = checkpoints.finalized {
-            if finalized.slot > old_finalized_slot {
-                self.prune_live_chain(finalized.slot);
+        if let Some(finalized) = checkpoints.finalized
+            && finalized.slot > old_finalized_slot
+        {
+            self.prune_live_chain(finalized.slot);
 
-                // Prune signatures and payloads for finalized slots
-                let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
-                let pruned_payloads = self.prune_aggregated_payloads(finalized.slot);
-                if pruned_sigs > 0 || pruned_payloads > 0 {
-                    info!(
-                        finalized_slot = finalized.slot,
-                        pruned_sigs, pruned_payloads, "Pruned finalized signatures"
-                    );
-                }
+            // Prune signatures and payloads for finalized slots
+            let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+            let pruned_payloads = self.prune_aggregated_payloads(finalized.slot);
+            if pruned_sigs > 0 || pruned_payloads > 0 {
+                info!(
+                    finalized_slot = finalized.slot,
+                    pruned_sigs, pruned_payloads, "Pruned finalized signatures"
+                );
             }
         }
     }
