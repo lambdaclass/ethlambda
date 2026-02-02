@@ -74,7 +74,7 @@ We support the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/b
 
 Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`).
 
-Support for older devnet releases stops once client interop devnets move to the next version.
+Support for older devnet releases is discontinued when the next devnet version is released.
 
 ## Incoming features
 
