@@ -12,7 +12,7 @@ use ethlambda_types::{
         AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
         SignedBlockWithAttestation,
     },
-    primitives::{H256, TreeHash},
+    primitives::{H256, ssz::TreeHash},
     signature::ValidatorSignature,
     state::{Checkpoint, State, Validator},
 };

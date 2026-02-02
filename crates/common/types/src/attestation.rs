@@ -1,7 +1,5 @@
-use ssz_derive::{Decode, Encode};
-use tree_hash_derive::TreeHash;
-
 use crate::{
+    primitives::ssz::{Decode, Encode, TreeHash},
     signature::SignatureSize,
     state::{Checkpoint, ValidatorRegistryLimit},
 };

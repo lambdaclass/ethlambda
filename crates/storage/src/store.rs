@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::{StorageBackend, Table};
+use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
     attestation::AttestationData,
@@ -9,8 +10,11 @@ use ethlambda_types::{
         AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
         BlockWithAttestation, SignedBlockWithAttestation,
     },
-    primitives::{Decode, Encode, H256, TreeHash},
-    signature::{StoredAggregatedPayload, StoredSignature, ValidatorSignature},
+    primitives::{
+        H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
+    signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
 use tracing::info;

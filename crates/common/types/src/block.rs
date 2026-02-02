@@ -1,11 +1,12 @@
 use serde::Serialize;
-use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::U1048576;
-use tree_hash_derive::TreeHash;
 
 use crate::{
     attestation::{AggregatedAttestation, Attestation, XmssSignature},
-    primitives::{ByteList, H256},
+    primitives::{
+        ByteList, H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
     state::ValidatorRegistryLimit,
 };
 
