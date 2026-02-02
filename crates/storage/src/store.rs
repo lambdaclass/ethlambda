@@ -790,8 +790,7 @@ impl Store {
     /// 3. Write back
     ///
     /// Concurrent calls could result in lost updates. This method MUST be called
-    /// from a single thread. In ethlambda, the Store is owned by the BlockChain
-    /// actor which provides single-threaded access.
+    /// from a single thread. In our case, that thread is the `BlockChain` `GenServer`
     pub fn insert_aggregated_payload(
         &mut self,
         attestation_data: &AttestationData,
