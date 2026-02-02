@@ -301,9 +301,7 @@ impl Store {
                 if pruned_sigs > 0 || pruned_payloads > 0 {
                     info!(
                         finalized_slot = finalized.slot,
-                        pruned_sigs,
-                        pruned_payloads,
-                        "Pruned finalized signatures"
+                        pruned_sigs, pruned_payloads, "Pruned finalized signatures"
                     );
                 }
             }
