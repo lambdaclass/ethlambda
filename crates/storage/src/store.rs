@@ -785,6 +785,21 @@ impl Store {
             })
     }
 
+    /// Insert an aggregated signature proof for a validator's attestation.
+    ///
+    /// Multiple proofs can be stored for the same (validator, attestation_data) pair,
+    /// each with its own slot metadata for pruning.
+    ///
+    /// # Thread Safety
+    ///
+    /// This method uses a read-modify-write pattern that is NOT atomic:
+    /// 1. Read existing payloads
+    /// 2. Append new payload
+    /// 3. Write back
+    ///
+    /// Concurrent calls could result in lost updates. This method MUST be called
+    /// from a single thread. In ethlambda, the Store is owned by the BlockChain
+    /// actor which provides single-threaded access.
     pub fn insert_aggregated_payload(
         &mut self,
         attestation_data: &AttestationData,
@@ -795,7 +810,7 @@ impl Store {
         let data_root = attestation_data.tree_hash_root();
         let key = (validator_id, data_root);
 
-        // Read existing, add new, write back
+        // Read existing, add new, write back (NOT atomic - requires single-threaded access)
         let mut payloads = self.get_aggregated_payloads(&key).unwrap_or_default();
         payloads.push(StoredAggregatedPayload { slot, proof });
 
