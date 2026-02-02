@@ -347,19 +347,17 @@ impl Store {
     pub fn prune_non_finalized_chain(&mut self, finalized_slot: u64) {
         let view = self.backend.begin_read().expect("read view");
 
-        // Collect keys to delete
+        // Collect keys to delete - stop once we hit finalized_slot
+        // Keys are sorted by slot (big-endian encoding) so we can stop early
         let keys_to_delete: Vec<_> = view
             .prefix_iterator(Table::NonFinalizedChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .filter_map(|(k, _)| {
-                let (slot, _) = decode_non_finalized_chain_key(&k);
-                if slot < finalized_slot {
-                    Some(k.to_vec())
-                } else {
-                    None
-                }
+            .take_while(|(k, _)| {
+                let (slot, _) = decode_non_finalized_chain_key(k);
+                slot < finalized_slot
             })
+            .map(|(k, _)| k.to_vec())
             .collect();
         drop(view);
 
