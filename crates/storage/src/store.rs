@@ -273,13 +273,8 @@ impl Store {
     ///
     /// When finalization advances, prunes the LiveChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
-        // Check if we need to prune before updating metadata
-        let should_prune = checkpoints.finalized.is_some();
-        let old_finalized_slot = if should_prune {
-            Some(self.latest_finalized().slot)
-        } else {
-            None
-        };
+        // Read old finalized slot before updating metadata
+        let old_finalized_slot = self.latest_finalized().slot;
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.as_ssz_bytes())];
 
@@ -287,31 +282,30 @@ impl Store {
             entries.push((KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()));
         }
 
-        let new_finalized_slot = if let Some(finalized) = checkpoints.finalized {
+        if let Some(finalized) = checkpoints.finalized {
             entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()));
-            Some(finalized.slot)
-        } else {
-            None
-        };
+        }
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
         batch.commit().expect("commit");
 
         // Prune after successful checkpoint update
-        if let (Some(old_slot), Some(new_slot)) = (old_finalized_slot, new_finalized_slot)
-            && new_slot > old_slot
-        {
-            self.prune_live_chain(new_slot);
+        if let Some(finalized) = checkpoints.finalized {
+            if finalized.slot > old_finalized_slot {
+                self.prune_live_chain(finalized.slot);
 
-            // Prune signatures and payloads for finalized slots
-            let pruned_sigs = self.prune_gossip_signatures(new_slot);
-            let pruned_payloads = self.prune_aggregated_payloads(new_slot);
-            if pruned_sigs > 0 || pruned_payloads > 0 {
-                info!(
-                    finalized_slot = new_slot,
-                    pruned_sigs, pruned_payloads, "Pruned finalized signatures"
-                );
+                // Prune signatures and payloads for finalized slots
+                let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+                let pruned_payloads = self.prune_aggregated_payloads(finalized.slot);
+                if pruned_sigs > 0 || pruned_payloads > 0 {
+                    info!(
+                        finalized_slot = finalized.slot,
+                        pruned_sigs,
+                        pruned_payloads,
+                        "Pruned finalized signatures"
+                    );
+                }
             }
         }
     }
