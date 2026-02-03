@@ -5,7 +5,7 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
-use ethlambda_types::primitives::TreeHash;
+use ethlambda_types::primitives::ssz::TreeHash;
 
 use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponseCode,

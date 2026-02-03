@@ -3,12 +3,11 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     ShortRoot,
     attestation::{Attestation, AttestationData, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::TreeHash,
+    primitives::{H256, ssz::TreeHash},
     signature::ValidatorSecretKey,
     state::Checkpoint,
 };

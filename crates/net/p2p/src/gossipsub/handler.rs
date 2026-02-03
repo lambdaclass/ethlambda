@@ -1,10 +1,11 @@
 use ethlambda_types::{
-    ShortRoot, attestation::SignedAttestation, block::SignedBlockWithAttestation,
+    ShortRoot,
+    attestation::SignedAttestation,
+    block::SignedBlockWithAttestation,
+    primitives::ssz::{Decode, Encode, TreeHash},
 };
 use libp2p::gossipsub::Event;
-use ssz::{Decode, Encode};
 use tracing::{error, info, trace};
-use tree_hash::TreeHash;
 
 use super::{
     encoding::{compress_message, decompress_message},
