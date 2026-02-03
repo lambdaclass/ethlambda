@@ -12,7 +12,7 @@ use ethlambda_types::{
         AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
         SignedBlockWithAttestation,
     },
-    primitives::{H256, TreeHash},
+    primitives::{H256, ssz::TreeHash},
     signature::ValidatorSignature,
     state::{Checkpoint, State, Validator},
 };
@@ -30,7 +30,7 @@ fn accept_new_attestations(store: &mut Store) {
 
 /// Update the head based on the fork choice rule.
 fn update_head(store: &mut Store) {
-    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let blocks = store.get_live_chain();
     let attestations: HashMap<u64, AttestationData> = store.iter_known_attestations().collect();
     let old_head = store.head();
     let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
@@ -69,7 +69,7 @@ fn update_safe_target(store: &mut Store) {
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
-    let blocks: HashMap<H256, Block> = store.iter_blocks().collect();
+    let blocks = store.get_live_chain();
     let attestations: HashMap<u64, AttestationData> = store.iter_new_attestations().collect();
     let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
@@ -217,10 +217,9 @@ pub fn on_gossip_attestation(
 
     if cfg!(not(feature = "skip-signature-verification")) {
         // Store signature for later lookup during block building
-        let signature_key = (validator_id, message);
         let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
             .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(signature_key, signature);
+        store.insert_gossip_signature(&attestation.data, validator_id, signature);
     }
     metrics::inc_attestations_valid("gossip");
 
@@ -382,12 +381,10 @@ pub fn on_block(
         .zip(attestation_signatures.iter())
     {
         let validator_ids = aggregation_bits_to_validator_indices(&att.aggregation_bits);
-        let data_root = att.data.tree_hash_root();
 
         for validator_id in validator_ids {
             // Update Proof Map - Store the proof so future block builders can reuse this aggregation
-            let key: SignatureKey = (validator_id, data_root);
-            store.push_aggregated_payload(key, proof.clone());
+            store.insert_aggregated_payload(&att.data, validator_id, proof.clone());
 
             // Update Fork Choice - Register the vote immediately (historical/on-chain)
             let attestation = Attestation {
@@ -415,14 +412,14 @@ pub fn on_block(
 
     if cfg!(not(feature = "skip-signature-verification")) {
         // Store the proposer's signature for potential future block building
-        let proposer_sig_key: SignatureKey = (
-            proposer_attestation.validator_id,
-            proposer_attestation.data.tree_hash_root(),
-        );
         let proposer_sig =
             ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(proposer_sig_key, proposer_sig);
+        store.insert_gossip_signature(
+            &proposer_attestation.data,
+            proposer_attestation.validator_id,
+            proposer_sig,
+        );
     }
 
     // Process proposer attestation (enters "new" stage, not "known")
@@ -559,13 +556,20 @@ pub fn produce_block_with_signatures(
         .collect();
 
     // Get known block roots for attestation validation
-    let known_block_roots: HashSet<H256> = store.iter_blocks().map(|(root, _)| root).collect();
+    let known_block_roots = store.get_block_roots();
 
     // Collect signature data for block building
-    let gossip_signatures: HashMap<SignatureKey, ValidatorSignature> =
-        store.iter_gossip_signatures().collect();
-    let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> =
-        store.iter_aggregated_payloads().collect();
+    let gossip_signatures: HashMap<SignatureKey, ValidatorSignature> = store
+        .iter_gossip_signatures()
+        .filter_map(|(key, stored)| stored.to_validator_signature().ok().map(|sig| (key, sig)))
+        .collect();
+    let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> = store
+        .iter_aggregated_payloads()
+        .map(|(key, stored_payloads)| {
+            let proofs = stored_payloads.into_iter().map(|sp| sp.proof).collect();
+            (key, proofs)
+        })
+        .collect();
 
     // Build the block using fixed-point attestation collection
     let (block, _post_state, signatures) = build_block(

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
-    primitives::{H256, TreeHash},
+    primitives::{H256, ssz::TreeHash},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
 

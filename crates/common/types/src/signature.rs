@@ -2,10 +2,9 @@ use leansig::{
     serialization::Serializable,
     signature::{SignatureScheme, SigningError},
 };
-use ssz::DecodeError;
 use ssz_types::typenum::{Diff, U488, U3600};
 
-use crate::primitives::H256;
+use crate::primitives::{H256, ssz::DecodeError};
 
 /// The XMSS signature scheme used for validator signatures.
 ///

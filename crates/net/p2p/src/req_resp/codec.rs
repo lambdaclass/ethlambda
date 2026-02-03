@@ -1,7 +1,7 @@
 use std::io;
 
+use ethlambda_types::primitives::ssz::{Decode, Encode};
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use ssz::{Decode, Encode};
 use tracing::{debug, trace};
 
 use super::{

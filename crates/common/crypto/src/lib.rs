@@ -1,9 +1,11 @@
 use std::sync::Once;
 
-use ethlambda_types::primitives::{Decode, Encode};
 use ethlambda_types::{
     block::ByteListMiB,
-    primitives::H256,
+    primitives::{
+        H256,
+        ssz::{Decode, Encode},
+    },
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
 use lean_multisig::{
