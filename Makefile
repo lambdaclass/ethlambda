@@ -13,12 +13,13 @@ test: leanSpec/fixtures ## 🧪 Run all tests, then forkchoice tests with skip-s
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
+DOCKER_TAG?=local
 
 docker-build: ## 🐳 Build the Docker image
 	docker build \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
-		-t ghcr.io/lambdaclass/ethlambda:local .
+		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 
 LEAN_SPEC_COMMIT_HASH:=4edcf7bc9271e6a70ded8aff17710d68beac4266
 
