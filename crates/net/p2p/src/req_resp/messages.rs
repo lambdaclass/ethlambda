@@ -115,7 +115,8 @@ pub type ErrorMessage = ssz_types::VariableList<u8, MaxErrorMessageLength>;
 /// Helper to create an ErrorMessage from a string.
 /// Debug builds panic if message exceeds 256 bytes (programming error).
 /// Release builds truncate to 256 bytes.
-#[allow(dead_code)]
+#[expect(dead_code)]
+// TODO: map errors to req/resp error messages
 pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     let bytes = msg.as_ref().as_bytes();
     debug_assert!(
