@@ -31,13 +31,16 @@ pub async fn handle_req_resp_message(
                     handle_blocks_by_root_request(server, request, channel, peer).await;
                 }
             },
-            request_response::Message::Response { response, .. } => match response {
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => match response {
                 Response::Success { payload } => match payload {
                     ResponsePayload::Status(status) => {
                         handle_status_response(status, peer).await;
                     }
-                    ResponsePayload::BlocksByRoot(block) => {
-                        handle_blocks_by_root_response(server, block, peer).await;
+                    ResponsePayload::BlocksByRoot(blocks) => {
+                        handle_blocks_by_root_response(server, blocks, peer, request_id).await;
                     }
                 },
                 Response::Error { code, message } => {
@@ -130,16 +133,32 @@ async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlockWithAttestation>,
     peer: PeerId,
+    request_id: request_response::OutboundRequestId,
 ) {
     info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
+
+    // Look up which root was requested for this specific request
+    let Some(requested_root) = server.request_id_map.remove(&request_id) else {
+        warn!(%peer, ?request_id, "Received response for unknown request_id");
+        return;
+    };
 
     for block in blocks {
         let root = block.message.block.tree_hash_root();
 
-        // Clean up tracking for this root
-        if server.pending_requests.remove(&root).is_some() {
-            server.request_id_map.retain(|_, r| *r != root);
+        // Validate that this block matches what we requested
+        if root != requested_root {
+            warn!(
+                %peer,
+                received_root = %ethlambda_types::ShortRoot(&root.0),
+                expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
+                "Received block with mismatched root, ignoring"
+            );
+            continue;
         }
+
+        // Clean up tracking for this root
+        server.pending_requests.remove(&root);
 
         server.blockchain.notify_new_block(block).await;
     }
