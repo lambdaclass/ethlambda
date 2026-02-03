@@ -2,7 +2,7 @@ use std::io;
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use ssz::{Decode, Encode};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use super::{
     encoding::{decode_payload, write_payload},
@@ -126,14 +126,20 @@ impl libp2p::request_response::Codec for Codec {
                     let chunk_code = ResponseCode::from(result_byte);
                     let chunk_payload = decode_payload(io).await?;
 
-                    if chunk_code == ResponseCode::SUCCESS {
-                        let block = SignedBlockWithAttestation::from_ssz_bytes(&chunk_payload)
-                            .map_err(|err| {
-                                io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                            })?;
-                        blocks.push(block);
+                    if chunk_code != ResponseCode::SUCCESS {
+                        // Non-success codes (RESOURCE_UNAVAILABLE) are skipped - block not available
+                        let error_message = ErrorMessage::from_ssz_bytes(&chunk_payload)
+                            .map(|msg| String::from_utf8_lossy(&msg).to_string())
+                            .unwrap_or_else(|_| "<invalid error message>".to_string());
+                        debug!(?chunk_code, %error_message, "Skipping block chunk with non-success code");
+                        continue;
                     }
-                    // Non-success codes (RESOURCE_UNAVAILABLE) are skipped - block not available
+
+                    let block = SignedBlockWithAttestation::from_ssz_bytes(&chunk_payload)
+                        .map_err(|err| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                        })?;
+                    blocks.push(block);
                 }
 
                 Ok(Response::success(ResponsePayload::BlocksByRoot(blocks)))
