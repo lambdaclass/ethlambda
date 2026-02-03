@@ -20,10 +20,16 @@ pub enum Table {
     AggregatedPayloads,
     /// Metadata: string keys -> various scalar values
     Metadata,
+    /// Live chain index: (slot || root) -> parent_root
+    ///
+    /// Fast lookup for fork choice without deserializing full blocks.
+    /// Includes finalized blocks (anchor) and all non-finalized blocks.
+    /// Pruned when slots become finalized (keeps finalized block itself).
+    LiveChain,
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 8] = [
+pub const ALL_TABLES: [Table; 9] = [
     Table::Blocks,
     Table::BlockSignatures,
     Table::States,
@@ -32,4 +38,5 @@ pub const ALL_TABLES: [Table; 8] = [
     Table::GossipSignatures,
     Table::AggregatedPayloads,
     Table::Metadata,
+    Table::LiveChain,
 ];

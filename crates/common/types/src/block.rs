@@ -1,11 +1,12 @@
 use serde::Serialize;
-use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::U1048576;
-use tree_hash_derive::TreeHash;
 
 use crate::{
     attestation::{AggregatedAttestation, Attestation, XmssSignature},
-    primitives::{ByteList, H256},
+    primitives::{
+        ByteList, H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
     state::ValidatorRegistryLimit,
 };
 
@@ -73,7 +74,7 @@ pub type AttestationSignatures =
 /// The proof can verify that all participants signed the same message in the
 /// same epoch, using a single verification operation instead of checking
 /// each signature individually.
-#[derive(Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,

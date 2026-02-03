@@ -1,6 +1,11 @@
-use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256, state::Checkpoint};
-use ssz::Decode as SszDecode;
-use ssz_derive::{Decode, Encode};
+use ethlambda_types::{
+    block::SignedBlockWithAttestation,
+    primitives::{
+        H256,
+        ssz::{Decode, Decode as SszDecode, Encode},
+    },
+    state::Checkpoint,
+};
 use ssz_types::typenum;
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";

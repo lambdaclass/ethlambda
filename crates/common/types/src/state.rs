@@ -1,14 +1,13 @@
 use serde::{Deserialize, Serialize};
-use ssz::DecodeError;
-use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::{U4096, U262144};
-use tree_hash::TreeHash;
-use tree_hash_derive::TreeHash;
 
 use crate::{
     block::{BlockBody, BlockHeader},
     genesis::Genesis,
-    primitives::H256,
+    primitives::{
+        H256,
+        ssz::{Decode, DecodeError, Encode, TreeHash},
+    },
     signature::ValidatorPublicKey,
 };
 

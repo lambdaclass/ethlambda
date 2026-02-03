@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ethlambda_types::{attestation::AttestationData, block::Block, primitives::H256};
+use ethlambda_types::{attestation::AttestationData, primitives::H256};
 
 /// Compute the LMD GHOST head of the chain, given a starting root, a set of blocks,
 /// a set of attestations, and a minimum score threshold.
@@ -9,7 +9,7 @@ use ethlambda_types::{attestation::AttestationData, block::Block, primitives::H2
 // TODO: add proto-array implementation
 pub fn compute_lmd_ghost_head(
     mut start_root: H256,
-    blocks: &HashMap<H256, Block>,
+    blocks: &HashMap<H256, (u64, H256)>,
     attestations: &HashMap<u64, AttestationData>,
     min_score: u64,
 ) -> H256 {
@@ -19,36 +19,33 @@ pub fn compute_lmd_ghost_head(
     if start_root.is_zero() {
         start_root = *blocks
             .iter()
-            .min_by_key(|(_, block)| block.slot)
+            .min_by_key(|(_, (slot, _))| slot)
             .map(|(root, _)| root)
             .expect("we already checked blocks is non-empty");
     }
-    let start_slot = blocks[&start_root].slot;
+    let start_slot = blocks[&start_root].0;
     let mut weights: HashMap<H256, u64> = HashMap::new();
 
     for attestation_data in attestations.values() {
         let mut current_root = attestation_data.head.root;
-        while let Some(block) = blocks.get(&current_root)
-            && block.slot > start_slot
+        while let Some(&(slot, parent_root)) = blocks.get(&current_root)
+            && slot > start_slot
         {
             *weights.entry(current_root).or_default() += 1;
-            current_root = block.parent_root;
+            current_root = parent_root;
         }
     }
 
     let mut children_map: HashMap<H256, Vec<H256>> = HashMap::new();
 
-    for (root, block) in blocks {
-        if block.parent_root.is_zero() {
+    for (root, &(_, parent_root)) in blocks {
+        if parent_root.is_zero() {
             continue;
         }
         if min_score > 0 && *weights.get(root).unwrap_or(&0) < min_score {
             continue;
         }
-        children_map
-            .entry(block.parent_root)
-            .or_default()
-            .push(*root);
+        children_map.entry(parent_root).or_default().push(*root);
     }
 
     let mut head = start_root;

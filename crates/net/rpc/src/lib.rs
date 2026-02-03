@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::Encode;
+use ethlambda_types::primitives::ssz::Encode;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -77,7 +77,7 @@ mod tests {
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
-        primitives::{H256, TreeHash},
+        primitives::{H256, ssz::TreeHash},
         state::{ChainConfig, Checkpoint, JustificationValidators, JustifiedSlots, State},
     };
     use http_body_util::BodyExt;
@@ -150,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_latest_finalized_state() {
-        use ethlambda_types::primitives::Encode;
+        use ethlambda_types::primitives::ssz::Encode;
 
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
