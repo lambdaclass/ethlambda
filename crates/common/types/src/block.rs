@@ -1,11 +1,12 @@
 use serde::Serialize;
-use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::U1048576;
-use tree_hash_derive::TreeHash;
 
 use crate::{
     attestation::{AggregatedAttestation, Attestation, XmssSignature},
-    primitives::{ByteList, H256},
+    primitives::{
+        ByteList, H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
     state::ValidatorRegistryLimit,
 };
 
@@ -73,7 +74,7 @@ pub type AttestationSignatures =
 /// The proof can verify that all participants signed the same message in the
 /// same epoch, using a single verification operation instead of checking
 /// each signature individually.
-#[derive(Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,
@@ -127,6 +128,44 @@ pub struct BlockWithAttestation {
 
     /// The proposer's attestation corresponding to this block.
     pub proposer_attestation: Attestation,
+}
+
+/// Stored block signatures and proposer attestation.
+///
+/// This type stores the data needed to reconstruct a `SignedBlockWithAttestation`
+/// when combined with a `Block` from the blocks table.
+#[derive(Clone, Encode, Decode)]
+pub struct BlockSignaturesWithAttestation {
+    /// The proposer's attestation for this block.
+    pub proposer_attestation: Attestation,
+
+    /// The aggregated signatures for the block.
+    pub signatures: BlockSignatures,
+}
+
+impl BlockSignaturesWithAttestation {
+    /// Create from a SignedBlockWithAttestation by consuming it.
+    ///
+    /// Takes ownership to avoid cloning large signature data.
+    pub fn from_signed_block(signed_block: SignedBlockWithAttestation) -> Self {
+        Self {
+            proposer_attestation: signed_block.message.proposer_attestation,
+            signatures: signed_block.signature,
+        }
+    }
+
+    /// Reconstruct a SignedBlockWithAttestation given the block.
+    ///
+    /// Consumes self to avoid cloning large signature data.
+    pub fn to_signed_block(self, block: Block) -> SignedBlockWithAttestation {
+        SignedBlockWithAttestation {
+            message: BlockWithAttestation {
+                block,
+                proposer_attestation: self.proposer_attestation,
+            },
+            signature: self.signatures,
+        }
+    }
 }
 
 /// The header of a block, containing metadata.

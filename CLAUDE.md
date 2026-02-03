@@ -71,15 +71,46 @@ make test                                    # All tests + forkchoice (with skip
 
 ### Common Operations
 ```bash
-make run-devnet                              # Docker build → lean-quickstart local devnet
-rm -rf leanSpec && make leanSpec/fixtures    # Regenerate test fixtures (requires uv)
+.claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
+rm -rf leanSpec && make leanSpec/fixtures                # Regenerate test fixtures (requires uv)
 ```
 
-### Debugging
+### Testing with Local Devnet
 
-<!-- TODO: fill this part after a debug session -->
+See `.claude/skills/test-pr-devnet/SKILL.md` for multi-client devnet testing workflows.
 
 ## Important Patterns & Idioms
+
+### Trait Implementations
+```rust
+// Prefer From/Into traits over custom from_x/to_x methods
+impl From<u8> for ResponseCode { fn from(code: u8) -> Self { Self(code) } }
+impl From<ResponseCode> for u8 { fn from(code: ResponseCode) -> Self { code.0 } }
+
+// Enables idiomatic .into() usage
+let code: ResponseCode = byte.into();
+let byte: u8 = code.into();
+```
+
+### Ownership for Large Structures
+```rust
+// Prefer taking ownership to avoid cloning large data (signatures ~3KB)
+pub fn consume_signed_block(signed_block: SignedBlockWithAttestation) { ... }
+
+// Add .clone() at call site if needed - makes cost explicit
+store.insert_signed_block(root, signed_block.clone());
+```
+
+### Formatting Patterns
+```rust
+// Extract long arguments into variables so formatter can join lines
+// Instead of:
+batch.put_batch(Table::X, vec![(key, value)]).expect("msg");
+
+// Prefer:
+let entries = vec![(key, value)];
+batch.put_batch(Table::X, entries).expect("msg");
+```
 
 ### Metrics (RAII Pattern)
 ```rust
@@ -189,6 +220,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ```bash
 cargo test --workspace --release                                    # All workspace tests
 cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
+cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests -- --test-threads=1  # Sequential
 ```
 
 ## Common Gotchas
@@ -196,6 +228,10 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 ### Signature Verification
 - Tests require `skip-signature-verification` feature for performance
 - Crypto tests marked `#[ignore]` (slow leanVM operations)
+
+### Storage Architecture
+- Genesis block has no signatures - stored in Blocks table only, not BlockSignatures
+- All other blocks must have entries in both tables
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition

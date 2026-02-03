@@ -66,17 +66,20 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
-### pq-devnet-1
+### pq-devnet-2
 
-We support the [pq-devnet-1 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-1.md). A dedicated git branch and docker tag `devnet1` are available for this version.
+We support the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md). A Docker tag `devnet2` is available for this version.
+
+### Older devnets
+
+Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`).
+
+Support for older devnet releases is discontinued when the next devnet version is released.
 
 ## Incoming features
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [pq-devnet-2](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md) support: signature aggregation with leanMultisig
-- Data persistence: DB-backed Store
-- Historical syncing from genesis for existing devnets
 - Checkpoint sync for long-lived networks
 - Observability: more metrics from leanMetrics and better logs
 - RPC endpoints for chain data consumption

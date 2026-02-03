@@ -5,11 +5,11 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::block::SignedBlockWithAttestation;
-use ethlambda_types::primitives::TreeHash;
+use ethlambda_types::primitives::ssz::TreeHash;
 
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload,
-    ResponseResult, Status,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponseCode,
+    ResponsePayload, Status, error_message,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
@@ -32,12 +32,18 @@ pub async fn handle_req_resp_message(
                     handle_blocks_by_root_request(server, request, channel, peer).await;
                 }
             },
-            request_response::Message::Response { response, .. } => match response.payload {
-                ResponsePayload::Status(status) => {
-                    handle_status_response(status, peer).await;
-                }
-                ResponsePayload::BlocksByRoot(blocks) => {
-                    handle_blocks_by_root_response(server, blocks, peer).await;
+            request_response::Message::Response { response, .. } => match response {
+                Response::Success { payload } => match payload {
+                    ResponsePayload::Status(status) => {
+                        handle_status_response(status, peer).await;
+                    }
+                    ResponsePayload::BlocksByRoot(block) => {
+                        handle_blocks_by_root_response(server, block, peer).await;
+                    }
+                },
+                Response::Error { code, message } => {
+                    let error_str = String::from_utf8_lossy(&message);
+                    warn!(%peer, ?code, %error_str, "Received error response");
                 }
             },
         },
@@ -84,7 +90,7 @@ async fn handle_status_request(
         .req_resp
         .send_response(
             channel,
-            Response::new(ResponseResult::Success, ResponsePayload::Status(our_status)),
+            Response::success(ResponsePayload::Status(our_status)),
         )
         .unwrap();
 }
@@ -94,21 +100,47 @@ async fn handle_status_response(status: Status, peer: PeerId) {
 }
 
 async fn handle_blocks_by_root_request(
-    _server: &mut P2PServer,
+    server: &mut P2PServer,
     request: BlocksByRootRequest,
-    _channel: request_response::ResponseChannel<Response>,
+    channel: request_response::ResponseChannel<Response>,
     peer: PeerId,
 ) {
     let num_roots = request.roots.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
-    // TODO: Implement signed block storage and send response chunks
-    // For now, we don't send any response (drop the channel)
-    // In a full implementation, we would:
-    // 1. Look up each requested block root
-    // 2. Send a response chunk for each found block
-    // 3. Each chunk contains: result byte + encoded SignedBlockWithAttestation
-    warn!(%peer, num_roots, "BlocksByRoot request received but block storage not implemented");
+    // TODO: Support multiple blocks per request (currently only handles first root)
+    // The protocol supports up to 1024 roots, but our response type only holds one block.
+    let Some(root) = request.roots.first() else {
+        debug!(%peer, "BlocksByRoot request with no roots");
+        return;
+    };
+
+    match server.store.get_signed_block(root) {
+        Some(signed_block) => {
+            let slot = signed_block.message.block.slot;
+            info!(%peer, %root, %slot, "Responding to BlocksByRoot request");
+
+            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
+                channel,
+                Response::success(ResponsePayload::BlocksByRoot(signed_block)),
+            ) {
+                warn!(%peer, %root, ?err, "Failed to send BlocksByRoot response");
+            }
+        }
+        None => {
+            debug!(%peer, %root, "Block not found for BlocksByRoot request");
+
+            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
+                channel,
+                Response::error(
+                    ResponseCode::RESOURCE_UNAVAILABLE,
+                    error_message("Block not found"),
+                ),
+            ) {
+                warn!(%peer, %root, ?err, "Failed to send RESOURCE_UNAVAILABLE response");
+            }
+        }
+    }
 }
 
 async fn handle_blocks_by_root_response(

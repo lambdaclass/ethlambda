@@ -1,11 +1,19 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::{StorageBackend, Table};
+use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{AggregatedSignatureProof, Block, BlockBody},
-    primitives::{Decode, Encode, H256, TreeHash},
+    block::{
+        AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
+        BlockWithAttestation, SignedBlockWithAttestation,
+    },
+    primitives::{
+        H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
     signature::ValidatorSignature,
     state::{ChainConfig, Checkpoint, State},
 };
@@ -81,6 +89,22 @@ fn decode_signature_key(bytes: &[u8]) -> SignatureKey {
     (validator_id, root)
 }
 
+/// Encode a LiveChain key (slot, root) to bytes.
+/// Layout: slot (8 bytes big-endian) || root (32 bytes)
+/// Big-endian ensures lexicographic ordering matches numeric ordering.
+fn encode_live_chain_key(slot: u64, root: &H256) -> Vec<u8> {
+    let mut result = slot.to_be_bytes().to_vec();
+    result.extend_from_slice(&root.0);
+    result
+}
+
+/// Decode a LiveChain key from bytes.
+fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
+    let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
+    let root = H256::from_slice(&bytes[8..]);
+    (slot, root)
+}
+
 /// Underlying storage of the node.
 /// Similar to the spec's `Store`, but backed by a pluggable storage backend.
 ///
@@ -128,45 +152,49 @@ impl Store {
             let mut batch = backend.begin_write().expect("write batch");
 
             // Metadata
+            let metadata_entries = vec![
+                (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
+                (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
+                (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
+                (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
+                (
+                    KEY_LATEST_JUSTIFIED.to_vec(),
+                    anchor_checkpoint.as_ssz_bytes(),
+                ),
+                (
+                    KEY_LATEST_FINALIZED.to_vec(),
+                    anchor_checkpoint.as_ssz_bytes(),
+                ),
+            ];
             batch
-                .put_batch(
-                    Table::Metadata,
-                    vec![
-                        (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
-                        (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
-                        (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
-                        (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
-                        (
-                            KEY_LATEST_JUSTIFIED.to_vec(),
-                            anchor_checkpoint.as_ssz_bytes(),
-                        ),
-                        (
-                            KEY_LATEST_FINALIZED.to_vec(),
-                            anchor_checkpoint.as_ssz_bytes(),
-                        ),
-                    ],
-                )
+                .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
 
             // Block and state
+            let block_entries = vec![(
+                anchor_block_root.as_ssz_bytes(),
+                anchor_block.as_ssz_bytes(),
+            )];
             batch
-                .put_batch(
-                    Table::Blocks,
-                    vec![(
-                        anchor_block_root.as_ssz_bytes(),
-                        anchor_block.as_ssz_bytes(),
-                    )],
-                )
+                .put_batch(Table::Blocks, block_entries)
                 .expect("put block");
+
+            let state_entries = vec![(
+                anchor_block_root.as_ssz_bytes(),
+                anchor_state.as_ssz_bytes(),
+            )];
             batch
-                .put_batch(
-                    Table::States,
-                    vec![(
-                        anchor_block_root.as_ssz_bytes(),
-                        anchor_state.as_ssz_bytes(),
-                    )],
-                )
+                .put_batch(Table::States, state_entries)
                 .expect("put state");
+
+            // Non-finalized chain index
+            let index_entries = vec![(
+                encode_live_chain_key(anchor_block.slot, &anchor_block_root),
+                anchor_block.parent_root.as_ssz_bytes(),
+            )];
+            batch
+                .put_batch(Table::LiveChain, index_entries)
+                .expect("put non-finalized chain index");
 
             batch.commit().expect("commit");
         }
@@ -246,7 +274,12 @@ impl Store {
     /// - Head is always updated to the new value.
     /// - Justified is updated if provided.
     /// - Finalized is updated if provided.
+    ///
+    /// When finalization advances, prunes the LiveChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+        // Read old finalized slot before updating metadata
+        let old_finalized_slot = self.latest_finalized().slot;
+
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.as_ssz_bytes())];
 
         if let Some(justified) = checkpoints.justified {
@@ -260,24 +293,165 @@ impl Store {
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
         batch.commit().expect("commit");
+
+        // Prune after successful checkpoint update
+        if let Some(finalized) = checkpoints.finalized
+            && finalized.slot > old_finalized_slot
+        {
+            self.prune_live_chain(finalized.slot);
+
+            // Prune signatures and payloads for finalized slots
+            let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+            let pruned_payloads = self.prune_aggregated_payloads(finalized.slot);
+            if pruned_sigs > 0 || pruned_payloads > 0 {
+                info!(
+                    finalized_slot = finalized.slot,
+                    pruned_sigs, pruned_payloads, "Pruned finalized signatures"
+                );
+            }
+        }
     }
 
     // ============ Blocks ============
 
-    /// Iterate over all (root, block) pairs.
-    pub fn iter_blocks(&self) -> impl Iterator<Item = (H256, Block)> + '_ {
+    /// Get block data for fork choice: root -> (slot, parent_root).
+    ///
+    /// Iterates only the LiveChain table, avoiding Block deserialization.
+    /// Returns only non-finalized blocks, automatically pruned on finalization.
+    pub fn get_live_chain(&self) -> HashMap<H256, (u64, H256)> {
         let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::Blocks, &[])
+        view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
-                let root = H256::from_ssz_bytes(&k).expect("valid root");
-                let block = Block::from_ssz_bytes(&v).expect("valid block");
-                (root, block)
+                let (slot, root) = decode_live_chain_key(&k);
+                let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
+                (root, (slot, parent_root))
             })
+            .collect()
+    }
+
+    /// Get all known block roots as HashSet.
+    ///
+    /// Useful for checking block existence without deserializing.
+    pub fn get_block_roots(&self) -> HashSet<H256> {
+        let view = self.backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::LiveChain, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, _)| {
+                let (_, root) = decode_live_chain_key(&k);
+                root
+            })
+            .collect()
+    }
+
+    /// Prune slot index entries with slot < finalized_slot.
+    ///
+    /// Blocks/states are retained for historical queries, only the
+    /// LiveChain index is pruned.
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) {
+        let view = self.backend.begin_read().expect("read view");
+
+        // Collect keys to delete - stop once we hit finalized_slot
+        // Keys are sorted by slot (big-endian encoding) so we can stop early
+        let keys_to_delete: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .take_while(|(k, _)| {
+                let (slot, _) = decode_live_chain_key(k);
+                slot < finalized_slot
+            })
+            .map(|(k, _)| k.to_vec())
             .collect();
-        entries.into_iter()
+        drop(view);
+
+        if keys_to_delete.is_empty() {
+            return;
+        }
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::LiveChain, keys_to_delete)
+            .expect("delete non-finalized chain entries");
+        batch.commit().expect("commit");
+    }
+
+    /// Prune gossip signatures for slots <= finalized_slot.
+    ///
+    /// Returns the number of signatures pruned.
+    pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut to_delete = vec![];
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(Table::GossipSignatures, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Ok(stored) = StoredSignature::from_ssz_bytes(&value_bytes)
+                && stored.slot <= finalized_slot
+            {
+                to_delete.push(key_bytes.to_vec());
+            }
+        }
+        drop(view);
+
+        let count = to_delete.len();
+        if !to_delete.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::GossipSignatures, to_delete)
+                .expect("delete");
+            batch.commit().expect("commit");
+        }
+        count
+    }
+
+    /// Prune aggregated payloads for slots <= finalized_slot.
+    ///
+    /// Returns the number of payloads pruned.
+    pub fn prune_aggregated_payloads(&mut self, finalized_slot: u64) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut updates = vec![];
+        let mut deletes = vec![];
+        let mut removed_count = 0;
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(Table::AggregatedPayloads, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Ok(mut payloads) = Vec::<StoredAggregatedPayload>::from_ssz_bytes(&value_bytes) {
+                let original_len = payloads.len();
+                payloads.retain(|p| p.slot > finalized_slot);
+                removed_count += original_len - payloads.len();
+
+                if payloads.is_empty() {
+                    deletes.push(key_bytes.to_vec());
+                } else if payloads.len() < original_len {
+                    updates.push((key_bytes.to_vec(), payloads.as_ssz_bytes()));
+                }
+            }
+        }
+        drop(view);
+
+        if !updates.is_empty() || !deletes.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            if !updates.is_empty() {
+                batch
+                    .put_batch(Table::AggregatedPayloads, updates)
+                    .expect("put");
+            }
+            if !deletes.is_empty() {
+                batch
+                    .delete_batch(Table::AggregatedPayloads, deletes)
+                    .expect("delete");
+            }
+            batch.commit().expect("commit");
+        }
+        removed_count
     }
 
     pub fn get_block(&self, root: &H256) -> Option<Block> {
@@ -296,13 +470,86 @@ impl Store {
 
     pub fn insert_block(&mut self, root: H256, block: Block) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::Blocks,
-                vec![(root.as_ssz_bytes(), block.as_ssz_bytes())],
-            )
+            .put_batch(Table::Blocks, block_entries)
             .expect("put block");
+
+        let index_entries = vec![(
+            encode_live_chain_key(block.slot, &root),
+            block.parent_root.as_ssz_bytes(),
+        )];
+        batch
+            .put_batch(Table::LiveChain, index_entries)
+            .expect("put non-finalized chain index");
+
         batch.commit().expect("commit");
+    }
+
+    // ============ Signed Blocks ============
+
+    /// Insert a signed block, storing the block and signatures separately.
+    ///
+    /// Blocks and signatures are stored in separate tables because the genesis
+    /// block has no signatures. This allows uniform storage of all blocks while
+    /// only storing signatures for non-genesis blocks.
+    ///
+    /// Takes ownership to avoid cloning large signature data.
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        // Destructure to extract all components without cloning
+        let SignedBlockWithAttestation {
+            message:
+                BlockWithAttestation {
+                    block,
+                    proposer_attestation,
+                },
+            signature,
+        } = signed_block;
+
+        let signatures = BlockSignaturesWithAttestation {
+            proposer_attestation,
+            signatures: signature,
+        };
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+
+        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        batch
+            .put_batch(Table::Blocks, block_entries)
+            .expect("put block");
+
+        let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockSignatures, sig_entries)
+            .expect("put block signatures");
+
+        let index_entries = vec![(
+            encode_live_chain_key(block.slot, &root),
+            block.parent_root.as_ssz_bytes(),
+        )];
+        batch
+            .put_batch(Table::LiveChain, index_entries)
+            .expect("put non-finalized chain index");
+
+        batch.commit().expect("commit");
+    }
+
+    /// Get a signed block by combining block and signatures.
+    ///
+    /// Returns None if either the block or signatures are not found.
+    /// Note: Genesis block has no entry in BlockSignatures table.
+    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.as_ssz_bytes();
+
+        let block_bytes = view.get(Table::Blocks, &key).expect("get")?;
+        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
+
+        let block = Block::from_ssz_bytes(&block_bytes).expect("valid block");
+        let signatures =
+            BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+
+        Some(signatures.to_signed_block(block))
     }
 
     // ============ States ============
@@ -332,12 +579,8 @@ impl Store {
 
     pub fn insert_state(&mut self, root: H256, state: State) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::States,
-                vec![(root.as_ssz_bytes(), state.as_ssz_bytes())],
-            )
-            .expect("put state");
+        let entries = vec![(root.as_ssz_bytes(), state.as_ssz_bytes())];
+        batch.put_batch(Table::States, entries).expect("put state");
         batch.commit().expect("commit");
     }
 
@@ -368,11 +611,9 @@ impl Store {
 
     pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::LatestKnownAttestations,
-                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
-            )
+            .put_batch(Table::LatestKnownAttestations, entries)
             .expect("put attestation");
         batch.commit().expect("commit");
     }
@@ -404,11 +645,9 @@ impl Store {
 
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::LatestNewAttestations,
-                vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())],
-            )
+            .put_batch(Table::LatestNewAttestations, entries)
             .expect("put attestation");
         batch.commit().expect("commit");
     }
@@ -457,10 +696,10 @@ impl Store {
 
     // ============ Gossip Signatures ============
 
-    /// Iterate over all (signature_key, signature) pairs.
+    /// Iterate over all (signature_key, stored_signature) pairs.
     pub fn iter_gossip_signatures(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, ValidatorSignature)> + '_ {
+    ) -> impl Iterator<Item = (SignatureKey, StoredSignature)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
             .prefix_iterator(Table::GossipSignatures, &[])
@@ -468,19 +707,19 @@ impl Store {
             .filter_map(|res| res.ok())
             .filter_map(|(k, v)| {
                 let key = decode_signature_key(&k);
-                ValidatorSignature::from_bytes(&v)
+                StoredSignature::from_ssz_bytes(&v)
                     .ok()
-                    .map(|sig| (key, sig))
+                    .map(|stored| (key, stored))
             })
             .collect();
         entries.into_iter()
     }
 
-    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<ValidatorSignature> {
+    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<StoredSignature> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::GossipSignatures, &encode_signature_key(key))
             .expect("get")
-            .and_then(|bytes| ValidatorSignature::from_bytes(&bytes).ok())
+            .and_then(|bytes| StoredSignature::from_ssz_bytes(&bytes).ok())
     }
 
     pub fn contains_gossip_signature(&self, key: &SignatureKey) -> bool {
@@ -490,23 +729,31 @@ impl Store {
             .is_some()
     }
 
-    pub fn insert_gossip_signature(&mut self, key: SignatureKey, signature: ValidatorSignature) {
+    pub fn insert_gossip_signature(
+        &mut self,
+        attestation_data: &AttestationData,
+        validator_id: u64,
+        signature: ValidatorSignature,
+    ) {
+        let slot = attestation_data.slot;
+        let data_root = attestation_data.tree_hash_root();
+        let key = (validator_id, data_root);
+
+        let stored = StoredSignature::new(slot, signature);
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(encode_signature_key(&key), stored.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::GossipSignatures,
-                vec![(encode_signature_key(&key), signature.to_bytes())],
-            )
+            .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
         batch.commit().expect("commit");
     }
 
     // ============ Aggregated Payloads ============
 
-    /// Iterate over all (signature_key, proofs) pairs.
+    /// Iterate over all (signature_key, stored_payloads) pairs.
     pub fn iter_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<AggregatedSignatureProof>)> + '_ {
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
             .prefix_iterator(Table::AggregatedPayloads, &[])
@@ -514,9 +761,9 @@ impl Store {
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
                 let key = decode_signature_key(&k);
-                let proofs =
-                    Vec::<AggregatedSignatureProof>::from_ssz_bytes(&v).expect("valid proofs");
-                (key, proofs)
+                let payloads =
+                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
+                (key, payloads)
             })
             .collect();
         entries.into_iter()
@@ -525,26 +772,47 @@ impl Store {
     pub fn get_aggregated_payloads(
         &self,
         key: &SignatureKey,
-    ) -> Option<Vec<AggregatedSignatureProof>> {
+    ) -> Option<Vec<StoredAggregatedPayload>> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::AggregatedPayloads, &encode_signature_key(key))
             .expect("get")
             .map(|bytes| {
-                Vec::<AggregatedSignatureProof>::from_ssz_bytes(&bytes).expect("valid proofs")
+                Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid payloads")
             })
     }
 
-    pub fn push_aggregated_payload(&mut self, key: SignatureKey, proof: AggregatedSignatureProof) {
-        // Read existing, add new, write back
-        let mut proofs = self.get_aggregated_payloads(&key).unwrap_or_default();
-        proofs.push(proof);
+    /// Insert an aggregated signature proof for a validator's attestation.
+    ///
+    /// Multiple proofs can be stored for the same (validator, attestation_data) pair,
+    /// each with its own slot metadata for pruning.
+    ///
+    /// # Thread Safety
+    ///
+    /// This method uses a read-modify-write pattern that is NOT atomic:
+    /// 1. Read existing payloads
+    /// 2. Append new payload
+    /// 3. Write back
+    ///
+    /// Concurrent calls could result in lost updates. This method MUST be called
+    /// from a single thread. In our case, that thread is the `BlockChain` `GenServer`
+    pub fn insert_aggregated_payload(
+        &mut self,
+        attestation_data: &AttestationData,
+        validator_id: u64,
+        proof: AggregatedSignatureProof,
+    ) {
+        let slot = attestation_data.slot;
+        let data_root = attestation_data.tree_hash_root();
+        let key = (validator_id, data_root);
+
+        // Read existing, add new, write back (NOT atomic - requires single-threaded access)
+        let mut payloads = self.get_aggregated_payloads(&key).unwrap_or_default();
+        payloads.push(StoredAggregatedPayload { slot, proof });
 
         let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(encode_signature_key(&key), payloads.as_ssz_bytes())];
         batch
-            .put_batch(
-                Table::AggregatedPayloads,
-                vec![(encode_signature_key(&key), proofs.as_ssz_bytes())],
-            )
+            .put_batch(Table::AggregatedPayloads, entries)
             .expect("put proofs");
         batch.commit().expect("commit");
     }

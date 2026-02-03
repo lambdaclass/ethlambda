@@ -7,10 +7,12 @@ use ethlambda_types::block::{
     AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody, BlockSignatures,
     BlockWithAttestation, SignedBlockWithAttestation,
 };
-use ethlambda_types::primitives::{BitList, Encode, H256, VariableList};
+use ethlambda_types::primitives::{
+    BitList, H256, VariableList,
+    ssz::{Decode as SszDecode, Encode as SszEncode},
+};
 use ethlambda_types::state::{Checkpoint as EthCheckpoint, State, ValidatorPubkeyBytes};
 use serde::Deserialize;
-use ssz_derive::{Decode as SszDecode, Encode as SszEncode};
 use ssz_types::FixedVector;
 use ssz_types::typenum::{U28, U32};
 use std::collections::HashMap;

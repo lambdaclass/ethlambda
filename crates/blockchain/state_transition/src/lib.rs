@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ethlambda_types::{
     ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
-    primitives::{H256, TreeHash},
+    primitives::{H256, ssz::TreeHash},
     state::{Checkpoint, JustificationValidators, State},
 };
 use tracing::info;

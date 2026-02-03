@@ -5,7 +5,7 @@ use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     block::{Block, SignedBlockWithAttestation},
-    primitives::TreeHash,
+    primitives::ssz::TreeHash,
     state::State,
 };
 
