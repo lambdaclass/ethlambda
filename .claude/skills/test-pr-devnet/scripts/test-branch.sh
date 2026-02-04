@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: ./test-branch.sh [branch-name] [--with-sync-test]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ETHLAMBDA_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+ETHLAMBDA_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 LEAN_QUICKSTART="${LEAN_QUICKSTART:-/Users/mega/lean_consensus/lean-quickstart}"
 
 # Colors
@@ -210,6 +210,7 @@ echo "Blocks published: $BLOCKS_PUBLISHED"
 
 # Count errors
 ERROR_COUNT=$(docker logs ethlambda_0 2>&1 | grep -c "ERROR" || echo "0")
+ERROR_COUNT=$(echo "$ERROR_COUNT" | tr -d '\n' | xargs)
 if [[ "$ERROR_COUNT" -eq 0 ]]; then
     echo -e "Errors: ${GREEN}$ERROR_COUNT${NC}"
 else

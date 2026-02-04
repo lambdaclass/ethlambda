@@ -392,12 +392,12 @@ pub fn on_block(
                 data: att.data.clone(),
             };
             // TODO: validate attestations before processing
-            if let Err(err) = on_attestation(store, attestation, true) {
-                warn!(%slot, %validator_id, %err, "Invalid attestation in block");
-                metrics::inc_attestations_invalid("block");
-            } else {
-                metrics::inc_attestations_valid("block");
-            }
+            let _ = on_attestation(store, attestation, true)
+                .inspect(|_| metrics::inc_attestations_valid("block"))
+                .inspect_err(|err| {
+                    warn!(%slot, %validator_id, %err, "Invalid attestation in block");
+                    metrics::inc_attestations_invalid("block");
+                });
         }
     }
 
@@ -424,12 +424,12 @@ pub fn on_block(
 
     // Process proposer attestation (enters "new" stage, not "known")
     // TODO: validate attestations before processing
-    if let Err(err) = on_attestation(store, proposer_attestation, false) {
-        metrics::inc_attestations_invalid("block");
-        warn!(%slot, %err, "Invalid proposer attestation in block");
-    } else {
-        metrics::inc_attestations_valid("gossip");
-    }
+    let _ = on_attestation(store, proposer_attestation, false)
+        .inspect(|_| metrics::inc_attestations_valid("gossip"))
+        .inspect_err(|err| {
+            warn!(%slot, %err, "Invalid proposer attestation in block");
+            metrics::inc_attestations_invalid("block");
+        });
 
     info!(%slot, %block_root, %state_root, "Processed new block");
     Ok(())
