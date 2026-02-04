@@ -94,6 +94,16 @@ pub fn verify_checkpoint_state(
         )));
     }
 
+    // Validator indices are sequential (0, 1, 2, ...)
+    for (position, validator) in state.validators.iter().enumerate() {
+        if validator.index != position as u64 {
+            return Err(CheckpointSyncError::Verification(format!(
+                "validator at position {} has index {} (expected {})",
+                position, validator.index, position
+            )));
+        }
+    }
+
     // Validator pubkeys match (critical security check)
     for (i, (state_val, expected_val)) in state
         .validators
@@ -123,10 +133,38 @@ pub fn verify_checkpoint_state(
         ));
     }
 
+    // If justified and finalized are at same slot, roots must match
+    if state.latest_justified.slot == state.latest_finalized.slot
+        && state.latest_justified.root != state.latest_finalized.root
+    {
+        return Err(CheckpointSyncError::Verification(
+            "justified and finalized at same slot must have matching roots".into(),
+        ));
+    }
+
     // Block header slot consistency
     if state.latest_block_header.slot > state.slot {
         return Err(CheckpointSyncError::Verification(
             "block header slot exceeds state slot".into(),
+        ));
+    }
+
+    // If block header matches checkpoint slots, roots must match
+    let block_root = state.latest_block_header.tree_hash_root();
+
+    if state.latest_block_header.slot == state.latest_finalized.slot
+        && block_root != state.latest_finalized.root.0
+    {
+        return Err(CheckpointSyncError::Verification(
+            "block header at finalized slot must match finalized root".into(),
+        ));
+    }
+
+    if state.latest_block_header.slot == state.latest_justified.slot
+        && block_root != state.latest_justified.root.0
+    {
+        return Err(CheckpointSyncError::Verification(
+            "block header at justified slot must match justified root".into(),
         ));
     }
 
@@ -201,6 +239,15 @@ mod tests {
         }
     }
 
+    fn create_validators_with_indices(count: usize) -> Vec<Validator> {
+        (0..count)
+            .map(|i| Validator {
+                pubkey: [i as u8 + 1; 52],
+                index: i as u64,
+            })
+            .collect()
+    }
+
     #[test]
     fn verify_accepts_valid_state() {
         let validators = vec![create_test_validator()];
@@ -233,8 +280,33 @@ mod tests {
     fn verify_rejects_validator_count_mismatch() {
         let validators = vec![create_test_validator()];
         let state = create_test_state(100, validators.clone(), 1000);
-        let extra_validators = vec![create_test_validator(), create_test_validator()];
+        let extra_validators = create_validators_with_indices(2);
         assert!(verify_checkpoint_state(&state, 1000, &extra_validators).is_err());
+    }
+
+    #[test]
+    fn verify_accepts_multiple_validators_with_sequential_indices() {
+        let validators = create_validators_with_indices(3);
+        let state = create_test_state(100, validators.clone(), 1000);
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_non_sequential_validator_indices() {
+        let mut validators = create_validators_with_indices(3);
+        validators[1].index = 5; // Wrong index at position 1
+        let state = create_test_state(100, validators.clone(), 1000);
+        let expected_validators = create_validators_with_indices(3);
+        assert!(verify_checkpoint_state(&state, 1000, &expected_validators).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_duplicate_validator_indices() {
+        let mut validators = create_validators_with_indices(3);
+        validators[2].index = 0; // Duplicate index
+        let state = create_test_state(100, validators.clone(), 1000);
+        let expected_validators = create_validators_with_indices(3);
+        assert!(verify_checkpoint_state(&state, 1000, &expected_validators).is_err());
     }
 
     #[test]
@@ -263,10 +335,79 @@ mod tests {
     }
 
     #[test]
+    fn verify_accepts_justified_equals_finalized_with_matching_roots() {
+        use ethlambda_types::primitives::H256;
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        let common_root = H256::from([42u8; 32]);
+        state.latest_finalized.slot = 50;
+        state.latest_finalized.root = common_root;
+        state.latest_justified.slot = 50; // Same slot
+        state.latest_justified.root = common_root; // Same root
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_justified_equals_finalized_with_different_roots() {
+        use ethlambda_types::primitives::H256;
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        state.latest_finalized.slot = 50;
+        state.latest_finalized.root = H256::from([1u8; 32]);
+        state.latest_justified.slot = 50; // Same slot
+        state.latest_justified.root = H256::from([2u8; 32]); // Different root - conflict!
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+    }
+
+    #[test]
     fn verify_rejects_block_header_slot_exceeds_state() {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 101; // Block header slot exceeds state slot
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+    }
+
+    #[test]
+    fn verify_accepts_block_header_matches_finalized_with_correct_root() {
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        state.latest_block_header.slot = 50;
+        let block_root = state.latest_block_header.tree_hash_root();
+        state.latest_finalized.slot = 50;
+        state.latest_finalized.root = block_root;
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_block_header_matches_finalized_with_wrong_root() {
+        use ethlambda_types::primitives::H256;
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        state.latest_block_header.slot = 50;
+        state.latest_finalized.slot = 50;
+        state.latest_finalized.root = H256::from([99u8; 32]); // Wrong root
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+    }
+
+    #[test]
+    fn verify_accepts_block_header_matches_justified_with_correct_root() {
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        state.latest_block_header.slot = 90;
+        let block_root = state.latest_block_header.tree_hash_root();
+        state.latest_justified.slot = 90;
+        state.latest_justified.root = block_root;
+        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_block_header_matches_justified_with_wrong_root() {
+        use ethlambda_types::primitives::H256;
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators.clone(), 1000);
+        state.latest_block_header.slot = 90;
+        state.latest_justified.slot = 90;
+        state.latest_justified.root = H256::from([99u8; 32]); // Wrong root
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
     }
 
