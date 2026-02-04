@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use ethlambda_types::block::{Block, BlockBody};
-use ethlambda_types::primitives::ssz::{Decode, TreeHash};
+use ethlambda_types::primitives::ssz::{Decode, DecodeError, TreeHash};
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
 
@@ -17,10 +17,38 @@ const CHECKPOINT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum CheckpointSyncError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("SSZ deserialization failed: {0}")]
-    Ssz(String),
-    #[error("Verification failed: {0}")]
-    Verification(String),
+    #[error("SSZ deserialization failed: {0:?}")]
+    SszDecode(DecodeError),
+    #[error("checkpoint state slot cannot be 0")]
+    SlotIsZero,
+    #[error("checkpoint state has no validators")]
+    NoValidators,
+    #[error("genesis time mismatch: expected {expected}, got {got}")]
+    GenesisTimeMismatch { expected: u64, got: u64 },
+    #[error("validator count mismatch: expected {expected}, got {got}")]
+    ValidatorCountMismatch { expected: usize, got: usize },
+    #[error(
+        "validator at position {position} has non-sequential index (expected {expected}, got {got})"
+    )]
+    NonSequentialValidatorIndex {
+        position: usize,
+        expected: u64,
+        got: u64,
+    },
+    #[error("validator {index} pubkey mismatch")]
+    ValidatorPubkeyMismatch { index: usize },
+    #[error("finalized slot cannot exceed state slot")]
+    FinalizedExceedsStateSlot,
+    #[error("justified slot cannot precede finalized slot")]
+    JustifiedPrecedesFinalized,
+    #[error("justified and finalized at same slot must have matching roots")]
+    JustifiedFinalizedRootMismatch,
+    #[error("block header slot exceeds state slot")]
+    BlockHeaderSlotExceedsState,
+    #[error("block header at finalized slot must match finalized root")]
+    BlockHeaderFinalizedRootMismatch,
+    #[error("block header at justified slot must match justified root")]
+    BlockHeaderJustifiedRootMismatch,
 }
 
 /// Fetch finalized state from checkpoint sync URL.
@@ -53,7 +81,8 @@ pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointS
         .error_for_status()?;
 
     let bytes = response.bytes().await?;
-    State::from_ssz_bytes(&bytes).map_err(|e| CheckpointSyncError::Ssz(format!("{:?}", e)))
+    let state = State::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)?;
+    Ok(state)
 }
 
 /// Verify checkpoint state is structurally valid.
@@ -69,38 +98,38 @@ pub fn verify_checkpoint_state(
 ) -> Result<(), CheckpointSyncError> {
     // Slot sanity check
     if state.slot == 0 {
-        return Err(CheckpointSyncError::Verification("slot cannot be 0".into()));
+        return Err(CheckpointSyncError::SlotIsZero);
     }
 
     // Validators exist
     if state.validators.is_empty() {
-        return Err(CheckpointSyncError::Verification("no validators".into()));
+        return Err(CheckpointSyncError::NoValidators);
     }
 
     // Genesis time matches
     if state.config.genesis_time != expected_genesis_time {
-        return Err(CheckpointSyncError::Verification(format!(
-            "genesis time mismatch: expected {}, got {}",
-            expected_genesis_time, state.config.genesis_time
-        )));
+        return Err(CheckpointSyncError::GenesisTimeMismatch {
+            expected: expected_genesis_time,
+            got: state.config.genesis_time,
+        });
     }
 
     // Validator count matches
     if state.validators.len() != expected_validators.len() {
-        return Err(CheckpointSyncError::Verification(format!(
-            "validator count mismatch: expected {}, got {}",
-            expected_validators.len(),
-            state.validators.len()
-        )));
+        return Err(CheckpointSyncError::ValidatorCountMismatch {
+            expected: expected_validators.len(),
+            got: state.validators.len(),
+        });
     }
 
     // Validator indices are sequential (0, 1, 2, ...)
     for (position, validator) in state.validators.iter().enumerate() {
         if validator.index != position as u64 {
-            return Err(CheckpointSyncError::Verification(format!(
-                "validator at position {} has index {} (expected {})",
-                position, validator.index, position
-            )));
+            return Err(CheckpointSyncError::NonSequentialValidatorIndex {
+                position,
+                expected: position as u64,
+                got: validator.index,
+            });
         }
     }
 
@@ -112,41 +141,30 @@ pub fn verify_checkpoint_state(
         .enumerate()
     {
         if state_val.pubkey != expected_val.pubkey {
-            return Err(CheckpointSyncError::Verification(format!(
-                "validator {} pubkey mismatch",
-                i
-            )));
+            return Err(CheckpointSyncError::ValidatorPubkeyMismatch { index: i });
         }
     }
 
     // Finalized slot sanity
     if state.latest_finalized.slot > state.slot {
-        return Err(CheckpointSyncError::Verification(
-            "finalized slot cannot exceed state slot".into(),
-        ));
+        return Err(CheckpointSyncError::FinalizedExceedsStateSlot);
     }
 
     // Justified must be at or after finalized
     if state.latest_justified.slot < state.latest_finalized.slot {
-        return Err(CheckpointSyncError::Verification(
-            "justified slot cannot precede finalized slot".into(),
-        ));
+        return Err(CheckpointSyncError::JustifiedPrecedesFinalized);
     }
 
     // If justified and finalized are at same slot, roots must match
     if state.latest_justified.slot == state.latest_finalized.slot
         && state.latest_justified.root != state.latest_finalized.root
     {
-        return Err(CheckpointSyncError::Verification(
-            "justified and finalized at same slot must have matching roots".into(),
-        ));
+        return Err(CheckpointSyncError::JustifiedFinalizedRootMismatch);
     }
 
     // Block header slot consistency
     if state.latest_block_header.slot > state.slot {
-        return Err(CheckpointSyncError::Verification(
-            "block header slot exceeds state slot".into(),
-        ));
+        return Err(CheckpointSyncError::BlockHeaderSlotExceedsState);
     }
 
     // If block header matches checkpoint slots, roots must match
@@ -155,17 +173,13 @@ pub fn verify_checkpoint_state(
     if state.latest_block_header.slot == state.latest_finalized.slot
         && block_root != state.latest_finalized.root.0
     {
-        return Err(CheckpointSyncError::Verification(
-            "block header at finalized slot must match finalized root".into(),
-        ));
+        return Err(CheckpointSyncError::BlockHeaderFinalizedRootMismatch);
     }
 
     if state.latest_block_header.slot == state.latest_justified.slot
         && block_root != state.latest_justified.root.0
     {
-        return Err(CheckpointSyncError::Verification(
-            "block header at justified slot must match justified root".into(),
-        ));
+        return Err(CheckpointSyncError::BlockHeaderJustifiedRootMismatch);
     }
 
     Ok(())
