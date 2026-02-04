@@ -215,10 +215,11 @@ where
     loop {
         // Read chunk result code
         let mut result_byte = 0_u8;
-        match io.read_exact(std::slice::from_mut(&mut result_byte)).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+        if let Err(e) = io.read_exact(std::slice::from_mut(&mut result_byte)).await {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(e);
         }
 
         let code = ResponseCode::from(result_byte);
