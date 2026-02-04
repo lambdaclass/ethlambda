@@ -21,7 +21,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
-use ethlambda_storage::{Store, backend::RocksDBBackend};
+use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -100,47 +100,19 @@ async fn main() {
     populate_name_registry(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
-    let validators = genesis_config.validators();
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
     let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
 
-    let store = if let Some(checkpoint_url) = &options.checkpoint_sync_url {
-        // Checkpoint sync path
-        info!(%checkpoint_url, "Starting checkpoint sync");
-
-        let Ok(state) = checkpoint_sync::fetch_checkpoint_state(checkpoint_url)
-            .await
-            .inspect_err(|err| error!(%checkpoint_url, %err, "Checkpoint sync failed"))
-        else {
-            std::process::exit(1);
-        };
-
-        let genesis_time = genesis.config.genesis_time;
-
-        // Verify against local genesis config
-        if let Err(err) =
-            checkpoint_sync::verify_checkpoint_state(&state, genesis_time, &validators)
-        {
-            error!(%err, "Checkpoint state verification failed");
-            std::process::exit(1);
-        }
-
-        let anchor_block = checkpoint_sync::construct_anchor_block(&state);
-
-        info!(
-            slot = state.slot,
-            validators = state.validators.len(),
-            finalized_slot = state.latest_finalized.slot,
-            "Checkpoint sync complete"
-        );
-
-        Store::get_forkchoice_store(backend, state, anchor_block)
-    } else {
-        let genesis_state = State::from_genesis(genesis_config.genesis_time, validators);
-        Store::from_anchor_state(backend, genesis_state)
-    };
+    let store = fetch_initial_state(
+        options.checkpoint_sync_url.as_deref(),
+        &genesis_config,
+        backend.clone(),
+    )
+    .await
+    .inspect_err(|err| error!(%err, "Failed to initialize state"))
+    .unwrap_or_else(|_| std::process::exit(1));
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
@@ -295,4 +267,54 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
         std::process::exit(1);
     };
     bytes
+}
+
+/// Fetch the initial state for the node.
+///
+/// If `checkpoint_url` is provided, performs checkpoint sync by downloading
+/// and verifying the finalized state from a remote peer. Otherwise, creates
+/// a genesis state from the local genesis configuration.
+///
+/// # Arguments
+///
+/// * `checkpoint_url` - Optional URL to fetch checkpoint state from
+/// * `genesis` - Genesis configuration (for genesis_time verification and genesis state creation)
+/// * `validators` - Validator set (moved for genesis state creation)
+/// * `backend` - Storage backend for Store creation
+///
+/// # Returns
+///
+/// `Ok(Store)` on success, or `Err(CheckpointSyncError)` if checkpoint sync fails.
+/// Genesis path is infallible and always returns `Ok`.
+async fn fetch_initial_state(
+    checkpoint_url: Option<&str>,
+    genesis: &GenesisConfig,
+    backend: Arc<dyn StorageBackend>,
+) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
+    let validators = genesis.validators();
+    let store = if let Some(checkpoint_url) = checkpoint_url {
+        // Checkpoint sync path
+        info!(%checkpoint_url, "Starting checkpoint sync");
+
+        let state = checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await?;
+
+        // Verify against local genesis config
+        checkpoint_sync::verify_checkpoint_state(&state, genesis.genesis_time, &validators)?;
+
+        let anchor_block = checkpoint_sync::construct_anchor_block(&state);
+
+        info!(
+            slot = state.slot,
+            validators = state.validators.len(),
+            finalized_slot = state.latest_finalized.slot,
+            "Checkpoint sync complete"
+        );
+
+        Store::get_forkchoice_store(backend, state, anchor_block)
+    } else {
+        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
+        Store::from_anchor_state(backend, genesis_state)
+    };
+
+    Ok(store)
 }
