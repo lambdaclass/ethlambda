@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use ethlambda_types::block::{Block, BlockBody};
-use ethlambda_types::primitives::Decode;
+use ethlambda_types::primitives::ssz::Decode;
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
 
