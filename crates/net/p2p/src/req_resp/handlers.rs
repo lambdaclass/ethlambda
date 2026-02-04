@@ -121,12 +121,13 @@ async fn handle_blocks_by_root_request(
     let found = blocks.len();
     info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
-    if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
-        channel,
-        Response::success(ResponsePayload::BlocksByRoot(blocks)),
-    ) {
-        warn!(%peer, ?err, "Failed to send BlocksByRoot response");
-    }
+    let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+    server
+        .swarm
+        .behaviour_mut()
+        .req_resp
+        .send_response(channel, response)
+        .inspect_err(|err| warn!(%peer, ?err, "Failed to send BlocksByRoot response"));
 }
 
 async fn handle_blocks_by_root_response(
