@@ -104,21 +104,20 @@ async fn main() {
         // Checkpoint sync path
         info!(%checkpoint_url, "Starting checkpoint sync");
 
-        let state = match checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await {
-            Ok(state) => state,
-            Err(e) => {
-                error!(%checkpoint_url, %e, "Checkpoint sync failed");
-                std::process::exit(1);
-            }
+        let Ok(state) = checkpoint_sync::fetch_checkpoint_state(checkpoint_url)
+            .await
+            .inspect_err(|err| error!(%checkpoint_url, %err, "Checkpoint sync failed"))
+        else {
+            std::process::exit(1);
         };
 
+        let genesis_time = genesis.config.genesis_time;
+
         // Verify against local genesis config
-        if let Err(e) = checkpoint_sync::verify_checkpoint_state(
-            &state,
-            genesis.config.genesis_time,
-            &validators,
-        ) {
-            error!(%e, "Checkpoint state verification failed");
+        if let Err(err) =
+            checkpoint_sync::verify_checkpoint_state(&state, genesis_time, &validators)
+        {
+            error!(%err, "Checkpoint state verification failed");
             std::process::exit(1);
         }
 
@@ -133,7 +132,6 @@ async fn main() {
 
         Store::get_forkchoice_store(backend, state, anchor_block)
     } else {
-        // Genesis path (existing code)
         let genesis_state = State::from_genesis(&genesis, validators);
         Store::from_genesis(backend, genesis_state)
     };
