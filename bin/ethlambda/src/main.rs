@@ -68,6 +68,8 @@ async fn main() {
 
     println!("{ASCII_ART}");
 
+    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+
     info!(node_key=?options.node_key, "got node key");
 
     let genesis_path = options.custom_network_config_dir.join("genesis.json");
