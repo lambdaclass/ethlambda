@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use ethlambda_types::block::{Block, BlockBody};
-use ethlambda_types::primitives::ssz::Decode;
+use ethlambda_types::primitives::ssz::{Decode, TreeHash};
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
 
@@ -52,23 +52,7 @@ pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointS
         .await?
         .error_for_status()?;
 
-    // DoS protection: Check Content-Length before reading
-    if let Some(content_length) = response.content_length()
-        && content_length > MAX_STATE_SIZE
-    {
-        return Err(CheckpointSyncError::Verification(format!(
-            "state too large: {} bytes (max {})",
-            content_length, MAX_STATE_SIZE
-        )));
-    }
-
     let bytes = response.bytes().await?;
-    if bytes.len() as u64 > MAX_STATE_SIZE {
-        return Err(CheckpointSyncError::Verification(
-            "state exceeds size limit".into(),
-        ));
-    }
-
     State::from_ssz_bytes(&bytes).map_err(|e| CheckpointSyncError::Ssz(format!("{:?}", e)))
 }
 
