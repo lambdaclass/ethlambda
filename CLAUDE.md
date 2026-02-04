@@ -112,6 +112,51 @@ let entries = vec![(key, value)];
 batch.put_batch(Table::X, entries).expect("msg");
 ```
 
+### Error Handling Patterns
+
+**Use `inspect` and `inspect_err` for side-effect-only error handling:**
+```rust
+// ✅ GOOD: Use inspect_err when only logging or performing side effects on error
+result
+    .inspect_err(|err| warn!(%err, "Operation failed"));
+
+// Extract complex expressions to variables for cleaner formatting
+let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+server.swarm.behaviour_mut().req_resp.send_response(channel, response)
+    .inspect_err(|err| warn!(%peer, ?err, "Failed to send response"));
+
+// ✅ GOOD: Use inspect + inspect_err when both branches need side effects
+operation()
+    .inspect(|_| metrics::inc_success())
+    .inspect_err(|_| metrics::inc_failed());
+
+// ❌ AVOID: Using if let Err when only performing side effects
+if let Err(err) = result {
+    warn!(%err, "Operation failed");
+}
+
+// ❌ AVOID: Using if/else for both success and error side effects
+if let Err(err) = operation() {
+    metrics::inc_failed();
+} else {
+    metrics::inc_success();
+}
+```
+
+**When NOT to use `inspect_err`:**
+```rust
+// Use if let Err or match when:
+// 1. Early return needed
+if let Err(err) = operation() {
+    error!(%err, "Fatal error");
+    return false;
+}
+
+// 2. Error needs transformation (use map_err + ?)
+let result = operation()
+    .map_err(|err| CustomError::from(err))?;
+```
+
 ### Metrics (RAII Pattern)
 ```rust
 // Timing guard automatically observes duration on drop
