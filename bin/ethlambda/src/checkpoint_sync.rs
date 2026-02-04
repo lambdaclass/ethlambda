@@ -5,8 +5,13 @@ use ethlambda_types::primitives::ssz::Decode;
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
 
-const CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_STATE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB limit
+/// Timeout for establishing the HTTP connection to the checkpoint peer.
+/// Fail fast if the peer is unreachable.
+const CHECKPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for reading data during body download.
+/// This is an inactivity timeout - it resets on each successful read.
+const CHECKPOINT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
@@ -19,12 +24,26 @@ pub enum CheckpointSyncError {
 }
 
 /// Fetch finalized state from checkpoint sync URL.
+///
+/// Uses two-phase timeout strategy:
+/// - Connect timeout (15s): Fails quickly if peer is unreachable
+/// - Read timeout (15s): Inactivity timeout that resets on each read
+///
+/// Note: We use a read timeout (via `.read_timeout()`) instead of a total download
+/// timeout to automatically detect stalled downloads. This allows large states
+/// to be downloaded successfully as long as data keeps flowing, while still
+/// failing fast if the connection stalls. A plain total timeout would
+/// disconnect even for valid downloads if the state is simply too large to
+/// transfer within the time limit.
 pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointSyncError> {
-    let url = format!(
-        "{}/lean/v0/states/finalized",
-        base_url.trim_end_matches('/')
-    );
-    let client = Client::builder().timeout(CHECKPOINT_TIMEOUT).build()?;
+    let base_url = base_url.trim_end_matches('/');
+    let url = format!("{base_url}/lean/v0/states/finalized");
+    // Use .read_timeout() to detect stalled downloads (inactivity timer).
+    // This allows large states to complete as long as data keeps flowing.
+    let client = Client::builder()
+        .connect_timeout(CHECKPOINT_CONNECT_TIMEOUT)
+        .read_timeout(CHECKPOINT_READ_TIMEOUT)
+        .build()?;
 
     let response = client
         .get(&url)
