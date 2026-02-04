@@ -134,8 +134,27 @@ impl libp2p::request_response::Codec for Codec {
     }
 }
 
-/// Decode Status response (single-chunk protocol).
-/// Errors are fatal and returned as error responses.
+/// Decodes a Status protocol response from a single-chunk response stream.
+///
+/// Reads the response code byte and payload, returning either a success response
+/// with the peer's Status or an error response with the error code and message.
+/// Unlike multi-chunk protocols, any error code from the peer is treated as a
+/// valid response rather than a connection failure.
+///
+/// # Returns
+///
+/// Returns `Ok(Response::Success)` containing the peer's `Status` if the response
+/// code is `SUCCESS`.
+///
+/// Returns `Ok(Response::Error)` containing the error code and message if the peer
+/// returned a non-success response code.
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - I/O error occurs while reading the response code or payload
+/// - Peer's error message cannot be SSZ-decoded (InvalidData)
+/// - Peer's Status payload cannot be SSZ-decoded (InvalidData)
 async fn decode_status_response<T>(io: &mut T) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
@@ -164,9 +183,29 @@ where
     Ok(Response::success(ResponsePayload::Status(status)))
 }
 
-/// Decode BlocksByRoot response (multi-chunk protocol).
-/// Error chunks are non-fatal and skipped. EOF at any point (even before first chunk)
-/// returns successfully with all blocks collected so far.
+/// Decodes a BlocksByRoot protocol response from a multi-chunk response stream.
+///
+/// Reads chunks until EOF, collecting successfully decoded blocks. Each chunk has
+/// its own response code - chunks with error codes are logged and skipped rather
+/// than terminating the stream. This allows partial success when some requested
+/// blocks are unavailable. The stream ends naturally at EOF (peer closes after
+/// sending all available blocks).
+///
+/// # Returns
+///
+/// Always returns `Ok(Response::Success)` containing a vector of successfully
+/// decoded blocks. The vector may be empty if no SUCCESS chunks were received
+/// before EOF (either no chunks sent, or all chunks had non-SUCCESS codes)
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - I/O error occurs while reading response codes or payloads (except `UnexpectedEof`
+///   which signals normal stream termination)
+/// - Block payload cannot be SSZ-decoded into `SignedBlockWithAttestation` (InvalidData)
+///
+/// Note: Error chunks from the peer (non-SUCCESS response codes) do not cause this
+/// function to return `Err` - they are logged and skipped.
 async fn decode_blocks_by_root_response<T>(io: &mut T) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
