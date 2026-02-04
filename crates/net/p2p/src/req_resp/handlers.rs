@@ -8,8 +8,7 @@ use ethlambda_types::block::SignedBlockWithAttestation;
 use ethlambda_types::primitives::ssz::TreeHash;
 
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponseCode,
-    ResponsePayload, Status, error_message,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
@@ -32,13 +31,16 @@ pub async fn handle_req_resp_message(
                     handle_blocks_by_root_request(server, request, channel, peer).await;
                 }
             },
-            request_response::Message::Response { response, .. } => match response {
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => match response {
                 Response::Success { payload } => match payload {
                     ResponsePayload::Status(status) => {
                         handle_status_response(status, peer).await;
                     }
-                    ResponsePayload::BlocksByRoot(block) => {
-                        handle_blocks_by_root_response(server, block, peer).await;
+                    ResponsePayload::BlocksByRoot(blocks) => {
+                        handle_blocks_by_root_response(server, blocks, peer, request_id).await;
                     }
                 },
                 Response::Error { code, message } => {
@@ -108,58 +110,59 @@ async fn handle_blocks_by_root_request(
     let num_roots = request.roots.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
-    // TODO: Support multiple blocks per request (currently only handles first root)
-    // The protocol supports up to 1024 roots, but our response type only holds one block.
-    let Some(root) = request.roots.first() else {
-        debug!(%peer, "BlocksByRoot request with no roots");
-        return;
-    };
-
-    match server.store.get_signed_block(root) {
-        Some(signed_block) => {
-            let slot = signed_block.message.block.slot;
-            info!(%peer, %root, %slot, "Responding to BlocksByRoot request");
-
-            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
-                channel,
-                Response::success(ResponsePayload::BlocksByRoot(signed_block)),
-            ) {
-                warn!(%peer, %root, ?err, "Failed to send BlocksByRoot response");
-            }
+    let mut blocks = Vec::new();
+    for root in request.roots.iter() {
+        if let Some(signed_block) = server.store.get_signed_block(root) {
+            blocks.push(signed_block);
         }
-        None => {
-            debug!(%peer, %root, "Block not found for BlocksByRoot request");
-
-            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
-                channel,
-                Response::error(
-                    ResponseCode::RESOURCE_UNAVAILABLE,
-                    error_message("Block not found"),
-                ),
-            ) {
-                warn!(%peer, %root, ?err, "Failed to send RESOURCE_UNAVAILABLE response");
-            }
-        }
+        // Missing blocks are silently skipped (per spec)
     }
+
+    let found = blocks.len();
+    info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
+
+    let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+    let _ = server
+        .swarm
+        .behaviour_mut()
+        .req_resp
+        .send_response(channel, response)
+        .inspect_err(|err| warn!(%peer, ?err, "Failed to send BlocksByRoot response"));
 }
 
 async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
-    block: SignedBlockWithAttestation,
+    blocks: Vec<SignedBlockWithAttestation>,
     peer: PeerId,
+    request_id: request_response::OutboundRequestId,
 ) {
-    let slot = block.message.block.slot;
-    let root = block.message.block.tree_hash_root();
+    info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
 
-    info!(%peer, %slot, %root, "Received BlocksByRoot response");
+    // Look up which root was requested for this specific request
+    let Some(requested_root) = server.request_id_map.remove(&request_id) else {
+        warn!(%peer, ?request_id, "Received response for unknown request_id");
+        return;
+    };
 
-    // Clean up tracking (success!)
-    if server.pending_requests.remove(&root).is_some() {
-        info!(%root, "Block fetch succeeded");
-        server.request_id_map.retain(|_, r| *r != root);
+    for block in blocks {
+        let root = block.message.block.tree_hash_root();
+
+        // Validate that this block matches what we requested
+        if root != requested_root {
+            warn!(
+                %peer,
+                received_root = %ethlambda_types::ShortRoot(&root.0),
+                expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
+                "Received block with mismatched root, ignoring"
+            );
+            continue;
+        }
+
+        // Clean up tracking for this root
+        server.pending_requests.remove(&root);
+
+        server.blockchain.notify_new_block(block).await;
     }
-
-    server.blockchain.notify_new_block(block).await;
 }
 
 /// Build a Status message from the current Store state.

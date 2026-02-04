@@ -323,11 +323,13 @@ impl BlockChainServer {
 
     fn request_missing_block(&mut self, block_root: H256) {
         // Send request to P2P layer (deduplication handled by P2P module)
-        if let Err(err) = self.p2p_tx.send(P2PMessage::FetchBlock(block_root)) {
-            error!(%block_root, %err, "Failed to send FetchBlock message to P2P");
-        } else {
-            info!(%block_root, "Requested missing block from network");
-        }
+        let _ = self
+            .p2p_tx
+            .send(P2PMessage::FetchBlock(block_root))
+            .inspect(|_| info!(%block_root, "Requested missing block from network"))
+            .inspect_err(
+                |err| error!(%block_root, %err, "Failed to send FetchBlock message to P2P"),
+            );
     }
 
     fn process_pending_children(&mut self, parent_root: H256) {
@@ -347,9 +349,8 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
-        if let Err(err) = store::on_gossip_attestation(&mut self.store, attestation) {
-            warn!(%err, "Failed to process gossiped attestation");
-        }
+        let _ = store::on_gossip_attestation(&mut self.store, attestation)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 }
 
