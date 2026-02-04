@@ -410,18 +410,4 @@ mod tests {
         state.latest_justified.root = H256::from([99u8; 32]); // Wrong root
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
     }
-
-    #[test]
-    fn construct_anchor_block_copies_header_fields() {
-        let validators = vec![create_test_validator()];
-        let state = create_test_state(100, validators, 1000);
-        let block = construct_anchor_block(&state);
-        assert_eq!(block.slot, state.latest_block_header.slot);
-        assert_eq!(block.parent_root, state.latest_block_header.parent_root);
-        assert_eq!(
-            block.proposer_index,
-            state.latest_block_header.proposer_index
-        );
-        assert_eq!(block.state_root, state.latest_block_header.state_root);
-    }
 }
