@@ -411,7 +411,7 @@ async fn handle_peer_redial(server: &mut P2PServer, peer_id: PeerId) {
         info!(%peer_id, "Redialing disconnected bootnode");
         // NOTE: this dial does some checks and adds a pending outbound connection attempt.
         // It does NOT block. If the dial fails, we'll later get an OutgoingConnectionError event.
-        server.swarm.dial(addr.clone()).inspect_err(|e| {
+        let _ = server.swarm.dial(addr.clone()).inspect_err(|e| {
             warn!(%peer_id, %e, "Failed to redial bootnode, will retry");
             // Schedule another redial attempt
             schedule_peer_redial(server.retry_tx.clone(), peer_id);

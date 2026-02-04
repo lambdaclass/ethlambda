@@ -122,7 +122,7 @@ async fn handle_blocks_by_root_request(
     info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
     let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
-    server
+    let _ = server
         .swarm
         .behaviour_mut()
         .req_resp
