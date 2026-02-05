@@ -462,23 +462,7 @@ impl Store {
         removed_count
     }
 
-    /// Get the full block by combining header and body.
-    pub fn get_block(&self, root: &H256) -> Option<Block> {
-        let view = self.backend.begin_read().expect("read view");
-        let key = root.as_ssz_bytes();
-
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
-
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
-        let body = BlockBody::from_ssz_bytes(&body_bytes).expect("valid body");
-
-        Some(Block::from_header_and_body(header, body))
-    }
-
-    /// Get only the block header without deserializing the body.
-    ///
-    /// This is more efficient than `get_block` when only header fields are needed.
+    /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::BlockHeaders, &root.as_ssz_bytes())
@@ -860,7 +844,7 @@ impl Store {
 
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
-        self.get_block(&self.safe_target())
+        self.get_block_header(&self.safe_target())
             .expect("safe target exists")
             .slot
     }
