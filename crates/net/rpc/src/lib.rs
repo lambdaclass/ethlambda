@@ -118,7 +118,7 @@ mod tests {
     async fn test_get_latest_justified_checkpoint() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_genesis(backend, state);
+        let store = Store::from_anchor_state(backend, state);
 
         let app = build_api_router(store.clone());
 
@@ -154,7 +154,7 @@ mod tests {
 
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_genesis(backend, state);
+        let store = Store::from_anchor_state(backend, state);
 
         // Get the expected state from the store
         let finalized = store.latest_finalized();
