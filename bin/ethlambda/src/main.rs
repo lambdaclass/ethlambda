@@ -1,3 +1,4 @@
+mod checkpoint_sync;
 mod version;
 
 use std::{
@@ -46,6 +47,10 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
+    /// URL of a peer to download checkpoint state from (e.g., http://peer:5052)
+    /// When set, skips genesis initialization and syncs from checkpoint.
+    #[arg(long)]
+    checkpoint_sync_url: Option<String>,
 }
 
 #[tokio::main]
@@ -93,9 +98,17 @@ async fn main() {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let genesis_state = State::from_genesis(&genesis, validators);
     let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
-    let store = Store::from_genesis(backend, genesis_state);
+
+    let mut state = State::from_genesis(&genesis, validators);
+
+    if let Some(checkpoint_sync_url) = &options.checkpoint_sync_url {
+        state = fetch_initial_state(checkpoint_sync_url, state)
+            .await
+            .inspect_err(|err| error!(%err, "Failed to initialize state"))
+            .unwrap_or_else(|_| std::process::exit(1));
+    }
+    let store = Store::from_anchor_state(backend, state);
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
@@ -277,4 +290,43 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
         std::process::exit(1);
     };
     bytes
+}
+
+/// Fetch the initial state for the node.
+///
+/// If `checkpoint_url` is provided, performs checkpoint sync by downloading
+/// and verifying the finalized state from a remote peer. Otherwise, creates
+/// a genesis state from the local genesis configuration.
+///
+/// # Arguments
+///
+/// * `checkpoint_url` - Optional URL to fetch checkpoint state from
+/// * `genesis` - Genesis configuration (for genesis_time verification and genesis state creation)
+/// * `validators` - Validator set (moved for genesis state creation)
+/// * `backend` - Storage backend for Store creation
+///
+/// # Returns
+///
+/// `Ok(Store)` on success, or `Err(CheckpointSyncError)` if checkpoint sync fails.
+/// Genesis path is infallible and always returns `Ok`.
+async fn fetch_initial_state(
+    checkpoint_url: &str,
+    genesis_state: State,
+) -> Result<State, checkpoint_sync::CheckpointSyncError> {
+    // Checkpoint sync path
+    info!(%checkpoint_url, "Starting checkpoint sync");
+
+    let state = checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await?;
+
+    // Verify against local genesis config
+    checkpoint_sync::verify_checkpoint_state(&state, &genesis_state)?;
+
+    info!(
+        slot = state.slot,
+        validators = state.validators.len(),
+        finalized_slot = state.latest_finalized.slot,
+        "Checkpoint sync complete"
+    );
+
+    Ok(state)
 }

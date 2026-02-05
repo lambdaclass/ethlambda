@@ -28,7 +28,7 @@ fn test_put_and_get(backend: &dyn StorageBackend) {
         let mut batch = backend.begin_write().unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_put_get_key".to_vec(), b"value1".to_vec())],
             )
             .unwrap();
@@ -38,7 +38,7 @@ fn test_put_and_get(backend: &dyn StorageBackend) {
     // Read data
     {
         let view = backend.begin_read().unwrap();
-        let value = view.get(Table::Blocks, b"test_put_get_key").unwrap();
+        let value = view.get(Table::BlockHeaders, b"test_put_get_key").unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
     }
 }
@@ -49,7 +49,7 @@ fn test_delete(backend: &dyn StorageBackend) {
         let mut batch = backend.begin_write().unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_delete_key".to_vec(), b"value1".to_vec())],
             )
             .unwrap();
@@ -60,7 +60,7 @@ fn test_delete(backend: &dyn StorageBackend) {
     {
         let mut batch = backend.begin_write().unwrap();
         batch
-            .delete_batch(Table::Blocks, vec![b"test_delete_key".to_vec()])
+            .delete_batch(Table::BlockHeaders, vec![b"test_delete_key".to_vec()])
             .unwrap();
         batch.commit().unwrap();
     }
@@ -68,7 +68,7 @@ fn test_delete(backend: &dyn StorageBackend) {
     // Verify deleted
     {
         let view = backend.begin_read().unwrap();
-        let value = view.get(Table::Blocks, b"test_delete_key").unwrap();
+        let value = view.get(Table::BlockHeaders, b"test_delete_key").unwrap();
         assert_eq!(value, None);
     }
 }
@@ -109,7 +109,7 @@ fn test_prefix_iterator(backend: &dyn StorageBackend) {
 fn test_nonexistent_key(backend: &dyn StorageBackend) {
     let view = backend.begin_read().unwrap();
     let value = view
-        .get(Table::Blocks, b"test_nonexistent_key_12345")
+        .get(Table::BlockHeaders, b"test_nonexistent_key_12345")
         .unwrap();
     assert_eq!(value, None);
 }
@@ -120,7 +120,7 @@ fn test_delete_then_put(backend: &dyn StorageBackend) {
         let mut batch = backend.begin_write().unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_del_put_key".to_vec(), b"old".to_vec())],
             )
             .unwrap();
@@ -131,11 +131,11 @@ fn test_delete_then_put(backend: &dyn StorageBackend) {
     {
         let mut batch = backend.begin_write().unwrap();
         batch
-            .delete_batch(Table::Blocks, vec![b"test_del_put_key".to_vec()])
+            .delete_batch(Table::BlockHeaders, vec![b"test_del_put_key".to_vec()])
             .unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_del_put_key".to_vec(), b"new".to_vec())],
             )
             .unwrap();
@@ -144,7 +144,7 @@ fn test_delete_then_put(backend: &dyn StorageBackend) {
 
     let view = backend.begin_read().unwrap();
     assert_eq!(
-        view.get(Table::Blocks, b"test_del_put_key").unwrap(),
+        view.get(Table::BlockHeaders, b"test_del_put_key").unwrap(),
         Some(b"new".to_vec())
     );
 }
@@ -155,18 +155,21 @@ fn test_put_then_delete(backend: &dyn StorageBackend) {
         let mut batch = backend.begin_write().unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_put_del_key".to_vec(), b"value".to_vec())],
             )
             .unwrap();
         batch
-            .delete_batch(Table::Blocks, vec![b"test_put_del_key".to_vec()])
+            .delete_batch(Table::BlockHeaders, vec![b"test_put_del_key".to_vec()])
             .unwrap();
         batch.commit().unwrap();
     }
 
     let view = backend.begin_read().unwrap();
-    assert_eq!(view.get(Table::Blocks, b"test_put_del_key").unwrap(), None);
+    assert_eq!(
+        view.get(Table::BlockHeaders, b"test_put_del_key").unwrap(),
+        None
+    );
 }
 
 fn test_multiple_tables(backend: &dyn StorageBackend) {
@@ -175,7 +178,7 @@ fn test_multiple_tables(backend: &dyn StorageBackend) {
         let mut batch = backend.begin_write().unwrap();
         batch
             .put_batch(
-                Table::Blocks,
+                Table::BlockHeaders,
                 vec![(b"test_multi_key".to_vec(), b"block".to_vec())],
             )
             .unwrap();
@@ -192,7 +195,7 @@ fn test_multiple_tables(backend: &dyn StorageBackend) {
     {
         let view = backend.begin_read().unwrap();
         assert_eq!(
-            view.get(Table::Blocks, b"test_multi_key").unwrap(),
+            view.get(Table::BlockHeaders, b"test_multi_key").unwrap(),
             Some(b"block".to_vec())
         );
         assert_eq!(
