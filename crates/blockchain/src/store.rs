@@ -46,8 +46,8 @@ fn update_head(store: &mut Store) {
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 
     if old_head != new_head {
-        let old_slot = store.get_block(&old_head).map(|b| b.slot).unwrap_or(0);
-        let new_slot = store.get_block(&new_head).map(|b| b.slot).unwrap_or(0);
+        let old_slot = store.get_block_header(&old_head).map(|h| h.slot).unwrap_or(0);
+        let new_slot = store.get_block_header(&new_head).map(|h| h.slot).unwrap_or(0);
         let justified_slot = store.latest_justified().slot;
         let finalized_slot = store.latest_finalized().slot;
         info!(
@@ -91,11 +91,11 @@ fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), 
     let data = &attestation.data;
 
     // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
-    let source_block = store
-        .get_block(&data.source.root)
+    let source_header = store
+        .get_block_header(&data.source.root)
         .ok_or(StoreError::UnknownSourceBlock(data.source.root))?;
-    let target_block = store
-        .get_block(&data.target.root)
+    let target_header = store
+        .get_block_header(&data.target.root)
         .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
 
     if !store.contains_block(&data.head.root) {
@@ -108,16 +108,16 @@ fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), 
     }
 
     // Consistency Check - Validate checkpoint slots match block slots.
-    if source_block.slot != data.source.slot {
+    if source_header.slot != data.source.slot {
         return Err(StoreError::SourceSlotMismatch {
             checkpoint_slot: data.source.slot,
-            block_slot: source_block.slot,
+            block_slot: source_header.slot,
         });
     }
-    if target_block.slot != data.target.slot {
+    if target_header.slot != data.target.slot {
         return Err(StoreError::TargetSlotMismatch {
             checkpoint_slot: data.target.slot,
-            block_slot: target_block.slot,
+            block_slot: target_header.slot,
         });
     }
 
@@ -441,12 +441,12 @@ pub fn on_block(
 pub fn get_attestation_target(store: &Store) -> Checkpoint {
     // Start from current head
     let mut target_block_root = store.head();
-    let mut target_block = store
-        .get_block(&target_block_root)
+    let mut target_header = store
+        .get_block_header(&target_block_root)
         .expect("head block exists");
 
     let safe_target_block_slot = store
-        .get_block(&store.safe_target())
+        .get_block_header(&store.safe_target())
         .expect("safe target exists")
         .slot;
 
@@ -455,10 +455,10 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
     // This ensures the target doesn't advance too far ahead of safe target,
     // providing a balance between liveness and safety.
     for _ in 0..JUSTIFICATION_LOOKBACK_SLOTS {
-        if target_block.slot > safe_target_block_slot {
-            target_block_root = target_block.parent_root;
-            target_block = store
-                .get_block(&target_block_root)
+        if target_header.slot > safe_target_block_slot {
+            target_block_root = target_header.parent_root;
+            target_header = store
+                .get_block_header(&target_block_root)
                 .expect("parent block exists");
         } else {
             break;
@@ -469,15 +469,15 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
     //
     // Walk back until we find a slot that satisfies justifiability rules
     // relative to the latest finalized checkpoint.
-    while !slot_is_justifiable_after(target_block.slot, store.latest_finalized().slot) {
-        target_block_root = target_block.parent_root;
-        target_block = store
-            .get_block(&target_block_root)
+    while !slot_is_justifiable_after(target_header.slot, store.latest_finalized().slot) {
+        target_block_root = target_header.parent_root;
+        target_header = store
+            .get_block_header(&target_block_root)
             .expect("parent block exists");
     }
     Checkpoint {
         root: target_block_root,
-        slot: target_block.slot,
+        slot: target_header.slot,
     }
 }
 
@@ -487,7 +487,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_checkpoint = Checkpoint {
         root: store.head(),
         slot: store
-            .get_block(&store.head())
+            .get_block_header(&store.head())
             .expect("head block exists")
             .slot,
     };
@@ -1055,16 +1055,16 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
         return false;
     }
 
-    let Some(old_head_block) = store.get_block(&old_head) else {
+    let Some(old_head_header) = store.get_block_header(&old_head) else {
         return false;
     };
 
-    let Some(new_head_block) = store.get_block(&new_head) else {
+    let Some(new_head_header) = store.get_block_header(&new_head) else {
         return false;
     };
 
-    let old_slot = old_head_block.slot;
-    let new_slot = new_head_block.slot;
+    let old_slot = old_head_header.slot;
+    let new_slot = new_head_header.slot;
 
     // Determine which head has the higher slot and walk back from it
     let (mut current_root, target_slot, target_root) = if new_slot >= old_slot {
@@ -1074,12 +1074,12 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
     };
 
     // Walk back through the chain until we reach the target slot
-    while let Some(current_block) = store.get_block(&current_root) {
-        if current_block.slot <= target_slot {
+    while let Some(current_header) = store.get_block_header(&current_root) {
+        if current_header.slot <= target_slot {
             // We've reached the target slot - check if we're at the target block
             return current_root != target_root;
         }
-        current_root = current_block.parent_root;
+        current_root = current_header.parent_root;
     }
 
     // Couldn't walk back far enough (missing blocks in chain)

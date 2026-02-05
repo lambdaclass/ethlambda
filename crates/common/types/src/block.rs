@@ -205,6 +205,38 @@ pub struct Block {
     pub body: BlockBody,
 }
 
+impl Block {
+    /// Extract the block header, computing the body root.
+    pub fn header(&self) -> BlockHeader {
+        BlockHeader {
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            parent_root: self.parent_root,
+            state_root: self.state_root,
+            body_root: self.body.tree_hash_root(),
+        }
+    }
+
+    /// Reconstruct a block from header and body.
+    ///
+    /// # Panics
+    /// Panics if the body root doesn't match the header's body_root.
+    pub fn from_header_and_body(header: BlockHeader, body: BlockBody) -> Self {
+        debug_assert_eq!(
+            header.body_root,
+            body.tree_hash_root(),
+            "body root mismatch"
+        );
+        Self {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root,
+            state_root: header.state_root,
+            body,
+        }
+    }
+}
+
 /// The body of a block, containing payload data.
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are

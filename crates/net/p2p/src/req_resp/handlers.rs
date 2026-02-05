@@ -169,7 +169,7 @@ async fn handle_blocks_by_root_response(
 pub fn build_status(store: &Store) -> Status {
     let finalized = store.latest_finalized();
     let head_root = store.head();
-    let head_slot = store.get_block(&head_root).expect("head block exists").slot;
+    let head_slot = store.get_block_header(&head_root).expect("head block exists").slot;
     Status {
         finalized,
         head: ethlambda_types::state::Checkpoint {

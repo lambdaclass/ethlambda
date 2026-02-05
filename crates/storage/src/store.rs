@@ -7,7 +7,7 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 use ethlambda_types::{
     attestation::AttestationData,
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
+        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
         BlockWithAttestation, SignedBlockWithAttestation,
     },
     primitives::{
@@ -170,14 +170,22 @@ impl Store {
                 .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
 
-            // Block and state
-            let block_entries = vec![(
+            // Block header and body (stored separately)
+            let header_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
-                anchor_block.as_ssz_bytes(),
+                anchor_block.header().as_ssz_bytes(),
             )];
             batch
-                .put_batch(Table::Blocks, block_entries)
-                .expect("put block");
+                .put_batch(Table::BlockHeaders, header_entries)
+                .expect("put block header");
+
+            let body_entries = vec![(
+                anchor_block_root.as_ssz_bytes(),
+                anchor_block.body.as_ssz_bytes(),
+            )];
+            batch
+                .put_batch(Table::BlockBodies, body_entries)
+                .expect("put block body");
 
             let state_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
@@ -454,26 +462,49 @@ impl Store {
         removed_count
     }
 
+    /// Get the full block by combining header and body.
     pub fn get_block(&self, root: &H256) -> Option<Block> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::Blocks, &root.as_ssz_bytes())
+        let key = root.as_ssz_bytes();
+
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+
+        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+        let body = BlockBody::from_ssz_bytes(&body_bytes).expect("valid body");
+
+        Some(Block::from_header_and_body(header, body))
+    }
+
+    /// Get only the block header without deserializing the body.
+    ///
+    /// This is more efficient than `get_block` when only header fields are needed.
+    pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::BlockHeaders, &root.as_ssz_bytes())
             .expect("get")
-            .map(|bytes| Block::from_ssz_bytes(&bytes).expect("valid block"))
+            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
     }
 
     pub fn contains_block(&self, root: &H256) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::Blocks, &root.as_ssz_bytes())
+        view.get(Table::BlockHeaders, &root.as_ssz_bytes())
             .expect("get")
             .is_some()
     }
 
     pub fn insert_block(&mut self, root: H256, block: Block) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+
+        let header_entries = vec![(root.as_ssz_bytes(), block.header().as_ssz_bytes())];
         batch
-            .put_batch(Table::Blocks, block_entries)
-            .expect("put block");
+            .put_batch(Table::BlockHeaders, header_entries)
+            .expect("put block header");
+
+        let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockBodies, body_entries)
+            .expect("put block body");
 
         let index_entries = vec![(
             encode_live_chain_key(block.slot, &root),
@@ -513,10 +544,15 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
 
-        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        let header_entries = vec![(root.as_ssz_bytes(), block.header().as_ssz_bytes())];
         batch
-            .put_batch(Table::Blocks, block_entries)
-            .expect("put block");
+            .put_batch(Table::BlockHeaders, header_entries)
+            .expect("put block header");
+
+        let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockBodies, body_entries)
+            .expect("put block body");
 
         let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
         batch
@@ -534,18 +570,21 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    /// Get a signed block by combining block and signatures.
+    /// Get a signed block by combining header, body, and signatures.
     ///
-    /// Returns None if either the block or signatures are not found.
+    /// Returns None if any of the components are not found.
     /// Note: Genesis block has no entry in BlockSignatures table.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.as_ssz_bytes();
 
-        let block_bytes = view.get(Table::Blocks, &key).expect("get")?;
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
         let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
 
-        let block = Block::from_ssz_bytes(&block_bytes).expect("valid block");
+        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+        let body = BlockBody::from_ssz_bytes(&body_bytes).expect("valid body");
+        let block = Block::from_header_and_body(header, body);
         let signatures =
             BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
