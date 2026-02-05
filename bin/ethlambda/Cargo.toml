@@ -3,6 +3,7 @@ name = "ethlambda"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 ethlambda-blockchain.workspace = true
