@@ -117,9 +117,12 @@ pub struct Store {
 }
 
 impl Store {
-    /// Initialize a Store from a genesis state.
-    pub fn from_genesis(backend: Arc<dyn StorageBackend>, genesis_state: State) -> Self {
-        Self::from_anchor_state(backend, genesis_state)
+    /// Initialize a Store from an anchor state only.
+    ///
+    /// Uses the state's `latest_block_header` as the anchor block header.
+    /// No block body is stored since it's not available.
+    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
+        Self::init_store(backend, anchor_state, None)
     }
 
     /// Initialize a Store from an anchor state and block.
@@ -147,14 +150,6 @@ impl Store {
         );
 
         Self::init_store(backend, anchor_state, Some(anchor_block.body))
-    }
-
-    /// Initialize a Store from an anchor state only.
-    ///
-    /// Uses the state's `latest_block_header` as the anchor block header.
-    /// No block body is stored since it's not available.
-    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
-        Self::init_store(backend, anchor_state, None)
     }
 
     /// Internal helper to initialize the store with anchor data.
