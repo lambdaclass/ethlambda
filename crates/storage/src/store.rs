@@ -139,12 +139,31 @@ impl Store {
         anchor_state: State,
         anchor_block: Block,
     ) -> Self {
+        Self::init_store(backend, anchor_state, anchor_block.header(), Some(anchor_block.body))
+    }
+
+    /// Initialize a Store from an anchor state only.
+    ///
+    /// Uses the state's `latest_block_header` as the anchor block header.
+    /// No block body is stored since it's not available.
+    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
+        let header = anchor_state.latest_block_header.clone();
+        Self::init_store(backend, anchor_state, header, None)
+    }
+
+    /// Internal helper to initialize the store with anchor data.
+    fn init_store(
+        backend: Arc<dyn StorageBackend>,
+        anchor_state: State,
+        anchor_header: BlockHeader,
+        anchor_body: Option<BlockBody>,
+    ) -> Self {
         let anchor_state_root = anchor_state.tree_hash_root();
-        let anchor_block_root = anchor_block.tree_hash_root();
+        let anchor_block_root = anchor_header.tree_hash_root();
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
-            slot: anchor_block.slot,
+            slot: anchor_header.slot,
         };
 
         // Insert initial data
@@ -170,23 +189,24 @@ impl Store {
                 .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
 
-            // Block header and body (stored separately)
+            // Block header
             let header_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
-                anchor_block.header().as_ssz_bytes(),
+                anchor_header.as_ssz_bytes(),
             )];
             batch
                 .put_batch(Table::BlockHeaders, header_entries)
                 .expect("put block header");
 
-            let body_entries = vec![(
-                anchor_block_root.as_ssz_bytes(),
-                anchor_block.body.as_ssz_bytes(),
-            )];
-            batch
-                .put_batch(Table::BlockBodies, body_entries)
-                .expect("put block body");
+            // Block body (if provided)
+            if let Some(body) = anchor_body {
+                let body_entries = vec![(anchor_block_root.as_ssz_bytes(), body.as_ssz_bytes())];
+                batch
+                    .put_batch(Table::BlockBodies, body_entries)
+                    .expect("put block body");
+            }
 
+            // State
             let state_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
                 anchor_state.as_ssz_bytes(),
@@ -195,14 +215,14 @@ impl Store {
                 .put_batch(Table::States, state_entries)
                 .expect("put state");
 
-            // Non-finalized chain index
+            // Live chain index
             let index_entries = vec![(
-                encode_live_chain_key(anchor_block.slot, &anchor_block_root),
-                anchor_block.parent_root.as_ssz_bytes(),
+                encode_live_chain_key(anchor_header.slot, &anchor_block_root),
+                anchor_header.parent_root.as_ssz_bytes(),
             )];
             batch
                 .put_batch(Table::LiveChain, index_entries)
-                .expect("put non-finalized chain index");
+                .expect("put live chain index");
 
             batch.commit().expect("commit");
         }
