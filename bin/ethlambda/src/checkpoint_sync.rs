@@ -1,8 +1,7 @@
 use std::time::Duration;
 
-use ethlambda_types::block::{Block, BlockBody};
 use ethlambda_types::primitives::ssz::{Decode, DecodeError, TreeHash};
-use ethlambda_types::state::{State, Validator};
+use ethlambda_types::state::State;
 use reqwest::Client;
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
@@ -89,13 +88,14 @@ pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointS
 ///
 /// Arguments:
 /// - state: The downloaded checkpoint state
-/// - expected_genesis_time: Genesis time from local config
-/// - expected_validators: Validator pubkeys from local genesis config
+/// - genesis_state: Local genesis state used as reference for genesis time and validators
 pub fn verify_checkpoint_state(
     state: &State,
-    expected_genesis_time: u64,
-    expected_validators: &[Validator],
+    genesis_state: &State,
 ) -> Result<(), CheckpointSyncError> {
+    let expected_genesis_time: u64 = genesis_state.config.genesis_time;
+    let expected_validators = &genesis_state.validators;
+
     // Slot sanity check
     if state.slot == 0 {
         return Err(CheckpointSyncError::SlotIsZero);
@@ -185,28 +185,12 @@ pub fn verify_checkpoint_state(
     Ok(())
 }
 
-/// Construct anchor block from checkpoint state.
-///
-/// IMPORTANT: This creates a block with default body. The block's tree_hash_root()
-/// will only match the original block if the original also had an empty body.
-/// For most checkpoint states, this is acceptable because fork choice uses the
-/// anchor checkpoint, not individual block lookups.
-pub fn construct_anchor_block(state: &State) -> Block {
-    Block {
-        slot: state.latest_block_header.slot,
-        parent_root: state.latest_block_header.parent_root,
-        proposer_index: state.latest_block_header.proposer_index,
-        state_root: state.latest_block_header.state_root,
-        body: BlockBody::default(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::primitives::VariableList;
-    use ethlambda_types::state::{ChainConfig, Checkpoint};
+    use ethlambda_types::state::{ChainConfig, Checkpoint, Validator};
 
     // Helper to create valid test state
     fn create_test_state(slot: u64, validators: Vec<Validator>, genesis_time: u64) -> State {
@@ -239,6 +223,11 @@ mod tests {
         }
     }
 
+    /// Create a genesis state to use as reference for verification.
+    fn create_genesis_state(validators: Vec<Validator>, genesis_time: u64) -> State {
+        create_test_state(0, validators, genesis_time)
+    }
+
     fn create_test_validator() -> Validator {
         Validator {
             pubkey: [1u8; 52],
@@ -266,69 +255,74 @@ mod tests {
     fn verify_accepts_valid_state() {
         let validators = vec![create_test_validator()];
         let state = create_test_state(100, validators.clone(), 1000);
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_ok());
     }
 
     #[test]
     fn verify_rejects_slot_zero() {
         let validators = vec![create_test_validator()];
         let state = create_test_state(0, validators.clone(), 1000);
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_rejects_empty_validators() {
         let state = create_test_state(100, vec![], 1000);
-        assert!(verify_checkpoint_state(&state, 1000, &[]).is_err());
+        let genesis = create_genesis_state(vec![], 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_rejects_genesis_time_mismatch() {
         let validators = vec![create_test_validator()];
         let state = create_test_state(100, validators.clone(), 1000);
-        // State has genesis_time=1000, we pass expected=9999
-        assert!(verify_checkpoint_state(&state, 9999, &validators).is_err());
+        // State has genesis_time=1000, genesis has 9999
+        let genesis = create_genesis_state(validators, 9999);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_rejects_validator_count_mismatch() {
         let validators = vec![create_test_validator()];
-        let state = create_test_state(100, validators.clone(), 1000);
-        let extra_validators = create_validators_with_indices(2);
-        assert!(verify_checkpoint_state(&state, 1000, &extra_validators).is_err());
+        let state = create_test_state(100, validators, 1000);
+        let genesis = create_genesis_state(create_validators_with_indices(2), 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_accepts_multiple_validators_with_sequential_indices() {
         let validators = create_validators_with_indices(3);
         let state = create_test_state(100, validators.clone(), 1000);
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_ok());
     }
 
     #[test]
     fn verify_rejects_non_sequential_validator_indices() {
         let mut validators = create_validators_with_indices(3);
         validators[1].index = 5; // Wrong index at position 1
-        let state = create_test_state(100, validators.clone(), 1000);
-        let expected_validators = create_validators_with_indices(3);
-        assert!(verify_checkpoint_state(&state, 1000, &expected_validators).is_err());
+        let state = create_test_state(100, validators, 1000);
+        let genesis = create_genesis_state(create_validators_with_indices(3), 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_rejects_duplicate_validator_indices() {
         let mut validators = create_validators_with_indices(3);
         validators[2].index = 0; // Duplicate index
-        let state = create_test_state(100, validators.clone(), 1000);
-        let expected_validators = create_validators_with_indices(3);
-        assert!(verify_checkpoint_state(&state, 1000, &expected_validators).is_err());
+        let state = create_test_state(100, validators, 1000);
+        let genesis = create_genesis_state(create_validators_with_indices(3), 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
     fn verify_rejects_validator_pubkey_mismatch() {
         let validators = vec![create_test_validator()];
-        let state = create_test_state(100, validators.clone(), 1000);
-        let different_validators = vec![create_different_validator()];
-        assert!(verify_checkpoint_state(&state, 1000, &different_validators).is_err());
+        let state = create_test_state(100, validators, 1000);
+        let genesis = create_genesis_state(vec![create_different_validator()], 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -336,7 +330,8 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_finalized.slot = 101; // Finalized after state slot
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -345,7 +340,8 @@ mod tests {
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_finalized.slot = 50;
         state.latest_justified.slot = 40; // Justified before finalized
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -358,7 +354,8 @@ mod tests {
         state.latest_finalized.root = common_root;
         state.latest_justified.slot = 50; // Same slot
         state.latest_justified.root = common_root; // Same root
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_ok());
     }
 
     #[test]
@@ -370,7 +367,8 @@ mod tests {
         state.latest_finalized.root = H256::from([1u8; 32]);
         state.latest_justified.slot = 50; // Same slot
         state.latest_justified.root = H256::from([2u8; 32]); // Different root - conflict!
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -378,7 +376,8 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 101; // Block header slot exceeds state slot
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -389,7 +388,8 @@ mod tests {
         let block_root = state.latest_block_header.tree_hash_root();
         state.latest_finalized.slot = 50;
         state.latest_finalized.root = block_root;
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_ok());
     }
 
     #[test]
@@ -400,7 +400,8 @@ mod tests {
         state.latest_block_header.slot = 50;
         state.latest_finalized.slot = 50;
         state.latest_finalized.root = H256::from([99u8; 32]); // Wrong root
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 
     #[test]
@@ -411,7 +412,8 @@ mod tests {
         let block_root = state.latest_block_header.tree_hash_root();
         state.latest_justified.slot = 90;
         state.latest_justified.root = block_root;
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_ok());
     }
 
     #[test]
@@ -422,6 +424,7 @@ mod tests {
         state.latest_block_header.slot = 90;
         state.latest_justified.slot = 90;
         state.latest_justified.root = H256::from([99u8; 32]); // Wrong root
-        assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+        let genesis = create_genesis_state(validators, 1000);
+        assert!(verify_checkpoint_state(&state, &genesis).is_err());
     }
 }
