@@ -814,10 +814,7 @@ impl Store {
     }
 
     /// Returns aggregated payloads for a signature key.
-    fn get_aggregated_payloads(
-        &self,
-        key: &SignatureKey,
-    ) -> Option<Vec<StoredAggregatedPayload>> {
+    fn get_aggregated_payloads(&self, key: &SignatureKey) -> Option<Vec<StoredAggregatedPayload>> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::AggregatedPayloads, &encode_signature_key(key))
             .expect("get")

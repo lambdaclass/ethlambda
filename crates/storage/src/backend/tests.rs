@@ -166,7 +166,10 @@ fn test_put_then_delete(backend: &dyn StorageBackend) {
     }
 
     let view = backend.begin_read().unwrap();
-    assert_eq!(view.get(Table::BlockHeaders, b"test_put_del_key").unwrap(), None);
+    assert_eq!(
+        view.get(Table::BlockHeaders, b"test_put_del_key").unwrap(),
+        None
+    );
 }
 
 fn test_multiple_tables(backend: &dyn StorageBackend) {

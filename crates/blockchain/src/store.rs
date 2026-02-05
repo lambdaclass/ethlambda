@@ -46,8 +46,14 @@ fn update_head(store: &mut Store) {
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 
     if old_head != new_head {
-        let old_slot = store.get_block_header(&old_head).map(|h| h.slot).unwrap_or(0);
-        let new_slot = store.get_block_header(&new_head).map(|h| h.slot).unwrap_or(0);
+        let old_slot = store
+            .get_block_header(&old_head)
+            .map(|h| h.slot)
+            .unwrap_or(0);
+        let new_slot = store
+            .get_block_header(&new_head)
+            .map(|h| h.slot)
+            .unwrap_or(0);
         let justified_slot = store.latest_justified().slot;
         let finalized_slot = store.latest_finalized().slot;
         info!(

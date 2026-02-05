@@ -167,7 +167,10 @@ mod tests {
             let backend = RocksDBBackend::open(dir.path()).unwrap();
             let mut batch = backend.begin_write().unwrap();
             batch
-                .put_batch(Table::BlockHeaders, vec![(b"key1".to_vec(), b"value1".to_vec())])
+                .put_batch(
+                    Table::BlockHeaders,
+                    vec![(b"key1".to_vec(), b"value1".to_vec())],
+                )
                 .unwrap();
             batch.commit().unwrap();
         }
