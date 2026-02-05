@@ -187,13 +187,13 @@ fn validate_checks(
     // Validate headSlot
     if let Some(expected_slot) = checks.head_slot {
         let head_root = st.head();
-        let head_block = st
-            .get_block(&head_root)
+        let head_header = st
+            .get_block_header(&head_root)
             .ok_or_else(|| format!("Step {}: head block not found", step_idx))?;
-        if head_block.slot != expected_slot {
+        if head_header.slot != expected_slot {
             return Err(format!(
                 "Step {}: headSlot mismatch: expected {}, got {}",
-                step_idx, expected_slot, head_block.slot
+                step_idx, expected_slot, head_header.slot
             )
             .into());
         }

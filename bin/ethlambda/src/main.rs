@@ -336,7 +336,7 @@ async fn fetch_initial_state(
         Store::get_forkchoice_store(backend, state, anchor_block)
     } else {
         let genesis_state = State::from_genesis(genesis, validators);
-        Store::from_genesis(backend, genesis_state)
+        Store::from_anchor_state(backend, genesis_state)
     };
 
     Ok(store)
