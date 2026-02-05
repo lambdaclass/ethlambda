@@ -98,9 +98,9 @@ fn validate_attestation(store: &Store, attestation: &Attestation) -> Result<(), 
         .get_block_header(&data.target.root)
         .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
 
-    if !store.contains_block(&data.head.root) {
-        return Err(StoreError::UnknownHeadBlock(data.head.root));
-    }
+    let _ = store
+        .get_block_header(&data.head.root)
+        .ok_or(StoreError::UnknownHeadBlock(data.head.root))?;
 
     // Topology Check - Source must be older than Target.
     if data.source.slot > data.target.slot {
