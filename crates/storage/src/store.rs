@@ -470,37 +470,6 @@ impl Store {
             .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
     }
 
-    pub fn contains_block(&self, root: &H256) -> bool {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.as_ssz_bytes())
-            .expect("get")
-            .is_some()
-    }
-
-    pub fn insert_block(&mut self, root: H256, block: Block) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-
-        let header_entries = vec![(root.as_ssz_bytes(), block.header().as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockHeaders, header_entries)
-            .expect("put block header");
-
-        let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockBodies, body_entries)
-            .expect("put block body");
-
-        let index_entries = vec![(
-            encode_live_chain_key(block.slot, &root),
-            block.parent_root.as_ssz_bytes(),
-        )];
-        batch
-            .put_batch(Table::LiveChain, index_entries)
-            .expect("put non-finalized chain index");
-
-        batch.commit().expect("commit");
-    }
-
     // ============ Signed Blocks ============
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -577,27 +546,18 @@ impl Store {
 
     // ============ States ============
 
-    /// Iterate over all (root, state) pairs.
-    pub fn iter_states(&self) -> impl Iterator<Item = (H256, State)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::States, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let root = H256::from_ssz_bytes(&k).expect("valid root");
-                let state = State::from_ssz_bytes(&v).expect("valid state");
-                (root, state)
-            })
-            .collect();
-        entries.into_iter()
-    }
-
     pub fn get_state(&self, root: &H256) -> Option<State> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::States, &root.as_ssz_bytes())
             .expect("get")
             .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+    }
+
+    pub fn has_state(&self, root: &H256) -> bool {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::States, &root.as_ssz_bytes())
+            .expect("get")
+            .is_some()
     }
 
     pub fn insert_state(&mut self, root: H256, state: State) {
@@ -736,20 +696,6 @@ impl Store {
             })
             .collect();
         entries.into_iter()
-    }
-
-    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<StoredSignature> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::GossipSignatures, &encode_signature_key(key))
-            .expect("get")
-            .and_then(|bytes| StoredSignature::from_ssz_bytes(&bytes).ok())
-    }
-
-    pub fn contains_gossip_signature(&self, key: &SignatureKey) -> bool {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::GossipSignatures, &encode_signature_key(key))
-            .expect("get")
-            .is_some()
     }
 
     pub fn insert_gossip_signature(

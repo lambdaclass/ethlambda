@@ -279,8 +279,8 @@ impl BlockChainServer {
         let parent_root = signed_block.message.block.parent_root;
         let proposer = signed_block.message.block.proposer_index;
 
-        // Check if parent block exists before attempting to process
-        if !self.store.contains_block(&parent_root) {
+        // Check if parent state exists before attempting to process
+        if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
 
             // Store block for later processing

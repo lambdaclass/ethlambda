@@ -325,7 +325,7 @@ pub fn on_block(
     let slot = block.slot;
 
     // Skip duplicate blocks (idempotent operation)
-    if store.contains_block(&block_root) {
+    if store.has_state(&block_root) {
         return Ok(());
     }
 
