@@ -219,8 +219,8 @@ impl Block {
 
     /// Reconstruct a block from header and body.
     ///
-    /// # Panics
-    /// Panics if the body root doesn't match the header's body_root.
+    /// The caller should ensure that `header.body_root` matches `body.tree_hash_root()`.
+    /// This is verified with a debug assertion but not in release builds.
     pub fn from_header_and_body(header: BlockHeader, body: BlockBody) -> Self {
         debug_assert_eq!(
             header.body_root,

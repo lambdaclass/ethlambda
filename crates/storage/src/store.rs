@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// The tree hash root of an empty block body.
+///
+/// Used to detect genesis/anchor blocks that have no attestations,
+/// allowing us to skip storing empty bodies and reconstruct them on read.
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().tree_hash_root());
 
 use crate::api::{StorageBackend, Table};
 use crate::types::{StoredAggregatedPayload, StoredSignature};
@@ -137,6 +143,7 @@ impl Store {
     /// Initialize a Store from an anchor state and block.
     ///
     /// The block must match the state's `latest_block_header`.
+    /// Named to mirror the spec's `get_forkchoice_store` function.
     ///
     /// # Panics
     ///
@@ -551,15 +558,19 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
 
-        let header_entries = vec![(root.as_ssz_bytes(), block.header().as_ssz_bytes())];
+        let header = block.header();
+        let header_entries = vec![(root.as_ssz_bytes(), header.as_ssz_bytes())];
         batch
             .put_batch(Table::BlockHeaders, header_entries)
             .expect("put block header");
 
-        let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockBodies, body_entries)
-            .expect("put block body");
+        // Skip storing empty bodies - they can be reconstructed from the header's body_root
+        if header.body_root != *EMPTY_BODY_ROOT {
+            let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
+            batch
+                .put_batch(Table::BlockBodies, body_entries)
+                .expect("put block body");
+        }
 
         let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
         batch
@@ -586,11 +597,18 @@ impl Store {
         let key = root.as_ssz_bytes();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
         let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
 
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
-        let body = BlockBody::from_ssz_bytes(&body_bytes).expect("valid body");
+
+        // Use empty body if header indicates empty, otherwise fetch from DB
+        let body = if header.body_root == *EMPTY_BODY_ROOT {
+            BlockBody::default()
+        } else {
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+        };
+
         let block = Block::from_header_and_body(header, body);
         let signatures =
             BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
