@@ -176,7 +176,7 @@ impl BlockSignaturesWithAttestation {
 ///
 /// Headers are smaller than full blocks. They're useful for tracking the chain
 /// without storing everything.
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Encode, Decode, TreeHash)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
     pub slot: u64,

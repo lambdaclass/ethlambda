@@ -118,28 +118,35 @@ pub struct Store {
 
 impl Store {
     /// Initialize a Store from a genesis state.
-    pub fn from_genesis(backend: Arc<dyn StorageBackend>, mut genesis_state: State) -> Self {
-        // Ensure the header state root is zero before computing the state root
-        genesis_state.latest_block_header.state_root = H256::ZERO;
-
-        let genesis_state_root = genesis_state.tree_hash_root();
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: genesis_state_root,
-            body: BlockBody::default(),
-        };
-        Self::get_forkchoice_store(backend, genesis_state, genesis_block)
+    pub fn from_genesis(backend: Arc<dyn StorageBackend>, genesis_state: State) -> Self {
+        Self::from_anchor_state(backend, genesis_state)
     }
 
     /// Initialize a Store from an anchor state and block.
+    ///
+    /// The block must match the state's `latest_block_header`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block's header doesn't match the state's `latest_block_header`
+    /// (comparing all fields except `state_root`, which is computed internally).
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
         anchor_state: State,
         anchor_block: Block,
     ) -> Self {
-        Self::init_store(backend, anchor_state, anchor_block.header(), Some(anchor_block.body))
+        // Compare headers with state_root zeroed (init_store handles state_root separately)
+        let mut state_header = anchor_state.latest_block_header.clone();
+        let mut block_header = anchor_block.header();
+        state_header.state_root = H256::ZERO;
+        block_header.state_root = H256::ZERO;
+
+        assert_eq!(
+            state_header, block_header,
+            "block header doesn't match state's latest_block_header"
+        );
+
+        Self::init_store(backend, anchor_state, Some(anchor_block.body))
     }
 
     /// Initialize a Store from an anchor state only.
@@ -147,23 +154,40 @@ impl Store {
     /// Uses the state's `latest_block_header` as the anchor block header.
     /// No block body is stored since it's not available.
     pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
-        let header = anchor_state.latest_block_header.clone();
-        Self::init_store(backend, anchor_state, header, None)
+        Self::init_store(backend, anchor_state, None)
     }
 
     /// Internal helper to initialize the store with anchor data.
+    ///
+    /// Header is taken from `anchor_state.latest_block_header`.
     fn init_store(
         backend: Arc<dyn StorageBackend>,
-        anchor_state: State,
-        anchor_header: BlockHeader,
+        mut anchor_state: State,
         anchor_body: Option<BlockBody>,
     ) -> Self {
+        // Save original state_root for validation
+        let original_state_root = anchor_state.latest_block_header.state_root;
+
+        // Zero out state_root before computing (state contains header, header contains state_root)
+        anchor_state.latest_block_header.state_root = H256::ZERO;
+
+        // Compute state root with zeroed header
         let anchor_state_root = anchor_state.tree_hash_root();
-        let anchor_block_root = anchor_header.tree_hash_root();
+
+        // Validate: original must be zero (genesis) or match computed (checkpoint sync)
+        assert!(
+            original_state_root == H256::ZERO || original_state_root == anchor_state_root,
+            "anchor header state_root mismatch: expected {anchor_state_root:?}, got {original_state_root:?}"
+        );
+
+        // Populate the correct state_root
+        anchor_state.latest_block_header.state_root = anchor_state_root;
+
+        let anchor_block_root = anchor_state.latest_block_header.tree_hash_root();
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
-            slot: anchor_header.slot,
+            slot: anchor_state.latest_block_header.slot,
         };
 
         // Insert initial data
@@ -192,7 +216,7 @@ impl Store {
             // Block header
             let header_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
-                anchor_header.as_ssz_bytes(),
+                anchor_state.latest_block_header.as_ssz_bytes(),
             )];
             batch
                 .put_batch(Table::BlockHeaders, header_entries)
@@ -217,8 +241,8 @@ impl Store {
 
             // Live chain index
             let index_entries = vec![(
-                encode_live_chain_key(anchor_header.slot, &anchor_block_root),
-                anchor_header.parent_root.as_ssz_bytes(),
+                encode_live_chain_key(anchor_state.latest_block_header.slot, &anchor_block_root),
+                anchor_state.latest_block_header.parent_root.as_ssz_bytes(),
             )];
             batch
                 .put_batch(Table::LiveChain, index_entries)
