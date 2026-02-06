@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -458,8 +458,15 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 .unwrap();
 
         let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
+        let (_, ip_bytes) = record
+            .pairs
+            .iter()
+            .find(|(key, _)| key.as_ref() == b"ip")
+            .expect("node record missing IP address");
+        let ip = IpAddr::from(Ipv4Addr::decode(ip_bytes.as_ref()).expect("invalid IPv4 address"));
+
         bootnodes.push(Bootnode {
-            ip: "127.0.0.1".parse().unwrap(),
+            ip,
             quic_port,
             public_key: public_key.into(),
         });
