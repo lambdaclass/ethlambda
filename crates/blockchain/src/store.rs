@@ -479,6 +479,20 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
             .get_block(&target_block_root)
             .expect("parent block exists");
     }
+    // Ensure target is at or after the source (latest_justified) to maintain
+    // the invariant: source.slot <= target.slot. When a block advances
+    // latest_justified between safe_target updates (interval 2), the walk-back
+    // above can land on a slot behind the new justified checkpoint.
+    let latest_justified = store.latest_justified();
+    if target_block.slot < latest_justified.slot {
+        warn!(
+            target_slot = target_block.slot,
+            justified_slot = latest_justified.slot,
+            "Attestation target walked behind justified source, clamping to justified"
+        );
+        return latest_justified;
+    }
+
     Checkpoint {
         root: target_block_root,
         slot: target_block.slot,
