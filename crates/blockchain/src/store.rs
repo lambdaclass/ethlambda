@@ -465,11 +465,15 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
         }
     }
 
+    let finalized_slot = store.latest_finalized().slot;
+
     // Ensure target is in justifiable slot range
     //
     // Walk back until we find a slot that satisfies justifiability rules
     // relative to the latest finalized checkpoint.
-    while !slot_is_justifiable_after(target_block.slot, store.latest_finalized().slot) {
+    while target_block.slot > finalized_slot
+        && !slot_is_justifiable_after(target_block.slot, finalized_slot)
+    {
         target_block_root = target_block.parent_root;
         target_block = store
             .get_block(&target_block_root)
