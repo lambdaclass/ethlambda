@@ -11,7 +11,7 @@ use clap::Parser;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
-    genesis::Genesis,
+    genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, Validator, ValidatorPubkeyBytes},
 };
@@ -72,7 +72,7 @@ async fn main() {
 
     info!(node_key=?options.node_key, "got node key");
 
-    let genesis_path = options.custom_network_config_dir.join("genesis.json");
+    let config_path = options.custom_network_config_dir.join("config.yaml");
     let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
     let validators_path = options
         .custom_network_config_dir
@@ -82,18 +82,26 @@ async fn main() {
         .join("validator-config.yaml");
     let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
 
-    let genesis_json = std::fs::read_to_string(&genesis_path).expect("Failed to read genesis.json");
-    let genesis: Genesis =
-        serde_json::from_str(&genesis_json).expect("Failed to parse genesis.json");
+    let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
+    let genesis_config: GenesisConfig =
+        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse config.yaml");
 
     populate_name_registry(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
-    let validators = read_validators(&validators_path);
+    let validators: Vec<Validator> = genesis_config
+        .genesis_validators
+        .into_iter()
+        .enumerate()
+        .map(|(i, pubkey)| Validator {
+            pubkey,
+            index: i as u64,
+        })
+        .collect();
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let genesis_state = State::from_genesis(&genesis, validators);
+    let genesis_state = State::from_genesis(genesis_config.genesis_time, validators);
     let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
     let store = Store::from_genesis(backend, genesis_state);
 
@@ -162,6 +170,7 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
 #[derive(Debug, Deserialize)]
 struct AnnotatedValidator {
     index: u64,
+    #[allow(dead_code)] // Present in YAML, needed for deserialization but not read in code
     #[serde(rename = "pubkey_hex")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
     pubkey: ValidatorPubkeyBytes,
@@ -181,33 +190,6 @@ where
         .try_into()
         .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
     Ok(pubkey)
-}
-
-fn read_validators(validators_path: impl AsRef<Path>) -> Vec<Validator> {
-    let validators_yaml =
-        std::fs::read_to_string(validators_path).expect("Failed to read validators file");
-    // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
-    let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
-        serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
-
-    let mut validators: Vec<Validator> = validator_infos
-        .into_values()
-        .map(|v| Validator {
-            pubkey: v[0].pubkey,
-            index: v[0].index,
-        })
-        .collect();
-
-    validators.sort_by_key(|v| v.index);
-    let num_validators = validators.len();
-
-    validators.dedup_by_key(|v| v.index);
-
-    if validators.len() != num_validators {
-        panic!("Duplicate validator indices found in config");
-    }
-
-    validators
 }
 
 fn read_validator_keys(
