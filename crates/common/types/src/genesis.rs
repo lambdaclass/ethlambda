@@ -33,13 +33,18 @@ where
     let hex_strings: Vec<String> = Vec::deserialize(d)?;
     hex_strings
         .into_iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(idx, s)| {
             let s = s.strip_prefix("0x").unwrap_or(&s);
-            let bytes = hex::decode(s)
-                .map_err(|_| D::Error::custom("GENESIS_VALIDATORS value is not valid hex"))?;
-            bytes
-                .try_into()
-                .map_err(|_| D::Error::custom("GENESIS_VALIDATORS pubkey length != 52"))
+            let bytes = hex::decode(s).map_err(|_| {
+                D::Error::custom(format!("GENESIS_VALIDATORS[{idx}] is not valid hex: {s}"))
+            })?;
+            bytes.try_into().map_err(|v: Vec<u8>| {
+                D::Error::custom(format!(
+                    "GENESIS_VALIDATORS[{idx}] has length {} (expected 52)",
+                    v.len()
+                ))
+            })
         })
         .collect()
 }
@@ -56,7 +61,7 @@ mod tests {
     const PUBKEY_B: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
     const PUBKEY_C: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410";
 
-    const TEST_CONFIG_JSON: &str = r#"# Genesis Settings
+    const TEST_CONFIG_YAML: &str = r#"# Genesis Settings
 GENESIS_TIME: 1770407233
 
 # Key Settings
@@ -74,7 +79,7 @@ GENESIS_VALIDATORS:
 
     #[test]
     fn deserialize_genesis_config() {
-        let config: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_JSON)
+        let config: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_YAML)
             .expect("Failed to deserialize genesis config");
 
         assert_eq!(config.genesis_time, 1770407233);
@@ -116,7 +121,7 @@ GENESIS_VALIDATORS:
 
     #[test]
     fn state_from_genesis_root() {
-        let config: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_JSON).unwrap();
+        let config: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
 
         let validators: Vec<Validator> = config
             .genesis_validators
