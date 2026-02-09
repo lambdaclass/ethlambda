@@ -471,16 +471,36 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
         }
     }
 
+    let finalized_slot = store.latest_finalized().slot;
+
     // Ensure target is in justifiable slot range
     //
     // Walk back until we find a slot that satisfies justifiability rules
     // relative to the latest finalized checkpoint.
-    while !slot_is_justifiable_after(target_header.slot, store.latest_finalized().slot) {
+    while target_header.slot > finalized_slot
+        && !slot_is_justifiable_after(target_header.slot, finalized_slot)
+    {
         target_block_root = target_header.parent_root;
         target_header = store
             .get_block_header(&target_block_root)
             .expect("parent block exists");
     }
+    // Ensure target is at or after the source (latest_justified) to maintain
+    // the invariant: source.slot <= target.slot. When a block advances
+    // latest_justified between safe_target updates (interval 2), the walk-back
+    // above can land on a slot behind the new justified checkpoint.
+    //
+    // See https://github.com/blockblaz/zeam/blob/697c293879e922942965cdb1da3c6044187ae00e/pkgs/node/src/forkchoice.zig#L654-L659
+    let latest_justified = store.latest_justified();
+    if target_header.slot < latest_justified.slot {
+        warn!(
+            target_slot = target_header.slot,
+            justified_slot = latest_justified.slot,
+            "Attestation target walked behind justified source, clamping to justified"
+        );
+        return latest_justified;
+    }
+
     Checkpoint {
         root: target_block_root,
         slot: target_header.slot,

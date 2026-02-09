@@ -3,7 +3,6 @@ use ssz_types::typenum::{U4096, U262144};
 
 use crate::{
     block::{BlockBody, BlockHeader},
-    genesis::Genesis,
     primitives::{
         H256,
         ssz::{Decode, DecodeError, Encode, TreeHash},
@@ -87,7 +86,7 @@ impl Validator {
 pub type ValidatorPubkeyBytes = [u8; 52];
 
 impl State {
-    pub fn from_genesis(genesis: &Genesis, validators: Vec<Validator>) -> Self {
+    pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {
         let genesis_header = BlockHeader {
             slot: 0,
             proposer_index: 0,
@@ -102,11 +101,11 @@ impl State {
             JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
 
         Self {
-            config: genesis.config.clone(),
+            config: ChainConfig { genesis_time },
             slot: 0,
             latest_block_header: genesis_header,
-            latest_justified: genesis.latest_justified,
-            latest_finalized: genesis.latest_finalized,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
             historical_block_hashes: Default::default(),
             justified_slots,
             validators,
@@ -117,7 +116,9 @@ impl State {
 }
 
 /// Represents a checkpoint in the chain's history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash,
+)]
 pub struct Checkpoint {
     /// The root hash of the checkpoint's block.
     pub root: H256,
