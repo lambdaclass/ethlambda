@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::state::ValidatorPubkeyBytes;
+use crate::state::{Validator, ValidatorPubkeyBytes};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenesisConfig {
@@ -9,6 +9,19 @@ pub struct GenesisConfig {
     #[serde(rename = "GENESIS_VALIDATORS")]
     #[serde(deserialize_with = "deser_hex_pubkeys")]
     pub genesis_validators: Vec<ValidatorPubkeyBytes>,
+}
+
+impl GenesisConfig {
+    pub fn validators(&self) -> Vec<Validator> {
+        self.genesis_validators
+            .iter()
+            .enumerate()
+            .map(|(i, pubkey)| Validator {
+                pubkey: *pubkey,
+                index: i as u64,
+            })
+            .collect()
+    }
 }
 
 fn deser_hex_pubkeys<'de, D>(d: D) -> Result<Vec<ValidatorPubkeyBytes>, D::Error>

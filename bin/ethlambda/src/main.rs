@@ -13,7 +13,7 @@ use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
-    state::{State, Validator, ValidatorPubkeyBytes},
+    state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
 use tracing::{error, info};
@@ -95,15 +95,7 @@ async fn main() {
     populate_name_registry(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
-    let validators: Vec<Validator> = genesis_config
-        .genesis_validators
-        .into_iter()
-        .enumerate()
-        .map(|(i, pubkey)| Validator {
-            pubkey,
-            index: i as u64,
-        })
-        .collect();
+    let validators = genesis_config.validators();
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
