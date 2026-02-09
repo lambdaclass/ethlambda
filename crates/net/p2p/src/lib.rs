@@ -475,9 +475,9 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 let octets: [u8; 16] = bytes.as_ref().try_into().expect("invalid IPv6 address");
                 IpAddr::from(Ipv6Addr::from(octets))
             });
-        let ip = ipv4
-            .or(ipv6)
-            .expect("node record missing IP address");
+
+        // Prefer IPv4 if both are present
+        let ip = ipv4.or(ipv6).expect("node record missing IP address");
 
         bootnodes.push(Bootnode {
             ip,
