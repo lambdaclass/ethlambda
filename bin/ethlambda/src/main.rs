@@ -101,7 +101,7 @@ async fn main() {
 
     let genesis_state = State::from_genesis(genesis_config.genesis_time, validators);
     let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
-    let store = Store::from_genesis(backend, genesis_state);
+    let store = Store::from_anchor_state(backend, genesis_state);
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);

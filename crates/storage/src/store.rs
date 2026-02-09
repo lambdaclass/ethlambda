@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// The tree hash root of an empty block body.
+///
+/// Used to detect genesis/anchor blocks that have no attestations,
+/// allowing us to skip storing empty bodies and reconstruct them on read.
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().tree_hash_root());
 
 use crate::api::{StorageBackend, Table};
 use crate::types::{StoredAggregatedPayload, StoredSignature};
@@ -7,7 +13,7 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 use ethlambda_types::{
     attestation::AttestationData,
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockSignaturesWithAttestation,
+        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
         BlockWithAttestation, SignedBlockWithAttestation,
     },
     primitives::{
@@ -105,46 +111,94 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
     (slot, root)
 }
 
-/// Underlying storage of the node.
-/// Similar to the spec's `Store`, but backed by a pluggable storage backend.
+/// Fork choice store backed by a pluggable storage backend.
 ///
-/// All data is stored in the backend. Metadata fields (time, config, head, etc.)
-/// are stored in the Metadata table with their field name as the key.
+/// The Store maintains all state required for fork choice and block processing:
+///
+/// - **Metadata**: time, config, head, safe_target, justified/finalized checkpoints
+/// - **Blocks**: headers and bodies stored separately for efficient header-only queries
+/// - **States**: beacon states indexed by block root
+/// - **Attestations**: latest known and pending ("new") attestations per validator
+/// - **Signatures**: gossip signatures and aggregated proofs for signature verification
+/// - **LiveChain**: slot index for efficient fork choice traversal (pruned on finalization)
+///
+/// # Constructors
+///
+/// - [`from_anchor_state`](Self::from_anchor_state): Initialize from a checkpoint state (no block body)
+/// - [`get_forkchoice_store`](Self::get_forkchoice_store): Initialize from state + block (stores body)
 #[derive(Clone)]
 pub struct Store {
-    /// Storage backend for all store data.
     backend: Arc<dyn StorageBackend>,
 }
 
 impl Store {
-    /// Initialize a Store from a genesis state.
-    pub fn from_genesis(backend: Arc<dyn StorageBackend>, mut genesis_state: State) -> Self {
-        // Ensure the header state root is zero before computing the state root
-        genesis_state.latest_block_header.state_root = H256::ZERO;
-
-        let genesis_state_root = genesis_state.tree_hash_root();
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: genesis_state_root,
-            body: BlockBody::default(),
-        };
-        Self::get_forkchoice_store(backend, genesis_state, genesis_block)
+    /// Initialize a Store from an anchor state only.
+    ///
+    /// Uses the state's `latest_block_header` as the anchor block header.
+    /// No block body is stored since it's not available.
+    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
+        Self::init_store(backend, anchor_state, None)
     }
 
     /// Initialize a Store from an anchor state and block.
+    ///
+    /// The block must match the state's `latest_block_header`.
+    /// Named to mirror the spec's `get_forkchoice_store` function.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block's header doesn't match the state's `latest_block_header`
+    /// (comparing all fields except `state_root`, which is computed internally).
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
         anchor_state: State,
         anchor_block: Block,
     ) -> Self {
+        // Compare headers with state_root zeroed (init_store handles state_root separately)
+        let mut state_header = anchor_state.latest_block_header.clone();
+        let mut block_header = anchor_block.header();
+        state_header.state_root = H256::ZERO;
+        block_header.state_root = H256::ZERO;
+
+        assert_eq!(
+            state_header, block_header,
+            "block header doesn't match state's latest_block_header"
+        );
+
+        Self::init_store(backend, anchor_state, Some(anchor_block.body))
+    }
+
+    /// Internal helper to initialize the store with anchor data.
+    ///
+    /// Header is taken from `anchor_state.latest_block_header`.
+    fn init_store(
+        backend: Arc<dyn StorageBackend>,
+        mut anchor_state: State,
+        anchor_body: Option<BlockBody>,
+    ) -> Self {
+        // Save original state_root for validation
+        let original_state_root = anchor_state.latest_block_header.state_root;
+
+        // Zero out state_root before computing (state contains header, header contains state_root)
+        anchor_state.latest_block_header.state_root = H256::ZERO;
+
+        // Compute state root with zeroed header
         let anchor_state_root = anchor_state.tree_hash_root();
-        let anchor_block_root = anchor_block.tree_hash_root();
+
+        // Validate: original must be zero (genesis) or match computed (checkpoint sync)
+        assert!(
+            original_state_root == H256::ZERO || original_state_root == anchor_state_root,
+            "anchor header state_root mismatch: expected {anchor_state_root:?}, got {original_state_root:?}"
+        );
+
+        // Populate the correct state_root
+        anchor_state.latest_block_header.state_root = anchor_state_root;
+
+        let anchor_block_root = anchor_state.latest_block_header.tree_hash_root();
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
-            slot: anchor_block.slot,
+            slot: anchor_state.latest_block_header.slot,
         };
 
         // Insert initial data
@@ -170,15 +224,24 @@ impl Store {
                 .put_batch(Table::Metadata, metadata_entries)
                 .expect("put metadata");
 
-            // Block and state
-            let block_entries = vec![(
+            // Block header
+            let header_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
-                anchor_block.as_ssz_bytes(),
+                anchor_state.latest_block_header.as_ssz_bytes(),
             )];
             batch
-                .put_batch(Table::Blocks, block_entries)
-                .expect("put block");
+                .put_batch(Table::BlockHeaders, header_entries)
+                .expect("put block header");
 
+            // Block body (if provided)
+            if let Some(body) = anchor_body {
+                let body_entries = vec![(anchor_block_root.as_ssz_bytes(), body.as_ssz_bytes())];
+                batch
+                    .put_batch(Table::BlockBodies, body_entries)
+                    .expect("put block body");
+            }
+
+            // State
             let state_entries = vec![(
                 anchor_block_root.as_ssz_bytes(),
                 anchor_state.as_ssz_bytes(),
@@ -187,14 +250,14 @@ impl Store {
                 .put_batch(Table::States, state_entries)
                 .expect("put state");
 
-            // Non-finalized chain index
+            // Live chain index
             let index_entries = vec![(
-                encode_live_chain_key(anchor_block.slot, &anchor_block_root),
-                anchor_block.parent_root.as_ssz_bytes(),
+                encode_live_chain_key(anchor_state.latest_block_header.slot, &anchor_block_root),
+                anchor_state.latest_block_header.parent_root.as_ssz_bytes(),
             )];
             batch
                 .put_batch(Table::LiveChain, index_entries)
-                .expect("put non-finalized chain index");
+                .expect("put live chain index");
 
             batch.commit().expect("commit");
         }
@@ -225,44 +288,50 @@ impl Store {
 
     // ============ Time ============
 
+    /// Returns the current store time in seconds since genesis.
     pub fn time(&self) -> u64 {
         self.get_metadata(KEY_TIME)
     }
 
+    /// Sets the current store time.
     pub fn set_time(&mut self, time: u64) {
         self.set_metadata(KEY_TIME, &time);
     }
 
     // ============ Config ============
 
+    /// Returns the chain configuration.
     pub fn config(&self) -> ChainConfig {
         self.get_metadata(KEY_CONFIG)
     }
 
     // ============ Head ============
 
+    /// Returns the current head block root.
     pub fn head(&self) -> H256 {
         self.get_metadata(KEY_HEAD)
     }
 
     // ============ Safe Target ============
 
+    /// Returns the safe target block root for attestations.
     pub fn safe_target(&self) -> H256 {
         self.get_metadata(KEY_SAFE_TARGET)
     }
 
+    /// Sets the safe target block root.
     pub fn set_safe_target(&mut self, safe_target: H256) {
         self.set_metadata(KEY_SAFE_TARGET, &safe_target);
     }
 
-    // ============ Latest Justified ============
+    // ============ Checkpoints ============
 
+    /// Returns the latest justified checkpoint.
     pub fn latest_justified(&self) -> Checkpoint {
         self.get_metadata(KEY_LATEST_JUSTIFIED)
     }
 
-    // ============ Latest Finalized ============
-
+    /// Returns the latest finalized checkpoint.
     pub fn latest_finalized(&self) -> Checkpoint {
         self.get_metadata(KEY_LATEST_FINALIZED)
     }
@@ -454,36 +523,12 @@ impl Store {
         removed_count
     }
 
-    pub fn get_block(&self, root: &H256) -> Option<Block> {
+    /// Get the block header by root.
+    pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::Blocks, &root.as_ssz_bytes())
+        view.get(Table::BlockHeaders, &root.as_ssz_bytes())
             .expect("get")
-            .map(|bytes| Block::from_ssz_bytes(&bytes).expect("valid block"))
-    }
-
-    pub fn contains_block(&self, root: &H256) -> bool {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::Blocks, &root.as_ssz_bytes())
-            .expect("get")
-            .is_some()
-    }
-
-    pub fn insert_block(&mut self, root: H256, block: Block) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
-        batch
-            .put_batch(Table::Blocks, block_entries)
-            .expect("put block");
-
-        let index_entries = vec![(
-            encode_live_chain_key(block.slot, &root),
-            block.parent_root.as_ssz_bytes(),
-        )];
-        batch
-            .put_batch(Table::LiveChain, index_entries)
-            .expect("put non-finalized chain index");
-
-        batch.commit().expect("commit");
+            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
     }
 
     // ============ Signed Blocks ============
@@ -513,10 +558,19 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
 
-        let block_entries = vec![(root.as_ssz_bytes(), block.as_ssz_bytes())];
+        let header = block.header();
+        let header_entries = vec![(root.as_ssz_bytes(), header.as_ssz_bytes())];
         batch
-            .put_batch(Table::Blocks, block_entries)
-            .expect("put block");
+            .put_batch(Table::BlockHeaders, header_entries)
+            .expect("put block header");
+
+        // Skip storing empty bodies - they can be reconstructed from the header's body_root
+        if header.body_root != *EMPTY_BODY_ROOT {
+            let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
+            batch
+                .put_batch(Table::BlockBodies, body_entries)
+                .expect("put block body");
+        }
 
         let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
         batch
@@ -534,18 +588,28 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    /// Get a signed block by combining block and signatures.
+    /// Get a signed block by combining header, body, and signatures.
     ///
-    /// Returns None if either the block or signatures are not found.
+    /// Returns None if any of the components are not found.
     /// Note: Genesis block has no entry in BlockSignatures table.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.as_ssz_bytes();
 
-        let block_bytes = view.get(Table::Blocks, &key).expect("get")?;
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
         let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
 
-        let block = Block::from_ssz_bytes(&block_bytes).expect("valid block");
+        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+
+        // Use empty body if header indicates empty, otherwise fetch from DB
+        let body = if header.body_root == *EMPTY_BODY_ROOT {
+            BlockBody::default()
+        } else {
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+        };
+
+        let block = Block::from_header_and_body(header, body);
         let signatures =
             BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
@@ -554,22 +618,7 @@ impl Store {
 
     // ============ States ============
 
-    /// Iterate over all (root, state) pairs.
-    pub fn iter_states(&self) -> impl Iterator<Item = (H256, State)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::States, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let root = H256::from_ssz_bytes(&k).expect("valid root");
-                let state = State::from_ssz_bytes(&v).expect("valid state");
-                (root, state)
-            })
-            .collect();
-        entries.into_iter()
-    }
-
+    /// Returns the state for the given block root.
     pub fn get_state(&self, root: &H256) -> Option<State> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::States, &root.as_ssz_bytes())
@@ -577,6 +626,15 @@ impl Store {
             .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
     }
 
+    /// Returns whether a state exists for the given block root.
+    pub fn has_state(&self, root: &H256) -> bool {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::States, &root.as_ssz_bytes())
+            .expect("get")
+            .is_some()
+    }
+
+    /// Stores a state indexed by block root.
     pub fn insert_state(&mut self, root: H256, state: State) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(root.as_ssz_bytes(), state.as_ssz_bytes())];
@@ -584,9 +642,12 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    // ============ Latest Known Attestations ============
+    // ============ Known Attestations ============
+    //
+    // "Known" attestations are included in fork choice weight calculations.
+    // They're promoted from "new" attestations at specific intervals.
 
-    /// Iterate over all (validator_id, attestation_data) pairs for known attestations.
+    /// Iterates over all known attestations (validator_id, attestation_data).
     pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
@@ -602,6 +663,7 @@ impl Store {
         entries.into_iter()
     }
 
+    /// Returns a validator's latest known attestation.
     pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::LatestKnownAttestations, &validator_id.as_ssz_bytes())
@@ -609,6 +671,7 @@ impl Store {
             .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
+    /// Stores a validator's latest known attestation.
     pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
@@ -618,9 +681,12 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    // ============ Latest New Attestations ============
+    // ============ New Attestations ============
+    //
+    // "New" attestations are pending attestations not yet included in fork choice.
+    // They're promoted to "known" via `promote_new_attestations`.
 
-    /// Iterate over all (validator_id, attestation_data) pairs for new attestations.
+    /// Iterates over all new (pending) attestations.
     pub fn iter_new_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
@@ -636,6 +702,7 @@ impl Store {
         entries.into_iter()
     }
 
+    /// Returns a validator's latest new (pending) attestation.
     pub fn get_new_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::LatestNewAttestations, &validator_id.as_ssz_bytes())
@@ -643,6 +710,7 @@ impl Store {
             .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
+    /// Stores a validator's new (pending) attestation.
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
@@ -652,6 +720,7 @@ impl Store {
         batch.commit().expect("commit");
     }
 
+    /// Removes a validator's new (pending) attestation.
     pub fn remove_new_attestation(&mut self, validator_id: &u64) {
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
@@ -695,8 +764,11 @@ impl Store {
     }
 
     // ============ Gossip Signatures ============
+    //
+    // Gossip signatures are individual validator signatures received via P2P.
+    // They're aggregated into proofs for block signature verification.
 
-    /// Iterate over all (signature_key, stored_signature) pairs.
+    /// Iterates over all gossip signatures.
     pub fn iter_gossip_signatures(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, StoredSignature)> + '_ {
@@ -715,20 +787,7 @@ impl Store {
         entries.into_iter()
     }
 
-    pub fn get_gossip_signature(&self, key: &SignatureKey) -> Option<StoredSignature> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::GossipSignatures, &encode_signature_key(key))
-            .expect("get")
-            .and_then(|bytes| StoredSignature::from_ssz_bytes(&bytes).ok())
-    }
-
-    pub fn contains_gossip_signature(&self, key: &SignatureKey) -> bool {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::GossipSignatures, &encode_signature_key(key))
-            .expect("get")
-            .is_some()
-    }
-
+    /// Stores a gossip signature for later aggregation.
     pub fn insert_gossip_signature(
         &mut self,
         attestation_data: &AttestationData,
@@ -749,8 +808,11 @@ impl Store {
     }
 
     // ============ Aggregated Payloads ============
+    //
+    // Aggregated payloads are leanVM proofs combining multiple signatures.
+    // Used to verify block signatures efficiently.
 
-    /// Iterate over all (signature_key, stored_payloads) pairs.
+    /// Iterates over all aggregated signature payloads.
     pub fn iter_aggregated_payloads(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
@@ -769,10 +831,8 @@ impl Store {
         entries.into_iter()
     }
 
-    pub fn get_aggregated_payloads(
-        &self,
-        key: &SignatureKey,
-    ) -> Option<Vec<StoredAggregatedPayload>> {
+    /// Returns aggregated payloads for a signature key.
+    fn get_aggregated_payloads(&self, key: &SignatureKey) -> Option<Vec<StoredAggregatedPayload>> {
         let view = self.backend.begin_read().expect("read view");
         view.get(Table::AggregatedPayloads, &encode_signature_key(key))
             .expect("get")
@@ -821,7 +881,7 @@ impl Store {
 
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
-        self.get_block(&self.safe_target())
+        self.get_block_header(&self.safe_target())
             .expect("safe target exists")
             .slot
     }
