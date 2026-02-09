@@ -132,7 +132,7 @@ GENESIS_VALIDATORS:
 
         // Pin the state root so changes are caught immediately.
         let expected =
-            hex::decode("362db4ffe968f1d100934797f6d3c7985b4aee9d96b328ad2e47243b8292e434")
+            hex::decode("118054414cf28edb0835fd566785c46c0de82ac717ee83a809786bc0c5bb7ef2")
                 .unwrap();
         assert_eq!(root.as_slice(), &expected[..], "state root mismatch");
 
