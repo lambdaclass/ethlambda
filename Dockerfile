@@ -44,7 +44,7 @@ FROM ubuntu AS runtime
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/lambdaclass/ethlambda
-LABEL org.opencontainers.image.description="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust."
+LABEL org.opencontainers.image.description="A minimalist and fast Lean Consensus client written in Rust by LambdaClass"
 LABEL org.opencontainers.image.licenses="MIT"
 
 ARG GIT_COMMIT=unknown
