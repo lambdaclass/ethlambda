@@ -483,6 +483,8 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
     // the invariant: source.slot <= target.slot. When a block advances
     // latest_justified between safe_target updates (interval 2), the walk-back
     // above can land on a slot behind the new justified checkpoint.
+    //
+    // See https://github.com/blockblaz/zeam/blob/697c293879e922942965cdb1da3c6044187ae00e/pkgs/node/src/forkchoice.zig#L654-L659
     let latest_justified = store.latest_justified();
     if target_block.slot < latest_justified.slot {
         warn!(
