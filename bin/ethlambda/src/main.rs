@@ -86,6 +86,12 @@ async fn main() {
     let genesis_config: GenesisConfig =
         serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse config.yaml");
 
+    info!(
+        genesis_time = genesis_config.genesis_time,
+        validator_count = genesis_config.genesis_validators.len(),
+        "Loaded genesis configuration"
+    );
+
     populate_name_registry(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
