@@ -168,10 +168,9 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
 #[derive(Debug, Deserialize)]
 struct AnnotatedValidator {
     index: u64,
-    #[allow(dead_code)] // Present in YAML, needed for deserialization but not read in code
     #[serde(rename = "pubkey_hex")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    pubkey: ValidatorPubkeyBytes,
+    _pubkey: ValidatorPubkeyBytes,
     privkey_file: PathBuf,
 }
 
