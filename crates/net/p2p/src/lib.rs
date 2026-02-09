@@ -463,7 +463,8 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
             .iter()
             .find(|(key, _)| key.as_ref() == b"ip")
             .expect("node record missing IP address");
-        let ip = IpAddr::from(Ipv4Addr::decode(ip_bytes.as_ref()).expect("invalid IPv4 address"));
+        let ip_octets: [u8; 4] = ip_bytes.as_ref().try_into().expect("invalid IPv4 address");
+        let ip = IpAddr::from(Ipv4Addr::from(ip_octets));
 
         bootnodes.push(Bootnode {
             ip,
