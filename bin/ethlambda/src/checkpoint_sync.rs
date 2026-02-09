@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use ethlambda_types::block::{Block, BlockBody};
 use ethlambda_types::primitives::ssz::{Decode, DecodeError, TreeHash};
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
@@ -183,22 +182,6 @@ pub fn verify_checkpoint_state(
     }
 
     Ok(())
-}
-
-/// Construct anchor block from checkpoint state.
-///
-/// IMPORTANT: This creates a block with default body. The block's tree_hash_root()
-/// will only match the original block if the original also had an empty body.
-/// For most checkpoint states, this is acceptable because fork choice uses the
-/// anchor checkpoint, not individual block lookups.
-pub fn construct_anchor_block(state: &State) -> Block {
-    Block {
-        slot: state.latest_block_header.slot,
-        parent_root: state.latest_block_header.parent_root,
-        proposer_index: state.latest_block_header.proposer_index,
-        state_root: state.latest_block_header.state_root,
-        body: BlockBody::default(),
-    }
 }
 
 #[cfg(test)]

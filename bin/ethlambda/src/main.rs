@@ -301,8 +301,6 @@ async fn fetch_initial_state(
         // Verify against local genesis config
         checkpoint_sync::verify_checkpoint_state(&state, genesis.genesis_time, &validators)?;
 
-        let anchor_block = checkpoint_sync::construct_anchor_block(&state);
-
         info!(
             slot = state.slot,
             validators = state.validators.len(),
@@ -310,7 +308,8 @@ async fn fetch_initial_state(
             "Checkpoint sync complete"
         );
 
-        Store::get_forkchoice_store(backend, state, anchor_block)
+        // Store the anchor state and header, without body
+        Store::from_anchor_state(backend, state)
     } else {
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
         Store::from_anchor_state(backend, genesis_state)
