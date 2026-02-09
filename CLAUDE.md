@@ -245,11 +245,17 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ## Configuration Files
 
-**Genesis:** `genesis.json` (JSON format, cross-client compatible)
-- `GENESIS_TIME`: Unix timestamp for slot 0
-- `GENESIS_VALIDATORS`: Array of 52-byte XMSS pubkeys (hex)
+**Genesis:** `config.yaml` (YAML format, cross-client compatible)
+```yaml
+GENESIS_TIME: 1770407233
+GENESIS_VALIDATORS:
+  - "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+  - "b7b0f72e24801b02bda64073cb4de6699a416b37..."
+```
+- Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
+- All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
+- Matches Ream/Zeam format — no extra state fields in the config file
 
-**Validators:** JSON array of `{"pubkey": "...", "index": 0}`
 **Bootnodes:** ENR records (Base64-encoded, RLP decoded for QUIC port + secp256k1 pubkey)
 
 ## Testing
