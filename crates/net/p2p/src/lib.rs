@@ -458,6 +458,8 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 .unwrap();
 
         let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
+
+        // TODO: support IPv6
         let (_, ip_bytes) = record
             .pairs
             .iter()
