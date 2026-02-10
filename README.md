@@ -4,10 +4,17 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 
 ## Getting started
 
-We use `cargo` as our build system. To build and run the client, simply run:
+We use `cargo` as our build system, but prefer `make` as a convenient wrapper for common tasks. These are some common targets:
 
 ```sh
-cargo run
+# Formats all code
+make fmt
+# Checks and lints the code
+make lint
+# Runs all tests
+make test
+# Builds a docker image tagged as "ghcr.io/lambdaclass/ethlambda:local"
+make docker-build DOCKER_TAG=local
 ```
 
 Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
@@ -21,8 +28,10 @@ To run a local devnet with multiple clients using [lean-quickstart](https://gith
 make run-devnet
 ```
 
-This generates fresh genesis files and starts all three clients with metrics enabled.
+This generates fresh genesis files and starts all configured clients with metrics enabled.
 Press `Ctrl+C` to stop all nodes.
+
+For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
 
 ## Philosophy
 
