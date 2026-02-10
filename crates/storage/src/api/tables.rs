@@ -14,8 +14,6 @@ pub enum Table {
     States,
     /// Gossip signatures: SignatureKey -> ValidatorSignature
     GossipSignatures,
-    /// Aggregated proofs from received blocks: SignatureKey -> Vec<StoredAggregatedPayload>
-    AggregatedPayloads,
     /// Attestation data indexed by tree hash root: H256 -> AttestationData
     AttestationDataByRoot,
     /// Pending aggregated payloads (not yet active in fork choice):
@@ -35,13 +33,12 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 11] = [
+pub const ALL_TABLES: [Table; 10] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
     Table::States,
     Table::GossipSignatures,
-    Table::AggregatedPayloads,
     Table::AttestationDataByRoot,
     Table::LatestNewAggregatedPayloads,
     Table::LatestKnownAggregatedPayloads,

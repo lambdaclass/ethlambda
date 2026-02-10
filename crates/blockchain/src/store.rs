@@ -553,9 +553,6 @@ pub fn on_block(
             // Store proof in known aggregated payloads (active in fork choice)
             store.insert_known_aggregated_payload((*validator_id, data_root), payload.clone());
 
-            // Also store in existing AggregatedPayloads table for block building
-            store.insert_aggregated_payload(&att.data, *validator_id, proof.clone());
-
             metrics::inc_attestations_valid("block");
         }
     }
@@ -738,9 +735,9 @@ pub fn produce_block_with_signatures(
     // Get known block roots for attestation validation
     let known_block_roots = store.get_block_roots();
 
-    // Collect existing proofs for block building (from previously received blocks)
+    // Collect existing proofs for block building from known aggregated payloads
     let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> = store
-        .iter_aggregated_payloads()
+        .iter_known_aggregated_payloads()
         .map(|(key, stored_payloads)| {
             let proofs = stored_payloads.into_iter().map(|sp| sp.proof).collect();
             (key, proofs)
@@ -1027,8 +1024,8 @@ fn build_block(
 /// Select existing aggregated proofs for attestations to include in a block.
 ///
 /// Fresh gossip aggregation happens at interval 2 (`aggregate_committee_signatures`).
-/// This function only selects from existing proofs in the `AggregatedPayloads` table
-/// (proofs from previously received blocks).
+/// This function only selects from existing proofs in the `LatestKnownAggregatedPayloads` table
+/// (proofs from previously received blocks and promoted gossip aggregations).
 ///
 /// Returns a list of (attestation, proof) pairs ready for block inclusion.
 fn select_aggregated_proofs(

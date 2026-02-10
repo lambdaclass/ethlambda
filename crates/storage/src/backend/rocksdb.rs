@@ -17,7 +17,6 @@ fn cf_name(table: Table) -> &'static str {
         Table::BlockSignatures => "block_signatures",
         Table::States => "states",
         Table::GossipSignatures => "gossip_signatures",
-        Table::AggregatedPayloads => "aggregated_payloads",
         Table::AttestationDataByRoot => "attestation_data_by_root",
         Table::LatestNewAggregatedPayloads => "latest_new_aggregated_payloads",
         Table::LatestKnownAggregatedPayloads => "latest_known_aggregated_payloads",
