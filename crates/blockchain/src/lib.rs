@@ -54,6 +54,7 @@ impl BlockChain {
             p2p_tx,
             key_manager,
             pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -93,6 +94,10 @@ struct BlockChainServer {
 
     // Pending blocks waiting for their parent
     pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
+    // Maps pending block_root → the oldest missing ancestor in its chain.
+    // Single lookup replaces walking the chain, safe because processing is synchronous:
+    // once the missing ancestor arrives, the entire chain is processed and all entries removed.
+    pending_block_parents: HashMap<H256, H256>,
 }
 
 impl BlockChainServer {
@@ -283,14 +288,24 @@ impl BlockChainServer {
         if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
 
+            // Resolve the actual missing ancestor: if the parent is itself pending,
+            // reuse its cached missing ancestor. Otherwise the parent IS the missing block.
+            let missing_root = self
+                .pending_block_parents
+                .get(&parent_root)
+                .copied()
+                .unwrap_or(parent_root);
+
+            self.pending_block_parents.insert(block_root, missing_root);
+
             // Store block for later processing
             self.pending_blocks
                 .entry(parent_root)
                 .or_default()
                 .push(signed_block);
 
-            // Request missing parent from network
-            self.request_missing_block(parent_root);
+            // Request the actual missing block from network
+            self.request_missing_block(missing_root);
             return;
         }
 
@@ -339,8 +354,12 @@ impl BlockChainServer {
                   "Processing pending blocks after parent arrival");
 
             for child_block in children {
+                let block_root = child_block.message.block.tree_hash_root();
                 let slot = child_block.message.block.slot;
                 trace!(%parent_root, %slot, "Processing pending child block");
+
+                // Clean up lineage tracking
+                self.pending_block_parents.remove(&block_root);
 
                 // Process recursively - might unblock more descendants
                 self.on_block(child_block);
