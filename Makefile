@@ -47,4 +47,4 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 		&& mv lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp lean-quickstart/client-cmds/ethlambda-cmd.sh
 	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
 	@cd lean-quickstart \
-		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > devnet.log 2>&1
+		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
