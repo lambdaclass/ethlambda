@@ -12,14 +12,18 @@ pub enum Table {
     BlockSignatures,
     /// State storage: H256 -> State
     States,
-    /// Known attestations: u64 -> AttestationData
-    LatestKnownAttestations,
-    /// Pending attestations: u64 -> AttestationData
-    LatestNewAttestations,
     /// Gossip signatures: SignatureKey -> ValidatorSignature
     GossipSignatures,
-    /// Aggregated proofs: SignatureKey -> Vec<AggregatedSignatureProof>
+    /// Aggregated proofs from received blocks: SignatureKey -> Vec<StoredAggregatedPayload>
     AggregatedPayloads,
+    /// Attestation data indexed by tree hash root: H256 -> AttestationData
+    AttestationDataByRoot,
+    /// Pending aggregated payloads (not yet active in fork choice):
+    /// SignatureKey -> Vec<StoredAggregatedPayload>
+    LatestNewAggregatedPayloads,
+    /// Active aggregated payloads (counted in fork choice):
+    /// SignatureKey -> Vec<StoredAggregatedPayload>
+    LatestKnownAggregatedPayloads,
     /// Metadata: string keys -> various scalar values
     Metadata,
     /// Live chain index: (slot || root) -> parent_root
@@ -31,15 +35,16 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 10] = [
+pub const ALL_TABLES: [Table; 11] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
     Table::States,
-    Table::LatestKnownAttestations,
-    Table::LatestNewAttestations,
     Table::GossipSignatures,
     Table::AggregatedPayloads,
+    Table::AttestationDataByRoot,
+    Table::LatestNewAggregatedPayloads,
+    Table::LatestKnownAggregatedPayloads,
     Table::Metadata,
     Table::LiveChain,
 ];

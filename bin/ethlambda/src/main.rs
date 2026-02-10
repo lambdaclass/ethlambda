@@ -46,6 +46,9 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
+    /// Whether this node acts as a committee aggregator
+    #[arg(long, default_value = "false")]
+    is_aggregator: bool,
 }
 
 #[tokio::main]
@@ -104,7 +107,10 @@ async fn main() {
     let store = Store::from_anchor_state(backend, genesis_state);
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
-    let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
+    // Use first validator ID for subnet subscription
+    let first_validator_id = validator_keys.keys().min().copied();
+    let blockchain =
+        BlockChain::spawn(store.clone(), p2p_tx, validator_keys, options.is_aggregator);
 
     let p2p_handle = tokio::spawn(start_p2p(
         node_p2p_key,
@@ -113,6 +119,7 @@ async fn main() {
         blockchain,
         p2p_rx,
         store.clone(),
+        first_validator_id,
     ));
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)

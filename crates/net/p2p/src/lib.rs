@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use ethlambda_blockchain::{BlockChain, P2PMessage};
+use ethlambda_blockchain::{ATTESTATION_COMMITTEE_COUNT, BlockChain, P2PMessage};
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
 use ethrex_common::H264;
@@ -24,7 +24,10 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 use crate::{
-    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
+    gossipsub::{
+        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        publish_aggregated_attestation, publish_attestation, publish_block,
+    },
     req_resp::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
         STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
@@ -60,6 +63,7 @@ pub async fn start_p2p(
     blockchain: BlockChain,
     p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
+    validator_id: Option<u64>,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
@@ -151,21 +155,44 @@ pub async fn start_p2p(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let network = "devnet0";
-    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
-    for topic_kind in topic_kinds {
-        let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
-        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
-    }
+    let network = "devnet3";
 
-    // Create topics for outbound messages
-    let attestation_topic = libp2p::gossipsub::IdentTopic::new(format!(
-        "/leanconsensus/{network}/{ATTESTATION_TOPIC_KIND}/ssz_snappy"
-    ));
-    let block_topic = libp2p::gossipsub::IdentTopic::new(format!(
-        "/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy"
-    ));
+    // Subscribe to block topic (all nodes)
+    let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
+    let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&block_topic)
+        .unwrap();
+
+    // Subscribe to aggregation topic (all validators)
+    let aggregation_topic_str =
+        format!("/leanconsensus/{network}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
+    let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&aggregation_topic)
+        .unwrap();
+
+    // Subscribe to attestation subnet topic (validators subscribe to their committee's subnet)
+    // ATTESTATION_COMMITTEE_COUNT is 1 for devnet-3 but will increase in future devnets.
+    #[allow(clippy::modulo_one)]
+    let subnet_id = validator_id.map(|vid| vid % ATTESTATION_COMMITTEE_COUNT);
+    let attestation_topic_kind = match subnet_id {
+        Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
+        // Non-validators subscribe to subnet 0 to receive attestations
+        None => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_0"),
+    };
+    let attestation_topic_str =
+        format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
+    let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&attestation_topic)
+        .unwrap();
 
     info!(socket=%listening_socket, "P2P node started");
 
@@ -178,6 +205,7 @@ pub async fn start_p2p(
         p2p_rx,
         attestation_topic,
         block_topic,
+        aggregation_topic,
         connected_peers: HashSet::new(),
         pending_requests: HashMap::new(),
         request_id_map: HashMap::new(),
@@ -203,6 +231,7 @@ pub(crate) struct P2PServer {
     pub(crate) p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
@@ -370,6 +399,9 @@ async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
         }
         P2PMessage::PublishBlock(signed_block) => {
             publish_block(server, signed_block).await;
+        }
+        P2PMessage::PublishAggregatedAttestation(attestation) => {
+            publish_aggregated_attestation(server, attestation).await;
         }
         P2PMessage::FetchBlock(root) => {
             // Deduplicate - if already pending, ignore

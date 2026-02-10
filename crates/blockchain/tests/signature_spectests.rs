@@ -50,7 +50,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Advance time to the block's slot
         let block_time = signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
-        store::on_tick(&mut st, block_time, true);
+        store::on_tick(&mut st, block_time, true, false);
 
         // Process the block (this includes signature verification)
         let result = store::on_block(&mut st, signed_block);
