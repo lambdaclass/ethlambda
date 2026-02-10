@@ -23,6 +23,7 @@ docker-build: ## 🐳 Build the Docker image
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
+	@echo
 
 LEAN_SPEC_COMMIT_HASH:=4edcf7bc9271e6a70ded8aff17710d68beac4266
 
@@ -37,9 +38,13 @@ lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
-	# Go to lean-quickstart/local-devnet/genesis/validator-config.yaml to modify
-	# the validator configuration for the local devnet.
-	# NOTE: to run the local image of ethlambda, make sure to set the image tag
-	# in lean-quickstart/client-cmds/ethlambda-cmd.sh to "ghcr.io/lambdaclass/ethlambda:local"
-	cd lean-quickstart \
-	&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics
+	@echo "Starting local devnet with ethlambda client. Logs will be dumped in devnet.log"
+	@echo
+	@echo "Devnet will be using the current configuration. For custom configurations, modify lean-quickstart/local-devnet/genesis/validator-config.yaml and restart the devnet."
+	@echo
+	@# Use temp file instead of sed -i for macOS/GNU portability
+	@sed 's|ghcr.io/lambdaclass/ethlambda:[^ ]*|ghcr.io/lambdaclass/ethlambda:local|' lean-quickstart/client-cmds/ethlambda-cmd.sh > lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp \
+		&& mv lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp lean-quickstart/client-cmds/ethlambda-cmd.sh
+	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
+	@cd lean-quickstart \
+		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > devnet.log 2>&1
