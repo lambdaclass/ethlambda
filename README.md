@@ -68,7 +68,11 @@ Additional features:
 
 ### pq-devnet-2
 
-We support the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md). A Docker tag `devnet2` is available for this version.
+Support for the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md) will be ending soon (see ["older devnets"](#older-devnets)). A Docker tag `devnet2` is currently available for this version.
+
+### pq-devnet-3
+
+We are working on adding support for the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` will be published for this version.
 
 ### Older devnets
 
@@ -80,6 +84,10 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- Checkpoint sync for long-lived networks
-- Observability: more metrics from leanMetrics and better logs
-- RPC endpoints for chain data consumption
+- [Checkpoint sync for long-lived networks](https://github.com/lambdaclass/ethlambda/issues/80)
+- [pq-devnet-3 support](https://github.com/lambdaclass/ethlambda/issues/73)
+- [Fetching of unknown blocks referenced by attestations](https://github.com/lambdaclass/ethlambda/issues/91)
+- [Discarding blocks with invalid signatures](https://github.com/lambdaclass/ethlambda/issues/78)
+- [Non-finalization hardening: bound memory usage during long periods of non-finalization](https://github.com/lambdaclass/ethlambda/issues/103)
+- [Observability: more metrics from leanMetrics](https://github.com/lambdaclass/ethlambda/issues/76)
+- [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
