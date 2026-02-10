@@ -30,3 +30,6 @@ target
 
 # Used for generating test vectors
 /leanSpec
+
+# Personal Claude Code overrides (not shared with team)
+CLAUDE.local.md
