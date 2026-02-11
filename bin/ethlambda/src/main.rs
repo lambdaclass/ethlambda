@@ -54,7 +54,7 @@ struct CliOptions {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
@@ -111,8 +111,7 @@ async fn main() {
         backend.clone(),
     )
     .await
-    .inspect_err(|err| error!(%err, "Failed to initialize state"))
-    .unwrap_or_else(|_| std::process::exit(1));
+    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
@@ -141,6 +140,8 @@ async fn main() {
         }
     }
     println!("Shutting down...");
+
+    Ok(())
 }
 
 fn populate_name_registry(validator_config: impl AsRef<Path>) {

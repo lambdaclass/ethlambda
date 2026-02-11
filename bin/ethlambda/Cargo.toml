@@ -26,6 +26,7 @@ hex.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
+eyre.workspace = true
 
 [build-dependencies]
 vergen-git2.workspace = true
