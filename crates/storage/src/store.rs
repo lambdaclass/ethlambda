@@ -13,8 +13,8 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 use ethlambda_types::{
     attestation::AttestationData,
     block::{
-        Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
-        BlockWithAttestation, SignedBlockWithAttestation,
+        Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation, BlockWithAttestation,
+        SignedBlockWithAttestation,
     },
     primitives::{
         H256,

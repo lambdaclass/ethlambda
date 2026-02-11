@@ -1,7 +1,10 @@
-.PHONY: help lint docker-build run-devnet test
+.PHONY: help fmt lint docker-build run-devnet test
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+fmt: ## 🎨 Format all code using rustfmt
+	cargo fmt --all
 
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -20,6 +23,7 @@ docker-build: ## 🐳 Build the Docker image
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
+	@echo
 
 LEAN_SPEC_COMMIT_HASH:=b39472e73f8a7d603cc13d14426eed14c6eff6f1
 
@@ -33,12 +37,14 @@ leanSpec/fixtures: leanSpec
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
-
-# TODO: start metrics too
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
-	# Go to lean-quickstart/local-devnet/genesis/validator-config.yaml to modify
-	# the validator configuration for the local devnet.
-	# NOTE: to run the local image of ethlambda, make sure to set the image tag
-	# in lean-quickstart/client-cmds/ethlambda-cmd.sh to "ghcr.io/lambdaclass/ethlambda:local"
-	cd lean-quickstart \
-	&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics
+	@echo "Starting local devnet with ethlambda client (\"$(DOCKER_TAG)\" tag). Logs will be dumped in devnet.log, and metrics served in http://localhost:3000"
+	@echo
+	@echo "Devnet will be using the current configuration. For custom configurations, modify lean-quickstart/local-devnet/genesis/validator-config.yaml and restart the devnet."
+	@echo
+	@# Use temp file instead of sed -i for macOS/GNU portability
+	@sed 's|ghcr.io/lambdaclass/ethlambda:[^ ]*|ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)|' lean-quickstart/client-cmds/ethlambda-cmd.sh > lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp \
+		&& mv lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp lean-quickstart/client-cmds/ethlambda-cmd.sh
+	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
+	@cd lean-quickstart \
+		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
