@@ -12,7 +12,8 @@ use std::sync::Arc;
 /// Returns the column family name for a table.
 fn cf_name(table: Table) -> &'static str {
     match table {
-        Table::Blocks => "blocks",
+        Table::BlockHeaders => "block_headers",
+        Table::BlockBodies => "block_bodies",
         Table::BlockSignatures => "block_signatures",
         Table::States => "states",
         Table::LatestKnownAttestations => "latest_known_attestations",
@@ -166,7 +167,10 @@ mod tests {
             let backend = RocksDBBackend::open(dir.path()).unwrap();
             let mut batch = backend.begin_write().unwrap();
             batch
-                .put_batch(Table::Blocks, vec![(b"key1".to_vec(), b"value1".to_vec())])
+                .put_batch(
+                    Table::BlockHeaders,
+                    vec![(b"key1".to_vec(), b"value1".to_vec())],
+                )
                 .unwrap();
             batch.commit().unwrap();
         }
@@ -175,7 +179,7 @@ mod tests {
         {
             let backend = RocksDBBackend::open(dir.path()).unwrap();
             let view = backend.begin_read().unwrap();
-            let value = view.get(Table::Blocks, b"key1").unwrap();
+            let value = view.get(Table::BlockHeaders, b"key1").unwrap();
             assert_eq!(value, Some(b"value1".to_vec()));
         }
     }
