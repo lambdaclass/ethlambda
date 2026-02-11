@@ -50,7 +50,7 @@ jobs:
       # Read the pinned leanSpec commit from the Makefile (single source of truth)
       - name: Get leanSpec pinned commit
         id: lean-spec
-        run: echo "commit=$(grep 'LEAN_SPEC_COMMIT_HASH' Makefile | sed 's/.*:=//')" >> $GITHUB_OUTPUT
+        run: echo "commit=$(sed -n 's/^LEAN_SPEC_COMMIT_HASH:= *//p' Makefile)" >> $GITHUB_OUTPUT
 
       - name: Cache test fixtures
         id: cache-fixtures
