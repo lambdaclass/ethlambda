@@ -87,6 +87,12 @@ impl BlockChain {
     }
 }
 
+/// GenServer that sequences all blockchain updates.
+///
+/// Any head or finalization updates are done by this server.
+/// Right now it also handles block processing, but in the future
+/// those updates might be done in parallel with only writes being
+/// processed by this server.
 struct BlockChainServer {
     store: Store,
     p2p_tx: mpsc::UnboundedSender<P2PMessage>,
