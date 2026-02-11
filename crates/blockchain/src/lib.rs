@@ -315,6 +315,12 @@ impl BlockChainServer {
             return;
         }
 
+        // Pre-check signatures for external blocks before processing
+        if let Err(err) = store::precheck_block_signatures(&self.store, &signed_block) {
+            warn!(%slot, %err, "Block signature verification failed");
+            return;
+        }
+
         // Parent exists, proceed with processing
         match self.process_block(signed_block) {
             Ok(_) => {
