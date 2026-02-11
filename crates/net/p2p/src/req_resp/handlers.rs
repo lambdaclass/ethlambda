@@ -4,12 +4,11 @@ use rand::seq::SliceRandom;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use ethlambda_types::block::SignedBlockWithAttestation;
 use ethlambda_types::primitives::ssz::TreeHash;
+use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponseCode,
-    ResponsePayload, Status, error_message,
+    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
@@ -32,13 +31,16 @@ pub async fn handle_req_resp_message(
                     handle_blocks_by_root_request(server, request, channel, peer).await;
                 }
             },
-            request_response::Message::Response { response, .. } => match response {
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => match response {
                 Response::Success { payload } => match payload {
                     ResponsePayload::Status(status) => {
                         handle_status_response(status, peer).await;
                     }
-                    ResponsePayload::BlocksByRoot(block) => {
-                        handle_blocks_by_root_response(server, block, peer).await;
+                    ResponsePayload::BlocksByRoot(blocks) => {
+                        handle_blocks_by_root_response(server, blocks, peer, request_id).await;
                     }
                 },
                 Response::Error { code, message } => {
@@ -57,7 +59,7 @@ pub async fn handle_req_resp_message(
 
             // Check if this was a block fetch request
             if let Some(root) = server.request_id_map.remove(&request_id) {
-                handle_fetch_failure(server, root, peer, error).await;
+                handle_fetch_failure(server, root, peer).await;
             }
         }
         request_response::Event::InboundFailure {
@@ -108,65 +110,76 @@ async fn handle_blocks_by_root_request(
     let num_roots = request.roots.len();
     info!(%peer, num_roots, "Received BlocksByRoot request");
 
-    // TODO: Support multiple blocks per request (currently only handles first root)
-    // The protocol supports up to 1024 roots, but our response type only holds one block.
-    let Some(root) = request.roots.first() else {
-        debug!(%peer, "BlocksByRoot request with no roots");
-        return;
-    };
-
-    match server.store.get_signed_block(root) {
-        Some(signed_block) => {
-            let slot = signed_block.message.block.slot;
-            info!(%peer, %root, %slot, "Responding to BlocksByRoot request");
-
-            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
-                channel,
-                Response::success(ResponsePayload::BlocksByRoot(signed_block)),
-            ) {
-                warn!(%peer, %root, ?err, "Failed to send BlocksByRoot response");
-            }
+    let mut blocks = Vec::new();
+    for root in request.roots.iter() {
+        if let Some(signed_block) = server.store.get_signed_block(root) {
+            blocks.push(signed_block);
         }
-        None => {
-            debug!(%peer, %root, "Block not found for BlocksByRoot request");
-
-            if let Err(err) = server.swarm.behaviour_mut().req_resp.send_response(
-                channel,
-                Response::error(
-                    ResponseCode::RESOURCE_UNAVAILABLE,
-                    error_message("Block not found"),
-                ),
-            ) {
-                warn!(%peer, %root, ?err, "Failed to send RESOURCE_UNAVAILABLE response");
-            }
-        }
+        // Missing blocks are silently skipped (per spec)
     }
+
+    let found = blocks.len();
+    info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
+
+    let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+    let _ = server
+        .swarm
+        .behaviour_mut()
+        .req_resp
+        .send_response(channel, response)
+        .inspect_err(|err| warn!(%peer, ?err, "Failed to send BlocksByRoot response"));
 }
 
 async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
-    block: SignedBlockWithAttestation,
+    blocks: Vec<SignedBlockWithAttestation>,
     peer: PeerId,
+    request_id: request_response::OutboundRequestId,
 ) {
-    let slot = block.message.block.slot;
-    let root = block.message.block.tree_hash_root();
+    info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
 
-    info!(%peer, %slot, %root, "Received BlocksByRoot response");
+    // Look up which root was requested for this specific request
+    let Some(requested_root) = server.request_id_map.remove(&request_id) else {
+        warn!(%peer, ?request_id, "Received response for unknown request_id");
+        return;
+    };
 
-    // Clean up tracking (success!)
-    if server.pending_requests.remove(&root).is_some() {
-        info!(%root, "Block fetch succeeded");
-        server.request_id_map.retain(|_, r| *r != root);
+    if blocks.is_empty() {
+        server.request_id_map.insert(request_id, requested_root);
+        warn!(%peer, "Received empty BlocksByRoot response");
+        handle_fetch_failure(server, requested_root, peer).await;
+        return;
     }
 
-    server.blockchain.notify_new_block(block).await;
+    for block in blocks {
+        let root = block.message.block.tree_hash_root();
+
+        // Validate that this block matches what we requested
+        if root != requested_root {
+            warn!(
+                %peer,
+                received_root = %ethlambda_types::ShortRoot(&root.0),
+                expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
+                "Received block with mismatched root, ignoring"
+            );
+            continue;
+        }
+
+        // Clean up tracking for this root
+        server.pending_requests.remove(&root);
+
+        server.blockchain.notify_new_block(block).await;
+    }
 }
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
     let finalized = store.latest_finalized();
     let head_root = store.head();
-    let head_slot = store.get_block(&head_root).expect("head block exists").slot;
+    let head_slot = store
+        .get_block_header(&head_root)
+        .expect("head block exists")
+        .slot;
     Status {
         finalized,
         head: ethlambda_types::state::Checkpoint {
@@ -178,10 +191,7 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 /// Handles tracking in both pending_requests and request_id_map.
-pub async fn fetch_block_from_peer(
-    server: &mut P2PServer,
-    root: ethlambda_types::primitives::H256,
-) -> bool {
+pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     if server.connected_peers.is_empty() {
         warn!(%root, "Cannot fetch block: no connected peers");
         return false;
@@ -234,18 +244,13 @@ pub async fn fetch_block_from_peer(
     true
 }
 
-async fn handle_fetch_failure(
-    server: &mut P2PServer,
-    root: ethlambda_types::primitives::H256,
-    peer: PeerId,
-    error: request_response::OutboundFailure,
-) {
+async fn handle_fetch_failure(server: &mut P2PServer, root: H256, peer: PeerId) {
     let Some(pending) = server.pending_requests.get_mut(&root) else {
         return;
     };
 
     if pending.attempts >= MAX_FETCH_RETRIES {
-        error!(%root, %peer, attempts=%pending.attempts, %error,
+        error!(%root, %peer, attempts=%pending.attempts,
                "Block fetch failed after max retries, giving up");
         server.pending_requests.remove(&root);
         return;
@@ -254,8 +259,7 @@ async fn handle_fetch_failure(
     let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
     let backoff = Duration::from_millis(backoff_ms);
 
-    warn!(%root, %peer, attempts=%pending.attempts, ?backoff, %error,
-          "Block fetch failed, scheduling retry");
+    warn!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");
 
     pending.attempts += 1;
 

@@ -31,7 +31,8 @@ ENV FEATURES=$FEATURES
 RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
-COPY --exclude=.git --exclude=target . .
+# Include .git so vergen-git2 can extract version info (branch, commit SHA)
+COPY --exclude=target . .
 RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin ethlambda
 
 # ARG is not resolved in COPY so we have to hack around it by copying the
@@ -43,7 +44,7 @@ FROM ubuntu AS runtime
 WORKDIR /app
 
 LABEL org.opencontainers.image.source=https://github.com/lambdaclass/ethlambda
-LABEL org.opencontainers.image.description="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust."
+LABEL org.opencontainers.image.description="A minimalist and fast Lean Consensus client written in Rust by LambdaClass"
 LABEL org.opencontainers.image.licenses="MIT"
 
 ARG GIT_COMMIT=unknown

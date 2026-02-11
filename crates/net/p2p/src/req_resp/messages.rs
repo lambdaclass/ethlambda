@@ -94,9 +94,7 @@ impl std::fmt::Debug for ResponseCode {
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-
-    // TODO: here we assume there's a single block per request
-    BlocksByRoot(SignedBlockWithAttestation),
+    BlocksByRoot(Vec<SignedBlockWithAttestation>),
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -117,6 +115,8 @@ pub type ErrorMessage = ssz_types::VariableList<u8, MaxErrorMessageLength>;
 /// Helper to create an ErrorMessage from a string.
 /// Debug builds panic if message exceeds 256 bytes (programming error).
 /// Release builds truncate to 256 bytes.
+#[expect(dead_code)]
+// TODO: map errors to req/resp error messages
 pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     let bytes = msg.as_ref().as_bytes();
     debug_assert!(

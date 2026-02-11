@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -37,10 +37,10 @@ mod req_resp;
 
 pub use metrics::populate_name_registry;
 
-// 10ms, 40ms, 160ms, 640ms, 2560ms
-const MAX_FETCH_RETRIES: u32 = 5;
-const INITIAL_BACKOFF_MS: u64 = 10;
-const BACKOFF_MULTIPLIER: u64 = 4;
+// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+const MAX_FETCH_RETRIES: u32 = 10;
+const INITIAL_BACKOFF_MS: u64 = 5;
+const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 enum RetryMessage {
@@ -411,11 +411,11 @@ async fn handle_peer_redial(server: &mut P2PServer, peer_id: PeerId) {
         info!(%peer_id, "Redialing disconnected bootnode");
         // NOTE: this dial does some checks and adds a pending outbound connection attempt.
         // It does NOT block. If the dial fails, we'll later get an OutgoingConnectionError event.
-        if let Err(e) = server.swarm.dial(addr.clone()) {
+        let _ = server.swarm.dial(addr.clone()).inspect_err(|e| {
             warn!(%peer_id, %e, "Failed to redial bootnode, will retry");
             // Schedule another redial attempt
             schedule_peer_redial(server.retry_tx.clone(), peer_id);
-        }
+        });
     }
 }
 
@@ -428,9 +428,9 @@ pub(crate) fn schedule_peer_redial(retry_tx: mpsc::UnboundedSender<RetryMessage>
 }
 
 pub struct Bootnode {
-    ip: IpAddr,
-    quic_port: u16,
-    public_key: PublicKey,
+    pub(crate) ip: IpAddr,
+    pub(crate) quic_port: u16,
+    pub(crate) public_key: PublicKey,
 }
 
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
@@ -458,8 +458,27 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 .unwrap();
 
         let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
+
+        let ipv4 = record
+            .pairs
+            .iter()
+            .find(|(key, _)| key.as_ref() == b"ip")
+            .map(|(_, bytes)| {
+                IpAddr::from(Ipv4Addr::decode(bytes.as_ref()).expect("invalid IPv4 address"))
+            });
+        let ipv6 = record
+            .pairs
+            .iter()
+            .find(|(key, _)| key.as_ref() == b"ip6")
+            .map(|(_, bytes)| {
+                IpAddr::from(Ipv6Addr::decode(bytes.as_ref()).expect("invalid IPv6 address"))
+            });
+
+        // Prefer IPv4 if both are present
+        let ip = ipv4.or(ipv6).expect("node record missing IP address");
+
         bootnodes.push(Bootnode {
-            ip: "127.0.0.1".parse().unwrap(),
+            ip,
             quic_port,
             public_key: public_key.into(),
         });
@@ -494,4 +513,61 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     hasher.update(data);
     let hash = hasher.finalize();
     libp2p::gossipsub::MessageId(hash[..20].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_enrs_extracts_ip_port_and_public_key() {
+        // Values taken from a local devnet run with lean-quickstart
+        let enrs = vec![
+            "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys".to_string(),
+            "enr:-IW4QPjoNZjNpzdjOqAR2rGguVAWmqpNCUCfbr-pp3rr6Dk6YO2KK5VWARr7BGr8BdmGmG75cBeVC2buzvtQ_nEWLKEBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKolzZWNwMjU2azGhA5_HplOwUZ8wpF4O3g4CBsjRMI6kQYT7ph5LkeKzLgTS".to_string(),
+            "enr:-IW4QNQN_PFdTfuYLGmdAWNivEJLT2tSZtn5jdBOImvh0QlLAJ1p8wHvvfD7aOa1lH88oJ8ddGK_a_FWqAQT_QY4qdMBgmlkgnY0gmlwhH8AAAGEcXVpY4IjK4lzZWNwMjU2azGhA7NTxgfOmGE2EQa4HhsXxFOeHdTLYIc2MEBczymm9IUN".to_string(),
+            "enr:-IW4QI9EXVDvUIxTrCV51Gs2RtpmZu71S7ZP7RRg1OoSBVvGFeXkc5WleBffXwTcWX1Qa9F_N6MhH28TsGFhXkMCGvUBgmlkgnY0gmlwhH8AAAGEcXVpY4IjL4lzZWNwMjU2azGhA6Dm1X9PyyCNAm3RUGcZtG5U3imbj_MDPU5CtPnpeaKS".to_string(),
+        ];
+
+        let bootnodes = parse_enrs(enrs);
+
+        assert_eq!(bootnodes.len(), 4);
+
+        // All ENRs encode 127.0.0.1 as the IPv4 address
+        for bootnode in &bootnodes {
+            assert_eq!(bootnode.ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        }
+
+        // Each ENR encodes a distinct QUIC port
+        assert_eq!(bootnodes[0].quic_port, 9001);
+        assert_eq!(bootnodes[1].quic_port, 9002);
+        assert_eq!(bootnodes[2].quic_port, 9003);
+        assert_eq!(bootnodes[3].quic_port, 9007);
+
+        // Verify the secp256k1 public keys (33-byte compressed format)
+        let expected_pubkeys: Vec<[u8; 33]> = vec![
+            hex::decode("02130c9c6175ae620f43db5682a7e4366bec1be688c9cf44254e49168dd37a0cac")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("039fc7a653b0519f30a45e0ede0e0206c8d1308ea44184fba61e4b91e2b32e04d2")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("03b353c607ce9861361106b81e1b17c4539e1dd4cb60873630405ccf29a6f4850d")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            hex::decode("03a0e6d57f4fcb208d026dd1506719b46e54de299b8ff3033d4e42b4f9e979a292")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        ];
+
+        for (bootnode, expected) in bootnodes.iter().zip(expected_pubkeys.iter()) {
+            let secp_key = secp256k1::PublicKey::try_from_bytes(expected).unwrap();
+            let expected_key: PublicKey = secp_key.into();
+            assert_eq!(bootnode.public_key, expected_key);
+        }
+    }
 }

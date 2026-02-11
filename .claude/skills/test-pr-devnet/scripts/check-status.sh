@@ -48,6 +48,7 @@ echo "Error counts:"
 for node in zeam_0 ream_0 qlean_0 ethlambda_0; do
     if docker ps --format "{{.Names}}" | grep -q "^$node$"; then
         COUNT=$(docker logs "$node" 2>&1 | grep -c "ERROR" || echo "0")
+        COUNT=$(echo "$COUNT" | tr -d '\n' | xargs)
         if [[ "$COUNT" -eq 0 ]]; then
             echo -e "  $node: ${GREEN}$COUNT${NC}"
         else

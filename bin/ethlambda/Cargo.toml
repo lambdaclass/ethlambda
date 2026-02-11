@@ -3,6 +3,7 @@ name = "ethlambda"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 ethlambda-blockchain.workspace = true
@@ -19,8 +20,7 @@ tracing.workspace = true
 tracing-subscriber = "0.3"
 
 serde.workspace = true
-serde_json.workspace = true
-serde_yaml_ng = "0.10"
+serde_yaml_ng.workspace = true
 hex.workspace = true
 
 clap.workspace = true
