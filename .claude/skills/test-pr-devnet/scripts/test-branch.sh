@@ -62,7 +62,9 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
-if [[ ! -d "$ETHLAMBDA_ROOT/.git" ]]; then
+# Use `git rev-parse` instead of `-d .git` to support git worktrees,
+# where .git is a file (not a directory) pointing to the main repo.
+if ! git -C "$ETHLAMBDA_ROOT" rev-parse --git-dir &>/dev/null; then
     echo -e "${RED}✗ Error: Not in a git repository${NC}"
     echo "  Run this script from ethlambda repository root"
     exit 1
