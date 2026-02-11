@@ -100,9 +100,9 @@ struct BlockChainServer {
 
     // Pending blocks waiting for their parent
     pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
-    // Maps pending block_root → the oldest missing ancestor in its chain.
-    // Single lookup replaces walking the chain, safe because processing is synchronous:
-    // once the missing ancestor arrives, the entire chain is processed and all entries removed.
+    // Maps pending block_root → its cached missing ancestor. Resolved by walking the
+    // chain at lookup time, since a cached ancestor may itself have become pending with
+    // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
 }
 
@@ -294,13 +294,13 @@ impl BlockChainServer {
         if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
 
-            // Resolve the actual missing ancestor: if the parent is itself pending,
-            // reuse its cached missing ancestor. Otherwise the parent IS the missing block.
-            let missing_root = self
-                .pending_block_parents
-                .get(&parent_root)
-                .copied()
-                .unwrap_or(parent_root);
+            // Resolve the actual missing ancestor by walking the chain. A stale entry
+            // can occur when a cached ancestor was itself received and became pending
+            // with its own missing parent — the children still point to the old value.
+            let mut missing_root = parent_root;
+            while let Some(&ancestor) = self.pending_block_parents.get(&missing_root) {
+                missing_root = ancestor;
+            }
 
             self.pending_block_parents.insert(block_root, missing_root);
 
