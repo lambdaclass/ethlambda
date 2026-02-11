@@ -4,8 +4,8 @@ use rand::seq::SliceRandom;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use ethlambda_types::block::SignedBlockWithAttestation;
 use ethlambda_types::primitives::ssz::TreeHash;
+use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 
 use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
@@ -59,7 +59,7 @@ pub async fn handle_req_resp_message(
 
             // Check if this was a block fetch request
             if let Some(root) = server.request_id_map.remove(&request_id) {
-                handle_fetch_failure(server, root, peer, error).await;
+                handle_fetch_failure(server, root, peer).await;
             }
         }
         request_response::Event::InboundFailure {
@@ -144,6 +144,13 @@ async fn handle_blocks_by_root_response(
         return;
     };
 
+    if blocks.is_empty() {
+        server.request_id_map.insert(request_id, requested_root);
+        warn!(%peer, "Received empty BlocksByRoot response");
+        handle_fetch_failure(server, requested_root, peer).await;
+        return;
+    }
+
     for block in blocks {
         let root = block.message.block.tree_hash_root();
 
@@ -184,10 +191,7 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 /// Handles tracking in both pending_requests and request_id_map.
-pub async fn fetch_block_from_peer(
-    server: &mut P2PServer,
-    root: ethlambda_types::primitives::H256,
-) -> bool {
+pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     if server.connected_peers.is_empty() {
         warn!(%root, "Cannot fetch block: no connected peers");
         return false;
@@ -240,18 +244,13 @@ pub async fn fetch_block_from_peer(
     true
 }
 
-async fn handle_fetch_failure(
-    server: &mut P2PServer,
-    root: ethlambda_types::primitives::H256,
-    peer: PeerId,
-    error: request_response::OutboundFailure,
-) {
+async fn handle_fetch_failure(server: &mut P2PServer, root: H256, peer: PeerId) {
     let Some(pending) = server.pending_requests.get_mut(&root) else {
         return;
     };
 
     if pending.attempts >= MAX_FETCH_RETRIES {
-        error!(%root, %peer, attempts=%pending.attempts, %error,
+        error!(%root, %peer, attempts=%pending.attempts,
                "Block fetch failed after max retries, giving up");
         server.pending_requests.remove(&root);
         return;
@@ -260,8 +259,7 @@ async fn handle_fetch_failure(
     let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
     let backoff = Duration::from_millis(backoff_ms);
 
-    warn!(%root, %peer, attempts=%pending.attempts, ?backoff, %error,
-          "Block fetch failed, scheduling retry");
+    warn!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");
 
     pending.attempts += 1;
 

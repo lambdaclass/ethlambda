@@ -13,20 +13,28 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
+  └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
   blockchain/               # State machine actor (GenServer pattern)
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
+    ├─ src/key_manager.rs   # Validator key management and signing
+    ├─ src/metrics.rs       # Blockchain-level Prometheus metrics
     ├─ fork_choice/         # LMD GHOST implementation (3SF-mini)
     └─ state_transition/    # STF: process_slots, process_block, attestations
+        └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
     ├─ crypto/              # XMSS aggregation (leansig wrapper)
-    └─ metrics/             # Prometheus metrics
+    └─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
   net/
     ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot)
-    └─ rpc/                 # Axum HTTP endpoints (/lean/v0/* and /metrics)
+    │   ├─ src/gossipsub/   # Topic encoding, message handling
+    │   ├─ src/req_resp/    # Request/response codec and handlers
+    │   └─ src/metrics.rs   # Peer connection/disconnection tracking
+    └─ rpc/                 # Axum HTTP: /lean/v0/{states,checkpoints,health} + /metrics
   storage/                  # RocksDB backend, in-memory for tests
+    └─ src/api/             # StorageBackend trait + Table enum
 ```
 
 ## Key Architecture Patterns
@@ -64,7 +72,7 @@ Fork choice head update
 
 ### Before Committing
 ```bash
-cargo fmt                                    # Format code
+make fmt                                     # Format code (cargo fmt --all)
 make lint                                    # Clippy with -D warnings
 make test                                    # All tests + forkchoice (with skip-signature-verification)
 ```
@@ -73,6 +81,8 @@ make test                                    # All tests + forkchoice (with skip
 ```bash
 .claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
 rm -rf leanSpec && make leanSpec/fixtures                # Regenerate test fixtures (requires uv)
+make docker-build                                        # Build Docker image (DOCKER_TAG=local)
+make run-devnet                                          # Run local devnet with lean-quickstart
 ```
 
 ### Testing with Local Devnet
@@ -95,10 +105,10 @@ let byte: u8 = code.into();
 ### Ownership for Large Structures
 ```rust
 // Prefer taking ownership to avoid cloning large data (signatures ~3KB)
-pub fn consume_signed_block(signed_block: SignedBlockWithAttestation) { ... }
+pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) { ... }
 
 // Add .clone() at call site if needed - makes cost explicit
-store.insert_signed_block(root, signed_block.clone());
+store.insert_signed_block(block_root, signed_block.clone());
 ```
 
 ### Formatting Patterns
@@ -157,11 +167,33 @@ let result = operation()
     .map_err(|err| CustomError::from(err))?;
 ```
 
-### Metrics (RAII Pattern)
+### Metrics Patterns
+
+**Registration with `LazyLock`:**
 ```rust
-// Timing guard automatically observes duration on drop
+// Module-scoped statics (preferred for state_transition metrics)
+static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!("lean_metric_name", "Description", vec![...]).unwrap()
+});
+
+// Function-scoped statics (used in blockchain metrics)
+pub fn update_head_slot(slot: u64) {
+    static LEAN_HEAD_SLOT: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!("lean_head_slot", "Latest slot").unwrap()
+    });
+    LEAN_HEAD_SLOT.set(slot.try_into().unwrap());
+}
+```
+
+**RAII timing guard (auto-observes duration on drop):**
+```rust
 let _timing = metrics::time_state_transition();
 ```
+
+**All metrics use `ethlambda_metrics::*` re-exports** — the `ethlambda-metrics` crate re-exports
+prometheus types (`IntGauge`, `IntCounter`, `Histogram`, etc.) and provides `TimingGuard` + `gather_default_metrics()`.
+
+**Naming convention:** All metrics use `lean_` prefix (e.g., `lean_head_slot`, `lean_state_transition_time_seconds`).
 
 ### Logging Patterns
 
@@ -281,8 +313,27 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 - Crypto tests marked `#[ignore]` (slow leanVM operations)
 
 ### Storage Architecture
-- Genesis block has no signatures - stored in Blocks table only, not BlockSignatures
-- All other blocks must have entries in both tables
+- Blocks are split into three tables: `BlockHeaders`, `BlockBodies`, `BlockSignatures`
+- Genesis/anchor blocks have empty bodies (detected via `EMPTY_BODY_ROOT`) — no entry in `BlockBodies`
+- Genesis block has no signatures — no entry in `BlockSignatures`
+- All other blocks must have entries in all three tables
+- `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
+- Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
+
+### Storage Tables (10)
+
+| Table | Key → Value | Purpose |
+|-------|-------------|---------|
+| `BlockHeaders` | H256 → BlockHeader | Block headers by root |
+| `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
+| `BlockSignatures` | H256 → BlockSignaturesWithAttestation | Signatures (absent for genesis) |
+| `States` | H256 → State | Beacon states by root |
+| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
+| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
+| `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
+| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
+| `Metadata` | string → various | Store state (head, config, checkpoints) |
+| `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition
@@ -304,6 +355,7 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 - `tree_hash`: Merkle tree hashing
 - `spawned-concurrency`: Actor model
 - `libp2p`: P2P networking (custom LambdaClass fork)
+- `vergen-git2`: Build-time git commit/branch info embedded in binary
 
 **Storage:**
 - `rocksdb`: Persistent backend
@@ -313,6 +365,7 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 
 **Specs:** `leanSpec/src/lean_spec/` (Python reference implementation)
 **Devnet:** `lean-quickstart` (github.com/blockblaz/lean-quickstart)
+**Releases:** See `RELEASE.md` for release process documentation
 
 ## Other implementations
 
