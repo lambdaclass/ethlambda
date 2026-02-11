@@ -533,6 +533,55 @@ impl Store {
 
     // ============ Signed Blocks ============
 
+    /// Insert a block as pending (parent state not yet available).
+    ///
+    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockSignatures`
+    /// **without** writing to `LiveChain`. This persists the heavy signature
+    /// data (~3KB+ per block) to disk while keeping the block invisible to
+    /// fork choice.
+    ///
+    /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
+    /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        let SignedBlockWithAttestation {
+            message:
+                BlockWithAttestation {
+                    block,
+                    proposer_attestation,
+                },
+            signature,
+        } = signed_block;
+
+        let signatures = BlockSignaturesWithAttestation {
+            proposer_attestation,
+            signatures: signature,
+        };
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+
+        let header = block.header();
+        let header_entries = vec![(root.as_ssz_bytes(), header.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockHeaders, header_entries)
+            .expect("put block header");
+
+        // Skip storing empty bodies - they can be reconstructed from the header's body_root
+        if header.body_root != *EMPTY_BODY_ROOT {
+            let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
+            batch
+                .put_batch(Table::BlockBodies, body_entries)
+                .expect("put block body");
+        }
+
+        let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockSignatures, sig_entries)
+            .expect("put block signatures");
+
+        // No LiveChain entry — block remains invisible to fork choice
+        batch.commit().expect("commit");
+    }
+
     /// Insert a signed block, storing the block and signatures separately.
     ///
     /// Blocks and signatures are stored in separate tables because the genesis
