@@ -37,10 +37,10 @@ mod req_resp;
 
 pub use metrics::populate_name_registry;
 
-// 10ms, 40ms, 160ms, 640ms, 2560ms
-const MAX_FETCH_RETRIES: u32 = 5;
-const INITIAL_BACKOFF_MS: u64 = 10;
-const BACKOFF_MULTIPLIER: u64 = 4;
+// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+const MAX_FETCH_RETRIES: u32 = 10;
+const INITIAL_BACKOFF_MS: u64 = 5;
+const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 enum RetryMessage {

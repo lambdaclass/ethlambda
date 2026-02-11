@@ -176,7 +176,7 @@ impl BlockSignaturesWithAttestation {
 ///
 /// Headers are smaller than full blocks. They're useful for tracking the chain
 /// without storing everything.
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Encode, Decode, TreeHash)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
     pub slot: u64,
@@ -203,6 +203,38 @@ pub struct Block {
     pub state_root: H256,
     /// The block's payload.
     pub body: BlockBody,
+}
+
+impl Block {
+    /// Extract the block header, computing the body root.
+    pub fn header(&self) -> BlockHeader {
+        BlockHeader {
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            parent_root: self.parent_root,
+            state_root: self.state_root,
+            body_root: self.body.tree_hash_root(),
+        }
+    }
+
+    /// Reconstruct a block from header and body.
+    ///
+    /// The caller should ensure that `header.body_root` matches `body.tree_hash_root()`.
+    /// This is verified with a debug assertion but not in release builds.
+    pub fn from_header_and_body(header: BlockHeader, body: BlockBody) -> Self {
+        debug_assert_eq!(
+            header.body_root,
+            body.tree_hash_root(),
+            "body root mismatch"
+        );
+        Self {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root,
+            state_root: header.state_root,
+            body,
+        }
+    }
 }
 
 /// The body of a block, containing payload data.

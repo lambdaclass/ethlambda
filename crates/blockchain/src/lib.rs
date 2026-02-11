@@ -54,6 +54,7 @@ impl BlockChain {
             p2p_tx,
             key_manager,
             pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -86,6 +87,12 @@ impl BlockChain {
     }
 }
 
+/// GenServer that sequences all blockchain updates.
+///
+/// Any head or finalization updates are done by this server.
+/// Right now it also handles block processing, but in the future
+/// those updates might be done in parallel with only writes being
+/// processed by this server.
 struct BlockChainServer {
     store: Store,
     p2p_tx: mpsc::UnboundedSender<P2PMessage>,
@@ -93,6 +100,10 @@ struct BlockChainServer {
 
     // Pending blocks waiting for their parent
     pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
+    // Maps pending block_root → its cached missing ancestor. Resolved by walking the
+    // chain at lookup time, since a cached ancestor may itself have become pending with
+    // a deeper missing parent after the entry was created.
+    pending_block_parents: HashMap<H256, H256>,
 }
 
 impl BlockChainServer {
@@ -279,9 +290,19 @@ impl BlockChainServer {
         let parent_root = signed_block.message.block.parent_root;
         let proposer = signed_block.message.block.proposer_index;
 
-        // Check if parent block exists before attempting to process
-        if !self.store.contains_block(&parent_root) {
+        // Check if parent state exists before attempting to process
+        if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
+
+            // Resolve the actual missing ancestor by walking the chain. A stale entry
+            // can occur when a cached ancestor was itself received and became pending
+            // with its own missing parent — the children still point to the old value.
+            let mut missing_root = parent_root;
+            while let Some(&ancestor) = self.pending_block_parents.get(&missing_root) {
+                missing_root = ancestor;
+            }
+
+            self.pending_block_parents.insert(block_root, missing_root);
 
             // Store block for later processing
             self.pending_blocks
@@ -289,8 +310,8 @@ impl BlockChainServer {
                 .or_default()
                 .push(signed_block);
 
-            // Request missing parent from network
-            self.request_missing_block(parent_root);
+            // Request the actual missing block from network
+            self.request_missing_block(missing_root);
             return;
         }
 
@@ -345,8 +366,12 @@ impl BlockChainServer {
                   "Processing pending blocks after parent arrival");
 
             for child_block in children {
+                let block_root = child_block.message.block.tree_hash_root();
                 let slot = child_block.message.block.slot;
                 trace!(%parent_root, %slot, "Processing pending child block");
+
+                // Clean up lineage tracking
+                self.pending_block_parents.remove(&block_root);
 
                 // Process recursively - might unblock more descendants
                 self.on_block(child_block);

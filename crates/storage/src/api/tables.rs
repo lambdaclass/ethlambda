@@ -1,8 +1,10 @@
 /// Tables in the storage layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Table {
-    /// Block storage: H256 -> Block
-    Blocks,
+    /// Block header storage: H256 -> BlockHeader
+    BlockHeaders,
+    /// Block body storage: H256 -> BlockBody
+    BlockBodies,
     /// Block signatures storage: H256 -> BlockSignaturesWithAttestation
     ///
     /// Stored separately from blocks because the genesis block has no signatures.
@@ -29,8 +31,9 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 9] = [
-    Table::Blocks,
+pub const ALL_TABLES: [Table; 10] = [
+    Table::BlockHeaders,
+    Table::BlockBodies,
     Table::BlockSignatures,
     Table::States,
     Table::LatestKnownAttestations,
