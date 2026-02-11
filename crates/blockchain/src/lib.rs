@@ -313,19 +313,30 @@ impl BlockChainServer {
                 .or_default()
                 .push(block_root);
 
-            // Check if the missing block's parent state is available from a previous session
-            if let Some(header) = self.store.get_block_header(&missing_root)
-                && self.store.has_state(&header.parent_root)
-            {
-                let block = self
-                    .store
-                    .get_signed_block(&missing_root)
-                    .expect("signed block exists when header exists");
-                self.on_block(block);
-                return;
+            // Walk up through DB: if missing_root is already stored from a previous
+            // session, the actual missing block is further up the chain.
+            while let Some(header) = self.store.get_block_header(&missing_root) {
+                if self.store.has_state(&header.parent_root) {
+                    // Parent state available — process from DB, cascade handles the rest
+                    let block = self
+                        .store
+                        .get_signed_block(&missing_root)
+                        .expect("signed block exists when header exists");
+                    self.on_block(block);
+                    return;
+                }
+                // Block exists but parent doesn't have state — register as pending
+                // so the cascade works when the true ancestor arrives
+                self.pending_blocks
+                    .entry(header.parent_root)
+                    .or_default()
+                    .push(missing_root);
+                self.pending_block_parents
+                    .insert(missing_root, header.parent_root);
+                missing_root = header.parent_root;
             }
 
-            // Otherwise, request from network
+            // Request the actual missing block from network
             self.request_missing_block(missing_root);
             return;
         }
