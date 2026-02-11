@@ -108,6 +108,11 @@ jobs:
         working-directory: leanSpec
         run: uv run fill --fork=Devnet --scheme prod -o fixtures -n 2
 
+      # Ensure make sees fixtures as up-to-date (its timestamp must be
+      # newer than leanSpec/, which intermediate steps may have modified).
+      - name: Mark fixtures as up-to-date
+        run: touch leanSpec/fixtures
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
