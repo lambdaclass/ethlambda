@@ -9,6 +9,7 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 - [Rust](https://rust-lang.org/tools/install)
 - [Git](https://git-scm.com/install)
 - [Docker](https://www.docker.com/get-started)
+- [yq](https://github.com/mikefarah/yq#install)
 
 ### Building and testing
 
