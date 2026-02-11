@@ -292,28 +292,28 @@ async fn fetch_initial_state(
     backend: Arc<dyn StorageBackend>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
-    let store = if let Some(checkpoint_url) = checkpoint_url {
-        // Checkpoint sync path
-        info!(%checkpoint_url, "Starting checkpoint sync");
 
-        let state = checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await?;
-
-        // Verify against local genesis config
-        checkpoint_sync::verify_checkpoint_state(&state, genesis.genesis_time, &validators)?;
-
-        info!(
-            slot = state.slot,
-            validators = state.validators.len(),
-            finalized_slot = state.latest_finalized.slot,
-            "Checkpoint sync complete"
-        );
-
-        // Store the anchor state and header, without body
-        Store::from_anchor_state(backend, state)
-    } else {
+    let Some(checkpoint_url) = checkpoint_url else {
+        info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        Store::from_anchor_state(backend, genesis_state)
+        return Ok(Store::from_anchor_state(backend, genesis_state));
     };
 
-    Ok(store)
+    // Checkpoint sync path
+    info!(%checkpoint_url, "Starting checkpoint sync");
+
+    let state = checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await?;
+
+    // Verify against local genesis config
+    checkpoint_sync::verify_checkpoint_state(&state, genesis.genesis_time, &validators)?;
+
+    info!(
+        slot = state.slot,
+        validators = state.validators.len(),
+        finalized_slot = state.latest_finalized.slot,
+        "Checkpoint sync complete"
+    );
+
+    // Store the anchor state and header, without body
+    Ok(Store::from_anchor_state(backend, state))
 }
