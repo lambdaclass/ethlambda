@@ -303,10 +303,9 @@ async fn fetch_initial_state(
     // Checkpoint sync path
     info!(%checkpoint_url, "Starting checkpoint sync");
 
-    let state = checkpoint_sync::fetch_checkpoint_state(checkpoint_url).await?;
-
-    // Verify against local genesis config
-    checkpoint_sync::verify_checkpoint_state(&state, genesis.genesis_time, &validators)?;
+    let state =
+        checkpoint_sync::fetch_checkpoint_state(checkpoint_url, genesis.genesis_time, &validators)
+            .await?;
 
     info!(
         slot = state.slot,

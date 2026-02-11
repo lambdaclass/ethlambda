@@ -62,7 +62,11 @@ pub enum CheckpointSyncError {
 /// failing fast if the connection stalls. A plain total timeout would
 /// disconnect even for valid downloads if the state is simply too large to
 /// transfer within the time limit.
-pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointSyncError> {
+pub async fn fetch_checkpoint_state(
+    base_url: &str,
+    expected_genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<State, CheckpointSyncError> {
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/lean/v0/states/finalized");
     // Use .read_timeout() to detect stalled downloads (inactivity timer).
@@ -81,6 +85,9 @@ pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointS
 
     let bytes = response.bytes().await?;
     let state = State::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)?;
+
+    verify_checkpoint_state(&state, expected_genesis_time, expected_validators)?;
+
     Ok(state)
 }
 
@@ -90,7 +97,7 @@ pub async fn fetch_checkpoint_state(base_url: &str) -> Result<State, CheckpointS
 /// - state: The downloaded checkpoint state
 /// - expected_genesis_time: Genesis time from local config
 /// - expected_validators: Validator pubkeys from local genesis config
-pub fn verify_checkpoint_state(
+fn verify_checkpoint_state(
     state: &State,
     expected_genesis_time: u64,
     expected_validators: &[Validator],
