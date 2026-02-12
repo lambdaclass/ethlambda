@@ -372,3 +372,6 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 - zeam (Zig): <https://github.com/blockblaz/zeam>
 - ream (Rust): <https://github.com/ReamLabs/ream>
 - qlean (C++): <https://github.com/qdrvm/qlean-mini>
+- grandine (Rust): <https://github.com/grandinetech/lean/tree/main/lean_client>
+- gean (Go): <https://github.com/devlongs/gean>
+- Lantern (C): <https://github.com/Pier-Two/lantern>
