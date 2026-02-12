@@ -26,21 +26,13 @@ When `--checkpoint-sync-url` is omitted, the node initializes from genesis.
 
 ### Direct peer
 
-Any running node that serves the `/lean/v0/states/finalized` endpoint can be used as a checkpoint source, not just ethlambda. Point `--checkpoint-sync-url` at the node's RPC address (default port `5054`):
-
-```bash
---checkpoint-sync-url http://peer:5054
-```
+Any running node that serves the `/lean/v0/states/finalized` endpoint can be used as a checkpoint source, not just ethlambda.
 
 This is the simplest option, with no additional infrastructure needed. The trade-off is that you trust a single peer to provide a correct finalized state.
 
 ### Leanpoint
 
 [Leanpoint](https://github.com/blockblaz/leanpoint) is a dedicated checkpoint sync provider. It polls multiple nodes and only serves state when 50%+ agree on finality, adding a layer of consensus validation.
-
-```bash
---checkpoint-sync-url http://leanpoint:5555
-```
 
 This is the recommended option for production deployments since it reduces trust in any single peer.
 
