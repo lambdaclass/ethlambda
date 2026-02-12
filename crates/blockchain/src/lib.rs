@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
@@ -99,7 +99,7 @@ struct BlockChainServer {
     key_manager: key_manager::KeyManager,
 
     // Pending block roots waiting for their parent (block data stored in DB)
-    pending_blocks: HashMap<H256, Vec<H256>>,
+    pending_blocks: HashMap<H256, HashSet<H256>>,
     // Maps pending block_root → its cached missing ancestor. Resolved by walking the
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
@@ -285,6 +285,22 @@ impl BlockChainServer {
     }
 
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+        let mut queue = VecDeque::new();
+        queue.push_back(signed_block);
+
+        while let Some(block) = queue.pop_front() {
+            self.process_or_pend_block(block, &mut queue);
+        }
+    }
+
+    /// Try to process a single block. If its parent state is missing, store it
+    /// as pending. On success, collect any unblocked children into `queue` for
+    /// the caller to process next (iteratively, avoiding deep recursion).
+    fn process_or_pend_block(
+        &mut self,
+        signed_block: SignedBlockWithAttestation,
+        queue: &mut VecDeque<SignedBlockWithAttestation>,
+    ) {
         let slot = signed_block.message.block.slot;
         let block_root = signed_block.message.block.tree_hash_root();
         let parent_root = signed_block.message.block.parent_root;
@@ -311,18 +327,21 @@ impl BlockChainServer {
             self.pending_blocks
                 .entry(parent_root)
                 .or_default()
-                .push(block_root);
+                .insert(block_root);
 
             // Walk up through DB: if missing_root is already stored from a previous
             // session, the actual missing block is further up the chain.
+            // Note: this loop always terminates — blocks reference parents by hash,
+            // so a cycle would require a hash collision.
             while let Some(header) = self.store.get_block_header(&missing_root) {
                 if self.store.has_state(&header.parent_root) {
-                    // Parent state available — process from DB, cascade handles the rest
+                    // Parent state available — enqueue for processing, cascade
+                    // handles the rest via the outer loop.
                     let block = self
                         .store
                         .get_signed_block(&missing_root)
-                        .expect("signed block exists when header exists");
-                    self.on_block(block);
+                        .expect("header and parent state exist, so the full signed block must too");
+                    queue.push_back(block);
                     return;
                 }
                 // Block exists but parent doesn't have state — register as pending
@@ -330,7 +349,7 @@ impl BlockChainServer {
                 self.pending_blocks
                     .entry(header.parent_root)
                     .or_default()
-                    .push(missing_root);
+                    .insert(missing_root);
                 self.pending_block_parents
                     .insert(missing_root, header.parent_root);
                 missing_root = header.parent_root;
@@ -352,8 +371,8 @@ impl BlockChainServer {
                     "Block imported successfully"
                 );
 
-                // Check if any pending blocks can now be processed
-                self.process_pending_children(block_root);
+                // Enqueue any pending blocks that were waiting for this parent
+                self.collect_pending_children(block_root, queue);
             }
             Err(err) => {
                 warn!(
@@ -379,31 +398,37 @@ impl BlockChainServer {
             );
     }
 
-    fn process_pending_children(&mut self, parent_root: H256) {
-        // Remove and process all blocks that were waiting for this parent
-        if let Some(child_roots) = self.pending_blocks.remove(&parent_root) {
-            info!(%parent_root, num_children=%child_roots.len(),
-                  "Processing pending blocks after parent arrival");
+    /// Move pending children of `parent_root` into the work queue for iterative
+    /// processing. This replaces the old recursive `process_pending_children`.
+    fn collect_pending_children(
+        &mut self,
+        parent_root: H256,
+        queue: &mut VecDeque<SignedBlockWithAttestation>,
+    ) {
+        let Some(child_roots) = self.pending_blocks.remove(&parent_root) else {
+            return;
+        };
 
-            for block_root in child_roots {
-                // Clean up lineage tracking
-                self.pending_block_parents.remove(&block_root);
+        info!(%parent_root, num_children=%child_roots.len(),
+              "Processing pending blocks after parent arrival");
 
-                // Load block data from DB
-                let Some(child_block) = self.store.get_signed_block(&block_root) else {
-                    warn!(
-                        block_root = %ShortRoot(&block_root.0),
-                        "Pending block missing from DB, skipping"
-                    );
-                    continue;
-                };
+        for block_root in child_roots {
+            // Clean up lineage tracking
+            self.pending_block_parents.remove(&block_root);
 
-                let slot = child_block.message.block.slot;
-                trace!(%parent_root, %slot, "Processing pending child block");
+            // Load block data from DB
+            let Some(child_block) = self.store.get_signed_block(&block_root) else {
+                warn!(
+                    block_root = %ShortRoot(&block_root.0),
+                    "Pending block missing from DB, skipping"
+                );
+                continue;
+            };
 
-                // Process recursively - might unblock more descendants
-                self.on_block(child_block);
-            }
+            let slot = child_block.message.block.slot;
+            trace!(%parent_root, %slot, "Processing pending child block");
+
+            queue.push_back(child_block);
         }
     }
 
