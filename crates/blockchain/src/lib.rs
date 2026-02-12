@@ -284,10 +284,14 @@ impl BlockChainServer {
         Ok(())
     }
 
+    /// Process a newly received block.
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
         let mut queue = VecDeque::new();
         queue.push_back(signed_block);
 
+        // A new block can trigger a cascade of pending blocks becoming processable.
+        // Here we process blocks iteratively, to avoid recursive calls that could
+        // cause a stack overflow.
         while let Some(block) = queue.pop_front() {
             self.process_or_pend_block(block, &mut queue);
         }
