@@ -72,3 +72,10 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 ---
 
 ✅(*) **Partial support**: These metrics are implemented but not collected "on scrape" as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.
+
+## Troubleshooting
+
+### Docker Desktop on MacOS
+
+lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.
+To work around this, enable the ["Enable host networking" option](https://docs.docker.com/enterprise/security/hardened-desktop/settings-management/settings-reference/#enable-host-networking) in Docker Desktop settings under Resources > Network.
