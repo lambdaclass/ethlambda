@@ -308,6 +308,13 @@ cargo test -p ethlambda-blockchain --features skip-signature-verification --test
 
 ## Common Gotchas
 
+### Aggregator Flag Required for Finalization
+- At least one node **must** be started with `--is-aggregator` to finalize blocks in production (without `skip-signature-verification`)
+- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
+- With `skip-signature-verification` (tests only), attestations bypass aggregation and go directly to `new_aggregated_payloads`, so the flag is not needed
+- **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
+
 ### Signature Verification
 - Tests require `skip-signature-verification` feature for performance
 - Crypto tests marked `#[ignore]` (slow leanVM operations)
