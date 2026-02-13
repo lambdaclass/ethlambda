@@ -38,6 +38,10 @@ A checkpoint becomes **justified** when ≥2/3 of validators attest to it as a t
 
 The threshold is computed as: `3 × vote_count ≥ 2 × validator_count`
 
+> **In ethlambda:** Justification and finalization are processed inside `process_block()`
+> in `crates/blockchain/state_transition/src/lib.rs`. The supermajority check is
+> `3 * vote_count >= 2 * validator_count` (line 292).
+
 Attestations must also pass validity checks before they count:
 - Source checkpoint must already be justified
 - Target must not already be justified
@@ -51,6 +55,11 @@ Not every slot can be justified, only slots at specific distances from the last
 finalized slot. This is the novel part of 3SF-mini.
 
 A slot is **justifiable** if `delta = slot - finalized_slot` matches any rule:
+
+> **In ethlambda:** The function `slot_is_justifiable_after(slot, finalized_slot)` in
+> `crates/blockchain/state_transition/src/lib.rs` implements this check. It uses
+> `isqrt()` for perfect square detection and the identity `4n(n+1) + 1 = (2n+1)²`
+> for pronic number detection.
 
 ```text
     ┌─────────────────────────────────────────────────────────┐
@@ -188,6 +197,12 @@ between its source and target. The intuition: if every slot between source and t
 *could have been* justified, then the chain of justifications is unbroken, and the
 source is safe to finalize.
 
+> **In ethlambda:** The finalization check (line 315) iterates over slots between
+> source and target and calls `slot_is_justifiable_after` on each. If none are
+> justifiable, there are no gaps and finalization proceeds. Note: the check uses
+> `original_finalized_slot` (the finalized slot at the start of block processing),
+> not the current one, since finalization can advance mid-processing.
+
 ```text
                     FINALIZATION CHECK
                     ──────────────────
@@ -269,6 +284,12 @@ Validators attest with `source=101, target=102`:
 
 **After finalization of slot 101:**
 - `justified_slots` window shifts forward (old slots pruned)
-- LiveChain entries for slots ≤101 are pruned
+- `LiveChain` entries for slots ≤101 are pruned
 - Gossip signatures and aggregation proofs for finalized blocks are cleaned up
 - Future fork choice runs start from slot 101's successor, never looking further back
+
+> **In ethlambda:** The `justified_slots` bitlist uses relative indexing (index 0 =
+> `finalized_slot + 1`). When finalization advances, `shift_window()` in
+> `crates/blockchain/state_transition/src/justified_slots_ops.rs` drops the
+> now-finalized prefix. The attestation target is also walked back to the nearest
+> justifiable slot via `slot_is_justifiable_after` in `crates/blockchain/src/store.rs`.
