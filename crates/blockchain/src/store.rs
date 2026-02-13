@@ -21,7 +21,7 @@ use ethlambda_types::{
 };
 use tracing::{info, trace, warn};
 
-use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, SECONDS_PER_SLOT, metrics};
+use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
@@ -260,9 +260,10 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// 800ms interval. Slot and interval-within-slot are derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
-pub fn on_tick(store: &mut Store, timestamp: u64, has_proposal: bool, is_aggregator: bool) {
-    // Convert UNIX timestamp to interval count since genesis
-    let time_delta_ms = timestamp.saturating_sub(store.config().genesis_time) * 1000;
+pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool, is_aggregator: bool) {
+    // Convert UNIX timestamp (ms) to interval count since genesis
+    let genesis_time_ms = store.config().genesis_time * 1000;
+    let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
     // If we're more than a slot behind, fast-forward to a slot before.
@@ -683,10 +684,10 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time = store.config().genesis_time + slot * SECONDS_PER_SLOT;
+    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
-    on_tick(store, slot_time, true, false);
+    on_tick(store, slot_time_ms, true, false);
 
     // Process any pending attestations before proposal
     accept_new_attestations(store);

@@ -136,13 +136,13 @@ struct BlockChainServer {
 }
 
 impl BlockChainServer {
-    fn on_tick(&mut self, timestamp: u64) {
-        let genesis_time = self.store.config().genesis_time;
+    fn on_tick(&mut self, timestamp_ms: u64) {
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
 
-        // Calculate current slot and interval from seconds
-        let time_since_genesis = timestamp.saturating_sub(genesis_time);
-        let slot = time_since_genesis / SECONDS_PER_SLOT;
-        let interval = (time_since_genesis % SECONDS_PER_SLOT) * 1000 / MILLISECONDS_PER_INTERVAL;
+        // Calculate current slot and interval from milliseconds
+        let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
+        let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
+        let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
         // Update current slot metric
         metrics::update_current_slot(slot);
@@ -157,7 +157,7 @@ impl BlockChainServer {
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(
             &mut self.store,
-            timestamp,
+            timestamp_ms,
             proposer_validator_id.is_some(),
             self.is_aggregator,
         );
@@ -453,7 +453,7 @@ impl GenServer for BlockChainServer {
                 let timestamp = SystemTime::UNIX_EPOCH
                     .elapsed()
                     .expect("already past the unix epoch");
-                self.on_tick(timestamp.as_secs());
+                self.on_tick(timestamp.as_millis() as u64);
                 // Schedule the next tick at the next 800ms interval boundary
                 let ms_since_epoch = timestamp.as_millis() as u64;
                 let ms_to_next_interval =

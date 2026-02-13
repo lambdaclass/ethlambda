@@ -78,11 +78,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = build_signed_block(block_data);
 
-                    let block_time =
-                        signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
+                    let block_time_ms =
+                        (signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time) * 1000;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time, true, false);
+                    store::on_tick(&mut store, block_time_ms, true, false);
                     let result = store::on_block(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
@@ -105,9 +105,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "tick" => {
-                    let timestamp = step.time.expect("tick step missing time");
+                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp, false, false);
+                    store::on_tick(&mut store, timestamp_ms, false, false);
                 }
                 other => {
                     // Fail for unsupported step types for now
