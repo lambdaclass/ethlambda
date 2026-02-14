@@ -5,13 +5,34 @@ use std::{
 };
 
 use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
-use ethlambda_storage::{Store, backend::InMemoryBackend};
+use ethlambda_storage::{SignatureKey, Store, StoredAggregatedPayload, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::Attestation,
+    attestation::{Attestation, AttestationData},
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::{H256, VariableList, ssz::TreeHash},
     state::State,
 };
+
+/// Extract per-validator attestation data from aggregated payloads.
+/// Test helper that mirrors the private function in blockchain::store.
+fn extract_attestations(
+    store: &Store,
+    payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
+) -> HashMap<u64, AttestationData> {
+    let mut result: HashMap<u64, AttestationData> = HashMap::new();
+    for ((validator_id, data_root), _) in payloads {
+        let Some(data) = store.get_attestation_data_by_root(&data_root) else {
+            continue;
+        };
+        let should_update = result
+            .get(&validator_id)
+            .is_none_or(|existing| existing.slot < data.slot);
+        if should_update {
+            result.insert(validator_id, data);
+        }
+    }
+    result
+}
 
 use crate::types::{ForkChoiceTestVector, StoreChecks};
 
@@ -57,11 +78,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = build_signed_block(block_data);
 
-                    let block_time =
-                        signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
+                    let block_time_ms =
+                        (signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time) * 1000;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time, true);
+                    store::on_tick(&mut store, block_time_ms, true, false);
                     let result = store::on_block(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
@@ -84,9 +105,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "tick" => {
-                    let timestamp = step.time.expect("tick step missing time");
+                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp, false);
+                    store::on_tick(&mut store, timestamp_ms, false, false);
                 }
                 other => {
                     // Fail for unsupported step types for now
@@ -279,14 +300,12 @@ fn validate_attestation_check(
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
-    use ethlambda_types::attestation::AttestationData;
-
     let validator_id = check.validator;
     let location = check.location.as_str();
 
     let attestations: HashMap<u64, AttestationData> = match location {
-        "new" => st.iter_new_attestations().collect(),
-        "known" => st.iter_known_attestations().collect(),
+        "new" => extract_attestations(st, st.iter_new_aggregated_payloads()),
+        "known" => extract_attestations(st, st.iter_known_aggregated_payloads()),
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -366,7 +385,8 @@ fn validate_lexicographic_head_among(
     }
 
     let blocks = st.get_live_chain();
-    let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
+    let known_attestations: HashMap<u64, AttestationData> =
+        extract_attestations(st, st.iter_known_aggregated_payloads());
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)

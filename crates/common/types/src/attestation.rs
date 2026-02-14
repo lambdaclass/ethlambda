@@ -1,4 +1,5 @@
 use crate::{
+    block::AggregatedSignatureProof,
     primitives::ssz::{Decode, Encode, TreeHash},
     signature::SignatureSize,
     state::{Checkpoint, ValidatorRegistryLimit},
@@ -61,3 +62,10 @@ pub struct AggregatedAttestation {
 /// A general-purpose bitfield for tracking which validators have participated
 /// in some collective action (attestation, signature aggregation, etc.).
 pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
+
+/// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SignedAggregatedAttestation {
+    pub data: AttestationData,
+    pub proof: AggregatedSignatureProof,
+}

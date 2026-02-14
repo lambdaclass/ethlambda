@@ -13,8 +13,8 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 use ethlambda_types::{
     attestation::AttestationData,
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
-        BlockWithAttestation, SignedBlockWithAttestation,
+        Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation, BlockWithAttestation,
+        SignedBlockWithAttestation,
     },
     primitives::{
         H256,
@@ -288,7 +288,11 @@ impl Store {
 
     // ============ Time ============
 
-    /// Returns the current store time in seconds since genesis.
+    /// Returns the current store time in interval counts since genesis.
+    ///
+    /// Each increment represents one 800ms interval. Derive slot/interval as:
+    ///   slot     = time() / INTERVALS_PER_SLOT
+    ///   interval = time() % INTERVALS_PER_SLOT
     pub fn time(&self) -> u64 {
         self.get_metadata(KEY_TIME)
     }
@@ -369,13 +373,18 @@ impl Store {
         {
             self.prune_live_chain(finalized.slot);
 
-            // Prune signatures and payloads for finalized slots
+            // Prune signatures, payloads, and attestation data for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
-            let pruned_payloads = self.prune_aggregated_payloads(finalized.slot);
-            if pruned_sigs > 0 || pruned_payloads > 0 {
+            let pruned_att_data = self.prune_attestation_data_by_root(finalized.slot);
+            self.prune_aggregated_payload_table(Table::LatestNewAggregatedPayloads, finalized.slot);
+            self.prune_aggregated_payload_table(
+                Table::LatestKnownAggregatedPayloads,
+                finalized.slot,
+            );
+            if pruned_sigs > 0 || pruned_att_data > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_sigs, pruned_payloads, "Pruned finalized signatures"
+                    pruned_sigs, pruned_att_data, "Pruned finalized signatures"
                 );
             }
         }
@@ -478,24 +487,51 @@ impl Store {
         count
     }
 
-    /// Prune aggregated payloads for slots <= finalized_slot.
+    /// Prune attestation data by root for slots <= finalized_slot.
     ///
-    /// Returns the number of payloads pruned.
-    pub fn prune_aggregated_payloads(&mut self, finalized_slot: u64) -> usize {
+    /// Returns the number of entries pruned.
+    pub fn prune_attestation_data_by_root(&mut self, finalized_slot: u64) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut to_delete = vec![];
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(Table::AttestationDataByRoot, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Ok(data) = AttestationData::from_ssz_bytes(&value_bytes)
+                && data.slot <= finalized_slot
+            {
+                to_delete.push(key_bytes.to_vec());
+            }
+        }
+        drop(view);
+
+        let count = to_delete.len();
+        if !to_delete.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::AttestationDataByRoot, to_delete)
+                .expect("delete");
+            batch.commit().expect("commit");
+        }
+        count
+    }
+
+    /// Prune an aggregated payload table (new or known) for slots <= finalized_slot.
+    fn prune_aggregated_payload_table(&mut self, table: Table, finalized_slot: u64) {
         let view = self.backend.begin_read().expect("read view");
         let mut updates = vec![];
         let mut deletes = vec![];
-        let mut removed_count = 0;
 
         for (key_bytes, value_bytes) in view
-            .prefix_iterator(Table::AggregatedPayloads, &[])
+            .prefix_iterator(table, &[])
             .expect("iter")
             .filter_map(|r| r.ok())
         {
             if let Ok(mut payloads) = Vec::<StoredAggregatedPayload>::from_ssz_bytes(&value_bytes) {
                 let original_len = payloads.len();
                 payloads.retain(|p| p.slot > finalized_slot);
-                removed_count += original_len - payloads.len();
 
                 if payloads.is_empty() {
                     deletes.push(key_bytes.to_vec());
@@ -509,18 +545,13 @@ impl Store {
         if !updates.is_empty() || !deletes.is_empty() {
             let mut batch = self.backend.begin_write().expect("write batch");
             if !updates.is_empty() {
-                batch
-                    .put_batch(Table::AggregatedPayloads, updates)
-                    .expect("put");
+                batch.put_batch(table, updates).expect("put");
             }
             if !deletes.is_empty() {
-                batch
-                    .delete_batch(Table::AggregatedPayloads, deletes)
-                    .expect("delete");
+                batch.delete_batch(table, deletes).expect("delete");
             }
             batch.commit().expect("commit");
         }
-        removed_count
     }
 
     /// Get the block header by root.
@@ -624,124 +655,185 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    // ============ Known Attestations ============
+    // ============ Attestation Data By Root ============
     //
-    // "Known" attestations are included in fork choice weight calculations.
-    // They're promoted from "new" attestations at specific intervals.
+    // Content-addressed attestation data storage. Used to reconstruct
+    // per-validator attestation maps from aggregated payloads.
 
-    /// Iterates over all known attestations (validator_id, attestation_data).
-    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+    /// Stores attestation data indexed by its tree hash root.
+    pub fn insert_attestation_data_by_root(&mut self, root: H256, data: AttestationData) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(root.as_ssz_bytes(), data.as_ssz_bytes())];
+        batch
+            .put_batch(Table::AttestationDataByRoot, entries)
+            .expect("put attestation data");
+        batch.commit().expect("commit");
+    }
+
+    /// Returns attestation data for the given root hash.
+    pub fn get_attestation_data_by_root(&self, root: &H256) -> Option<AttestationData> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::AttestationDataByRoot, &root.as_ssz_bytes())
+            .expect("get")
+            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
+    }
+
+    // ============ Known Aggregated Payloads ============
+    //
+    // "Known" aggregated payloads are active in fork choice weight calculations.
+    // Promoted from "new" payloads at specific intervals (0 with proposal, 4).
+
+    /// Iterates over all known aggregated payloads.
+    pub fn iter_known_aggregated_payloads(
+        &self,
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestKnownAttestations, &[])
+            .prefix_iterator(Table::LatestKnownAggregatedPayloads, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
-                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
-                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
-                (validator_id, data)
+                let key = decode_signature_key(&k);
+                let payloads =
+                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
+                (key, payloads)
             })
             .collect();
         entries.into_iter()
     }
 
-    /// Returns a validator's latest known attestation.
-    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+    /// Insert an aggregated payload into the known (fork-choice-active) table.
+    pub fn insert_known_aggregated_payload(
+        &mut self,
+        key: SignatureKey,
+        payload: StoredAggregatedPayload,
+    ) {
+        let encoded_key = encode_signature_key(&key);
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestKnownAttestations, &validator_id.as_ssz_bytes())
+        let mut payloads: Vec<StoredAggregatedPayload> = view
+            .get(Table::LatestKnownAggregatedPayloads, &encoded_key)
             .expect("get")
-            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
-    }
+            .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
+            .unwrap_or_default();
+        drop(view);
 
-    /// Stores a validator's latest known attestation.
-    pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
+        payloads.push(payload);
+
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
+        let entries = vec![(encoded_key, payloads.as_ssz_bytes())];
         batch
-            .put_batch(Table::LatestKnownAttestations, entries)
-            .expect("put attestation");
+            .put_batch(Table::LatestKnownAggregatedPayloads, entries)
+            .expect("put known aggregated payload");
         batch.commit().expect("commit");
     }
 
-    // ============ New Attestations ============
+    // ============ New Aggregated Payloads ============
     //
-    // "New" attestations are pending attestations not yet included in fork choice.
-    // They're promoted to "known" via `promote_new_attestations`.
+    // "New" aggregated payloads are pending — not yet counted in fork choice.
+    // Promoted to "known" via `promote_new_aggregated_payloads`.
 
-    /// Iterates over all new (pending) attestations.
-    pub fn iter_new_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+    /// Iterates over all new (pending) aggregated payloads.
+    pub fn iter_new_aggregated_payloads(
+        &self,
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestNewAttestations, &[])
+            .prefix_iterator(Table::LatestNewAggregatedPayloads, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
-                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
-                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
-                (validator_id, data)
+                let key = decode_signature_key(&k);
+                let payloads =
+                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
+                (key, payloads)
             })
             .collect();
         entries.into_iter()
     }
 
-    /// Returns a validator's latest new (pending) attestation.
-    pub fn get_new_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+    /// Insert an aggregated payload into the new (pending) table.
+    pub fn insert_new_aggregated_payload(
+        &mut self,
+        key: SignatureKey,
+        payload: StoredAggregatedPayload,
+    ) {
+        let encoded_key = encode_signature_key(&key);
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestNewAttestations, &validator_id.as_ssz_bytes())
+        let mut payloads: Vec<StoredAggregatedPayload> = view
+            .get(Table::LatestNewAggregatedPayloads, &encoded_key)
             .expect("get")
-            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
-    }
+            .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
+            .unwrap_or_default();
+        drop(view);
 
-    /// Stores a validator's new (pending) attestation.
-    pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
+        payloads.push(payload);
+
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
+        let entries = vec![(encoded_key, payloads.as_ssz_bytes())];
         batch
-            .put_batch(Table::LatestNewAttestations, entries)
-            .expect("put attestation");
+            .put_batch(Table::LatestNewAggregatedPayloads, entries)
+            .expect("put new aggregated payload");
         batch.commit().expect("commit");
     }
 
-    /// Removes a validator's new (pending) attestation.
-    pub fn remove_new_attestation(&mut self, validator_id: &u64) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(
-                Table::LatestNewAttestations,
-                vec![validator_id.as_ssz_bytes()],
-            )
-            .expect("delete attestation");
-        batch.commit().expect("commit");
-    }
-
-    /// Promotes all new attestations to known attestations.
+    /// Promotes all new aggregated payloads to known, making them active in fork choice.
     ///
-    /// Takes all attestations from `latest_new_attestations` and moves them
-    /// to `latest_known_attestations`, making them count for fork choice.
-    pub fn promote_new_attestations(&mut self) {
-        // Read all new attestations
+    /// Merges entries from `LatestNewAggregatedPayloads` into `LatestKnownAggregatedPayloads`,
+    /// appending to existing payload lists rather than overwriting them.
+    pub fn promote_new_aggregated_payloads(&mut self) {
         let view = self.backend.begin_read().expect("read view");
-        let new_attestations: Vec<(Vec<u8>, Vec<u8>)> = view
-            .prefix_iterator(Table::LatestNewAttestations, &[])
+        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = view
+            .prefix_iterator(Table::LatestNewAggregatedPayloads, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
-        drop(view);
 
-        if new_attestations.is_empty() {
+        if new_entries.is_empty() {
+            drop(view);
             return;
         }
 
-        // Delete from new and insert to known in a single batch
+        // Merge new payloads with existing known payloads
+        let merged: Vec<(Vec<u8>, Vec<u8>)> = new_entries
+            .iter()
+            .map(|(key, new_bytes)| {
+                let new_payloads =
+                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(new_bytes).expect("valid");
+                let mut known_payloads: Vec<StoredAggregatedPayload> = view
+                    .get(Table::LatestKnownAggregatedPayloads, key)
+                    .expect("get")
+                    .map(|bytes| {
+                        Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid")
+                    })
+                    .unwrap_or_default();
+                known_payloads.extend(new_payloads);
+                (key.clone(), known_payloads.as_ssz_bytes())
+            })
+            .collect();
+        drop(view);
+
+        let keys_to_delete: Vec<_> = new_entries.into_iter().map(|(k, _)| k).collect();
         let mut batch = self.backend.begin_write().expect("write batch");
-        let keys_to_delete: Vec<_> = new_attestations.iter().map(|(k, _)| k.clone()).collect();
         batch
-            .delete_batch(Table::LatestNewAttestations, keys_to_delete)
-            .expect("delete new attestations");
+            .delete_batch(Table::LatestNewAggregatedPayloads, keys_to_delete)
+            .expect("delete new aggregated payloads");
         batch
-            .put_batch(Table::LatestKnownAttestations, new_attestations)
-            .expect("put known attestations");
+            .put_batch(Table::LatestKnownAggregatedPayloads, merged)
+            .expect("put known aggregated payloads");
+        batch.commit().expect("commit");
+    }
+
+    /// Delete specific gossip signatures by key.
+    pub fn delete_gossip_signatures(&mut self, keys: &[SignatureKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let encoded_keys: Vec<_> = keys.iter().map(encode_signature_key).collect();
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::GossipSignatures, encoded_keys)
+            .expect("delete gossip signatures");
         batch.commit().expect("commit");
     }
 
@@ -786,76 +878,6 @@ impl Store {
         batch
             .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
-        batch.commit().expect("commit");
-    }
-
-    // ============ Aggregated Payloads ============
-    //
-    // Aggregated payloads are leanVM proofs combining multiple signatures.
-    // Used to verify block signatures efficiently.
-
-    /// Iterates over all aggregated signature payloads.
-    pub fn iter_aggregated_payloads(
-        &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::AggregatedPayloads, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let key = decode_signature_key(&k);
-                let payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
-                (key, payloads)
-            })
-            .collect();
-        entries.into_iter()
-    }
-
-    /// Returns aggregated payloads for a signature key.
-    fn get_aggregated_payloads(&self, key: &SignatureKey) -> Option<Vec<StoredAggregatedPayload>> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::AggregatedPayloads, &encode_signature_key(key))
-            .expect("get")
-            .map(|bytes| {
-                Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid payloads")
-            })
-    }
-
-    /// Insert an aggregated signature proof for a validator's attestation.
-    ///
-    /// Multiple proofs can be stored for the same (validator, attestation_data) pair,
-    /// each with its own slot metadata for pruning.
-    ///
-    /// # Thread Safety
-    ///
-    /// This method uses a read-modify-write pattern that is NOT atomic:
-    /// 1. Read existing payloads
-    /// 2. Append new payload
-    /// 3. Write back
-    ///
-    /// Concurrent calls could result in lost updates. This method MUST be called
-    /// from a single thread. In our case, that thread is the `BlockChain` `GenServer`
-    pub fn insert_aggregated_payload(
-        &mut self,
-        attestation_data: &AttestationData,
-        validator_id: u64,
-        proof: AggregatedSignatureProof,
-    ) {
-        let slot = attestation_data.slot;
-        let data_root = attestation_data.tree_hash_root();
-        let key = (validator_id, data_root);
-
-        // Read existing, add new, write back (NOT atomic - requires single-threaded access)
-        let mut payloads = self.get_aggregated_payloads(&key).unwrap_or_default();
-        payloads.push(StoredAggregatedPayload { slot, proof });
-
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encode_signature_key(&key), payloads.as_ssz_bytes())];
-        batch
-            .put_batch(Table::AggregatedPayloads, entries)
-            .expect("put proofs");
         batch.commit().expect("commit");
     }
 

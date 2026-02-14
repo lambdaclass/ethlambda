@@ -5,7 +5,7 @@ use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     ShortRoot,
-    attestation::{Attestation, AttestationData, SignedAttestation},
+    attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::{H256, ssz::TreeHash},
     signature::ValidatorSecretKey,
@@ -30,6 +30,8 @@ pub enum P2PMessage {
     PublishAttestation(SignedAttestation),
     /// Publish a block to the gossip network.
     PublishBlock(SignedBlockWithAttestation),
+    /// Publish an aggregated attestation to the gossip network.
+    PublishAggregatedAttestation(SignedAggregatedAttestation),
     /// Fetch a block by its root hash.
     FetchBlock(H256),
 }
@@ -38,14 +40,23 @@ pub struct BlockChain {
     handle: GenServerHandle<BlockChainServer>,
 }
 
-/// Seconds in a slot. Each slot has 4 intervals of 1 second each.
+/// Seconds in a slot.
 pub const SECONDS_PER_SLOT: u64 = 4;
+/// Milliseconds in a slot.
+pub const MILLISECONDS_PER_SLOT: u64 = 4_000;
+/// Milliseconds per interval (800ms ticks).
+pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
+/// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
+pub const INTERVALS_PER_SLOT: u64 = 5;
+/// Number of attestation committees per slot.
+pub const ATTESTATION_COMMITTEE_COUNT: u64 = 1;
 
 impl BlockChain {
     pub fn spawn(
         store: Store,
         p2p_tx: mpsc::UnboundedSender<P2PMessage>,
         validator_keys: HashMap<u64, ValidatorSecretKey>,
+        is_aggregator: bool,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
@@ -54,6 +65,7 @@ impl BlockChain {
             p2p_tx,
             key_manager,
             pending_blocks: HashMap::new(),
+            is_aggregator,
             pending_block_parents: HashMap::new(),
         }
         .start();
@@ -85,6 +97,20 @@ impl BlockChain {
             .await
             .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new attestation"));
     }
+
+    /// Sends an aggregated attestation to the BlockChain for processing.
+    pub async fn notify_new_aggregated_attestation(
+        &mut self,
+        attestation: SignedAggregatedAttestation,
+    ) {
+        let _ = self
+            .handle
+            .cast(CastMessage::NewAggregatedAttestation(attestation))
+            .await
+            .inspect_err(
+                |err| error!(%err, "Failed to notify BlockChain of new aggregated attestation"),
+            );
+    }
 }
 
 /// GenServer that sequences all blockchain updates.
@@ -104,16 +130,19 @@ struct BlockChainServer {
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+
+    /// Whether this node acts as a committee aggregator.
+    is_aggregator: bool,
 }
 
 impl BlockChainServer {
-    fn on_tick(&mut self, timestamp: u64) {
-        let genesis_time = self.store.config().genesis_time;
+    fn on_tick(&mut self, timestamp_ms: u64) {
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
 
-        // Calculate current slot and interval
-        let time_since_genesis = timestamp.saturating_sub(genesis_time);
-        let slot = time_since_genesis / SECONDS_PER_SLOT;
-        let interval = time_since_genesis % SECONDS_PER_SLOT;
+        // Calculate current slot and interval from milliseconds
+        let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
+        let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
+        let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
         // Update current slot metric
         metrics::update_current_slot(slot);
@@ -126,7 +155,12 @@ impl BlockChainServer {
             .flatten();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        store::on_tick(&mut self.store, timestamp, proposer_validator_id.is_some());
+        store::on_tick(
+            &mut self.store,
+            timestamp_ms,
+            proposer_validator_id.is_some(),
+            self.is_aggregator,
+        );
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
@@ -138,7 +172,7 @@ impl BlockChainServer {
             self.produce_attestations(slot);
         }
 
-        // Update safe target slot metric (updated by store.on_tick at interval 2)
+        // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
     }
 
@@ -437,8 +471,13 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
-        let _ = store::on_gossip_attestation(&mut self.store, attestation)
+        let _ = store::on_gossip_attestation(&mut self.store, attestation, self.is_aggregator)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
+    }
+
+    fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
+        let _ = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"));
     }
 }
 
@@ -446,6 +485,7 @@ impl BlockChainServer {
 enum CastMessage {
     NewBlock(SignedBlockWithAttestation),
     NewAttestation(SignedAttestation),
+    NewAggregatedAttestation(SignedAggregatedAttestation),
     Tick,
 }
 
@@ -476,12 +516,13 @@ impl GenServer for BlockChainServer {
                 let timestamp = SystemTime::UNIX_EPOCH
                     .elapsed()
                     .expect("already past the unix epoch");
-                self.on_tick(timestamp.as_secs());
-                // Schedule the next tick at the start of the next second
-                let millis_to_next_sec =
-                    ((timestamp.as_secs() as u128 + 1) * 1000 - timestamp.as_millis()) as u64;
+                self.on_tick(timestamp.as_millis() as u64);
+                // Schedule the next tick at the next 800ms interval boundary
+                let ms_since_epoch = timestamp.as_millis() as u64;
+                let ms_to_next_interval =
+                    MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
                 send_after(
-                    Duration::from_millis(millis_to_next_sec),
+                    Duration::from_millis(ms_to_next_interval),
                     handle.clone(),
                     message,
                 );
@@ -490,6 +531,9 @@ impl GenServer for BlockChainServer {
                 self.on_block(signed_block);
             }
             CastMessage::NewAttestation(attestation) => self.on_gossip_attestation(attestation),
+            CastMessage::NewAggregatedAttestation(attestation) => {
+                self.on_gossip_aggregated_attestation(attestation);
+            }
         }
         CastResponse::NoReply
     }
