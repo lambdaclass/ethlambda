@@ -206,7 +206,9 @@ fn aggregate_committee_signatures(store: &mut Store) {
 /// Ensures the vote respects the basic laws of time and topology:
 ///     1. The blocks voted for must exist in our store.
 ///     2. A vote cannot span backwards in time (source > target).
-///     3. A vote cannot be for a future slot.
+///     3. The head must be at least as recent as source and target.
+///     4. Checkpoint slots must match the actual block slots.
+///     5. A vote cannot be for a future slot.
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -218,13 +220,19 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         .get_block_header(&data.target.root)
         .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
 
-    let _ = store
+    let head_header = store
         .get_block_header(&data.head.root)
         .ok_or(StoreError::UnknownHeadBlock(data.head.root))?;
 
-    // Topology Check - Source must be older than Target.
+    // Topology Check - Source must be older than Target, and Head must be at least as recent.
     if data.source.slot > data.target.slot {
         return Err(StoreError::SourceExceedsTarget);
+    }
+    if data.head.slot < data.target.slot {
+        return Err(StoreError::HeadOlderThanTarget {
+            head_slot: data.head.slot,
+            target_slot: data.target.slot,
+        });
     }
 
     // Consistency Check - Validate checkpoint slots match block slots.
@@ -238,6 +246,12 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         return Err(StoreError::TargetSlotMismatch {
             checkpoint_slot: data.target.slot,
             block_slot: target_header.slot,
+        });
+    }
+    if head_header.slot != data.head.slot {
+        return Err(StoreError::HeadSlotMismatch {
+            checkpoint_slot: data.head.slot,
+            block_slot: head_header.slot,
         });
     }
 
@@ -798,6 +812,9 @@ pub enum StoreError {
     #[error("Source checkpoint slot exceeds target")]
     SourceExceedsTarget,
 
+    #[error("Head checkpoint slot {head_slot} is older than target slot {target_slot}")]
+    HeadOlderThanTarget { head_slot: u64, target_slot: u64 },
+
     #[error("Source checkpoint slot {checkpoint_slot} does not match block slot {block_slot}")]
     SourceSlotMismatch {
         checkpoint_slot: u64,
@@ -806,6 +823,12 @@ pub enum StoreError {
 
     #[error("Target checkpoint slot {checkpoint_slot} does not match block slot {block_slot}")]
     TargetSlotMismatch {
+        checkpoint_slot: u64,
+        block_slot: u64,
+    },
+
+    #[error("Head checkpoint slot {checkpoint_slot} does not match block slot {block_slot}")]
+    HeadSlotMismatch {
         checkpoint_slot: u64,
         block_slot: u64,
     },
