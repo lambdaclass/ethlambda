@@ -133,11 +133,13 @@ fn extract_attestations_from_aggregated_payloads(
 ///
 /// Collects individual gossip signatures, aggregates them by attestation data,
 /// and stores the resulting proofs in `LatestNewAggregatedPayloads`.
-fn aggregate_committee_signatures(store: &mut Store) {
+fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
     let gossip_sigs: Vec<(SignatureKey, _)> = store.iter_gossip_signatures().collect();
     if gossip_sigs.is_empty() {
-        return;
+        return Vec::new();
     }
+
+    let mut new_aggregates: Vec<SignedAggregatedAttestation> = Vec::new();
 
     let head_state = store.head_state();
     let validators = &head_state.validators;
@@ -191,6 +193,12 @@ fn aggregate_committee_signatures(store: &mut Store) {
 
         let participants = aggregation_bits_from_validator_indices(&ids);
         let proof = AggregatedSignatureProof::new(participants, proof_data);
+
+        new_aggregates.push(SignedAggregatedAttestation {
+            data: data.clone(),
+            proof: proof.clone(),
+        });
+
         let payload = StoredAggregatedPayload { slot, proof };
 
         // Store in new aggregated payloads for each covered validator
@@ -207,6 +215,8 @@ fn aggregate_committee_signatures(store: &mut Store) {
 
     // Delete aggregated entries from gossip_signatures
     store.delete_gossip_signatures(&keys_to_delete);
+
+    new_aggregates
 }
 
 /// Validate incoming attestation before processing.
@@ -282,7 +292,14 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// 800ms interval. Slot and interval-within-slot are derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
-pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool, is_aggregator: bool) {
+pub fn on_tick(
+    store: &mut Store,
+    timestamp_ms: u64,
+    has_proposal: bool,
+    is_aggregator: bool,
+) -> Vec<SignedAggregatedAttestation> {
+    let mut new_aggregates: Vec<SignedAggregatedAttestation> = Vec::new();
+
     // Convert UNIX timestamp (ms) to interval count since genesis
     let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
@@ -320,7 +337,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool, is_aggr
             2 => {
                 // Aggregation interval
                 if is_aggregator {
-                    aggregate_committee_signatures(store);
+                    new_aggregates.extend(aggregate_committee_signatures(store));
                 }
             }
             3 => {
@@ -334,6 +351,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool, is_aggr
             _ => unreachable!("slots only have 5 intervals"),
         }
     }
+
+    new_aggregates
 }
 
 /// Process a gossiped attestation.
