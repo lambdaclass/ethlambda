@@ -82,8 +82,16 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
+    // Merge both attestation pools. At interval 3 the migration (interval 4) hasn't
+    // run yet, so attestations that entered "known" directly (proposer's own attestation
+    // in block body, node's self-attestation) would be invisible without this merge.
+    let mut all_payloads: HashMap<SignatureKey, Vec<StoredAggregatedPayload>> =
+        store.iter_known_aggregated_payloads().collect();
+    for (key, new_proofs) in store.iter_new_aggregated_payloads() {
+        all_payloads.entry(key).or_default().extend(new_proofs);
+    }
     let attestations =
-        extract_attestations_from_aggregated_payloads(store, store.iter_new_aggregated_payloads());
+        extract_attestations_from_aggregated_payloads(store, all_payloads.into_iter());
     let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
