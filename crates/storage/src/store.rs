@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().tree_hash_root());
 
-use crate::api::{StorageBackend, Table};
+use crate::api::{StorageBackend, StorageWriteBatch, Table};
 use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
@@ -533,6 +533,21 @@ impl Store {
 
     // ============ Signed Blocks ============
 
+    /// Insert a block as pending (parent state not yet available).
+    ///
+    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockSignatures`
+    /// **without** writing to `LiveChain`. This persists the heavy signature
+    /// data (~3KB+ per block) to disk while keeping the block invisible to
+    /// fork choice.
+    ///
+    /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
+    /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        write_signed_block(batch.as_mut(), &root, signed_block);
+        batch.commit().expect("commit");
+    }
+
     /// Insert a signed block, storing the block and signatures separately.
     ///
     /// Blocks and signatures are stored in separate tables because the genesis
@@ -541,41 +556,8 @@ impl Store {
     ///
     /// Takes ownership to avoid cloning large signature data.
     pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
-        // Destructure to extract all components without cloning
-        let SignedBlockWithAttestation {
-            message:
-                BlockWithAttestation {
-                    block,
-                    proposer_attestation,
-                },
-            signature,
-        } = signed_block;
-
-        let signatures = BlockSignaturesWithAttestation {
-            proposer_attestation,
-            signatures: signature,
-        };
-
         let mut batch = self.backend.begin_write().expect("write batch");
-
-        let header = block.header();
-        let header_entries = vec![(root.as_ssz_bytes(), header.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockHeaders, header_entries)
-            .expect("put block header");
-
-        // Skip storing empty bodies - they can be reconstructed from the header's body_root
-        if header.body_root != *EMPTY_BODY_ROOT {
-            let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
-            batch
-                .put_batch(Table::BlockBodies, body_entries)
-                .expect("put block body");
-        }
-
-        let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockSignatures, sig_entries)
-            .expect("put block signatures");
+        let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
         let index_entries = vec![(
             encode_live_chain_key(block.slot, &root),
@@ -891,4 +873,51 @@ impl Store {
         self.get_state(&self.head())
             .expect("head state is always available")
     }
+}
+
+/// Write block header, body, and signatures onto an existing batch.
+///
+/// Returns the deserialized [`Block`] so callers can access fields like
+/// `slot` and `parent_root` without re-deserializing.
+fn write_signed_block(
+    batch: &mut dyn StorageWriteBatch,
+    root: &H256,
+    signed_block: SignedBlockWithAttestation,
+) -> Block {
+    let SignedBlockWithAttestation {
+        message:
+            BlockWithAttestation {
+                block,
+                proposer_attestation,
+            },
+        signature,
+    } = signed_block;
+
+    let signatures = BlockSignaturesWithAttestation {
+        proposer_attestation,
+        signatures: signature,
+    };
+
+    let header = block.header();
+    let root_bytes = root.as_ssz_bytes();
+
+    let header_entries = vec![(root_bytes.clone(), header.as_ssz_bytes())];
+    batch
+        .put_batch(Table::BlockHeaders, header_entries)
+        .expect("put block header");
+
+    // Skip storing empty bodies - they can be reconstructed from the header's body_root
+    if header.body_root != *EMPTY_BODY_ROOT {
+        let body_entries = vec![(root_bytes.clone(), block.body.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockBodies, body_entries)
+            .expect("put block body");
+    }
+
+    let sig_entries = vec![(root_bytes, signatures.as_ssz_bytes())];
+    batch
+        .put_batch(Table::BlockSignatures, sig_entries)
+        .expect("put block signatures");
+
+    block
 }

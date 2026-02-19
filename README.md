@@ -4,6 +4,15 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 
 ## Getting started
 
+### Prerequisites
+
+- [Rust](https://rust-lang.org/tools/install)
+- [Git](https://git-scm.com/install)
+- [Docker](https://www.docker.com/get-started)
+- [yq](https://github.com/mikefarah/yq#install)
+
+### Building and testing
+
 We use `cargo` as our build system, but prefer `make` as a convenient wrapper for common tasks. These are some common targets:
 
 ```sh
@@ -19,7 +28,7 @@ make docker-build DOCKER_TAG=local
 
 Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
 
-## Running in a devnet
+### Running in a devnet
 
 To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):
 
@@ -93,7 +102,6 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [Checkpoint sync for long-lived networks](https://github.com/lambdaclass/ethlambda/issues/80)
 - [pq-devnet-3 support](https://github.com/lambdaclass/ethlambda/issues/73)
 - [Fetching of unknown blocks referenced by attestations](https://github.com/lambdaclass/ethlambda/issues/91)
 - [Discarding blocks with invalid signatures](https://github.com/lambdaclass/ethlambda/issues/78)
