@@ -85,9 +85,7 @@ pub async fn start_p2p(
         // Taken from ream
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .max_messages_per_rpc(Some(500))
-        .validate_messages()
         .allow_self_origin(true)
-        .flood_publish(false)
         .idontwant_message_size_threshold(1000)
         .build()
         .expect("invalid gossipsub config");
