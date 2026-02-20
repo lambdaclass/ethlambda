@@ -153,7 +153,7 @@ pub async fn start_p2p(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let network = "devnet3";
+    let network = "devnet0";
 
     // Subscribe to block topic (all nodes)
     let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
