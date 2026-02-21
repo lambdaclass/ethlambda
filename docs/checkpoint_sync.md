@@ -8,11 +8,12 @@ Checkpoint sync allows a new consensus node to skip replaying the entire chain f
 
 Checkpoint sync still requires a full network config directory (`--custom-network-config-dir`). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.
 
-Pass the `--checkpoint-sync-url` flag when starting ethlambda:
+Pass the `--checkpoint-sync-url` flag when starting ethlambda (you can pass multiple urls):
 
 ```bash
 ethlambda \
-  --checkpoint-sync-url <URL> \
+  --checkpoint-sync-url <URL1> \
+  --checkpoint-sync-url <URL2> \
   --custom-network-config-dir ./network-config \
   --node-key ./node.key \
   --node-id ethlambda_0
