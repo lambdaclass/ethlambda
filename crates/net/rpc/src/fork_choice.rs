@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use axum::{http::HeaderValue, http::header, response::IntoResponse};
 use ethlambda_storage::Store;
-use ethlambda_types::{attestation::AttestationData, primitives::H256};
+use ethlambda_types::primitives::H256;
 use serde::Serialize;
 
 use crate::json_response;
@@ -35,35 +33,11 @@ pub struct CheckpointInfo {
     slot: u64,
 }
 
-/// Extract per-validator attestation data from aggregated payloads.
-///
-/// Replicates the logic from `blockchain/src/store.rs` to keep the RPC crate
-/// decoupled from the blockchain crate.
-fn extract_attestations(store: &Store) -> HashMap<u64, AttestationData> {
-    let mut result: HashMap<u64, AttestationData> = HashMap::new();
-
-    for ((validator_id, data_root), _payload_list) in store.iter_known_aggregated_payloads() {
-        let Some(data) = store.get_attestation_data_by_root(&data_root) else {
-            continue;
-        };
-
-        let should_update = result
-            .get(&validator_id)
-            .is_none_or(|existing| existing.slot < data.slot);
-
-        if should_update {
-            result.insert(validator_id, data);
-        }
-    }
-
-    result
-}
-
 pub async fn get_fork_choice(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let blocks = store.get_live_chain();
-    let attestations = extract_attestations(&store);
+    let attestations = store.extract_latest_known_attestations();
 
     let justified = store.latest_justified();
     let finalized = store.latest_finalized();

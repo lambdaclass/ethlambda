@@ -34,10 +34,7 @@ fn accept_new_attestations(store: &mut Store) {
 /// Update the head based on the fork choice rule.
 fn update_head(store: &mut Store) {
     let blocks = store.get_live_chain();
-    let attestations = extract_attestations_from_aggregated_payloads(
-        store,
-        store.iter_known_aggregated_payloads(),
-    );
+    let attestations = store.extract_latest_known_attestations();
     let old_head = store.head();
     let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
@@ -90,8 +87,7 @@ fn update_safe_target(store: &mut Store) {
     for (key, new_proofs) in store.iter_new_aggregated_payloads() {
         all_payloads.entry(key).or_default().extend(new_proofs);
     }
-    let attestations =
-        extract_attestations_from_aggregated_payloads(store, all_payloads.into_iter());
+    let attestations = store.extract_latest_attestations(all_payloads.into_iter());
     let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -99,34 +95,6 @@ fn update_safe_target(store: &mut Store) {
         min_target_score,
     );
     store.set_safe_target(safe_target);
-}
-
-/// Reconstruct per-validator attestation data from aggregated payloads.
-///
-/// For each (validator_id, data_root) key in the payloads, looks up the
-/// attestation data by root. Returns the latest attestation per validator
-/// (by slot).
-fn extract_attestations_from_aggregated_payloads(
-    store: &Store,
-    payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
-) -> HashMap<u64, AttestationData> {
-    let mut result: HashMap<u64, AttestationData> = HashMap::new();
-
-    for ((validator_id, data_root), _payload_list) in payloads {
-        let Some(data) = store.get_attestation_data_by_root(&data_root) else {
-            continue;
-        };
-
-        let should_update = result
-            .get(&validator_id)
-            .is_none_or(|existing| existing.slot < data.slot);
-
-        if should_update {
-            result.insert(validator_id, data);
-        }
-    }
-
-    result
 }
 
 /// Aggregate committee signatures at interval 2.
@@ -765,10 +733,7 @@ pub fn produce_block_with_signatures(
     }
 
     // Convert known aggregated payloads to Attestation objects for build_block
-    let known_attestations = extract_attestations_from_aggregated_payloads(
-        store,
-        store.iter_known_aggregated_payloads(),
-    );
+    let known_attestations = store.extract_latest_known_attestations();
     let available_attestations: Vec<Attestation> = known_attestations
         .into_iter()
         .map(|(validator_id, data)| Attestation { validator_id, data })
