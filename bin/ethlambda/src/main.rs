@@ -55,7 +55,7 @@ struct CliOptions {
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
     /// Number of attestation committees (subnets) per slot
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
     attestation_committee_count: u64,
 }
 
