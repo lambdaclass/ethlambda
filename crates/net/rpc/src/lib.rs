@@ -7,6 +7,7 @@ use ethlambda_types::primitives::ssz::Encode;
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
+mod fork_choice;
 pub mod metrics;
 
 pub async fn start_rpc_server(address: SocketAddr, store: Store) -> Result<(), std::io::Error> {
@@ -28,6 +29,11 @@ fn build_api_router(store: Store) -> Router {
         .route(
             "/lean/v0/checkpoints/justified",
             get(get_latest_justified_state),
+        )
+        .route("/lean/v0/fork_choice", get(fork_choice::get_fork_choice))
+        .route(
+            "/lean/v0/fork_choice/ui",
+            get(fork_choice::get_fork_choice_ui),
         )
         .with_state(store)
 }

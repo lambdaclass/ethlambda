@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ethlambda Fork Choice</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: "Courier New", Courier, monospace;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #info-bar {
+      display: flex;
+      gap: 24px;
+      padding: 12px 20px;
+      background: #16213e;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    #info-bar .label {
+      color: #888;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    #info-bar .value {
+      font-size: 14px;
+      font-weight: bold;
+    }
+
+    #info-bar .item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .value-head { color: #ff9800; }
+    .value-justified { color: #2196f3; }
+    .value-finalized { color: #4caf50; }
+    .value-validators { color: #e0e0e0; }
+
+    #chart-container {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+    }
+
+    svg {
+      display: block;
+    }
+
+    .link {
+      fill: none;
+      stroke: #444;
+      stroke-width: 1.5;
+    }
+
+    .node-circle {
+      stroke-width: 2;
+      cursor: pointer;
+    }
+
+    .node-label {
+      fill: #ccc;
+      font-size: 10px;
+      text-anchor: middle;
+      pointer-events: none;
+    }
+
+    .tooltip {
+      position: fixed;
+      background: #16213e;
+      border: 1px solid #555;
+      border-radius: 4px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-family: "Courier New", Courier, monospace;
+      color: #e0e0e0;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.15s;
+      z-index: 100;
+      line-height: 1.6;
+    }
+
+    .tooltip .tt-label {
+      color: #888;
+    }
+
+    #empty-message {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 18px;
+      color: #666;
+      display: none;
+    }
+
+    .slot-axis-label {
+      fill: #555;
+      font-size: 10px;
+      text-anchor: end;
+    }
+  </style>
+</head>
+<body>
+  <div id="info-bar">
+    <div class="item">
+      <span class="label">Head Slot</span>
+      <span class="value value-head" id="head-slot">--</span>
+    </div>
+    <div class="item">
+      <span class="label">Justified Slot</span>
+      <span class="value value-justified" id="justified-slot">--</span>
+    </div>
+    <div class="item">
+      <span class="label">Finalized Slot</span>
+      <span class="value value-finalized" id="finalized-slot">--</span>
+    </div>
+    <div class="item">
+      <span class="label">Validators</span>
+      <span class="value value-validators" id="validator-count">--</span>
+    </div>
+  </div>
+
+  <div id="chart-container">
+    <div id="empty-message">Waiting for blocks...</div>
+  </div>
+
+  <div class="tooltip" id="tooltip"></div>
+
+  <script>
+    const POLL_INTERVAL = 2000;
+    const MARGIN = { top: 40, right: 60, bottom: 40, left: 80 };
+    const SLOT_HEIGHT = 50;
+    const MIN_RADIUS = 8;
+    const MAX_RADIUS = 30;
+    const TRANSITION_DURATION = 500;
+
+    const COLORS = {
+      finalized: "#4caf50",
+      justified: "#2196f3",
+      safeTarget: "#ffeb3b",
+      head: "#ff9800",
+      default: "#666"
+    };
+
+    const container = document.getElementById("chart-container");
+    const tooltip = document.getElementById("tooltip");
+    const emptyMsg = document.getElementById("empty-message");
+
+    let svg, gLinks, gNodes, gAxis;
+    let currentData = null;
+
+    function initSVG() {
+      svg = d3.select("#chart-container")
+        .append("svg")
+        .attr("width", "100%");
+
+      gAxis = svg.append("g").attr("class", "axis-group");
+      gLinks = svg.append("g").attr("class", "links-group");
+      gNodes = svg.append("g").attr("class", "nodes-group");
+    }
+
+    function truncateRoot(root) {
+      if (!root) return "0x??";
+      return root.length > 10 ? root.slice(0, 10) : root;
+    }
+
+    function nodeColor(node, data) {
+      if (node.root === data.head) return COLORS.head;
+      if (node.root === data.safe_target) return COLORS.safeTarget;
+      if (node.root === data.justified.root) return COLORS.justified;
+      if (node.slot <= data.finalized.slot) return COLORS.finalized;
+      return COLORS.default;
+    }
+
+    function nodeStroke(node, data) {
+      const color = nodeColor(node, data);
+      return d3.color(color).darker(0.5).toString();
+    }
+
+    function nodeRadius(node, validatorCount) {
+      if (!validatorCount || validatorCount === 0) return MIN_RADIUS;
+      const ratio = node.weight / validatorCount;
+      return MIN_RADIUS + ratio * (MAX_RADIUS - MIN_RADIUS);
+    }
+
+    function isGenesisParent(parentRoot) {
+      if (!parentRoot) return true;
+      return /^0x0+$/.test(parentRoot);
+    }
+
+    function buildTree(nodes) {
+      const nodeMap = new Map();
+      nodes.forEach(n => nodeMap.set(n.root, { ...n, children: [] }));
+
+      let rootNode = null;
+
+      nodes.forEach(n => {
+        const treeNode = nodeMap.get(n.root);
+        if (isGenesisParent(n.parent_root) || !nodeMap.has(n.parent_root)) {
+          if (!rootNode || n.slot < rootNode.slot) {
+            rootNode = treeNode;
+          }
+        } else {
+          const parent = nodeMap.get(n.parent_root);
+          if (parent) {
+            parent.children.push(treeNode);
+          }
+        }
+      });
+
+      if (!rootNode && nodes.length > 0) {
+        const sorted = [...nodes].sort((a, b) => a.slot - b.slot);
+        rootNode = nodeMap.get(sorted[0].root);
+      }
+
+      return rootNode;
+    }
+
+    function flattenTree(node, result) {
+      if (!node) return result;
+      result.push(node);
+      if (node.children) {
+        node.children.forEach(c => flattenTree(c, result));
+      }
+      return result;
+    }
+
+    function collectLinks(node, links) {
+      if (!node || !node.children) return links;
+      node.children.forEach(child => {
+        links.push({ source: node, target: child });
+        collectLinks(child, links);
+      });
+      return links;
+    }
+
+    function layoutTree(rootNode, data) {
+      if (!rootNode) return { nodes: [], links: [], width: 0, height: 0 };
+
+      const hierarchy = d3.hierarchy(rootNode, d => d.children);
+
+      const treeLayout = d3.tree().nodeSize([80, SLOT_HEIGHT]);
+      treeLayout(hierarchy);
+
+      const allDescendants = hierarchy.descendants();
+
+      const minSlot = d3.min(allDescendants, d => d.data.slot);
+      const maxSlot = d3.max(allDescendants, d => d.data.slot);
+      const slotRange = maxSlot - minSlot || 1;
+
+      const totalHeight = Math.max(slotRange * SLOT_HEIGHT, 200);
+
+      allDescendants.forEach(d => {
+        d.y = MARGIN.top + ((d.data.slot - minSlot) / slotRange) * totalHeight;
+      });
+
+      let minX = d3.min(allDescendants, d => d.x);
+      let maxX = d3.max(allDescendants, d => d.x);
+      const treeWidth = maxX - minX;
+
+      const containerWidth = container.clientWidth;
+      const centerOffset = containerWidth / 2 - (minX + maxX) / 2;
+
+      allDescendants.forEach(d => {
+        d.x += centerOffset;
+      });
+
+      const flatNodes = allDescendants.map(d => ({
+        ...d.data,
+        x: d.x,
+        y: d.y,
+        _color: nodeColor(d.data, data),
+        _stroke: nodeStroke(d.data, data),
+        _radius: nodeRadius(d.data, data.validator_count)
+      }));
+
+      const links = [];
+      hierarchy.links().forEach(link => {
+        links.push({
+          source: { x: link.source.x, y: link.source.y, root: link.source.data.root },
+          target: { x: link.target.x, y: link.target.y, root: link.target.data.root }
+        });
+      });
+
+      minX = d3.min(flatNodes, d => d.x);
+      maxX = d3.max(flatNodes, d => d.x);
+      const svgWidth = Math.max(containerWidth, maxX - minX + MARGIN.left + MARGIN.right + 60);
+      const svgHeight = totalHeight + MARGIN.top + MARGIN.bottom;
+
+      const slots = [];
+      for (let s = minSlot; s <= maxSlot; s++) {
+        const yPos = MARGIN.top + ((s - minSlot) / slotRange) * totalHeight;
+        slots.push({ slot: s, y: yPos });
+      }
+
+      return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
+    }
+
+    function showTooltip(event, d) {
+      tooltip.innerHTML =
+        `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
+        `<span class="tt-label">slot:</span> ${d.slot}<br>` +
+        `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
+        `<span class="tt-label">weight:</span> ${d.weight}`;
+      tooltip.style.opacity = 1;
+      tooltip.style.left = (event.clientX + 14) + "px";
+      tooltip.style.top = (event.clientY - 14) + "px";
+    }
+
+    function hideTooltip() {
+      tooltip.style.opacity = 0;
+    }
+
+    function render(data) {
+      if (!data || !data.nodes || data.nodes.length === 0) {
+        emptyMsg.style.display = "block";
+        svg.attr("height", 0);
+        gLinks.selectAll("*").remove();
+        gNodes.selectAll("*").remove();
+        gAxis.selectAll("*").remove();
+        return;
+      }
+
+      emptyMsg.style.display = "none";
+
+      document.getElementById("head-slot").textContent =
+        data.nodes.find(n => n.root === data.head)?.slot ?? "--";
+      document.getElementById("justified-slot").textContent = data.justified.slot;
+      document.getElementById("finalized-slot").textContent = data.finalized.slot;
+      document.getElementById("validator-count").textContent = data.validator_count;
+
+      const rootNode = buildTree(data.nodes);
+      const layout = layoutTree(rootNode, data);
+
+      svg.attr("height", layout.height);
+      svg.attr("width", layout.width);
+
+      // Slot axis labels (show every slot if few, else skip some)
+      const slotStep = layout.slots.length > 40 ? Math.ceil(layout.slots.length / 40) : 1;
+      const visibleSlots = layout.slots.filter((_, i) => i % slotStep === 0);
+
+      const axisLabels = gAxis.selectAll(".slot-axis-label")
+        .data(visibleSlots, d => d.slot);
+
+      axisLabels.exit().remove();
+
+      axisLabels.enter()
+        .append("text")
+        .attr("class", "slot-axis-label")
+        .merge(axisLabels)
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("x", MARGIN.left - 10)
+        .attr("y", d => d.y + 4)
+        .text(d => `slot ${d.slot}`);
+
+      // Links
+      const linkData = layout.links;
+      const linkKey = d => `${d.source.root}-${d.target.root}`;
+
+      const links = gLinks.selectAll(".link")
+        .data(linkData, linkKey);
+
+      links.exit()
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("opacity", 0)
+        .remove();
+
+      const linksEnter = links.enter()
+        .append("line")
+        .attr("class", "link")
+        .attr("opacity", 0);
+
+      links.merge(linksEnter)
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y)
+        .attr("opacity", 1);
+
+      // Nodes
+      const nodeGroups = gNodes.selectAll(".node-group")
+        .data(layout.nodes, d => d.root);
+
+      nodeGroups.exit()
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("opacity", 0)
+        .remove();
+
+      const nodeEnter = nodeGroups.enter()
+        .append("g")
+        .attr("class", "node-group")
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .attr("opacity", 0);
+
+      nodeEnter.append("circle")
+        .attr("class", "node-circle")
+        .attr("r", d => d._radius)
+        .attr("fill", d => d._color)
+        .attr("stroke", d => d._stroke);
+
+      nodeEnter.append("text")
+        .attr("class", "node-label")
+        .attr("dy", d => d._radius + 14)
+        .text(d => truncateRoot(d.root));
+
+      const nodeMerged = nodeEnter.merge(nodeGroups);
+
+      nodeMerged
+        .on("mouseover", function (event, d) { showTooltip(event, d); })
+        .on("mousemove", function (event, d) { showTooltip(event, d); })
+        .on("mouseout", hideTooltip);
+
+      nodeMerged
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("transform", d => `translate(${d.x},${d.y})`)
+        .attr("opacity", 1);
+
+      nodeMerged.select("circle")
+        .transition()
+        .duration(TRANSITION_DURATION)
+        .attr("r", d => d._radius)
+        .attr("fill", d => d._color)
+        .attr("stroke", d => d._stroke);
+
+      nodeMerged.select("text")
+        .attr("dy", d => d._radius + 14)
+        .text(d => truncateRoot(d.root));
+
+      // Auto-scroll to head node
+      const headNode = layout.nodes.find(n => n.root === data.head);
+      if (headNode) {
+        const containerRect = container.getBoundingClientRect();
+        const headY = headNode.y;
+        const scrollTarget = headY - containerRect.height / 2;
+        container.scrollTo({
+          top: Math.max(0, scrollTarget),
+          behavior: "smooth"
+        });
+      }
+    }
+
+    async function fetchAndRender() {
+      try {
+        const response = await fetch("/lean/v0/fork_choice");
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        currentData = data;
+        render(data);
+      } catch (err) {
+        console.error("Failed to fetch fork choice data:", err);
+        if (!currentData) {
+          emptyMsg.style.display = "block";
+        }
+      }
+    }
+
+    initSVG();
+    fetchAndRender();
+    setInterval(fetchAndRender, POLL_INTERVAL);
+
+    window.addEventListener("resize", () => {
+      if (currentData) render(currentData);
+    });
+  </script>
+</body>
+</html>
