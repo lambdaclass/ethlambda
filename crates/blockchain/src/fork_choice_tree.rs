@@ -10,7 +10,7 @@ const MAX_DISPLAY_DEPTH: usize = 20;
 ///
 /// Renders a tree showing the chain structure with Unicode connectors,
 /// missing-slot indicators, weight annotations, and head markers.
-pub fn format_fork_choice_tree(
+pub(crate) fn format_fork_choice_tree(
     blocks: &HashMap<H256, (u64, H256)>,
     weights: &HashMap<H256, u64>,
     head: H256,
@@ -190,34 +190,34 @@ impl TreeRenderer<'_> {
                 return;
             }
 
-            let node_children = self.children_map.get(&current).cloned().unwrap_or_default();
+            let node_children = self.children_map.get(&current).map(|c| c.as_slice());
 
-            match node_children.len() {
-                0 => {
+            match node_children.unwrap_or_default() {
+                [] => {
                     // Leaf node — show head marker and weight
                     let head_marker = if is_head { " *" } else { "" };
                     let w = self.weights.get(&current).copied().unwrap_or(0);
                     writeln!(output, "{head_marker}  [w:{w}]").unwrap();
                     return;
                 }
-                1 => {
+                [only_child] => {
                     // Continue linear chain
                     if is_head {
                         write!(output, " *").unwrap();
                     }
                     write!(output, "\u{2500}\u{2500} ").unwrap();
                     prev_slot = Some(slot);
-                    current = node_children[0];
+                    current = *only_child;
                 }
-                _ => {
+                children => {
                     // Sub-fork
                     if is_head {
                         write!(output, " *").unwrap();
                     }
-                    let branch_count = node_children.len();
+                    let branch_count = children.len();
                     writeln!(output, " \u{2500} {branch_count} branches").unwrap();
                     let new_prefix = format!("{prefix}{continuation}");
-                    self.render_branches(output, &node_children, &new_prefix, depth);
+                    self.render_branches(output, children, &new_prefix, depth);
                     return;
                 }
             }
@@ -366,6 +366,92 @@ mod tests {
 
         assert!(result.contains("Fork Choice Tree:"));
         assert!(result.contains("(empty)"));
+    }
+
+    #[test]
+    fn single_block_chain() {
+        let root = h(1);
+
+        let mut blocks = HashMap::new();
+        blocks.insert(root, (0, H256::ZERO));
+
+        let weights = HashMap::new();
+        let result = format_fork_choice_tree(&blocks, &weights, root, cp(root, 0), cp(root, 0));
+
+        assert!(result.contains(&format!("{}(0)", ShortRoot(&root.0))));
+        assert!(result.contains("*"));
+    }
+
+    #[test]
+    fn depth_truncation() {
+        // Build a chain of 25 blocks (exceeds MAX_DISPLAY_DEPTH=20)
+        let nodes: Vec<H256> = (1..=25).map(h).collect();
+
+        let mut blocks = HashMap::new();
+        blocks.insert(nodes[0], (0, H256::ZERO));
+        for i in 1..25 {
+            blocks.insert(nodes[i], (i as u64, nodes[i - 1]));
+        }
+
+        let weights = HashMap::new();
+        let head = nodes[24];
+        let result =
+            format_fork_choice_tree(&blocks, &weights, head, cp(nodes[0], 0), cp(nodes[0], 0));
+
+        assert!(
+            result.contains("..."),
+            "long chain should be truncated with ..."
+        );
+        // The last node (slot 24) should NOT appear since we truncate at depth 20
+        assert!(
+            !result.contains("(24)"),
+            "slot 24 should not appear due to truncation"
+        );
+    }
+
+    #[test]
+    fn nested_fork() {
+        // root(0) -> a(1) -> b(2) [fork]
+        //                    ├── c(3) -> e(4) [sub-fork]
+        //                    │   ├── f(5) [head, w:4]
+        //                    │   └── g(5) [w:1]
+        //                    └── d(3) [w:2]
+        let root = h(1);
+        let a = h(2);
+        let b = h(3);
+        let c = h(4);
+        let d = h(5);
+        let e = h(6);
+        let f = h(7);
+        let g = h(8);
+
+        let mut blocks = HashMap::new();
+        blocks.insert(root, (0, H256::ZERO));
+        blocks.insert(a, (1, root));
+        blocks.insert(b, (2, a));
+        blocks.insert(c, (3, b));
+        blocks.insert(d, (3, b));
+        blocks.insert(e, (4, c));
+        blocks.insert(f, (5, e));
+        blocks.insert(g, (5, e));
+
+        let mut weights = HashMap::new();
+        weights.insert(c, 5);
+        weights.insert(d, 2);
+        weights.insert(e, 4);
+        weights.insert(f, 4);
+        weights.insert(g, 1);
+
+        let result = format_fork_choice_tree(&blocks, &weights, f, cp(root, 0), cp(root, 0));
+
+        // Should have two levels of branching
+        assert!(result.contains("2 branches"), "should show outer fork");
+        // Nested fork should also show branches
+        let branch_count = result.matches("2 branches").count();
+        assert_eq!(branch_count, 2, "should show both outer and inner fork");
+        assert!(result.contains("[w:4]"));
+        assert!(result.contains("[w:1]"));
+        assert!(result.contains("[w:2]"));
     }
 
     #[test]
