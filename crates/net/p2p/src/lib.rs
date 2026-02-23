@@ -177,6 +177,7 @@ pub async fn start_p2p(
         .unwrap();
 
     // Subscribe to attestation subnet topic (validators subscribe to their committee's subnet)
+    // attestation_committee_count is validated to be >= 1 by clap at CLI parse time.
     let subnet_id = validator_id.map(|vid| vid % attestation_committee_count);
     let attestation_topic_kind = match subnet_id {
         Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
