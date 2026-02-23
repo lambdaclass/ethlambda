@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use ethlambda_blockchain::{ATTESTATION_COMMITTEE_COUNT, BlockChain, P2PMessage};
+use ethlambda_blockchain::{BlockChain, P2PMessage};
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
 use ethrex_common::H264;
@@ -56,6 +56,7 @@ pub(crate) struct PendingRequest {
     pub(crate) last_peer: Option<PeerId>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_p2p(
     node_key: Vec<u8>,
     bootnodes: Vec<Bootnode>,
@@ -64,6 +65,7 @@ pub async fn start_p2p(
     p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
     validator_id: Option<u64>,
+    attestation_committee_count: u64,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
@@ -175,9 +177,7 @@ pub async fn start_p2p(
         .unwrap();
 
     // Subscribe to attestation subnet topic (validators subscribe to their committee's subnet)
-    // ATTESTATION_COMMITTEE_COUNT is 1 for devnet-3 but will increase in future devnets.
-    #[allow(clippy::modulo_one)]
-    let subnet_id = validator_id.map(|vid| vid % ATTESTATION_COMMITTEE_COUNT);
+    let subnet_id = validator_id.map(|vid| vid % attestation_committee_count);
     let attestation_topic_kind = match subnet_id {
         Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
         // Non-validators subscribe to subnet 0 to receive attestations

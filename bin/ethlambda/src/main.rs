@@ -54,6 +54,9 @@ struct CliOptions {
     /// Whether this node acts as a committee aggregator
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
+    /// Number of attestation committees (subnets) per slot
+    #[arg(long, default_value = "1")]
+    attestation_committee_count: u64,
 }
 
 #[tokio::main]
@@ -130,6 +133,7 @@ async fn main() -> eyre::Result<()> {
         p2p_rx,
         store.clone(),
         first_validator_id,
+        options.attestation_committee_count,
     ));
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
