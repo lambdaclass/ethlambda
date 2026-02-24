@@ -3,9 +3,8 @@ use ethlambda_types::attestation::{
     Attestation as EthAttestation, AttestationData as EthAttestationData, XmssSignature,
 };
 use ethlambda_types::block::{
-    AggregatedAttestations, AggregatedSignatureProof, AggregationBits as EthAggregationBitsSig,
-    AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody, BlockSignatures,
-    BlockWithAttestation, SignedBlockWithAttestation,
+    AggregatedAttestations, AggregatedSignatureProof, AttestationSignatures, Block as EthBlock,
+    BlockBody as EthBlockBody, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation,
 };
 use ethlambda_types::primitives::{
     BitList, H256, VariableList,
@@ -229,7 +228,7 @@ impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
             .into_iter()
             .map(|att_sig| {
                 // Convert participants bitfield
-                let participants: EthAggregationBitsSig = att_sig.participants.into();
+                let participants: EthAggregationBits = att_sig.participants.into();
                 // Create proof with participants but empty proof_data
                 AggregatedSignatureProof::empty(participants)
             })
