@@ -624,16 +624,12 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    // ============ Known Attestations ============
-    //
-    // "Known" attestations are included in fork choice weight calculations.
-    // They're promoted from "new" attestations at specific intervals.
+    // ============ Attestation Helpers ============
 
-    /// Iterates over all known attestations (validator_id, attestation_data).
-    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+    fn iter_attestations(&self, table: Table) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestKnownAttestations, &[])
+            .prefix_iterator(table, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
@@ -645,22 +641,38 @@ impl Store {
         entries.into_iter()
     }
 
-    /// Returns a validator's latest known attestation.
-    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+    fn get_attestation(&self, table: Table, validator_id: &u64) -> Option<AttestationData> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestKnownAttestations, &validator_id.as_ssz_bytes())
+        view.get(table, &validator_id.as_ssz_bytes())
             .expect("get")
             .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
-    /// Stores a validator's latest known attestation.
-    pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
+    fn insert_attestation(&mut self, table: Table, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
-        batch
-            .put_batch(Table::LatestKnownAttestations, entries)
-            .expect("put attestation");
+        batch.put_batch(table, entries).expect("put attestation");
         batch.commit().expect("commit");
+    }
+
+    // ============ Known Attestations ============
+    //
+    // "Known" attestations are included in fork choice weight calculations.
+    // They're promoted from "new" attestations at specific intervals.
+
+    /// Iterates over all known attestations (validator_id, attestation_data).
+    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+        self.iter_attestations(Table::LatestKnownAttestations)
+    }
+
+    /// Returns a validator's latest known attestation.
+    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+        self.get_attestation(Table::LatestKnownAttestations, validator_id)
+    }
+
+    /// Stores a validator's latest known attestation.
+    pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
+        self.insert_attestation(Table::LatestKnownAttestations, validator_id, data);
     }
 
     // ============ New Attestations ============
@@ -670,36 +682,17 @@ impl Store {
 
     /// Iterates over all new (pending) attestations.
     pub fn iter_new_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestNewAttestations, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
-                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
-                (validator_id, data)
-            })
-            .collect();
-        entries.into_iter()
+        self.iter_attestations(Table::LatestNewAttestations)
     }
 
     /// Returns a validator's latest new (pending) attestation.
     pub fn get_new_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestNewAttestations, &validator_id.as_ssz_bytes())
-            .expect("get")
-            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
+        self.get_attestation(Table::LatestNewAttestations, validator_id)
     }
 
     /// Stores a validator's new (pending) attestation.
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
-        batch
-            .put_batch(Table::LatestNewAttestations, entries)
-            .expect("put attestation");
-        batch.commit().expect("commit");
+        self.insert_attestation(Table::LatestNewAttestations, validator_id, data);
     }
 
     /// Removes a validator's new (pending) attestation.
