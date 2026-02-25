@@ -1,6 +1,6 @@
 use super::common::{AggregationBits, Block, Container, ProposerAttestation, TestInfo, TestState};
-use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::attestation::XmssSignature;
+use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
     AggregatedSignatureProof, AggregationBits as EthAggregationBitsSig, AttestationSignatures,
     BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation,
