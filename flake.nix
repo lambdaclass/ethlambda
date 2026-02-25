@@ -20,9 +20,7 @@
         overlays = [ rust-overlay.overlays.default ];
       };
 
-      rustToolchain = pkgs: pkgs.rust-bin.stable."1.92.0".default.override {
-        extensions = [ "clippy" "rustfmt" ];
-      };
+      rustToolchain = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
       mkCraneLib = pkgs: (crane.mkLib pkgs).overrideToolchain (rustToolchain pkgs);
     in
