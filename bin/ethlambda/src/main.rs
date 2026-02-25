@@ -47,7 +47,7 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
-    /// URL of a peer to download checkpoint state from (e.g., http://peer:5052)
+    /// URL to download checkpoint state from (e.g., http://peer:5052/lean/v0/states/finalized)
     /// When set, skips genesis initialization and syncs from checkpoint.
     #[arg(long)]
     checkpoint_sync_url: Option<String>,
