@@ -364,19 +364,18 @@ pub fn on_gossip_attestation(
     let validator_pubkey = target_state.validators[validator_id as usize]
         .get_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
-    let message = attestation.data.tree_hash_root();
+    let data_root = attestation.data.tree_hash_root();
     if cfg!(not(feature = "skip-signature-verification")) {
         use ethlambda_types::signature::ValidatorSignature;
         let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
             .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        if !signature.is_valid(&validator_pubkey, epoch, &message) {
+        if !signature.is_valid(&validator_pubkey, epoch, &data_root) {
             return Err(StoreError::SignatureVerificationFailed);
         }
     }
 
     // Store attestation data by root (content-addressed, idempotent)
-    let data_root = attestation.data.tree_hash_root();
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
     if cfg!(feature = "skip-signature-verification") {
