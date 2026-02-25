@@ -23,7 +23,9 @@ pub fn compute_lmd_ghost_head(
             .map(|(root, _)| root)
             .expect("we already checked blocks is non-empty");
     }
-    let start_slot = blocks[&start_root].0;
+    let Some(&(start_slot, _)) = blocks.get(&start_root) else {
+        return start_root;
+    };
     let mut weights: HashMap<H256, u64> = HashMap::new();
 
     for attestation_data in attestations.values() {
