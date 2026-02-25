@@ -17,6 +17,7 @@ use crate::types::{ForkChoiceTestVector, StoreChecks};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
 
+mod common;
 mod types;
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
