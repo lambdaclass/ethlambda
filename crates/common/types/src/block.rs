@@ -2,7 +2,7 @@ use serde::Serialize;
 use ssz_types::typenum::U1048576;
 
 use crate::{
-    attestation::{AggregatedAttestation, Attestation, XmssSignature},
+    attestation::{AggregatedAttestation, AggregationBits, Attestation, XmssSignature},
     primitives::{
         ByteList, H256,
         ssz::{Decode, Encode, TreeHash},
@@ -102,23 +102,7 @@ impl AggregatedSignatureProof {
             proof_data: ByteList::empty(),
         }
     }
-
-    /// Get the participants bitfield.
-    pub fn participants(&self) -> &AggregationBits {
-        &self.participants
-    }
-
-    /// Get the proof data.
-    pub fn proof_data(&self) -> &ByteListMiB {
-        &self.proof_data
-    }
 }
-
-/// Bitlist representing validator participation in an attestation or signature.
-///
-/// A general-purpose bitfield for tracking which validators have participated
-/// in some collective action (attestation, signature aggregation, etc.).
-pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
 
 /// Bundle containing a block and the proposer's attestation.
 #[derive(Debug, Clone, Encode, Decode, TreeHash)]

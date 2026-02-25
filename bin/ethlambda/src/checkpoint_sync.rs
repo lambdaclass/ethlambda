@@ -63,12 +63,10 @@ pub enum CheckpointSyncError {
 /// disconnect even for valid downloads if the state is simply too large to
 /// transfer within the time limit.
 pub async fn fetch_checkpoint_state(
-    base_url: &str,
+    url: &str,
     expected_genesis_time: u64,
     expected_validators: &[Validator],
 ) -> Result<State, CheckpointSyncError> {
-    let base_url = base_url.trim_end_matches('/');
-    let url = format!("{base_url}/lean/v0/states/finalized");
     // Use .read_timeout() to detect stalled downloads (inactivity timer).
     // This allows large states to complete as long as data keeps flowing.
     let client = Client::builder()
@@ -77,7 +75,7 @@ pub async fn fetch_checkpoint_state(
         .build()?;
 
     let response = client
-        .get(&url)
+        .get(url)
         .header("Accept", "application/octet-stream")
         .send()
         .await?
