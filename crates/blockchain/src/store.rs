@@ -959,7 +959,7 @@ fn build_block(
     let mut included_keys: HashSet<SignatureKey> = HashSet::new();
 
     // Fixed-point loop: collect attestations until no new ones can be added
-    let _post_state = loop {
+    loop {
         // Aggregate attestations by data for the candidate block
         let aggregated = aggregate_attestations_by_data(&included_attestations);
         let attestations: AggregatedAttestations = aggregated
@@ -983,7 +983,7 @@ fn build_block(
 
         // No attestation source provided: done after computing post_state
         if available_attestations.is_empty() || known_block_roots.is_empty() {
-            break post_state;
+            break;
         }
 
         // Find new valid attestations matching post-state requirements
@@ -1017,12 +1017,12 @@ fn build_block(
 
         // Fixed point reached: no new attestations found
         if new_attestations.is_empty() {
-            break post_state;
+            break;
         }
 
         // Add new attestations and continue iteration
         included_attestations.extend(new_attestations);
-    };
+    }
 
     // Select existing proofs for the attestations to include in the block.
     let (aggregated_attestations, aggregated_signatures) =
