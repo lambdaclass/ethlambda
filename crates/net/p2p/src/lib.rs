@@ -85,9 +85,7 @@ pub async fn start_p2p(
         // Taken from ream
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .max_messages_per_rpc(Some(500))
-        .validate_messages()
         .allow_self_origin(true)
-        .flood_publish(false)
         .idontwant_message_size_threshold(1000)
         .build()
         .expect("invalid gossipsub config");
@@ -155,7 +153,7 @@ pub async fn start_p2p(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let network = "devnet3";
+    let network = "devnet0";
 
     // Subscribe to block topic (all nodes)
     let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
