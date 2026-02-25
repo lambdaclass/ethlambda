@@ -7,9 +7,11 @@ use ethlambda_state_transition::{
 use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store};
 use ethlambda_types::{
     ShortRoot,
-    attestation::{AggregatedAttestation, Attestation, AttestationData, SignedAttestation},
+    attestation::{
+        AggregatedAttestation, AggregationBits, Attestation, AttestationData, SignedAttestation,
+    },
     block::{
-        AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
+        AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
         SignedBlockWithAttestation,
     },
     primitives::{H256, ssz::TreeHash},

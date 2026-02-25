@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ethlambda_state_transition::is_proposer;
@@ -98,8 +98,8 @@ struct BlockChainServer {
     p2p_tx: mpsc::UnboundedSender<P2PMessage>,
     key_manager: key_manager::KeyManager,
 
-    // Pending blocks waiting for their parent
-    pending_blocks: HashMap<H256, Vec<SignedBlockWithAttestation>>,
+    // Pending block roots waiting for their parent (block data stored in DB)
+    pending_blocks: HashMap<H256, HashSet<H256>>,
     // Maps pending block_root → its cached missing ancestor. Resolved by walking the
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
@@ -284,7 +284,27 @@ impl BlockChainServer {
         Ok(())
     }
 
+    /// Process a newly received block.
     fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+        let mut queue = VecDeque::new();
+        queue.push_back(signed_block);
+
+        // A new block can trigger a cascade of pending blocks becoming processable.
+        // Here we process blocks iteratively, to avoid recursive calls that could
+        // cause a stack overflow.
+        while let Some(block) = queue.pop_front() {
+            self.process_or_pend_block(block, &mut queue);
+        }
+    }
+
+    /// Try to process a single block. If its parent state is missing, store it
+    /// as pending. On success, collect any unblocked children into `queue` for
+    /// the caller to process next (iteratively, avoiding deep recursion).
+    fn process_or_pend_block(
+        &mut self,
+        signed_block: SignedBlockWithAttestation,
+        queue: &mut VecDeque<SignedBlockWithAttestation>,
+    ) {
         let slot = signed_block.message.block.slot;
         let block_root = signed_block.message.block.tree_hash_root();
         let parent_root = signed_block.message.block.parent_root;
@@ -304,11 +324,40 @@ impl BlockChainServer {
 
             self.pending_block_parents.insert(block_root, missing_root);
 
-            // Store block for later processing
+            // Persist block data to DB (no LiveChain entry — invisible to fork choice)
+            self.store.insert_pending_block(block_root, signed_block);
+
+            // Store only the H256 reference in memory
             self.pending_blocks
                 .entry(parent_root)
                 .or_default()
-                .push(signed_block);
+                .insert(block_root);
+
+            // Walk up through DB: if missing_root is already stored from a previous
+            // session, the actual missing block is further up the chain.
+            // Note: this loop always terminates — blocks reference parents by hash,
+            // so a cycle would require a hash collision.
+            while let Some(header) = self.store.get_block_header(&missing_root) {
+                if self.store.has_state(&header.parent_root) {
+                    // Parent state available — enqueue for processing, cascade
+                    // handles the rest via the outer loop.
+                    let block = self
+                        .store
+                        .get_signed_block(&missing_root)
+                        .expect("header and parent state exist, so the full signed block must too");
+                    queue.push_back(block);
+                    return;
+                }
+                // Block exists but parent doesn't have state — register as pending
+                // so the cascade works when the true ancestor arrives
+                self.pending_blocks
+                    .entry(header.parent_root)
+                    .or_default()
+                    .insert(missing_root);
+                self.pending_block_parents
+                    .insert(missing_root, header.parent_root);
+                missing_root = header.parent_root;
+            }
 
             // Request the actual missing block from network
             self.request_missing_block(missing_root);
@@ -326,8 +375,8 @@ impl BlockChainServer {
                     "Block imported successfully"
                 );
 
-                // Check if any pending blocks can now be processed
-                self.process_pending_children(block_root);
+                // Enqueue any pending blocks that were waiting for this parent
+                self.collect_pending_children(block_root, queue);
             }
             Err(err) => {
                 warn!(
@@ -353,23 +402,37 @@ impl BlockChainServer {
             );
     }
 
-    fn process_pending_children(&mut self, parent_root: H256) {
-        // Remove and process all blocks that were waiting for this parent
-        if let Some(children) = self.pending_blocks.remove(&parent_root) {
-            info!(%parent_root, num_children=%children.len(),
-                  "Processing pending blocks after parent arrival");
+    /// Move pending children of `parent_root` into the work queue for iterative
+    /// processing. This replaces the old recursive `process_pending_children`.
+    fn collect_pending_children(
+        &mut self,
+        parent_root: H256,
+        queue: &mut VecDeque<SignedBlockWithAttestation>,
+    ) {
+        let Some(child_roots) = self.pending_blocks.remove(&parent_root) else {
+            return;
+        };
 
-            for child_block in children {
-                let block_root = child_block.message.block.tree_hash_root();
-                let slot = child_block.message.block.slot;
-                trace!(%parent_root, %slot, "Processing pending child block");
+        info!(%parent_root, num_children=%child_roots.len(),
+              "Processing pending blocks after parent arrival");
 
-                // Clean up lineage tracking
-                self.pending_block_parents.remove(&block_root);
+        for block_root in child_roots {
+            // Clean up lineage tracking
+            self.pending_block_parents.remove(&block_root);
 
-                // Process recursively - might unblock more descendants
-                self.on_block(child_block);
-            }
+            // Load block data from DB
+            let Some(child_block) = self.store.get_signed_block(&block_root) else {
+                warn!(
+                    block_root = %ShortRoot(&block_root.0),
+                    "Pending block missing from DB, skipping"
+                );
+                continue;
+            };
+
+            let slot = child_block.message.block.slot;
+            trace!(%parent_root, %slot, "Processing pending child block");
+
+            queue.push_back(child_block);
         }
     }
 

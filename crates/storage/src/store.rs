@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().tree_hash_root());
 
-use crate::api::{StorageBackend, Table};
+use crate::api::{StorageBackend, StorageWriteBatch, Table};
 use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
@@ -533,6 +533,21 @@ impl Store {
 
     // ============ Signed Blocks ============
 
+    /// Insert a block as pending (parent state not yet available).
+    ///
+    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockSignatures`
+    /// **without** writing to `LiveChain`. This persists the heavy signature
+    /// data (~3KB+ per block) to disk while keeping the block invisible to
+    /// fork choice.
+    ///
+    /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
+    /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        write_signed_block(batch.as_mut(), &root, signed_block);
+        batch.commit().expect("commit");
+    }
+
     /// Insert a signed block, storing the block and signatures separately.
     ///
     /// Blocks and signatures are stored in separate tables because the genesis
@@ -541,41 +556,8 @@ impl Store {
     ///
     /// Takes ownership to avoid cloning large signature data.
     pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
-        // Destructure to extract all components without cloning
-        let SignedBlockWithAttestation {
-            message:
-                BlockWithAttestation {
-                    block,
-                    proposer_attestation,
-                },
-            signature,
-        } = signed_block;
-
-        let signatures = BlockSignaturesWithAttestation {
-            proposer_attestation,
-            signatures: signature,
-        };
-
         let mut batch = self.backend.begin_write().expect("write batch");
-
-        let header = block.header();
-        let header_entries = vec![(root.as_ssz_bytes(), header.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockHeaders, header_entries)
-            .expect("put block header");
-
-        // Skip storing empty bodies - they can be reconstructed from the header's body_root
-        if header.body_root != *EMPTY_BODY_ROOT {
-            let body_entries = vec![(root.as_ssz_bytes(), block.body.as_ssz_bytes())];
-            batch
-                .put_batch(Table::BlockBodies, body_entries)
-                .expect("put block body");
-        }
-
-        let sig_entries = vec![(root.as_ssz_bytes(), signatures.as_ssz_bytes())];
-        batch
-            .put_batch(Table::BlockSignatures, sig_entries)
-            .expect("put block signatures");
+        let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
         let index_entries = vec![(
             encode_live_chain_key(block.slot, &root),
@@ -642,16 +624,12 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    // ============ Known Attestations ============
-    //
-    // "Known" attestations are included in fork choice weight calculations.
-    // They're promoted from "new" attestations at specific intervals.
+    // ============ Attestation Helpers ============
 
-    /// Iterates over all known attestations (validator_id, attestation_data).
-    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+    fn iter_attestations(&self, table: Table) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestKnownAttestations, &[])
+            .prefix_iterator(table, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
@@ -663,22 +641,38 @@ impl Store {
         entries.into_iter()
     }
 
-    /// Returns a validator's latest known attestation.
-    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+    fn get_attestation(&self, table: Table, validator_id: &u64) -> Option<AttestationData> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestKnownAttestations, &validator_id.as_ssz_bytes())
+        view.get(table, &validator_id.as_ssz_bytes())
             .expect("get")
             .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
-    /// Stores a validator's latest known attestation.
-    pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
+    fn insert_attestation(&mut self, table: Table, validator_id: u64, data: AttestationData) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
-        batch
-            .put_batch(Table::LatestKnownAttestations, entries)
-            .expect("put attestation");
+        batch.put_batch(table, entries).expect("put attestation");
         batch.commit().expect("commit");
+    }
+
+    // ============ Known Attestations ============
+    //
+    // "Known" attestations are included in fork choice weight calculations.
+    // They're promoted from "new" attestations at specific intervals.
+
+    /// Iterates over all known attestations (validator_id, attestation_data).
+    pub fn iter_known_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
+        self.iter_attestations(Table::LatestKnownAttestations)
+    }
+
+    /// Returns a validator's latest known attestation.
+    pub fn get_known_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
+        self.get_attestation(Table::LatestKnownAttestations, validator_id)
+    }
+
+    /// Stores a validator's latest known attestation.
+    pub fn insert_known_attestation(&mut self, validator_id: u64, data: AttestationData) {
+        self.insert_attestation(Table::LatestKnownAttestations, validator_id, data);
     }
 
     // ============ New Attestations ============
@@ -688,36 +682,17 @@ impl Store {
 
     /// Iterates over all new (pending) attestations.
     pub fn iter_new_attestations(&self) -> impl Iterator<Item = (u64, AttestationData)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestNewAttestations, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let validator_id = u64::from_ssz_bytes(&k).expect("valid validator_id");
-                let data = AttestationData::from_ssz_bytes(&v).expect("valid attestation data");
-                (validator_id, data)
-            })
-            .collect();
-        entries.into_iter()
+        self.iter_attestations(Table::LatestNewAttestations)
     }
 
     /// Returns a validator's latest new (pending) attestation.
     pub fn get_new_attestation(&self, validator_id: &u64) -> Option<AttestationData> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::LatestNewAttestations, &validator_id.as_ssz_bytes())
-            .expect("get")
-            .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
+        self.get_attestation(Table::LatestNewAttestations, validator_id)
     }
 
     /// Stores a validator's new (pending) attestation.
     pub fn insert_new_attestation(&mut self, validator_id: u64, data: AttestationData) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(validator_id.as_ssz_bytes(), data.as_ssz_bytes())];
-        batch
-            .put_batch(Table::LatestNewAttestations, entries)
-            .expect("put attestation");
-        batch.commit().expect("commit");
+        self.insert_attestation(Table::LatestNewAttestations, validator_id, data);
     }
 
     /// Removes a validator's new (pending) attestation.
@@ -891,4 +866,51 @@ impl Store {
         self.get_state(&self.head())
             .expect("head state is always available")
     }
+}
+
+/// Write block header, body, and signatures onto an existing batch.
+///
+/// Returns the deserialized [`Block`] so callers can access fields like
+/// `slot` and `parent_root` without re-deserializing.
+fn write_signed_block(
+    batch: &mut dyn StorageWriteBatch,
+    root: &H256,
+    signed_block: SignedBlockWithAttestation,
+) -> Block {
+    let SignedBlockWithAttestation {
+        message:
+            BlockWithAttestation {
+                block,
+                proposer_attestation,
+            },
+        signature,
+    } = signed_block;
+
+    let signatures = BlockSignaturesWithAttestation {
+        proposer_attestation,
+        signatures: signature,
+    };
+
+    let header = block.header();
+    let root_bytes = root.as_ssz_bytes();
+
+    let header_entries = vec![(root_bytes.clone(), header.as_ssz_bytes())];
+    batch
+        .put_batch(Table::BlockHeaders, header_entries)
+        .expect("put block header");
+
+    // Skip storing empty bodies - they can be reconstructed from the header's body_root
+    if header.body_root != *EMPTY_BODY_ROOT {
+        let body_entries = vec![(root_bytes.clone(), block.body.as_ssz_bytes())];
+        batch
+            .put_batch(Table::BlockBodies, body_entries)
+            .expect("put block body");
+    }
+
+    let sig_entries = vec![(root_bytes, signatures.as_ssz_bytes())];
+    batch
+        .put_batch(Table::BlockSignatures, sig_entries)
+        .expect("put block signatures");
+
+    block
 }
