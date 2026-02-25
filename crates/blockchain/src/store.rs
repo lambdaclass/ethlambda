@@ -26,17 +26,20 @@ use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store) {
+fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
-    update_head(store);
+    update_head(store, log_tree);
 }
 
 /// Update the head based on the fork choice rule.
-fn update_head(store: &mut Store) {
+///
+/// When `log_tree` is true, also computes block weights and logs an ASCII
+/// fork choice tree to the terminal.
+fn update_head(store: &mut Store, log_tree: bool) {
     let blocks = store.get_live_chain();
     let attestations = store.extract_latest_known_attestations();
     let old_head = store.head();
-    let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
+    let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
         &attestations,
@@ -69,6 +72,17 @@ fn update_head(store: &mut Store) {
             "Fork choice head updated"
         );
     }
+
+    if log_tree {
+        let tree = crate::fork_choice_tree::format_fork_choice_tree(
+            &blocks,
+            &weights,
+            new_head,
+            store.latest_justified(),
+            store.latest_finalized(),
+        );
+        info!("\n{tree}");
+    }
 }
 
 /// Update the safe target for attestation.
@@ -88,7 +102,7 @@ fn update_safe_target(store: &mut Store) {
         all_payloads.entry(key).or_default().extend(new_proofs);
     }
     let attestations = store.extract_latest_attestations(all_payloads.into_iter());
-    let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
+    let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
         &attestations,
@@ -296,7 +310,7 @@ pub fn on_tick(
             0 => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store);
+                    accept_new_attestations(store, false);
                 }
             }
             1 => {
@@ -313,8 +327,8 @@ pub fn on_tick(
                 update_safe_target(store);
             }
             4 => {
-                // End of slot - accept accumulated attestations
-                accept_new_attestations(store);
+                // End of slot - accept accumulated attestations and log tree
+                accept_new_attestations(store, true);
             }
             _ => unreachable!("slots only have 5 intervals"),
         }
@@ -570,7 +584,7 @@ pub fn on_block(
     // Update forkchoice head based on new block and attestations
     // IMPORTANT: This must happen BEFORE processing proposer attestation
     // to prevent the proposer from gaining circular weight advantage.
-    update_head(store);
+    update_head(store, false);
 
     // Process proposer attestation as pending (enters "new" stage via gossip path)
     // The proposer's attestation should NOT affect this block's fork choice position.
@@ -699,7 +713,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     on_tick(store, slot_time_ms, true, false);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store);
+    accept_new_attestations(store, false);
 
     store.head()
 }
