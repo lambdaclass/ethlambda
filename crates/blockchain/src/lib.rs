@@ -155,12 +155,19 @@ impl BlockChainServer {
             .flatten();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        store::on_tick(
+        let new_aggregates = store::on_tick(
             &mut self.store,
             timestamp_ms,
             proposer_validator_id.is_some(),
             self.is_aggregator,
         );
+
+        for aggregate in new_aggregates {
+            let _ = self
+                .p2p_tx
+                .send(P2PMessage::PublishAggregatedAttestation(aggregate))
+                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        }
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
