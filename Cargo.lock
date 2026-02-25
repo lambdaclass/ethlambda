@@ -2041,6 +2041,7 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-fork-choice",
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-types",

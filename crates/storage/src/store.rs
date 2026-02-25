@@ -678,6 +678,40 @@ impl Store {
             .map(|bytes| AttestationData::from_ssz_bytes(&bytes).expect("valid attestation data"))
     }
 
+    /// Reconstruct per-validator attestation data from aggregated payloads.
+    ///
+    /// For each (validator_id, data_root) key in the payloads, looks up the
+    /// attestation data by root. Returns the latest attestation per validator
+    /// (by slot).
+    pub fn extract_latest_attestations(
+        &self,
+        payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
+    ) -> HashMap<u64, AttestationData> {
+        let mut result: HashMap<u64, AttestationData> = HashMap::new();
+
+        for ((validator_id, data_root), _payload_list) in payloads {
+            let Some(data) = self.get_attestation_data_by_root(&data_root) else {
+                continue;
+            };
+
+            let should_update = result
+                .get(&validator_id)
+                .is_none_or(|existing| existing.slot < data.slot);
+
+            if should_update {
+                result.insert(validator_id, data);
+            }
+        }
+
+        result
+    }
+
+    /// Convenience: extract latest attestation per validator from known
+    /// (fork-choice-active) aggregated payloads only.
+    pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
+        self.extract_latest_attestations(self.iter_known_aggregated_payloads())
+    }
+
     // ============ Known Aggregated Payloads ============
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.

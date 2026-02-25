@@ -12,6 +12,7 @@ version.workspace = true
 [dependencies]
 axum = "0.8.1"
 tokio.workspace = true
+ethlambda-fork-choice.workspace = true
 ethlambda-metrics.workspace = true
 tracing.workspace = true
 ethlambda-storage.workspace = true
