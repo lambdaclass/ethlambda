@@ -233,7 +233,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_attestation(state, source, target, original_finalized_slot) {
+        if !is_valid_vote(state, source, target, original_finalized_slot) {
             continue;
         }
 
@@ -300,7 +300,7 @@ fn process_attestations(
 /// 4. Both checkpoints exist in historical_block_hashes
 /// 5. Target slot > source slot
 /// 6. Target slot is justifiable after the finalized slot
-fn is_valid_attestation(
+fn is_valid_vote(
     state: &State,
     source: Checkpoint,
     target: Checkpoint,
