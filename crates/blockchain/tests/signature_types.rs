@@ -1,17 +1,10 @@
-use ethlambda_types::attestation::{
-    AggregatedAttestation as EthAggregatedAttestation, AggregationBits as EthAggregationBits,
-    Attestation as EthAttestation, AttestationData as EthAttestationData, XmssSignature,
-};
+use super::common::{AggregationBits, Block, Container, ProposerAttestation, TestInfo, TestState};
+use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::block::{
-    AggregatedAttestations, AggregatedSignatureProof, AggregationBits as EthAggregationBitsSig,
-    AttestationSignatures, Block as EthBlock, BlockBody as EthBlockBody, BlockSignatures,
-    BlockWithAttestation, SignedBlockWithAttestation,
+    AggregatedSignatureProof, AggregationBits as EthAggregationBitsSig, AttestationSignatures,
+    BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation,
 };
-use ethlambda_types::primitives::{
-    BitList, H256, VariableList,
-    ssz::{Decode as SszDecode, Encode as SszEncode},
-};
-use ethlambda_types::state::{Checkpoint as EthCheckpoint, State, ValidatorPubkeyBytes};
+use ethlambda_types::primitives::ssz::{Decode as SszDecode, Encode as SszEncode};
 use serde::Deserialize;
 use ssz_types::FixedVector;
 use ssz_types::typenum::{U28, U32};
@@ -41,6 +34,10 @@ pub struct SszXmssSignature {
     pub rho: Rho,
     pub hashes: Vec<HashDigest>,
 }
+
+// ============================================================================
+// Root Structures
+// ============================================================================
 
 /// Root struct for verify signatures test vectors
 #[derive(Debug, Clone, Deserialize)]
@@ -77,131 +74,9 @@ pub struct VerifySignaturesTest {
     pub info: TestInfo,
 }
 
-/// Pre-state of the beacon chain for signature tests
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TestState {
-    pub config: Config,
-    pub slot: u64,
-    #[serde(rename = "latestBlockHeader")]
-    pub latest_block_header: BlockHeader,
-    #[serde(rename = "latestJustified")]
-    pub latest_justified: Checkpoint,
-    #[serde(rename = "latestFinalized")]
-    pub latest_finalized: Checkpoint,
-    #[serde(rename = "historicalBlockHashes")]
-    pub historical_block_hashes: Container<H256>,
-    #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Container<u64>,
-    pub validators: Container<Validator>,
-    #[serde(rename = "justificationsRoots")]
-    pub justifications_roots: Container<H256>,
-    #[serde(rename = "justificationsValidators")]
-    pub justifications_validators: Container<bool>,
-}
-
-impl From<TestState> for State {
-    fn from(value: TestState) -> Self {
-        let historical_block_hashes =
-            VariableList::new(value.historical_block_hashes.data).unwrap();
-        let validators =
-            VariableList::new(value.validators.data.into_iter().map(Into::into).collect()).unwrap();
-        let justifications_roots = VariableList::new(value.justifications_roots.data).unwrap();
-
-        State {
-            config: value.config.into(),
-            slot: value.slot,
-            latest_block_header: value.latest_block_header.into(),
-            latest_justified: value.latest_justified.into(),
-            latest_finalized: value.latest_finalized.into(),
-            historical_block_hashes,
-            justified_slots: BitList::with_capacity(0).unwrap(),
-            validators,
-            justifications_roots,
-            justifications_validators: BitList::with_capacity(0).unwrap(),
-        }
-    }
-}
-
-/// Configuration for the beacon chain
-#[derive(Debug, Clone, Deserialize)]
-pub struct Config {
-    #[serde(rename = "genesisTime")]
-    pub genesis_time: u64,
-}
-
-impl From<Config> for ethlambda_types::state::ChainConfig {
-    fn from(value: Config) -> Self {
-        ethlambda_types::state::ChainConfig {
-            genesis_time: value.genesis_time,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Checkpoint {
-    pub root: H256,
-    pub slot: u64,
-}
-
-impl From<Checkpoint> for EthCheckpoint {
-    fn from(value: Checkpoint) -> Self {
-        Self {
-            root: value.root,
-            slot: value.slot,
-        }
-    }
-}
-
-/// Block header representing the latest block
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct BlockHeader {
-    pub slot: u64,
-    #[serde(rename = "proposerIndex")]
-    pub proposer_index: u64,
-    #[serde(rename = "parentRoot")]
-    pub parent_root: H256,
-    #[serde(rename = "stateRoot")]
-    pub state_root: H256,
-    #[serde(rename = "bodyRoot")]
-    pub body_root: H256,
-}
-
-impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
-    fn from(value: BlockHeader) -> Self {
-        Self {
-            slot: value.slot,
-            proposer_index: value.proposer_index,
-            parent_root: value.parent_root,
-            state_root: value.state_root,
-            body_root: value.body_root,
-        }
-    }
-}
-
-/// Validator information
-#[derive(Debug, Clone, Deserialize)]
-pub struct Validator {
-    pub index: u64,
-    #[serde(deserialize_with = "deser_pubkey_hex")]
-    pub pubkey: ValidatorPubkeyBytes,
-}
-
-impl From<Validator> for ethlambda_types::state::Validator {
-    fn from(value: Validator) -> Self {
-        Self {
-            index: value.index,
-            pubkey: value.pubkey,
-        }
-    }
-}
-
-/// Generic container for arrays
-#[derive(Debug, Clone, Deserialize)]
-pub struct Container<T> {
-    pub data: Vec<T>,
-}
+// ============================================================================
+// Signed Block Types
+// ============================================================================
 
 /// Signed block with attestation and signature
 #[derive(Debug, Clone, Deserialize)]
@@ -256,123 +131,9 @@ pub struct TestBlockWithAttestation {
     pub proposer_attestation: ProposerAttestation,
 }
 
-/// A block to be processed
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct Block {
-    pub slot: u64,
-    #[serde(rename = "proposerIndex")]
-    pub proposer_index: u64,
-    #[serde(rename = "parentRoot")]
-    pub parent_root: H256,
-    #[serde(rename = "stateRoot")]
-    pub state_root: H256,
-    pub body: BlockBody,
-}
-
-impl From<Block> for EthBlock {
-    fn from(value: Block) -> Self {
-        Self {
-            slot: value.slot,
-            proposer_index: value.proposer_index,
-            parent_root: value.parent_root,
-            state_root: value.state_root,
-            body: value.body.into(),
-        }
-    }
-}
-
-/// Block body containing attestations
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct BlockBody {
-    pub attestations: Container<AggregatedAttestation>,
-}
-
-impl From<BlockBody> for EthBlockBody {
-    fn from(value: BlockBody) -> Self {
-        let attestations: AggregatedAttestations = value
-            .attestations
-            .data
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("too many attestations");
-        Self { attestations }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct AggregatedAttestation {
-    #[serde(rename = "aggregationBits")]
-    pub aggregation_bits: AggregationBits,
-    pub data: AttestationData,
-}
-
-impl From<AggregatedAttestation> for EthAggregatedAttestation {
-    fn from(value: AggregatedAttestation) -> Self {
-        Self {
-            aggregation_bits: value.aggregation_bits.into(),
-            data: value.data.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct AggregationBits {
-    pub data: Vec<bool>,
-}
-
-impl From<AggregationBits> for EthAggregationBits {
-    fn from(value: AggregationBits) -> Self {
-        let mut bits = EthAggregationBits::with_capacity(value.data.len()).unwrap();
-        for (i, &b) in value.data.iter().enumerate() {
-            bits.set(i, b).unwrap();
-        }
-        bits
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct AttestationData {
-    pub slot: u64,
-    pub head: Checkpoint,
-    pub target: Checkpoint,
-    pub source: Checkpoint,
-}
-
-impl From<AttestationData> for EthAttestationData {
-    fn from(value: AttestationData) -> Self {
-        Self {
-            slot: value.slot,
-            head: value.head.into(),
-            target: value.target.into(),
-            source: value.source.into(),
-        }
-    }
-}
-
-/// Proposer attestation structure
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct ProposerAttestation {
-    #[serde(rename = "validatorId")]
-    pub validator_id: u64,
-    pub data: AttestationData,
-}
-
-impl From<ProposerAttestation> for EthAttestation {
-    fn from(value: ProposerAttestation) -> Self {
-        Self {
-            validator_id: value.validator_id,
-            data: value.data.into(),
-        }
-    }
-}
+// ============================================================================
+// Signature Types
+// ============================================================================
 
 /// Bundle of signatures for block and attestations
 #[derive(Debug, Clone, Deserialize)]
@@ -496,33 +257,4 @@ pub struct AttestationSignature {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofData {
     pub data: String,
-}
-
-/// Test metadata and information
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TestInfo {
-    pub hash: String,
-    pub comment: String,
-    #[serde(rename = "testId")]
-    pub test_id: String,
-    pub description: String,
-    #[serde(rename = "fixtureFormat")]
-    pub fixture_format: String,
-}
-
-// Helpers
-
-pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value = String::deserialize(d)?;
-    let pubkey: ValidatorPubkeyBytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
-        .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
-        .try_into()
-        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
-    Ok(pubkey)
 }
