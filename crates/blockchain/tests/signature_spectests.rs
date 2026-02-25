@@ -9,6 +9,7 @@ use ethlambda_types::{
     state::State,
 };
 
+mod common;
 mod signature_types;
 use signature_types::VerifySignaturesTestVector;
 
@@ -87,6 +88,6 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
 datatest_stable::harness!({
     test = run,
-    root = "../../../ethlambda/leanSpec/fixtures/consensus/verify_signatures",
+    root = "../../leanSpec/fixtures/consensus/verify_signatures",
     pattern = r".*\.json"
 });

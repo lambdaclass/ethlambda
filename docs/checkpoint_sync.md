@@ -26,7 +26,7 @@ When `--checkpoint-sync-url` is omitted, the node initializes from genesis.
 
 ### Direct peer
 
-Any running node that serves the `/lean/v0/states/finalized` endpoint can be used as a checkpoint source, not just ethlambda.
+Any running node that serves the finalized state as SSZ can be used as a checkpoint source, not just ethlambda. For ethlambda nodes, the endpoint is `/lean/v0/states/finalized`.
 
 This is the simplest option, with no additional infrastructure needed. The trade-off is that you trust a single peer to provide a correct finalized state.
 
@@ -38,7 +38,7 @@ This is the recommended option for production deployments since it reduces trust
 
 ## How It Works
 
-1. **Fetch and verify**: The node sends an HTTP GET to `{url}/lean/v0/states/finalized` requesting the SSZ-encoded finalized state. Once downloaded, the state is decoded and verified against the local genesis config (see [Verification Checks](#verification-checks) below).
+1. **Fetch and verify**: The node sends an HTTP GET to the provided URL requesting the SSZ-encoded finalized state. Once downloaded, the state is decoded and verified against the local genesis config (see [Verification Checks](#verification-checks) below).
 
    Timeouts:
    - **Connect**: 15 seconds (fail fast if peer is unreachable)

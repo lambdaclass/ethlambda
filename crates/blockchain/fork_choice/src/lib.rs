@@ -47,7 +47,9 @@ pub fn compute_lmd_ghost_head(
             .map(|(root, _)| root)
             .expect("we already checked blocks is non-empty");
     }
-    let start_slot = blocks[&start_root].0;
+    let Some(&(start_slot, _)) = blocks.get(&start_root) else {
+        return start_root;
+    };
     let weights = compute_block_weights(start_slot, blocks, attestations);
 
     let mut children_map: HashMap<H256, Vec<H256>> = HashMap::new();

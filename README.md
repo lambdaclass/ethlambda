@@ -104,7 +104,6 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [Checkpoint sync for long-lived networks](https://github.com/lambdaclass/ethlambda/issues/80)
 - [pq-devnet-3 support](https://github.com/lambdaclass/ethlambda/issues/73)
 - [Fetching of unknown blocks referenced by attestations](https://github.com/lambdaclass/ethlambda/issues/91)
 - [Discarding blocks with invalid signatures](https://github.com/lambdaclass/ethlambda/issues/78)
