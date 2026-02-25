@@ -48,9 +48,6 @@ pub const MILLISECONDS_PER_SLOT: u64 = 4_000;
 pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 /// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
 pub const INTERVALS_PER_SLOT: u64 = 5;
-/// Number of attestation committees per slot.
-pub const ATTESTATION_COMMITTEE_COUNT: u64 = 1;
-
 impl BlockChain {
     pub fn spawn(
         store: Store,
