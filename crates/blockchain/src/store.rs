@@ -39,7 +39,7 @@ fn update_head(store: &mut Store, log_tree: bool) {
     let blocks = store.get_live_chain();
     let attestations = store.extract_latest_known_attestations();
     let old_head = store.head();
-    let new_head = ethlambda_fork_choice::compute_lmd_ghost_head(
+    let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
         &attestations,
@@ -74,15 +74,12 @@ fn update_head(store: &mut Store, log_tree: bool) {
     }
 
     if log_tree {
-        let finalized = store.latest_finalized();
-        let weights =
-            ethlambda_fork_choice::compute_block_weights(finalized.slot, &blocks, &attestations);
         let tree = crate::fork_choice_tree::format_fork_choice_tree(
             &blocks,
             &weights,
             new_head,
             store.latest_justified(),
-            finalized,
+            store.latest_finalized(),
         );
         info!("\n{tree}");
     }
@@ -105,7 +102,7 @@ fn update_safe_target(store: &mut Store) {
         all_payloads.entry(key).or_default().extend(new_proofs);
     }
     let attestations = store.extract_latest_attestations(all_payloads.into_iter());
-    let safe_target = ethlambda_fork_choice::compute_lmd_ghost_head(
+    let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
         &attestations,

@@ -29,6 +29,8 @@ pub fn compute_block_weights(
 /// Compute the LMD GHOST head of the chain, given a starting root, a set of blocks,
 /// a set of attestations, and a minimum score threshold.
 ///
+/// Returns the head root and the per-block attestation weights used for selection.
+///
 /// This is the same implementation from leanSpec
 // TODO: add proto-array implementation
 pub fn compute_lmd_ghost_head(
@@ -36,9 +38,9 @@ pub fn compute_lmd_ghost_head(
     blocks: &HashMap<H256, (u64, H256)>,
     attestations: &HashMap<u64, AttestationData>,
     min_score: u64,
-) -> H256 {
+) -> (H256, HashMap<H256, u64>) {
     if blocks.is_empty() {
-        return start_root;
+        return (start_root, HashMap::new());
     }
     if start_root.is_zero() {
         start_root = *blocks
@@ -48,7 +50,7 @@ pub fn compute_lmd_ghost_head(
             .expect("we already checked blocks is non-empty");
     }
     let Some(&(start_slot, _)) = blocks.get(&start_root) else {
-        return start_root;
+        return (start_root, HashMap::new());
     };
     let weights = compute_block_weights(start_slot, blocks, attestations);
 
@@ -76,7 +78,7 @@ pub fn compute_lmd_ghost_head(
             .expect("checked it's not empty");
     }
 
-    head
+    (head, weights)
 }
 
 #[cfg(test)]
