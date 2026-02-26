@@ -34,7 +34,7 @@ At each slot, validators vote for the newest block as their **target**, citing
 the latest justified checkpoint as their **source**:
 
 - **Slot N+1:** Votes `source=N, target=N+1`. Three of four vote
-  (3×3=9 > 2×4=8) — **N+1 justified**.
+  (3×3=9 >= 2×4=8) — **N+1 justified**.
 - **Slot N+2:** Votes `source=N+1, target=N+2`. Three of four vote —
   **N+2 justified**. N+1 and N+2 are consecutive justifiable slots and both
   are justified, so **N+1 is finalized**.
@@ -47,7 +47,7 @@ that make this work — and what happens when things go wrong.
 
 | Term | Meaning |
 |------|---------|
-| **Justified** | A checkpoint backed by >2/3 validator votes |
+| **Justified** | A checkpoint backed by >=2/3 validator votes |
 | **Finalized** | A checkpoint that can never be reverted |
 | **Source** | The latest justified checkpoint (vote origin) |
 | **Target** | The checkpoint being voted for (vote destination) |
@@ -55,7 +55,7 @@ that make this work — and what happens when things go wrong.
 
 ## Justification via Supermajority
 
-A checkpoint becomes **justified** when >2/3 of validators attest to it as a target:
+A checkpoint becomes **justified** when >=2/3 of validators attest to it as a target:
 
 ```text
                    JUSTIFICATION
@@ -66,7 +66,7 @@ A checkpoint becomes **justified** when >2/3 of validators attest to it as a tar
                   └───┴───┴───┴───┴───────┴───┘
                               │
                     7 out of 9 votes
-                  (3×7=21 > 2×9=18)  ✓
+                  (3×7=21 >= 2×9=18) ✓
                               │
                               ▼
                      ┌──────────────┐
@@ -75,12 +75,12 @@ A checkpoint becomes **justified** when >2/3 of validators attest to it as a tar
                      └──────────────┘
 ```
 
-The threshold is computed as: `3 × vote_count > 2 × validator_count`
+The threshold is computed as: `3 × vote_count >= 2 × validator_count`
 
 > **In ethlambda:** Justification and finalization are processed inside
 > `process_attestations()` in `crates/blockchain/state_transition/src/lib.rs`,
 > called from `process_block()`. The supermajority check is
-> `3 * vote_count > 2 * validator_count`.
+> `3 * vote_count >= 2 * validator_count`.
 
 Attestations must also pass validity checks before they count:
 - Source checkpoint must already be justified
@@ -144,7 +144,7 @@ Visualizing the first 40 slots after finalization (✓ = justifiable):
 **Key property:** Gaps between justifiable slots grow, but never become infinite.
 As more time passes since finalization, the network gets progressively wider windows
 to accumulate votes. This creates a natural backpressure: if the network is struggling
-to reach >2/3 consensus (e.g., due to partitions or validator dropouts), the increasing
+to reach >=2/3 consensus (e.g., due to partitions or validator dropouts), the increasing
 gaps give more time for the supermajority to form.
 
 ## Finalization
@@ -202,7 +202,7 @@ The justifiability schedule acts as a backoff mechanism to increase finalization
 during periods of asynchrony. By "diluting" the possible targets of a justification
 vote (via the `slot_is_justifiable_after` function), the protocol increases the window
 during which votes for a given slot can be included, improving the chances of achieving
-the required >2/3 majority.
+the required >=2/3 majority.
 
 Since finalization requires two consecutively justifiable slots to both be justified,
 this backoff isn't immediately reset after finalization occurs; it only lowers over
@@ -225,7 +225,7 @@ time when synchrony is restored.
 
 ```
     Validators vote, but with many justifiable targets, votes scatter
-    and no single slot reaches >2/3. As gaps widen, votes concentrate.
+    and no single slot reaches >=2/3. As gaps widen, votes concentrate.
 
     Near slot 1000, the 32-slot gap between 992 and 1024 means
     no competing justifiable target exists for 32 slots after 992.
@@ -336,7 +336,7 @@ Each attestation carries three checkpoints, each determined by a different mecha
     └────────────────────────────────────────────────────────────────┘
 ```
 
-The **safe target** is computed by running LMD-GHOST with a >2/3 vote threshold,
+The **safe target** is computed by running LMD-GHOST with a >=2/3 vote threshold,
 where V is the total number of validators. Only blocks backed by a supermajority
 qualify, so the safe target is always at or behind the head. See
 [Safe Target Selection](ghost-fork-choice.md#safe-target-selection) for details.
@@ -370,13 +370,13 @@ The attestation **target** is then derived from the safe target via a walk-back:
 ### Lagging Safe Target (Fork with Delayed Convergence)
 
 When validators disagree about the head (e.g., due to a fork or network partition),
-the safe target can lag behind the head. No single branch has >2/3 support, so
+the safe target can lag behind the head. No single branch has >=2/3 support, so
 the safe target stays stuck at the last point where everyone agrees. This delays
 justification until the fork resolves.
 
 ```text
     Setup: 9 validators, finalized at slot 100, justified at slot 101
-    Threshold for safe target: >2/3 of 9 → need >6 → 7 votes
+    Threshold for safe target: >=2/3 of 9 → need >=6 → 6 votes
 ```
 
 **Slot 102: Fork! Two blocks proposed at the same slot.**
@@ -390,7 +390,7 @@ justification until the fork resolves.
 | Step | Result |
 |------|--------|
 | Head | B102a (5 votes > 4 votes for B102b) |
-| Safe target | B102a has 5 < 7, B102b has 4 < 7. Neither clears >2/3 → **Safe target = B101** (stuck at justified checkpoint) |
+| Safe target | B102a has 5 < 6, B102b has 4 < 6. Neither clears >=2/3 → **Safe target = B101** (stuck at justified checkpoint) |
 | Attestation target | Walk back from B102a to B101 (1 step). B101 = source → **Target = source. No progress.** |
 
 **Slot 103: Fork persists.**
@@ -418,7 +418,7 @@ Now the a-branch has 7 validators (V0–V4 + V7 + V8).
 | Step | Result |
 |------|--------|
 | Head | B104a (7 votes subtree > 2 votes) |
-| Safe target | B102a subtree now has 7 votes > 6 → included. But B103a only has 5 (V7/V8 attested to B102a, not B103a) → excluded. **Safe target = B102a** |
+| Safe target | B102a subtree now has 7 votes >= 6 → included. But B103a only has 5 (V7/V8 attested to B102a, not B103a) → excluded. **Safe target = B102a** |
 | Attestation target | Walk back from B104a toward B102a: 2 steps (B104a → B103a → B102a). Slot 102 justifiable (delta=2 ≤ 5). 102 > source 101 ✓ → **Target = B102a** |
 
 Now attestations can advance justification:
@@ -428,7 +428,7 @@ Now attestations can advance justification:
     (slot 101)      (slot 102)
        │               │
        ▼               ▼
-    [ J=101 ]─────▶[ B102a ]    7/9 votes → 3×7=21 > 2×9=18 → JUSTIFIED ✓
+    [ J=101 ]─────▶[ B102a ]    7/9 votes → 3×7=21 >= 2×9=18 → JUSTIFIED ✓
        │
        └── Finalization check:
            Slots between 101 and 102 (exclusive): NONE
@@ -446,7 +446,7 @@ After slot 104: **finalized=101, justified=102.**
 | Step | Result |
 |------|--------|
 | Head | B105a (unanimous) |
-| Safe target | B104a (9 votes > 6) |
+| Safe target | B104a (9 votes >= 6) |
 | Attestation target | Walk from B105a to B104a (1 step). Slot 104 justifiable (delta=104−101=3 ≤ 5). 104 > source 102 ✓ → **Target = B104a** |
 
 Attestations targeting B104a reach supermajority → **B104a JUSTIFIED ✓**
@@ -558,7 +558,7 @@ as two consecutive justifiable slots are both justified.
      per slot        per slot        per slot        per slot
 
     Every validator participates in every slot.
-    >2/3 threshold checked per-slot → can justify any slot.
+    >=2/3 threshold checked per-slot → can justify any slot.
 ```
 
 This is simple and fast, but it means every validator must produce and verify a vote
@@ -592,7 +592,7 @@ Ethereum's beacon chain has ~1,000,000 active validators. Having all of them vot
                               (first slot of epoch)
 
     Each validator attests exactly ONCE per epoch.
-    The full >2/3 tally is only meaningful at epoch boundaries.
+    The full >=2/3 tally is only meaningful at epoch boundaries.
 ```
 
 Each validator is shuffled into a **committee** assigned to one specific slot. Within
@@ -688,6 +688,6 @@ tolerating missed windows, it makes the windows wider when the network is strugg
 Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini's
 justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
 (via the perfect square and pronic number rules), creating natural vote concentration when the
-network is struggling to reach >2/3. Casper FFG has no equivalent — its epoch spacing is the
+network is struggling to reach >=2/3. Casper FFG has no equivalent — its epoch spacing is the
 same whether the network is healthy or partitioned. See
 [Justifiable Slot Backoff](#justifiable-slot-backoff) for a detailed walkthrough.
