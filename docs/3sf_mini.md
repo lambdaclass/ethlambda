@@ -325,7 +325,7 @@ Each attestation carries three checkpoints, each determined by a different mecha
     │                       ATTESTATION                              │
     │                                                                │
     │  head    Newest block the validator sees                       │
-    │          ← LMD-GHOST with min_score = 0                       │
+    │          ← LMD-GHOST with min_score = 0                        │
     │                                                                │
     │  target  Block the validator wants justified next              │
     │          ← Derived from safe target, walked back to nearest    │
@@ -535,7 +535,9 @@ intermediate slot was individually finalized.
 
 Both 3SF-mini and Casper FFG are finality gadgets built on the same foundation:
 supermajority links between checkpoints. They differ fundamentally in their unit of
-time and what that implies for validator participation.
+time and what that implies for validator participation. For a thorough treatment of
+Casper FFG as used in Ethereum, see the
+[eth2book chapter on Casper FFG](https://eth2book.info/capella/part2/consensus/casper_ffg/).
 
 ### Slots vs Epochs: The Core Architectural Split
 
@@ -576,12 +578,12 @@ Ethereum's beacon chain has ~1,000,000 active validators. Having all of them vot
     Epoch N
     ┌─────────────────────────────────────────────────────────────┐
     │ Slot 0     Slot 1     Slot 2    ...    Slot 30    Slot 31   │
-    │ ┌──────┐   ┌──────┐   ┌──────┐        ┌──────┐   ┌──────┐  │
-    │ │~28125│   │~28125│   │~28125│  ...   │~28125│   │~28125│  │
-    │ │valids│   │valids│   │valids│        │valids│   │valids│  │
-    │ └──┬───┘   └──┬───┘   └──┬───┘        └──┬───┘   └──┬───┘  │
-    │    │           │           │               │           │     │
-    └────┼───────────┼───────────┼───────────────┼───────────┼─────┘
+    │ ┌──────┐   ┌──────┐   ┌──────┐        ┌──────┐   ┌──────┐   │
+    │ │~28125│   │~28125│   │~28125│  ...   │~28125│   │~28125│   │
+    │ │valids│   │valids│   │valids│        │valids│   │valids│   │
+    │ └──┬───┘   └──┬───┘   └──┬───┘        └──┬───┘   └──┬───┘   │
+    │    │           │           │               │           │    │
+    └────┼───────────┼───────────┼───────────────┼───────────┼────┘
          └───────────┴───────────┴───┬───────────┴───────────┘
                                      │
                             All ~900k votes
