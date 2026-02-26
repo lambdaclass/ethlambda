@@ -402,9 +402,11 @@ pub fn on_block(
                 validator_id,
                 data: att.data.clone(),
             };
-            // Block body attestations may contain stale data (e.g., source advancing
-            // past target during justification changes). Invalid attestations are
-            // skipped rather than rejecting the block.
+            // Block body attestations can fail validation for legitimate reasons
+            // (e.g., referencing blocks from forks we haven't seen, or source
+            // exceeding target when the attester's justified checkpoint advanced
+            // past their chosen target). Invalid attestations are skipped rather
+            // than rejecting the block.
             let _ = on_attestation(store, attestation, true)
                 .inspect(|_| metrics::inc_attestations_valid("block"))
                 .inspect_err(|err| {
@@ -436,9 +438,9 @@ pub fn on_block(
     }
 
     // Process proposer attestation (enters "new" stage, not "known").
-    // Like block body attestations, the proposer's vote may become stale if
-    // justification advances during state transition, so errors are logged
-    // rather than rejecting the block.
+    // Like block body attestations, this can fail validation for legitimate
+    // reasons (e.g., referencing the block being processed, or stale checkpoint
+    // data). Errors are logged rather than rejecting the block.
     let _ = on_attestation(store, proposer_attestation, false)
         .inspect(|_| metrics::inc_attestations_valid("gossip"))
         .inspect_err(|err| {
