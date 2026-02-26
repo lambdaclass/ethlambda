@@ -41,7 +41,7 @@ the latest justified checkpoint as their **source**:
 
 That's the core loop: each block carries attestations that justify the current
 slot and finalize the previous one. The rest of this document explains the rules
-that make this work — and what happens when things go wrong.
+that make this work, and what happens when things go wrong.
 
 ## Concepts
 
