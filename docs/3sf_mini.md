@@ -311,10 +311,9 @@ When finalization advances, the following cleanup occurs:
 
 ## End-to-End: From Head Selection to Finalization
 
-This section shows how the full consensus cycle works from start to finish,
-connecting [LMD-GHOST fork choice](ghost-fork-choice.md) with 3SF-mini.
-The [quick example above](#quick-example-three-slots-to-finality) showed the
-happy path; here we focus on what happens when things go wrong.
+This section connects [LMD-GHOST fork choice](ghost-fork-choice.md) with 3SF-mini.
+The [quick example above](#quick-example-three-slots-to-finality) showed the happy
+path; here we focus on what happens when things go wrong.
 
 ### Recap: Attestation Anatomy
 
@@ -336,64 +335,28 @@ Each attestation carries three checkpoints, each determined by a different mecha
     └────────────────────────────────────────────────────────────────┘
 ```
 
-The **safe target** is computed by running LMD-GHOST with a >=2/3 vote threshold,
-where V is the total number of validators. Only blocks backed by a supermajority
-qualify, so the safe target is always at or behind the head. See
+The **safe target** is computed by running LMD-GHOST with a >=2/3 vote threshold.
+Only blocks backed by a supermajority qualify, so the safe target is always at or
+behind the head. The attestation **target** is derived by walking back from the head
+toward the safe target (max 3 steps), then to the nearest justifiable slot. See
 [Safe Target Selection](ghost-fork-choice.md#safe-target-selection) for details.
 
-The attestation **target** is then derived from the safe target via a walk-back:
-
-```text
-    ATTESTATION TARGET DERIVATION
-    ─────────────────────────────
-
-    Start at head
-        │
-        ▼
-    Walk back toward safe target (max 3 steps)
-        │
-        ▼
-    Walk back to nearest justifiable slot
-        │
-        ▼
-    Final target
-```
-
 > **In ethlambda:** `get_attestation_target()` in `crates/blockchain/src/store.rs`
-> implements this walk-back. The max walk-back distance is controlled by
-> `JUSTIFICATION_LOOKBACK_SLOTS = 3`, which provides a liveness guarantee: even if
-> the safe target is stuck, the target eventually advances once the head moves far
-> enough ahead. An additional clamp step ensures the result is never behind the
-> latest justified checkpoint (source), guarding against races where justification
-> advances between safe target updates.
+> implements this walk-back. `JUSTIFICATION_LOOKBACK_SLOTS = 3` provides a liveness
+> guarantee: even if the safe target is stuck, the target eventually advances once
+> the head moves far enough ahead.
 
 ### Lagging Safe Target (Fork with Delayed Convergence)
 
-When validators disagree about the head (e.g., due to a fork or network partition),
-the safe target can lag behind the head. No single branch has >=2/3 support, so
-the safe target stays stuck at the last point where everyone agrees. This delays
-justification until the fork resolves.
+When validators disagree about the head, the safe target lags behind — no single
+branch has >=2/3 support. This delays justification until the fork resolves.
 
 ```text
-    Setup: 9 validators, finalized at slot 100, justified at slot 101
-    Threshold for safe target: >=2/3 of 9 → need >=6 → 6 votes
+    Setup: 9 validators, finalized=100, justified=101
+    Safe target threshold: >=6 votes (2/3 of 9)
 ```
 
-**Slot 102: Fork! Two blocks proposed at the same slot.**
-
-```text
-                         ┌──[ B102a ]     V0–V4 (5 validators)
-    [ F=100 ]──[ J=101 ]─┤
-                         └──[ B102b ]     V5–V8 (4 validators)
-```
-
-| Step | Result |
-|------|--------|
-| Head | B102a (5 votes > 4 votes for B102b) |
-| Safe target | B102a has 5 < 6, B102b has 4 < 6. Neither clears >=2/3 → **Safe target = B101** (stuck at justified checkpoint) |
-| Attestation target | Walk back from B102a to B101 (1 step). B101 = source → **Target = source. No progress.** |
-
-**Slot 103: Fork persists.**
+**Slots 102–103: Fork splits votes. No progress.**
 
 ```text
                          ┌──[ B102a ]──[ B103a ]     V0–V4 (5)
@@ -401,13 +364,12 @@ justification until the fork resolves.
                          └──[ B102b ]──[ B103b ]     V5–V8 (4)
 ```
 
-Head = B103a. Safe target still B101. Walk-back from B103a to B101 takes 2 steps.
-Target = source again. **Still no justification progress.**
+Neither branch clears >=2/3 → safe target stuck at B101. Walk-back from head
+always lands on source (B101). **No attestation can advance justification.**
 
 **Slot 104: V7 and V8 switch sides. Fork resolves.**
 
 V7 and V8 receive B102a (delayed by the partition) and switch to the a-branch.
-Now the a-branch has 7 validators (V0–V4 + V7 + V8).
 
 ```text
                          ┌──[ B102a ]──[ B103a ]──[ B104a ]     V0–V4, V7, V8 (7)
@@ -415,74 +377,24 @@ Now the a-branch has 7 validators (V0–V4 + V7 + V8).
                          └──[ B102b ]──[ B103b ]──[ B104b ]     V5–V6  (2)
 ```
 
-| Step | Result |
-|------|--------|
-| Head | B104a (7 votes subtree > 2 votes) |
-| Safe target | B102a subtree now has 7 votes >= 6 → included. But B103a only has 5 (V7/V8 attested to B102a, not B103a) → excluded. **Safe target = B102a** |
-| Attestation target | Walk back from B104a toward B102a: 2 steps (B104a → B103a → B102a). Slot 102 justifiable (delta=2 ≤ 5). 102 > source 101 ✓ → **Target = B102a** |
-
-Now attestations can advance justification:
+B102a subtree now has 7 votes >= 6 → **safe target = B102a**. Walk-back from B104a
+lands on B102a (2 steps). Slot 102 is justifiable (delta=2 ≤ 5).
 
 ```text
-    source          target
-    (slot 101)      (slot 102)
-       │               │
-       ▼               ▼
-    [ J=101 ]─────▶[ B102a ]    7/9 votes → 3×7=21 >= 2×9=18 → JUSTIFIED ✓
-       │
-       └── Finalization check:
-           Slots between 101 and 102 (exclusive): NONE
-           → J(101) FINALIZED ✓
+    source=101 ──▶ target=102    7/9 votes → 3×7=21 >= 2×9=18 → JUSTIFIED ✓
+    Finalization: no slots between 101 and 102 → 101 FINALIZED ✓
 ```
 
 After slot 104: **finalized=101, justified=102.**
 
-**Slot 105: Full convergence. V5–V6 rejoin the a-branch.**
+**Slots 105–106: Full convergence and recovery.**
 
-```text
-    [ F=101 ]──[ J=102a ]──[ B103a ]──[ B104a ]──[ B105a ]     All 9 validators
-```
+All 9 validators on the a-branch. Slot 105: target=B104a → **B104a JUSTIFIED**.
+But finalization fails — slot 103 (between source=102 and target=104) is justifiable
+but was never justified (lost in the fork).
 
-| Step | Result |
-|------|--------|
-| Head | B105a (unanimous) |
-| Safe target | B104a (9 votes >= 6) |
-| Attestation target | Walk from B105a to B104a (1 step). Slot 104 justifiable (delta=104−101=3 ≤ 5). 104 > source 102 ✓ → **Target = B104a** |
-
-Attestations targeting B104a reach supermajority → **B104a JUSTIFIED ✓**
-
-Finalization check (source=102, target=104, original_finalized=101):
-
-```text
-    Slots between 102 and 104 (exclusive): [103]
-    Is slot 103 justifiable after F=101?  delta = 103−101 = 2 ≤ 5 → YES
-
-    Justifiable slot exists between source and target → FINALIZATION FAILS ✗
-```
-
-Slot 103 is justifiable but was **never justified** (it was lost in the fork).
-This blocks finalization because the protocol can't be sure an alternative
-justification path through slot 103 doesn't exist.
-
-**Slot 106: Catching up.**
-
-Head = B106a. Safe target = B105a. Target walks back to B105a (1 step).
-Slot 105 justifiable (delta=4 ≤ 5). 105 > source 104 ✓.
-
-Attestations: `{source=J(104), target=B105a}` → **B105a JUSTIFIED ✓**
-
-Finalization check (source=104, target=105, original_finalized=101):
-
-```text
-    Slots between 104 and 105 (exclusive): NONE
-    → J(104a) FINALIZED ✓
-```
-
-After slot 106: **finalized=104, justified=105.**
-
-Finalization jumped from 101 to 104, skipping slots 102 and 103. This is safe:
-finalization only guarantees that finalized blocks are permanent, not that every
-intermediate slot was individually finalized.
+Slot 106: target=B105a → **B105a JUSTIFIED**. No justifiable slots between 104 and
+105 → **104 FINALIZED**. Finalization jumped from 101 to 104, skipping 102 and 103.
 
 ```text
     FORK WITH DELAYED CONVERGENCE
@@ -503,33 +415,7 @@ intermediate slot was individually finalized.
                                                    ▲
                               finalization jumps ──┘
                                (102,103 skipped; 103 was never justified)
-
-    Compared to full synchrony:
-    ┌──────────────┬────────────────┬─────────────────────┐
-    │              │ Full synchrony │ Fork (this example) │
-    ├──────────────┼────────────────┼─────────────────────┤
-    │ Finalized by │                │                     │
-    │   slot 104   │ 103            │ 101                 │
-    │   slot 106   │ 105            │ 104                 │
-    │ Slots lost   │ 0              │ ~2 slots behind     │
-    └──────────────┴────────────────┴─────────────────────┘
 ```
-
-**Key observations:**
-
-1. **Safe target is the bottleneck.** While stuck at B101, no attestation could
-   advance justification because the walk-back always landed on source. Justification
-   only resumed once enough validators converged to push the safe target forward.
-
-2. **Forks create justification gaps.** Slot 103 was justifiable but never justified
-   (the fork split votes). This gap prevented finalization of slot 102, even after
-   it was justified. The protocol had to "skip over" the gap by finding two later
-   consecutive justifiable slots (104 and 105) that were both justified.
-
-3. **Recovery is quick.** Once the fork resolved and safe target advanced,
-   justification and finalization caught up within two slots. The protocol doesn't
-   need to re-justify missed slots; it just needs any two consecutive justifiable
-   slots to both be justified.
 
 ## Comparison with Casper FFG
 
