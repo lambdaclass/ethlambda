@@ -27,7 +27,7 @@ A checkpoint becomes **justified** when >2/3 of validators attest to it as a tar
                   └───┴───┴───┴───┴───────┴───┘
                               │
                     7 out of 9 votes
-                  (3×7=21 ≥ 2×9=18)  ✓
+                  (3×7=21 > 2×9=18)  ✓
                               │
                               ▼
                      ┌──────────────┐
@@ -36,12 +36,12 @@ A checkpoint becomes **justified** when >2/3 of validators attest to it as a tar
                      └──────────────┘
 ```
 
-The threshold is computed as: `3 × vote_count ≥ 2 × validator_count`
+The threshold is computed as: `3 × vote_count > 2 × validator_count`
 
 > **In ethlambda:** Justification and finalization are processed inside
 > `process_attestations()` in `crates/blockchain/state_transition/src/lib.rs`,
 > called from `process_block()`. The supermajority check is
-> `3 * vote_count >= 2 * validator_count`.
+> `3 * vote_count > 2 * validator_count`.
 
 Attestations must also pass validity checks before they count:
 - Source checkpoint must already be justified
@@ -105,7 +105,7 @@ Visualizing the first 40 slots after finalization (✓ = justifiable):
 **Key property:** Gaps between justifiable slots grow, but never become infinite.
 As more time passes since finalization, the network gets progressively wider windows
 to accumulate votes. This creates a natural backpressure: if the network is struggling
-to reach 2/3 consensus (e.g., due to partitions or validator dropouts), the increasing
+to reach >2/3 consensus (e.g., due to partitions or validator dropouts), the increasing
 gaps give more time for the supermajority to form.
 
 ## Finalization
@@ -163,7 +163,7 @@ The justifiability schedule acts as a backoff mechanism to increase finalization
 during periods of asynchrony. By "diluting" the possible targets of a justification
 vote (via the `slot_is_justifiable_after` function), the protocol increases the window
 during which votes for a given slot can be included, improving the chances of achieving
-the required 2/3 majority.
+the required >2/3 majority.
 
 Since finalization requires two consecutively justifiable slots to both be justified,
 this backoff isn't immediately reset after finalization occurs; it only lowers over
@@ -186,7 +186,7 @@ time when synchrony is restored.
 
 ```
     Validators vote, but with many justifiable targets, votes scatter
-    and no single slot reaches 2/3. As gaps widen, votes concentrate.
+    and no single slot reaches >2/3. As gaps widen, votes concentrate.
 
     Near slot 1000, the 32-slot gap between 992 and 1024 means
     no competing justifiable target exists for 32 slots after 992.
@@ -276,7 +276,7 @@ Validators attest with `source=100, target=101`. 3 of 4 vote:
     (slot 100)      (slot 101)
        │               │
        ▼               ▼
-    [  100  ]─────▶[  101  ]    3/4 votes → 3×3=9 ≥ 2×4=8 → JUSTIFIED ✓
+    [  100  ]─────▶[  101  ]    3/4 votes → 3×3=9 > 2×4=8 → JUSTIFIED ✓
 ```
 
 **Round 2: Justify slot 102 and finalize slot 101.**
