@@ -34,8 +34,8 @@ At each slot, validators vote for the newest block as their **target**, citing
 the latest justified checkpoint as their **source**:
 
 - **Slot N+1:** Votes `source=N, target=N+1`. Three of four vote
-  (3×3=9 >= 2×4=8) — **N+1 justified**.
-- **Slot N+2:** Votes `source=N+1, target=N+2`. Three of four vote —
+  (3×3=9 >= 2×4=8), so **N+1 is justified**.
+- **Slot N+2:** Votes `source=N+1, target=N+2`. Three of four vote, so
   **N+2 justified**. N+1 and N+2 are consecutive justifiable slots and both
   are justified, so **N+1 is finalized**.
 
@@ -349,7 +349,7 @@ toward the safe target (max 3 steps), then to the nearest justifiable slot. See
 
 ### Lagging Safe Target (Fork with Delayed Convergence)
 
-When validators disagree about the head, the safe target lags behind — no single
+When validators disagree about the head, the safe target lags behind: no single
 branch has two-thirds support. This delays justification until the fork resolves.
 
 ```text
@@ -391,7 +391,7 @@ After slot 104: **finalized=101, justified=102.**
 **Slots 105–106: Full convergence and recovery.**
 
 All 9 validators on the a-branch. Slot 105: target=B104a → **B104a JUSTIFIED**.
-But finalization fails — slot 103 (between source=102 and target=104) is justifiable
+But finalization fails: slot 103 (between source=102 and target=104) is justifiable
 but was never justified (lost in the fork).
 
 Slot 106: target=B105a → **B105a JUSTIFIED**. No justifiable slots between 104 and
@@ -540,7 +540,7 @@ falls slightly behind:
     The direct link N→N+1 didn't form in time.
     Instead, a link forms from N→N+2. Processing this link:
       1. Epoch N+2 becomes JUSTIFIED (target of a supermajority link)
-      2. Epoch N becomes FINALIZED (all intermediates — just N+1 — are justified)
+      2. Epoch N becomes FINALIZED (all intermediates are justified)
 ```
 
 The 2-finality rule is a recovery mechanism: even if the network missed the ideal one-epoch
@@ -563,13 +563,13 @@ last 4 epoch boundaries to detect both cases. In practice, most finalization hap
 
 Instead of checking that intermediate checkpoints *are justified*, 3SF-mini checks that no
 intermediate checkpoints *could exist at all*. This is a stronger guarantee: validators'
-votes between source and target could only have gone to the target — there's nowhere else
+votes between source and target could only have gone to the target, since there's nowhere else
 to direct them. This structural property is also why 3SF-mini doesn't need Casper's
 surround-vote slashing condition.
 
 Casper's k-finality is essentially a tolerance parameter: "how many epochs behind can we be
 and still finalize?" Ethereum chose k=2, meaning it tolerates one missed epoch. 3SF-mini
-doesn't need this concept because the justifiability schedule itself adapts — instead of
+doesn't need this concept because the justifiability schedule itself adapts. Instead of
 tolerating missed windows, it makes the windows wider when the network is struggling.
 
 ### Adaptive Backoff (unique to 3SF-mini)
@@ -577,6 +577,6 @@ tolerating missed windows, it makes the windows wider when the network is strugg
 Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini's
 justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
 (via the perfect square and pronic number rules), creating natural vote concentration when the
-network is struggling to reach a two-thirds majority. Casper FFG has no equivalent — its epoch spacing is the
+network is struggling to reach a two-thirds majority. Casper FFG has no equivalent; its epoch spacing is the
 same whether the network is healthy or partitioned. See
 [Justifiable Slot Backoff](#justifiable-slot-backoff) for a detailed walkthrough.
