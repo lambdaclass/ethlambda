@@ -9,6 +9,7 @@ use ethlambda_types::{
     state::State,
 };
 
+mod common;
 mod signature_types;
 use signature_types::VerifySignaturesTestVector;
 
