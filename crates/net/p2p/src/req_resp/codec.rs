@@ -173,7 +173,7 @@ where
                 format!("Invalid error message: {err:?}"),
             )
         })?;
-        let error_str = String::from_utf8_lossy(&message).to_string();
+        let error_str = String::from_utf8_lossy(&message).into_owned();
         trace!(?code, %error_str, "Received error response");
         return Ok(Response::error(code, message));
     }
@@ -227,7 +227,7 @@ where
 
         if code != ResponseCode::SUCCESS {
             let error_message = ErrorMessage::from_ssz_bytes(&payload)
-                .map(|msg| String::from_utf8_lossy(&msg).to_string())
+                .map(|msg| String::from_utf8_lossy(&msg).into_owned())
                 .unwrap_or_else(|_| "<invalid error message>".to_string());
             debug!(?code, %error_message, "Skipping block chunk with non-success code");
             continue;
