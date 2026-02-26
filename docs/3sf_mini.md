@@ -630,3 +630,164 @@ intermediate slot was individually finalized.
    justification and finalization caught up within two slots. The protocol doesn't
    need to re-justify missed slots; it just needs any two consecutive justifiable
    slots to both be justified.
+
+## Comparison with Casper FFG
+
+Both 3SF-mini and Casper FFG are finality gadgets built on the same foundation:
+supermajority links between checkpoints. They differ fundamentally in their unit of
+time and what that implies for validator participation.
+
+### Slots vs Epochs: The Core Architectural Split
+
+**3SF-mini: Every Validator, Every Slot**
+
+In 3SF-mini, **all validators vote in every slot**. A checkpoint can be justified at
+any slot (subject to the justifiability schedule), and finalization can happen as soon
+as two consecutive justifiable slots are both justified.
+
+```text
+    3SF-mini  (4-second slots, 4 validators)
+
+    Slot 100        Slot 101        Slot 102        Slot 103
+    ┌───────┐       ┌───────┐       ┌───────┐       ┌───────┐
+    │V0 V1  │       │V0 V1  │       │V0 V1  │       │V0 V1  │
+    │V2 V3  │       │V2 V3  │       │V2 V3  │       │V2 V3  │
+    └───┬───┘       └───┬───┘       └───┬───┘       └───┬───┘
+        │               │               │               │
+     4 votes         4 votes         4 votes         4 votes
+     per slot        per slot        per slot        per slot
+
+    Every validator participates in every slot.
+    >2/3 threshold checked per-slot → can justify any slot.
+```
+
+This is simple and fast, but it means every validator must produce and verify a vote
+every slot. The total message load scales as `validators × slots`.
+
+**Casper FFG: Validators Split Across an Epoch**
+
+Ethereum's beacon chain has ~1,000,000 active validators. Having all of them vote every
+12-second slot would be unmanageable. Instead, Casper FFG groups 32 slots into an
+**epoch**, and splits the validator set across the slots within it:
+
+```text
+    Casper FFG  (12-second slots, 32 per epoch, ~900k validators)
+
+    Epoch N
+    ┌─────────────────────────────────────────────────────────────┐
+    │ Slot 0     Slot 1     Slot 2    ...    Slot 30    Slot 31   │
+    │ ┌──────┐   ┌──────┐   ┌──────┐        ┌──────┐   ┌──────┐  │
+    │ │~28125│   │~28125│   │~28125│  ...   │~28125│   │~28125│  │
+    │ │valids│   │valids│   │valids│        │valids│   │valids│  │
+    │ └──┬───┘   └──┬───┘   └──┬───┘        └──┬───┘   └──┬───┘  │
+    │    │           │           │               │           │     │
+    └────┼───────────┼───────────┼───────────────┼───────────┼─────┘
+         └───────────┴───────────┴───┬───────────┴───────────┘
+                                     │
+                            All ~900k votes
+                          collected over 32 slots
+                                     │
+                                     ▼
+                              Epoch checkpoint
+                              (first slot of epoch)
+
+    Each validator attests exactly ONCE per epoch.
+    The full >2/3 tally is only meaningful at epoch boundaries.
+```
+
+Each validator is shuffled into a **committee** assigned to one specific slot. Within
+that slot, the committee may be further split (up to 64 sub-committees) for parallel
+aggregation. The result: each validator only attests once per epoch, and the network
+processes ~28,000 attestations per slot instead of ~900,000.
+
+**The trade-off:**
+
+| | **3SF-mini** | **Casper FFG** |
+|---|---|---|
+| **Who votes when** | All validators, every slot | Each validator once per epoch (in its assigned slot) |
+| **Messages per slot** | `N` (all validators) | `N / 32` (one committee) |
+| **Supermajority known after** | 1 slot (all votes in) | 1 epoch (need all 32 committees) |
+| **Fastest finalization** | 2 slots = **8 seconds** | 2 epochs = **~12.8 minutes** |
+| **Practical validator limit** | Hundreds–thousands | Millions |
+
+Epochs exist because of a scalability constraint, not a protocol-theory preference. If
+you could process a million votes per slot, Casper FFG wouldn't need epochs at all. 3SF-mini
+sidesteps this by targeting a smaller validator set, which lets it operate at slot granularity.
+
+### Finalization Logic
+
+Both require a chain of justified checkpoints, but the rules differ in what they check.
+
+**Casper FFG** uses **k-finality**. The original rule (k=1) requires a direct supermajority
+link from a checkpoint to its immediate successor: justify epoch N+1 with source=N, and N
+is finalized. Ethereum generalizes this to **k=2**, which handles the case where the network
+falls slightly behind:
+
+```text
+    Casper FFG — 1-finality (ideal case):
+
+    Epoch N       Epoch N+1
+    ┌─────┐       ┌─────┐
+    │ CP  │══════▶│ CP  │       Supermajority link N → N+1
+    │ J ✓ │       │     │
+    └─────┘       └─────┘
+
+    Processing this link:
+      1. Epoch N+1 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (direct successor justified)
+
+
+    Casper FFG — 2-finality (one epoch behind):
+
+    Epoch N       Epoch N+1     Epoch N+2
+    ┌─────┐       ┌─────┐       ┌─────┐
+    │ CP  │       │ CP  │       │ CP  │
+    │ J ✓ │       │ J ✓ │       │     │
+    └─────┘       └─────┘       └─────┘
+       │                           │
+       └══════ supermajority ══════┘
+               link N → N+2
+
+    The direct link N→N+1 didn't form in time.
+    Instead, a link forms from N→N+2. Processing this link:
+      1. Epoch N+2 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (all intermediates — just N+1 — are justified)
+```
+
+The 2-finality rule is a recovery mechanism: even if the network missed the ideal one-epoch
+finalization window, it gets a second chance. Ethereum tracks the justification status of the
+last 4 epoch boundaries to detect both cases. In practice, most finalization happens via
+1-finality during normal operation; 2-finality kicks in during brief network hiccups.
+
+**3SF-mini** takes a different approach entirely:
+
+```text
+    Slot S        Slot T
+    ┌─────┐       ┌─────┐
+    │ CP  │──────▶│ CP  │       No justifiable slots exist
+    │ J ✓ │       │ J ✓ │       between S and T
+    └─────┘       └─────┘
+    ∴ Slot S is FINALIZED
+
+    Rule: Finalized when NO intermediate checkpoints could exist
+```
+
+Instead of checking that intermediate checkpoints *are justified*, 3SF-mini checks that no
+intermediate checkpoints *could exist at all*. This is a stronger guarantee: validators'
+votes between source and target could only have gone to the target — there's nowhere else
+to direct them. This structural property is also why 3SF-mini doesn't need Casper's
+surround-vote slashing condition.
+
+Casper's k-finality is essentially a tolerance parameter: "how many epochs behind can we be
+and still finalize?" Ethereum chose k=2, meaning it tolerates one missed epoch. 3SF-mini
+doesn't need this concept because the justifiability schedule itself adapts — instead of
+tolerating missed windows, it makes the windows wider when the network is struggling.
+
+### Adaptive Backoff (unique to 3SF-mini)
+
+Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini's
+justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
+(via the perfect square and pronic number rules), creating natural vote concentration when the
+network is struggling to reach >2/3. Casper FFG has no equivalent — its epoch spacing is the
+same whether the network is healthy or partitioned. See
+[Justifiable Slot Backoff](#justifiable-slot-backoff) for a detailed walkthrough.
