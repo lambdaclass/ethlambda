@@ -188,7 +188,10 @@ pub fn on_tick(store: &mut Store, timestamp: u64, has_proposal: bool) {
     }
 }
 
-/// Process a gossiped attestation.
+/// Process a gossiped attestation (with signature verification).
+///
+/// This is the safe default: it always verifies the validator's XMSS signature
+/// and stores it for future block building.
 pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: SignedAttestation,
@@ -211,24 +214,56 @@ pub fn on_gossip_attestation(
         .get_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
     let message = attestation.data.tree_hash_root();
-    if cfg!(not(feature = "skip-signature-verification")) {
-        use ethlambda_types::signature::ValidatorSignature;
-        // Use attestation.data.slot as epoch (matching what Zeam and ethlambda use for signing)
-        let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        if !signature.is_valid(&validator_pubkey, epoch, &message) {
-            return Err(StoreError::SignatureVerificationFailed);
-        }
+
+    // Verify the validator's XMSS signature
+    let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+    let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+        .map_err(|_| StoreError::SignatureDecodingFailed)?;
+    if !signature.is_valid(&validator_pubkey, epoch, &message) {
+        return Err(StoreError::SignatureVerificationFailed);
     }
+
     on_attestation(store, attestation.clone(), false)?;
 
-    if cfg!(not(feature = "skip-signature-verification")) {
-        // Store signature for later lookup during block building
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(&attestation.data, validator_id, signature);
-    }
+    // Store signature for later lookup during block building
+    store.insert_gossip_signature(&attestation.data, validator_id, signature);
+
+    metrics::inc_attestations_valid("gossip");
+
+    let slot = attestation.data.slot;
+    let target_slot = attestation.data.target.slot;
+    let source_slot = attestation.data.source.slot;
+    info!(
+        slot,
+        validator = validator_id,
+        target_slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        source_slot,
+        source_root = %ShortRoot(&attestation.data.source.root.0),
+        "Attestation processed"
+    );
+
+    Ok(())
+}
+
+/// Process a gossiped attestation without signature verification.
+///
+/// This skips all cryptographic checks and signature storage. Use only in tests
+/// where signatures are absent or irrelevant.
+pub fn on_gossip_attestation_without_verification(
+    store: &mut Store,
+    signed_attestation: SignedAttestation,
+) -> Result<(), StoreError> {
+    let validator_id = signed_attestation.validator_id;
+    let attestation = Attestation {
+        validator_id,
+        data: signed_attestation.message,
+    };
+    validate_attestation(store, &attestation)
+        .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
+
+    on_attestation(store, attestation.clone(), false)?;
+
     metrics::inc_attestations_valid("gossip");
 
     let slot = attestation.data.slot;
@@ -312,23 +347,25 @@ fn on_attestation(
     Ok(())
 }
 
-/// Process a new block and update the forkchoice state.
+/// Process a new block and update the forkchoice state (with signature verification).
+///
+/// This is the safe default: it always verifies cryptographic signatures
+/// and stores them for future block building. Use this for all production paths.
 ///
 /// This method integrates a block into the forkchoice store by:
 /// 1. Validating the block's parent exists
-/// 2. Computing the post-state via the state transition function
-/// 3. Processing attestations included in the block body (on-chain)
-/// 4. Updating the forkchoice head
-/// 5. Processing the proposer's attestation (as if gossiped)
+/// 2. Verifying cryptographic signatures
+/// 3. Computing the post-state via the state transition function
+/// 4. Processing attestations included in the block body (on-chain)
+/// 5. Updating the forkchoice head
+/// 6. Processing the proposer's attestation (as if gossiped)
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
 
-    // Unpack block components
-    let block = signed_block.message.block.clone();
-    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block = &signed_block.message.block;
     let block_root = block.tree_hash_root();
     let slot = block.slot;
 
@@ -338,8 +375,6 @@ pub fn on_block(
     }
 
     // Verify parent state is available
-    // Note: Parent block existence is checked by the caller before calling this function.
-    // This check ensures the state has been computed for the parent block.
     let parent_state =
         store
             .get_state(&block.parent_root)
@@ -349,14 +384,67 @@ pub fn on_block(
             })?;
 
     // Validate cryptographic signatures
-    // TODO: extract signature verification to a pre-checks function
-    // to avoid the need for this
-    if cfg!(not(feature = "skip-signature-verification")) {
-        verify_signatures(&parent_state, &signed_block)?;
+    verify_signatures(&parent_state, &signed_block)?;
+
+    // Store the proposer's signature for potential future block building
+    let proposer_attestation = &signed_block.message.proposer_attestation;
+    let proposer_sig = ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+        .map_err(|_| StoreError::SignatureDecodingFailed)?;
+    store.insert_gossip_signature(
+        &proposer_attestation.data,
+        proposer_attestation.validator_id,
+        proposer_sig,
+    );
+
+    on_block_core(store, signed_block, parent_state)
+}
+
+/// Process a new block without signature verification.
+///
+/// This skips all cryptographic checks and signature storage. Use only in tests
+/// where signatures are absent or irrelevant (e.g., fork choice spec tests).
+pub fn on_block_without_verification(
+    store: &mut Store,
+    signed_block: SignedBlockWithAttestation,
+) -> Result<(), StoreError> {
+    let _timing = metrics::time_fork_choice_block_processing();
+
+    let block = &signed_block.message.block;
+    let block_root = block.tree_hash_root();
+    let slot = block.slot;
+
+    // Skip duplicate blocks (idempotent operation)
+    if store.has_state(&block_root) {
+        return Ok(());
     }
 
+    // Verify parent state is available
+    let parent_state =
+        store
+            .get_state(&block.parent_root)
+            .ok_or(StoreError::MissingParentState {
+                parent_root: block.parent_root,
+                slot,
+            })?;
+
+    on_block_core(store, signed_block, parent_state)
+}
+
+/// Shared block processing logic used by both `on_block()` and `on_block_without_verification()`.
+///
+/// Takes `parent_state` by value to avoid cloning (the caller already fetched it).
+fn on_block_core(
+    store: &mut Store,
+    signed_block: SignedBlockWithAttestation,
+    parent_state: State,
+) -> Result<(), StoreError> {
+    let block = signed_block.message.block.clone();
+    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block_root = block.tree_hash_root();
+    let slot = block.slot;
+
     // Execute state transition function to compute post-block state
-    let mut post_state = parent_state.clone();
+    let mut post_state = parent_state;
     ethlambda_state_transition::state_transition(&mut post_state, &block)?;
 
     // Cache the state root in the latest block header
@@ -413,22 +501,6 @@ pub fn on_block(
     // IMPORTANT: This must happen BEFORE processing proposer attestation
     // to prevent the proposer from gaining circular weight advantage.
     update_head(store);
-
-    // Process proposer attestation as if received via gossip
-    // The proposer's attestation should NOT affect this block's fork choice position.
-    // It is treated as pending until interval 3 (end of slot).
-
-    if cfg!(not(feature = "skip-signature-verification")) {
-        // Store the proposer's signature for potential future block building
-        let proposer_sig =
-            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-                .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(
-            &proposer_attestation.data,
-            proposer_attestation.validator_id,
-            proposer_sig,
-        );
-    }
 
     // Process proposer attestation (enters "new" stage, not "known")
     // TODO: validate attestations before processing

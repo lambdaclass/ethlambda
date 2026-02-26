@@ -63,7 +63,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time, true);
-                    let result = store::on_block(&mut store, signed_block);
+                    let result = store::on_block_without_verification(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
                         (true, false) => {
@@ -303,46 +303,46 @@ fn validate_attestation_check(
     })?;
 
     // Validate attestation slot if specified
-    if let Some(expected_slot) = check.attestation_slot {
-        if attestation.slot != expected_slot {
-            return Err(format!(
-                "Step {}: attestation slot mismatch for validator {}: expected {}, got {}",
-                step_idx, validator_id, expected_slot, attestation.slot
-            )
-            .into());
-        }
+    if let Some(expected_slot) = check.attestation_slot
+        && attestation.slot != expected_slot
+    {
+        return Err(format!(
+            "Step {}: attestation slot mismatch for validator {}: expected {}, got {}",
+            step_idx, validator_id, expected_slot, attestation.slot
+        )
+        .into());
     }
 
-    if let Some(expected_head_slot) = check.head_slot {
-        if attestation.head.slot != expected_head_slot {
-            return Err(format!(
-                "Step {}: attestation head slot mismatch: expected {}, got {}",
-                step_idx, expected_head_slot, attestation.head.slot
-            )
-            .into());
-        }
+    if let Some(expected_head_slot) = check.head_slot
+        && attestation.head.slot != expected_head_slot
+    {
+        return Err(format!(
+            "Step {}: attestation head slot mismatch: expected {}, got {}",
+            step_idx, expected_head_slot, attestation.head.slot
+        )
+        .into());
     }
 
     // Validate source slot if specified
-    if let Some(expected_source_slot) = check.source_slot {
-        if attestation.source.slot != expected_source_slot {
-            return Err(format!(
-                "Step {}: attestation source slot mismatch: expected {}, got {}",
-                step_idx, expected_source_slot, attestation.source.slot
-            )
-            .into());
-        }
+    if let Some(expected_source_slot) = check.source_slot
+        && attestation.source.slot != expected_source_slot
+    {
+        return Err(format!(
+            "Step {}: attestation source slot mismatch: expected {}, got {}",
+            step_idx, expected_source_slot, attestation.source.slot
+        )
+        .into());
     }
 
     // Validate target slot if specified
-    if let Some(expected_target_slot) = check.target_slot {
-        if attestation.target.slot != expected_target_slot {
-            return Err(format!(
-                "Step {}: attestation target slot mismatch: expected {}, got {}",
-                step_idx, expected_target_slot, attestation.target.slot
-            )
-            .into());
-        }
+    if let Some(expected_target_slot) = check.target_slot
+        && attestation.target.slot != expected_target_slot
+    {
+        return Err(format!(
+            "Step {}: attestation target slot mismatch: expected {}, got {}",
+            step_idx, expected_target_slot, attestation.target.slot
+        )
+        .into());
     }
 
     Ok(())

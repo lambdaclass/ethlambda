@@ -67,14 +67,10 @@ The Dockerfile accepts build arguments for customizing the build:
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `BUILD_PROFILE` | `release` | Cargo build profile |
-| `FEATURES` | `""` | Extra Cargo features (e.g. `skip-signature-verification`) |
+| `FEATURES` | `""` | Extra Cargo features |
 | `RUSTFLAGS` | `""` | Extra Rust compiler flags |
 
 Example with custom args:
-
-```bash
-docker build --build-arg FEATURES=skip-signature-verification -t ethlambda:test .
-```
 
 `GIT_COMMIT` and `GIT_BRANCH` are also available but set automatically by CI.
 When building locally, `vergen-git2` extracts them from the local Git repo at
