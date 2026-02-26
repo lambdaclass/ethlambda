@@ -4,6 +4,45 @@ ethlambda uses **3SF-mini** (Three-Stage Finality, minimal version) for justific
 and finalization. Unlike the Ethereum Beacon Chain's epoch-based Casper FFG, 3SF-mini
 operates at the **slot level**: any slot can be justified, not just epoch boundaries.
 
+## Quick Example: Three Slots to Finality
+
+4 validators, slot N already finalized and justified.
+
+```text
+                             source  target
+                                │       │
+                                ▼       ▼
+    Slot N        ──[ N-2 ]──[ N-1 ]──[ N ]
+                       F        J       H
+
+                                     source    target
+                                        │         │
+                                        ▼         ▼
+    Slot N+1      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]
+                       F        F       J         H
+
+                                               source     target
+                                                  │          │
+                                                  ▼          ▼
+    Slot N+2      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]────[ N+2 ]
+                       F        F       F         J          H
+
+    H = head    J = justified    F = finalized
+```
+
+At each slot, validators vote for the newest block as their **target**, citing
+the latest justified checkpoint as their **source**:
+
+- **Slot N+1:** Votes `source=N, target=N+1`. Three of four vote
+  (3×3=9 > 2×4=8) — **N+1 justified**.
+- **Slot N+2:** Votes `source=N+1, target=N+2`. Three of four vote —
+  **N+2 justified**. N+1 and N+2 are consecutive justifiable slots and both
+  are justified, so **N+1 is finalized**.
+
+That's the core loop: each block carries attestations that justify the current
+slot and finalize the previous one. The rest of this document explains the rules
+that make this work — and what happens when things go wrong.
+
 ## Concepts
 
 | Term | Meaning |
@@ -257,50 +296,12 @@ time when synchrony is restored.
     slot and the chain head, progressively tightening the gaps.
 ```
 
-## Worked Example: Justification and Finalization
-
-```text
-    Setup: 4 validators (V0–V3), finalized at slot 100
-
-    Slot 100: [FINALIZED] ← anchor
-    Slot 101: Block proposed, justifiable? delta=1 ≤ 5 → YES
-    Slot 102: Block proposed, justifiable? delta=2 ≤ 5 → YES
-```
-
-**Round 1: Justify slot 101.**
-
-Validators attest with `source=100, target=101`. 3 of 4 vote:
-
-```text
-    source          target
-    (slot 100)      (slot 101)
-       │               │
-       ▼               ▼
-    [  100  ]─────▶[  101  ]    3/4 votes → 3×3=9 > 2×4=8 → JUSTIFIED ✓
-```
-
-**Round 2: Justify slot 102 and finalize slot 101.**
-
-Validators attest with `source=101, target=102`:
-
-```text
-    source          target
-    (slot 101)      (slot 102)
-       │               │
-       ▼               ▼
-    [  101  ]─────▶[  102  ]    3/4 votes → JUSTIFIED ✓
-       │
-       └── Finalization check:
-           Slots between 101 and 102 (exclusive): NONE
-           No justifiable slots between them → slot 101 FINALIZED ✓
-```
-
-**After finalization of slot 101:**
+When finalization advances, the following cleanup occurs:
 
 - `justified_slots` window shifts forward (old slots pruned)
-- `LiveChain` entries for slots ≤101 are pruned
+- `LiveChain` entries for finalized slots are pruned
 - Gossip signatures and aggregation proofs for finalized blocks are cleaned up
-- Future fork choice runs start from slot 101's successor, never looking further back
+- Future fork choice runs start from the finalized slot's successor
 
 > **In ethlambda:** The `justified_slots` bitlist uses relative indexing (index 0 =
 > `finalized_slot + 1`). When finalization advances, `shift_window()` in
@@ -310,9 +311,10 @@ Validators attest with `source=101, target=102`:
 
 ## End-to-End: From Head Selection to Finalization
 
-The sections above cover justification and finalization in isolation. This section
-shows how the full consensus cycle works from start to finish, connecting
-[LMD-GHOST fork choice](ghost-fork-choice.md) with 3SF-mini.
+This section shows how the full consensus cycle works from start to finish,
+connecting [LMD-GHOST fork choice](ghost-fork-choice.md) with 3SF-mini.
+The [quick example above](#quick-example-three-slots-to-finality) showed the
+happy path; here we focus on what happens when things go wrong.
 
 ### Recap: Attestation Anatomy
 
@@ -365,110 +367,7 @@ The attestation **target** is then derived from the safe target via a walk-back:
 > latest justified checkpoint (source), guarding against races where justification
 > advances between safe target updates.
 
-### Example 1: Full Synchrony (Safe Target One Slot Behind Head)
-
-When all validators are online and see the same chain, the safe target tracks
-one slot behind the head: the previous block has had a full slot for attestations
-to accumulate, giving it >2/3 support. Finalization proceeds at the fastest
-possible rate: one finalization per slot.
-
-```text
-    Setup: 9 validators, finalized at slot 100, justified at slot 101
-    All validators online, all see the same chain
-```
-
-**Slot 102: Block B102 proposed.**
-
-```text
-    Chain:  ─[ F=100 ]──[ J=101 ]──[ B102 ]──
-                                       ▲
-                                      head
-```
-
-| Step | What happens |
-|------|-------------|
-| Head selection | LMD-GHOST (min_score=0): all 9 validators' latest heads point at B102 → **Head = B102** |
-| Safe target | LMD-GHOST (min_score=7): B101 has accumulated 9 votes > 6 over the previous slot → **Safe target = B101** |
-| Attestation target | Walk back from B102 toward B101: one step → B101. But B101 = source (already justified). Clamp → **Target = B101** |
-
-Since target = source, these attestations cannot advance justification. This is
-normal. Validators still broadcast the attestation because its **head** field
-contributes to fork choice, even when the target can't make progress.
-
-But B102 also carries attestations **from the previous slot** (slot 101's
-validators targeted B102 before it was the head). Those attestations have
-`source=J(101), target=B102`:
-
-```text
-    Justification of B102 (from slot 101 attestations included in block B102):
-
-    source          target
-    (slot 101)      (slot 102)
-       │               │
-       ▼               ▼
-    [ J=101 ]─────▶[ B102 ]    7/9 votes → 3×7=21 > 2×9=18 → JUSTIFIED ✓
-       │
-       └── Finalization check:
-           Slots between 101 and 102 (exclusive): NONE
-           No justifiable slots between them → J(101) FINALIZED ✓
-```
-
-After slot 102: **finalized=101, justified=102.**
-
-**Slot 103: Block B103 proposed.**
-
-```text
-    Chain:  ─[ F=101 ]──[ J=102 ]──[ B103 ]──
-                                       ▲
-                                      head
-```
-
-| Step | Result |
-|------|--------|
-| Head | B103 (9 votes, unanimous) |
-| Safe target | B102 (9 votes from slot 102 attestations > 6) |
-| Attestation target | Walk back from B103 to B102. Slot 102 justifiable (delta=102−101=1 ≤ 5). But B102 is already justified = source. Clamp → Target = B102 |
-
-Again, the current slot's attestations can't advance justification. But block B103
-carries attestations from slot 102 targeting B103 (`source=J(102), target=B103`):
-
-```text
-    7/9 votes for B103 → JUSTIFIED ✓
-
-    Finalization check (source=102, target=103, original_finalized=101):
-        Slots between 102 and 103 (exclusive): NONE
-        → J(102) FINALIZED ✓
-```
-
-After slot 103: **finalized=102, justified=103.**
-
-```text
-    FULL SYNCHRONY TIMELINE
-    ═══════════════════════
-
-    Slot:      100     101      102      103      104
-    Block:     B100    B101     B102     B103     B104
-                F      J→F      J→F      J→F      J
-                │       │        │        │        │
-    Justified:  ·      by B101  by B102  by B103  by B104
-    Finalized:  ·       ·       F=101    F=102    F=103
-                                 ▲        ▲        ▲
-                                 │        │        │
-                            Each block justifies the current slot
-                            AND finalizes the previous one.
-
-    Safe:      ·       B100     B101     B102     B103
-                                 │        │        │
-                         always one slot behind the head
-```
-
-**Key property:** In full synchrony, the safe target tracks exactly one slot behind
-the head. Justification comes from the *previous* slot's attestations (carried
-in the current block), and finalization follows immediately because consecutive
-slots are always consecutive justifiable slots when delta ≤ 5. This gives the
-fastest possible finalization rate: **one finalization per slot**.
-
-### Example 2: Lagging Safe Target (Fork with Delayed Convergence)
+### Lagging Safe Target (Fork with Delayed Convergence)
 
 When validators disagree about the head (e.g., due to a fork or network partition),
 the safe target can lag behind the head. No single branch has >2/3 support, so
