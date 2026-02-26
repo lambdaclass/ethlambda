@@ -39,15 +39,16 @@ the latest justified checkpoint as their **source**:
   **N+2 justified**. N+1 and N+2 are consecutive justifiable slots and both
   are justified, so **N+1 is finalized**.
 
-That's the core loop: each block carries attestations that justify the current
-slot and finalize the previous one. The rest of this document explains the rules
-that make this work, and what happens when things go wrong.
+In the ideal case, each block carries attestations that justify the parent slot
+and finalize the one before it. In practice, forks, missed slots, and delayed
+votes can break this cadence. The rest of this document explains the rules that
+make this work, and what happens when things go wrong.
 
 ## Concepts
 
 | Term | Meaning |
 |------|---------|
-| **Justified** | A checkpoint backed by >=2/3 validator votes |
+| **Justified** | A checkpoint backed by at least two-thirds of validator votes |
 | **Finalized** | A checkpoint that can never be reverted |
 | **Source** | The latest justified checkpoint (vote origin) |
 | **Target** | The checkpoint being voted for (vote destination) |
@@ -55,7 +56,7 @@ that make this work, and what happens when things go wrong.
 
 ## Justification via Supermajority
 
-A checkpoint becomes **justified** when >=2/3 of validators attest to it as a target:
+A checkpoint becomes **justified** when at least two-thirds of validators attest to it as a target:
 
 ```text
                    JUSTIFICATION
@@ -144,7 +145,7 @@ Visualizing the first 40 slots after finalization (✓ = justifiable):
 **Key property:** Gaps between justifiable slots grow, but never become infinite.
 As more time passes since finalization, the network gets progressively wider windows
 to accumulate votes. This creates a natural backpressure: if the network is struggling
-to reach >=2/3 consensus (e.g., due to partitions or validator dropouts), the increasing
+to reach a two-thirds majority (e.g., due to partitions or validator dropouts), the increasing
 gaps give more time for the supermajority to form.
 
 ## Finalization
@@ -202,7 +203,7 @@ The justifiability schedule acts as a backoff mechanism to increase finalization
 during periods of asynchrony. By "diluting" the possible targets of a justification
 vote (via the `slot_is_justifiable_after` function), the protocol increases the window
 during which votes for a given slot can be included, improving the chances of achieving
-the required >=2/3 majority.
+the required two-thirds majority.
 
 Since finalization requires two consecutively justifiable slots to both be justified,
 this backoff isn't immediately reset after finalization occurs; it only lowers over
@@ -335,7 +336,7 @@ Each attestation carries three checkpoints, each determined by a different mecha
     └────────────────────────────────────────────────────────────────┘
 ```
 
-The **safe target** is computed by running LMD-GHOST with a >=2/3 vote threshold.
+The **safe target** is computed by running LMD-GHOST with a two-thirds vote threshold.
 Only blocks backed by a supermajority qualify, so the safe target is always at or
 behind the head. The attestation **target** is derived by walking back from the head
 toward the safe target (max 3 steps), then to the nearest justifiable slot. See
@@ -349,7 +350,7 @@ toward the safe target (max 3 steps), then to the nearest justifiable slot. See
 ### Lagging Safe Target (Fork with Delayed Convergence)
 
 When validators disagree about the head, the safe target lags behind — no single
-branch has >=2/3 support. This delays justification until the fork resolves.
+branch has two-thirds support. This delays justification until the fork resolves.
 
 ```text
     Setup: 9 validators, finalized=100, justified=101
@@ -364,7 +365,7 @@ branch has >=2/3 support. This delays justification until the fork resolves.
                          └──[ B102b ]──[ B103b ]     V5–V8 (4)
 ```
 
-Neither branch clears >=2/3 → safe target stuck at B101. Walk-back from head
+Neither branch clears two-thirds → safe target stuck at B101. Walk-back from head
 always lands on source (B101). **No attestation can advance justification.**
 
 **Slot 104: V7 and V8 switch sides. Fork resolves.**
@@ -576,6 +577,6 @@ tolerating missed windows, it makes the windows wider when the network is strugg
 Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini's
 justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
 (via the perfect square and pronic number rules), creating natural vote concentration when the
-network is struggling to reach >=2/3. Casper FFG has no equivalent — its epoch spacing is the
+network is struggling to reach a two-thirds majority. Casper FFG has no equivalent — its epoch spacing is the
 same whether the network is healthy or partitioned. See
 [Justifiable Slot Backoff](#justifiable-slot-backoff) for a detailed walkthrough.
