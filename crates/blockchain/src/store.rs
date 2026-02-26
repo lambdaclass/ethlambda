@@ -8,11 +8,11 @@ use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store, StoredAggregatedPa
 use ethlambda_types::{
     ShortRoot,
     attestation::{
-        AggregatedAttestation, Attestation, AttestationData, SignedAggregatedAttestation,
-        SignedAttestation,
+        AggregatedAttestation, AggregationBits, Attestation, AttestationData,
+        SignedAggregatedAttestation, SignedAttestation,
     },
     block::{
-        AggregatedAttestations, AggregatedSignatureProof, AggregationBits, Block, BlockBody,
+        AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
         SignedBlockWithAttestation,
     },
     primitives::{H256, ssz::TreeHash},
