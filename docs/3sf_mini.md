@@ -8,7 +8,7 @@ operates at the **slot level**: any slot can be justified, not just epoch bounda
 
 | Term | Meaning |
 |------|---------|
-| **Justified** | A checkpoint backed by ≥2/3 validator votes |
+| **Justified** | A checkpoint backed by >2/3 validator votes |
 | **Finalized** | A checkpoint that can never be reverted |
 | **Source** | The latest justified checkpoint (vote origin) |
 | **Target** | The checkpoint being voted for (vote destination) |
@@ -16,7 +16,7 @@ operates at the **slot level**: any slot can be justified, not just epoch bounda
 
 ## Justification via Supermajority
 
-A checkpoint becomes **justified** when ≥2/3 of validators attest to it as a target:
+A checkpoint becomes **justified** when >2/3 of validators attest to it as a target:
 
 ```text
                    JUSTIFICATION
@@ -46,6 +46,7 @@ The threshold is computed as: `3 × vote_count ≥ 2 × validator_count`
 Attestations must also pass validity checks before they count:
 - Source checkpoint must already be justified
 - Target must not already be justified
+- Neither source nor target may have a zero-hash root
 - Source slot < Target slot (time flows forward)
 - Both checkpoints must reference known blocks
 - Target slot must be **justifiable** per the 3SF-mini schedule (see below)
@@ -86,7 +87,7 @@ Visualizing the first 40 slots after finalization (✓ = justifiable):
 
     delta: 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
            ·  ·  ·  ·  ✓  ·  ·  ·  ·  ✓  ·  ·  ·  ·  ·  ✓  ·  ·  ·  ·
-                       5²             5×6                6²=6×6
+                       5²             5×6                6²
 ```
 
 | delta | Rule | Formula | Gap since previous |
@@ -99,7 +100,7 @@ Visualizing the first 40 slots after finalization (✓ = justifiable):
 | 20    | 3    | 4×5     | 4  |
 | 25    | 2    | 5²      | 5  |
 | 30    | 3    | 5×6     | 5  |
-| 36    | 2+3  | 6²=6×6  | 6  |
+| 36    | 2    | 6²      | 6  |
 
 **Key property:** Gaps between justifiable slots grow, but never become infinite.
 As more time passes since finalization, the network gets progressively wider windows
