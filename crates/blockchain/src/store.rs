@@ -314,12 +314,18 @@ fn on_attestation(
 
 /// Process a new block and update the forkchoice state.
 ///
-/// This method integrates a block into the forkchoice store by:
-/// 1. Validating the block's parent exists
-/// 2. Computing the post-state via the state transition function
-/// 3. Processing attestations included in the block body (on-chain)
-/// 4. Updating the forkchoice head
-/// 5. Processing the proposer's attestation (as if gossiped)
+/// This method integrates a block into the forkchoice store in two phases:
+///
+/// **Phase 1 — Validation (read-only):**
+/// 1. Verifying the block's parent state exists
+/// 2. Validating cryptographic signatures (when enabled)
+/// 3. Computing the post-state via the state transition function
+///
+/// **Phase 2 — Mutations (only if all validation passes):**
+/// 4. Storing the block, state, and updating checkpoints
+/// 5. Processing block body attestations into fork choice (best-effort)
+/// 6. Updating the forkchoice head
+/// 7. Processing the proposer's attestation (as pending)
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
@@ -349,8 +355,6 @@ pub fn on_block(
             })?;
 
     // Validate cryptographic signatures
-    // TODO: extract signature verification to a pre-checks function
-    // to avoid the need for this
     if cfg!(not(feature = "skip-signature-verification")) {
         verify_signatures(&parent_state, &signed_block)?;
     }
@@ -362,6 +366,8 @@ pub fn on_block(
     // Cache the state root in the latest block header
     let state_root = block.state_root;
     post_state.latest_block_header.state_root = state_root;
+
+    // === Store mutations (only reached if all validation passes) ===
 
     // Update justified/finalized checkpoints if they have higher slots
     let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
@@ -381,9 +387,6 @@ pub fn on_block(
     let aggregated_attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
-    // Process block body attestations.
-    // TODO: fail the block if an attestation is invalid. Right now we
-    // just log a warning.
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
@@ -391,15 +394,17 @@ pub fn on_block(
         let validator_ids = aggregation_bits_to_validator_indices(&att.aggregation_bits);
 
         for validator_id in validator_ids {
-            // Update Proof Map - Store the proof so future block builders can reuse this aggregation
+            // Store the proof so future block builders can reuse this aggregation
             store.insert_aggregated_payload(&att.data, validator_id, proof.clone());
 
-            // Update Fork Choice - Register the vote immediately (historical/on-chain)
+            // Register the vote immediately (historical/on-chain)
             let attestation = Attestation {
                 validator_id,
                 data: att.data.clone(),
             };
-            // TODO: validate attestations before processing
+            // Block body attestations may contain stale data (e.g., source advancing
+            // past target during justification changes). Invalid attestations are
+            // skipped rather than rejecting the block.
             let _ = on_attestation(store, attestation, true)
                 .inspect(|_| metrics::inc_attestations_valid("block"))
                 .inspect_err(|err| {
@@ -430,8 +435,10 @@ pub fn on_block(
         );
     }
 
-    // Process proposer attestation (enters "new" stage, not "known")
-    // TODO: validate attestations before processing
+    // Process proposer attestation (enters "new" stage, not "known").
+    // Like block body attestations, the proposer's vote may become stale if
+    // justification advances during state transition, so errors are logged
+    // rather than rejecting the block.
     let _ = on_attestation(store, proposer_attestation, false)
         .inspect(|_| metrics::inc_attestations_valid("gossip"))
         .inspect_err(|err| {
