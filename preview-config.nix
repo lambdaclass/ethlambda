@@ -1,5 +1,5 @@
 # NixOS configuration for ethlambda preview containers (4-node devnet)
-# Copy this file to the root of your repo as preview-config.nix and adapt it.
+# Used by tekton's preview.sh to build a NixOS container for PR previews.
 # Built by: tekton's preview.sh using nix build --impure --expr
 #
 # system.build.previewMeta  -- read by tekton before container start (routing, services, DB)
@@ -159,21 +159,7 @@ in
         source /etc/preview.env
         set +a
 
-        SECRETS_FILE="/home/preview/.devnet-secrets.env"
-
-        # Generate stable per-preview secrets on first run.
-        if [ ! -f "$SECRETS_FILE" ]; then
-          echo "Generating preview secrets..."
-          {
-            echo "RUST_LOG=info"
-          } > "$SECRETS_FILE"
-          chmod 600 "$SECRETS_FILE"
-        fi
-
-        set -a
-        source "$SECRETS_FILE"
-        source /etc/preview.env
-        set +a
+        export RUST_LOG=info
 
         # On container restart, skip setup if already built and genesis exists.
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
@@ -185,6 +171,7 @@ in
           exit 0
         fi
         rm -f /tmp/force-rebuild
+        rm -rf "${genesisDir}"
 
         # ── 1. Clone ethlambda ──
         PREVIEW_TOKEN=$(cat /etc/preview-token 2>/dev/null || echo "")
