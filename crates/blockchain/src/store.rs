@@ -473,7 +473,9 @@ fn on_block_core(
         );
     }
 
-    // Process proposer attestation (enters "new" stage, not "known")
+    // Process proposer attestation as if received via gossip
+    // The proposer's attestation should NOT affect this block's fork choice position.
+    // It is treated as pending until interval 3 (end of slot).
     // TODO: validate attestations before processing
     let _ = on_attestation(store, proposer_attestation, false)
         .inspect(|_| metrics::inc_attestations_valid("gossip"))
