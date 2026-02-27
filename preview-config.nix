@@ -9,6 +9,11 @@
 # Each node runs as a separate systemd service with its own QUIC port, metrics
 # endpoint, and RocksDB data directory.
 #
+# The ethlambda binary and lean-quickstart source are fetched and built at Nix
+# eval time on the tekton host (via builtins.getFlake and builtins.fetchGit).
+# This eliminates runtime network dependencies for git/nix operations; the
+# container only needs network access for Podman image pulls during genesis.
+#
 # Ports:
 #   QUIC (P2P):    9001-9004 (UDP)
 #   Metrics/RPC:   8081-8084 (TCP)  -- serves /lean/v0/* API and /metrics
@@ -22,7 +27,7 @@
 
 let
   meta = {
-    # Oneshot service that clones, builds, and generates genesis.
+    # Oneshot service that generates genesis (binary is pre-built at nix eval time).
     setupService = "setup-devnet";
 
     # Long-running ethlambda node services started after setup completes.
@@ -54,14 +59,30 @@ let
     extraHosts = [];
   };
 
+  # ── Build-time fetches (run on tekton host at Nix eval time) ──────────
+  # builtins.getFlake and builtins.getEnv require --impure, which tekton's
+  # preview.sh already passes. PREVIEW_BRANCH must be exported in the host
+  # shell before running nix build (tekton sets this from the PR metadata).
+
+  # Fetch + build ethlambda from the PR branch's flake.nix (crane + rust-overlay).
+  previewBranch = let b = builtins.getEnv "PREVIEW_BRANCH"; in
+    if b == "" then "tekton-integration" else b;
+  ethlambdaFlake = builtins.getFlake "github:lambdaclass/ethlambda/${previewBranch}";
+  ethlambdaBin = ethlambdaFlake.packages.x86_64-linux.default;
+
+  # Fetch lean-quickstart genesis scripts (public repo, no auth needed).
+  quickstartSrc = builtins.fetchGit {
+    url = "https://github.com/blockblaz/lean-quickstart";
+    ref = "main";
+  };
+
   # Paths used throughout the config
-  appDir = "/home/preview/app";
-  quickstartDir = "/home/preview/lean-quickstart";
   genesisDir = "/home/preview/devnet/genesis";
   dataDir = "/home/preview/devnet/data";
 
-  # nix build produces result/bin/ethlambda via the repo's flake.nix
-  binaryPath = "${appDir}/result/bin/ethlambda";
+  # Binary is in the nix store; quickstart source is a nix store path.
+  binaryPath = "${ethlambdaBin}/bin/ethlambda";
+  quickstartDir = "${quickstartSrc}";
 
   # Helper: create a systemd service for ethlambda node N
   mkNodeService = idx:
@@ -122,22 +143,18 @@ in
     dockerCompat = true;
   };
 
-  # Nix: enable flakes for 'nix build' from the repo's flake.nix
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
-
   # ── Setup service ─────────────────────────────────────────────────────
-  # Clones the repo, builds ethlambda via nix build (using the repo's
-  # flake.nix for exact Rust version and reproducible builds), generates
-  # genesis for a 4-node ethlambda-only devnet, and creates per-node
-  # data directories.
+  # Generates genesis for a 4-node ethlambda-only devnet and creates
+  # per-node data directories. The ethlambda binary and lean-quickstart
+  # source are already in the nix store (fetched at build time on the host).
   systemd.services = {
     setup-devnet = {
-      description = "Setup ethlambda 4-node devnet (clone, build, genesis)";
+      description = "Setup ethlambda 4-node devnet (genesis generation)";
       after = [ "systemd-resolved.service" "network-online.target" ];
       wants = [ "systemd-resolved.service" "network-online.target" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
-        bash coreutils git nix
+        bash coreutils
         # Genesis generation (generate-genesis.sh needs these)
         yq-go podman
         gawk gnugrep gnused which
@@ -148,7 +165,7 @@ in
         User = "preview";
         Group = "preview";
         WorkingDirectory = "/home/preview";
-        TimeoutStartSec = "900"; # nix build fetches deps + compiles Rust
+        TimeoutStartSec = "300"; # genesis generation + podman image pulls
       };
       script = ''
         set -euo pipefail
@@ -164,26 +181,10 @@ in
 
         export RUST_LOG=info
 
-        # ── Wait for DNS resolution ──
-        # DNS may not be available immediately at service start (e.g. network
-        # not yet routable, resolved still configuring upstream servers).
-        # Poll until github.com resolves (max ~30s).
-        for i in $(seq 1 30); do
-          if getent hosts github.com >/dev/null 2>&1; then
-            break
-          fi
-          echo "Waiting for DNS resolution... ($i/30)"
-          sleep 1
-        done
-        if ! getent hosts github.com >/dev/null 2>&1; then
-          echo "ERROR: DNS resolution failed after 30s"
-          exit 1
-        fi
-
-        # On container restart, skip setup if already built and genesis exists.
+        # On container restart, skip setup if genesis already exists.
+        # The binary is always present (built into the nix store at host build time).
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
-        if [ -f "${binaryPath}" ] \
-           && [ -d "${genesisDir}/hash-sig-keys" ] \
+        if [ -d "${genesisDir}/hash-sig-keys" ] \
            && [ -f "${genesisDir}/config.yaml" ] \
            && [ ! -f /tmp/force-rebuild ]; then
           echo "Devnet already set up, skipping (container restart)."
@@ -192,41 +193,7 @@ in
         rm -f /tmp/force-rebuild
         rm -rf "${genesisDir}"
 
-        # ── 1. Clone ethlambda ──
-        PREVIEW_TOKEN=$(cat /etc/preview-token 2>/dev/null || echo "")
-        AUTHED_URL=$(echo "$PREVIEW_REPO_URL" | sed "s|https://|https://x-access-token:$PREVIEW_TOKEN@|")
-
-        if [ -d "${appDir}/.git" ]; then
-          echo "Updating ethlambda repo..."
-          ${pkgs.git}/bin/git -C "${appDir}" remote set-url origin "$AUTHED_URL"
-          ${pkgs.git}/bin/git -C "${appDir}" fetch origin
-          ${pkgs.git}/bin/git -C "${appDir}" reset --hard "origin/$PREVIEW_BRANCH"
-        else
-          echo "Cloning ethlambda (branch: $PREVIEW_BRANCH)..."
-          ${pkgs.git}/bin/git clone --depth 1 --branch "$PREVIEW_BRANCH" --single-branch "$AUTHED_URL" "${appDir}"
-        fi
-
-        # ── 2. Build ethlambda ──
-        # Uses the repo's flake.nix which pins the exact Rust version (1.92.0)
-        # and handles all build dependencies via crane + rust-overlay.
-        echo "Building ethlambda with nix build..."
-        cd "${appDir}"
-        nix build 2>&1
-
-        if [ ! -f "${binaryPath}" ]; then
-          echo "ERROR: Binary not found at ${binaryPath} after build"
-          exit 1
-        fi
-        echo "Build complete: $(readlink -f ${appDir}/result)"
-
-        # ── 3. Clone lean-quickstart (for genesis generation scripts) ──
-        if [ ! -d "${quickstartDir}/.git" ]; then
-          echo "Cloning lean-quickstart..."
-          ${pkgs.git}/bin/git clone --depth 1 --single-branch \
-            https://github.com/blockblaz/lean-quickstart.git "${quickstartDir}"
-        fi
-
-        # ── 4. Write 4-node ethlambda-only validator config ──
+        # ── 1. Write 4-node ethlambda-only validator config ──
         # Four ethlambda nodes, each with 1 validator, on localhost with
         # unique QUIC and metrics ports. Private keys are secp256k1 keys
         # for P2P identity (reused from the standard devnet config).
@@ -272,7 +239,7 @@ validators:
     count: 1
 VCEOF
 
-        # ── 5. Generate genesis ──
+        # ── 2. Generate genesis ──
         # Runs lean-quickstart's genesis generator which uses container images to:
         #   1. Generate XMSS key pairs (hash-sig-cli)
         #   2. Generate genesis state (eth-beacon-genesis)
@@ -291,7 +258,7 @@ VCEOF
           fi
         done
 
-        # ── 6. Create per-node data directories ──
+        # ── 3. Create per-node data directories ──
         for i in 0 1 2 3; do
           mkdir -p "${dataDir}/ethlambda_$i"
         done
@@ -330,7 +297,6 @@ VCEOF
   environment.etc."preview-meta.json".text = builtins.toJSON meta;
 
   environment.systemPackages = with pkgs; [
-    git
     curl
     jq
     yq-go
