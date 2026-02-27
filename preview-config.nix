@@ -14,10 +14,10 @@
 #   Metrics/RPC:   8081-8084 (TCP)  -- serves /lean/v0/* API and /metrics
 #
 # Prerequisites:
-#   - Docker (or podman with dockerCompat) for genesis generation tools:
+#   - Podman (rootless, with dockerCompat) for genesis generation tools:
 #     hash-sig-cli (XMSS key generation) and eth-beacon-genesis (genesis state)
-#   - If Docker is unavailable in the container, replace virtualisation.docker
-#     with: virtualisation.podman = { enable = true; dockerCompat = true; };
+#   - Podman rootless uses user namespaces instead of cgroup BPF, so it works
+#     inside systemd-nspawn containers where Docker's cgroup device access fails.
 { config, lib, pkgs, ... }:
 
 let
@@ -115,10 +115,12 @@ in
   networking.firewall.allowedTCPPorts = [ 8081 8082 8083 8084 ];
   networking.firewall.allowedUDPPorts = [ 9001 9002 9003 9004 ];
 
-  # Docker for genesis generation (hash-sig-cli, eth-beacon-genesis).
-  # Requires cgroup delegation from the host for systemd-nspawn containers.
-  # Alternative: virtualisation.podman = { enable = true; dockerCompat = true; };
-  virtualisation.docker.enable = true;
+  # Podman (rootless) for genesis generation (hash-sig-cli, eth-beacon-genesis).
+  # dockerCompat provides a `docker` CLI alias so generate-genesis.sh works unmodified.
+  virtualisation.podman = {
+    enable = true;
+    dockerCompat = true;
+  };
 
   # Nix: enable flakes for 'nix build' from the repo's flake.nix
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
@@ -131,13 +133,13 @@ in
   systemd.services = {
     setup-devnet = {
       description = "Setup ethlambda 4-node devnet (clone, build, genesis)";
-      after = [ "systemd-resolved.service" "docker.service" ];
-      wants = [ "systemd-resolved.service" "docker.service" ];
+      after = [ "systemd-resolved.service" ];
+      wants = [ "systemd-resolved.service" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
         bash coreutils git nix
         # Genesis generation (generate-genesis.sh needs these)
-        yq-go docker
+        yq-go podman
         gawk gnugrep gnused which
       ];
       serviceConfig = {
@@ -255,7 +257,7 @@ validators:
 VCEOF
 
         # ── 5. Generate genesis ──
-        # Runs lean-quickstart's genesis generator which uses Docker to:
+        # Runs lean-quickstart's genesis generator which uses container images to:
         #   1. Generate XMSS key pairs (hash-sig-cli)
         #   2. Generate genesis state (eth-beacon-genesis)
         # Output: config.yaml, validators.yaml, nodes.yaml, genesis.json,
@@ -289,7 +291,7 @@ VCEOF
     home = "/home/preview";
     group = "preview";
     shell = pkgs.bash;
-    extraGroups = [ "docker" ]; # Needed for genesis generation via Docker
+    extraGroups = []; # Podman rootless needs no special groups
   };
 
   users.groups.preview = {};
@@ -317,7 +319,7 @@ VCEOF
     jq
     yq-go
     htop     # Useful for debugging resource usage
-    docker   # For genesis tool access via SSH
+    podman   # For genesis tool access via SSH
   ];
 
   system.stateVersion = "24.11";
