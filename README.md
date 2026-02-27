@@ -86,17 +86,17 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
-### pq-devnet-2
-
-Support for the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md) will be ending soon (see ["older devnets"](#older-devnets)). A Docker tag `devnet2` is currently available for this version.
-
 ### pq-devnet-3
 
-We are working on adding support for the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` will be published for this version.
+We are running the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` is available for this version.
+
+### pq-devnet-4
+
+We are working on adding support for the [pq-devnet-4 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-4.md). A Docker tag `devnet4` will be published for this version.
 
 ### Older devnets
 
-Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`).
+Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`, `devnet3`).
 
 Support for older devnet releases is discontinued when the next devnet version is released.
 
