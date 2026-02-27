@@ -50,8 +50,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let signed_block: SignedBlockWithAttestation = test.signed_block_with_attestation.into();
 
         // Advance time to the block's slot
-        let block_time = signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
-        store::on_tick(&mut st, block_time, true);
+        let block_time_ms =
+            (signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time) * 1000;
+        store::on_tick(&mut st, block_time_ms, true, false);
 
         // Process the block (this includes signature verification)
         let result = store::on_block(&mut st, signed_block);
@@ -87,6 +88,6 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
 datatest_stable::harness!({
     test = run,
-    root = "../../../ethlambda/leanSpec/fixtures/consensus/verify_signatures",
+    root = "../../leanSpec/fixtures/consensus/verify_signatures",
     pattern = r".*\.json"
 });

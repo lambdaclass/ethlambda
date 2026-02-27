@@ -102,6 +102,13 @@ impl AggregatedSignatureProof {
             proof_data: ByteList::empty(),
         }
     }
+
+    /// Returns the validator indices that are set in the participants bitfield.
+    pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.participants.len())
+            .filter(|&i| self.participants.get(i).unwrap_or(false))
+            .map(|i| i as u64)
+    }
 }
 
 /// Bundle containing a block and the proposer's attestation.
