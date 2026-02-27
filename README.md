@@ -104,9 +104,10 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [pq-devnet-3 support](https://github.com/lambdaclass/ethlambda/issues/73)
-- [Fetching of unknown blocks referenced by attestations](https://github.com/lambdaclass/ethlambda/issues/91)
-- [Discarding blocks with invalid signatures](https://github.com/lambdaclass/ethlambda/issues/78)
+- [Add support for pq-devnet-4](https://github.com/lambdaclass/ethlambda/issues/155)
+- [Use spawned for our P2P event loop](https://github.com/lambdaclass/ethlambda/issues/165)
+- [Prune finalized states and old blocks](https://github.com/lambdaclass/ethlambda/issues/166)
 - [Non-finalization hardening: bound memory usage during long periods of non-finalization](https://github.com/lambdaclass/ethlambda/issues/103)
 - [Observability: more metrics from leanMetrics](https://github.com/lambdaclass/ethlambda/issues/76)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
+- [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
