@@ -921,6 +921,13 @@ impl Store {
 
     // ============ Derived Accessors ============
 
+    /// Returns the slot of the current head block.
+    pub fn head_slot(&self) -> u64 {
+        self.get_block_header(&self.head())
+            .expect("head block exists")
+            .slot
+    }
+
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
         self.get_block_header(&self.safe_target())
