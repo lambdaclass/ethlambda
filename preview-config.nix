@@ -303,6 +303,8 @@ VCEOF
     extraGroups = [ "docker" ]; # Needed for genesis generation via Docker
   };
 
+  users.groups.preview = {};
+
   # SSH access for debugging (key-only, no passwords)
   services.openssh = {
     enable = true;
