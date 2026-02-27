@@ -286,6 +286,7 @@ VCEOF
   users.users.preview = {
     isNormalUser = true;
     home = "/home/preview";
+    group = "preview";
     shell = pkgs.bash;
     extraGroups = [ "docker" ]; # Needed for genesis generation via Docker
   };
