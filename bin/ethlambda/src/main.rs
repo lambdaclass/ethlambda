@@ -134,6 +134,7 @@ async fn main() -> eyre::Result<()> {
         store.clone(),
         first_validator_id,
         options.attestation_committee_count,
+        options.is_aggregator,
     ));
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
@@ -143,8 +144,8 @@ async fn main() -> eyre::Result<()> {
     info!("Node initialized");
 
     tokio::select! {
-        _ = p2p_handle => {
-            panic!("P2P node task has exited unexpectedly");
+        result = p2p_handle => {
+            panic!("P2P node task has exited unexpectedly: {result:?}");
         }
         _ = tokio::signal::ctrl_c() => {
             // Ctrl-C received, shutting down
