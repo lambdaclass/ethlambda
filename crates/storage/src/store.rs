@@ -371,7 +371,7 @@ impl Store {
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            self.prune_live_chain(finalized.slot);
+            let pruned_chain = self.prune_live_chain(finalized.slot);
 
             // Prune signatures, payloads, and attestation data for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
@@ -381,10 +381,10 @@ impl Store {
                 Table::LatestKnownAggregatedPayloads,
                 finalized.slot,
             );
-            if pruned_sigs > 0 || pruned_att_data > 0 {
+            if pruned_chain > 0 || pruned_sigs > 0 || pruned_att_data > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_sigs, pruned_att_data, "Pruned finalized signatures"
+                    pruned_chain, pruned_sigs, pruned_att_data, "Pruned finalized data"
                 );
             }
         }
@@ -428,7 +428,9 @@ impl Store {
     ///
     /// Blocks/states are retained for historical queries, only the
     /// LiveChain index is pruned.
-    pub fn prune_live_chain(&mut self, finalized_slot: u64) {
+    ///
+    /// Returns the number of entries pruned.
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> usize {
         let view = self.backend.begin_read().expect("read view");
 
         // Collect keys to delete - stop once we hit finalized_slot
@@ -445,8 +447,9 @@ impl Store {
             .collect();
         drop(view);
 
-        if keys_to_delete.is_empty() {
-            return;
+        let count = keys_to_delete.len();
+        if count == 0 {
+            return 0;
         }
 
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -454,6 +457,7 @@ impl Store {
             .delete_batch(Table::LiveChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
+        count
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
