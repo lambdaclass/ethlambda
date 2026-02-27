@@ -66,6 +66,7 @@ pub async fn start_p2p(
     store: Store,
     validator_id: Option<u64>,
     attestation_committee_count: u64,
+    is_aggregator: bool,
 ) {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
@@ -176,22 +177,30 @@ pub async fn start_p2p(
         .subscribe(&aggregation_topic)
         .unwrap();
 
-    // Subscribe to attestation subnet topic (validators subscribe to their committee's subnet)
+    // Build attestation subnet topic (needed for publishing even without subscribing)
     // attestation_committee_count is validated to be >= 1 by clap at CLI parse time.
     let subnet_id = validator_id.map(|vid| vid % attestation_committee_count);
     let attestation_topic_kind = match subnet_id {
         Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
-        // Non-validators subscribe to subnet 0 to receive attestations
+        // Non-validators use subnet 0 for publishing
         None => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_0"),
     };
     let attestation_topic_str =
         format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
     let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&attestation_topic)
-        .unwrap();
+
+    // Only aggregators subscribe to attestation subnets; non-aggregators
+    // publish via gossipsub's fanout mechanism without subscribing.
+    if is_aggregator {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&attestation_topic)
+            .unwrap();
+        info!(%attestation_topic_kind, "Subscribed to attestation subnet");
+    } else {
+        info!(%attestation_topic_kind, "Skipping attestation subnet subscription (not an aggregator)");
+    }
 
     info!(socket=%listening_socket, "P2P node started");
 
