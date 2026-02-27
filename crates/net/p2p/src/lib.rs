@@ -67,7 +67,7 @@ pub async fn start_p2p(
     validator_id: Option<u64>,
     attestation_committee_count: u64,
     is_aggregator: bool,
-) {
+) -> Result<(), libp2p::gossipsub::SubscriptionError> {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -195,11 +195,8 @@ pub async fn start_p2p(
         swarm
             .behaviour_mut()
             .gossipsub
-            .subscribe(&attestation_topic)
-            .unwrap();
+            .subscribe(&attestation_topic)?;
         info!(%attestation_topic_kind, "Subscribed to attestation subnet");
-    } else {
-        info!(%attestation_topic_kind, "Skipping attestation subnet subscription (not an aggregator)");
     }
 
     info!(socket=%listening_socket, "P2P node started");
@@ -223,6 +220,7 @@ pub async fn start_p2p(
     };
 
     event_loop(server).await;
+    Ok(())
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours

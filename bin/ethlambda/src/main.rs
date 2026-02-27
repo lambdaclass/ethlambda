@@ -144,8 +144,8 @@ async fn main() -> eyre::Result<()> {
     info!("Node initialized");
 
     tokio::select! {
-        _ = p2p_handle => {
-            panic!("P2P node task has exited unexpectedly");
+        result = p2p_handle => {
+            panic!("P2P node task has exited unexpectedly: {result:?}");
         }
         _ = tokio::signal::ctrl_c() => {
             // Ctrl-C received, shutting down
