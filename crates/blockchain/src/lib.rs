@@ -477,7 +477,11 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, self.is_aggregator)
+        if !self.is_aggregator {
+            warn!("Received unaggregated attestation but node is not an aggregator");
+            return;
+        }
+        let _ = store::on_gossip_attestation(&mut self.store, attestation)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 

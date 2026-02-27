@@ -337,42 +337,13 @@ pub fn on_tick(
     new_aggregates
 }
 
-/// Process a gossiped attestation (with signature verification).
+/// Process a gossiped attestation with signature verification.
 ///
-/// This is the safe default: it always verifies the validator's XMSS signature
-/// and stores it for future block building.
+/// Verifies the validator's XMSS signature and stores it for later aggregation
+/// at interval 2. Only aggregator nodes receive unaggregated gossip attestations.
 pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: SignedAttestation,
-    is_aggregator: bool,
-) -> Result<(), StoreError> {
-    on_gossip_attestation_core(store, signed_attestation, true, is_aggregator)
-}
-
-/// Process a gossiped attestation without signature verification.
-///
-/// This skips all cryptographic checks and signature storage. Use only in tests
-/// where signatures are absent or irrelevant.
-pub fn on_gossip_attestation_without_verification(
-    store: &mut Store,
-    signed_attestation: SignedAttestation,
-) -> Result<(), StoreError> {
-    on_gossip_attestation_core(store, signed_attestation, false, false)
-}
-
-/// Core gossip attestation processing logic.
-///
-/// When `verify` is true, the validator's XMSS signature is checked and stored
-/// for future block building. When false, all signature checks are skipped and
-/// a dummy proof is inserted so the fork choice pipeline still sees attestations.
-///
-/// When `is_aggregator` is true (and `verify` is true), the gossip signature is
-/// stored for later aggregation at interval 2.
-fn on_gossip_attestation_core(
-    store: &mut Store,
-    signed_attestation: SignedAttestation,
-    verify: bool,
-    is_aggregator: bool,
 ) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
@@ -384,48 +355,30 @@ fn on_gossip_attestation_core(
 
     let data_root = attestation.data.tree_hash_root();
 
-    if verify {
-        let target = attestation.data.target;
-        let target_state = store
-            .get_state(&target.root)
-            .ok_or(StoreError::MissingTargetState(target.root))?;
-        if validator_id >= target_state.validators.len() as u64 {
-            return Err(StoreError::InvalidValidatorIndex);
-        }
-        let validator_pubkey = target_state.validators[validator_id as usize]
-            .get_pubkey()
-            .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+    let target = attestation.data.target;
+    let target_state = store
+        .get_state(&target.root)
+        .ok_or(StoreError::MissingTargetState(target.root))?;
+    if validator_id >= target_state.validators.len() as u64 {
+        return Err(StoreError::InvalidValidatorIndex);
+    }
+    let validator_pubkey = target_state.validators[validator_id as usize]
+        .get_pubkey()
+        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
-        // Verify the validator's XMSS signature
-        let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        if !signature.is_valid(&validator_pubkey, epoch, &data_root) {
-            return Err(StoreError::SignatureVerificationFailed);
-        }
+    // Verify the validator's XMSS signature
+    let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+    let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+        .map_err(|_| StoreError::SignatureDecodingFailed)?;
+    if !signature.is_valid(&validator_pubkey, epoch, &data_root) {
+        return Err(StoreError::SignatureVerificationFailed);
     }
 
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
-    if !verify {
-        // Without signature verification, insert directly into new aggregated payloads
-        // with a dummy proof so the fork choice pipeline still sees attestations.
-        let participants = aggregation_bits_from_validator_indices(&[validator_id]);
-        let payload = StoredAggregatedPayload {
-            slot: attestation.data.slot,
-            proof: AggregatedSignatureProof::empty(participants),
-        };
-        store.insert_new_aggregated_payload((validator_id, data_root), payload);
-    } else if is_aggregator {
-        // With verification, store gossip signature for later aggregation at interval 2.
-        // With ATTESTATION_COMMITTEE_COUNT=1, all validators are in the same subnet.
-        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-            .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(&attestation.data, validator_id, signature);
-    } else {
-        on_attestation(store, attestation.clone(), false)?;
-    }
+    // Store gossip signature for later aggregation at interval 2.
+    store.insert_gossip_signature(&attestation.data, validator_id, signature);
 
     metrics::inc_attestations_valid("gossip");
 
