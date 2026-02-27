@@ -196,54 +196,7 @@ pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: SignedAttestation,
 ) -> Result<(), StoreError> {
-    let validator_id = signed_attestation.validator_id;
-    let attestation = Attestation {
-        validator_id,
-        data: signed_attestation.message,
-    };
-    validate_attestation(store, &attestation)
-        .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
-    let target = attestation.data.target;
-    let target_state = store
-        .get_state(&target.root)
-        .ok_or(StoreError::MissingTargetState(target.root))?;
-    if validator_id >= target_state.validators.len() as u64 {
-        return Err(StoreError::InvalidValidatorIndex);
-    }
-    let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
-    let message = attestation.data.tree_hash_root();
-
-    // Verify the validator's XMSS signature
-    let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-    let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
-        .map_err(|_| StoreError::SignatureDecodingFailed)?;
-    if !signature.is_valid(&validator_pubkey, epoch, &message) {
-        return Err(StoreError::SignatureVerificationFailed);
-    }
-
-    on_attestation(store, attestation.clone(), false)?;
-
-    // Store signature for later lookup during block building
-    store.insert_gossip_signature(&attestation.data, validator_id, signature);
-
-    metrics::inc_attestations_valid("gossip");
-
-    let slot = attestation.data.slot;
-    let target_slot = attestation.data.target.slot;
-    let source_slot = attestation.data.source.slot;
-    info!(
-        slot,
-        validator = validator_id,
-        target_slot,
-        target_root = %ShortRoot(&attestation.data.target.root.0),
-        source_slot,
-        source_root = %ShortRoot(&attestation.data.source.root.0),
-        "Attestation processed"
-    );
-
-    Ok(())
+    on_gossip_attestation_core(store, signed_attestation, true)
 }
 
 /// Process a gossiped attestation without signature verification.
@@ -254,6 +207,18 @@ pub fn on_gossip_attestation_without_verification(
     store: &mut Store,
     signed_attestation: SignedAttestation,
 ) -> Result<(), StoreError> {
+    on_gossip_attestation_core(store, signed_attestation, false)
+}
+
+/// Core gossip attestation processing logic.
+///
+/// When `verify` is true, the validator's XMSS signature is checked and stored
+/// for future block building. When false, all signature checks are skipped.
+fn on_gossip_attestation_core(
+    store: &mut Store,
+    signed_attestation: SignedAttestation,
+    verify: bool,
+) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
         validator_id,
@@ -262,7 +227,34 @@ pub fn on_gossip_attestation_without_verification(
     validate_attestation(store, &attestation)
         .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
 
-    on_attestation(store, attestation.clone(), false)?;
+    if verify {
+        let target = attestation.data.target;
+        let target_state = store
+            .get_state(&target.root)
+            .ok_or(StoreError::MissingTargetState(target.root))?;
+        if validator_id >= target_state.validators.len() as u64 {
+            return Err(StoreError::InvalidValidatorIndex);
+        }
+        let validator_pubkey = target_state.validators[validator_id as usize]
+            .get_pubkey()
+            .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+        let message = attestation.data.tree_hash_root();
+
+        // Verify the validator's XMSS signature
+        let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+        let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+            .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        if !signature.is_valid(&validator_pubkey, epoch, &message) {
+            return Err(StoreError::SignatureVerificationFailed);
+        }
+
+        on_attestation(store, attestation.clone(), false)?;
+
+        // Store signature for later lookup during block building
+        store.insert_gossip_signature(&attestation.data, validator_id, signature);
+    } else {
+        on_attestation(store, attestation.clone(), false)?;
+    }
 
     metrics::inc_attestations_valid("gossip");
 
@@ -351,52 +343,11 @@ fn on_attestation(
 ///
 /// This is the safe default: it always verifies cryptographic signatures
 /// and stores them for future block building. Use this for all production paths.
-///
-/// This method integrates a block into the forkchoice store by:
-/// 1. Validating the block's parent exists
-/// 2. Verifying cryptographic signatures
-/// 3. Computing the post-state via the state transition function
-/// 4. Processing attestations included in the block body (on-chain)
-/// 5. Updating the forkchoice head
-/// 6. Processing the proposer's attestation (as if gossiped)
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
-    let _timing = metrics::time_fork_choice_block_processing();
-
-    let block = &signed_block.message.block;
-    let block_root = block.tree_hash_root();
-    let slot = block.slot;
-
-    // Skip duplicate blocks (idempotent operation)
-    if store.has_state(&block_root) {
-        return Ok(());
-    }
-
-    // Verify parent state is available
-    let parent_state =
-        store
-            .get_state(&block.parent_root)
-            .ok_or(StoreError::MissingParentState {
-                parent_root: block.parent_root,
-                slot,
-            })?;
-
-    // Validate cryptographic signatures
-    verify_signatures(&parent_state, &signed_block)?;
-
-    // Store the proposer's signature for potential future block building
-    let proposer_attestation = &signed_block.message.proposer_attestation;
-    let proposer_sig = ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-        .map_err(|_| StoreError::SignatureDecodingFailed)?;
-    store.insert_gossip_signature(
-        &proposer_attestation.data,
-        proposer_attestation.validator_id,
-        proposer_sig,
-    );
-
-    on_block_core(store, signed_block, parent_state)
+    on_block_core(store, signed_block, true)
 }
 
 /// Process a new block without signature verification.
@@ -407,6 +358,18 @@ pub fn on_block_without_verification(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
+    on_block_core(store, signed_block, false)
+}
+
+/// Core block processing logic.
+///
+/// When `verify` is true, cryptographic signatures are validated and stored
+/// for future block building. When false, all signature checks are skipped.
+fn on_block_core(
+    store: &mut Store,
+    signed_block: SignedBlockWithAttestation,
+    verify: bool,
+) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
 
     let block = &signed_block.message.block;
@@ -419,6 +382,8 @@ pub fn on_block_without_verification(
     }
 
     // Verify parent state is available
+    // Note: Parent block existence is checked by the caller before calling this function.
+    // This check ensures the state has been computed for the parent block.
     let parent_state =
         store
             .get_state(&block.parent_root)
@@ -427,17 +392,22 @@ pub fn on_block_without_verification(
                 slot,
             })?;
 
-    on_block_core(store, signed_block, parent_state)
-}
+    if verify {
+        // Validate cryptographic signatures
+        verify_signatures(&parent_state, &signed_block)?;
 
-/// Shared block processing logic used by both `on_block()` and `on_block_without_verification()`.
-///
-/// Takes `parent_state` by value to avoid cloning (the caller already fetched it).
-fn on_block_core(
-    store: &mut Store,
-    signed_block: SignedBlockWithAttestation,
-    parent_state: State,
-) -> Result<(), StoreError> {
+        // Store the proposer's signature for potential future block building
+        let proposer_attestation = &signed_block.message.proposer_attestation;
+        let proposer_sig =
+            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        store.insert_gossip_signature(
+            &proposer_attestation.data,
+            proposer_attestation.validator_id,
+            proposer_sig,
+        );
+    }
+
     let block = signed_block.message.block.clone();
     let proposer_attestation = signed_block.message.proposer_attestation.clone();
     let block_root = block.tree_hash_root();

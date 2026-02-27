@@ -72,6 +72,10 @@ The Dockerfile accepts build arguments for customizing the build:
 
 Example with custom args:
 
+```bash
+docker build --build-arg BUILD_PROFILE=debug -t ethlambda:debug .
+```
+
 `GIT_COMMIT` and `GIT_BRANCH` are also available but set automatically by CI.
 When building locally, `vergen-git2` extracts them from the local Git repo at
 build time.
