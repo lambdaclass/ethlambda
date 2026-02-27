@@ -133,8 +133,8 @@ in
   systemd.services = {
     setup-devnet = {
       description = "Setup ethlambda 4-node devnet (clone, build, genesis)";
-      after = [ "systemd-resolved.service" ];
-      wants = [ "systemd-resolved.service" ];
+      after = [ "systemd-resolved.service" "network-online.target" ];
+      wants = [ "systemd-resolved.service" "network-online.target" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
         bash coreutils git nix
@@ -163,6 +163,22 @@ in
         set +a
 
         export RUST_LOG=info
+
+        # ── Wait for DNS resolution ──
+        # DNS may not be available immediately at service start (e.g. network
+        # not yet routable, resolved still configuring upstream servers).
+        # Poll until github.com resolves (max ~30s).
+        for i in $(seq 1 30); do
+          if getent hosts github.com >/dev/null 2>&1; then
+            break
+          fi
+          echo "Waiting for DNS resolution... ($i/30)"
+          sleep 1
+        done
+        if ! getent hosts github.com >/dev/null 2>&1; then
+          echo "ERROR: DNS resolution failed after 30s"
+          exit 1
+        fi
 
         # On container restart, skip setup if already built and genesis exists.
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
