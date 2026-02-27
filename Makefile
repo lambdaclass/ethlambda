@@ -9,10 +9,9 @@ fmt: ## 🎨 Format all code using rustfmt
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
-test: leanSpec/fixtures ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
+test: leanSpec/fixtures ## 🧪 Run all tests
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
 	cargo test --workspace --release
-	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)

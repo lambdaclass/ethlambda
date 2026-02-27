@@ -140,6 +140,8 @@ impl BlockChainServer {
 
         // Update safe target slot metric (updated by store.on_tick at interval 2)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
+        // Update head slot metric (head may change when attestations are promoted at intervals 0/3)
+        metrics::update_head_slot(self.store.head_slot());
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -275,9 +277,8 @@ impl BlockChainServer {
         &mut self,
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
-        let slot = signed_block.message.block.slot;
         store::on_block(&mut self.store, signed_block)?;
-        metrics::update_head_slot(slot);
+        metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
