@@ -303,15 +303,18 @@ VCEOF
     extraGroups = [ "docker" ]; # Needed for genesis generation via Docker
   };
 
-  # SSH access for debugging
+  # SSH access for debugging (key-only, no passwords)
   services.openssh = {
     enable = true;
-    settings.PermitRootLogin = "yes";
+    settings = {
+      PermitRootLogin = "prohibit-password";
+      PasswordAuthentication = false;
+    };
   };
 
-  users.users.root = {
-    password = "changeme";
-  };
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEYfIsBaa3Jr/0Ij7QOwWcLp1I1fnNp86yW0Bzsg4Ylg"
+  ];
 
   # Required: expose meta to tekton before container boot, and inside the container.
   system.build.previewMeta = pkgs.writeText "preview-meta.json" (builtins.toJSON meta);
