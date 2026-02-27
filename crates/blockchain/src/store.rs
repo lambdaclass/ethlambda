@@ -395,17 +395,6 @@ fn on_block_core(
     if verify {
         // Validate cryptographic signatures
         verify_signatures(&parent_state, &signed_block)?;
-
-        // Store the proposer's signature for potential future block building
-        let proposer_attestation = &signed_block.message.proposer_attestation;
-        let proposer_sig =
-            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-                .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(
-            &proposer_attestation.data,
-            proposer_attestation.validator_id,
-            proposer_sig,
-        );
     }
 
     let block = signed_block.message.block.clone();
@@ -471,6 +460,18 @@ fn on_block_core(
     // IMPORTANT: This must happen BEFORE processing proposer attestation
     // to prevent the proposer from gaining circular weight advantage.
     update_head(store);
+
+    if verify {
+        // Store the proposer's signature for potential future block building
+        let proposer_sig =
+            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        store.insert_gossip_signature(
+            &proposer_attestation.data,
+            proposer_attestation.validator_id,
+            proposer_sig,
+        );
+    }
 
     // Process proposer attestation (enters "new" stage, not "known")
     // TODO: validate attestations before processing
