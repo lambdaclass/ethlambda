@@ -136,8 +136,9 @@ in
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
         bash coreutils git nix
-        # Genesis generation
+        # Genesis generation (generate-genesis.sh needs these)
         yq-go docker
+        gawk gnugrep gnused which
       ];
       serviceConfig = {
         Type = "oneshot";
