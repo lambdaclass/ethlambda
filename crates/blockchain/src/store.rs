@@ -337,13 +337,41 @@ pub fn on_tick(
     new_aggregates
 }
 
-/// Process a gossiped attestation.
+/// Process a gossiped attestation (with signature verification).
 ///
-/// Verifies the signature, stores attestation data by root, and (if this node
-/// is an aggregator) stores the gossip signature for later aggregation.
+/// This is the safe default: it always verifies the validator's XMSS signature
+/// and stores it for future block building.
 pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: SignedAttestation,
+    is_aggregator: bool,
+) -> Result<(), StoreError> {
+    on_gossip_attestation_core(store, signed_attestation, true, is_aggregator)
+}
+
+/// Process a gossiped attestation without signature verification.
+///
+/// This skips all cryptographic checks and signature storage. Use only in tests
+/// where signatures are absent or irrelevant.
+pub fn on_gossip_attestation_without_verification(
+    store: &mut Store,
+    signed_attestation: SignedAttestation,
+) -> Result<(), StoreError> {
+    on_gossip_attestation_core(store, signed_attestation, false, false)
+}
+
+/// Core gossip attestation processing logic.
+///
+/// When `verify` is true, the validator's XMSS signature is checked and stored
+/// for future block building. When false, all signature checks are skipped and
+/// a dummy proof is inserted so the fork choice pipeline still sees attestations.
+///
+/// When `is_aggregator` is true (and `verify` is true), the gossip signature is
+/// stored for later aggregation at interval 2.
+fn on_gossip_attestation_core(
+    store: &mut Store,
+    signed_attestation: SignedAttestation,
+    verify: bool,
     is_aggregator: bool,
 ) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
@@ -354,19 +382,21 @@ pub fn on_gossip_attestation(
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
 
-    let target = attestation.data.target;
-    let target_state = store
-        .get_state(&target.root)
-        .ok_or(StoreError::MissingTargetState(target.root))?;
-    if validator_id >= target_state.validators.len() as u64 {
-        return Err(StoreError::InvalidValidatorIndex);
-    }
-    let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
     let data_root = attestation.data.tree_hash_root();
-    if cfg!(not(feature = "skip-signature-verification")) {
-        use ethlambda_types::signature::ValidatorSignature;
+
+    if verify {
+        let target = attestation.data.target;
+        let target_state = store
+            .get_state(&target.root)
+            .ok_or(StoreError::MissingTargetState(target.root))?;
+        if validator_id >= target_state.validators.len() as u64 {
+            return Err(StoreError::InvalidValidatorIndex);
+        }
+        let validator_pubkey = target_state.validators[validator_id as usize]
+            .get_pubkey()
+            .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+
+        // Verify the validator's XMSS signature
         let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
             .map_err(|_| StoreError::SignatureDecodingFailed)?;
@@ -378,7 +408,7 @@ pub fn on_gossip_attestation(
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
-    if cfg!(feature = "skip-signature-verification") {
+    if !verify {
         // Without signature verification, insert directly into new aggregated payloads
         // with a dummy proof so the fork choice pipeline still sees attestations.
         let participants = aggregation_bits_from_validator_indices(&[validator_id]);
@@ -393,6 +423,8 @@ pub fn on_gossip_attestation(
         let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
             .map_err(|_| StoreError::SignatureDecodingFailed)?;
         store.insert_gossip_signature(&attestation.data, validator_id, signature);
+    } else {
+        on_attestation(store, attestation.clone(), false)?;
     }
 
     metrics::inc_attestations_valid("gossip");
@@ -426,38 +458,36 @@ pub fn on_gossip_aggregated_attestation(
         .inspect_err(|_| metrics::inc_attestations_invalid("aggregated"))?;
 
     // Verify aggregated proof signature
-    if cfg!(not(feature = "skip-signature-verification")) {
-        let target_state = store
-            .get_state(&aggregated.data.target.root)
-            .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
-        let validators = &target_state.validators;
-        let num_validators = validators.len() as u64;
+    let target_state = store
+        .get_state(&aggregated.data.target.root)
+        .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
+    let validators = &target_state.validators;
+    let num_validators = validators.len() as u64;
 
-        let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
-        if participant_indices.iter().any(|&vid| vid >= num_validators) {
-            return Err(StoreError::InvalidValidatorIndex);
-        }
-
-        let pubkeys: Vec<_> = participant_indices
-            .iter()
-            .map(|&vid| {
-                validators[vid as usize]
-                    .get_pubkey()
-                    .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let message = aggregated.data.tree_hash_root();
-        let epoch: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
-
-        ethlambda_crypto::verify_aggregated_signature(
-            &aggregated.proof.proof_data,
-            pubkeys,
-            &message,
-            epoch,
-        )
-        .map_err(StoreError::AggregateVerificationFailed)?;
+    let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
+    if participant_indices.iter().any(|&vid| vid >= num_validators) {
+        return Err(StoreError::InvalidValidatorIndex);
     }
+
+    let pubkeys: Vec<_> = participant_indices
+        .iter()
+        .map(|&vid| {
+            validators[vid as usize]
+                .get_pubkey()
+                .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let message = aggregated.data.tree_hash_root();
+    let epoch: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
+
+    ethlambda_crypto::verify_aggregated_signature(
+        &aggregated.proof.proof_data,
+        pubkeys,
+        &message,
+        epoch,
+    )
+    .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Store attestation data by root (content-addressed, idempotent)
     let data_root = aggregated.data.tree_hash_root();
@@ -488,23 +518,40 @@ pub fn on_gossip_aggregated_attestation(
     Ok(())
 }
 
-/// Process a new block and update the forkchoice state.
+/// Process a new block and update the forkchoice state (with signature verification).
 ///
-/// This method integrates a block into the forkchoice store by:
-/// 1. Validating the block's parent exists
-/// 2. Computing the post-state via the state transition function
-/// 3. Processing attestations included in the block body (on-chain)
-/// 4. Updating the forkchoice head
-/// 5. Processing the proposer's attestation (as if gossiped)
+/// This is the safe default: it always verifies cryptographic signatures
+/// and stores them for future block building. Use this for all production paths.
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
+    on_block_core(store, signed_block, true)
+}
+
+/// Process a new block without signature verification.
+///
+/// This skips all cryptographic checks and signature storage. Use only in tests
+/// where signatures are absent or irrelevant (e.g., fork choice spec tests).
+pub fn on_block_without_verification(
+    store: &mut Store,
+    signed_block: SignedBlockWithAttestation,
+) -> Result<(), StoreError> {
+    on_block_core(store, signed_block, false)
+}
+
+/// Core block processing logic.
+///
+/// When `verify` is true, cryptographic signatures are validated and stored
+/// for future block building. When false, all signature checks are skipped.
+fn on_block_core(
+    store: &mut Store,
+    signed_block: SignedBlockWithAttestation,
+    verify: bool,
+) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
 
-    // Unpack block components
-    let block = signed_block.message.block.clone();
-    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block = &signed_block.message.block;
     let block_root = block.tree_hash_root();
     let slot = block.slot;
 
@@ -524,15 +571,18 @@ pub fn on_block(
                 slot,
             })?;
 
-    // Validate cryptographic signatures
-    // TODO: extract signature verification to a pre-checks function
-    // to avoid the need for this
-    if cfg!(not(feature = "skip-signature-verification")) {
+    if verify {
+        // Validate cryptographic signatures
         verify_signatures(&parent_state, &signed_block)?;
     }
 
+    let block = signed_block.message.block.clone();
+    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block_root = block.tree_hash_root();
+    let slot = block.slot;
+
     // Execute state transition function to compute post-block state
-    let mut post_state = parent_state.clone();
+    let mut post_state = parent_state;
     ethlambda_state_transition::state_transition(&mut post_state, &block)?;
 
     // Cache the state root in the latest block header
@@ -591,7 +641,7 @@ pub fn on_block(
     let proposer_data_root = proposer_attestation.data.tree_hash_root();
     store.insert_attestation_data_by_root(proposer_data_root, proposer_attestation.data.clone());
 
-    if cfg!(feature = "skip-signature-verification") {
+    if !verify {
         // Without sig verification, insert directly with a dummy proof
         let participants = aggregation_bits_from_validator_indices(&[proposer_vid]);
         let payload = StoredAggregatedPayload {
