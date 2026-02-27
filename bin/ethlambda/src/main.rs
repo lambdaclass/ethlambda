@@ -51,6 +51,12 @@ struct CliOptions {
     /// When set, skips genesis initialization and syncs from checkpoint.
     #[arg(long)]
     checkpoint_sync_url: Option<String>,
+    /// Whether this node acts as a committee aggregator
+    #[arg(long, default_value = "false")]
+    is_aggregator: bool,
+    /// Number of attestation committees (subnets) per slot
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
+    attestation_committee_count: u64,
 }
 
 #[tokio::main]
@@ -114,7 +120,10 @@ async fn main() -> eyre::Result<()> {
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
-    let blockchain = BlockChain::spawn(store.clone(), p2p_tx, validator_keys);
+    // Use first validator ID for subnet subscription
+    let first_validator_id = validator_keys.keys().min().copied();
+    let blockchain =
+        BlockChain::spawn(store.clone(), p2p_tx, validator_keys, options.is_aggregator);
 
     let p2p_handle = tokio::spawn(start_p2p(
         node_p2p_key,
@@ -123,6 +132,9 @@ async fn main() -> eyre::Result<()> {
         blockchain,
         p2p_rx,
         store.clone(),
+        first_validator_id,
+        options.attestation_committee_count,
+        options.is_aggregator,
     ));
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
@@ -132,8 +144,8 @@ async fn main() -> eyre::Result<()> {
     info!("Node initialized");
 
     tokio::select! {
-        _ = p2p_handle => {
-            panic!("P2P node task has exited unexpectedly");
+        result = p2p_handle => {
+            panic!("P2P node task has exited unexpectedly: {result:?}");
         }
         _ = tokio::signal::ctrl_c() => {
             // Ctrl-C received, shutting down

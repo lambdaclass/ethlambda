@@ -7,12 +7,13 @@ use tracing::{debug, trace};
 use super::{
     encoding::{decode_payload, write_payload},
     messages::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, ErrorMessage, Request, Response,
-        ResponseCode, ResponsePayload, STATUS_PROTOCOL_V1, Status,
+        BLOCKS_BY_ROOT_PROTOCOL_V1, ErrorMessage, Request, Response, ResponseCode, ResponsePayload,
+        STATUS_PROTOCOL_V1, Status,
     },
 };
 
 use ethlambda_types::block::SignedBlockWithAttestation;
+use ethlambda_types::primitives::ssz::Decode as SszDecode;
 
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
@@ -41,10 +42,9 @@ impl libp2p::request_response::Codec for Codec {
                 Ok(Request::Status(status))
             }
             BLOCKS_BY_ROOT_PROTOCOL_V1 => {
-                let request =
-                    BlocksByRootRequest::from_ssz_bytes_compat(&payload).map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
-                    })?;
+                let request = SszDecode::from_ssz_bytes(&payload).map_err(|err| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
+                })?;
                 Ok(Request::BlocksByRoot(request))
             }
             _ => Err(io::Error::new(
