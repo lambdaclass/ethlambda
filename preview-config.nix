@@ -9,10 +9,9 @@
 # Each node runs as a separate systemd service with its own QUIC port, metrics
 # endpoint, and RocksDB data directory.
 #
-# The ethlambda binary and lean-quickstart source are fetched and built at Nix
-# eval time on the tekton host (via builtins.getFlake and builtins.fetchGit).
-# This eliminates runtime network dependencies for git/nix operations; the
-# container only needs network access for Podman image pulls during genesis.
+# The setup service clones the PR branch and builds ethlambda at container start,
+# so previews always run the exact binary from the branch under review.
+# PREVIEW_BRANCH is available at runtime via /etc/preview.env (injected by tekton).
 #
 # Ports:
 #   QUIC (P2P):    9001-9004 (UDP)
@@ -27,7 +26,7 @@
 
 let
   meta = {
-    # Oneshot service that generates genesis (binary is pre-built at nix eval time).
+    # Oneshot service that clones, builds, and generates genesis.
     setupService = "setup-devnet";
 
     # Long-running ethlambda node services started after setup completes.
@@ -59,32 +58,13 @@ let
     extraHosts = [];
   };
 
-  # ── Build-time fetches (run on tekton host at Nix eval time) ──────────
-  # builtins.getFlake and builtins.getEnv require --impure, which tekton's
-  # preview.sh already passes. PREVIEW_BRANCH must be exported in the host
-  # shell before running nix build (tekton sets this from the PR metadata).
-
-  # Fetch + build ethlambda from the PR branch's flake.nix (crane + rust-overlay).
-  # PREVIEW_BRANCH is injected by tekton from PR metadata. Abort if unset so that
-  # a CI misconfiguration produces a clear error rather than silently evaluating
-  # the wrong branch.
-  previewBranch =
-    let b = builtins.getEnv "PREVIEW_BRANCH"; in
-    if b == "" then abort "PREVIEW_BRANCH env var must be set (pass --impure to nix build)" else b;
-  ethlambdaFlake = builtins.getFlake "github:lambdaclass/ethlambda/${previewBranch}";
-  ethlambdaBin = ethlambdaFlake.packages.x86_64-linux.default;
-
-  # Fetch lean-quickstart genesis scripts (public repo, no auth needed).
-  quickstartSrc = builtins.fetchGit {
-    url = "https://github.com/blockblaz/lean-quickstart";
-    ref = "main";
-  };
-
   # Paths used throughout the config
-  genesisDir = "/home/preview/devnet/genesis";
-  dataDir = "/home/preview/devnet/data";
+  appDir       = "/home/preview/app";
+  quickstartDir = "/home/preview/lean-quickstart";
+  genesisDir   = "/home/preview/devnet/genesis";
+  dataDir      = "/home/preview/devnet/data";
 
-  binaryPath = "${ethlambdaBin}/bin/ethlambda";
+  binaryPath = "${appDir}/target/release/ethlambda";
 
   # Helper: create a systemd service for ethlambda node N.
   # Node 0 runs with --is-aggregator so the devnet can finalize blocks:
@@ -160,17 +140,16 @@ in
   '';
 
   # ── Setup service ─────────────────────────────────────────────────────
-  # Generates genesis for a 4-node ethlambda-only devnet and creates
-  # per-node data directories. The ethlambda binary and lean-quickstart
-  # source are already in the nix store (fetched at build time on the host).
+  # Clones the PR branch, builds ethlambda via nix build, clones lean-quickstart,
+  # generates genesis for the 4-node devnet, and creates per-node data directories.
   systemd.services = {
     setup-devnet = {
-      description = "Setup ethlambda 4-node devnet (genesis generation)";
+      description = "Setup ethlambda 4-node devnet (clone, build, genesis)";
       after = [ "systemd-resolved.service" "network-online.target" ];
       wants = [ "systemd-resolved.service" "network-online.target" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
-        bash coreutils
+        bash coreutils git rustup pkg-config llvmPackages.libclang
         # Genesis generation (generate-genesis.sh needs these)
         yq-go podman
         gawk gnugrep gnused which shadow
@@ -180,7 +159,7 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         WorkingDirectory = "/home/preview";
-        TimeoutStartSec = "300"; # genesis generation + podman image pulls
+        TimeoutStartSec = "900"; # rustup toolchain install + cargo build --release
       };
       script = ''
         set -euo pipefail
@@ -196,10 +175,10 @@ in
 
         export RUST_LOG=info
 
-        # On container restart, skip setup if genesis already exists.
-        # The binary is always present (built into the nix store at host build time).
+        # On container restart, skip setup if the binary and genesis already exist.
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
-        if [ -d "${genesisDir}/hash-sig-keys" ] \
+        if [ -f "${binaryPath}" ] \
+           && [ -d "${genesisDir}/hash-sig-keys" ] \
            && [ -f "${genesisDir}/config.yaml" ] \
            && [ ! -f /tmp/force-rebuild ]; then
           echo "Devnet already set up, skipping (container restart)."
@@ -210,7 +189,45 @@ in
         # and a new genesis state, so any existing chain state is incompatible.
         rm -rf "${genesisDir}" "${dataDir}"
 
-        # ── 1. Write 4-node ethlambda-only validator config ──
+        # ── 1. Clone ethlambda ──
+        PREVIEW_TOKEN=$(cat /etc/preview-token 2>/dev/null || echo "")
+        AUTHED_URL=$(echo "$PREVIEW_REPO_URL" | sed "s|https://|https://x-access-token:$PREVIEW_TOKEN@|")
+
+        if [ -d "${appDir}/.git" ]; then
+          echo "Updating ethlambda repo (branch: $PREVIEW_BRANCH)..."
+          git -C "${appDir}" remote set-url origin "$AUTHED_URL"
+          git -C "${appDir}" fetch origin
+          git -C "${appDir}" reset --hard "origin/$PREVIEW_BRANCH"
+        else
+          echo "Cloning ethlambda (branch: $PREVIEW_BRANCH)..."
+          git clone --depth 1 --branch "$PREVIEW_BRANCH" --single-branch "$AUTHED_URL" "${appDir}"
+        fi
+
+        # ── 2. Build ethlambda ──
+        # cargo build instead of nix build: the flake has no binary cache, so nix
+        # build would recompile from scratch on every preview start (10-15 min).
+        # rustup reads rust-toolchain.toml automatically and installs the pinned version.
+        export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+        export RUSTUP_HOME=/home/preview/.rustup
+        export CARGO_HOME=/home/preview/.cargo
+        cd "${appDir}"
+        rustup toolchain install  # installs from rust-toolchain.toml
+        cargo build --release --bin ethlambda
+
+        if [ ! -f "${appDir}/target/release/ethlambda" ]; then
+          echo "ERROR: Binary not found after cargo build"
+          exit 1
+        fi
+        echo "Build complete: ${appDir}/target/release/ethlambda"
+
+        # ── 3. Clone lean-quickstart (for genesis generation scripts) ──
+        if [ ! -d "${quickstartDir}/.git" ]; then
+          echo "Cloning lean-quickstart..."
+          git clone --depth 1 --single-branch \
+            https://github.com/blockblaz/lean-quickstart.git "${quickstartDir}"
+        fi
+
+        # ── 4. Write 4-node ethlambda-only validator config ──
         # Four ethlambda nodes, each with 1 validator, on localhost with
         # unique QUIC and metrics ports. The privkeys below are secp256k1
         # P2P identity keys reused from the standard devnet config — they are
@@ -258,7 +275,7 @@ validators:
     count: 1
 VCEOF
 
-        # ── 2. Generate genesis ──
+        # ── 5. Generate genesis ──
         # Runs lean-quickstart's genesis generator which uses container images to:
         #   1. Generate XMSS key pairs (hash-sig-cli)
         #   2. Generate genesis state (eth-beacon-genesis)
@@ -266,7 +283,7 @@ VCEOF
         #         genesis.ssz, annotated_validators.yaml, *.key files,
         #         hash-sig-keys/ directory
         echo "Generating genesis for 4-node devnet..."
-        cd "${quickstartSrc}"
+        cd "${quickstartDir}"
         bash generate-genesis.sh "${genesisDir}" --mode local
 
         # Verify critical output files
@@ -277,12 +294,12 @@ VCEOF
           fi
         done
 
-        # ── 3. Create per-node data directories ──
+        # ── 6. Create per-node data directories ──
         for i in 0 1 2 3; do
           mkdir -p "${dataDir}/ethlambda_$i"
         done
 
-        chown -R preview:preview /home/preview/devnet
+        chown -R preview:preview /home/preview/devnet /home/preview/lean-quickstart
 
         echo "Devnet setup complete. 4 ethlambda nodes ready to start."
       '';
@@ -323,8 +340,9 @@ VCEOF
     curl
     jq
     yq-go
-    htop     # Useful for debugging resource usage
-    podman   # For genesis tool access via SSH
+    htop    # Useful for debugging resource usage
+    podman  # For genesis tool access via SSH
+    rustup  # For inspecting/rebuilding ethlambda over SSH
   ];
 
   system.stateVersion = "24.11";
