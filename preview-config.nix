@@ -180,6 +180,15 @@ in
 
         export RUST_LOG=info
 
+        # Podman inside nspawn: disable BPF cgroup device manager
+          mkdir -p /etc/containers
+          cat > /etc/containers/containers.conf << 'CONFEOF'
+  [engine]
+  cgroup_manager = "cgroupfs"
+  [containers]
+  cgroups = "disabled"
+  CONFEOF
+
         # On container restart, skip setup if genesis already exists.
         # The binary is always present (built into the nix store at host build time).
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
