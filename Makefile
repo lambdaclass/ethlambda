@@ -9,10 +9,9 @@ fmt: ## 🎨 Format all code using rustfmt
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
-test: leanSpec/fixtures ## 🧪 Run all tests, then forkchoice tests with skip-signature-verification
+test: leanSpec/fixtures ## 🧪 Run all tests
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
 	cargo test --workspace --release
-	cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
@@ -25,7 +24,7 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-LEAN_SPEC_COMMIT_HASH:=4edcf7bc9271e6a70ded8aff17710d68beac4266
+LEAN_SPEC_COMMIT_HASH:=8b7636bb8a95fe4bec414cc4c24e74079e6256b6
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch

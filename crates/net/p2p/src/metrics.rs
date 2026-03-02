@@ -17,7 +17,7 @@ static NODE_NAME_REGISTRY: LazyLock<RwLock<HashMap<PeerId, &'static str>>> =
 
 pub fn populate_name_registry(names_and_privkeys: HashMap<String, H256>) {
     let mut registry = NODE_NAME_REGISTRY.write().unwrap();
-    let name_registry = names_and_privkeys
+    *registry = names_and_privkeys
         .into_iter()
         .filter_map(|(name, mut privkey)| {
             let Ok(privkey) = secp256k1::SecretKey::try_from_bytes(&mut privkey) else {
@@ -31,7 +31,6 @@ pub fn populate_name_registry(names_and_privkeys: HashMap<String, H256>) {
             Some((peer_id, &*name.leak()))
         })
         .collect();
-    *registry = name_registry;
 }
 
 fn resolve(peer_id: &Option<PeerId>) -> &'static str {

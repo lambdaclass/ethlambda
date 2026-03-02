@@ -4,10 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::Attestation,
+    attestation::{Attestation, AttestationData},
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::{H256, VariableList, ssz::TreeHash},
     state::State,
@@ -58,12 +58,12 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = build_signed_block(block_data);
 
-                    let block_time =
-                        signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time;
+                    let block_time_ms = genesis_time * 1000
+                        + signed_block.message.block.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time, true);
-                    let result = store::on_block(&mut store, signed_block);
+                    store::on_tick(&mut store, block_time_ms, true, false);
+                    let result = store::on_block_without_verification(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
                         (true, false) => {
@@ -85,9 +85,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "tick" => {
-                    let timestamp = step.time.expect("tick step missing time");
+                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp, false);
+                    store::on_tick(&mut store, timestamp_ms, false, false);
                 }
                 other => {
                     // Fail for unsupported step types for now
@@ -280,14 +280,16 @@ fn validate_attestation_check(
     check: &types::AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
-    use ethlambda_types::attestation::AttestationData;
-
     let validator_id = check.validator;
     let location = check.location.as_str();
 
     let attestations: HashMap<u64, AttestationData> = match location {
-        "new" => st.iter_new_attestations().collect(),
-        "known" => st.iter_known_attestations().collect(),
+        "new" => {
+            st.extract_latest_attestations(st.iter_new_aggregated_payloads().map(|(key, _)| key))
+        }
+        "known" => {
+            st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key))
+        }
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -303,46 +305,46 @@ fn validate_attestation_check(
     })?;
 
     // Validate attestation slot if specified
-    if let Some(expected_slot) = check.attestation_slot {
-        if attestation.slot != expected_slot {
-            return Err(format!(
-                "Step {}: attestation slot mismatch for validator {}: expected {}, got {}",
-                step_idx, validator_id, expected_slot, attestation.slot
-            )
-            .into());
-        }
+    if let Some(expected_slot) = check.attestation_slot
+        && attestation.slot != expected_slot
+    {
+        return Err(format!(
+            "Step {}: attestation slot mismatch for validator {}: expected {}, got {}",
+            step_idx, validator_id, expected_slot, attestation.slot
+        )
+        .into());
     }
 
-    if let Some(expected_head_slot) = check.head_slot {
-        if attestation.head.slot != expected_head_slot {
-            return Err(format!(
-                "Step {}: attestation head slot mismatch: expected {}, got {}",
-                step_idx, expected_head_slot, attestation.head.slot
-            )
-            .into());
-        }
+    if let Some(expected_head_slot) = check.head_slot
+        && attestation.head.slot != expected_head_slot
+    {
+        return Err(format!(
+            "Step {}: attestation head slot mismatch: expected {}, got {}",
+            step_idx, expected_head_slot, attestation.head.slot
+        )
+        .into());
     }
 
     // Validate source slot if specified
-    if let Some(expected_source_slot) = check.source_slot {
-        if attestation.source.slot != expected_source_slot {
-            return Err(format!(
-                "Step {}: attestation source slot mismatch: expected {}, got {}",
-                step_idx, expected_source_slot, attestation.source.slot
-            )
-            .into());
-        }
+    if let Some(expected_source_slot) = check.source_slot
+        && attestation.source.slot != expected_source_slot
+    {
+        return Err(format!(
+            "Step {}: attestation source slot mismatch: expected {}, got {}",
+            step_idx, expected_source_slot, attestation.source.slot
+        )
+        .into());
     }
 
     // Validate target slot if specified
-    if let Some(expected_target_slot) = check.target_slot {
-        if attestation.target.slot != expected_target_slot {
-            return Err(format!(
-                "Step {}: attestation target slot mismatch: expected {}, got {}",
-                step_idx, expected_target_slot, attestation.target.slot
-            )
-            .into());
-        }
+    if let Some(expected_target_slot) = check.target_slot
+        && attestation.target.slot != expected_target_slot
+    {
+        return Err(format!(
+            "Step {}: attestation target slot mismatch: expected {}, got {}",
+            step_idx, expected_target_slot, attestation.target.slot
+        )
+        .into());
     }
 
     Ok(())
@@ -367,7 +369,8 @@ fn validate_lexicographic_head_among(
     }
 
     let blocks = st.get_live_chain();
-    let known_attestations: HashMap<u64, AttestationData> = st.iter_known_attestations().collect();
+    let known_attestations: HashMap<u64, AttestationData> =
+        st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key));
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)

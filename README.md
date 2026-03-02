@@ -40,6 +40,8 @@ make run-devnet
 This generates fresh genesis files and starts all configured clients with metrics enabled.
 Press `Ctrl+C` to stop all nodes.
 
+> **Important:** When running nodes manually (outside `make run-devnet`), at least one node must be started with `--is-aggregator` for attestations to be aggregated and included in blocks. Without this flag, the network will produce blocks but never finalize.
+
 For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
 
 ## Philosophy
@@ -84,17 +86,17 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
-### pq-devnet-2
-
-Support for the [pq-devnet-2 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-2.md) will be ending soon (see ["older devnets"](#older-devnets)). A Docker tag `devnet2` is currently available for this version.
-
 ### pq-devnet-3
 
-We are working on adding support for the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` will be published for this version.
+We are running the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` is available for this version.
+
+### pq-devnet-4
+
+We are working on adding support for the [pq-devnet-4 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-4.md). A Docker tag `devnet4` will be published for this version.
 
 ### Older devnets
 
-Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`).
+Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`, `devnet3`).
 
 Support for older devnet releases is discontinued when the next devnet version is released.
 
@@ -102,9 +104,10 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [pq-devnet-3 support](https://github.com/lambdaclass/ethlambda/issues/73)
-- [Fetching of unknown blocks referenced by attestations](https://github.com/lambdaclass/ethlambda/issues/91)
-- [Discarding blocks with invalid signatures](https://github.com/lambdaclass/ethlambda/issues/78)
+- [Add support for pq-devnet-4](https://github.com/lambdaclass/ethlambda/issues/155)
+- [Use spawned for our P2P event loop](https://github.com/lambdaclass/ethlambda/issues/165)
+- [Prune finalized states and old blocks](https://github.com/lambdaclass/ethlambda/issues/166)
 - [Non-finalization hardening: bound memory usage during long periods of non-finalization](https://github.com/lambdaclass/ethlambda/issues/103)
 - [Observability: more metrics from leanMetrics](https://github.com/lambdaclass/ethlambda/issues/76)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
+- [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)

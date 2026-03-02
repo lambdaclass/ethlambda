@@ -1,6 +1,6 @@
 use ethlambda_types::{
     ShortRoot,
-    attestation::SignedAttestation,
+    attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::SignedBlockWithAttestation,
     primitives::ssz::{Decode, Encode, TreeHash},
 };
@@ -9,7 +9,7 @@ use tracing::{error, info, trace};
 
 use super::{
     encoding::{compress_message, decompress_message},
-    messages::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND},
+    messages::{AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND},
 };
 use crate::P2PServer;
 
@@ -22,7 +22,8 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     else {
         unreachable!("we already matched on event_loop");
     };
-    match message.topic.as_str().split("/").nth(3) {
+    let topic_kind = message.topic.as_str().split("/").nth(3);
+    match topic_kind {
         Some(BLOCK_TOPIC_KIND) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
@@ -50,7 +51,33 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             );
             server.blockchain.notify_new_block(signed_block).await;
         }
-        Some(ATTESTATION_TOPIC_KIND) => {
+        Some(AGGREGATION_TOPIC_KIND) => {
+            let Ok(uncompressed_data) = decompress_message(&message.data)
+                .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
+            else {
+                return;
+            };
+
+            let Ok(aggregation) = SignedAggregatedAttestation::from_ssz_bytes(&uncompressed_data)
+                .inspect_err(|err| error!(?err, "Failed to decode gossipped aggregation"))
+            else {
+                return;
+            };
+            let slot = aggregation.data.slot;
+            info!(
+                %slot,
+                target_slot = aggregation.data.target.slot,
+                target_root = %ShortRoot(&aggregation.data.target.root.0),
+                source_slot = aggregation.data.source.slot,
+                source_root = %ShortRoot(&aggregation.data.source.root.0),
+                "Received aggregated attestation from gossip"
+            );
+            server
+                .blockchain
+                .notify_new_aggregated_attestation(aggregation)
+                .await;
+        }
+        Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
             else {
@@ -95,7 +122,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
 
-    // Publish to gossipsub
+    // Publish to the attestation subnet topic
     let _ = server
         .swarm
         .behaviour_mut()
@@ -147,4 +174,37 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWith
         .inspect_err(
             |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),
         );
+}
+
+pub async fn publish_aggregated_attestation(
+    server: &mut P2PServer,
+    attestation: SignedAggregatedAttestation,
+) {
+    let slot = attestation.data.slot;
+
+    // Encode to SSZ
+    let ssz_bytes = attestation.as_ssz_bytes();
+
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
+
+    // Publish to the aggregation topic
+    let _ = server
+        .swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(server.aggregation_topic.clone(), compressed)
+        .inspect(|_| {
+            info!(
+                %slot,
+                target_slot = attestation.data.target.slot,
+                target_root = %ShortRoot(&attestation.data.target.root.0),
+                source_slot = attestation.data.source.slot,
+                source_root = %ShortRoot(&attestation.data.source.root.0),
+                "Published aggregated attestation to gossipsub"
+            )
+        })
+        .inspect_err(|err| {
+            tracing::warn!(%slot, %err, "Failed to publish aggregated attestation to gossipsub")
+        });
 }

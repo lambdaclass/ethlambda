@@ -74,7 +74,7 @@ Fork choice head update
 ```bash
 make fmt                                     # Format code (cargo fmt --all)
 make lint                                    # Clippy with -D warnings
-make test                                    # All tests + forkchoice (with skip-signature-verification)
+make test                                    # All tests + forkchoice spec tests
 ```
 
 ### Common Operations
@@ -295,21 +295,29 @@ GENESIS_VALIDATORS:
 ### Test Categories
 1. **Unit tests**: Embedded in source files
 2. **Spec tests**: From `leanSpec/fixtures/consensus/`
-   - `forkchoice_spectests.rs` (requires `skip-signature-verification`)
+   - `forkchoice_spectests.rs` (uses `on_block_without_verification`)
    - `signature_spectests.rs`
    - `stf_spectests.rs` (state transition)
 
 ### Running Tests
 ```bash
 cargo test --workspace --release                                    # All workspace tests
-cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests
-cargo test -p ethlambda-blockchain --features skip-signature-verification --test forkchoice_spectests -- --test-threads=1  # Sequential
+cargo test -p ethlambda-blockchain --test forkchoice_spectests
+cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads=1  # Sequential
 ```
 
 ## Common Gotchas
 
+### Aggregator Flag Required for Finalization
+- At least one node **must** be started with `--is-aggregator` to finalize blocks in production (without `skip-signature-verification`)
+- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
+- With `skip-signature-verification` (tests only), attestations bypass aggregation and go directly to `new_aggregated_payloads`, so the flag is not needed
+- **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
+
 ### Signature Verification
-- Tests require `skip-signature-verification` feature for performance
+- Fork choice tests use `on_block_without_verification()` to skip signature checks
+- Signature spec tests use `on_block()` which always verifies
 - Crypto tests marked `#[ignore]` (slow leanVM operations)
 
 ### Storage Architecture

@@ -24,7 +24,10 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 
 use crate::{
-    gossipsub::{ATTESTATION_TOPIC_KIND, BLOCK_TOPIC_KIND, publish_attestation, publish_block},
+    gossipsub::{
+        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        publish_aggregated_attestation, publish_attestation, publish_block,
+    },
     req_resp::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
         STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
@@ -53,6 +56,7 @@ pub(crate) struct PendingRequest {
     pub(crate) last_peer: Option<PeerId>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_p2p(
     node_key: Vec<u8>,
     bootnodes: Vec<Bootnode>,
@@ -60,7 +64,10 @@ pub async fn start_p2p(
     blockchain: BlockChain,
     p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
-) {
+    validator_id: Option<u64>,
+    attestation_committee_count: u64,
+    is_aggregator: bool,
+) -> Result<(), libp2p::gossipsub::SubscriptionError> {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -81,9 +88,7 @@ pub async fn start_p2p(
         // Taken from ream
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .max_messages_per_rpc(Some(500))
-        .validate_messages()
         .allow_self_origin(true)
-        .flood_publish(false)
         .idontwant_message_size_threshold(1000)
         .build()
         .expect("invalid gossipsub config");
@@ -152,20 +157,47 @@ pub async fn start_p2p(
         .expect("failed to bind gossipsub listening address");
 
     let network = "devnet0";
-    let topic_kinds = [BLOCK_TOPIC_KIND, ATTESTATION_TOPIC_KIND];
-    for topic_kind in topic_kinds {
-        let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
-        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
-    }
 
-    // Create topics for outbound messages
-    let attestation_topic = libp2p::gossipsub::IdentTopic::new(format!(
-        "/leanconsensus/{network}/{ATTESTATION_TOPIC_KIND}/ssz_snappy"
-    ));
-    let block_topic = libp2p::gossipsub::IdentTopic::new(format!(
-        "/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy"
-    ));
+    // Subscribe to block topic (all nodes)
+    let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
+    let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&block_topic)
+        .unwrap();
+
+    // Subscribe to aggregation topic (all validators)
+    let aggregation_topic_str =
+        format!("/leanconsensus/{network}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
+    let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&aggregation_topic)
+        .unwrap();
+
+    // Build attestation subnet topic (needed for publishing even without subscribing)
+    // attestation_committee_count is validated to be >= 1 by clap at CLI parse time.
+    let subnet_id = validator_id.map(|vid| vid % attestation_committee_count);
+    let attestation_topic_kind = match subnet_id {
+        Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
+        // Non-validators use subnet 0 for publishing
+        None => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_0"),
+    };
+    let attestation_topic_str =
+        format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
+    let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
+
+    // Only aggregators subscribe to attestation subnets; non-aggregators
+    // publish via gossipsub's fanout mechanism without subscribing.
+    if is_aggregator {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&attestation_topic)?;
+        info!(%attestation_topic_kind, "Subscribed to attestation subnet");
+    }
 
     info!(socket=%listening_socket, "P2P node started");
 
@@ -178,6 +210,7 @@ pub async fn start_p2p(
         p2p_rx,
         attestation_topic,
         block_topic,
+        aggregation_topic,
         connected_peers: HashSet::new(),
         pending_requests: HashMap::new(),
         request_id_map: HashMap::new(),
@@ -187,6 +220,7 @@ pub async fn start_p2p(
     };
 
     event_loop(server).await;
+    Ok(())
 }
 
 /// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
@@ -203,6 +237,7 @@ pub(crate) struct P2PServer {
     pub(crate) p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
@@ -370,6 +405,9 @@ async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
         }
         P2PMessage::PublishBlock(signed_block) => {
             publish_block(server, signed_block).await;
+        }
+        P2PMessage::PublishAggregatedAttestation(attestation) => {
+            publish_aggregated_attestation(server, attestation).await;
         }
         P2PMessage::FetchBlock(root) => {
             // Deduplicate - if already pending, ignore
