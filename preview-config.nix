@@ -65,8 +65,12 @@ let
   # shell before running nix build (tekton sets this from the PR metadata).
 
   # Fetch + build ethlambda from the PR branch's flake.nix (crane + rust-overlay).
-  previewBranch = let b = builtins.getEnv "PREVIEW_BRANCH"; in
-    if b == "" then "tekton-integration" else b;
+  # PREVIEW_BRANCH is injected by tekton from PR metadata. Abort if unset so that
+  # a CI misconfiguration produces a clear error rather than silently evaluating
+  # the wrong branch.
+  previewBranch =
+    let b = builtins.getEnv "PREVIEW_BRANCH"; in
+    if b == "" then abort "PREVIEW_BRANCH env var must be set (pass --impure to nix build)" else b;
   ethlambdaFlake = builtins.getFlake "github:lambdaclass/ethlambda/${previewBranch}";
   ethlambdaBin = ethlambdaFlake.packages.x86_64-linux.default;
 
@@ -80,9 +84,7 @@ let
   genesisDir = "/home/preview/devnet/genesis";
   dataDir = "/home/preview/devnet/data";
 
-  # Binary is in the nix store; quickstart source is a nix store path.
   binaryPath = "${ethlambdaBin}/bin/ethlambda";
-  quickstartDir = "${quickstartSrc}";
 
   # Helper: create a systemd service for ethlambda node N.
   # Node 0 runs with --is-aggregator so the devnet can finalize blocks:
@@ -130,11 +132,14 @@ in
   # Networking: static IP is set by nixos-container, disable DHCP
   networking.useDHCP = false;
   networking.useHostResolvConf = false;
+  # systemd-resolved handles DNS; FallbackDNS is used when the container's
+  # upstream resolver is unavailable. Don't set networking.nameservers here:
+  # with resolved enabled, NixOS routes DNS through 127.0.0.53, and setting
+  # nameservers directly would bypass resolved and produce conflicting config.
   services.resolved = {
     enable = true;
     settings.Resolve.FallbackDNS = [ "8.8.8.8" "1.1.1.1" ];
   };
-  networking.nameservers = [ "8.8.8.8" "1.1.1.1" ];
 
   # Open ports: 4 RPC/metrics (TCP) + 4 QUIC P2P (UDP)
   networking.firewall.allowedTCPPorts = [ 8081 8082 8083 8084 ];
@@ -201,12 +206,16 @@ in
           exit 0
         fi
         rm -f /tmp/force-rebuild
-        rm -rf "${genesisDir}"
+        # Clear both genesis and RocksDB data dirs: new genesis produces new XMSS keys
+        # and a new genesis state, so any existing chain state is incompatible.
+        rm -rf "${genesisDir}" "${dataDir}"
 
         # ── 1. Write 4-node ethlambda-only validator config ──
         # Four ethlambda nodes, each with 1 validator, on localhost with
-        # unique QUIC and metrics ports. Private keys are secp256k1 keys
-        # for P2P identity (reused from the standard devnet config).
+        # unique QUIC and metrics ports. The privkeys below are secp256k1
+        # P2P identity keys reused from the standard devnet config — they are
+        # publicly known and are NOT secrets. Validator signing uses XMSS keys
+        # generated fresh by hash-sig-cli during genesis.
         mkdir -p "${genesisDir}"
 
         cat > "${genesisDir}/validator-config.yaml" << 'VCEOF'
@@ -257,7 +266,7 @@ VCEOF
         #         genesis.ssz, annotated_validators.yaml, *.key files,
         #         hash-sig-keys/ directory
         echo "Generating genesis for 4-node devnet..."
-        cd "${quickstartDir}"
+        cd "${quickstartSrc}"
         bash generate-genesis.sh "${genesisDir}" --mode local
 
         # Verify critical output files
