@@ -1,0 +1,16 @@
+[package]
+name = "ethlambda-test-fixtures"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ethlambda-types.workspace = true
+
+serde.workspace = true
+hex.workspace = true

@@ -4,6 +4,7 @@ use rand::seq::SliceRandom;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::ssz::TreeHash;
 use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 
@@ -182,7 +183,7 @@ pub fn build_status(store: &Store) -> Status {
         .slot;
     Status {
         finalized,
-        head: ethlambda_types::state::Checkpoint {
+        head: Checkpoint {
             root: head_root,
             slot: head_slot,
         },

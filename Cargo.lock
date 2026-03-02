@@ -1971,6 +1971,7 @@ dependencies = [
  "ethlambda-metrics",
  "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
  "serde",
@@ -2059,6 +2060,7 @@ version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
  "ethlambda-metrics",
+ "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
  "serde",
@@ -2075,6 +2077,15 @@ dependencies = [
  "rocksdb",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "ethlambda-test-fixtures"
+version = "0.1.0"
+dependencies = [
+ "ethlambda-types",
+ "hex",
+ "serde",
 ]
 
 [[package]]

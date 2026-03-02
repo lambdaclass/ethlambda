@@ -193,8 +193,9 @@ fn verify_checkpoint_state(
 mod tests {
     use super::*;
     use ethlambda_types::block::BlockHeader;
+    use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::primitives::VariableList;
-    use ethlambda_types::state::{ChainConfig, Checkpoint};
+    use ethlambda_types::state::ChainConfig;
 
     // Helper to create valid test state
     fn create_test_state(slot: u64, validators: Vec<Validator>, genesis_time: u64) -> State {

@@ -74,25 +74,16 @@ fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
-    use ethlambda_storage::{Store, backend::InMemoryBackend};
+pub(crate) mod test_utils {
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
+        checkpoint::Checkpoint,
         primitives::{H256, ssz::TreeHash},
-        state::{ChainConfig, Checkpoint, JustificationValidators, JustifiedSlots, State},
+        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
-    use http_body_util::BodyExt;
-    use serde_json::json;
-    use std::sync::Arc;
-    use tower::ServiceExt;
 
     /// Create a minimal test state for testing.
-    fn create_test_state() -> State {
+    pub(crate) fn create_test_state() -> State {
         let genesis_header = BlockHeader {
             slot: 0,
             proposer_index: 0,
@@ -119,6 +110,22 @@ mod tests {
             justifications_validators: JustificationValidators::with_capacity(0).unwrap(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    use super::test_utils::create_test_state;
 
     #[tokio::test]
     async fn test_get_latest_justified_checkpoint() {

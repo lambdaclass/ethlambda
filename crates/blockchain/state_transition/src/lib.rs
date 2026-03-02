@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use ethlambda_types::{
     ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
+    checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
-    state::{Checkpoint, JustificationValidators, State},
+    state::{JustificationValidators, State},
 };
 use tracing::info;
 

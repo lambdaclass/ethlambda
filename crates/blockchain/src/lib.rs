@@ -7,9 +7,9 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
+    checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
     signature::ValidatorSecretKey,
-    state::Checkpoint,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
@@ -179,7 +179,7 @@ impl BlockChainServer {
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
-        // Update head slot metric (head may change when attestations are promoted at intervals 0/3)
+        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
     }
 

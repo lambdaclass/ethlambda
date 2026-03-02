@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ethlambda_types::{ShortRoot, primitives::H256, state::Checkpoint};
+use ethlambda_types::{ShortRoot, checkpoint::Checkpoint, primitives::H256};
 
 /// Maximum depth of the tree to display before truncating with `...`.
 const MAX_DISPLAY_DEPTH: usize = 20;
