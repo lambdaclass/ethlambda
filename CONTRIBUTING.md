@@ -136,7 +136,7 @@ Use GitHub Issues to report bugs or request features. Please include:
 
 ## Running a Local Devnet
 
-ethlambda supports spinning up a local multi-client devnet via [lean-quickstart](https://github.com/pq-ethereum/lean-quickstart). This is the fastest way to test your changes in a realistic environment.
+ethlambda supports spinning up a local multi-client devnet via [lean-quickstart](https://github.com/blockblaz/lean-quickstart). This is the fastest way to test your changes in a realistic environment.
 
 ## Security
 
