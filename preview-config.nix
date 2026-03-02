@@ -143,7 +143,7 @@ in
     dockerCompat = true;
   };
 
-  environment.etc."containers/containers.conf".text = ''
+  environment.etc."containers/containers.conf".text = lib.mkForce ''
     [engine]
     cgroup_manager = "cgroupfs"
     [containers]
