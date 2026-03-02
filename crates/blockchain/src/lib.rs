@@ -167,6 +167,11 @@ impl BlockChainServer {
                 .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
         }
 
+        // Safety-net pruning once per slot: prevents OOM when finalization is stalled
+        if interval == 0 {
+            self.store.safety_net_prune();
+        }
+
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
             self.propose_block(slot, validator_id);
