@@ -9,8 +9,8 @@
 # Each node runs as a separate systemd service with its own QUIC port, metrics
 # endpoint, and RocksDB data directory.
 #
-# The setup service clones the PR branch and builds ethlambda at container start,
-# so previews always run the exact binary from the branch under review.
+# The setup service builds ethlambda via `nix build github:lambdaclass/ethlambda/$BRANCH`
+# at container start, so previews always run the exact binary from the branch under review.
 # PREVIEW_BRANCH is available at runtime via /etc/preview.env (injected by tekton).
 #
 # Ports:
@@ -64,7 +64,8 @@ let
   genesisDir   = "/home/preview/devnet/genesis";
   dataDir      = "/home/preview/devnet/data";
 
-  binaryPath = "${appDir}/target/release/ethlambda";
+  # nix build outputs a store path symlinked at appDir; binary is at bin/ethlambda
+  binaryPath = "${appDir}/bin/ethlambda";
 
   # Helper: create a systemd service for ethlambda node N.
   # Node 0 runs with --is-aggregator so the devnet can finalize blocks:
@@ -140,16 +141,17 @@ in
   '';
 
   # ── Setup service ─────────────────────────────────────────────────────
-  # Clones the PR branch, builds ethlambda via nix build, clones lean-quickstart,
-  # generates genesis for the 4-node devnet, and creates per-node data directories.
+  # Builds ethlambda via `nix build github:lambdaclass/ethlambda/$PREVIEW_BRANCH`,
+  # clones lean-quickstart, generates genesis for the 4-node devnet, and creates
+  # per-node data directories.
   systemd.services = {
     setup-devnet = {
-      description = "Setup ethlambda 4-node devnet (clone, build, genesis)";
+      description = "Setup ethlambda 4-node devnet (nix build, genesis)";
       after = [ "systemd-resolved.service" "network-online.target" ];
       wants = [ "systemd-resolved.service" "network-online.target" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
       path = with pkgs; [
-        bash coreutils git rustup pkg-config llvmPackages.libclang
+        bash coreutils git
         # Genesis generation (generate-genesis.sh needs these)
         yq-go podman
         gawk gnugrep gnused which shadow
@@ -159,7 +161,7 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         WorkingDirectory = "/home/preview";
-        TimeoutStartSec = "900"; # rustup toolchain install + cargo build --release
+        TimeoutStartSec = "900"; # nix build compiles ethlambda from source on first run
       };
       script = ''
         set -euo pipefail
@@ -172,8 +174,6 @@ in
         set -a
         source /etc/preview.env
         set +a
-
-        export RUST_LOG=info
 
         # On container restart, skip setup if the binary and genesis already exist.
         # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
@@ -189,45 +189,32 @@ in
         # and a new genesis state, so any existing chain state is incompatible.
         rm -rf "${genesisDir}" "${dataDir}"
 
-        # ── 1. Clone ethlambda ──
+        # ── 1. Build ethlambda via nix build ──
+        # Fetches the flake from GitHub and builds the ethlambda binary.
+        # crane's two-phase build (buildDepsOnly + buildPackage) means Rust
+        # dependencies are a separate derivation: once compiled they stay in
+        # /nix/store and only ethlambda itself needs recompiling on branch updates.
         PREVIEW_TOKEN=$(cat /etc/preview-token 2>/dev/null || echo "")
-        AUTHED_URL=$(echo "$PREVIEW_REPO_URL" | sed "s|https://|https://x-access-token:$PREVIEW_TOKEN@|")
+        echo "Building ethlambda (branch: $PREVIEW_BRANCH) via nix build..."
+        nix build "github:lambdaclass/ethlambda/$PREVIEW_BRANCH" \
+          --out-link "${appDir}" \
+          --extra-experimental-features "nix-command flakes" \
+          --option access-tokens "github.com=$PREVIEW_TOKEN"
 
-        if [ -d "${appDir}/.git" ]; then
-          echo "Updating ethlambda repo (branch: $PREVIEW_BRANCH)..."
-          git -C "${appDir}" remote set-url origin "$AUTHED_URL"
-          git -C "${appDir}" fetch origin
-          git -C "${appDir}" reset --hard "origin/$PREVIEW_BRANCH"
-        else
-          echo "Cloning ethlambda (branch: $PREVIEW_BRANCH)..."
-          git clone --depth 1 --branch "$PREVIEW_BRANCH" --single-branch "$AUTHED_URL" "${appDir}"
-        fi
-
-        # ── 2. Build ethlambda ──
-        # cargo build instead of nix build: the flake has no binary cache, so nix
-        # build would recompile from scratch on every preview start (10-15 min).
-        # rustup reads rust-toolchain.toml automatically and installs the pinned version.
-        export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-        export RUSTUP_HOME=/home/preview/.rustup
-        export CARGO_HOME=/home/preview/.cargo
-        cd "${appDir}"
-        rustup toolchain install  # installs from rust-toolchain.toml
-        cargo build --release --bin ethlambda
-
-        if [ ! -f "${appDir}/target/release/ethlambda" ]; then
-          echo "ERROR: Binary not found after cargo build"
+        if [ ! -f "${binaryPath}" ]; then
+          echo "ERROR: Binary not found after nix build"
           exit 1
         fi
-        echo "Build complete: ${appDir}/target/release/ethlambda"
+        echo "Build complete: ${binaryPath}"
 
-        # ── 3. Clone lean-quickstart (for genesis generation scripts) ──
+        # ── 2. Clone lean-quickstart (for genesis generation scripts) ──
         if [ ! -d "${quickstartDir}/.git" ]; then
           echo "Cloning lean-quickstart..."
           git clone --depth 1 --single-branch \
             https://github.com/blockblaz/lean-quickstart.git "${quickstartDir}"
         fi
 
-        # ── 4. Write 4-node ethlambda-only validator config ──
+        # ── 3. Write 4-node ethlambda-only validator config ──
         # Four ethlambda nodes, each with 1 validator, on localhost with
         # unique QUIC and metrics ports. The privkeys below are secp256k1
         # P2P identity keys reused from the standard devnet config — they are
@@ -275,7 +262,7 @@ validators:
     count: 1
 VCEOF
 
-        # ── 5. Generate genesis ──
+        # ── 4. Generate genesis ──
         # Runs lean-quickstart's genesis generator which uses container images to:
         #   1. Generate XMSS key pairs (hash-sig-cli)
         #   2. Generate genesis state (eth-beacon-genesis)
@@ -294,7 +281,7 @@ VCEOF
           fi
         done
 
-        # ── 6. Create per-node data directories ──
+        # ── 5. Create per-node data directories ──
         for i in 0 1 2 3; do
           mkdir -p "${dataDir}/ethlambda_$i"
         done
@@ -342,8 +329,14 @@ VCEOF
     yq-go
     htop    # Useful for debugging resource usage
     podman  # For genesis tool access via SSH
-    rustup  # For inspecting/rebuilding ethlambda over SSH
   ];
+
+  # nix build inside systemd-nspawn containers cannot create nested namespaces,
+  # so the nix sandbox must be disabled. Flakes are needed for `nix build github:...`.
+  nix.settings = {
+    experimental-features = [ "nix-command" "flakes" ];
+    sandbox = false;
+  };
 
   system.stateVersion = "24.11";
 }
