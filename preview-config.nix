@@ -163,8 +163,6 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        User = "preview";
-        Group = "preview";
         WorkingDirectory = "/home/preview";
         TimeoutStartSec = "300"; # genesis generation + podman image pulls
       };
@@ -263,6 +261,8 @@ VCEOF
         for i in 0 1 2 3; do
           mkdir -p "${dataDir}/ethlambda_$i"
         done
+
+        chown -R preview:preview /home/preview/devnet
 
         echo "Devnet setup complete. 4 ethlambda nodes ready to start."
       '';
