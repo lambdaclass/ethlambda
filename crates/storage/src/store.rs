@@ -1137,7 +1137,10 @@ mod tests {
         let mut batch = backend.begin_write().expect("write batch");
         let key = root.as_ssz_bytes();
         batch
-            .put_batch(Table::BlockHeaders, vec![(key.clone(), header.as_ssz_bytes())])
+            .put_batch(
+                Table::BlockHeaders,
+                vec![(key.clone(), header.as_ssz_bytes())],
+            )
             .expect("put header");
         batch
             .put_batch(Table::BlockBodies, vec![(key.clone(), vec![0u8; 4])])
@@ -1187,23 +1190,33 @@ mod tests {
     #[test]
     fn prune_old_blocks_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         // Insert exactly BLOCKS_TO_KEEP blocks
         for i in 0..BLOCKS_TO_KEEP as u64 {
             insert_header(backend.as_ref(), root(i), i);
         }
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), BLOCKS_TO_KEEP);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            BLOCKS_TO_KEEP
+        );
 
         let pruned = store.prune_old_blocks(&[]);
         assert_eq!(pruned, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), BLOCKS_TO_KEEP);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            BLOCKS_TO_KEEP
+        );
     }
 
     #[test]
     fn prune_old_blocks_exceeding_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         let total = BLOCKS_TO_KEEP + 10;
         for i in 0..total as u64 {
@@ -1213,9 +1226,18 @@ mod tests {
 
         let pruned = store.prune_old_blocks(&[]);
         assert_eq!(pruned, 10);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), BLOCKS_TO_KEEP);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockBodies), BLOCKS_TO_KEEP);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), BLOCKS_TO_KEEP);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            BLOCKS_TO_KEEP
+        );
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockBodies),
+            BLOCKS_TO_KEEP
+        );
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockSignatures),
+            BLOCKS_TO_KEEP
+        );
 
         // Oldest blocks (slots 0..10) should be gone
         for i in 0..10u64 {
@@ -1230,7 +1252,9 @@ mod tests {
     #[test]
     fn prune_old_blocks_preserves_protected() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         let total = BLOCKS_TO_KEEP + 10;
         for i in 0..total as u64 {
@@ -1244,10 +1268,26 @@ mod tests {
 
         // 10 would be pruned, but 2 are protected
         assert_eq!(pruned, 8);
-        assert!(has_key(backend.as_ref(), Table::BlockHeaders, &finalized_root));
-        assert!(has_key(backend.as_ref(), Table::BlockHeaders, &justified_root));
-        assert!(has_key(backend.as_ref(), Table::BlockBodies, &finalized_root));
-        assert!(has_key(backend.as_ref(), Table::BlockSignatures, &finalized_root));
+        assert!(has_key(
+            backend.as_ref(),
+            Table::BlockHeaders,
+            &finalized_root
+        ));
+        assert!(has_key(
+            backend.as_ref(),
+            Table::BlockHeaders,
+            &justified_root
+        ));
+        assert!(has_key(
+            backend.as_ref(),
+            Table::BlockBodies,
+            &finalized_root
+        ));
+        assert!(has_key(
+            backend.as_ref(),
+            Table::BlockSignatures,
+            &finalized_root
+        ));
     }
 
     // ============ State Pruning Tests ============
@@ -1255,14 +1295,19 @@ mod tests {
     #[test]
     fn prune_old_states_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         // Insert STATES_TO_KEEP headers + states
         for i in 0..STATES_TO_KEEP as u64 {
             insert_header(backend.as_ref(), root(i), i);
             insert_state(backend.as_ref(), root(i));
         }
-        assert_eq!(count_entries(backend.as_ref(), Table::States), STATES_TO_KEEP);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::States),
+            STATES_TO_KEEP
+        );
 
         let pruned = store.prune_old_states(&[]);
         assert_eq!(pruned, 0);
@@ -1271,7 +1316,9 @@ mod tests {
     #[test]
     fn prune_old_states_exceeding_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         let total = STATES_TO_KEEP + 5;
         for i in 0..total as u64 {
@@ -1282,7 +1329,10 @@ mod tests {
 
         let pruned = store.prune_old_states(&[]);
         assert_eq!(pruned, 5);
-        assert_eq!(count_entries(backend.as_ref(), Table::States), STATES_TO_KEEP);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::States),
+            STATES_TO_KEEP
+        );
 
         // Oldest states should be gone
         for i in 0..5u64 {
@@ -1297,7 +1347,9 @@ mod tests {
     #[test]
     fn prune_old_states_preserves_protected() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store { backend: backend.clone() };
+        let mut store = Store {
+            backend: backend.clone(),
+        };
 
         let total = STATES_TO_KEEP + 5;
         for i in 0..total as u64 {
