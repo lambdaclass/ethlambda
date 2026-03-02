@@ -7,9 +7,9 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
+    checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
     signature::ValidatorSecretKey,
-    state::Checkpoint,
 };
 use spawned_concurrency::tasks::{
     CallResponse, CastResponse, GenServer, GenServerHandle, send_after,

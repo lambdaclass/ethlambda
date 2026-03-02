@@ -77,8 +77,9 @@ fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
 pub(crate) mod test_utils {
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
+        checkpoint::Checkpoint,
         primitives::{H256, ssz::TreeHash},
-        state::{ChainConfig, Checkpoint, JustificationValidators, JustifiedSlots, State},
+        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
 
     /// Create a minimal test state for testing.

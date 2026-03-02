@@ -16,12 +16,13 @@ use ethlambda_types::{
         Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation, BlockWithAttestation,
         SignedBlockWithAttestation,
     },
+    checkpoint::Checkpoint,
     primitives::{
         H256,
         ssz::{Decode, Encode, TreeHash},
     },
     signature::ValidatorSignature,
-    state::{ChainConfig, Checkpoint, State},
+    state::{ChainConfig, State},
 };
 use tracing::info;
 

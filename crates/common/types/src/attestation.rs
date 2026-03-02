@@ -1,8 +1,9 @@
 use crate::{
     block::AggregatedSignatureProof,
+    checkpoint::Checkpoint,
     primitives::ssz::{Decode, Encode, TreeHash},
     signature::SignatureSize,
-    state::{Checkpoint, ValidatorRegistryLimit},
+    state::ValidatorRegistryLimit,
 };
 
 /// Validator specific attestation wrapping shared attestation data.

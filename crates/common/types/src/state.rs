@@ -3,6 +3,7 @@ use ssz_types::typenum::{U4096, U262144};
 
 use crate::{
     block::{BlockBody, BlockHeader},
+    checkpoint::Checkpoint,
     primitives::{
         H256,
         ssz::{Decode, DecodeError, Encode, TreeHash},
@@ -114,9 +115,6 @@ impl State {
         }
     }
 }
-
-// Re-export from checkpoint module for backwards compatibility
-pub use crate::checkpoint::{Checkpoint, deser_dec_str};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct ChainConfig {

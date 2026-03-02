@@ -7,11 +7,9 @@ use ethlambda_types::{
         AttestationData as DomainAttestationData,
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
+    checkpoint::Checkpoint as DomainCheckpoint,
     primitives::{BitList, H256, VariableList},
-    state::{
-        ChainConfig, Checkpoint as DomainCheckpoint, State, Validator as DomainValidator,
-        ValidatorPubkeyBytes,
-    },
+    state::{ChainConfig, State, Validator as DomainValidator, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
 

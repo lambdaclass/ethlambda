@@ -15,9 +15,10 @@ use ethlambda_types::{
         AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
         SignedBlockWithAttestation,
     },
+    checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
     signature::ValidatorSignature,
-    state::{Checkpoint, State},
+    state::State,
 };
 use tracing::{info, trace, warn};
 

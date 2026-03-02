@@ -102,7 +102,7 @@ pub struct Checkpoint {
     pub slot: u64,
 }
 
-impl From<Checkpoint> for ethlambda_types::state::Checkpoint {
+impl From<Checkpoint> for ethlambda_types::checkpoint::Checkpoint {
     fn from(value: Checkpoint) -> Self {
         Self {
             root: value.root,

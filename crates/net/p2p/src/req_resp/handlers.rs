@@ -182,7 +182,7 @@ pub fn build_status(store: &Store) -> Status {
         .slot;
     Status {
         finalized,
-        head: ethlambda_types::state::Checkpoint {
+        head: ethlambda_types::checkpoint::Checkpoint {
             root: head_root,
             slot: head_slot,
         },

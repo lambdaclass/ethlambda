@@ -1,10 +1,10 @@
 use ethlambda_types::{
     block::SignedBlockWithAttestation,
+    checkpoint::Checkpoint,
     primitives::{
         H256,
         ssz::{Decode, Encode},
     },
-    state::Checkpoint,
 };
 use ssz_types::typenum;
 

@@ -84,7 +84,7 @@ pub fn compute_lmd_ghost_head(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::state::Checkpoint;
+    use ethlambda_types::checkpoint::Checkpoint;
 
     fn make_attestation(head_root: H256, slot: u64) -> AttestationData {
         AttestationData {
