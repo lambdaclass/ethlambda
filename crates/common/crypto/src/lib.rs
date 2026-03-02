@@ -374,7 +374,7 @@ mod tests {
     fn test_cross_client_ream_signature_rejects_wrong_epoch() {
         let pk = ream_pubkey();
         let sig = ream_signature();
-        let wrong_epoch = 6;
+        let wrong_epoch = REAM_EPOCH + 1;
         assert!(
             !sig.is_valid(&pk, wrong_epoch, &H256::ZERO),
             "ream signature should reject wrong epoch"
