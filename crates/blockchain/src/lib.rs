@@ -63,6 +63,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             is_aggregator,
             pending_block_parents: HashMap::new(),
+            pending_block_slots: HashMap::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -126,6 +127,8 @@ struct BlockChainServer {
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+    // Maps pending block_root → slot, for age-based eviction
+    pending_block_slots: HashMap<H256, u64>,
 
     /// Whether this node acts as a committee aggregator.
     is_aggregator: bool,
@@ -168,6 +171,9 @@ impl BlockChainServer {
         // Safety-net pruning once per slot: prevents OOM when finalization is stalled
         if interval == 0 {
             self.store.safety_net_prune();
+            let finalized_slot = self.store.latest_finalized().slot;
+            let cutoff = finalized_slot.max(self.store.head_slot().saturating_sub(1024));
+            self.prune_pending_blocks(cutoff);
         }
 
         // Now build and publish the block (after attestations have been accepted)
@@ -366,6 +372,7 @@ impl BlockChainServer {
             }
 
             self.pending_block_parents.insert(block_root, missing_root);
+            self.pending_block_slots.insert(block_root, slot);
 
             // Persist block data to DB (no LiveChain entry — invisible to fork choice)
             self.store.insert_pending_block(block_root, signed_block);
@@ -399,6 +406,7 @@ impl BlockChainServer {
                     .insert(missing_root);
                 self.pending_block_parents
                     .insert(missing_root, header.parent_root);
+                self.pending_block_slots.insert(missing_root, header.slot);
                 missing_root = header.parent_root;
             }
 
@@ -462,6 +470,7 @@ impl BlockChainServer {
         for block_root in child_roots {
             // Clean up lineage tracking
             self.pending_block_parents.remove(&block_root);
+            self.pending_block_slots.remove(&block_root);
 
             // Load block data from DB
             let Some(child_block) = self.store.get_signed_block(&block_root) else {
@@ -477,6 +486,36 @@ impl BlockChainServer {
 
             queue.push_back(child_block);
         }
+    }
+
+    /// Evict pending blocks older than `cutoff_slot` to prevent unbounded memory
+    /// growth when parents never arrive (network partition, attack).
+    fn prune_pending_blocks(&mut self, cutoff_slot: u64) {
+        let stale_roots: Vec<H256> = self
+            .pending_block_slots
+            .iter()
+            .filter(|&(_, slot)| *slot <= cutoff_slot)
+            .map(|(&root, _)| root)
+            .collect();
+
+        if stale_roots.is_empty() {
+            return;
+        }
+
+        let count = stale_roots.len();
+        for root in &stale_roots {
+            self.pending_block_slots.remove(root);
+            self.pending_block_parents.remove(root);
+        }
+
+        // Clean stale children from pending_blocks parent entries
+        let stale_set: HashSet<H256> = stale_roots.into_iter().collect();
+        self.pending_blocks.retain(|_, children| {
+            children.retain(|child| !stale_set.contains(child));
+            !children.is_empty()
+        });
+
+        info!(count, cutoff_slot, "Pruned stale pending blocks");
     }
 
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
