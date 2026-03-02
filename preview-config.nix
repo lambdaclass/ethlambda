@@ -84,12 +84,16 @@ let
   binaryPath = "${ethlambdaBin}/bin/ethlambda";
   quickstartDir = "${quickstartSrc}";
 
-  # Helper: create a systemd service for ethlambda node N
+  # Helper: create a systemd service for ethlambda node N.
+  # Node 0 runs with --is-aggregator so the devnet can finalize blocks:
+  # without at least one aggregator, attestations are never packed into
+  # blocks and justified_slot/finalized_slot stay at 0 forever.
   mkNodeService = idx:
     let
       name = "ethlambda_${toString idx}";
       gossipPort = 9001 + idx;
       metricsPort = 8081 + idx;
+      aggregatorArgs = lib.optionals (idx == 0) [ "--is-aggregator" ];
     in
     {
       description = "ethlambda node ${toString idx} (gossip=${toString gossipPort}, rpc=${toString metricsPort})";
@@ -100,7 +104,7 @@ let
         Type = "simple";
         User = "preview";
         WorkingDirectory = "${dataDir}/${name}";
-        ExecStart = builtins.concatStringsSep " " [
+        ExecStart = builtins.concatStringsSep " " ([
           binaryPath
           "--custom-network-config-dir" genesisDir
           "--gossipsub-port" (toString gossipPort)
@@ -108,7 +112,7 @@ let
           "--node-key" "${genesisDir}/${name}.key"
           "--metrics-address" "0.0.0.0"
           "--metrics-port" (toString metricsPort)
-        ];
+        ] ++ aggregatorArgs);
         Restart = "on-failure";
         RestartSec = 5;
       };
