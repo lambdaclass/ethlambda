@@ -28,6 +28,7 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+ethlambda-test-fixtures.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
