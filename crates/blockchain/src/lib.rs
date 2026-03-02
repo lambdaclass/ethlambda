@@ -170,9 +170,7 @@ impl BlockChainServer {
 
         // Safety-net pruning once per slot: prevents OOM when finalization is stalled
         if interval == 0 {
-            self.store.safety_net_prune();
-            let finalized_slot = self.store.latest_finalized().slot;
-            let cutoff = finalized_slot.max(self.store.head_slot().saturating_sub(1024));
+            let cutoff = self.store.safety_net_prune();
             self.prune_pending_blocks(cutoff);
         }
 

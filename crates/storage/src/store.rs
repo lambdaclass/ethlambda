@@ -1015,14 +1015,16 @@ impl Store {
     /// When finalization is healthy, `cutoff == finalized_slot` and this is a no-op
     /// (finalization-triggered pruning already handles it).
     /// When finalization is stalled, prunes data older than 1024 slots behind head.
-    pub fn safety_net_prune(&mut self) {
+    ///
+    /// Returns the computed cutoff slot so callers can reuse it for their own pruning.
+    pub fn safety_net_prune(&mut self) -> u64 {
         let head_slot = self.head_slot();
         let finalized_slot = self.latest_finalized().slot;
         let cutoff_slot = finalized_slot.max(head_slot.saturating_sub(MAX_UNFINALIZED_SLOTS));
 
         // No-op when finalization is healthy
         if cutoff_slot <= finalized_slot {
-            return;
+            return cutoff_slot;
         }
 
         // Build set of roots that must never be pruned
@@ -1056,6 +1058,8 @@ impl Store {
                 "Safety-net pruning: finalization stalled"
             );
         }
+
+        cutoff_slot
     }
 
     /// Prune states for blocks with slot <= cutoff_slot, preserving protected roots.
