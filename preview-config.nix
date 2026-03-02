@@ -61,7 +61,7 @@ let
   # Build ethlambda from the current repo at eval time (requires --impure).
   # tekton evaluates preview-config.nix from the cloned PR branch, so path:.
   # resolves to the branch under review — the container always runs that branch's binary.
-  ethlambdaPkg = (builtins.getFlake "path:.").packages.x86_64-linux.ethlambda;
+  ethlambdaPkg = (builtins.getFlake (toString ./.)).packages.x86_64-linux.ethlambda;
 
   # Paths used throughout the config
   quickstartDir = "/home/preview/lean-quickstart";
