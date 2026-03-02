@@ -158,6 +158,7 @@ in
         # Genesis generation (generate-genesis.sh needs these)
         yq-go podman
         gawk gnugrep gnused which
+        (writeShellScriptBin "docker" ''exec podman "$@"'')
       ];
       serviceConfig = {
         Type = "oneshot";
