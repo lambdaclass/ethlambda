@@ -18,7 +18,7 @@ pub struct Checkpoint {
 }
 
 // Taken from ethrex-common
-pub fn deser_dec_str<'de, D>(d: D) -> Result<u64, D::Error>
+fn deser_dec_str<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

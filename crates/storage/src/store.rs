@@ -465,62 +465,18 @@ impl Store {
     ///
     /// Returns the number of signatures pruned.
     pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
-        let view = self.backend.begin_read().expect("read view");
-        let mut to_delete = vec![];
-
-        for (key_bytes, value_bytes) in view
-            .prefix_iterator(Table::GossipSignatures, &[])
-            .expect("iter")
-            .filter_map(|r| r.ok())
-        {
-            if let Ok(stored) = StoredSignature::from_ssz_bytes(&value_bytes)
-                && stored.slot <= finalized_slot
-            {
-                to_delete.push(key_bytes.to_vec());
-            }
-        }
-        drop(view);
-
-        let count = to_delete.len();
-        if !to_delete.is_empty() {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::GossipSignatures, to_delete)
-                .expect("delete");
-            batch.commit().expect("commit");
-        }
-        count
+        self.prune_by_slot(Table::GossipSignatures, finalized_slot, |bytes| {
+            StoredSignature::from_ssz_bytes(bytes).ok().map(|s| s.slot)
+        })
     }
 
     /// Prune attestation data by root for slots <= finalized_slot.
     ///
     /// Returns the number of entries pruned.
     pub fn prune_attestation_data_by_root(&mut self, finalized_slot: u64) -> usize {
-        let view = self.backend.begin_read().expect("read view");
-        let mut to_delete = vec![];
-
-        for (key_bytes, value_bytes) in view
-            .prefix_iterator(Table::AttestationDataByRoot, &[])
-            .expect("iter")
-            .filter_map(|r| r.ok())
-        {
-            if let Ok(data) = AttestationData::from_ssz_bytes(&value_bytes)
-                && data.slot <= finalized_slot
-            {
-                to_delete.push(key_bytes.to_vec());
-            }
-        }
-        drop(view);
-
-        let count = to_delete.len();
-        if !to_delete.is_empty() {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::AttestationDataByRoot, to_delete)
-                .expect("delete");
-            batch.commit().expect("commit");
-        }
-        count
+        self.prune_by_slot(Table::AttestationDataByRoot, finalized_slot, |bytes| {
+            AttestationData::from_ssz_bytes(bytes).ok().map(|d| d.slot)
+        })
     }
 
     /// Prune an aggregated payload table (new or known) for slots <= finalized_slot.
@@ -690,12 +646,12 @@ impl Store {
     /// (by slot).
     pub fn extract_latest_attestations(
         &self,
-        payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
+        keys: impl Iterator<Item = SignatureKey>,
     ) -> HashMap<u64, AttestationData> {
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
         let mut data_cache: HashMap<H256, Option<AttestationData>> = HashMap::new();
 
-        for ((validator_id, data_root), _payload_list) in payloads {
+        for (validator_id, data_root) in keys {
             let data = data_cache
                 .entry(data_root)
                 .or_insert_with(|| self.get_attestation_data_by_root(&data_root));
@@ -719,7 +675,7 @@ impl Store {
     /// Convenience: extract latest attestation per validator from known
     /// (fork-choice-active) aggregated payloads only.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.extract_latest_attestations(self.iter_known_aggregated_payloads())
+        self.extract_latest_attestations(self.iter_known_aggregated_payloads().map(|(key, _)| key))
     }
 
     // ============ Known Aggregated Payloads ============
@@ -743,6 +699,14 @@ impl Store {
         self.insert_aggregated_payload(Table::LatestKnownAggregatedPayloads, key, payload);
     }
 
+    /// Batch-insert multiple aggregated payloads into the known table in a single commit.
+    pub fn insert_known_aggregated_payloads_batch(
+        &mut self,
+        entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
+    ) {
+        self.insert_aggregated_payloads_batch(Table::LatestKnownAggregatedPayloads, entries);
+    }
+
     // ============ New Aggregated Payloads ============
     //
     // "New" aggregated payloads are pending — not yet counted in fork choice.
@@ -762,6 +726,49 @@ impl Store {
         payload: StoredAggregatedPayload,
     ) {
         self.insert_aggregated_payload(Table::LatestNewAggregatedPayloads, key, payload);
+    }
+
+    /// Batch-insert multiple aggregated payloads into the new table in a single commit.
+    pub fn insert_new_aggregated_payloads_batch(
+        &mut self,
+        entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
+    ) {
+        self.insert_aggregated_payloads_batch(Table::LatestNewAggregatedPayloads, entries);
+    }
+
+    // ============ Pruning Helpers ============
+
+    /// Prune entries from a table where the slot (extracted via `get_slot`) is <= `finalized_slot`.
+    /// Returns the number of entries pruned.
+    fn prune_by_slot(
+        &mut self,
+        table: Table,
+        finalized_slot: u64,
+        get_slot: impl Fn(&[u8]) -> Option<u64>,
+    ) -> usize {
+        let view = self.backend.begin_read().expect("read view");
+        let mut to_delete = vec![];
+
+        for (key_bytes, value_bytes) in view
+            .prefix_iterator(table, &[])
+            .expect("iter")
+            .filter_map(|r| r.ok())
+        {
+            if let Some(slot) = get_slot(&value_bytes)
+                && slot <= finalized_slot
+            {
+                to_delete.push(key_bytes.to_vec());
+            }
+        }
+        drop(view);
+
+        let count = to_delete.len();
+        if !to_delete.is_empty() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch.delete_batch(table, to_delete).expect("delete");
+            batch.commit().expect("commit");
+        }
+        count
     }
 
     // ============ Aggregated Payload Helpers ============
@@ -791,22 +798,45 @@ impl Store {
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        let encoded_key = encode_signature_key(&key);
+        self.insert_aggregated_payloads_batch(table, vec![(key, payload)]);
+    }
+
+    /// Batch-insert multiple aggregated payloads in a single read-write-commit cycle.
+    /// Groups entries by key to correctly handle multiple payloads for the same key.
+    fn insert_aggregated_payloads_batch(
+        &mut self,
+        table: Table,
+        entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+
+        // Group entries by key to handle multiple payloads for the same key
+        let mut grouped: HashMap<Vec<u8>, Vec<StoredAggregatedPayload>> = HashMap::new();
+        for (key, payload) in entries {
+            let encoded_key = encode_signature_key(&key);
+            grouped.entry(encoded_key).or_default().push(payload);
+        }
+
         let view = self.backend.begin_read().expect("read view");
-        let mut payloads: Vec<StoredAggregatedPayload> = view
-            .get(table, &encoded_key)
-            .expect("get")
-            .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
-            .unwrap_or_default();
+        let mut batch_entries = Vec::new();
+
+        for (encoded_key, new_payloads) in grouped {
+            let mut payloads: Vec<StoredAggregatedPayload> = view
+                .get(table, &encoded_key)
+                .expect("get")
+                .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
+                .unwrap_or_default();
+            payloads.extend(new_payloads);
+            batch_entries.push((encoded_key, payloads.as_ssz_bytes()));
+        }
         drop(view);
 
-        payloads.push(payload);
-
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encoded_key, payloads.as_ssz_bytes())];
         batch
-            .put_batch(table, entries)
-            .expect("put aggregated payload");
+            .put_batch(table, batch_entries)
+            .expect("put aggregated payloads");
         batch.commit().expect("commit");
     }
 

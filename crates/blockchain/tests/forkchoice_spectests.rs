@@ -284,8 +284,12 @@ fn validate_attestation_check(
     let location = check.location.as_str();
 
     let attestations: HashMap<u64, AttestationData> = match location {
-        "new" => st.extract_latest_attestations(st.iter_new_aggregated_payloads()),
-        "known" => st.extract_latest_attestations(st.iter_known_aggregated_payloads()),
+        "new" => {
+            st.extract_latest_attestations(st.iter_new_aggregated_payloads().map(|(key, _)| key))
+        }
+        "known" => {
+            st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key))
+        }
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -366,7 +370,7 @@ fn validate_lexicographic_head_among(
 
     let blocks = st.get_live_chain();
     let known_attestations: HashMap<u64, AttestationData> =
-        st.extract_latest_attestations(st.iter_known_aggregated_payloads());
+        st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key));
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)
