@@ -695,7 +695,11 @@ impl Store {
     /// Convenience: extract latest attestation per validator from known
     /// (fork-choice-active) aggregated payloads only.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.extract_latest_attestations(self.iter_known_aggregated_payloads().map(|(key, _)| key))
+        self.extract_latest_attestations(
+            self.iter_known_aggregated_payloads()
+                .into_iter()
+                .map(|(key, _)| key),
+        )
     }
 
     // ============ Known Aggregated Payloads ============
@@ -703,10 +707,10 @@ impl Store {
     // "Known" aggregated payloads are active in fork choice weight calculations.
     // Promoted from "new" payloads at specific intervals (0 with proposal, 4).
 
-    /// Iterates over all known aggregated payloads.
+    /// Returns all known aggregated payloads.
     pub fn iter_known_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
         self.iter_aggregated_payloads(Table::LatestKnownAggregatedPayloads)
     }
 
@@ -738,10 +742,10 @@ impl Store {
     // "New" aggregated payloads are pending — not yet counted in fork choice.
     // Promoted to "known" via `promote_new_aggregated_payloads`.
 
-    /// Iterates over all new (pending) aggregated payloads.
+    /// Returns all new (pending) aggregated payloads.
     pub fn iter_new_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
         self.iter_aggregated_payloads(Table::LatestNewAggregatedPayloads)
     }
 
@@ -808,10 +812,9 @@ impl Store {
     fn iter_aggregated_payloads(
         &self,
         table: Table,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
         let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(table, &[])
+        view.prefix_iterator(table, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
@@ -820,8 +823,7 @@ impl Store {
                     Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
                 (key, payloads)
             })
-            .collect();
-        entries.into_iter()
+            .collect()
     }
 
     fn iter_aggregated_payload_keys(&self, table: Table) -> impl Iterator<Item = SignatureKey> {
@@ -949,13 +951,10 @@ impl Store {
     // Gossip signatures are individual validator signatures received via P2P.
     // They're aggregated into proofs for block signature verification.
 
-    /// Iterates over all gossip signatures.
-    pub fn iter_gossip_signatures(
-        &self,
-    ) -> impl Iterator<Item = (SignatureKey, StoredSignature)> + '_ {
+    /// Returns all gossip signatures.
+    pub fn iter_gossip_signatures(&self) -> Vec<(SignatureKey, StoredSignature)> {
         let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::GossipSignatures, &[])
+        view.prefix_iterator(Table::GossipSignatures, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .filter_map(|(k, v)| {
@@ -964,8 +963,7 @@ impl Store {
                     .ok()
                     .map(|stored| (key, stored))
             })
-            .collect();
-        entries.into_iter()
+            .collect()
     }
 
     /// Stores a gossip signature for later aggregation.

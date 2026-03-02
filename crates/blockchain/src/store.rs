@@ -117,7 +117,7 @@ fn update_safe_target(store: &mut Store) {
 /// Collects individual gossip signatures, aggregates them by attestation data,
 /// and stores the resulting proofs in `LatestNewAggregatedPayloads`.
 fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
-    let gossip_sigs: Vec<(SignatureKey, _)> = store.iter_gossip_signatures().collect();
+    let gossip_sigs = store.iter_gossip_signatures();
     if gossip_sigs.is_empty() {
         return Vec::new();
     }
@@ -765,7 +765,7 @@ pub fn produce_block_with_signatures(
     }
 
     // Single pass over known aggregated payloads: extract both attestation data and proofs
-    let known_payloads: Vec<_> = store.iter_known_aggregated_payloads().collect();
+    let known_payloads = store.iter_known_aggregated_payloads();
 
     let known_attestations =
         store.extract_latest_attestations(known_payloads.iter().map(|(key, _)| *key));
