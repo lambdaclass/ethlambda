@@ -1,6 +1,6 @@
 use axum::{http::HeaderValue, http::header, response::IntoResponse};
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::H256;
+use ethlambda_types::{checkpoint::Checkpoint, primitives::H256};
 use serde::Serialize;
 
 use crate::json_response;
@@ -12,8 +12,8 @@ const FORK_CHOICE_HTML: &str = include_str!("../static/fork_choice.html");
 pub struct ForkChoiceResponse {
     nodes: Vec<ForkChoiceNode>,
     head: H256,
-    justified: CheckpointInfo,
-    finalized: CheckpointInfo,
+    justified: Checkpoint,
+    finalized: Checkpoint,
     safe_target: H256,
     validator_count: u64,
 }
@@ -25,12 +25,6 @@ pub struct ForkChoiceNode {
     parent_root: H256,
     proposer_index: u64,
     weight: u64,
-}
-
-#[derive(Serialize)]
-pub struct CheckpointInfo {
-    root: H256,
-    slot: u64,
 }
 
 pub async fn get_fork_choice(
@@ -72,14 +66,8 @@ pub async fn get_fork_choice(
     let response = ForkChoiceResponse {
         nodes,
         head,
-        justified: CheckpointInfo {
-            root: justified.root,
-            slot: justified.slot,
-        },
-        finalized: CheckpointInfo {
-            root: finalized.root,
-            slot: finalized.slot,
-        },
+        justified,
+        finalized,
         safe_target,
         validator_count,
     };
