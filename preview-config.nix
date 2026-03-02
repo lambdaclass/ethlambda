@@ -9,8 +9,8 @@
 # Each node runs as a separate systemd service with its own QUIC port, metrics
 # endpoint, and RocksDB data directory.
 #
-# The setup service builds ethlambda via `nix build github:lambdaclass/ethlambda/$BRANCH`
-# at container start, so previews always run the exact binary from the branch under review.
+# The ethlambda binary is built from the PR branch at Nix eval time via builtins.getFlake,
+# so the container image always contains the exact binary from the branch under review.
 # PREVIEW_BRANCH is available at runtime via /etc/preview.env (injected by tekton).
 #
 # Ports:
@@ -26,7 +26,7 @@
 
 let
   meta = {
-    # Oneshot service that clones, builds, and generates genesis.
+    # Oneshot service that generates genesis state for the devnet.
     setupService = "setup-devnet";
 
     # Long-running ethlambda node services started after setup completes.
@@ -58,14 +58,17 @@ let
     extraHosts = [];
   };
 
+  # Build ethlambda from the current repo at eval time (requires --impure).
+  # tekton evaluates preview-config.nix from the cloned PR branch, so path:.
+  # resolves to the branch under review — the container always runs that branch's binary.
+  ethlambdaPkg = (builtins.getFlake "path:.").packages.x86_64-linux.ethlambda;
+
   # Paths used throughout the config
-  appDir       = "/home/preview/app";
   quickstartDir = "/home/preview/lean-quickstart";
   genesisDir   = "/home/preview/devnet/genesis";
   dataDir      = "/home/preview/devnet/data";
 
-  # nix build outputs a store path symlinked at appDir; binary is at bin/ethlambda
-  binaryPath = "${appDir}/bin/ethlambda";
+  binaryPath = "${ethlambdaPkg}/bin/ethlambda";
 
   # Helper: create a systemd service for ethlambda node N.
   # Node 0 runs with --is-aggregator so the devnet can finalize blocks:
@@ -141,12 +144,12 @@ in
   '';
 
   # ── Setup service ─────────────────────────────────────────────────────
-  # Builds ethlambda via `nix build github:lambdaclass/ethlambda/$PREVIEW_BRANCH`,
-  # clones lean-quickstart, generates genesis for the 4-node devnet, and creates
-  # per-node data directories.
+  # Clones lean-quickstart, generates genesis for the 4-node devnet, and creates
+  # per-node data directories. The ethlambda binary is already in the container
+  # image (built from path:. via builtins.getFlake at eval time).
   systemd.services = {
     setup-devnet = {
-      description = "Setup ethlambda 4-node devnet (nix build, genesis)";
+      description = "Setup ethlambda 4-node devnet (genesis)";
       after = [ "systemd-resolved.service" "network-online.target" ];
       wants = [ "systemd-resolved.service" "network-online.target" ];
       before = map (idx: "ethlambda-${toString idx}.service") [ 0 1 2 3 ];
@@ -161,7 +164,7 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         WorkingDirectory = "/home/preview";
-        TimeoutStartSec = "900"; # nix build compiles ethlambda from source on first run
+        TimeoutStartSec = "300"; # genesis generation (podman image pull + XMSS key gen)
       };
       script = ''
         set -euo pipefail
@@ -175,10 +178,11 @@ in
         source /etc/preview.env
         set +a
 
-        # On container restart, skip setup if the binary and genesis already exist.
-        # Touch /tmp/force-rebuild to force a full rebuild on 'preview update'.
-        if [ -f "${binaryPath}" ] \
-           && [ -d "${genesisDir}/hash-sig-keys" ] \
+        # On container restart, skip setup if genesis already exists.
+        # Touch /tmp/force-rebuild to force re-genesis on 'preview update'.
+        # (The ethlambda binary is baked into the container image at eval time —
+        # no runtime build needed.)
+        if [ -d "${genesisDir}/hash-sig-keys" ] \
            && [ -f "${genesisDir}/config.yaml" ] \
            && [ ! -f /tmp/force-rebuild ]; then
           echo "Devnet already set up, skipping (container restart)."
@@ -189,32 +193,14 @@ in
         # and a new genesis state, so any existing chain state is incompatible.
         rm -rf "${genesisDir}" "${dataDir}"
 
-        # ── 1. Build ethlambda via nix build ──
-        # Fetches the flake from GitHub and builds the ethlambda binary.
-        # crane's two-phase build (buildDepsOnly + buildPackage) means Rust
-        # dependencies are a separate derivation: once compiled they stay in
-        # /nix/store and only ethlambda itself needs recompiling on branch updates.
-        PREVIEW_TOKEN=$(cat /etc/preview-token 2>/dev/null || echo "")
-        echo "Building ethlambda (branch: $PREVIEW_BRANCH) via nix build..."
-        nix build "github:lambdaclass/ethlambda/$PREVIEW_BRANCH" \
-          --out-link "${appDir}" \
-          --extra-experimental-features "nix-command flakes" \
-          --option access-tokens "github.com=$PREVIEW_TOKEN"
-
-        if [ ! -f "${binaryPath}" ]; then
-          echo "ERROR: Binary not found after nix build"
-          exit 1
-        fi
-        echo "Build complete: ${binaryPath}"
-
-        # ── 2. Clone lean-quickstart (for genesis generation scripts) ──
+        # ── 1. Clone lean-quickstart (for genesis generation scripts) ──
         if [ ! -d "${quickstartDir}/.git" ]; then
           echo "Cloning lean-quickstart..."
           git clone --depth 1 --single-branch \
             https://github.com/blockblaz/lean-quickstart.git "${quickstartDir}"
         fi
 
-        # ── 3. Write 4-node ethlambda-only validator config ──
+        # ── 2. Write 4-node ethlambda-only validator config ──
         # Four ethlambda nodes, each with 1 validator, on localhost with
         # unique QUIC and metrics ports. The privkeys below are secp256k1
         # P2P identity keys reused from the standard devnet config — they are
@@ -262,7 +248,7 @@ validators:
     count: 1
 VCEOF
 
-        # ── 4. Generate genesis ──
+        # ── 3. Generate genesis ──
         # Runs lean-quickstart's genesis generator which uses container images to:
         #   1. Generate XMSS key pairs (hash-sig-cli)
         #   2. Generate genesis state (eth-beacon-genesis)
@@ -281,7 +267,7 @@ VCEOF
           fi
         done
 
-        # ── 5. Create per-node data directories ──
+        # ── 4. Create per-node data directories ──
         for i in 0 1 2 3; do
           mkdir -p "${dataDir}/ethlambda_$i"
         done
@@ -330,13 +316,6 @@ VCEOF
     htop    # Useful for debugging resource usage
     podman  # For genesis tool access via SSH
   ];
-
-  # nix build inside systemd-nspawn containers cannot create nested namespaces,
-  # so the nix sandbox must be disabled. Flakes are needed for `nix build github:...`.
-  nix.settings = {
-    experimental-features = [ "nix-command" "flakes" ];
-    sandbox = false;
-  };
 
   system.stateVersion = "24.11";
 }
