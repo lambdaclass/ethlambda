@@ -313,11 +313,10 @@ mod tests {
     }
 
     // ── Cross-client XMSS compatibility tests (ream) ────────────────────
-    //
     // Verify that signatures produced by the ream client (Rust) can be
-    // decoded and verified by ethlambda. Test vectors come from
-    // leanSpec PR #433.
-
+    // decoded and verified by ethlambda.
+    // Test vectors were produced by ream (epoch 5, all-zeros message) and
+    // are also used in leanSpec PR #433 for Python-side cross-client testing.
     /// 52-byte XMSS public key produced by ream.
     const REAM_PUBLIC_KEY_HEX: &str = "7bbaf95bd653c827b5775e00b973b24d50ab4743db3373244f29c95fdf4ccc628788ba2b5b9d635acdb25770e8ceef66bfdecd0a";
 
