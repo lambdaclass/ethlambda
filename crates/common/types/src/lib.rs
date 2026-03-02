@@ -1,5 +1,6 @@
 pub mod attestation;
 pub mod block;
+pub mod checkpoint;
 pub mod genesis;
 pub mod primitives;
 pub mod signature;

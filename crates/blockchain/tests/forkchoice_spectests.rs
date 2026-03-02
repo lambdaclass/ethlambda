@@ -5,34 +5,13 @@ use std::{
 };
 
 use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
-use ethlambda_storage::{SignatureKey, Store, StoredAggregatedPayload, backend::InMemoryBackend};
+use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{Attestation, AttestationData},
     block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     primitives::{H256, VariableList, ssz::TreeHash},
     state::State,
 };
-
-/// Extract per-validator attestation data from aggregated payloads.
-/// Test helper that mirrors the private function in blockchain::store.
-fn extract_attestations(
-    store: &Store,
-    payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
-) -> HashMap<u64, AttestationData> {
-    let mut result: HashMap<u64, AttestationData> = HashMap::new();
-    for ((validator_id, data_root), _) in payloads {
-        let Some(data) = store.get_attestation_data_by_root(&data_root) else {
-            continue;
-        };
-        let should_update = result
-            .get(&validator_id)
-            .is_none_or(|existing| existing.slot < data.slot);
-        if should_update {
-            result.insert(validator_id, data);
-        }
-    }
-    result
-}
 
 use crate::types::{ForkChoiceTestVector, StoreChecks};
 
@@ -305,8 +284,12 @@ fn validate_attestation_check(
     let location = check.location.as_str();
 
     let attestations: HashMap<u64, AttestationData> = match location {
-        "new" => extract_attestations(st, st.iter_new_aggregated_payloads()),
-        "known" => extract_attestations(st, st.iter_known_aggregated_payloads()),
+        "new" => {
+            st.extract_latest_attestations(st.iter_new_aggregated_payloads().map(|(key, _)| key))
+        }
+        "known" => {
+            st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key))
+        }
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -387,7 +370,7 @@ fn validate_lexicographic_head_among(
 
     let blocks = st.get_live_chain();
     let known_attestations: HashMap<u64, AttestationData> =
-        extract_attestations(st, st.iter_known_aggregated_payloads());
+        st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key));
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)
