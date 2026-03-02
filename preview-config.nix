@@ -157,7 +157,7 @@ in
         bash coreutils
         # Genesis generation (generate-genesis.sh needs these)
         yq-go podman
-        gawk gnugrep gnused which
+        gawk gnugrep gnused which shadow
         (writeShellScriptBin "docker" ''exec podman "$@"'')
       ];
       serviceConfig = {
@@ -275,7 +275,9 @@ VCEOF
     home = "/home/preview";
     group = "preview";
     shell = pkgs.bash;
-    extraGroups = []; # Podman rootless needs no special groups
+    extraGroups = [];
+    subUidRanges = [{ startUid = 100000; count = 65536; }];
+    subGidRanges = [{ startGid = 100000; count = 65536; }];
   };
 
   users.groups.preview = {};
