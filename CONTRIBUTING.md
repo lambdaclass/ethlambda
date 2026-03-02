@@ -6,7 +6,7 @@ Before diving in, we recommend reading [our introductory blog post](https://blog
 
 ## Philosophy
 
-ethlambda follows the [LambdaClass work ethos](https://blog.lambdaclass.com/): simplicity is not the opposite of capability, but its foundation. Every contribution should uphold this.
+ethlambda follows the [LambdaClass work ethos](https://blog.lambdaclass.com/lambdas-engineering-philosophy/): simplicity is not the opposite of capability, but its foundation. Every contribution should uphold this.
 
 - **Lines of code matter.** We track LoC. ethlambda targets staying under a strict limit. If you can remove lines without losing clarity, do it.
 - **Vertical integration.** Flat structure, self-explanatory crates. If you can't explain a module in one sentence, it's doing too much.
