@@ -631,6 +631,22 @@ impl Store {
         batch.commit().expect("commit");
     }
 
+    /// Batch-insert multiple attestation data entries in a single commit.
+    pub fn insert_attestation_data_by_root_batch(&mut self, entries: Vec<(H256, AttestationData)>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut batch = self.backend.begin_write().expect("write batch");
+        let ssz_entries = entries
+            .into_iter()
+            .map(|(root, data)| (root.as_ssz_bytes(), data.as_ssz_bytes()))
+            .collect();
+        batch
+            .put_batch(Table::AttestationDataByRoot, ssz_entries)
+            .expect("put attestation data batch");
+        batch.commit().expect("commit");
+    }
+
     /// Returns attestation data for the given root hash.
     pub fn get_attestation_data_by_root(&self, root: &H256) -> Option<AttestationData> {
         let view = self.backend.begin_read().expect("read view");
@@ -690,6 +706,12 @@ impl Store {
         self.iter_aggregated_payloads(Table::LatestKnownAggregatedPayloads)
     }
 
+    /// Iterates over keys only from the known aggregated payloads table,
+    /// skipping value deserialization.
+    pub fn iter_known_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
+        self.iter_aggregated_payload_keys(Table::LatestKnownAggregatedPayloads)
+    }
+
     /// Insert an aggregated payload into the known (fork-choice-active) table.
     pub fn insert_known_aggregated_payload(
         &mut self,
@@ -717,6 +739,12 @@ impl Store {
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
         self.iter_aggregated_payloads(Table::LatestNewAggregatedPayloads)
+    }
+
+    /// Iterates over keys only from the new aggregated payloads table,
+    /// skipping value deserialization.
+    pub fn iter_new_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
+        self.iter_aggregated_payload_keys(Table::LatestNewAggregatedPayloads)
     }
 
     /// Insert an aggregated payload into the new (pending) table.
@@ -790,6 +818,17 @@ impl Store {
             })
             .collect();
         entries.into_iter()
+    }
+
+    fn iter_aggregated_payload_keys(&self, table: Table) -> impl Iterator<Item = SignatureKey> {
+        let view = self.backend.begin_read().expect("read view");
+        let keys: Vec<_> = view
+            .prefix_iterator(table, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(k, _)| decode_signature_key(&k))
+            .collect();
+        keys.into_iter()
     }
 
     fn insert_aggregated_payload(

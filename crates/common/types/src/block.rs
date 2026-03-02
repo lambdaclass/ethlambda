@@ -2,7 +2,9 @@ use serde::Serialize;
 use ssz_types::typenum::U1048576;
 
 use crate::{
-    attestation::{AggregatedAttestation, AggregationBits, Attestation, XmssSignature},
+    attestation::{
+        AggregatedAttestation, AggregationBits, Attestation, XmssSignature, validator_indices,
+    },
     primitives::{
         ByteList, H256,
         ssz::{Decode, Encode, TreeHash},
@@ -105,9 +107,7 @@ impl AggregatedSignatureProof {
 
     /// Returns the validator indices that are set in the participants bitfield.
     pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..self.participants.len())
-            .filter(|&i| self.participants.get(i).unwrap_or(false))
-            .map(|i| i as u64)
+        validator_indices(&self.participants)
     }
 }
 
