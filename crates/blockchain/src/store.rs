@@ -145,7 +145,6 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         };
 
         let slot = data.slot;
-        let message = data.tree_hash_root();
 
         let mut sigs = vec![];
         let mut pubkeys = vec![];
@@ -167,7 +166,8 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             continue;
         }
 
-        let Ok(proof_data) = aggregate_signatures(pubkeys, sigs, &message, slot as u32)
+        // data_root is already the tree_hash_root of the attestation data
+        let Ok(proof_data) = aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
             .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures"))
         else {
             continue;
@@ -378,7 +378,7 @@ pub fn on_gossip_attestation(
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
     // Store gossip signature for later aggregation at interval 2.
-    store.insert_gossip_signature(&attestation.data, validator_id, signature);
+    store.insert_gossip_signature(data_root, attestation.data.slot, validator_id, signature);
 
     metrics::inc_attestations_valid("gossip");
 
@@ -431,19 +431,18 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let message = aggregated.data.tree_hash_root();
+    let data_root = aggregated.data.tree_hash_root();
     let epoch: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     ethlambda_crypto::verify_aggregated_signature(
         &aggregated.proof.proof_data,
         pubkeys,
-        &message,
+        &data_root,
         epoch,
     )
     .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Store attestation data by root (content-addressed, idempotent)
-    let data_root = aggregated.data.tree_hash_root();
     store.insert_attestation_data_by_root(data_root, aggregated.data.clone());
 
     // Store one aggregated payload per participating validator
@@ -531,8 +530,6 @@ fn on_block_core(
 
     let block = signed_block.message.block.clone();
     let proposer_attestation = signed_block.message.proposer_attestation.clone();
-    let block_root = block.tree_hash_root();
-    let slot = block.slot;
 
     // Execute state transition function to compute post-block state
     let mut post_state = parent_state;
@@ -607,7 +604,12 @@ fn on_block_core(
         let proposer_sig =
             ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(&proposer_attestation.data, proposer_vid, proposer_sig);
+        store.insert_gossip_signature(
+            proposer_data_root,
+            proposer_attestation.data.slot,
+            proposer_vid,
+            proposer_sig,
+        );
     }
 
     info!(%slot, %block_root, %state_root, "Processed new block");
@@ -748,8 +750,14 @@ pub fn produce_block_with_signatures(
         });
     }
 
-    // Convert known aggregated payloads to Attestation objects for build_block
-    let known_attestations = store.extract_latest_known_attestations();
+    // Single pass over known aggregated payloads: extract both attestation data and proofs
+    let known_payloads: Vec<_> = store.iter_known_aggregated_payloads().collect();
+
+    let known_attestations = store.extract_latest_attestations(
+        known_payloads
+            .iter()
+            .map(|(key, payloads)| (*key, payloads.clone())),
+    );
     let available_attestations: Vec<Attestation> = known_attestations
         .into_iter()
         .map(|(validator_id, data)| Attestation { validator_id, data })
@@ -758,9 +766,9 @@ pub fn produce_block_with_signatures(
     // Get known block roots for attestation validation
     let known_block_roots = store.get_block_roots();
 
-    // Collect existing proofs for block building from known aggregated payloads
-    let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> = store
-        .iter_known_aggregated_payloads()
+    // Collect existing proofs for block building from the already-fetched payloads
+    let aggregated_payloads: HashMap<SignatureKey, Vec<AggregatedSignatureProof>> = known_payloads
+        .into_iter()
         .map(|(key, stored_payloads)| {
             let proofs = stored_payloads.into_iter().map(|sp| sp.proof).collect();
             (key, proofs)

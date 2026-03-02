@@ -692,9 +692,14 @@ impl Store {
         payloads: impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)>,
     ) -> HashMap<u64, AttestationData> {
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
+        let mut data_cache: HashMap<H256, Option<AttestationData>> = HashMap::new();
 
         for ((validator_id, data_root), _payload_list) in payloads {
-            let Some(data) = self.get_attestation_data_by_root(&data_root) else {
+            let data = data_cache
+                .entry(data_root)
+                .or_insert_with(|| self.get_attestation_data_by_root(&data_root));
+
+            let Some(data) = data else {
                 continue;
             };
 
@@ -703,7 +708,7 @@ impl Store {
                 .is_none_or(|existing| existing.slot < data.slot);
 
             if should_update {
-                result.insert(validator_id, data);
+                result.insert(validator_id, data.clone());
             }
         }
 
@@ -725,19 +730,7 @@ impl Store {
     pub fn iter_known_aggregated_payloads(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestKnownAggregatedPayloads, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let key = decode_signature_key(&k);
-                let payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
-                (key, payloads)
-            })
-            .collect();
-        entries.into_iter()
+        self.iter_aggregated_payloads(Table::LatestKnownAggregatedPayloads)
     }
 
     /// Insert an aggregated payload into the known (fork-choice-active) table.
@@ -746,23 +739,7 @@ impl Store {
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        let encoded_key = encode_signature_key(&key);
-        let view = self.backend.begin_read().expect("read view");
-        let mut payloads: Vec<StoredAggregatedPayload> = view
-            .get(Table::LatestKnownAggregatedPayloads, &encoded_key)
-            .expect("get")
-            .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
-            .unwrap_or_default();
-        drop(view);
-
-        payloads.push(payload);
-
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encoded_key, payloads.as_ssz_bytes())];
-        batch
-            .put_batch(Table::LatestKnownAggregatedPayloads, entries)
-            .expect("put known aggregated payload");
-        batch.commit().expect("commit");
+        self.insert_aggregated_payload(Table::LatestKnownAggregatedPayloads, key, payload);
     }
 
     // ============ New Aggregated Payloads ============
@@ -774,9 +751,27 @@ impl Store {
     pub fn iter_new_aggregated_payloads(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
+        self.iter_aggregated_payloads(Table::LatestNewAggregatedPayloads)
+    }
+
+    /// Insert an aggregated payload into the new (pending) table.
+    pub fn insert_new_aggregated_payload(
+        &mut self,
+        key: SignatureKey,
+        payload: StoredAggregatedPayload,
+    ) {
+        self.insert_aggregated_payload(Table::LatestNewAggregatedPayloads, key, payload);
+    }
+
+    // ============ Aggregated Payload Helpers ============
+
+    fn iter_aggregated_payloads(
+        &self,
+        table: Table,
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
         let view = self.backend.begin_read().expect("read view");
         let entries: Vec<_> = view
-            .prefix_iterator(Table::LatestNewAggregatedPayloads, &[])
+            .prefix_iterator(table, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
             .map(|(k, v)| {
@@ -789,16 +784,16 @@ impl Store {
         entries.into_iter()
     }
 
-    /// Insert an aggregated payload into the new (pending) table.
-    pub fn insert_new_aggregated_payload(
+    fn insert_aggregated_payload(
         &mut self,
+        table: Table,
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
         let encoded_key = encode_signature_key(&key);
         let view = self.backend.begin_read().expect("read view");
         let mut payloads: Vec<StoredAggregatedPayload> = view
-            .get(Table::LatestNewAggregatedPayloads, &encoded_key)
+            .get(table, &encoded_key)
             .expect("get")
             .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
             .unwrap_or_default();
@@ -809,8 +804,8 @@ impl Store {
         let mut batch = self.backend.begin_write().expect("write batch");
         let entries = vec![(encoded_key, payloads.as_ssz_bytes())];
         batch
-            .put_batch(Table::LatestNewAggregatedPayloads, entries)
-            .expect("put new aggregated payload");
+            .put_batch(table, entries)
+            .expect("put aggregated payload");
         batch.commit().expect("commit");
     }
 
@@ -902,12 +897,11 @@ impl Store {
     /// Stores a gossip signature for later aggregation.
     pub fn insert_gossip_signature(
         &mut self,
-        attestation_data: &AttestationData,
+        data_root: H256,
+        slot: u64,
         validator_id: u64,
         signature: ValidatorSignature,
     ) {
-        let slot = attestation_data.slot;
-        let data_root = attestation_data.tree_hash_root();
         let key = (validator_id, data_root);
 
         let stored = StoredSignature::new(slot, signature);

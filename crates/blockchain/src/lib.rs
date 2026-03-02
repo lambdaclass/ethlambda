@@ -179,7 +179,7 @@ impl BlockChainServer {
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
-        // Update head slot metric (head may change when attestations are promoted at intervals 0/3)
+        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
     }
 

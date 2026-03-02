@@ -101,37 +101,11 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
-    use ethlambda_types::{
-        block::{BlockBody, BlockHeader},
-        primitives::ssz::TreeHash,
-        state::{ChainConfig, Checkpoint, JustificationValidators, JustifiedSlots, State},
-    };
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    fn create_test_state() -> State {
-        let genesis_header = BlockHeader {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body_root: BlockBody::default().tree_hash_root(),
-        };
-
-        State {
-            config: ChainConfig { genesis_time: 1000 },
-            slot: 0,
-            latest_block_header: genesis_header,
-            latest_justified: Checkpoint::default(),
-            latest_finalized: Checkpoint::default(),
-            historical_block_hashes: Default::default(),
-            justified_slots: JustifiedSlots::with_capacity(0).unwrap(),
-            validators: Default::default(),
-            justifications_roots: Default::default(),
-            justifications_validators: JustificationValidators::with_capacity(0).unwrap(),
-        }
-    }
+    use crate::test_utils::create_test_state;
 
     fn build_test_router(store: Store) -> Router {
         Router::new()
