@@ -32,7 +32,11 @@
 
           commonArgs = {
             pname = "ethlambda";
-            src = craneLib.cleanCargoSource ./.;
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                (craneLib.filterCargoSources path type) || (builtins.match ".*\\.html$" path != null);
+            };
             strictDeps = true;
 
             nativeBuildInputs = with pkgs; [
