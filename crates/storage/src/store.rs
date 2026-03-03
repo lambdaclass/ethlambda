@@ -90,6 +90,10 @@ const _: () = assert!(
     "BLOCKS_TO_KEEP must be >= STATES_TO_KEEP"
 );
 
+/// Periodic fallback pruning interval: prune old blocks/states every N slots
+/// even if finalization hasn't advanced. Set to 7200 slots (~8 hours at 4s/slot).
+pub const PRUNING_FALLBACK_INTERVAL_SLOTS: u64 = 7200;
+
 // ============ Key Encoding Helpers ============
 
 /// Encode a SignatureKey (validator_id, root) to bytes.
@@ -414,6 +418,21 @@ impl Store {
                     "Pruned finalized data"
                 );
             }
+        }
+    }
+
+    /// Fallback pruning for when finalization is stalled.
+    ///
+    /// Calls `prune_old_states` and `prune_old_blocks` with the current
+    /// finalized and justified roots as protected. This reuses the same
+    /// retention-window logic from `update_checkpoints`, but runs
+    /// independently of finalization advancement.
+    pub fn periodic_prune(&mut self) {
+        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
+        let pruned_states = self.prune_old_states(&protected_roots);
+        let pruned_blocks = self.prune_old_blocks(&protected_roots);
+        if pruned_states > 0 || pruned_blocks > 0 {
+            info!(pruned_states, pruned_blocks, "Periodic fallback pruning");
         }
     }
 
@@ -1390,5 +1409,115 @@ mod tests {
         assert_eq!(pruned, 3);
         assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
         assert!(has_key(backend.as_ref(), Table::States, &justified_root));
+    }
+
+    // ============ Periodic Pruning Tests ============
+
+    /// Set up finalized and justified checkpoints in metadata.
+    fn set_checkpoints(backend: &dyn StorageBackend, finalized: Checkpoint, justified: Checkpoint) {
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Metadata,
+                vec![
+                    (KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()),
+                    (KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()),
+                ],
+            )
+            .expect("put checkpoints");
+        batch.commit().expect("commit");
+    }
+
+    #[test]
+    fn periodic_prune_removes_old_states_and_blocks() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store {
+            backend: backend.clone(),
+        };
+
+        // Use roots that are within the retention window as finalized/justified
+        let finalized_root = root(0);
+        let justified_root = root(1);
+        set_checkpoints(
+            backend.as_ref(),
+            Checkpoint {
+                slot: 0,
+                root: finalized_root,
+            },
+            Checkpoint {
+                slot: 1,
+                root: justified_root,
+            },
+        );
+
+        // Insert more than STATES_TO_KEEP headers + states and BLOCKS_TO_KEEP blocks
+        let total_states = STATES_TO_KEEP + 5;
+        for i in 0..total_states as u64 {
+            insert_header(backend.as_ref(), root(i), i);
+            insert_state(backend.as_ref(), root(i));
+        }
+
+        assert_eq!(count_entries(backend.as_ref(), Table::States), total_states);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            total_states
+        );
+
+        // periodic_prune should prune states beyond STATES_TO_KEEP
+        // (protecting finalized and justified roots)
+        store.periodic_prune();
+
+        // States beyond retention should be pruned (5 excess - 2 protected = 3 pruned)
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::States),
+            STATES_TO_KEEP + 2
+        );
+        // Finalized and justified states must survive
+        assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
+        assert!(has_key(backend.as_ref(), Table::States, &justified_root));
+
+        // Blocks: total_states < BLOCKS_TO_KEEP, so no blocks should be pruned
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            total_states
+        );
+    }
+
+    #[test]
+    fn periodic_prune_no_op_within_retention() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store {
+            backend: backend.clone(),
+        };
+
+        set_checkpoints(
+            backend.as_ref(),
+            Checkpoint {
+                slot: 0,
+                root: root(0),
+            },
+            Checkpoint {
+                slot: 0,
+                root: root(0),
+            },
+        );
+
+        // Insert exactly STATES_TO_KEEP entries (no excess)
+        for i in 0..STATES_TO_KEEP as u64 {
+            insert_header(backend.as_ref(), root(i), i);
+            insert_state(backend.as_ref(), root(i));
+        }
+
+        store.periodic_prune();
+
+        // Nothing should be pruned
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::States),
+            STATES_TO_KEEP
+        );
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockHeaders),
+            STATES_TO_KEEP
+        );
     }
 }
