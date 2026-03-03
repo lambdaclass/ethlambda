@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// The tree hash root of an empty block body.
 ///
@@ -138,9 +138,15 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
 ///
 /// - [`from_anchor_state`](Self::from_anchor_state): Initialize from a checkpoint state (no block body)
 /// - [`get_forkchoice_store`](Self::get_forkchoice_store): Initialize from state + block (stores body)
+type AggregatedPayloadMap = HashMap<SignatureKey, Vec<StoredAggregatedPayload>>;
+
+/// Lock ordering invariant: always acquire `known_aggregated_payloads` before
+/// `new_aggregated_payloads` when both locks are needed, to prevent deadlocks.
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
+    known_aggregated_payloads: Arc<Mutex<AggregatedPayloadMap>>,
+    new_aggregated_payloads: Arc<Mutex<AggregatedPayloadMap>>,
 }
 
 impl Store {
@@ -276,7 +282,11 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self { backend }
+        Self {
+            backend,
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     // ============ Metadata Helpers ============
@@ -388,11 +398,9 @@ impl Store {
             // Prune signatures, payloads, and attestation data for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
             let pruned_att_data = self.prune_attestation_data_by_root(finalized.slot);
-            self.prune_aggregated_payload_table(Table::LatestNewAggregatedPayloads, finalized.slot);
-            self.prune_aggregated_payload_table(
-                Table::LatestKnownAggregatedPayloads,
-                finalized.slot,
-            );
+            // Lock ordering: known before new (field declaration order)
+            Self::prune_aggregated_payload_map(&self.known_aggregated_payloads, finalized.slot);
+            Self::prune_aggregated_payload_map(&self.new_aggregated_payloads, finalized.slot);
             // Prune old states before blocks: state pruning uses headers for slot lookup
             let protected_roots = [finalized.root, self.latest_justified().root];
             let pruned_states = self.prune_old_states(&protected_roots);
@@ -505,40 +513,13 @@ impl Store {
         })
     }
 
-    /// Prune an aggregated payload table (new or known) for slots <= finalized_slot.
-    fn prune_aggregated_payload_table(&mut self, table: Table, finalized_slot: u64) {
-        let view = self.backend.begin_read().expect("read view");
-        let mut updates = vec![];
-        let mut deletes = vec![];
-
-        for (key_bytes, value_bytes) in view
-            .prefix_iterator(table, &[])
-            .expect("iter")
-            .filter_map(|r| r.ok())
-        {
-            if let Ok(mut payloads) = Vec::<StoredAggregatedPayload>::from_ssz_bytes(&value_bytes) {
-                let original_len = payloads.len();
-                payloads.retain(|p| p.slot > finalized_slot);
-
-                if payloads.is_empty() {
-                    deletes.push(key_bytes.to_vec());
-                } else if payloads.len() < original_len {
-                    updates.push((key_bytes.to_vec(), payloads.as_ssz_bytes()));
-                }
-            }
-        }
-        drop(view);
-
-        if !updates.is_empty() || !deletes.is_empty() {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            if !updates.is_empty() {
-                batch.put_batch(table, updates).expect("put");
-            }
-            if !deletes.is_empty() {
-                batch.delete_batch(table, deletes).expect("delete");
-            }
-            batch.commit().expect("commit");
-        }
+    /// Prune an in-memory aggregated payload map for slots <= finalized_slot.
+    fn prune_aggregated_payload_map(map: &Mutex<AggregatedPayloadMap>, finalized_slot: u64) {
+        let mut guard = map.lock().expect("lock");
+        guard.retain(|_, payloads| {
+            payloads.retain(|p| p.slot > finalized_slot);
+            !payloads.is_empty()
+        });
     }
 
     /// Prune old states beyond the retention window.
@@ -822,7 +803,11 @@ impl Store {
     /// Convenience: extract latest attestation per validator from known
     /// (fork-choice-active) aggregated payloads only.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.extract_latest_attestations(self.iter_known_aggregated_payloads().map(|(key, _)| key))
+        self.extract_latest_attestations(
+            self.iter_known_aggregated_payloads()
+                .into_iter()
+                .map(|(key, _)| key),
+        )
     }
 
     // ============ Known Aggregated Payloads ============
@@ -830,34 +815,36 @@ impl Store {
     // "Known" aggregated payloads are active in fork choice weight calculations.
     // Promoted from "new" payloads at specific intervals (0 with proposal, 4).
 
-    /// Iterates over all known aggregated payloads.
+    /// Returns all known aggregated payloads.
     pub fn iter_known_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        self.iter_aggregated_payloads(Table::LatestKnownAggregatedPayloads)
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
+        Self::iter_aggregated_payloads_from(&self.known_aggregated_payloads)
     }
 
-    /// Iterates over keys only from the known aggregated payloads table,
-    /// skipping value deserialization.
-    pub fn iter_known_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
-        self.iter_aggregated_payload_keys(Table::LatestKnownAggregatedPayloads)
+    /// Returns keys from the known aggregated payloads map.
+    pub fn iter_known_aggregated_payload_keys(&self) -> Vec<SignatureKey> {
+        Self::iter_aggregated_payload_keys_from(&self.known_aggregated_payloads)
     }
 
-    /// Insert an aggregated payload into the known (fork-choice-active) table.
+    /// Insert an aggregated payload into the known (fork-choice-active) map.
     pub fn insert_known_aggregated_payload(
         &mut self,
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.insert_aggregated_payload(Table::LatestKnownAggregatedPayloads, key, payload);
+        Self::insert_aggregated_payloads_batch_to(
+            &self.known_aggregated_payloads,
+            vec![(key, payload)],
+        );
     }
 
-    /// Batch-insert multiple aggregated payloads into the known table in a single commit.
+    /// Batch-insert multiple aggregated payloads into the known map.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.insert_aggregated_payloads_batch(Table::LatestKnownAggregatedPayloads, entries);
+        Self::insert_aggregated_payloads_batch_to(&self.known_aggregated_payloads, entries);
     }
 
     // ============ New Aggregated Payloads ============
@@ -865,34 +852,36 @@ impl Store {
     // "New" aggregated payloads are pending — not yet counted in fork choice.
     // Promoted to "known" via `promote_new_aggregated_payloads`.
 
-    /// Iterates over all new (pending) aggregated payloads.
+    /// Returns all new (pending) aggregated payloads.
     pub fn iter_new_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        self.iter_aggregated_payloads(Table::LatestNewAggregatedPayloads)
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
+        Self::iter_aggregated_payloads_from(&self.new_aggregated_payloads)
     }
 
-    /// Iterates over keys only from the new aggregated payloads table,
-    /// skipping value deserialization.
-    pub fn iter_new_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
-        self.iter_aggregated_payload_keys(Table::LatestNewAggregatedPayloads)
+    /// Returns keys from the new aggregated payloads map.
+    pub fn iter_new_aggregated_payload_keys(&self) -> Vec<SignatureKey> {
+        Self::iter_aggregated_payload_keys_from(&self.new_aggregated_payloads)
     }
 
-    /// Insert an aggregated payload into the new (pending) table.
+    /// Insert an aggregated payload into the new (pending) map.
     pub fn insert_new_aggregated_payload(
         &mut self,
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.insert_aggregated_payload(Table::LatestNewAggregatedPayloads, key, payload);
+        Self::insert_aggregated_payloads_batch_to(
+            &self.new_aggregated_payloads,
+            vec![(key, payload)],
+        );
     }
 
-    /// Batch-insert multiple aggregated payloads into the new table in a single commit.
+    /// Batch-insert multiple aggregated payloads into the new map.
     pub fn insert_new_aggregated_payloads_batch(
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.insert_aggregated_payloads_batch(Table::LatestNewAggregatedPayloads, entries);
+        Self::insert_aggregated_payloads_batch_to(&self.new_aggregated_payloads, entries);
     }
 
     // ============ Pruning Helpers ============
@@ -932,130 +921,43 @@ impl Store {
 
     // ============ Aggregated Payload Helpers ============
 
-    fn iter_aggregated_payloads(
-        &self,
-        table: Table,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(table, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let key = decode_signature_key(&k);
-                let payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
-                (key, payloads)
-            })
-            .collect();
-        entries.into_iter()
+    fn iter_aggregated_payloads_from(
+        map: &Mutex<AggregatedPayloadMap>,
+    ) -> Vec<(SignatureKey, Vec<StoredAggregatedPayload>)> {
+        map.lock()
+            .expect("lock")
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 
-    fn iter_aggregated_payload_keys(&self, table: Table) -> impl Iterator<Item = SignatureKey> {
-        let view = self.backend.begin_read().expect("read view");
-        let keys: Vec<_> = view
-            .prefix_iterator(table, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, _)| decode_signature_key(&k))
-            .collect();
-        keys.into_iter()
+    fn iter_aggregated_payload_keys_from(map: &Mutex<AggregatedPayloadMap>) -> Vec<SignatureKey> {
+        map.lock().expect("lock").keys().copied().collect()
     }
 
-    fn insert_aggregated_payload(
-        &mut self,
-        table: Table,
-        key: SignatureKey,
-        payload: StoredAggregatedPayload,
-    ) {
-        self.insert_aggregated_payloads_batch(table, vec![(key, payload)]);
-    }
-
-    /// Batch-insert multiple aggregated payloads in a single read-write-commit cycle.
-    /// Groups entries by key to correctly handle multiple payloads for the same key.
-    fn insert_aggregated_payloads_batch(
-        &mut self,
-        table: Table,
+    fn insert_aggregated_payloads_batch_to(
+        map: &Mutex<AggregatedPayloadMap>,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
         if entries.is_empty() {
             return;
         }
-
-        // Group entries by key to handle multiple payloads for the same key
-        let mut grouped: HashMap<Vec<u8>, Vec<StoredAggregatedPayload>> = HashMap::new();
+        let mut guard = map.lock().expect("lock");
         for (key, payload) in entries {
-            let encoded_key = encode_signature_key(&key);
-            grouped.entry(encoded_key).or_default().push(payload);
+            guard.entry(key).or_default().push(payload);
         }
-
-        let view = self.backend.begin_read().expect("read view");
-        let mut batch_entries = Vec::new();
-
-        for (encoded_key, new_payloads) in grouped {
-            let mut payloads: Vec<StoredAggregatedPayload> = view
-                .get(table, &encoded_key)
-                .expect("get")
-                .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
-                .unwrap_or_default();
-            payloads.extend(new_payloads);
-            batch_entries.push((encoded_key, payloads.as_ssz_bytes()));
-        }
-        drop(view);
-
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(table, batch_entries)
-            .expect("put aggregated payloads");
-        batch.commit().expect("commit");
     }
 
     /// Promotes all new aggregated payloads to known, making them active in fork choice.
     ///
-    /// Merges entries from `LatestNewAggregatedPayloads` into `LatestKnownAggregatedPayloads`,
-    /// appending to existing payload lists rather than overwriting them.
+    /// Drains `new_aggregated_payloads` and merges into `known_aggregated_payloads`.
     pub fn promote_new_aggregated_payloads(&mut self) {
-        let view = self.backend.begin_read().expect("read view");
-        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = view
-            .prefix_iterator(Table::LatestNewAggregatedPayloads, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
-            .collect();
-
-        if new_entries.is_empty() {
-            drop(view);
-            return;
+        // Lock ordering: known before new (field declaration order)
+        let mut known_guard = self.known_aggregated_payloads.lock().expect("lock");
+        let mut new_guard = self.new_aggregated_payloads.lock().expect("lock");
+        for (key, new_payloads) in new_guard.drain() {
+            known_guard.entry(key).or_default().extend(new_payloads);
         }
-
-        // Merge new payloads with existing known payloads
-        let merged: Vec<(Vec<u8>, Vec<u8>)> = new_entries
-            .iter()
-            .map(|(key, new_bytes)| {
-                let new_payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(new_bytes).expect("valid");
-                let mut known_payloads: Vec<StoredAggregatedPayload> = view
-                    .get(Table::LatestKnownAggregatedPayloads, key)
-                    .expect("get")
-                    .map(|bytes| {
-                        Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid")
-                    })
-                    .unwrap_or_default();
-                known_payloads.extend(new_payloads);
-                (key.clone(), known_payloads.as_ssz_bytes())
-            })
-            .collect();
-        drop(view);
-
-        let keys_to_delete: Vec<_> = new_entries.into_iter().map(|(k, _)| k).collect();
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::LatestNewAggregatedPayloads, keys_to_delete)
-            .expect("delete new aggregated payloads");
-        batch
-            .put_batch(Table::LatestKnownAggregatedPayloads, merged)
-            .expect("put known aggregated payloads");
-        batch.commit().expect("commit");
     }
 
     /// Delete specific gossip signatures by key.
@@ -1256,6 +1158,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Insert exactly BLOCKS_TO_KEEP blocks
@@ -1280,6 +1184,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let total = BLOCKS_TO_KEEP + 10;
@@ -1318,6 +1224,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let total = BLOCKS_TO_KEEP + 10;
@@ -1361,6 +1269,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Insert STATES_TO_KEEP headers + states
@@ -1382,6 +1292,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let total = STATES_TO_KEEP + 5;
@@ -1413,6 +1325,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            known_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
+            new_aggregated_payloads: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let total = STATES_TO_KEEP + 5;

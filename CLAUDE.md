@@ -328,7 +328,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (10)
+### Storage Tables (8)
 
 | Table | Key → Value | Purpose |
 |-------|-------------|---------|
@@ -336,12 +336,23 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
 | `BlockSignatures` | H256 → BlockSignaturesWithAttestation | Signatures (absent for genesis) |
 | `States` | H256 → State | Beacon states by root |
-| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
-| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
 | `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
-| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
+| `AttestationDataByRoot` | H256 → AttestationData | Content-addressed attestation data |
 | `Metadata` | string → various | Store state (head, config, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
+
+### In-Memory Store Fields
+
+Two ephemeral maps live on `Store` as `Arc<Mutex<HashMap>>` (not persisted to RocksDB):
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `known_aggregated_payloads` | SignatureKey → Vec\<StoredAggregatedPayload\> | Fork-choice-active aggregated proofs |
+| `new_aggregated_payloads` | SignatureKey → Vec\<StoredAggregatedPayload\> | Pending aggregated proofs (promoted each interval) |
+
+Lock ordering invariant: always acquire `known_aggregated_payloads` before `new_aggregated_payloads`.
+
+**Note**: Existing RocksDB databases with the old `latest_new_aggregated_payloads` / `latest_known_aggregated_payloads` column families must be wiped before running the new binary — `open_cf_descriptors` fails if the DB contains CFs not in the descriptor list.
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition

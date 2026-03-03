@@ -100,6 +100,7 @@ fn update_safe_target(store: &mut Store) {
     // node's self-attestation) would be invisible without this merge.
     let all_keys: HashSet<SignatureKey> = store
         .iter_known_aggregated_payload_keys()
+        .into_iter()
         .chain(store.iter_new_aggregated_payload_keys())
         .collect();
     let attestations = store.extract_latest_attestations(all_keys.into_iter());
@@ -765,7 +766,7 @@ pub fn produce_block_with_signatures(
     }
 
     // Single pass over known aggregated payloads: extract both attestation data and proofs
-    let known_payloads: Vec<_> = store.iter_known_aggregated_payloads().collect();
+    let known_payloads = store.iter_known_aggregated_payloads();
 
     let known_attestations =
         store.extract_latest_attestations(known_payloads.iter().map(|(key, _)| *key));
