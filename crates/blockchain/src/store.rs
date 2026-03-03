@@ -319,8 +319,7 @@ pub fn on_tick(
                 let finalized = store.latest_finalized();
                 if slot > 0
                     && slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
-                    && slot.saturating_sub(finalized.slot)
-                        > PRUNING_FALLBACK_INTERVAL_SLOTS
+                    && slot.saturating_sub(finalized.slot) > PRUNING_FALLBACK_INTERVAL_SLOTS
                 {
                     warn!(
                         %slot,
@@ -1276,4 +1275,139 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
     // Couldn't walk back far enough (missing blocks in chain)
     // Assume the ancestor is behind the latest finalized block
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use ethlambda_storage::{StorageBackend, Table, backend::InMemoryBackend};
+    use ethlambda_types::{block::BlockHeader, primitives::ssz::Encode, state::State};
+
+    use crate::MILLISECONDS_PER_INTERVAL;
+
+    /// Generate a deterministic H256 root from an index.
+    fn root(index: u64) -> H256 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_be_bytes());
+        H256::from(bytes)
+    }
+
+    /// Insert a block header (and dummy body + signature) for a given root and slot.
+    fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64) {
+        let header = BlockHeader {
+            slot,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: H256::ZERO,
+        };
+        let mut batch = backend.begin_write().expect("write batch");
+        let key = root.as_ssz_bytes();
+        batch
+            .put_batch(
+                Table::BlockHeaders,
+                vec![(key.clone(), header.as_ssz_bytes())],
+            )
+            .expect("put header");
+        batch
+            .put_batch(Table::BlockBodies, vec![(key.clone(), vec![0u8; 4])])
+            .expect("put body");
+        batch
+            .put_batch(Table::BlockSignatures, vec![(key, vec![0u8; 4])])
+            .expect("put sigs");
+        batch.commit().expect("commit");
+    }
+
+    /// Insert a dummy state for a given root.
+    fn insert_state(backend: &dyn StorageBackend, root: H256) {
+        let mut batch = backend.begin_write().expect("write batch");
+        let key = root.as_ssz_bytes();
+        batch
+            .put_batch(Table::States, vec![(key, vec![0u8; 4])])
+            .expect("put state");
+        batch.commit().expect("commit");
+    }
+
+    /// Count entries in a table.
+    fn count_entries(backend: &dyn StorageBackend, table: Table) -> usize {
+        let view = backend.begin_read().expect("read view");
+        view.prefix_iterator(table, &[])
+            .expect("iterator")
+            .filter_map(|r| r.ok())
+            .count()
+    }
+
+    /// Tick the store to exactly interval 0 of the given slot.
+    ///
+    /// Pre-sets store.time so on_tick processes a single interval, avoiding
+    /// side effects from other intervals (update_safe_target, etc.).
+    fn tick_to_interval_0(store: &mut Store, slot: u64) {
+        store.set_time(slot * INTERVALS_PER_SLOT - 1);
+        let timestamp_ms = slot * INTERVALS_PER_SLOT * MILLISECONDS_PER_INTERVAL;
+        on_tick(store, timestamp_ms, false, false);
+    }
+
+    #[test]
+    fn on_tick_triggers_periodic_pruning_when_finalization_stalled() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let state = State::from_genesis(0, vec![]);
+        let mut store = Store::from_anchor_state(backend.clone(), state);
+
+        // Insert 905 additional headers + states (exceeds STATES_TO_KEEP=900).
+        // Genesis already inserted 1 header + state, so total = 906.
+        for i in 1..=905u64 {
+            insert_header(backend.as_ref(), root(i), i);
+            insert_state(backend.as_ref(), root(i));
+        }
+        let states_before = count_entries(backend.as_ref(), Table::States);
+        assert!(states_before > 900, "should exceed retention window");
+
+        // Tick to interval 0 of slot 2*PRUNING_FALLBACK_INTERVAL_SLOTS.
+        // Finalization is at slot 0, so lag = 14400 > 7200 → periodic pruning fires.
+        tick_to_interval_0(&mut store, PRUNING_FALLBACK_INTERVAL_SLOTS * 2);
+
+        let states_after = count_entries(backend.as_ref(), Table::States);
+        assert!(
+            states_after < states_before,
+            "states should have been pruned: before={states_before}, after={states_after}"
+        );
+    }
+
+    #[test]
+    fn on_tick_skips_periodic_pruning_when_finalization_healthy() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let state = State::from_genesis(0, vec![]);
+        let mut store = Store::from_anchor_state(backend.clone(), state);
+
+        // Advance finalization first (this triggers update_checkpoints' own pruning).
+        let target_slot = PRUNING_FALLBACK_INTERVAL_SLOTS;
+        store.update_checkpoints(ForkCheckpoints::new(
+            store.head(),
+            None,
+            Some(Checkpoint {
+                slot: target_slot - 1,
+                root: store.head(),
+            }),
+        ));
+
+        // Insert excess states AFTER finalization pruning has run.
+        for i in 1..=905u64 {
+            insert_header(backend.as_ref(), root(i), i);
+            insert_state(backend.as_ref(), root(i));
+        }
+        let states_before = count_entries(backend.as_ref(), Table::States);
+        assert!(states_before > 900, "should exceed retention window");
+
+        // Tick to interval 0 of the same target slot.
+        // Finalization is at target_slot - 1, so lag = 1 ≤ threshold → no periodic pruning.
+        tick_to_interval_0(&mut store, target_slot);
+
+        let states_after = count_entries(backend.as_ref(), Table::States);
+        assert_eq!(
+            states_after, states_before,
+            "no pruning should occur when finalization is healthy"
+        );
+    }
 }
