@@ -115,7 +115,7 @@ fn update_safe_target(store: &mut Store) {
 /// Aggregate committee signatures at interval 2.
 ///
 /// Collects individual gossip signatures, aggregates them by attestation data,
-/// and stores the resulting proofs in `LatestNewAggregatedPayloads`.
+/// and stores the resulting proofs in the new aggregated payloads buffer.
 fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
     let gossip_sigs: Vec<(SignatureKey, _)> = store.iter_gossip_signatures().collect();
     if gossip_sigs.is_empty() {
@@ -334,6 +334,17 @@ pub fn on_tick(
             4 => {
                 // End of slot - accept accumulated attestations and log tree
                 accept_new_attestations(store, true);
+
+                // Prune stale gossip signatures and attestation data by age
+                let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(slot);
+                if pruned_sigs + pruned_att_data > 0 {
+                    info!(
+                        %slot,
+                        pruned_sigs,
+                        pruned_att_data,
+                        "Pruned stale attestation data by age"
+                    );
+                }
             }
             _ => unreachable!("slots only have 5 intervals"),
         }
@@ -1067,7 +1078,7 @@ fn build_block(
 /// Select existing aggregated proofs for attestations to include in a block.
 ///
 /// Fresh gossip aggregation happens at interval 2 (`aggregate_committee_signatures`).
-/// This function only selects from existing proofs in the `LatestKnownAggregatedPayloads` table
+/// This function only selects from existing proofs in the known aggregated payloads buffer
 /// (proofs from previously received blocks and promoted gossip aggregations).
 ///
 /// Returns a list of (attestation, proof) pairs ready for block inclusion.

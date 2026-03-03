@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock};
 
 /// The tree hash root of an empty block body.
@@ -90,6 +90,67 @@ const _: () = assert!(
     "BLOCKS_TO_KEEP must be >= STATES_TO_KEEP"
 );
 
+/// Hard cap for each aggregated payload buffer (new and known).
+/// Matches Lantern's approach. With 9 validators, this holds
+/// ~455 unique attestation messages (~30 min at 1/slot).
+const AGGREGATED_PAYLOAD_CAP: usize = 4096;
+
+/// Attestation data retention window in slots (~4.3 min at 4s/slot).
+const ATTESTATION_RETENTION_SLOTS: u64 = 64;
+
+/// Fixed-size circular buffer for aggregated payloads.
+///
+/// Entries are evicted FIFO when the buffer reaches capacity.
+/// This prevents unbounded memory growth when finalization stalls.
+#[derive(Clone, Default)]
+struct PayloadBuffer {
+    entries: VecDeque<(SignatureKey, StoredAggregatedPayload)>,
+    capacity: usize,
+}
+
+impl PayloadBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Insert one entry, FIFO-evicting the oldest if at capacity.
+    fn push(&mut self, key: SignatureKey, payload: StoredAggregatedPayload) {
+        if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, payload));
+    }
+
+    /// Insert multiple entries, FIFO-evicting as needed.
+    fn push_batch(&mut self, entries: Vec<(SignatureKey, StoredAggregatedPayload)>) {
+        for (key, payload) in entries {
+            self.push(key, payload);
+        }
+    }
+
+    /// Take all entries, leaving the buffer empty.
+    fn drain(&mut self) -> Vec<(SignatureKey, StoredAggregatedPayload)> {
+        self.entries.drain(..).collect()
+    }
+
+    /// Group entries by key, preserving insertion order within each group.
+    fn grouped(&self) -> HashMap<SignatureKey, Vec<StoredAggregatedPayload>> {
+        let mut map: HashMap<SignatureKey, Vec<StoredAggregatedPayload>> = HashMap::new();
+        for (key, payload) in &self.entries {
+            map.entry(*key).or_default().push(payload.clone());
+        }
+        map
+    }
+
+    /// Return deduplicated keys.
+    fn unique_keys(&self) -> HashSet<SignatureKey> {
+        self.entries.iter().map(|(key, _)| *key).collect()
+    }
+}
+
 // ============ Key Encoding Helpers ============
 
 /// Encode a SignatureKey (validator_id, root) to bytes.
@@ -141,6 +202,8 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
+    new_payloads: PayloadBuffer,
+    known_payloads: PayloadBuffer,
 }
 
 impl Store {
@@ -276,7 +339,11 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self { backend }
+        Self {
+            backend,
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+        }
     }
 
     // ============ Metadata Helpers ============
@@ -385,14 +452,9 @@ impl Store {
         {
             let pruned_chain = self.prune_live_chain(finalized.slot);
 
-            // Prune signatures, payloads, and attestation data for finalized slots
+            // Prune signatures and attestation data for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
             let pruned_att_data = self.prune_attestation_data_by_root(finalized.slot);
-            self.prune_aggregated_payload_table(Table::LatestNewAggregatedPayloads, finalized.slot);
-            self.prune_aggregated_payload_table(
-                Table::LatestKnownAggregatedPayloads,
-                finalized.slot,
-            );
             // Prune old states before blocks: state pruning uses headers for slot lookup
             let protected_roots = [finalized.root, self.latest_justified().root];
             let pruned_states = self.prune_old_states(&protected_roots);
@@ -505,40 +567,18 @@ impl Store {
         })
     }
 
-    /// Prune an aggregated payload table (new or known) for slots <= finalized_slot.
-    fn prune_aggregated_payload_table(&mut self, table: Table, finalized_slot: u64) {
-        let view = self.backend.begin_read().expect("read view");
-        let mut updates = vec![];
-        let mut deletes = vec![];
-
-        for (key_bytes, value_bytes) in view
-            .prefix_iterator(table, &[])
-            .expect("iter")
-            .filter_map(|r| r.ok())
-        {
-            if let Ok(mut payloads) = Vec::<StoredAggregatedPayload>::from_ssz_bytes(&value_bytes) {
-                let original_len = payloads.len();
-                payloads.retain(|p| p.slot > finalized_slot);
-
-                if payloads.is_empty() {
-                    deletes.push(key_bytes.to_vec());
-                } else if payloads.len() < original_len {
-                    updates.push((key_bytes.to_vec(), payloads.as_ssz_bytes()));
-                }
-            }
+    /// Prune stale gossip signatures and attestation data by slot age.
+    ///
+    /// Independent of finalization — prevents unbounded growth when finalization stalls.
+    /// Returns (pruned_sigs, pruned_att_data).
+    pub fn prune_attestation_data_by_age(&mut self, current_slot: u64) -> (usize, usize) {
+        let cutoff_slot = current_slot.saturating_sub(ATTESTATION_RETENTION_SLOTS);
+        if cutoff_slot == 0 {
+            return (0, 0);
         }
-        drop(view);
-
-        if !updates.is_empty() || !deletes.is_empty() {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            if !updates.is_empty() {
-                batch.put_batch(table, updates).expect("put");
-            }
-            if !deletes.is_empty() {
-                batch.delete_batch(table, deletes).expect("delete");
-            }
-            batch.commit().expect("commit");
-        }
+        let pruned_sigs = self.prune_gossip_signatures(cutoff_slot);
+        let pruned_att_data = self.prune_attestation_data_by_root(cutoff_slot);
+        (pruned_sigs, pruned_att_data)
     }
 
     /// Prune old states beyond the retention window.
@@ -822,7 +862,8 @@ impl Store {
     /// Convenience: extract latest attestation per validator from known
     /// (fork-choice-active) aggregated payloads only.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.extract_latest_attestations(self.iter_known_aggregated_payloads().map(|(key, _)| key))
+        let keys = self.known_payloads.unique_keys();
+        self.extract_latest_attestations(keys.into_iter())
     }
 
     // ============ Known Aggregated Payloads ============
@@ -830,34 +871,33 @@ impl Store {
     // "Known" aggregated payloads are active in fork choice weight calculations.
     // Promoted from "new" payloads at specific intervals (0 with proposal, 4).
 
-    /// Iterates over all known aggregated payloads.
+    /// Iterates over all known aggregated payloads, grouped by key.
     pub fn iter_known_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        self.iter_aggregated_payloads(Table::LatestKnownAggregatedPayloads)
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
+        self.known_payloads.grouped().into_iter()
     }
 
-    /// Iterates over keys only from the known aggregated payloads table,
-    /// skipping value deserialization.
-    pub fn iter_known_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
-        self.iter_aggregated_payload_keys(Table::LatestKnownAggregatedPayloads)
+    /// Iterates over deduplicated keys from the known aggregated payloads.
+    pub fn iter_known_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> {
+        self.known_payloads.unique_keys().into_iter()
     }
 
-    /// Insert an aggregated payload into the known (fork-choice-active) table.
+    /// Insert an aggregated payload into the known (fork-choice-active) buffer.
     pub fn insert_known_aggregated_payload(
         &mut self,
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.insert_aggregated_payload(Table::LatestKnownAggregatedPayloads, key, payload);
+        self.known_payloads.push(key, payload);
     }
 
-    /// Batch-insert multiple aggregated payloads into the known table in a single commit.
+    /// Batch-insert multiple aggregated payloads into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.insert_aggregated_payloads_batch(Table::LatestKnownAggregatedPayloads, entries);
+        self.known_payloads.push_batch(entries);
     }
 
     // ============ New Aggregated Payloads ============
@@ -865,34 +905,33 @@ impl Store {
     // "New" aggregated payloads are pending — not yet counted in fork choice.
     // Promoted to "known" via `promote_new_aggregated_payloads`.
 
-    /// Iterates over all new (pending) aggregated payloads.
+    /// Iterates over all new (pending) aggregated payloads, grouped by key.
     pub fn iter_new_aggregated_payloads(
         &self,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> + '_ {
-        self.iter_aggregated_payloads(Table::LatestNewAggregatedPayloads)
+    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
+        self.new_payloads.grouped().into_iter()
     }
 
-    /// Iterates over keys only from the new aggregated payloads table,
-    /// skipping value deserialization.
-    pub fn iter_new_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> + '_ {
-        self.iter_aggregated_payload_keys(Table::LatestNewAggregatedPayloads)
+    /// Iterates over deduplicated keys from the new aggregated payloads.
+    pub fn iter_new_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> {
+        self.new_payloads.unique_keys().into_iter()
     }
 
-    /// Insert an aggregated payload into the new (pending) table.
+    /// Insert an aggregated payload into the new (pending) buffer.
     pub fn insert_new_aggregated_payload(
         &mut self,
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.insert_aggregated_payload(Table::LatestNewAggregatedPayloads, key, payload);
+        self.new_payloads.push(key, payload);
     }
 
-    /// Batch-insert multiple aggregated payloads into the new table in a single commit.
+    /// Batch-insert multiple aggregated payloads into the new buffer.
     pub fn insert_new_aggregated_payloads_batch(
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.insert_aggregated_payloads_batch(Table::LatestNewAggregatedPayloads, entries);
+        self.new_payloads.push_batch(entries);
     }
 
     // ============ Pruning Helpers ============
@@ -930,132 +969,12 @@ impl Store {
         count
     }
 
-    // ============ Aggregated Payload Helpers ============
-
-    fn iter_aggregated_payloads(
-        &self,
-        table: Table,
-    ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
-        let view = self.backend.begin_read().expect("read view");
-        let entries: Vec<_> = view
-            .prefix_iterator(table, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let key = decode_signature_key(&k);
-                let payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(&v).expect("valid payloads");
-                (key, payloads)
-            })
-            .collect();
-        entries.into_iter()
-    }
-
-    fn iter_aggregated_payload_keys(&self, table: Table) -> impl Iterator<Item = SignatureKey> {
-        let view = self.backend.begin_read().expect("read view");
-        let keys: Vec<_> = view
-            .prefix_iterator(table, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, _)| decode_signature_key(&k))
-            .collect();
-        keys.into_iter()
-    }
-
-    fn insert_aggregated_payload(
-        &mut self,
-        table: Table,
-        key: SignatureKey,
-        payload: StoredAggregatedPayload,
-    ) {
-        self.insert_aggregated_payloads_batch(table, vec![(key, payload)]);
-    }
-
-    /// Batch-insert multiple aggregated payloads in a single read-write-commit cycle.
-    /// Groups entries by key to correctly handle multiple payloads for the same key.
-    fn insert_aggregated_payloads_batch(
-        &mut self,
-        table: Table,
-        entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
-    ) {
-        if entries.is_empty() {
-            return;
-        }
-
-        // Group entries by key to handle multiple payloads for the same key
-        let mut grouped: HashMap<Vec<u8>, Vec<StoredAggregatedPayload>> = HashMap::new();
-        for (key, payload) in entries {
-            let encoded_key = encode_signature_key(&key);
-            grouped.entry(encoded_key).or_default().push(payload);
-        }
-
-        let view = self.backend.begin_read().expect("read view");
-        let mut batch_entries = Vec::new();
-
-        for (encoded_key, new_payloads) in grouped {
-            let mut payloads: Vec<StoredAggregatedPayload> = view
-                .get(table, &encoded_key)
-                .expect("get")
-                .map(|bytes| Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid"))
-                .unwrap_or_default();
-            payloads.extend(new_payloads);
-            batch_entries.push((encoded_key, payloads.as_ssz_bytes()));
-        }
-        drop(view);
-
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(table, batch_entries)
-            .expect("put aggregated payloads");
-        batch.commit().expect("commit");
-    }
-
     /// Promotes all new aggregated payloads to known, making them active in fork choice.
     ///
-    /// Merges entries from `LatestNewAggregatedPayloads` into `LatestKnownAggregatedPayloads`,
-    /// appending to existing payload lists rather than overwriting them.
+    /// Drains the new buffer and pushes all entries into the known buffer.
     pub fn promote_new_aggregated_payloads(&mut self) {
-        let view = self.backend.begin_read().expect("read view");
-        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = view
-            .prefix_iterator(Table::LatestNewAggregatedPayloads, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
-            .collect();
-
-        if new_entries.is_empty() {
-            drop(view);
-            return;
-        }
-
-        // Merge new payloads with existing known payloads
-        let merged: Vec<(Vec<u8>, Vec<u8>)> = new_entries
-            .iter()
-            .map(|(key, new_bytes)| {
-                let new_payloads =
-                    Vec::<StoredAggregatedPayload>::from_ssz_bytes(new_bytes).expect("valid");
-                let mut known_payloads: Vec<StoredAggregatedPayload> = view
-                    .get(Table::LatestKnownAggregatedPayloads, key)
-                    .expect("get")
-                    .map(|bytes| {
-                        Vec::<StoredAggregatedPayload>::from_ssz_bytes(&bytes).expect("valid")
-                    })
-                    .unwrap_or_default();
-                known_payloads.extend(new_payloads);
-                (key.clone(), known_payloads.as_ssz_bytes())
-            })
-            .collect();
-        drop(view);
-
-        let keys_to_delete: Vec<_> = new_entries.into_iter().map(|(k, _)| k).collect();
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::LatestNewAggregatedPayloads, keys_to_delete)
-            .expect("delete new aggregated payloads");
-        batch
-            .put_batch(Table::LatestKnownAggregatedPayloads, merged)
-            .expect("put known aggregated payloads");
-        batch.commit().expect("commit");
+        let drained = self.new_payloads.drain();
+        self.known_payloads.push_batch(drained);
     }
 
     /// Delete specific gossip signatures by key.
@@ -1256,6 +1175,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         // Insert exactly BLOCKS_TO_KEEP blocks
@@ -1280,6 +1201,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         let total = BLOCKS_TO_KEEP + 10;
@@ -1318,6 +1241,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         let total = BLOCKS_TO_KEEP + 10;
@@ -1361,6 +1286,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         // Insert STATES_TO_KEEP headers + states
@@ -1382,6 +1309,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         let total = STATES_TO_KEEP + 5;
@@ -1413,6 +1342,8 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store {
             backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
         };
 
         let total = STATES_TO_KEEP + 5;
@@ -1429,5 +1360,176 @@ mod tests {
         assert_eq!(pruned, 3);
         assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
         assert!(has_key(backend.as_ref(), Table::States, &justified_root));
+    }
+
+    // ============ PayloadBuffer Tests ============
+
+    fn make_payload(slot: u64) -> StoredAggregatedPayload {
+        use ethlambda_types::attestation::AggregationBits;
+        use ethlambda_types::block::AggregatedSignatureProof;
+
+        StoredAggregatedPayload {
+            slot,
+            proof: AggregatedSignatureProof::empty(AggregationBits::with_capacity(0).unwrap()),
+        }
+    }
+
+    #[test]
+    fn payload_buffer_fifo_eviction() {
+        let mut buf = PayloadBuffer::new(3);
+        let key = (0u64, H256::ZERO);
+
+        buf.push(key, make_payload(1));
+        buf.push(key, make_payload(2));
+        buf.push(key, make_payload(3));
+        assert_eq!(buf.entries.len(), 3);
+
+        // Pushing a 4th entry should evict the oldest (slot 1)
+        buf.push(key, make_payload(4));
+        assert_eq!(buf.entries.len(), 3);
+        let slots: Vec<u64> = buf.entries.iter().map(|(_, p)| p.slot).collect();
+        assert_eq!(slots, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn payload_buffer_grouped_returns_correct_groups() {
+        let mut buf = PayloadBuffer::new(10);
+        let key_a = (0u64, H256::ZERO);
+        let key_b = (1u64, H256::ZERO);
+
+        buf.push(key_a, make_payload(1));
+        buf.push(key_b, make_payload(2));
+        buf.push(key_a, make_payload(3));
+
+        let grouped = buf.grouped();
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[&key_a].len(), 2);
+        assert_eq!(grouped[&key_a][0].slot, 1);
+        assert_eq!(grouped[&key_a][1].slot, 3);
+        assert_eq!(grouped[&key_b].len(), 1);
+        assert_eq!(grouped[&key_b][0].slot, 2);
+    }
+
+    #[test]
+    fn payload_buffer_drain_empties_buffer() {
+        let mut buf = PayloadBuffer::new(10);
+        let key = (0u64, H256::ZERO);
+
+        buf.push(key, make_payload(1));
+        buf.push(key, make_payload(2));
+
+        let drained = buf.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(buf.entries.is_empty());
+    }
+
+    #[test]
+    fn promote_moves_new_to_known() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store {
+            backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+        };
+
+        let key = (0u64, H256::ZERO);
+        store.insert_new_aggregated_payload(key, make_payload(1));
+        store.insert_new_aggregated_payload(key, make_payload(2));
+
+        assert_eq!(store.new_payloads.entries.len(), 2);
+        assert_eq!(store.known_payloads.entries.len(), 0);
+
+        store.promote_new_aggregated_payloads();
+
+        assert_eq!(store.new_payloads.entries.len(), 0);
+        assert_eq!(store.known_payloads.entries.len(), 2);
+    }
+
+    fn make_attestation_data(slot: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
+
+    fn make_gossip_signature(slot: u64) -> StoredSignature {
+        StoredSignature {
+            slot,
+            signature_bytes: vec![0u8; 32],
+        }
+    }
+
+    #[test]
+    fn prune_attestation_data_by_age_removes_old() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store {
+            backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+        };
+
+        // Insert gossip signatures at slots 10 and 100 via raw backend
+        {
+            let mut batch = backend.begin_write().expect("write batch");
+            let key10 = encode_signature_key(&(0u64, root(10)));
+            let key100 = encode_signature_key(&(1u64, root(100)));
+            batch
+                .put_batch(
+                    Table::GossipSignatures,
+                    vec![
+                        (key10, make_gossip_signature(10).as_ssz_bytes()),
+                        (key100, make_gossip_signature(100).as_ssz_bytes()),
+                    ],
+                )
+                .expect("put");
+            batch.commit().expect("commit");
+        }
+
+        // Insert attestation data at slots 10 and 100
+        store.insert_attestation_data_by_root(root(10), make_attestation_data(10));
+        store.insert_attestation_data_by_root(root(100), make_attestation_data(100));
+
+        // Prune with current_slot = 100, retention = 64 → cutoff = 36
+        let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(100);
+        assert_eq!(pruned_sigs, 1); // slot 10 <= 36
+        assert_eq!(pruned_att_data, 1); // slot 10 <= 36
+
+        // Slot 100 entries should remain
+        assert_eq!(count_entries(backend.as_ref(), Table::GossipSignatures), 1);
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::AttestationDataByRoot),
+            1
+        );
+    }
+
+    #[test]
+    fn prune_attestation_data_by_age_noop_early_slots() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store {
+            backend: backend.clone(),
+            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+        };
+
+        // Insert gossip signature at slot 5 via raw backend
+        {
+            let mut batch = backend.begin_write().expect("write batch");
+            let key = encode_signature_key(&(0u64, root(5)));
+            batch
+                .put_batch(
+                    Table::GossipSignatures,
+                    vec![(key, make_gossip_signature(5).as_ssz_bytes())],
+                )
+                .expect("put");
+            batch.commit().expect("commit");
+        }
+
+        // current_slot = 30 → cutoff = 30 - 64 = 0 (saturating) → short-circuits
+        let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(30);
+        assert_eq!(pruned_sigs, 0);
+        assert_eq!(pruned_att_data, 0);
+        assert_eq!(count_entries(backend.as_ref(), Table::GossipSignatures), 1);
     }
 }
