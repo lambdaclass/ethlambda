@@ -28,5 +28,7 @@ reqwest.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
 
+tikv-jemallocator.workspace = true
+
 [build-dependencies]
 vergen-git2.workspace = true

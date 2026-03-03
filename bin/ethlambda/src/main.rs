@@ -1,6 +1,15 @@
 mod checkpoint_sync;
 mod version;
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
@@ -80,6 +89,10 @@ async fn main() -> eyre::Result<()> {
     println!("{ASCII_ART}");
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+    #[cfg(not(target_env = "msvc"))]
+    info!("Using jemalloc allocator with heap profiling enabled");
+    #[cfg(target_env = "msvc")]
+    info!("Using system allocator (MSVC target)");
 
     info!(node_key=?options.node_key, "got node key");
 

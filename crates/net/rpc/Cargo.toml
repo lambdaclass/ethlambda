@@ -19,6 +19,7 @@ ethlambda-storage.workspace = true
 ethlambda-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jemalloc_pprof.workspace = true
 
 [dev-dependencies]
 ethlambda-types.workspace = true

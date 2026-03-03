@@ -74,3 +74,7 @@ rand = "0.9"
 rocksdb = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 eyre = "0.6"
+
+# Allocator + heap profiling
+tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
+jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
