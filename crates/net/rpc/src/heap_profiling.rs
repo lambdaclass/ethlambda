@@ -10,7 +10,10 @@ mod inner {
 
     pub async fn handle_get_heap() -> impl IntoResponse {
         let Some(prof_ctl) = jemalloc_pprof::PROF_CTL.as_ref() else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Heap profiling not enabled")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Heap profiling not enabled",
+            )
                 .into_response();
         };
         let mut guard = prof_ctl.lock().await;
@@ -31,7 +34,10 @@ mod inner {
 
     pub async fn handle_get_heap_flamegraph() -> impl IntoResponse {
         let Some(prof_ctl) = jemalloc_pprof::PROF_CTL.as_ref() else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Heap profiling not enabled")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Heap profiling not enabled",
+            )
                 .into_response();
         };
         let mut guard = prof_ctl.lock().await;

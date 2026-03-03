@@ -46,10 +46,7 @@ fn build_api_router(store: Store) -> Router {
 /// Build the debug router for profiling endpoints.
 fn build_debug_router() -> Router {
     Router::new()
-        .route(
-            "/debug/pprof/allocs",
-            get(heap_profiling::handle_get_heap),
-        )
+        .route("/debug/pprof/allocs", get(heap_profiling::handle_get_heap))
         .route(
             "/debug/pprof/allocs/flamegraph",
             get(heap_profiling::handle_get_heap_flamegraph),
