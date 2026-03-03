@@ -64,6 +64,13 @@ pub struct AggregatedAttestation {
 /// in some collective action (attestation, signature aggregation, etc.).
 pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
 
+/// Returns the indices of set bits in an `AggregationBits` bitfield as validator IDs.
+pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + '_ {
+    bits.iter()
+        .enumerate()
+        .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
+}
+
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SignedAggregatedAttestation {

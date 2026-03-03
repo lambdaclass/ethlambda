@@ -20,3 +20,6 @@ rec_aggregation = { git = "https://github.com/leanEthereum/leanMultisig.git", re
 leansig.workspace = true
 thiserror.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

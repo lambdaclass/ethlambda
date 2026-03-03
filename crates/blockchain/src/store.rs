@@ -11,7 +11,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
-        SignedAggregatedAttestation, SignedAttestation,
+        SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
     block::{
         AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
@@ -96,15 +96,15 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools. At interval 3 the migration (interval 4) hasn't
-    // run yet, so attestations that entered "known" directly (proposer's own attestation
-    // in block body, node's self-attestation) would be invisible without this merge.
-    let mut all_payloads: HashMap<SignatureKey, Vec<StoredAggregatedPayload>> =
-        store.iter_known_aggregated_payloads().collect();
-    for (key, new_proofs) in store.iter_new_aggregated_payloads() {
-        all_payloads.entry(key).or_default().extend(new_proofs);
-    }
-    let attestations = store.extract_latest_attestations(all_payloads.into_keys());
+    // Merge both attestation pools (keys only — skip payload deserialization).
+    // At interval 3 the migration (interval 4) hasn't run yet, so attestations
+    // that entered "known" directly (proposer's own attestation in block body,
+    // node's self-attestation) would be invisible without this merge.
+    let all_keys: HashSet<SignatureKey> = store
+        .iter_known_aggregated_payload_keys()
+        .chain(store.iter_new_aggregated_payload_keys())
+        .collect();
+    let attestations = store.extract_latest_attestations(all_keys.into_iter());
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -585,15 +585,16 @@ fn on_block_core(
 
     // Process block body attestations.
     // Store attestation data by root and proofs in known aggregated payloads.
+    let mut att_data_entries: Vec<(H256, AttestationData)> = Vec::new();
     let mut known_entries: Vec<(SignatureKey, StoredAggregatedPayload)> = Vec::new();
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
     {
         let data_root = att.data.tree_hash_root();
-        store.insert_attestation_data_by_root(data_root, att.data.clone());
+        att_data_entries.push((data_root, att.data.clone()));
 
-        let validator_ids = aggregation_bits_to_validator_indices(&att.aggregation_bits);
+        let validator_ids: Vec<_> = validator_indices(&att.aggregation_bits).collect();
         let payload = StoredAggregatedPayload {
             slot: att.data.slot,
             proof: proof.clone(),
@@ -604,18 +605,21 @@ fn on_block_core(
             metrics::inc_attestations_valid("block");
         }
     }
+
+    // Process proposer attestation as pending (enters "new" stage via gossip path)
+    // The proposer's attestation should NOT affect this block's fork choice position.
+    let proposer_vid = proposer_attestation.validator_id;
+    let proposer_data_root = proposer_attestation.data.tree_hash_root();
+    att_data_entries.push((proposer_data_root, proposer_attestation.data.clone()));
+
+    // Batch-insert all attestation data (body + proposer) in a single commit
+    store.insert_attestation_data_by_root_batch(att_data_entries);
     store.insert_known_aggregated_payloads_batch(known_entries);
 
     // Update forkchoice head based on new block and attestations
     // IMPORTANT: This must happen BEFORE processing proposer attestation
     // to prevent the proposer from gaining circular weight advantage.
     update_head(store, false);
-
-    // Process proposer attestation as pending (enters "new" stage via gossip path)
-    // The proposer's attestation should NOT affect this block's fork choice position.
-    let proposer_vid = proposer_attestation.validator_id;
-    let proposer_data_root = proposer_attestation.data.tree_hash_root();
-    store.insert_attestation_data_by_root(proposer_data_root, proposer_attestation.data.clone());
 
     if !verify {
         // Without sig verification, insert directly with a dummy proof
@@ -904,15 +908,7 @@ pub enum StoreError {
     NotProposer { validator_index: u64, slot: u64 },
 }
 
-/// Extract validator indices from aggregation bits.
-fn aggregation_bits_to_validator_indices(bits: &AggregationBits) -> Vec<u64> {
-    bits.iter()
-        .enumerate()
-        .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
-        .collect()
-}
-
-/// Extract validator indices from aggregation bits.
+/// Build an AggregationBits bitfield from a list of validator indices.
 fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
     if bits.is_empty() {
         return AggregationBits::with_capacity(0).expect("max capacity is non-zero");
@@ -1101,8 +1097,7 @@ fn select_aggregated_proofs(
         let data = &aggregated.data;
         let message = data.tree_hash_root();
 
-        let validator_ids = aggregation_bits_to_validator_indices(&aggregated.aggregation_bits);
-        let mut remaining: HashSet<u64> = validator_ids.into_iter().collect();
+        let mut remaining: HashSet<u64> = validator_indices(&aggregated.aggregation_bits).collect();
 
         // Select existing proofs that cover the most remaining validators
         while !remaining.is_empty() {
@@ -1120,8 +1115,7 @@ fn select_aggregated_proofs(
             let (proof, covered) = candidates
                 .iter()
                 .map(|p| {
-                    let covered: Vec<_> = aggregation_bits_to_validator_indices(&p.participants)
-                        .into_iter()
+                    let covered: Vec<_> = validator_indices(&p.participants)
                         .filter(|vid| remaining.contains(vid))
                         .collect();
                     (p, covered)
@@ -1177,7 +1171,7 @@ fn verify_signatures(
 
     // Verify each attestation's signature proof
     for (attestation, aggregated_proof) in attestations.iter().zip(attestation_signatures) {
-        let validator_ids = aggregation_bits_to_validator_indices(&attestation.aggregation_bits);
+        let validator_ids: Vec<_> = validator_indices(&attestation.aggregation_bits).collect();
         if validator_ids.iter().any(|vid| *vid >= num_validators) {
             return Err(StoreError::InvalidValidatorIndex);
         }

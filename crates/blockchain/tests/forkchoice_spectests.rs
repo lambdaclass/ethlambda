@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{SECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{Attestation, AttestationData},
@@ -58,8 +58,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = build_signed_block(block_data);
 
-                    let block_time_ms =
-                        (signed_block.message.block.slot * SECONDS_PER_SLOT + genesis_time) * 1000;
+                    let block_time_ms = genesis_time * 1000
+                        + signed_block.message.block.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true, false);
