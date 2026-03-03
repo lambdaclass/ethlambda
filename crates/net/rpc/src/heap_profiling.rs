@@ -1,8 +1,8 @@
-/// Heap profiling endpoints backed by jemalloc's built-in profiler.
-///
-/// Returns pprof-format heap profiles at `/debug/pprof/allocs` and interactive
-/// SVG flamegraphs at `/debug/pprof/allocs/flamegraph`. Only functional on Linux;
-/// other platforms return 501 Not Implemented.
+//! Heap profiling endpoints backed by jemalloc's built-in profiler.
+//!
+//! Returns pprof-format heap profiles at `/debug/pprof/allocs` and interactive
+//! SVG flamegraphs at `/debug/pprof/allocs/flamegraph`. Only functional on Linux;
+//! other platforms return 501 Not Implemented.
 
 #[cfg(target_os = "linux")]
 mod inner {
