@@ -316,14 +316,15 @@ pub fn on_tick(
         match interval {
             0 => {
                 // Periodic fallback pruning when finalization is stalled
+                let finalized = store.latest_finalized();
                 if slot > 0
                     && slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
-                    && slot.saturating_sub(store.latest_finalized().slot)
+                    && slot.saturating_sub(finalized.slot)
                         > PRUNING_FALLBACK_INTERVAL_SLOTS
                 {
                     warn!(
                         %slot,
-                        finalized_slot = store.latest_finalized().slot,
+                        finalized_slot = finalized.slot,
                         "Finalization stalled, running periodic fallback pruning"
                     );
                     store.periodic_prune();
