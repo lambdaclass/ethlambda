@@ -1450,7 +1450,7 @@ mod tests {
             },
         );
 
-        // Insert more than STATES_TO_KEEP headers + states and BLOCKS_TO_KEEP blocks
+        // Insert more than STATES_TO_KEEP headers + states, but fewer than BLOCKS_TO_KEEP
         let total_states = STATES_TO_KEEP + 5;
         for i in 0..total_states as u64 {
             insert_header(backend.as_ref(), root(i), i);
