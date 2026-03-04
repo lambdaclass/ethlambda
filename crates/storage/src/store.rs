@@ -503,11 +503,13 @@ impl Store {
     /// 2. `slot` is a multiple of `PRUNING_FALLBACK_INTERVAL_SLOTS`
     /// 3. `current_slot - finalized_slot > PRUNING_FALLBACK_INTERVAL_SLOTS`
     pub fn periodic_prune(&mut self, slot: u64) {
+        // Check cheap arithmetic conditions before any DB read
+        if slot == 0 || !slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS) {
+            return;
+        }
+
         let finalized = self.latest_finalized();
-        if slot == 0
-            || !slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
-            || slot.saturating_sub(finalized.slot) <= PRUNING_FALLBACK_INTERVAL_SLOTS
-        {
+        if slot.saturating_sub(finalized.slot) <= PRUNING_FALLBACK_INTERVAL_SLOTS {
             return;
         }
 
