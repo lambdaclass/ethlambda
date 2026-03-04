@@ -482,48 +482,35 @@ impl Store {
                     "Pruned finalized data"
                 );
             }
-        }
-    }
+        } else {
+            // Fallback pruning when finalization is stalled.
+            // When finalization doesn't advance, the normal pruning path above never
+            // triggers. This fallback runs every PRUNING_FALLBACK_INTERVAL_SLOTS slots
+            // and prunes old states and blocks if finalization is far behind.
+            let head_slot = self
+                .get_block_header(&checkpoints.head)
+                .map(|h| h.slot)
+                .unwrap_or(0);
 
-    /// Fallback pruning for when finalization is stalled.
-    ///
-    /// Calls `prune_old_states` and `prune_old_blocks` with the current
-    /// finalized and justified roots as protected. This reuses the same
-    /// retention-window logic from `update_checkpoints`, but runs
-    /// independently of finalization advancement.
-    /// Periodic fallback pruning for stalled finalization.
-    ///
-    /// When finalization stalls (e.g., network issues, low participation), the normal
-    /// pruning path in `update_checkpoints` never triggers because finalization doesn't
-    /// advance. This method runs every `PRUNING_FALLBACK_INTERVAL_SLOTS` slots and prunes
-    /// old states and blocks if finalization is far behind.
-    ///
-    /// Trigger conditions (all must be true):
-    /// 1. `slot > 0` (skip genesis)
-    /// 2. `slot` is a multiple of `PRUNING_FALLBACK_INTERVAL_SLOTS`
-    /// 3. `current_slot - finalized_slot > PRUNING_FALLBACK_INTERVAL_SLOTS`
-    pub fn periodic_prune(&mut self, slot: u64) {
-        // Check cheap arithmetic conditions before any DB read
-        if slot == 0 || !slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS) {
-            return;
-        }
+            if head_slot > 0
+                && head_slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
+                && head_slot.saturating_sub(old_finalized_slot)
+                    > PRUNING_FALLBACK_INTERVAL_SLOTS
+            {
+                warn!(
+                    slot = head_slot,
+                    finalized_slot = old_finalized_slot,
+                    "Finalization stalled, running periodic fallback pruning"
+                );
 
-        let finalized = self.latest_finalized();
-        if slot.saturating_sub(finalized.slot) <= PRUNING_FALLBACK_INTERVAL_SLOTS {
-            return;
-        }
-
-        warn!(
-            %slot,
-            finalized_slot = finalized.slot,
-            "Finalization stalled, running periodic fallback pruning"
-        );
-
-        let protected_roots = [finalized.root, self.latest_justified().root];
-        let pruned_states = self.prune_old_states(&protected_roots);
-        let pruned_blocks = self.prune_old_blocks(&protected_roots);
-        if pruned_states > 0 || pruned_blocks > 0 {
-            info!(pruned_states, pruned_blocks, "Periodic fallback pruning");
+                let protected_roots =
+                    [self.latest_finalized().root, self.latest_justified().root];
+                let pruned_states = self.prune_old_states(&protected_roots);
+                let pruned_blocks = self.prune_old_blocks(&protected_roots);
+                if pruned_states > 0 || pruned_blocks > 0 {
+                    info!(pruned_states, pruned_blocks, "Periodic fallback pruning");
+                }
+            }
         }
     }
 
@@ -1416,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn periodic_prune_removes_old_states_and_blocks() {
+    fn fallback_pruning_removes_old_states_and_blocks() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1448,29 +1435,37 @@ mod tests {
             total_states
         );
 
-        // periodic_prune should prune states beyond STATES_TO_KEEP
-        // (protecting finalized and justified roots).
-        // Slot must satisfy all 3 trigger conditions: > 0, multiple of interval, lag > interval.
-        store.periodic_prune(PRUNING_FALLBACK_INTERVAL_SLOTS * 2);
+        // Insert a head block at a slot that triggers fallback pruning:
+        // slot > 0, multiple of interval, lag > interval.
+        let head_slot = PRUNING_FALLBACK_INTERVAL_SLOTS * 2;
+        let head_root = root(9999);
+        insert_header(backend.as_ref(), head_root, head_slot);
 
-        // States beyond retention should be pruned (5 excess - 2 protected = 3 pruned)
+        // Calling update_checkpoints with head_only triggers the fallback path
+        // (finalization doesn't advance → else branch fires)
+        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
+
+        // 906 headers total (905 original + 1 head). Top 900 by slot are kept in the
+        // retention window, leaving 6 candidates. 2 are protected (finalized + justified),
+        // so 4 are pruned → 905 - 4 = 901 states remaining.
         assert_eq!(
             count_entries(backend.as_ref(), Table::States),
-            STATES_TO_KEEP + 2
+            STATES_TO_KEEP + 1
         );
         // Finalized and justified states must survive
         assert!(has_key(backend.as_ref(), Table::States, &finalized_root));
         assert!(has_key(backend.as_ref(), Table::States, &justified_root));
 
         // Blocks: total_states < BLOCKS_TO_KEEP, so no blocks should be pruned
+        // (+1 for the head block we inserted)
         assert_eq!(
             count_entries(backend.as_ref(), Table::BlockHeaders),
-            total_states
+            total_states + 1
         );
     }
 
     #[test]
-    fn periodic_prune_no_op_within_retention() {
+    fn fallback_pruning_no_op_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1492,18 +1487,22 @@ mod tests {
             insert_state(backend.as_ref(), root(i));
         }
 
-        // Slot is a multiple of the interval, but finalization is at slot 0
-        // and count is within retention — nothing should be pruned
-        store.periodic_prune(PRUNING_FALLBACK_INTERVAL_SLOTS * 2);
+        // Insert a head block at a slot that triggers fallback pruning
+        let head_slot = PRUNING_FALLBACK_INTERVAL_SLOTS * 2;
+        let head_root = root(9999);
+        insert_header(backend.as_ref(), head_root, head_slot);
 
-        // Nothing should be pruned
+        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
+
+        // Nothing should be pruned (within retention window)
         assert_eq!(
             count_entries(backend.as_ref(), Table::States),
             STATES_TO_KEEP
         );
+        // +1 for the head block
         assert_eq!(
             count_entries(backend.as_ref(), Table::BlockHeaders),
-            STATES_TO_KEEP
+            STATES_TO_KEEP + 1
         );
     }
 
