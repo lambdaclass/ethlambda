@@ -334,17 +334,6 @@ pub fn on_tick(
             4 => {
                 // End of slot - accept accumulated attestations and log tree
                 accept_new_attestations(store, true);
-
-                // Prune stale gossip signatures and attestation data by age
-                let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(slot);
-                if pruned_sigs + pruned_att_data > 0 {
-                    info!(
-                        %slot,
-                        pruned_sigs,
-                        pruned_att_data,
-                        "Pruned stale attestation data by age"
-                    );
-                }
             }
             _ => unreachable!("slots only have 5 intervals"),
         }

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// The tree hash root of an empty block body.
 ///
@@ -90,19 +90,21 @@ const _: () = assert!(
     "BLOCKS_TO_KEEP must be >= STATES_TO_KEEP"
 );
 
-/// Hard cap for each aggregated payload buffer (new and known).
+/// Hard cap for the known aggregated payload buffer.
 /// Matches Lantern's approach. With 9 validators, this holds
 /// ~455 unique attestation messages (~30 min at 1/slot).
 const AGGREGATED_PAYLOAD_CAP: usize = 4096;
 
-/// Attestation data retention window in slots (~4.3 min at 4s/slot).
-const ATTESTATION_RETENTION_SLOTS: u64 = 64;
+/// Hard cap for the new (pending) aggregated payload buffer.
+/// Smaller than known since new payloads are drained every interval (~4s).
+/// With 9 validators at 1 attestation/slot, one interval holds ~9 entries.
+const NEW_PAYLOAD_CAP: usize = 512;
 
 /// Fixed-size circular buffer for aggregated payloads.
 ///
 /// Entries are evicted FIFO when the buffer reaches capacity.
 /// This prevents unbounded memory growth when finalization stalls.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PayloadBuffer {
     entries: VecDeque<(SignatureKey, StoredAggregatedPayload)>,
     capacity: usize,
@@ -202,8 +204,8 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
-    new_payloads: PayloadBuffer,
-    known_payloads: PayloadBuffer,
+    new_payloads: Arc<Mutex<PayloadBuffer>>,
+    known_payloads: Arc<Mutex<PayloadBuffer>>,
 }
 
 impl Store {
@@ -341,8 +343,8 @@ impl Store {
 
         Self {
             backend,
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
+            new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
+            known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
         }
     }
 
@@ -565,20 +567,6 @@ impl Store {
         self.prune_by_slot(Table::AttestationDataByRoot, finalized_slot, |bytes| {
             AttestationData::from_ssz_bytes(bytes).ok().map(|d| d.slot)
         })
-    }
-
-    /// Prune stale gossip signatures and attestation data by slot age.
-    ///
-    /// Independent of finalization — prevents unbounded growth when finalization stalls.
-    /// Returns (pruned_sigs, pruned_att_data).
-    pub fn prune_attestation_data_by_age(&mut self, current_slot: u64) -> (usize, usize) {
-        let cutoff_slot = current_slot.saturating_sub(ATTESTATION_RETENTION_SLOTS);
-        if cutoff_slot == 0 {
-            return (0, 0);
-        }
-        let pruned_sigs = self.prune_gossip_signatures(cutoff_slot);
-        let pruned_att_data = self.prune_attestation_data_by_root(cutoff_slot);
-        (pruned_sigs, pruned_att_data)
     }
 
     /// Prune old states beyond the retention window.
@@ -862,7 +850,7 @@ impl Store {
     /// Convenience: extract latest attestation per validator from known
     /// (fork-choice-active) aggregated payloads only.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        let keys = self.known_payloads.unique_keys();
+        let keys = self.known_payloads.lock().unwrap().unique_keys();
         self.extract_latest_attestations(keys.into_iter())
     }
 
@@ -875,12 +863,16 @@ impl Store {
     pub fn iter_known_aggregated_payloads(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
-        self.known_payloads.grouped().into_iter()
+        self.known_payloads.lock().unwrap().grouped().into_iter()
     }
 
     /// Iterates over deduplicated keys from the known aggregated payloads.
     pub fn iter_known_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> {
-        self.known_payloads.unique_keys().into_iter()
+        self.known_payloads
+            .lock()
+            .unwrap()
+            .unique_keys()
+            .into_iter()
     }
 
     /// Insert an aggregated payload into the known (fork-choice-active) buffer.
@@ -889,7 +881,7 @@ impl Store {
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.known_payloads.push(key, payload);
+        self.known_payloads.lock().unwrap().push(key, payload);
     }
 
     /// Batch-insert multiple aggregated payloads into the known buffer.
@@ -897,7 +889,7 @@ impl Store {
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.known_payloads.push_batch(entries);
+        self.known_payloads.lock().unwrap().push_batch(entries);
     }
 
     // ============ New Aggregated Payloads ============
@@ -909,12 +901,12 @@ impl Store {
     pub fn iter_new_aggregated_payloads(
         &self,
     ) -> impl Iterator<Item = (SignatureKey, Vec<StoredAggregatedPayload>)> {
-        self.new_payloads.grouped().into_iter()
+        self.new_payloads.lock().unwrap().grouped().into_iter()
     }
 
     /// Iterates over deduplicated keys from the new aggregated payloads.
     pub fn iter_new_aggregated_payload_keys(&self) -> impl Iterator<Item = SignatureKey> {
-        self.new_payloads.unique_keys().into_iter()
+        self.new_payloads.lock().unwrap().unique_keys().into_iter()
     }
 
     /// Insert an aggregated payload into the new (pending) buffer.
@@ -923,7 +915,7 @@ impl Store {
         key: SignatureKey,
         payload: StoredAggregatedPayload,
     ) {
-        self.new_payloads.push(key, payload);
+        self.new_payloads.lock().unwrap().push(key, payload);
     }
 
     /// Batch-insert multiple aggregated payloads into the new buffer.
@@ -931,7 +923,7 @@ impl Store {
         &mut self,
         entries: Vec<(SignatureKey, StoredAggregatedPayload)>,
     ) {
-        self.new_payloads.push_batch(entries);
+        self.new_payloads.lock().unwrap().push_batch(entries);
     }
 
     // ============ Pruning Helpers ============
@@ -973,8 +965,8 @@ impl Store {
     ///
     /// Drains the new buffer and pushes all entries into the known buffer.
     pub fn promote_new_aggregated_payloads(&mut self) {
-        let drained = self.new_payloads.drain();
-        self.known_payloads.push_batch(drained);
+        let drained = self.new_payloads.lock().unwrap().drain();
+        self.known_payloads.lock().unwrap().push_batch(drained);
     }
 
     /// Delete specific gossip signatures by key.
@@ -1168,16 +1160,34 @@ mod tests {
         H256::from(bytes)
     }
 
+    impl Store {
+        /// Create a Store with an in-memory backend for tests.
+        fn test_store() -> Self {
+            let backend = Arc::new(InMemoryBackend::new());
+            Self {
+                backend,
+                new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
+                known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            }
+        }
+
+        /// Create a Store with a shared in-memory backend for tests that need
+        /// direct backend access.
+        fn test_store_with_backend(backend: Arc<InMemoryBackend>) -> Self {
+            Self {
+                backend,
+                new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
+                known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            }
+        }
+    }
+
     // ============ Block Pruning Tests ============
 
     #[test]
     fn prune_old_blocks_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         // Insert exactly BLOCKS_TO_KEEP blocks
         for i in 0..BLOCKS_TO_KEEP as u64 {
@@ -1199,11 +1209,7 @@ mod tests {
     #[test]
     fn prune_old_blocks_exceeding_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         let total = BLOCKS_TO_KEEP + 10;
         for i in 0..total as u64 {
@@ -1239,11 +1245,7 @@ mod tests {
     #[test]
     fn prune_old_blocks_preserves_protected() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         let total = BLOCKS_TO_KEEP + 10;
         for i in 0..total as u64 {
@@ -1284,11 +1286,7 @@ mod tests {
     #[test]
     fn prune_old_states_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         // Insert STATES_TO_KEEP headers + states
         for i in 0..STATES_TO_KEEP as u64 {
@@ -1307,11 +1305,7 @@ mod tests {
     #[test]
     fn prune_old_states_exceeding_retention() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         let total = STATES_TO_KEEP + 5;
         for i in 0..total as u64 {
@@ -1340,11 +1334,7 @@ mod tests {
     #[test]
     fn prune_old_states_preserves_protected() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store_with_backend(backend.clone());
 
         let total = STATES_TO_KEEP + 5;
         for i in 0..total as u64 {
@@ -1425,111 +1415,35 @@ mod tests {
 
     #[test]
     fn promote_moves_new_to_known() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+        let mut store = Store::test_store();
 
         let key = (0u64, H256::ZERO);
         store.insert_new_aggregated_payload(key, make_payload(1));
         store.insert_new_aggregated_payload(key, make_payload(2));
 
-        assert_eq!(store.new_payloads.entries.len(), 2);
-        assert_eq!(store.known_payloads.entries.len(), 0);
+        assert_eq!(store.new_payloads.lock().unwrap().entries.len(), 2);
+        assert_eq!(store.known_payloads.lock().unwrap().entries.len(), 0);
 
         store.promote_new_aggregated_payloads();
 
-        assert_eq!(store.new_payloads.entries.len(), 0);
-        assert_eq!(store.known_payloads.entries.len(), 2);
-    }
-
-    fn make_attestation_data(slot: u64) -> AttestationData {
-        AttestationData {
-            slot,
-            head: Checkpoint::default(),
-            target: Checkpoint::default(),
-            source: Checkpoint::default(),
-        }
-    }
-
-    fn make_gossip_signature(slot: u64) -> StoredSignature {
-        StoredSignature {
-            slot,
-            signature_bytes: vec![0u8; 32],
-        }
+        assert_eq!(store.new_payloads.lock().unwrap().entries.len(), 0);
+        assert_eq!(store.known_payloads.lock().unwrap().entries.len(), 2);
     }
 
     #[test]
-    fn prune_attestation_data_by_age_removes_old() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
+    fn cloned_store_shares_payload_buffers() {
+        let mut store = Store::test_store();
+        let cloned = store.clone();
 
-        // Insert gossip signatures at slots 10 and 100 via raw backend
-        {
-            let mut batch = backend.begin_write().expect("write batch");
-            let key10 = encode_signature_key(&(0u64, root(10)));
-            let key100 = encode_signature_key(&(1u64, root(100)));
-            batch
-                .put_batch(
-                    Table::GossipSignatures,
-                    vec![
-                        (key10, make_gossip_signature(10).as_ssz_bytes()),
-                        (key100, make_gossip_signature(100).as_ssz_bytes()),
-                    ],
-                )
-                .expect("put");
-            batch.commit().expect("commit");
-        }
+        let key = (0u64, H256::ZERO);
+        store.insert_new_aggregated_payload(key, make_payload(1));
 
-        // Insert attestation data at slots 10 and 100
-        store.insert_attestation_data_by_root(root(10), make_attestation_data(10));
-        store.insert_attestation_data_by_root(root(100), make_attestation_data(100));
+        // Modification on original should be visible in clone
+        assert_eq!(cloned.new_payloads.lock().unwrap().entries.len(), 1);
 
-        // Prune with current_slot = 100, retention = 64 → cutoff = 36
-        let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(100);
-        assert_eq!(pruned_sigs, 1); // slot 10 <= 36
-        assert_eq!(pruned_att_data, 1); // slot 10 <= 36
+        store.promote_new_aggregated_payloads();
 
-        // Slot 100 entries should remain
-        assert_eq!(count_entries(backend.as_ref(), Table::GossipSignatures), 1);
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::AttestationDataByRoot),
-            1
-        );
-    }
-
-    #[test]
-    fn prune_attestation_data_by_age_noop_early_slots() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store {
-            backend: backend.clone(),
-            new_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-            known_payloads: PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP),
-        };
-
-        // Insert gossip signature at slot 5 via raw backend
-        {
-            let mut batch = backend.begin_write().expect("write batch");
-            let key = encode_signature_key(&(0u64, root(5)));
-            batch
-                .put_batch(
-                    Table::GossipSignatures,
-                    vec![(key, make_gossip_signature(5).as_ssz_bytes())],
-                )
-                .expect("put");
-            batch.commit().expect("commit");
-        }
-
-        // current_slot = 30 → cutoff = 30 - 64 = 0 (saturating) → short-circuits
-        let (pruned_sigs, pruned_att_data) = store.prune_attestation_data_by_age(30);
-        assert_eq!(pruned_sigs, 0);
-        assert_eq!(pruned_att_data, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::GossipSignatures), 1);
+        assert_eq!(cloned.new_payloads.lock().unwrap().entries.len(), 0);
+        assert_eq!(cloned.known_payloads.lock().unwrap().entries.len(), 1);
     }
 }
