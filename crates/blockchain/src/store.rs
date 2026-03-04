@@ -117,7 +117,7 @@ fn update_safe_target(store: &mut Store) {
 /// Aggregate committee signatures at interval 2.
 ///
 /// Collects individual gossip signatures, aggregates them by attestation data,
-/// and stores the resulting proofs in `LatestNewAggregatedPayloads`.
+/// and stores the resulting proofs in the new aggregated payloads buffer.
 fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
     let gossip_sigs: Vec<(SignatureKey, _)> = store.iter_gossip_signatures().collect();
     if gossip_sigs.is_empty() {
@@ -1083,7 +1083,7 @@ fn build_block(
 /// Select existing aggregated proofs for attestations to include in a block.
 ///
 /// Fresh gossip aggregation happens at interval 2 (`aggregate_committee_signatures`).
-/// This function only selects from existing proofs in the `LatestKnownAggregatedPayloads` table
+/// This function only selects from existing proofs in the known aggregated payloads buffer
 /// (proofs from previously received blocks and promoted gossip aggregations).
 ///
 /// Returns a list of (attestation, proof) pairs ready for block inclusion.

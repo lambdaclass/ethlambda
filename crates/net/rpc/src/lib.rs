@@ -8,13 +8,18 @@ pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod fork_choice;
+mod heap_profiling;
 pub mod metrics;
 
 pub async fn start_rpc_server(address: SocketAddr, store: Store) -> Result<(), std::io::Error> {
     let metrics_router = metrics::start_prometheus_metrics_api();
     let api_router = build_api_router(store);
+    let debug_router = build_debug_router();
 
-    let app = Router::new().merge(metrics_router).merge(api_router);
+    let app = Router::new()
+        .merge(metrics_router)
+        .merge(api_router)
+        .merge(debug_router);
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
@@ -36,6 +41,16 @@ fn build_api_router(store: Store) -> Router {
             get(fork_choice::get_fork_choice_ui),
         )
         .with_state(store)
+}
+
+/// Build the debug router for profiling endpoints.
+fn build_debug_router() -> Router {
+    Router::new()
+        .route("/debug/pprof/allocs", get(heap_profiling::handle_get_heap))
+        .route(
+            "/debug/pprof/allocs/flamegraph",
+            get(heap_profiling::handle_get_heap_flamegraph),
+        )
 }
 
 async fn get_latest_finalized_state(
