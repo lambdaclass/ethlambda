@@ -4,9 +4,7 @@ use ethlambda_crypto::aggregate_signatures;
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
-use ethlambda_storage::{
-    ForkCheckpoints, PRUNING_FALLBACK_INTERVAL_SLOTS, SignatureKey, Store, StoredAggregatedPayload,
-};
+use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store, StoredAggregatedPayload};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
@@ -316,18 +314,7 @@ pub fn on_tick(
         match interval {
             0 => {
                 // Periodic fallback pruning when finalization is stalled
-                let finalized = store.latest_finalized();
-                if slot > 0
-                    && slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
-                    && slot.saturating_sub(finalized.slot) > PRUNING_FALLBACK_INTERVAL_SLOTS
-                {
-                    warn!(
-                        %slot,
-                        finalized_slot = finalized.slot,
-                        "Finalization stalled, running periodic fallback pruning"
-                    );
-                    store.periodic_prune();
-                }
+                store.periodic_prune(slot);
 
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
@@ -1276,7 +1263,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use ethlambda_storage::{StorageBackend, Table, backend::InMemoryBackend};
+    use ethlambda_storage::{
+        PRUNING_FALLBACK_INTERVAL_SLOTS, StorageBackend, Table, backend::InMemoryBackend,
+    };
     use ethlambda_types::{block::BlockHeader, primitives::ssz::Encode, state::State};
 
     use crate::MILLISECONDS_PER_INTERVAL;

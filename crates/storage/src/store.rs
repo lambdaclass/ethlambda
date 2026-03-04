@@ -24,7 +24,7 @@ use ethlambda_types::{
     signature::ValidatorSignature,
     state::{ChainConfig, State},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Key for looking up individual validator signatures.
 /// Used to index signature caches by (validator, message) pairs.
@@ -491,8 +491,33 @@ impl Store {
     /// finalized and justified roots as protected. This reuses the same
     /// retention-window logic from `update_checkpoints`, but runs
     /// independently of finalization advancement.
-    pub fn periodic_prune(&mut self) {
-        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
+    /// Periodic fallback pruning for stalled finalization.
+    ///
+    /// When finalization stalls (e.g., network issues, low participation), the normal
+    /// pruning path in `update_checkpoints` never triggers because finalization doesn't
+    /// advance. This method runs every `PRUNING_FALLBACK_INTERVAL_SLOTS` slots and prunes
+    /// old states and blocks if finalization is far behind.
+    ///
+    /// Trigger conditions (all must be true):
+    /// 1. `slot > 0` (skip genesis)
+    /// 2. `slot` is a multiple of `PRUNING_FALLBACK_INTERVAL_SLOTS`
+    /// 3. `current_slot - finalized_slot > PRUNING_FALLBACK_INTERVAL_SLOTS`
+    pub fn periodic_prune(&mut self, slot: u64) {
+        let finalized = self.latest_finalized();
+        if slot == 0
+            || !slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
+            || slot.saturating_sub(finalized.slot) <= PRUNING_FALLBACK_INTERVAL_SLOTS
+        {
+            return;
+        }
+
+        warn!(
+            %slot,
+            finalized_slot = finalized.slot,
+            "Finalization stalled, running periodic fallback pruning"
+        );
+
+        let protected_roots = [finalized.root, self.latest_justified().root];
         let pruned_states = self.prune_old_states(&protected_roots);
         let pruned_blocks = self.prune_old_blocks(&protected_roots);
         if pruned_states > 0 || pruned_blocks > 0 {
@@ -1422,8 +1447,9 @@ mod tests {
         );
 
         // periodic_prune should prune states beyond STATES_TO_KEEP
-        // (protecting finalized and justified roots)
-        store.periodic_prune();
+        // (protecting finalized and justified roots).
+        // Slot must satisfy all 3 trigger conditions: > 0, multiple of interval, lag > interval.
+        store.periodic_prune(PRUNING_FALLBACK_INTERVAL_SLOTS * 2);
 
         // States beyond retention should be pruned (5 excess - 2 protected = 3 pruned)
         assert_eq!(
@@ -1464,7 +1490,9 @@ mod tests {
             insert_state(backend.as_ref(), root(i));
         }
 
-        store.periodic_prune();
+        // Slot is a multiple of the interval, but finalization is at slot 0
+        // and count is within retention — nothing should be pruned
+        store.periodic_prune(PRUNING_FALLBACK_INTERVAL_SLOTS * 2);
 
         // Nothing should be pruned
         assert_eq!(
