@@ -1254,4 +1254,3 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
     // Assume the ancestor is behind the latest finalized block
     false
 }
-

@@ -494,8 +494,7 @@ impl Store {
 
             if head_slot > 0
                 && head_slot.is_multiple_of(PRUNING_FALLBACK_INTERVAL_SLOTS)
-                && head_slot.saturating_sub(old_finalized_slot)
-                    > PRUNING_FALLBACK_INTERVAL_SLOTS
+                && head_slot.saturating_sub(old_finalized_slot) > PRUNING_FALLBACK_INTERVAL_SLOTS
             {
                 warn!(
                     slot = head_slot,
@@ -503,8 +502,7 @@ impl Store {
                     "Finalization stalled, running periodic fallback pruning"
                 );
 
-                let protected_roots =
-                    [self.latest_finalized().root, self.latest_justified().root];
+                let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
                 let pruned_states = self.prune_old_states(&protected_roots);
                 let pruned_blocks = self.prune_old_blocks(&protected_roots);
                 if pruned_states > 0 || pruned_blocks > 0 {
