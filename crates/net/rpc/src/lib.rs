@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::{H256, ssz::Encode};
+use ethlambda_types::primitives::{H256, ssz::SszEncode};
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -73,7 +73,7 @@ async fn get_latest_finalized_state(
     // Serving the canonical form ensures checkpoint sync interoperability.
     state.latest_block_header.state_root = H256::ZERO;
 
-    ssz_response(state.as_ssz_bytes())
+    ssz_response(state.to_ssz())
 }
 
 async fn get_latest_justified_state(
@@ -106,7 +106,7 @@ pub(crate) mod test_utils {
     use ethlambda_types::{
         block::{BlockBody, BlockHeader},
         checkpoint::Checkpoint,
-        primitives::{H256, ssz::TreeHash},
+        primitives::{H256, ssz::HashTreeRoot},
         state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
 
@@ -117,7 +117,7 @@ pub(crate) mod test_utils {
             proposer_index: 0,
             parent_root: H256::ZERO,
             state_root: H256::ZERO,
-            body_root: BlockBody::default().tree_hash_root(),
+            body_root: H256(BlockBody::default().hash_tree_root()),
         };
 
         let genesis_checkpoint = Checkpoint {
@@ -132,10 +132,10 @@ pub(crate) mod test_utils {
             latest_justified: genesis_checkpoint,
             latest_finalized: genesis_checkpoint,
             historical_block_hashes: Default::default(),
-            justified_slots: JustifiedSlots::with_capacity(0).unwrap(),
+            justified_slots: JustifiedSlots::new(),
             validators: Default::default(),
             justifications_roots: Default::default(),
-            justifications_validators: JustificationValidators::with_capacity(0).unwrap(),
+            justifications_validators: JustificationValidators::new(),
         }
     }
 }
@@ -191,8 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_latest_finalized_state() {
-        use ethlambda_types::primitives::{H256, ssz::Encode};
-
+        use ethlambda_types::primitives::{H256, ssz::SszEncode};
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
@@ -201,7 +200,7 @@ mod tests {
         let finalized = store.latest_finalized();
         let mut expected_state = store.get_state(&finalized.root).unwrap();
         expected_state.latest_block_header.state_root = H256::ZERO;
-        let expected_ssz = expected_state.as_ssz_bytes();
+        let expected_ssz = expected_state.to_ssz();
 
         let app = build_api_router(store);
 

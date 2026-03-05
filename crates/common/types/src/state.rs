@@ -1,23 +1,17 @@
 use serde::{Deserialize, Serialize};
-use ssz_types::typenum::{U4096, U262144};
 
 use crate::{
     block::{BlockBody, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{
-        H256,
-        ssz::{Decode, DecodeError, Encode, TreeHash},
+        H256, SszBitlist, SszList,
+        ssz::{HashTreeRoot, SszDecode, SszEncode},
     },
-    signature::ValidatorPublicKey,
+    signature::{SignatureParseError, ValidatorPublicKey},
 };
 
-// Constants
-
-/// The maximum number of validators that can be in the registry.
-pub type ValidatorRegistryLimit = U4096;
-
 /// The main consensus state object
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
     /// The chain's configuration parameters
     pub config: ChainConfig,
@@ -34,7 +28,7 @@ pub struct State {
     /// A bitfield indicating which historical slots were justified
     pub justified_slots: JustifiedSlots,
     /// Registry of validators tracked by the state
-    pub validators: ssz_types::VariableList<Validator, ValidatorRegistryLimit>,
+    pub validators: SszList<Validator, 4096>,
     /// Roots of justified blocks
     pub justifications_roots: JustificationRoots,
     /// A bitlist of validators who participated in justifications
@@ -46,46 +40,104 @@ pub struct State {
 /// With a 4-second slot, this corresponds to a history
 /// of approximately 12.1 days.
 pub const HISTORICAL_ROOTS_LIMIT: usize = 262_144; // 2**18
-type HistoricalRootsLimit = U262144;
 
 /// List of historical block root hashes up to historical_roots_limit.
-type HistoricalBlockHashes = ssz_types::VariableList<H256, HistoricalRootsLimit>;
+type HistoricalBlockHashes = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
 /// Bitlist tracking justified slots up to historical roots limit.
-pub type JustifiedSlots = ssz_types::BitList<HistoricalRootsLimit>;
+pub type JustifiedSlots = SszBitlist<HISTORICAL_ROOTS_LIMIT>;
 
 /// List of justified block roots up to historical_roots_limit.
-pub type JustificationRoots = ssz_types::VariableList<H256, HistoricalRootsLimit>;
+pub type JustificationRoots = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
 /// Bitlist for tracking validator justifications per historical root.
-pub type JustificationValidators =
-    ssz_types::BitList<ssz_types::typenum::Prod<HistoricalRootsLimit, ValidatorRegistryLimit>>;
+///
+/// Maximum size is HISTORICAL_ROOTS_LIMIT × VALIDATOR_REGISTRY_LIMIT = 262144 × 4096 = 1,073,741,824.
+pub type JustificationValidators = SszBitlist<1_073_741_824>;
 
 /// Represents a validator's static metadata and operational interface.
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
     /// XMSS one-time signature public key.
-    #[serde(serialize_with = "serialize_pubkey_hex")]
     pub pubkey: ValidatorPubkeyBytes,
     /// Validator index in the registry.
     pub index: u64,
 }
 
-fn serialize_pubkey_hex<S>(pubkey: &ValidatorPubkeyBytes, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&hex::encode(pubkey))
-}
-
 impl Validator {
-    pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, DecodeError> {
+    pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
         // TODO: make this unfallible by moving check to the constructor
-        ValidatorPublicKey::from_bytes(&self.pubkey)
+        ValidatorPublicKey::from_bytes(&self.pubkey.0)
     }
 }
 
-pub type ValidatorPubkeyBytes = [u8; 52];
+/// 52-byte XMSS public key bytes.
+///
+/// Wrapped as a newtype because libssz only provides SszEncode/SszDecode/HashTreeRoot
+/// for common byte array sizes (4, 20, 32, 48, 96); 52 is specific to XMSS keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValidatorPubkeyBytes(pub [u8; 52]);
+
+impl serde::Serialize for ValidatorPubkeyBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl std::ops::Deref for ValidatorPubkeyBytes {
+    type Target = [u8; 52];
+    fn deref(&self) -> &[u8; 52] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<u8>> for ValidatorPubkeyBytes {
+    type Error = Vec<u8>;
+    fn try_from(v: Vec<u8>) -> Result<Self, Self::Error> {
+        let arr: [u8; 52] = v.as_slice().try_into().map_err(|_| v)?;
+        Ok(Self(arr))
+    }
+}
+
+impl ssz::SszEncode for ValidatorPubkeyBytes {
+    fn is_fixed_size() -> bool {
+        true
+    }
+    fn fixed_size() -> usize {
+        52
+    }
+    fn encoded_len(&self) -> usize {
+        52
+    }
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.0);
+    }
+}
+
+impl ssz::SszDecode for ValidatorPubkeyBytes {
+    fn is_fixed_size() -> bool {
+        true
+    }
+    fn fixed_size() -> usize {
+        52
+    }
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        if bytes.len() != 52 {
+            return Err(ssz::DecodeError::InvalidFixedLength {
+                expected: 52,
+                got: bytes.len(),
+            });
+        }
+        let arr: [u8; 52] = bytes.try_into().unwrap();
+        Ok(Self(arr))
+    }
+}
+
+impl ssz_merkle::HashTreeRoot for ValidatorPubkeyBytes {
+    fn hash_tree_root(&self) -> ssz_merkle::Node {
+        ssz_merkle::merkleize(&ssz_merkle::pack(&self.0), None)
+    }
+}
 
 impl State {
     pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {
@@ -94,13 +146,11 @@ impl State {
             proposer_index: 0,
             parent_root: H256::ZERO,
             state_root: H256::ZERO,
-            body_root: BlockBody::default().tree_hash_root(),
+            body_root: H256(BlockBody::default().hash_tree_root()),
         };
-        let validators = ssz_types::VariableList::new(validators).unwrap();
-        let justified_slots =
-            JustifiedSlots::with_capacity(0).expect("failed to initialize empty list");
-        let justifications_validators =
-            JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
+        let validators = SszList::try_from(validators).unwrap();
+        let justified_slots = JustifiedSlots::new();
+        let justifications_validators = JustificationValidators::new();
 
         Self {
             config: ChainConfig { genesis_time },
@@ -117,7 +167,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ChainConfig {
     pub genesis_time: u64,
 }

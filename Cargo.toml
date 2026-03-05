@@ -54,20 +54,14 @@ prometheus = "0.14"
 
 clap = { version = "4.3", features = ["derive", "env"] }
 
-# H256 type
-# TODO: switch to ethrex implementation when available
-ethereum-types = { version = "0.15.1", features = ["serialize"] }
-
 # XMSS signatures
 leansig = { git = "https://github.com/leanEthereum/leanSig.git", rev = "73bedc26ed961b110df7ac2e234dc11361a4bf25" }
 
-# SSZ deps
-# TODO: roll up our own implementation
-ethereum_ssz_derive = "0.8.3"
-ethereum_ssz = "0.8.3"
-ssz_types = "0.10.1"
-tree_hash = "0.9.1"
-tree_hash_derive = "0.9.1"
+# SSZ implementation
+ssz = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
+ssz-derive = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
+ssz-merkle = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
+ssz-types = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }

@@ -2,7 +2,10 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::SignedBlockWithAttestation,
-    primitives::ssz::{Decode, Encode, TreeHash},
+    primitives::{
+        H256,
+        ssz::{HashTreeRoot, SszDecode, SszEncode},
+    },
 };
 use libp2p::gossipsub::Event;
 use tracing::{error, info, trace};
@@ -37,7 +40,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 return;
             };
             let slot = signed_block.message.block.slot;
-            let block_root = signed_block.message.block.tree_hash_root();
+            let block_root = H256(signed_block.message.block.hash_tree_root());
             let proposer = signed_block.message.block.proposer_index;
             let parent_root = signed_block.message.block.parent_root;
             let attestation_count = signed_block.message.block.body.attestations.len();
@@ -125,7 +128,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     let validator = attestation.validator_id;
 
     // Encode to SSZ
-    let ssz_bytes = attestation.as_ssz_bytes();
+    let ssz_bytes = attestation.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
@@ -148,12 +151,12 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
     let slot = signed_block.message.block.slot;
     let proposer = signed_block.message.block.proposer_index;
-    let block_root = signed_block.message.block.tree_hash_root();
+    let block_root = H256(signed_block.message.block.hash_tree_root());
     let parent_root = signed_block.message.block.parent_root;
     let attestation_count = signed_block.message.block.body.attestations.len();
 
     // Encode to SSZ
-    let ssz_bytes = signed_block.as_ssz_bytes();
+    let ssz_bytes = signed_block.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
@@ -179,7 +182,7 @@ pub async fn publish_aggregated_attestation(
     let slot = attestation.data.slot;
 
     // Encode to SSZ
-    let ssz_bytes = attestation.as_ssz_bytes();
+    let ssz_bytes = attestation.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);

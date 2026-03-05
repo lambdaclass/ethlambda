@@ -20,7 +20,7 @@ pub fn populate_name_registry(names_and_privkeys: HashMap<String, H256>) {
     *registry = names_and_privkeys
         .into_iter()
         .filter_map(|(name, mut privkey)| {
-            let Ok(privkey) = secp256k1::SecretKey::try_from_bytes(&mut privkey) else {
+            let Ok(privkey) = secp256k1::SecretKey::try_from_bytes(&mut privkey.0) else {
                 return None;
             };
             let pubkey = Keypair::from(secp256k1::Keypair::from(privkey)).public();

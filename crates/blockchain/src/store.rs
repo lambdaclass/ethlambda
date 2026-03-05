@@ -16,7 +16,7 @@ use ethlambda_types::{
         SignedBlockWithAttestation,
     },
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::TreeHash},
+    primitives::{H256, ssz::HashTreeRoot},
     signature::ValidatorSignature,
     state::State,
 };
@@ -377,7 +377,7 @@ pub fn on_gossip_attestation(
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
-    let data_root = attestation.data.tree_hash_root();
+    let data_root = H256(attestation.data.hash_tree_root());
 
     let target = attestation.data.target;
     let target_state = store
@@ -469,7 +469,7 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let data_root = aggregated.data.tree_hash_root();
+    let data_root = H256(aggregated.data.hash_tree_root());
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     {
@@ -502,7 +502,13 @@ pub fn on_gossip_aggregated_attestation(
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     let slot = aggregated.data.slot;
-    let num_participants = aggregated.proof.participants.num_set_bits();
+    let num_participants: u32 = aggregated
+        .proof
+        .participants
+        .as_bytes()
+        .iter()
+        .map(|b| b.count_ones())
+        .sum();
     info!(
         slot,
         num_participants,
@@ -553,7 +559,7 @@ fn on_block_core(
     let _timing = metrics::time_fork_choice_block_processing();
 
     let block = &signed_block.message.block;
-    let block_root = block.tree_hash_root();
+    let block_root = H256(block.hash_tree_root());
     let slot = block.slot;
 
     // Skip duplicate blocks (idempotent operation)
@@ -614,7 +620,7 @@ fn on_block_core(
         .iter()
         .zip(attestation_signatures.iter())
     {
-        let data_root = att.data.tree_hash_root();
+        let data_root = H256(att.data.hash_tree_root());
         att_data_entries.push((data_root, att.data.clone()));
 
         let validator_ids: Vec<_> = validator_indices(&att.aggregation_bits).collect();
@@ -632,7 +638,7 @@ fn on_block_core(
     // Process proposer attestation as pending (enters "new" stage via gossip path)
     // The proposer's attestation should NOT affect this block's fork choice position.
     let proposer_vid = proposer_attestation.validator_id;
-    let proposer_data_root = proposer_attestation.data.tree_hash_root();
+    let proposer_data_root = H256(proposer_attestation.data.hash_tree_root());
     att_data_entries.push((proposer_data_root, proposer_attestation.data.clone()));
 
     // Batch-insert all attestation data (body + proposer) in a single commit
@@ -955,7 +961,7 @@ pub enum StoreError {
 /// Build an AggregationBits bitfield from a list of validator indices.
 fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
     if bits.is_empty() {
-        return AggregationBits::with_capacity(0).expect("max capacity is non-zero");
+        return AggregationBits::with_length(0).unwrap();
     }
     let max_id = bits
         .iter()
@@ -963,12 +969,10 @@ fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
         .max()
         .expect("already checked it's non-empty") as usize;
     let mut aggregation_bits =
-        AggregationBits::with_capacity(max_id + 1).expect("validator count exceeds limit");
+        AggregationBits::with_length(max_id + 1).expect("validator count exceeds limit");
 
     for &vid in bits {
-        aggregation_bits
-            .set(vid as usize, true)
-            .expect("capacity support highest validator id");
+        aggregation_bits.set(vid as usize, true);
     }
     aggregation_bits
 }
@@ -982,7 +986,7 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
     let mut groups: HashMap<H256, (AttestationData, Vec<u64>)> = HashMap::new();
 
     for attestation in attestations {
-        let data_root = attestation.data.tree_hash_root();
+        let data_root = H256(attestation.data.hash_tree_root());
         groups
             .entry(data_root)
             .or_insert_with(|| (attestation.data.clone(), Vec::new()))
@@ -997,11 +1001,10 @@ fn aggregate_attestations_by_data(attestations: &[Attestation]) -> Vec<Aggregate
             // Find max validator id to determine bitlist capacity
             let max_id = validator_ids.iter().copied().max().unwrap_or(0) as usize;
             let mut bits =
-                AggregationBits::with_capacity(max_id + 1).expect("validator count exceeds limit");
+                AggregationBits::with_length(max_id + 1).expect("validator count exceeds limit");
 
             for vid in validator_ids {
-                bits.set(vid as usize, true)
-                    .expect("validator id exceeds capacity");
+                bits.set(vid as usize, true);
             }
 
             AggregatedAttestation {
@@ -1064,7 +1067,7 @@ fn build_block(
         let mut new_attestations: Vec<Attestation> = Vec::new();
 
         for attestation in available_attestations {
-            let data_root = attestation.data.tree_hash_root();
+            let data_root = H256(attestation.data.hash_tree_root());
             let sig_key: SignatureKey = (attestation.validator_id, data_root);
 
             // Skip if target block is unknown
@@ -1119,7 +1122,7 @@ fn build_block(
     process_slots(&mut post_state, slot)?;
     process_block(&mut post_state, &final_block)?;
 
-    final_block.state_root = post_state.tree_hash_root();
+    final_block.state_root = H256(post_state.hash_tree_root());
 
     Ok((final_block, post_state, aggregated_signatures))
 }
@@ -1139,7 +1142,7 @@ fn select_aggregated_proofs(
 
     for aggregated in aggregate_attestations_by_data(attestations) {
         let data = &aggregated.data;
-        let message = data.tree_hash_root();
+        let message = H256(data.hash_tree_root());
 
         let mut remaining: HashSet<u64> = validator_indices(&aggregated.aggregation_bits).collect();
 
@@ -1225,7 +1228,7 @@ fn verify_signatures(
         }
 
         let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let message = attestation.data.tree_hash_root();
+        let message = H256(attestation.data.hash_tree_root());
 
         // Collect public keys for all participating validators
         let public_keys: Vec<_> = validator_ids
@@ -1276,7 +1279,7 @@ fn verify_signatures(
         .slot
         .try_into()
         .expect("slot exceeds u32");
-    let message = proposer_attestation.data.tree_hash_root();
+    let message = H256(proposer_attestation.data.hash_tree_root());
 
     if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
@@ -1334,12 +1337,15 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, Attestation, AttestationData},
+        attestation::{
+            AggregatedAttestation, AggregationBits, Attestation, AttestationData, XmssSignature,
+        },
         block::{
-            AggregatedSignatureProof, BlockBody, BlockSignatures, BlockWithAttestation,
-            SignedBlockWithAttestation,
+            AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
+            BlockWithAttestation, SignedBlockWithAttestation,
         },
         checkpoint::Checkpoint,
+        signature::SIGNATURE_SIZE,
         state::State,
     };
 
@@ -1355,15 +1361,15 @@ mod tests {
         };
 
         // Create attestation with bits [0, 1] set
-        let mut attestation_bits = AggregationBits::with_capacity(4).unwrap();
-        attestation_bits.set(0, true).unwrap();
-        attestation_bits.set(1, true).unwrap();
+        let mut attestation_bits = AggregationBits::with_length(4).unwrap();
+        attestation_bits.set(0, true);
+        attestation_bits.set(1, true);
 
         // Create proof with different bits [0, 1, 2] set
-        let mut proof_bits = AggregationBits::with_capacity(4).unwrap();
-        proof_bits.set(0, true).unwrap();
-        proof_bits.set(1, true).unwrap();
-        proof_bits.set(2, true).unwrap();
+        let mut proof_bits = AggregationBits::with_length(4).unwrap();
+        proof_bits.set(0, true);
+        proof_bits.set(1, true);
+        proof_bits.set(2, true);
 
         let attestation = AggregatedAttestation {
             aggregation_bits: attestation_bits,
@@ -1371,8 +1377,8 @@ mod tests {
         };
         let proof = AggregatedSignatureProof::empty(proof_bits);
 
-        let attestations = AggregatedAttestations::new(vec![attestation]).unwrap();
-        let attestation_signatures = ssz_types::VariableList::new(vec![proof]).unwrap();
+        let attestations = AggregatedAttestations::try_from(vec![attestation]).unwrap();
+        let attestation_signatures = AttestationSignatures::try_from(vec![proof]).unwrap();
 
         let signed_block = SignedBlockWithAttestation {
             message: BlockWithAttestation {
@@ -1390,7 +1396,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures,
-                proposer_signature: ssz_types::FixedVector::from_elem(0),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
             },
         };
 

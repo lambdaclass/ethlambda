@@ -1,12 +1,14 @@
 use ethlambda_types::{
-    block::AggregatedSignatureProof, primitives::ssz, signature::ValidatorSignature,
+    block::AggregatedSignatureProof,
+    primitives::ssz,
+    signature::{SignatureParseError, ValidatorSignature},
 };
 
 /// Gossip signature stored with slot for pruning.
 ///
 /// Signatures are stored alongside the slot they pertain to, enabling
 /// simple slot-based pruning when blocks become finalized.
-#[derive(Debug, Clone, ssz::Encode, ssz::Decode)]
+#[derive(Debug, Clone, ssz::SszEncode, ssz::SszDecode)]
 pub struct StoredSignature {
     pub slot: u64,
     pub signature_bytes: Vec<u8>,
@@ -20,7 +22,7 @@ impl StoredSignature {
         }
     }
 
-    pub fn to_validator_signature(&self) -> Result<ValidatorSignature, ssz::DecodeError> {
+    pub fn to_validator_signature(&self) -> Result<ValidatorSignature, SignatureParseError> {
         ValidatorSignature::from_bytes(&self.signature_bytes)
     }
 }
@@ -29,7 +31,7 @@ impl StoredSignature {
 ///
 /// Aggregated signature proofs are stored with their slot to enable
 /// pruning when blocks become finalized.
-#[derive(Debug, Clone, ssz::Encode, ssz::Decode)]
+#[derive(Debug, Clone, ssz::SszEncode, ssz::SszDecode)]
 pub struct StoredAggregatedPayload {
     pub slot: u64,
     pub proof: AggregatedSignatureProof,

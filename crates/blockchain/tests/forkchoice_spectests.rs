@@ -7,9 +7,12 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{Attestation, AttestationData},
-    block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    primitives::{H256, VariableList, ssz::TreeHash},
+    attestation::{Attestation, AttestationData, XmssSignature},
+    block::{
+        AttestationSignatures, Block, BlockSignatures, BlockWithAttestation,
+        SignedBlockWithAttestation,
+    },
+    primitives::{H256, ssz::HashTreeRoot},
     state::State,
 };
 
@@ -52,7 +55,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // Register block label if present
                     if let Some(ref label) = block_data.block_root_label {
                         let block: Block = block_data.block.clone().into();
-                        let root = H256::from(block.tree_hash_root());
+                        let root = H256(block.hash_tree_root());
                         block_registry.insert(label.clone(), root);
                     }
 
@@ -114,8 +117,8 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttest
             proposer_attestation,
         },
         signature: BlockSignatures {
-            proposer_signature: Default::default(),
-            attestation_signatures: VariableList::empty(),
+            proposer_signature: XmssSignature::try_from(vec![0u8; 3112]).unwrap(),
+            attestation_signatures: AttestationSignatures::new(),
         },
     }
 }

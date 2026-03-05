@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ethlambda_types::primitives::ssz::{Decode, DecodeError, TreeHash};
+use ethlambda_types::primitives::ssz::{DecodeError, HashTreeRoot, SszDecode};
 use ethlambda_types::state::{State, Validator};
 use reqwest::Client;
 
@@ -172,7 +172,7 @@ fn verify_checkpoint_state(
     }
 
     // If block header matches checkpoint slots, roots must match
-    let block_root = state.latest_block_header.tree_hash_root();
+    let block_root = state.latest_block_header.hash_tree_root();
 
     if state.latest_block_header.slot == state.latest_finalized.slot
         && block_root != state.latest_finalized.root.0
@@ -194,17 +194,16 @@ mod tests {
     use super::*;
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::checkpoint::Checkpoint;
-    use ethlambda_types::primitives::VariableList;
-    use ethlambda_types::state::ChainConfig;
+    use ethlambda_types::primitives::{H256, SszList};
+    use ethlambda_types::state::{
+        ChainConfig, JustificationValidators, JustifiedSlots, ValidatorPubkeyBytes,
+    };
 
     // Helper to create valid test state
     fn create_test_state(slot: u64, validators: Vec<Validator>, genesis_time: u64) -> State {
-        use ethlambda_types::primitives::H256;
-        use ethlambda_types::state::{JustificationValidators, JustifiedSlots};
-
         State {
             slot,
-            validators: VariableList::new(validators).unwrap(),
+            validators: SszList::try_from(validators).unwrap(),
             latest_block_header: BlockHeader {
                 slot,
                 parent_root: H256::ZERO,
@@ -222,22 +221,22 @@ mod tests {
             },
             config: ChainConfig { genesis_time },
             historical_block_hashes: Default::default(),
-            justified_slots: JustifiedSlots::with_capacity(0).unwrap(),
+            justified_slots: JustifiedSlots::new(),
             justifications_roots: Default::default(),
-            justifications_validators: JustificationValidators::with_capacity(0).unwrap(),
+            justifications_validators: JustificationValidators::new(),
         }
     }
 
     fn create_test_validator() -> Validator {
         Validator {
-            pubkey: [1u8; 52],
+            pubkey: ValidatorPubkeyBytes([1u8; 52]),
             index: 0,
         }
     }
 
     fn create_different_validator() -> Validator {
         Validator {
-            pubkey: [2u8; 52],
+            pubkey: ValidatorPubkeyBytes([2u8; 52]),
             index: 0,
         }
     }
@@ -245,7 +244,7 @@ mod tests {
     fn create_validators_with_indices(count: usize) -> Vec<Validator> {
         (0..count)
             .map(|i| Validator {
-                pubkey: [i as u8 + 1; 52],
+                pubkey: ValidatorPubkeyBytes([i as u8 + 1; 52]),
                 index: i as u64,
             })
             .collect()
@@ -375,7 +374,7 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 50;
-        let block_root = state.latest_block_header.tree_hash_root();
+        let block_root = H256(state.latest_block_header.hash_tree_root());
         state.latest_finalized.slot = 50;
         state.latest_finalized.root = block_root;
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
@@ -397,7 +396,7 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 90;
-        let block_root = state.latest_block_header.tree_hash_root();
+        let block_root = H256(state.latest_block_header.hash_tree_root());
         state.latest_justified.slot = 90;
         state.latest_justified.root = block_root;
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());

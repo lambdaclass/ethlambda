@@ -1,6 +1,6 @@
 use std::io;
 
-use ethlambda_types::primitives::ssz::{Decode, Encode};
+use ethlambda_types::primitives::ssz::{SszDecode, SszEncode};
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
 
@@ -13,7 +13,6 @@ use super::{
 };
 
 use ethlambda_types::block::SignedBlockWithAttestation;
-use ethlambda_types::primitives::ssz::Decode as SszDecode;
 
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
@@ -84,8 +83,8 @@ impl libp2p::request_response::Codec for Codec {
         trace!(?req, "Writing request");
 
         let encoded = match req {
-            Request::Status(status) => status.as_ssz_bytes(),
-            Request::BlocksByRoot(request) => request.as_ssz_bytes(),
+            Request::Status(status) => status.to_ssz(),
+            Request::BlocksByRoot(request) => request.to_ssz(),
         };
 
         write_payload(io, &encoded).await
@@ -106,14 +105,14 @@ impl libp2p::request_response::Codec for Codec {
                     ResponsePayload::Status(status) => {
                         // Send success code (0)
                         io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
-                        let encoded = status.as_ssz_bytes();
+                        let encoded = status.to_ssz();
                         write_payload(io, &encoded).await
                     }
                     ResponsePayload::BlocksByRoot(blocks) => {
                         // Write each block as separate chunk
                         for block in blocks {
                             io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
-                            let encoded = block.as_ssz_bytes();
+                            let encoded = block.to_ssz();
                             write_payload(io, &encoded).await?;
                         }
                         // Empty response if no blocks found (stream just ends)
@@ -126,7 +125,7 @@ impl libp2p::request_response::Codec for Codec {
                 io.write_all(&[code.into()]).await?;
 
                 // Error messages are SSZ-encoded as List[byte, 256]
-                let encoded = message.as_ssz_bytes();
+                let encoded = message.to_ssz();
 
                 write_payload(io, &encoded).await
             }

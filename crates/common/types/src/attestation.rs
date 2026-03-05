@@ -1,13 +1,15 @@
 use crate::{
     block::AggregatedSignatureProof,
     checkpoint::Checkpoint,
-    primitives::ssz::{Decode, Encode, TreeHash},
-    signature::SignatureSize,
-    state::ValidatorRegistryLimit,
+    primitives::{
+        SszBitlist, SszVector,
+        ssz::{HashTreeRoot, SszDecode, SszEncode},
+    },
+    signature::SIGNATURE_SIZE,
 };
 
 /// Validator specific attestation wrapping shared attestation data.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Attestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,
@@ -17,7 +19,7 @@ pub struct Attestation {
 }
 
 /// Attestation content describing the validator's observed chain view.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AttestationData {
     /// The slot for which the attestation is made.
     pub slot: u64,
@@ -33,7 +35,7 @@ pub struct AttestationData {
 }
 
 /// Validator attestation bundled with its signature.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct SignedAttestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,
@@ -43,10 +45,11 @@ pub struct SignedAttestation {
     pub signature: XmssSignature,
 }
 
-pub type XmssSignature = ssz_types::FixedVector<u8, SignatureSize>;
+/// XMSS signature as a fixed-length byte vector (3112 bytes).
+pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
 
 /// Aggregated attestation consisting of participation bits and message.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AggregatedAttestation {
     /// Bitfield indicating which validators participated in the aggregation.
     pub aggregation_bits: AggregationBits,
@@ -62,17 +65,21 @@ pub struct AggregatedAttestation {
 ///
 /// A general-purpose bitfield for tracking which validators have participated
 /// in some collective action (attestation, signature aggregation, etc.).
-pub type AggregationBits = ssz_types::BitList<ValidatorRegistryLimit>;
+pub type AggregationBits = SszBitlist<4096>;
 
 /// Returns the indices of set bits in an `AggregationBits` bitfield as validator IDs.
 pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + '_ {
-    bits.iter()
-        .enumerate()
-        .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
+    (0..bits.len()).filter_map(move |i| {
+        if bits.get(i) == Some(true) {
+            Some(i as u64)
+        } else {
+            None
+        }
+    })
 }
 
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
     pub proof: AggregatedSignatureProof,

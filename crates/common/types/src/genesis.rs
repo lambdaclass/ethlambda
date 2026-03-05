@@ -17,7 +17,7 @@ impl GenesisConfig {
             .iter()
             .enumerate()
             .map(|(i, pubkey)| Validator {
-                pubkey: *pubkey,
+                pubkey: pubkey.clone(),
                 index: i as u64,
             })
             .collect()
@@ -53,7 +53,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        primitives::ssz::TreeHash,
+        primitives::{H256, ssz::HashTreeRoot},
         state::{State, Validator},
     };
 
@@ -67,7 +67,7 @@ GENESIS_TIME: 1770407233
 # Key Settings
 ACTIVE_EPOCH: 18
 
-# Validator Settings  
+# Validator Settings
 VALIDATOR_COUNT: 3
 
 # Genesis Validator Pubkeys
@@ -85,15 +85,15 @@ GENESIS_VALIDATORS:
         assert_eq!(config.genesis_time, 1770407233);
         assert_eq!(config.genesis_validators.len(), 3);
         assert_eq!(
-            config.genesis_validators[0],
+            config.genesis_validators[0].0,
             hex::decode(PUBKEY_A).unwrap().as_slice()
         );
         assert_eq!(
-            config.genesis_validators[1],
+            config.genesis_validators[1].0,
             hex::decode(PUBKEY_B).unwrap().as_slice()
         );
         assert_eq!(
-            config.genesis_validators[2],
+            config.genesis_validators[2].0,
             hex::decode(PUBKEY_C).unwrap().as_slice()
         );
     }
@@ -133,7 +133,7 @@ GENESIS_VALIDATORS:
             })
             .collect();
         let state = State::from_genesis(config.genesis_time, validators);
-        let root = state.tree_hash_root();
+        let root = H256(state.hash_tree_root());
 
         // Pin the state root so changes are caught immediately.
         let expected =
@@ -146,7 +146,7 @@ GENESIS_VALIDATORS:
                 .unwrap();
         let mut block = state.latest_block_header;
         block.state_root = root;
-        let block_root = block.tree_hash_root();
+        let block_root = H256(block.hash_tree_root());
         assert_eq!(
             block_root.as_slice(),
             &expected_block_root[..],

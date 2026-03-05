@@ -2,12 +2,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::primitives::{
     H256,
-    ssz::{Decode, Encode, TreeHash},
+    ssz::{HashTreeRoot, SszDecode, SszEncode},
 };
 
 /// Represents a checkpoint in the chain's history.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Checkpoint {
     /// The root hash of the checkpoint's block.
