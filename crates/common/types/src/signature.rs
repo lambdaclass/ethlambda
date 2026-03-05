@@ -41,8 +41,8 @@ impl ValidatorSignature {
         self.inner.to_bytes()
     }
 
-    pub fn is_valid(&self, pubkey: &ValidatorPublicKey, epoch: u32, message: &H256) -> bool {
-        LeanSignatureScheme::verify(&pubkey.inner, epoch, message, &self.inner)
+    pub fn is_valid(&self, pubkey: &ValidatorPublicKey, slot: u32, message: &H256) -> bool {
+        LeanSignatureScheme::verify(&pubkey.inner, slot, message, &self.inner)
     }
 
     pub fn into_inner(self) -> LeanSigSignature {
@@ -83,10 +83,10 @@ impl ValidatorSecretKey {
 
     /// Sign a message with this private key.
     ///
-    /// The epoch is used as part of the XMSS signature scheme to track
+    /// The slot is used as part of the XMSS signature scheme to track
     /// one-time signature usage.
-    pub fn sign(&self, epoch: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
-        let sig = LeanSignatureScheme::sign(&self.inner, epoch, message)?;
+    pub fn sign(&self, slot: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
+        let sig = LeanSignatureScheme::sign(&self.inner, slot, message)?;
         Ok(ValidatorSignature { inner: sig })
     }
 }

@@ -72,8 +72,8 @@ impl KeyManager {
         attestation_data: &AttestationData,
     ) -> Result<XmssSignature, KeyManagerError> {
         let message_hash = attestation_data.tree_hash_root();
-        let epoch = attestation_data.slot as u32;
-        self.sign_message(validator_id, epoch, &message_hash)
+        let slot = attestation_data.slot as u32;
+        self.sign_message(validator_id, slot, &message_hash)
     }
 
     /// Signs a message hash for the specified validator.
@@ -81,7 +81,7 @@ impl KeyManager {
     /// # Arguments
     ///
     /// * `validator_id` - The ID of the validator whose key should be used for signing
-    /// * `epoch` - The epoch number used in the XMSS signature scheme
+    /// * `slot` - The slot number used in the XMSS signature scheme
     /// * `message` - The message hash to sign
     ///
     /// # Returns
@@ -92,7 +92,7 @@ impl KeyManager {
     fn sign_message(
         &mut self,
         validator_id: u64,
-        epoch: u32,
+        slot: u32,
         message: &H256,
     ) -> Result<XmssSignature, KeyManagerError> {
         let secret_key = self
@@ -101,7 +101,7 @@ impl KeyManager {
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
         let signature: ValidatorSignature = secret_key
-            .sign(epoch, message)
+            .sign(slot, message)
             .map_err(|e| KeyManagerError::SigningError(e.to_string()))?;
 
         // Convert ValidatorSignature to XmssSignature (FixedVector<u8, SignatureSize>)

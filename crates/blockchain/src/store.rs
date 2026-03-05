@@ -372,10 +372,10 @@ pub fn on_gossip_attestation(
         .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
     // Verify the validator's XMSS signature
-    let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+    let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
     let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
         .map_err(|_| StoreError::SignatureDecodingFailed)?;
-    if !signature.is_valid(&validator_pubkey, epoch, &data_root) {
+    if !signature.is_valid(&validator_pubkey, slot, &data_root) {
         return Err(StoreError::SignatureVerificationFailed);
     }
 
@@ -437,13 +437,13 @@ pub fn on_gossip_aggregated_attestation(
         .collect::<Result<_, _>>()?;
 
     let data_root = aggregated.data.tree_hash_root();
-    let epoch: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
+    let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     ethlambda_crypto::verify_aggregated_signature(
         &aggregated.proof.proof_data,
         pubkeys,
         &data_root,
-        epoch,
+        slot,
     )
     .map_err(StoreError::AggregateVerificationFailed)?;
 
@@ -1160,7 +1160,7 @@ fn verify_signatures(
             return Err(StoreError::InvalidValidatorIndex);
         }
 
-        let epoch: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+        let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.tree_hash_root();
 
         // Collect public keys for all participating validators
@@ -1177,7 +1177,7 @@ fn verify_signatures(
             &aggregated_proof.proof_data,
             public_keys,
             &message,
-            epoch,
+            slot,
         ) {
             Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
             Err(e) => {
@@ -1201,14 +1201,14 @@ fn verify_signatures(
         .get_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(proposer.index))?;
 
-    let epoch = proposer_attestation
+    let slot = proposer_attestation
         .data
         .slot
         .try_into()
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
 
-    if !proposer_signature.is_valid(&proposer_pubkey, epoch, &message) {
+    if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
     Ok(())
