@@ -485,7 +485,6 @@ impl BlockChainServer {
 }
 
 #[protocol]
-#[allow(dead_code)] // tick() is invoked via send_after(Tick), not called directly
 pub(crate) trait BlockChainProtocol: Send + Sync {
     fn new_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
@@ -493,6 +492,7 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after(Tick), not called directly
     fn tick(&self) -> Result<(), ActorError>;
 }
 
