@@ -89,16 +89,16 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             else {
                 return;
             };
-            let slot = signed_attestation.message.slot;
+            let slot = signed_attestation.data.slot;
             let validator = signed_attestation.validator_id;
             info!(
                 %slot,
                 validator,
-                head_root = %ShortRoot(&signed_attestation.message.head.root.0),
-                target_slot = signed_attestation.message.target.slot,
-                target_root = %ShortRoot(&signed_attestation.message.target.root.0),
-                source_slot = signed_attestation.message.source.slot,
-                source_root = %ShortRoot(&signed_attestation.message.source.root.0),
+                head_root = %ShortRoot(&signed_attestation.data.head.root.0),
+                target_slot = signed_attestation.data.target.slot,
+                target_root = %ShortRoot(&signed_attestation.data.target.root.0),
+                source_slot = signed_attestation.data.source.slot,
+                source_root = %ShortRoot(&signed_attestation.data.source.root.0),
                 "Received attestation from gossip"
             );
             server
@@ -113,7 +113,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
 }
 
 pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
-    let slot = attestation.message.slot;
+    let slot = attestation.data.slot;
     let validator = attestation.validator_id;
 
     // Encode to SSZ
@@ -131,10 +131,10 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .inspect(|_| info!(
             %slot,
             validator,
-            target_slot = attestation.message.target.slot,
-            target_root = %ShortRoot(&attestation.message.target.root.0),
-            source_slot = attestation.message.source.slot,
-            source_root = %ShortRoot(&attestation.message.source.root.0),
+            target_slot = attestation.data.target.slot,
+            target_root = %ShortRoot(&attestation.data.target.root.0),
+            source_slot = attestation.data.source.slot,
+            source_root = %ShortRoot(&attestation.data.source.root.0),
             "Published attestation to gossipsub"
         ))
         .inspect_err(|err| {

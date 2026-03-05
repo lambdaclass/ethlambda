@@ -223,7 +223,7 @@ impl BlockChainServer {
             // Create signed attestation
             let signed_attestation = SignedAttestation {
                 validator_id,
-                message: attestation_data.clone(),
+                data: attestation_data.clone(),
                 signature,
             };
 

@@ -37,8 +37,8 @@ pub struct AttestationData {
 pub struct SignedAttestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,
-    /// The attestation message signed by the validator.
-    pub message: AttestationData,
+    /// The attestation data signed by the validator.
+    pub data: AttestationData,
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
     pub signature: XmssSignature,
 }
