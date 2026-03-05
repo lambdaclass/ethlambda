@@ -11,9 +11,10 @@ use ethlambda_types::{
     primitives::{H256, ssz::TreeHash},
     signature::ValidatorSecretKey,
 };
-use spawned_concurrency::tasks::{
-    CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
-};
+use spawned_concurrency::actor;
+use spawned_concurrency::error::ActorError;
+use spawned_concurrency::protocol;
+use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
@@ -38,7 +39,7 @@ pub enum P2PMessage {
 }
 
 pub struct BlockChain {
-    handle: GenServerHandle<BlockChainServer>,
+    handle: ActorRef<BlockChainServer>,
 }
 
 /// Milliseconds per interval (800ms ticks).
@@ -68,41 +69,35 @@ impl BlockChain {
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
-        send_after(time_until_genesis, handle.clone(), CastMessage::Tick);
+        send_after(
+            time_until_genesis,
+            handle.context(),
+            block_chain_protocol::Tick,
+        );
         BlockChain { handle }
     }
 
     /// Sends a block to the BlockChain for processing.
-    ///
-    /// Note that this is *NOT* `async`, since the internal [`GenServerHandle::cast`] is non-blocking.
-    pub async fn notify_new_block(&mut self, block: SignedBlockWithAttestation) {
+    pub fn notify_new_block(&self, block: SignedBlockWithAttestation) {
         let _ = self
             .handle
-            .cast(CastMessage::NewBlock(block))
-            .await
+            .new_block(block)
             .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new block"));
     }
 
     /// Sends an attestation to the BlockChain for processing.
-    ///
-    /// Note that this is *NOT* `async`, since the internal [`GenServerHandle::cast`] is non-blocking.
-    pub async fn notify_new_attestation(&mut self, attestation: SignedAttestation) {
+    pub fn notify_new_attestation(&self, attestation: SignedAttestation) {
         let _ = self
             .handle
-            .cast(CastMessage::NewAttestation(attestation))
-            .await
+            .new_attestation(attestation)
             .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new attestation"));
     }
 
     /// Sends an aggregated attestation to the BlockChain for processing.
-    pub async fn notify_new_aggregated_attestation(
-        &mut self,
-        attestation: SignedAggregatedAttestation,
-    ) {
+    pub fn notify_new_aggregated_attestation(&self, attestation: SignedAggregatedAttestation) {
         let _ = self
             .handle
-            .cast(CastMessage::NewAggregatedAttestation(attestation))
-            .await
+            .new_aggregated_attestation(attestation)
             .inspect_err(
                 |err| error!(%err, "Failed to notify BlockChain of new aggregated attestation"),
             );
@@ -489,60 +484,61 @@ impl BlockChainServer {
     }
 }
 
-#[derive(Clone, Debug)]
-enum CastMessage {
-    NewBlock(SignedBlockWithAttestation),
-    NewAttestation(SignedAttestation),
-    NewAggregatedAttestation(SignedAggregatedAttestation),
-    Tick,
+#[protocol]
+#[allow(dead_code)] // tick() is invoked via send_after(Tick), not called directly
+pub(crate) trait BlockChainProtocol: Send + Sync {
+    fn new_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
+    fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    fn new_aggregated_attestation(
+        &self,
+        attestation: SignedAggregatedAttestation,
+    ) -> Result<(), ActorError>;
+    fn tick(&self) -> Result<(), ActorError>;
 }
 
-impl GenServer for BlockChainServer {
-    type CallMsg = ();
-
-    type CastMsg = CastMessage;
-
-    type OutMsg = ();
-
-    type Error = ();
-
-    async fn handle_call(
-        &mut self,
-        _message: Self::CallMsg,
-        _handle: &GenServerHandle<Self>,
-    ) -> CallResponse<Self> {
-        CallResponse::Unused
+#[actor(protocol = BlockChainProtocol)]
+impl BlockChainServer {
+    #[send_handler]
+    async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
+        let timestamp = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch");
+        self.on_tick(timestamp.as_millis() as u64);
+        // Schedule the next tick at the next 800ms interval boundary
+        let ms_since_epoch = timestamp.as_millis() as u64;
+        let ms_to_next_interval =
+            MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
+        send_after(
+            Duration::from_millis(ms_to_next_interval),
+            ctx.clone(),
+            block_chain_protocol::Tick,
+        );
     }
 
-    async fn handle_cast(
+    #[send_handler]
+    async fn handle_new_block(
         &mut self,
-        message: Self::CastMsg,
-        handle: &GenServerHandle<Self>,
-    ) -> CastResponse {
-        match message {
-            CastMessage::Tick => {
-                let timestamp = SystemTime::UNIX_EPOCH
-                    .elapsed()
-                    .expect("already past the unix epoch");
-                self.on_tick(timestamp.as_millis() as u64);
-                // Schedule the next tick at the next 800ms interval boundary
-                let ms_since_epoch = timestamp.as_millis() as u64;
-                let ms_to_next_interval =
-                    MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
-                send_after(
-                    Duration::from_millis(ms_to_next_interval),
-                    handle.clone(),
-                    message,
-                );
-            }
-            CastMessage::NewBlock(signed_block) => {
-                self.on_block(signed_block);
-            }
-            CastMessage::NewAttestation(attestation) => self.on_gossip_attestation(attestation),
-            CastMessage::NewAggregatedAttestation(attestation) => {
-                self.on_gossip_aggregated_attestation(attestation);
-            }
-        }
-        CastResponse::NoReply
+        msg: block_chain_protocol::NewBlock,
+        _ctx: &Context<Self>,
+    ) {
+        self.on_block(msg.block);
+    }
+
+    #[send_handler]
+    async fn handle_new_attestation(
+        &mut self,
+        msg: block_chain_protocol::NewAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        self.on_gossip_attestation(msg.attestation);
+    }
+
+    #[send_handler]
+    async fn handle_new_aggregated_attestation(
+        &mut self,
+        msg: block_chain_protocol::NewAggregatedAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        self.on_gossip_aggregated_attestation(msg.attestation);
     }
 }

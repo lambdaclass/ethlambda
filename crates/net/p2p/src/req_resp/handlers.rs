@@ -169,7 +169,7 @@ async fn handle_blocks_by_root_response(
         // Clean up tracking for this root
         server.pending_requests.remove(&root);
 
-        server.blockchain.notify_new_block(block).await;
+        server.blockchain.notify_new_block(block);
     }
 }
 
