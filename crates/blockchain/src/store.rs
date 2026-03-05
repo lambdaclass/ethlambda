@@ -353,7 +353,7 @@ pub fn on_gossip_attestation(
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
         validator_id,
-        data: signed_attestation.message,
+        data: signed_attestation.data,
     };
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
