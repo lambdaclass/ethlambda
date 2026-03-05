@@ -1173,12 +1173,8 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
-        match verify_aggregated_signature(
-            &aggregated_proof.proof_data,
-            public_keys,
-            &message,
-            slot,
-        ) {
+        match verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, slot)
+        {
             Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
             Err(e) => {
                 metrics::inc_pq_sig_aggregated_signatures_invalid();

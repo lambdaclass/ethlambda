@@ -278,8 +278,7 @@ mod tests {
 
         let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, slot, &message);
 
-        let proof_data =
-            aggregate_signatures(vec![pk.clone()], vec![sig], &message, slot).unwrap();
+        let proof_data = aggregate_signatures(vec![pk.clone()], vec![sig], &message, slot).unwrap();
 
         // Verify with wrong message should fail
         let verify_result =
@@ -300,8 +299,7 @@ mod tests {
 
         let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, slot, &message);
 
-        let proof_data =
-            aggregate_signatures(vec![pk.clone()], vec![sig], &message, slot).unwrap();
+        let proof_data = aggregate_signatures(vec![pk.clone()], vec![sig], &message, slot).unwrap();
 
         // Verify with wrong slot should fail
         let verify_result =
