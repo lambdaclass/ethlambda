@@ -201,13 +201,16 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     }
 
     // Exclude peers that already returned empty responses for this root
-    let pool: Vec<_> = {
-        let failed = server.pending_requests.get(&root).map(|p| &p.failed_peers);
+    let failed = server.pending_requests.get(&root).map(|p| &p.failed_peers);
+    let pool: Vec<_> = if failed.is_none_or(|f| f.is_empty()) {
+        server.connected_peers.iter().copied().collect()
+    } else {
+        let failed = failed.unwrap();
         server
             .connected_peers
             .iter()
             .copied()
-            .filter(|p| failed.is_none_or(|f| !f.contains(p)))
+            .filter(|p| !failed.contains(p))
             .collect()
     };
 
