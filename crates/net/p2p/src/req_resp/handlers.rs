@@ -1,7 +1,9 @@
+use ethlambda_network_api::NewBlock;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
-use tokio::time::Duration;
+use spawned_concurrency::tasks::{Context, send_after};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
@@ -13,12 +15,13 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    RetryMessage, req_resp::RequestedBlockRoots,
+    p2_p_protocol, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
     event: request_response::Event<Request, Response>,
+    ctx: &Context<P2PServer>,
 ) {
     match event {
         request_response::Event::Message { peer, message, .. } => match message {
@@ -41,7 +44,7 @@ pub async fn handle_req_resp_message(
                         handle_status_response(status, peer).await;
                     }
                     ResponsePayload::BlocksByRoot(blocks) => {
-                        handle_blocks_by_root_response(server, blocks, peer, request_id).await;
+                        handle_blocks_by_root_response(server, blocks, peer, request_id, ctx).await;
                     }
                 },
                 Response::Error { code, message } => {
@@ -60,7 +63,7 @@ pub async fn handle_req_resp_message(
 
             // Check if this was a block fetch request
             if let Some(root) = server.request_id_map.remove(&request_id) {
-                handle_fetch_failure(server, root, peer).await;
+                handle_fetch_failure(server, root, peer, ctx).await;
             }
         }
         request_response::Event::InboundFailure {
@@ -87,15 +90,8 @@ async fn handle_status_request(
 ) {
     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
     let our_status = build_status(&server.store);
-    server
-        .swarm
-        .behaviour_mut()
-        .req_resp
-        .send_response(
-            channel,
-            Response::success(ResponsePayload::Status(our_status)),
-        )
-        .unwrap();
+    let response = Response::success(ResponsePayload::Status(our_status));
+    server.swarm_handle.send_response(channel, response);
 }
 
 async fn handle_status_response(status: Status, peer: PeerId) {
@@ -123,12 +119,7 @@ async fn handle_blocks_by_root_request(
     info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
     let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
-    let _ = server
-        .swarm
-        .behaviour_mut()
-        .req_resp
-        .send_response(channel, response)
-        .inspect_err(|err| warn!(%peer, ?err, "Failed to send BlocksByRoot response"));
+    server.swarm_handle.send_response(channel, response);
 }
 
 async fn handle_blocks_by_root_response(
@@ -136,6 +127,7 @@ async fn handle_blocks_by_root_response(
     blocks: Vec<SignedBlockWithAttestation>,
     peer: PeerId,
     request_id: request_response::OutboundRequestId,
+    ctx: &Context<P2PServer>,
 ) {
     info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
 
@@ -148,7 +140,7 @@ async fn handle_blocks_by_root_response(
     if blocks.is_empty() {
         server.request_id_map.insert(request_id, requested_root);
         warn!(%peer, "Received empty BlocksByRoot response");
-        handle_fetch_failure(server, requested_root, peer).await;
+        handle_fetch_failure(server, requested_root, peer, ctx).await;
         return;
     }
 
@@ -169,7 +161,11 @@ async fn handle_blocks_by_root_response(
         // Clean up tracking for this root
         server.pending_requests.remove(&root);
 
-        server.blockchain.notify_new_block(block);
+        if let Some(ref recipient) = server.new_block {
+            let _ = recipient
+                .send(NewBlock { block })
+                .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
+        }
     }
 }
 
@@ -217,15 +213,18 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     let request = BlocksByRootRequest { roots };
 
     info!(%peer, %root, "Sending BlocksByRoot request for missing block");
-    let request_id = server
-        .swarm
-        .behaviour_mut()
-        .req_resp
-        .send_request_with_protocol(
-            &peer,
+    let Some(request_id) = server
+        .swarm_handle
+        .send_request(
+            peer,
             Request::BlocksByRoot(request),
             libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-        );
+        )
+        .await
+    else {
+        warn!(%root, "Failed to send BlocksByRoot request (swarm adapter closed)");
+        return false;
+    };
 
     // Track the request if not already tracked (new request)
     let pending = server
@@ -245,7 +244,12 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     true
 }
 
-async fn handle_fetch_failure(server: &mut P2PServer, root: H256, peer: PeerId) {
+async fn handle_fetch_failure(
+    server: &mut P2PServer,
+    root: H256,
+    peer: PeerId,
+    ctx: &Context<P2PServer>,
+) {
     let Some(pending) = server.pending_requests.get_mut(&root) else {
         return;
     };
@@ -264,9 +268,9 @@ async fn handle_fetch_failure(server: &mut P2PServer, root: H256, peer: PeerId) 
 
     pending.attempts += 1;
 
-    let retry_tx = server.retry_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(backoff).await;
-        let _ = retry_tx.send(RetryMessage::BlockFetch(root));
-    });
+    send_after(
+        backoff,
+        ctx.clone(),
+        p2_p_protocol::RetryBlockFetch { root },
+    );
 }
