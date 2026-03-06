@@ -1,42 +1,58 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
-use ethlambda_blockchain::{BlockChain, P2PMessage};
+use ethlambda_blockchain::BlockChain;
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::H256;
+use ethlambda_types::{
+    ShortRoot,
+    attestation::{SignedAggregatedAttestation, SignedAttestation},
+    block::SignedBlockWithAttestation,
+    primitives::{
+        H256,
+        ssz::{Encode, TreeHash},
+    },
+};
 use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
-    futures::StreamExt,
-    gossipsub::{MessageAuthenticity, ValidationMode},
+    gossipsub::{self as libp2p_gossipsub, MessageAuthenticity, ValidationMode},
     identity::{PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response::{self, OutboundRequestId},
-    swarm::{NetworkBehaviour, SwarmEvent},
+    request_response,
+    swarm::NetworkBehaviour,
 };
+use rand::seq::SliceRandom;
 use sha2::Digest;
+use spawned_concurrency::actor;
+use spawned_concurrency::error::ActorError;
+use spawned_concurrency::protocol;
+use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio::sync::mpsc;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::{
     gossipsub::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        publish_aggregated_attestation, publish_attestation, publish_block,
+        encoding::compress_message,
     },
     req_resp::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
-        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
+        BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Codec, MAX_COMPRESSED_PAYLOAD_SIZE,
+        Request, RequestedBlockRoots, Response, ResponsePayload, STATUS_PROTOCOL_V1, Status,
+        build_status,
     },
+    swarm_driver::{SwarmCommand, SwarmDriver},
 };
 
 mod gossipsub;
 pub mod metrics;
 mod req_resp;
+mod swarm_driver;
 
 pub use metrics::populate_name_registry;
 
@@ -46,14 +62,741 @@ const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
-enum RetryMessage {
-    BlockFetch(H256),
-    PeerRedial(PeerId),
-}
-
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
-    pub(crate) last_peer: Option<PeerId>,
+}
+
+/// Wrapper for ResponseChannel that implements Clone via Arc<Mutex<Option<_>>>.
+///
+/// The spawned-concurrency `#[protocol]` macro derives Clone on all generated
+/// message structs, but libp2p's ResponseChannel is not Clone. This wrapper
+/// allows the channel to be sent through the actor's mailbox. The inner Option
+/// is taken when the response is sent, ensuring single-use semantics.
+#[derive(Clone)]
+pub(crate) struct ResponseChannelWrapper(
+    Arc<Mutex<Option<request_response::ResponseChannel<Response>>>>,
+);
+
+impl ResponseChannelWrapper {
+    pub(crate) fn new(channel: request_response::ResponseChannel<Response>) -> Self {
+        Self(Arc::new(Mutex::new(Some(channel))))
+    }
+
+    pub(crate) fn take(&self) -> Option<request_response::ResponseChannel<Response>> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+// --- P2P Protocol ---
+
+#[protocol]
+pub(crate) trait P2pProtocol: Send + Sync {
+    // From SwarmDriver — gossip
+    fn on_gossip_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
+    fn on_gossip_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    fn on_gossip_aggregated_attestation(
+        &self,
+        attestation: SignedAggregatedAttestation,
+    ) -> Result<(), ActorError>;
+
+    // From SwarmDriver — req/resp
+    fn on_status_request(
+        &self,
+        status: Status,
+        channel: ResponseChannelWrapper,
+        peer: PeerId,
+    ) -> Result<(), ActorError>;
+    fn on_blocks_by_root_request(
+        &self,
+        request: BlocksByRootRequest,
+        channel: ResponseChannelWrapper,
+        peer: PeerId,
+    ) -> Result<(), ActorError>;
+    fn on_status_response(&self, status: Status, peer: PeerId) -> Result<(), ActorError>;
+    fn on_blocks_by_root_response(
+        &self,
+        blocks: Vec<SignedBlockWithAttestation>,
+        peer: PeerId,
+        correlation_id: u64,
+    ) -> Result<(), ActorError>;
+    fn on_req_resp_failure(
+        &self,
+        peer: PeerId,
+        correlation_id: u64,
+        error: String,
+    ) -> Result<(), ActorError>;
+
+    // From SwarmDriver — connections
+    fn on_peer_connected(
+        &self,
+        peer_id: PeerId,
+        direction: String,
+        first_connection: bool,
+    ) -> Result<(), ActorError>;
+    fn on_peer_disconnected(
+        &self,
+        peer_id: PeerId,
+        direction: String,
+        reason: String,
+        last_connection: bool,
+    ) -> Result<(), ActorError>;
+    fn on_outgoing_connection_error(
+        &self,
+        peer_id: Option<PeerId>,
+        error: String,
+    ) -> Result<(), ActorError>;
+
+    // From BlockChain (via P2PMessage bridge)
+    fn publish_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    fn publish_block(&self, signed_block: SignedBlockWithAttestation) -> Result<(), ActorError>;
+    fn publish_aggregated_attestation(
+        &self,
+        attestation: SignedAggregatedAttestation,
+    ) -> Result<(), ActorError>;
+    fn fetch_block(&self, root: H256) -> Result<(), ActorError>;
+
+    // Self-scheduled retries
+    #[allow(dead_code)]
+    fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
+    #[allow(dead_code)]
+    fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
+}
+
+// --- P2PServer (actor state) ---
+
+pub(crate) struct P2PServer {
+    swarm_tx: mpsc::UnboundedSender<SwarmCommand>,
+    blockchain: BlockChain,
+    store: Store,
+    attestation_topic: libp2p_gossipsub::IdentTopic,
+    block_topic: libp2p_gossipsub::IdentTopic,
+    aggregation_topic: libp2p_gossipsub::IdentTopic,
+    connected_peers: HashSet<PeerId>,
+    pending_requests: HashMap<H256, PendingRequest>,
+    /// Maps correlation IDs to block roots for tracking outbound BlocksByRoot requests.
+    correlation_id_map: HashMap<u64, H256>,
+    next_correlation_id: u64,
+    /// Bootnode addresses for redialing when disconnected.
+    bootnode_addrs: HashMap<PeerId, Multiaddr>,
+}
+
+impl P2PServer {
+    fn next_correlation_id(&mut self) -> u64 {
+        let id = self.next_correlation_id;
+        self.next_correlation_id += 1;
+        id
+    }
+
+    /// Fetch a missing block from a random connected peer.
+    fn fetch_block_from_peer(&mut self, root: H256) -> bool {
+        if self.connected_peers.is_empty() {
+            warn!(%root, "Cannot fetch block: no connected peers");
+            return false;
+        }
+
+        let peers: Vec<_> = self.connected_peers.iter().copied().collect();
+        let peer = match peers.choose(&mut rand::thread_rng()) {
+            Some(&p) => p,
+            None => {
+                warn!(%root, "Failed to select random peer");
+                return false;
+            }
+        };
+
+        let mut roots = RequestedBlockRoots::empty();
+        if let Err(err) = roots.push(root) {
+            error!(%root, ?err, "Failed to create BlocksByRoot request");
+            return false;
+        }
+        let request = BlocksByRootRequest { roots };
+
+        info!(%peer, %root, "Sending BlocksByRoot request for missing block");
+
+        let correlation_id = self.next_correlation_id();
+        let _ = self.swarm_tx.send(SwarmCommand::SendRequest {
+            correlation_id,
+            peer_id: peer,
+            request: Request::BlocksByRoot(request),
+            protocol: StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+        });
+
+        self.pending_requests
+            .entry(root)
+            .or_insert(PendingRequest { attempts: 1 });
+
+        self.correlation_id_map.insert(correlation_id, root);
+
+        true
+    }
+
+    /// Handle a fetch failure by scheduling a retry with exponential backoff.
+    fn handle_fetch_failure(&mut self, root: H256, peer: PeerId, ctx: &Context<Self>) {
+        let Some(pending) = self.pending_requests.get_mut(&root) else {
+            return;
+        };
+
+        if pending.attempts >= MAX_FETCH_RETRIES {
+            error!(
+                %root, %peer, attempts = %pending.attempts,
+                "Block fetch failed after max retries, giving up"
+            );
+            self.pending_requests.remove(&root);
+            return;
+        }
+
+        let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+        let backoff = Duration::from_millis(backoff_ms);
+
+        warn!(
+            %root, %peer, attempts = %pending.attempts, ?backoff,
+            "Block fetch failed, scheduling retry"
+        );
+
+        pending.attempts += 1;
+
+        send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+    }
+}
+
+// --- Actor implementation ---
+
+#[actor(protocol = P2pProtocol)]
+impl P2PServer {
+    // --- Gossip handlers ---
+
+    #[send_handler]
+    async fn handle_on_gossip_block(
+        &mut self,
+        msg: p2p_protocol::OnGossipBlock,
+        _ctx: &Context<Self>,
+    ) {
+        let signed_block = msg.block;
+        let slot = signed_block.message.block.slot;
+        let block_root = signed_block.message.block.tree_hash_root();
+        let proposer = signed_block.message.block.proposer_index;
+        let parent_root = signed_block.message.block.parent_root;
+        let attestation_count = signed_block.message.block.body.attestations.len();
+        info!(
+            %slot,
+            proposer,
+            block_root = %ShortRoot(&block_root.0),
+            parent_root = %ShortRoot(&parent_root.0),
+            attestation_count,
+            "Received block from gossip"
+        );
+        self.blockchain.notify_new_block(signed_block);
+    }
+
+    #[send_handler]
+    async fn handle_on_gossip_attestation(
+        &mut self,
+        msg: p2p_protocol::OnGossipAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        let attestation = msg.attestation;
+        let slot = attestation.data.slot;
+        let validator = attestation.validator_id;
+        info!(
+            %slot,
+            validator,
+            head_root = %ShortRoot(&attestation.data.head.root.0),
+            target_slot = attestation.data.target.slot,
+            target_root = %ShortRoot(&attestation.data.target.root.0),
+            source_slot = attestation.data.source.slot,
+            source_root = %ShortRoot(&attestation.data.source.root.0),
+            "Received attestation from gossip"
+        );
+        self.blockchain.notify_new_attestation(attestation);
+    }
+
+    #[send_handler]
+    async fn handle_on_gossip_aggregated_attestation(
+        &mut self,
+        msg: p2p_protocol::OnGossipAggregatedAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        let attestation = msg.attestation;
+        let slot = attestation.data.slot;
+        info!(
+            %slot,
+            target_slot = attestation.data.target.slot,
+            target_root = %ShortRoot(&attestation.data.target.root.0),
+            source_slot = attestation.data.source.slot,
+            source_root = %ShortRoot(&attestation.data.source.root.0),
+            "Received aggregated attestation from gossip"
+        );
+        self.blockchain
+            .notify_new_aggregated_attestation(attestation);
+    }
+
+    // --- Req/resp handlers ---
+
+    #[send_handler]
+    async fn handle_on_status_request(
+        &mut self,
+        msg: p2p_protocol::OnStatusRequest,
+        _ctx: &Context<Self>,
+    ) {
+        let request = msg.status;
+        let peer = msg.peer;
+        info!(
+            finalized_slot = %request.finalized.slot,
+            head_slot = %request.head.slot,
+            "Received status request from peer {peer}"
+        );
+        let our_status = build_status(&self.store);
+        if let Some(channel) = msg.channel.take() {
+            let response = Response::success(ResponsePayload::Status(our_status));
+            let _ = self
+                .swarm_tx
+                .send(SwarmCommand::SendResponse { channel, response });
+        }
+    }
+
+    #[send_handler]
+    async fn handle_on_blocks_by_root_request(
+        &mut self,
+        msg: p2p_protocol::OnBlocksByRootRequest,
+        _ctx: &Context<Self>,
+    ) {
+        let request = msg.request;
+        let peer = msg.peer;
+        let num_roots = request.roots.len();
+        info!(%peer, num_roots, "Received BlocksByRoot request");
+
+        let mut blocks = Vec::new();
+        for root in request.roots.iter() {
+            if let Some(signed_block) = self.store.get_signed_block(root) {
+                blocks.push(signed_block);
+            }
+            // Missing blocks are silently skipped (per spec)
+        }
+
+        let found = blocks.len();
+        info!(%peer, num_roots, found, "Responding to BlocksByRoot request");
+
+        if let Some(channel) = msg.channel.take() {
+            let response = Response::success(ResponsePayload::BlocksByRoot(blocks));
+            let _ = self
+                .swarm_tx
+                .send(SwarmCommand::SendResponse { channel, response })
+                .inspect_err(
+                    |err| warn!(%peer, %err, "Failed to send BlocksByRoot response command"),
+                );
+        }
+    }
+
+    #[send_handler]
+    async fn handle_on_status_response(
+        &mut self,
+        msg: p2p_protocol::OnStatusResponse,
+        _ctx: &Context<Self>,
+    ) {
+        info!(
+            finalized_slot = %msg.status.finalized.slot,
+            head_slot = %msg.status.head.slot,
+            "Received status response from peer {}",
+            msg.peer
+        );
+    }
+
+    #[send_handler]
+    async fn handle_on_blocks_by_root_response(
+        &mut self,
+        msg: p2p_protocol::OnBlocksByRootResponse,
+        ctx: &Context<Self>,
+    ) {
+        let blocks = msg.blocks;
+        let peer = msg.peer;
+        let correlation_id = msg.correlation_id;
+        info!(%peer, count = blocks.len(), "Received BlocksByRoot response");
+
+        let Some(requested_root) = self.correlation_id_map.remove(&correlation_id) else {
+            warn!(%peer, correlation_id, "Received response for unknown correlation_id");
+            return;
+        };
+
+        if blocks.is_empty() {
+            self.correlation_id_map
+                .insert(correlation_id, requested_root);
+            warn!(%peer, "Received empty BlocksByRoot response");
+            self.handle_fetch_failure(requested_root, peer, ctx);
+            return;
+        }
+
+        for block in blocks {
+            let root = block.message.block.tree_hash_root();
+            if root != requested_root {
+                warn!(
+                    %peer,
+                    received_root = %ShortRoot(&root.0),
+                    expected_root = %ShortRoot(&requested_root.0),
+                    "Received block with mismatched root, ignoring"
+                );
+                continue;
+            }
+            self.pending_requests.remove(&root);
+            self.blockchain.notify_new_block(block);
+        }
+    }
+
+    #[send_handler]
+    async fn handle_on_req_resp_failure(
+        &mut self,
+        msg: p2p_protocol::OnReqRespFailure,
+        ctx: &Context<Self>,
+    ) {
+        if let Some(root) = self.correlation_id_map.remove(&msg.correlation_id) {
+            self.handle_fetch_failure(root, msg.peer, ctx);
+        }
+    }
+
+    // --- Connection handlers ---
+
+    #[send_handler]
+    async fn handle_on_peer_connected(
+        &mut self,
+        msg: p2p_protocol::OnPeerConnected,
+        _ctx: &Context<Self>,
+    ) {
+        let peer_id = msg.peer_id;
+        let direction = &msg.direction;
+
+        if msg.first_connection {
+            self.connected_peers.insert(peer_id);
+            let peer_count = self.connected_peers.len();
+            metrics::notify_peer_connected(&Some(peer_id), direction, "success");
+
+            let our_status = build_status(&self.store);
+            let our_finalized_slot = our_status.finalized.slot;
+            let our_head_slot = our_status.head.slot;
+            info!(
+                %peer_id,
+                %direction,
+                peer_count,
+                our_finalized_slot,
+                our_head_slot,
+                "Peer connected"
+            );
+
+            // Send status request on first connection
+            let correlation_id = self.next_correlation_id();
+            let _ = self.swarm_tx.send(SwarmCommand::SendRequest {
+                correlation_id,
+                peer_id,
+                request: Request::Status(our_status),
+                protocol: StreamProtocol::new(STATUS_PROTOCOL_V1),
+            });
+        } else {
+            info!(%peer_id, %direction, "Added peer connection");
+        }
+    }
+
+    #[send_handler]
+    async fn handle_on_peer_disconnected(
+        &mut self,
+        msg: p2p_protocol::OnPeerDisconnected,
+        ctx: &Context<Self>,
+    ) {
+        let peer_id = msg.peer_id;
+        let direction = &msg.direction;
+        let reason = &msg.reason;
+
+        if msg.last_connection {
+            self.connected_peers.remove(&peer_id);
+            let peer_count = self.connected_peers.len();
+            metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+
+            info!(
+                %peer_id,
+                %direction,
+                %reason,
+                peer_count,
+                "Peer disconnected"
+            );
+
+            if self.bootnode_addrs.contains_key(&peer_id) {
+                send_after(
+                    Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
+                    ctx.clone(),
+                    p2p_protocol::RetryPeerRedial { peer_id },
+                );
+                info!(
+                    %peer_id,
+                    "Scheduled bootnode redial in {}s",
+                    PEER_REDIAL_INTERVAL_SECS
+                );
+            }
+        } else {
+            info!(
+                %peer_id, %direction, %reason,
+                "Peer connection closed but other connections remain"
+            );
+        }
+    }
+
+    #[send_handler]
+    async fn handle_on_outgoing_connection_error(
+        &mut self,
+        msg: p2p_protocol::OnOutgoingConnectionError,
+        ctx: &Context<Self>,
+    ) {
+        let peer_id = msg.peer_id;
+        let error = &msg.error;
+        let error_lower = error.to_lowercase();
+        let result = if error_lower.contains("timeout")
+            || error_lower.contains("timedout")
+            || error_lower.contains("timed out")
+        {
+            "timeout"
+        } else {
+            "error"
+        };
+        metrics::notify_peer_connected(&peer_id, "outbound", result);
+        warn!(?peer_id, %error, "Outgoing connection error");
+
+        if let Some(pid) = peer_id
+            && self.bootnode_addrs.contains_key(&pid)
+            && !self.connected_peers.contains(&pid)
+        {
+            send_after(
+                Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
+                ctx.clone(),
+                p2p_protocol::RetryPeerRedial { peer_id: pid },
+            );
+            info!(%pid, "Scheduled bootnode redial after connection error");
+        }
+    }
+
+    // --- Publish handlers (from BlockChain via bridge) ---
+
+    #[send_handler]
+    async fn handle_publish_attestation(
+        &mut self,
+        msg: p2p_protocol::PublishAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        let attestation = msg.attestation;
+        let slot = attestation.data.slot;
+        let validator = attestation.validator_id;
+
+        let ssz_bytes = attestation.as_ssz_bytes();
+        let compressed = compress_message(&ssz_bytes);
+
+        let _ = self
+            .swarm_tx
+            .send(SwarmCommand::GossipPublish {
+                topic: self.attestation_topic.clone(),
+                data: compressed,
+            })
+            .inspect(|_| {
+                info!(
+                    %slot,
+                    validator,
+                    target_slot = attestation.data.target.slot,
+                    target_root = %ShortRoot(&attestation.data.target.root.0),
+                    source_slot = attestation.data.source.slot,
+                    source_root = %ShortRoot(&attestation.data.source.root.0),
+                    "Published attestation to gossipsub"
+                )
+            })
+            .inspect_err(|err| {
+                warn!(
+                    %slot, %validator, %err,
+                    "Failed to publish attestation to gossipsub"
+                )
+            });
+    }
+
+    #[send_handler]
+    async fn handle_publish_block(
+        &mut self,
+        msg: p2p_protocol::PublishBlock,
+        _ctx: &Context<Self>,
+    ) {
+        let signed_block = msg.signed_block;
+        let slot = signed_block.message.block.slot;
+        let proposer = signed_block.message.block.proposer_index;
+        let block_root = signed_block.message.block.tree_hash_root();
+        let parent_root = signed_block.message.block.parent_root;
+        let attestation_count = signed_block.message.block.body.attestations.len();
+
+        let ssz_bytes = signed_block.as_ssz_bytes();
+        let compressed = compress_message(&ssz_bytes);
+
+        let _ = self
+            .swarm_tx
+            .send(SwarmCommand::GossipPublish {
+                topic: self.block_topic.clone(),
+                data: compressed,
+            })
+            .inspect(|_| {
+                info!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    attestation_count,
+                    "Published block to gossipsub"
+                )
+            })
+            .inspect_err(|err| {
+                warn!(
+                    %slot, %proposer, %err,
+                    "Failed to publish block to gossipsub"
+                )
+            });
+    }
+
+    #[send_handler]
+    async fn handle_publish_aggregated_attestation(
+        &mut self,
+        msg: p2p_protocol::PublishAggregatedAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        let attestation = msg.attestation;
+        let slot = attestation.data.slot;
+
+        let ssz_bytes = attestation.as_ssz_bytes();
+        let compressed = compress_message(&ssz_bytes);
+
+        let _ = self
+            .swarm_tx
+            .send(SwarmCommand::GossipPublish {
+                topic: self.aggregation_topic.clone(),
+                data: compressed,
+            })
+            .inspect(|_| {
+                info!(
+                    %slot,
+                    target_slot = attestation.data.target.slot,
+                    target_root = %ShortRoot(&attestation.data.target.root.0),
+                    source_slot = attestation.data.source.slot,
+                    source_root = %ShortRoot(&attestation.data.source.root.0),
+                    "Published aggregated attestation to gossipsub"
+                )
+            })
+            .inspect_err(|err| {
+                warn!(
+                    %slot, %err,
+                    "Failed to publish aggregated attestation to gossipsub"
+                )
+            });
+    }
+
+    // --- Fetch and retry handlers ---
+
+    #[send_handler]
+    async fn handle_fetch_block(&mut self, msg: p2p_protocol::FetchBlock, _ctx: &Context<Self>) {
+        let root = msg.root;
+
+        // Deduplicate — if already pending, ignore
+        if self.pending_requests.contains_key(&root) {
+            trace!(%root, "Block fetch already in progress, ignoring duplicate");
+            return;
+        }
+
+        self.fetch_block_from_peer(root);
+    }
+
+    #[send_handler]
+    async fn handle_retry_block_fetch(
+        &mut self,
+        msg: p2p_protocol::RetryBlockFetch,
+        _ctx: &Context<Self>,
+    ) {
+        let root = msg.root;
+
+        if !self.pending_requests.contains_key(&root) {
+            trace!(%root, "Block fetch completed during backoff, skipping retry");
+            return;
+        }
+
+        info!(%root, "Retrying block fetch after backoff");
+
+        if !self.fetch_block_from_peer(root) {
+            error!(%root, "Failed to retry block fetch, giving up");
+            self.pending_requests.remove(&root);
+        }
+    }
+
+    #[send_handler]
+    async fn handle_retry_peer_redial(
+        &mut self,
+        msg: p2p_protocol::RetryPeerRedial,
+        ctx: &Context<Self>,
+    ) {
+        let peer_id = msg.peer_id;
+
+        if self.connected_peers.contains(&peer_id) {
+            trace!(%peer_id, "Bootnode reconnected during redial delay, skipping");
+            return;
+        }
+
+        if let Some(addr) = self.bootnode_addrs.get(&peer_id) {
+            info!(%peer_id, "Redialing disconnected bootnode");
+            let _ = self
+                .swarm_tx
+                .send(SwarmCommand::Dial(addr.clone()))
+                .inspect_err(|e| {
+                    warn!(%peer_id, %e, "Failed to send redial command, will retry");
+                    send_after(
+                        Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
+                        ctx.clone(),
+                        p2p_protocol::RetryPeerRedial { peer_id },
+                    );
+                });
+        }
+    }
+}
+
+// --- Public API ---
+
+/// Handle to the P2P actor.
+#[derive(Clone)]
+pub struct P2P {
+    handle: ActorRef<P2PServer>,
+}
+
+impl P2P {
+    pub fn publish_attestation(&self, attestation: SignedAttestation) {
+        let _ = self
+            .handle
+            .publish_attestation(attestation)
+            .inspect_err(|err| error!(%err, "Failed to publish attestation to P2P actor"));
+    }
+
+    pub fn publish_block(&self, signed_block: SignedBlockWithAttestation) {
+        let _ = self
+            .handle
+            .publish_block(signed_block)
+            .inspect_err(|err| error!(%err, "Failed to publish block to P2P actor"));
+    }
+
+    pub fn publish_aggregated_attestation(&self, attestation: SignedAggregatedAttestation) {
+        let _ = self
+            .handle
+            .publish_aggregated_attestation(attestation)
+            .inspect_err(
+                |err| error!(%err, "Failed to publish aggregated attestation to P2P actor"),
+            );
+    }
+
+    pub fn fetch_block(&self, root: H256) {
+        let _ = self
+            .handle
+            .fetch_block(root)
+            .inspect_err(|err| error!(%err, "Failed to fetch block via P2P actor"));
+    }
+}
+
+// --- Initialization ---
+
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
+#[derive(NetworkBehaviour)]
+pub(crate) struct Behaviour {
+    gossipsub: libp2p::gossipsub::Behaviour,
+    req_resp: request_response::Behaviour<Codec>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,12 +805,11 @@ pub async fn start_p2p(
     bootnodes: Vec<Bootnode>,
     listening_socket: SocketAddr,
     blockchain: BlockChain,
-    p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
     store: Store,
     validator_id: Option<u64>,
     attestation_committee_count: u64,
     is_aggregator: bool,
-) -> Result<(), libp2p::gossipsub::SubscriptionError> {
+) -> Result<(P2P, tokio::task::JoinHandle<()>), libp2p::gossipsub::SubscriptionError> {
     let config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -120,8 +862,6 @@ pub async fn start_p2p(
     let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    // TODO: implement Executor with spawned?
-    // libp2p::swarm::Config::with_executor(executor)
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
@@ -160,7 +900,7 @@ pub async fn start_p2p(
 
     // Subscribe to block topic (all nodes)
     let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
-    let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
+    let block_topic = libp2p_gossipsub::IdentTopic::new(block_topic_str);
     swarm
         .behaviour_mut()
         .gossipsub
@@ -170,7 +910,7 @@ pub async fn start_p2p(
     // Subscribe to aggregation topic (all validators)
     let aggregation_topic_str =
         format!("/leanconsensus/{network}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
-    let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
+    let aggregation_topic = libp2p_gossipsub::IdentTopic::new(aggregation_topic_str);
     swarm
         .behaviour_mut()
         .gossipsub
@@ -187,7 +927,7 @@ pub async fn start_p2p(
     };
     let attestation_topic_str =
         format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
-    let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
+    let attestation_topic = libp2p_gossipsub::IdentTopic::new(attestation_topic_str);
 
     // Only aggregators subscribe to attestation subnets; non-aggregators
     // publish via gossipsub's fanout mechanism without subscribing.
@@ -201,269 +941,32 @@ pub async fn start_p2p(
 
     info!(socket=%listening_socket, "P2P node started");
 
-    let (retry_tx, retry_rx) = mpsc::unbounded_channel();
+    // Create channels between actor and swarm driver
+    let (swarm_cmd_tx, swarm_cmd_rx) = mpsc::unbounded_channel();
 
     let server = P2PServer {
-        swarm,
+        swarm_tx: swarm_cmd_tx,
         blockchain,
         store,
-        p2p_rx,
         attestation_topic,
         block_topic,
         aggregation_topic,
         connected_peers: HashSet::new(),
         pending_requests: HashMap::new(),
-        request_id_map: HashMap::new(),
+        correlation_id_map: HashMap::new(),
+        next_correlation_id: 0,
         bootnode_addrs,
-        retry_tx,
-        retry_rx,
     };
 
-    event_loop(server).await;
-    Ok(())
+    let actor_ref = server.start();
+
+    let driver = SwarmDriver::new(swarm, swarm_cmd_rx, actor_ref.clone());
+    let driver_handle = tokio::spawn(driver.run());
+
+    Ok((P2P { handle: actor_ref }, driver_handle))
 }
 
-/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
-#[derive(NetworkBehaviour)]
-pub(crate) struct Behaviour {
-    gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: request_response::Behaviour<Codec>,
-}
-
-pub(crate) struct P2PServer {
-    pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) blockchain: BlockChain,
-    pub(crate) store: Store,
-    pub(crate) p2p_rx: mpsc::UnboundedReceiver<P2PMessage>,
-    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) connected_peers: HashSet<PeerId>,
-    pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
-    pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
-    /// Bootnode addresses for redialing when disconnected
-    bootnode_addrs: HashMap<PeerId, Multiaddr>,
-    /// Channel for scheduling retries (block fetches and peer redials)
-    pub(crate) retry_tx: mpsc::UnboundedSender<RetryMessage>,
-    retry_rx: mpsc::UnboundedReceiver<RetryMessage>,
-}
-
-/// Event loop for the P2P crate.
-/// Processes swarm events, incoming requests, responses, gossip, and outgoing messages from blockchain.
-async fn event_loop(mut server: P2PServer) {
-    loop {
-        tokio::select! {
-            biased;
-
-            message = server.p2p_rx.recv() => {
-                let Some(message) = message else {
-                    break;
-                };
-                handle_p2p_message(&mut server, message).await;
-            }
-            event = server.swarm.next() => {
-                let Some(event) = event else {
-                    break;
-                };
-                handle_swarm_event(&mut server, event).await;
-            }
-            Some(msg) = server.retry_rx.recv() => {
-                match msg {
-                    RetryMessage::BlockFetch(root) => handle_retry(&mut server, root).await,
-                    RetryMessage::PeerRedial(peer_id) => handle_peer_redial(&mut server, peer_id).await,
-                }
-            }
-        }
-    }
-}
-
-async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourEvent>) {
-    match event {
-        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
-            req_resp::handle_req_resp_message(server, req_resp_event).await;
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-            message @ libp2p::gossipsub::Event::Message { .. },
-        )) => {
-            gossipsub::handle_gossipsub_message(server, message).await;
-        }
-        SwarmEvent::ConnectionEstablished {
-            peer_id,
-            endpoint,
-            num_established,
-            ..
-        } => {
-            let direction = connection_direction(&endpoint);
-            if num_established.get() == 1 {
-                server.connected_peers.insert(peer_id);
-                let peer_count = server.connected_peers.len();
-                metrics::notify_peer_connected(&Some(peer_id), direction, "success");
-                // Send status request on first connection to this peer
-                let our_status = build_status(&server.store);
-                let our_finalized_slot = our_status.finalized.slot;
-                let our_head_slot = our_status.head.slot;
-                info!(
-                    %peer_id,
-                    %direction,
-                    peer_count,
-                    our_finalized_slot,
-                    our_head_slot,
-                    "Peer connected"
-                );
-                server
-                    .swarm
-                    .behaviour_mut()
-                    .req_resp
-                    .send_request_with_protocol(
-                        &peer_id,
-                        Request::Status(our_status),
-                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
-                    );
-            } else {
-                info!(%peer_id, %direction, "Added peer connection");
-            }
-        }
-        SwarmEvent::ConnectionClosed {
-            peer_id,
-            endpoint,
-            num_established,
-            cause,
-            ..
-        } => {
-            let direction = connection_direction(&endpoint);
-            let reason = match cause {
-                None => "remote_close",
-                Some(err) => {
-                    // Categorize disconnection reasons
-                    let err_str = err.to_string().to_lowercase();
-                    if err_str.contains("timeout")
-                        || err_str.contains("timedout")
-                        || err_str.contains("keepalive")
-                    {
-                        "timeout"
-                    } else if err_str.contains("reset") || err_str.contains("connectionreset") {
-                        "remote_close"
-                    } else {
-                        "error"
-                    }
-                }
-            };
-            if num_established == 0 {
-                server.connected_peers.remove(&peer_id);
-                let peer_count = server.connected_peers.len();
-                metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
-
-                info!(
-                    %peer_id,
-                    %direction,
-                    %reason,
-                    peer_count,
-                    "Peer disconnected"
-                );
-
-                // Schedule redial if this is a bootnode
-                if server.bootnode_addrs.contains_key(&peer_id) {
-                    schedule_peer_redial(server.retry_tx.clone(), peer_id);
-                    info!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
-                }
-            } else {
-                info!(%peer_id, %direction, %reason, "Peer connection closed but other connections remain");
-            }
-        }
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            let result = if error.to_string().to_lowercase().contains("timed out") {
-                "timeout"
-            } else {
-                "error"
-            };
-            metrics::notify_peer_connected(&peer_id, "outbound", result);
-            warn!(?peer_id, %error, "Outgoing connection error");
-
-            // Schedule redial if this was a bootnode
-            if let Some(pid) = peer_id
-                && server.bootnode_addrs.contains_key(&pid)
-                && !server.connected_peers.contains(&pid)
-            {
-                schedule_peer_redial(server.retry_tx.clone(), pid);
-                info!(%pid, "Scheduled bootnode redial after connection error");
-            }
-        }
-        SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-            metrics::notify_peer_connected(&peer_id, "inbound", "error");
-            warn!(%error, "Incoming connection error");
-        }
-        _ => {
-            trace!(?event, "Ignored swarm event");
-        }
-    }
-}
-
-async fn handle_p2p_message(server: &mut P2PServer, message: P2PMessage) {
-    match message {
-        P2PMessage::PublishAttestation(attestation) => {
-            publish_attestation(server, attestation).await;
-        }
-        P2PMessage::PublishBlock(signed_block) => {
-            publish_block(server, signed_block).await;
-        }
-        P2PMessage::PublishAggregatedAttestation(attestation) => {
-            publish_aggregated_attestation(server, attestation).await;
-        }
-        P2PMessage::FetchBlock(root) => {
-            // Deduplicate - if already pending, ignore
-            if server.pending_requests.contains_key(&root) {
-                trace!(%root, "Block fetch already in progress, ignoring duplicate");
-                return;
-            }
-
-            // Send request and track it (tracking handled internally by fetch_block_from_peer)
-            fetch_block_from_peer(server, root).await;
-        }
-    }
-}
-
-async fn handle_retry(server: &mut P2PServer, root: H256) {
-    // Check if still pending (might have succeeded during backoff)
-    if !server.pending_requests.contains_key(&root) {
-        trace!(%root, "Block fetch completed during backoff, skipping retry");
-        return;
-    }
-
-    info!(%root, "Retrying block fetch after backoff");
-
-    // Retry the fetch (tracking handled internally by fetch_block_from_peer)
-    if !fetch_block_from_peer(server, root).await {
-        tracing::error!(%root, "Failed to retry block fetch, giving up");
-        server.pending_requests.remove(&root);
-    }
-}
-
-async fn handle_peer_redial(server: &mut P2PServer, peer_id: PeerId) {
-    // Skip if already reconnected
-    if server.connected_peers.contains(&peer_id) {
-        trace!(%peer_id, "Bootnode reconnected during redial delay, skipping");
-        return;
-    }
-
-    if let Some(addr) = server.bootnode_addrs.get(&peer_id) {
-        info!(%peer_id, "Redialing disconnected bootnode");
-        // NOTE: this dial does some checks and adds a pending outbound connection attempt.
-        // It does NOT block. If the dial fails, we'll later get an OutgoingConnectionError event.
-        let _ = server.swarm.dial(addr.clone()).inspect_err(|e| {
-            warn!(%peer_id, %e, "Failed to redial bootnode, will retry");
-            // Schedule another redial attempt
-            schedule_peer_redial(server.retry_tx.clone(), peer_id);
-        });
-    }
-}
-
-/// Schedules a peer redial after the configured delay interval.
-pub(crate) fn schedule_peer_redial(retry_tx: mpsc::UnboundedSender<RetryMessage>, peer_id: PeerId) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
-        let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
-    });
-}
+// --- Types and utilities ---
 
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
@@ -522,14 +1025,6 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
         });
     }
     bootnodes
-}
-
-fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
-    if endpoint.is_dialer() {
-        "outbound"
-    } else {
-        "inbound"
-    }
 }
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {

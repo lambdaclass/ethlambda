@@ -18,6 +18,7 @@ use std::{
 };
 
 use clap::Parser;
+use ethlambda_blockchain::P2PMessage;
 use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
@@ -132,23 +133,39 @@ async fn main() -> eyre::Result<()> {
     .await
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
-    let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (p2p_tx, mut p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     // Use first validator ID for subnet subscription
     let first_validator_id = validator_keys.keys().min().copied();
     let blockchain =
         BlockChain::spawn(store.clone(), p2p_tx, validator_keys, options.is_aggregator);
 
-    let p2p_handle = tokio::spawn(start_p2p(
+    let (p2p, driver_handle) = start_p2p(
         node_p2p_key,
         bootnodes,
         p2p_socket,
         blockchain,
-        p2p_rx,
         store.clone(),
         first_validator_id,
         options.attestation_committee_count,
         options.is_aggregator,
-    ));
+    )
+    .await
+    .expect("Failed to start P2P");
+
+    // Bridge: forward P2PMessages from blockchain to the P2P actor
+    let p2p_bridge = p2p.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = p2p_rx.recv().await {
+            match msg {
+                P2PMessage::PublishAttestation(a) => p2p_bridge.publish_attestation(a),
+                P2PMessage::PublishBlock(b) => p2p_bridge.publish_block(b),
+                P2PMessage::PublishAggregatedAttestation(a) => {
+                    p2p_bridge.publish_aggregated_attestation(a)
+                }
+                P2PMessage::FetchBlock(root) => p2p_bridge.fetch_block(root),
+            }
+        }
+    });
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
         .await
@@ -157,8 +174,8 @@ async fn main() -> eyre::Result<()> {
     info!("Node initialized");
 
     tokio::select! {
-        result = p2p_handle => {
-            panic!("P2P node task has exited unexpectedly: {result:?}");
+        result = driver_handle => {
+            panic!("P2P SwarmDriver has exited unexpectedly: {result:?}");
         }
         _ = tokio::signal::ctrl_c() => {
             // Ctrl-C received, shutting down
