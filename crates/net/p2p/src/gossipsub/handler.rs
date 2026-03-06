@@ -1,3 +1,4 @@
+use ethlambda_network_api::{NewAggregatedAttestation, NewAttestation, NewBlock};
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
@@ -20,7 +21,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
         message,
     } = event
     else {
-        unreachable!("we already matched on event_loop");
+        unreachable!("we already matched on Message variant in handle_swarm_event");
     };
     let topic_kind = message.topic.as_str().split("/").nth(3);
     match topic_kind {
@@ -49,7 +50,13 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 attestation_count,
                 "Received block from gossip"
             );
-            server.blockchain.notify_new_block(signed_block);
+            if let Some(ref recipient) = server.new_block {
+                let _ = recipient
+                    .send(NewBlock {
+                        block: signed_block,
+                    })
+                    .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
+            }
         }
         Some(AGGREGATION_TOPIC_KIND) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -72,9 +79,15 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 source_root = %ShortRoot(&aggregation.data.source.root.0),
                 "Received aggregated attestation from gossip"
             );
-            server
-                .blockchain
-                .notify_new_aggregated_attestation(aggregation);
+            if let Some(ref recipient) = server.new_aggregated {
+                let _ = recipient
+                    .send(NewAggregatedAttestation {
+                        attestation: aggregation,
+                    })
+                    .inspect_err(
+                        |err| error!(%err, "Failed to forward aggregated attestation to blockchain"),
+                    );
+            }
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -100,7 +113,13 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 source_root = %ShortRoot(&signed_attestation.data.source.root.0),
                 "Received attestation from gossip"
             );
-            server.blockchain.notify_new_attestation(signed_attestation);
+            if let Some(ref recipient) = server.new_attestation {
+                let _ = recipient
+                    .send(NewAttestation {
+                        attestation: signed_attestation,
+                    })
+                    .inspect_err(|err| error!(%err, "Failed to forward attestation to blockchain"));
+            }
         }
         _ => {
             trace!("Received message on unknown topic: {}", message.topic);
@@ -119,23 +138,18 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     let compressed = compress_message(&ssz_bytes);
 
     // Publish to the attestation subnet topic
-    let _ = server
-        .swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(server.attestation_topic.clone(), compressed)
-        .inspect(|_| info!(
-            %slot,
-            validator,
-            target_slot = attestation.data.target.slot,
-            target_root = %ShortRoot(&attestation.data.target.root.0),
-            source_slot = attestation.data.source.slot,
-            source_root = %ShortRoot(&attestation.data.source.root.0),
-            "Published attestation to gossipsub"
-        ))
-        .inspect_err(|err| {
-            tracing::warn!(%slot, %validator, %err, "Failed to publish attestation to gossipsub")
-        });
+    server
+        .swarm_handle
+        .publish(server.attestation_topic.clone(), compressed);
+    info!(
+        %slot,
+        validator,
+        target_slot = attestation.data.target.slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        source_slot = attestation.data.source.slot,
+        source_root = %ShortRoot(&attestation.data.source.root.0),
+        "Published attestation to gossipsub"
+    );
 }
 
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
@@ -152,24 +166,17 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWith
     let compressed = compress_message(&ssz_bytes);
 
     // Publish to gossipsub
-    let _ = server
-        .swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(server.block_topic.clone(), compressed)
-        .inspect(|_| {
-            info!(
-                %slot,
-                proposer,
-                block_root = %ShortRoot(&block_root.0),
-                parent_root = %ShortRoot(&parent_root.0),
-                attestation_count,
-                "Published block to gossipsub"
-            )
-        })
-        .inspect_err(
-            |err| tracing::warn!(%slot, %proposer, %err, "Failed to publish block to gossipsub"),
-        );
+    server
+        .swarm_handle
+        .publish(server.block_topic.clone(), compressed);
+    info!(
+        %slot,
+        proposer,
+        block_root = %ShortRoot(&block_root.0),
+        parent_root = %ShortRoot(&parent_root.0),
+        attestation_count,
+        "Published block to gossipsub"
+    );
 }
 
 pub async fn publish_aggregated_attestation(
@@ -185,22 +192,15 @@ pub async fn publish_aggregated_attestation(
     let compressed = compress_message(&ssz_bytes);
 
     // Publish to the aggregation topic
-    let _ = server
-        .swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(server.aggregation_topic.clone(), compressed)
-        .inspect(|_| {
-            info!(
-                %slot,
-                target_slot = attestation.data.target.slot,
-                target_root = %ShortRoot(&attestation.data.target.root.0),
-                source_slot = attestation.data.source.slot,
-                source_root = %ShortRoot(&attestation.data.source.root.0),
-                "Published aggregated attestation to gossipsub"
-            )
-        })
-        .inspect_err(|err| {
-            tracing::warn!(%slot, %err, "Failed to publish aggregated attestation to gossipsub")
-        });
+    server
+        .swarm_handle
+        .publish(server.aggregation_topic.clone(), compressed);
+    info!(
+        %slot,
+        target_slot = attestation.data.target.slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        source_slot = attestation.data.source.slot,
+        source_root = %ShortRoot(&attestation.data.source.root.0),
+        "Published aggregated attestation to gossipsub"
+    );
 }

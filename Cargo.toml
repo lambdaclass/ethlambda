@@ -10,6 +10,7 @@ members = [
     "crates/common/metrics",
     "crates/common/test-fixtures",
     "crates/common/types",
+    "crates/net/api",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
@@ -33,6 +34,7 @@ ethlambda-crypto = { path = "crates/common/crypto" }
 ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
+ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
