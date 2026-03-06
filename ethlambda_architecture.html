@@ -1,0 +1,1173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ethlambda — Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --rust:         #e07b39;
+    --rust-light:   #f4a261;
+    --rust-dark:    #c0572a;
+    --rust-bg:      #3d1f0a;
+    --consensus:    #9b59b6;
+    --consensus-l:  #c39bd3;
+    --consensus-d:  #6c3483;
+    --consensus-bg: #2d1b3d;
+    --net:          #00b4d8;
+    --net-l:        #90e0ef;
+    --net-d:        #0077b6;
+    --net-bg:       #0a2744;
+    --storage:      #2ecc71;
+    --storage-l:    #82e0aa;
+    --storage-d:    #1a9150;
+    --storage-bg:   #0a2e18;
+    --crypto:       #f39c12;
+    --crypto-l:     #f8c471;
+    --crypto-d:     #b7770d;
+    --crypto-bg:    #2d1e06;
+    --types:        #e74c3c;
+    --types-l:      #f1948a;
+    --types-d:      #c0392b;
+    --types-bg:     #2e0f0f;
+    --api:          #1abc9c;
+    --api-l:        #76d7c4;
+    --api-d:        #148f77;
+    --api-bg:       #0a2e2a;
+    --bg:           #0d1117;
+    --bg2:          #161b22;
+    --bg3:          #21262d;
+    --border:       #30363d;
+    --text:         #e6edf3;
+    --text-muted:   #8b949e;
+    --text-dim:     #484f58;
+    --panel-w:      360px;
+    --header-h:     64px;
+    --tab-h:        48px;
+  }
+
+  html, body {
+    height: 100%;
+    font-family: 'Inter', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  #app {
+    display: grid;
+    grid-template-rows: var(--header-h) var(--tab-h) 1fr;
+    grid-template-columns: 1fr var(--panel-w);
+    height: 100vh;
+  }
+
+  #header {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; padding: 0 24px;
+    background: var(--bg2); border-bottom: 1px solid var(--border); gap: 16px;
+  }
+  #header .logo { display: flex; align-items: center; gap: 10px; }
+  #header .logo svg { flex-shrink: 0; }
+  #header h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  #header .subtitle { font-size: 12px; color: var(--text-muted); font-weight: 400; }
+  #header .badge { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .lang-badge {
+    padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+    letter-spacing: 0.3px; font-family: 'JetBrains Mono', monospace;
+  }
+  .lb-rust { background: var(--rust-bg); color: var(--rust-light); border: 1px solid var(--rust-dark); }
+  .lb-consensus { background: var(--consensus-bg); color: var(--consensus-l); border: 1px solid var(--consensus-d); }
+  .lb-net { background: var(--net-bg); color: var(--net-l); border: 1px solid var(--net-d); }
+  .lb-storage { background: var(--storage-bg); color: var(--storage-l); border: 1px solid var(--storage-d); }
+
+  #tabs {
+    grid-column: 1 / -1; display: flex; align-items: center;
+    background: var(--bg2); border-bottom: 1px solid var(--border); padding: 0 16px; gap: 4px;
+  }
+  .tab {
+    padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500;
+    color: var(--text-muted); cursor: pointer; transition: all 0.15s;
+    user-select: none; border: 1px solid transparent;
+  }
+  .tab:hover { background: var(--bg3); color: var(--text); }
+  .tab.active { background: var(--bg3); color: var(--text); border-color: var(--border); }
+
+  #canvas { overflow: hidden; position: relative; background: var(--bg); }
+
+  #panel {
+    background: var(--bg2); border-left: 1px solid var(--border);
+    overflow-y: auto; display: flex; flex-direction: column;
+  }
+  #panel-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--bg2); z-index: 1;
+  }
+  #panel-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+  #panel-subtitle { font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+  #panel-body { padding: 16px 20px; flex: 1; }
+  #panel-body .section-label {
+    font-size: 10px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--text-dim); margin: 16px 0 8px;
+  }
+  #panel-body .section-label:first-child { margin-top: 0; }
+  #panel-body p { font-size: 13px; line-height: 1.6; color: #c9d1d9; }
+  #panel-body ul { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+  #panel-body ul li {
+    font-size: 12px; color: #c9d1d9; padding: 4px 8px;
+    background: var(--bg3); border-radius: 4px; font-family: 'JetBrains Mono', monospace;
+  }
+  #panel-body .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace; margin: 2px;
+  }
+  #panel-placeholder {
+    padding: 40px 20px; text-align: center; color: var(--text-dim); font-size: 13px; line-height: 1.7;
+  }
+
+  .view {
+    position: absolute; inset: 0; overflow: auto;
+    opacity: 0; pointer-events: none; transition: opacity 0.25s;
+  }
+  .view.active { opacity: 1; pointer-events: all; }
+
+  .node {
+    position: absolute; border-radius: 8px; cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s; user-select: none;
+  }
+  .node:hover { transform: translateY(-2px) scale(1.02); z-index: 10; }
+  .node.selected { z-index: 10; }
+  .node-inner {
+    height: 100%; border-radius: 8px; padding: 10px 14px;
+    border: 1px solid; display: flex; flex-direction: column; gap: 4px;
+  }
+  .node-title { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node-sub { font-size: 10px; font-family: 'JetBrains Mono', monospace; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .consensus .node-inner { background: linear-gradient(135deg, rgba(155,89,182,0.25), rgba(108,52,131,0.15)); border-color: rgba(155,89,182,0.5); }
+  .consensus.selected .node-inner, .consensus:hover .node-inner { border-color: var(--consensus); box-shadow: 0 0 12px rgba(155,89,182,0.4); }
+  .net .node-inner { background: linear-gradient(135deg, rgba(0,180,216,0.25), rgba(0,119,182,0.15)); border-color: rgba(0,180,216,0.5); }
+  .net.selected .node-inner, .net:hover .node-inner { border-color: var(--net); box-shadow: 0 0 12px rgba(0,180,216,0.4); }
+  .storage-node .node-inner { background: linear-gradient(135deg, rgba(46,204,113,0.2), rgba(26,145,80,0.12)); border-color: rgba(46,204,113,0.4); }
+  .storage-node.selected .node-inner, .storage-node:hover .node-inner { border-color: var(--storage); box-shadow: 0 0 12px rgba(46,204,113,0.3); }
+  .crypto-node .node-inner { background: linear-gradient(135deg, rgba(243,156,18,0.2), rgba(183,119,13,0.12)); border-color: rgba(243,156,18,0.4); }
+  .crypto-node.selected .node-inner, .crypto-node:hover .node-inner { border-color: var(--crypto); box-shadow: 0 0 12px rgba(243,156,18,0.3); }
+  .types-node .node-inner { background: linear-gradient(135deg, rgba(231,76,60,0.2), rgba(192,57,43,0.12)); border-color: rgba(231,76,60,0.4); }
+  .types-node.selected .node-inner, .types-node:hover .node-inner { border-color: var(--types); box-shadow: 0 0 12px rgba(231,76,60,0.3); }
+  .entry-node .node-inner { background: linear-gradient(135deg, rgba(224,123,57,0.25), rgba(192,87,42,0.15)); border-color: rgba(224,123,57,0.5); }
+  .entry-node.selected .node-inner, .entry-node:hover .node-inner { border-color: var(--rust); box-shadow: 0 0 12px rgba(224,123,57,0.4); }
+  .api-node .node-inner { background: linear-gradient(135deg, rgba(26,188,156,0.2), rgba(20,143,119,0.12)); border-color: rgba(26,188,156,0.4); }
+  .api-node.selected .node-inner, .api-node:hover .node-inner { border-color: var(--api); box-shadow: 0 0 12px rgba(26,188,156,0.3); }
+
+  .group-box { position: absolute; border-radius: 12px; border: 1px dashed; pointer-events: none; }
+  .group-label {
+    position: absolute; top: -11px; left: 14px; font-size: 10px; font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase; padding: 2px 8px; border-radius: 4px;
+  }
+
+  #view-actors { padding: 32px; }
+  .actors-canvas { position: relative; width: 900px; height: 560px; margin: 0 auto; }
+
+  #view-flow { padding: 32px; }
+  .flow-canvas { position: relative; width: 920px; height: 620px; margin: 0 auto; }
+  .flow-step { position: absolute; border-radius: 10px; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s; user-select: none; }
+  .flow-step:hover { transform: translateY(-2px) scale(1.015); }
+  .flow-step-inner { height: 100%; border-radius: 10px; padding: 12px 16px; border: 1px solid; display: flex; flex-direction: column; gap: 5px; }
+  .flow-num { font-size: 10px; font-weight: 700; font-family: 'JetBrains Mono', monospace; opacity: 0.6; }
+  .flow-title { font-size: 13px; font-weight: 600; line-height: 1.3; }
+  .flow-detail { font-size: 11px; color: #8b949e; font-family: 'JetBrains Mono', monospace; line-height: 1.4; }
+
+  #view-layers { padding: 32px; }
+  .layers-canvas { position: relative; width: 860px; margin: 0 auto; }
+  .layer-row { margin-bottom: 20px; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
+  .layer-header { padding: 14px 20px; display: flex; align-items: center; gap: 14px; cursor: pointer; user-select: none; transition: filter 0.15s; }
+  .layer-header:hover { filter: brightness(1.1); }
+  .layer-lang-icon { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 800; font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
+  .layer-lang-title { font-size: 15px; font-weight: 700; }
+  .layer-lang-desc { font-size: 12px; opacity: 0.75; margin-top: 2px; }
+  .layer-path { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.7; padding: 3px 10px; border-radius: 4px; background: rgba(0,0,0,0.25); }
+  .layer-modules { padding: 12px 20px 16px; display: flex; flex-wrap: wrap; gap: 8px; background: rgba(0,0,0,0.2); border-top: 1px solid rgba(255,255,255,0.06); }
+  .layer-mod { padding: 5px 12px; border-radius: 6px; font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 500; cursor: pointer; transition: filter 0.1s, transform 0.1s; border: 1px solid; }
+  .layer-mod:hover { filter: brightness(1.25); transform: translateY(-1px); }
+
+  .layer-consensus .layer-header { background: linear-gradient(90deg, rgba(155,89,182,0.3), rgba(155,89,182,0.08)); }
+  .layer-consensus .layer-lang-icon { background: rgba(155,89,182,0.4); color: var(--consensus-l); }
+  .layer-consensus .layer-mod { background: rgba(155,89,182,0.15); border-color: rgba(155,89,182,0.35); color: var(--consensus-l); }
+  .layer-net .layer-header { background: linear-gradient(90deg, rgba(0,180,216,0.3), rgba(0,180,216,0.08)); }
+  .layer-net .layer-lang-icon { background: rgba(0,180,216,0.4); color: var(--net-l); }
+  .layer-net .layer-mod { background: rgba(0,180,216,0.15); border-color: rgba(0,180,216,0.35); color: var(--net-l); }
+  .layer-storage .layer-header { background: linear-gradient(90deg, rgba(46,204,113,0.2), rgba(46,204,113,0.05)); }
+  .layer-storage .layer-lang-icon { background: rgba(46,204,113,0.35); color: var(--storage-l); }
+  .layer-storage .layer-mod { background: rgba(46,204,113,0.12); border-color: rgba(46,204,113,0.3); color: var(--storage-l); }
+  .layer-crypto .layer-header { background: linear-gradient(90deg, rgba(243,156,18,0.25), rgba(243,156,18,0.06)); }
+  .layer-crypto .layer-lang-icon { background: rgba(243,156,18,0.4); color: var(--crypto-l); }
+  .layer-crypto .layer-mod { background: rgba(243,156,18,0.12); border-color: rgba(243,156,18,0.3); color: var(--crypto-l); }
+  .layer-types .layer-header { background: linear-gradient(90deg, rgba(231,76,60,0.2), rgba(231,76,60,0.05)); }
+  .layer-types .layer-lang-icon { background: rgba(231,76,60,0.35); color: var(--types-l); }
+  .layer-types .layer-mod { background: rgba(231,76,60,0.12); border-color: rgba(231,76,60,0.3); color: var(--types-l); }
+  .layer-entry .layer-header { background: linear-gradient(90deg, rgba(224,123,57,0.3), rgba(224,123,57,0.08)); }
+  .layer-entry .layer-lang-icon { background: rgba(224,123,57,0.4); color: var(--rust-light); }
+  .layer-entry .layer-mod { background: rgba(224,123,57,0.15); border-color: rgba(224,123,57,0.35); color: var(--rust-light); }
+  .layer-api .layer-header { background: linear-gradient(90deg, rgba(26,188,156,0.25), rgba(26,188,156,0.06)); }
+  .layer-api .layer-lang-icon { background: rgba(26,188,156,0.4); color: var(--api-l); }
+  .layer-api .layer-mod { background: rgba(26,188,156,0.12); border-color: rgba(26,188,156,0.3); color: var(--api-l); }
+
+  #view-deps { padding: 32px; overflow: auto; }
+  .deps-canvas { position: relative; width: 1000px; height: 560px; margin: 0 auto; }
+  .deps-canvas .group-box { background: rgba(255,255,255,0.015); }
+
+  @keyframes flowPulse { 0% { stroke-dashoffset: 60; opacity: 1; } 100% { stroke-dashoffset: 0; opacity: 0.4; } }
+
+  #tooltip {
+    position: fixed; background: var(--bg3); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 11px; color: var(--text-muted); pointer-events: none;
+    opacity: 0; transition: opacity 0.1s; z-index: 1000; white-space: nowrap;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  #tooltip.visible { opacity: 1; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="logo">
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <rect width="32" height="32" rx="8" fill="#1a0a0a"/>
+        <path d="M16 4L28 10V22L16 28L4 22V10L16 4Z" fill="none" stroke="#e07b39" stroke-width="1.5"/>
+        <path d="M16 8L24 12V20L16 24L8 20V12L16 8Z" fill="rgba(224,123,57,0.25)" stroke="#f4a261" stroke-width="1"/>
+        <circle cx="16" cy="16" r="3" fill="#e07b39"/>
+      </svg>
+    </div>
+    <div>
+      <h1>ethlambda</h1>
+      <div class="subtitle">Minimalist Lean Ethereum Consensus Client in Rust</div>
+    </div>
+    <div class="badge">
+      <span class="lang-badge lb-rust">Rust</span>
+      <span class="lang-badge lb-consensus">3SF-mini</span>
+      <span class="lang-badge lb-net">libp2p</span>
+      <span class="lang-badge lb-storage">RocksDB</span>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <div class="tab active" data-view="actors">Actor Model</div>
+    <div class="tab" data-view="flow">Block Data Flow</div>
+    <div class="tab" data-view="layers">Crate Layers</div>
+    <div class="tab" data-view="deps">Crate Dependencies</div>
+  </nav>
+
+  <main id="canvas">
+
+    <!-- VIEW 1: ACTOR MODEL -->
+    <div id="view-actors" class="view active">
+      <div class="actors-canvas" id="actors-canvas">
+        <svg id="actors-svg" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;">
+          <defs>
+            <marker id="arr-consensus" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="rgba(155,89,182,0.7)"/></marker>
+            <marker id="arr-net" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="rgba(0,180,216,0.7)"/></marker>
+            <marker id="arr-storage" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="rgba(46,204,113,0.7)"/></marker>
+            <marker id="arr-rust" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="rgba(224,123,57,0.7)"/></marker>
+            <marker id="arr-api" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="rgba(26,188,156,0.7)"/></marker>
+          </defs>
+        </svg>
+
+        <!-- MAIN -->
+        <div class="node entry-node" id="an-main" style="left:350px;top:10px;width:200px;height:52px" data-id="main">
+          <div class="node-inner"><div class="node-title">main (tokio::main)</div><div class="node-sub">bin/ethlambda</div></div>
+        </div>
+
+        <!-- BlockChain Actor -->
+        <div class="node consensus" id="an-blockchain" style="left:80px;top:130px;width:230px;height:56px" data-id="blockchain">
+          <div class="node-inner"><div class="node-title">BlockChain (Actor)</div><div class="node-sub">spawned-concurrency 0.5</div></div>
+        </div>
+
+        <!-- P2P Actor -->
+        <div class="node net" id="an-p2p" style="left:400px;top:130px;width:220px;height:56px" data-id="p2p">
+          <div class="node-inner"><div class="node-title">P2P (Actor)</div><div class="node-sub">spawned-concurrency 0.5</div></div>
+        </div>
+
+        <!-- RPC -->
+        <div class="node net" id="an-rpc" style="left:700px;top:130px;width:170px;height:56px" data-id="rpc">
+          <div class="node-inner"><div class="node-title">RPC Server</div><div class="node-sub">Axum HTTP :5054</div></div>
+        </div>
+
+        <!-- Network API (bridge) -->
+        <div class="node api-node" id="an-netapi" style="left:245px;top:100px;width:145px;height:40px" data-id="netapi">
+          <div class="node-inner"><div class="node-title">network-api</div><div class="node-sub">Recipient&lt;M&gt; messages</div></div>
+        </div>
+
+        <!-- BlockChain internals -->
+        <div class="node consensus" id="an-store" style="left:20px;top:290px;width:170px;height:48px" data-id="store">
+          <div class="node-inner"><div class="node-title">Store (fork choice)</div><div class="node-sub">state + attestations</div></div>
+        </div>
+        <div class="node consensus" id="an-keymgr" style="left:210px;top:290px;width:160px;height:48px" data-id="keymgr">
+          <div class="node-inner"><div class="node-title">KeyManager</div><div class="node-sub">XMSS signing</div></div>
+        </div>
+        <div class="node consensus" id="an-forkchoice" style="left:20px;top:390px;width:170px;height:48px" data-id="forkchoice">
+          <div class="node-inner"><div class="node-title">LMD GHOST</div><div class="node-sub">fork_choice crate</div></div>
+        </div>
+        <div class="node consensus" id="an-stf" style="left:210px;top:390px;width:170px;height:48px" data-id="statetransition">
+          <div class="node-inner"><div class="node-title">State Transition</div><div class="node-sub">process_slots + process_block</div></div>
+        </div>
+
+        <!-- P2P internals -->
+        <div class="node net" id="an-swarmadapter" style="left:420px;top:290px;width:190px;height:48px" data-id="swarmadapter">
+          <div class="node-inner"><div class="node-title">SwarmAdapter</div><div class="node-sub">tokio task + SwarmHandle</div></div>
+        </div>
+        <div class="node net" id="an-gossipsub" style="left:420px;top:390px;width:170px;height:48px" data-id="gossipsub">
+          <div class="node-inner"><div class="node-title">GossipSub</div><div class="node-sub">blocks + attestations</div></div>
+        </div>
+        <div class="node net" id="an-reqresp" style="left:420px;top:480px;width:170px;height:48px" data-id="reqresp">
+          <div class="node-inner"><div class="node-title">Req/Resp</div><div class="node-sub">Status + BlocksByRoot</div></div>
+        </div>
+
+        <!-- Shared -->
+        <div class="node storage-node" id="an-rocksdb" style="left:680px;top:290px;width:180px;height:48px" data-id="rocksdb">
+          <div class="node-inner"><div class="node-title">RocksDB Backend</div><div class="node-sub">Arc&lt;dyn StorageBackend&gt;</div></div>
+        </div>
+        <div class="node crypto-node" id="an-crypto" style="left:680px;top:390px;width:180px;height:48px" data-id="crypto">
+          <div class="node-inner"><div class="node-title">XMSS Crypto</div><div class="node-sub">leansig + leanVM</div></div>
+        </div>
+
+        <!-- Labels -->
+        <div style="position:absolute;left:268px;top:82px;font-size:9px;color:var(--api-l);font-family:'JetBrains Mono',monospace;pointer-events:none;opacity:0.8;">
+          InitP2P / InitBlockChain
+        </div>
+
+        <!-- Group boxes -->
+        <div class="group-box" style="left:10px;top:115px;width:380px;height:340px;border-color:rgba(155,89,182,0.25);">
+          <span class="group-label" style="background:rgba(155,89,182,0.2);color:#c39bd3;">BlockChain Actor (blockchain crate)</span>
+        </div>
+        <div class="group-box" style="left:405px;top:115px;width:220px;height:430px;border-color:rgba(0,180,216,0.2);">
+          <span class="group-label" style="background:rgba(0,180,216,0.15);color:#90e0ef;">P2P Actor (p2p crate)</span>
+        </div>
+        <div class="group-box" style="left:665px;top:270px;width:215px;height:195px;border-color:rgba(255,255,255,0.1);">
+          <span class="group-label" style="background:rgba(255,255,255,0.08);color:#8b949e;">Shared Infrastructure</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIEW 2: DATA FLOW -->
+    <div id="view-flow" class="view">
+      <div class="flow-canvas" id="flow-canvas">
+        <svg id="flow-svg" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;">
+          <defs>
+            <marker id="farr-net" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(0,180,216,0.8)"/></marker>
+            <marker id="farr-consensus" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(155,89,182,0.8)"/></marker>
+            <marker id="farr-storage" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(46,204,113,0.8)"/></marker>
+            <marker id="farr-crypto" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(243,156,18,0.8)"/></marker>
+            <marker id="farr-api" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(26,188,156,0.8)"/></marker>
+          </defs>
+        </svg>
+
+        <div class="flow-step net" id="fs-gossip" style="left:20px;top:60px;width:200px;height:100px" data-id="gossipsub">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(0,180,216,0.25),rgba(0,119,182,0.12));border-color:rgba(0,180,216,0.5);">
+            <div class="flow-num">STEP 1 &middot; SWARM</div>
+            <div class="flow-title">GossipSub Receive</div>
+            <div class="flow-detail">SwarmAdapter captures<br/>event from libp2p mesh</div>
+          </div>
+        </div>
+
+        <div class="flow-step net" id="fs-decode" style="left:270px;top:60px;width:200px;height:100px" data-id="p2p">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(0,180,216,0.25),rgba(0,119,182,0.12));border-color:rgba(0,180,216,0.5);">
+            <div class="flow-num">STEP 2 &middot; P2P ACTOR</div>
+            <div class="flow-title">Decode & Verify</div>
+            <div class="flow-detail">WrappedSwarmEvent &rarr;<br/>snappy + SSZ + XMSS verify</div>
+          </div>
+        </div>
+
+        <div class="flow-step api-node" id="fs-msg" style="left:520px;top:60px;width:200px;height:100px" data-id="netapi">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(26,188,156,0.2),rgba(20,143,119,0.1));border-color:rgba(26,188,156,0.4);">
+            <div class="flow-num">STEP 3 &middot; NETWORK-API</div>
+            <div class="flow-title">NewBlock Message</div>
+            <div class="flow-detail">Recipient&lt;NewBlock&gt;<br/>typed actor message</div>
+          </div>
+        </div>
+
+        <div class="flow-step consensus" id="fs-stf" style="left:520px;top:210px;width:200px;height:100px" data-id="statetransition">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(155,89,182,0.3),rgba(108,52,131,0.18));border-color:rgba(155,89,182,0.6);">
+            <div class="flow-num">STEP 4 &middot; PURE FUNCTIONS</div>
+            <div class="flow-title">State Transition</div>
+            <div class="flow-detail">process_slots()<br/>process_block()<br/>update justification</div>
+          </div>
+        </div>
+
+        <div class="flow-step consensus" id="fs-forkchoice" style="left:270px;top:210px;width:200px;height:100px" data-id="forkchoice">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(155,89,182,0.25),rgba(108,52,131,0.15));border-color:rgba(155,89,182,0.5);">
+            <div class="flow-num">STEP 5 &middot; FORK CHOICE</div>
+            <div class="flow-title">LMD GHOST Head</div>
+            <div class="flow-detail">recompute head<br/>weight attestations<br/>update safe target</div>
+          </div>
+        </div>
+
+        <div class="flow-step storage-node" id="fs-storage" style="left:270px;top:380px;width:200px;height:90px" data-id="rocksdb">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(46,204,113,0.2),rgba(26,145,80,0.1));border-color:rgba(46,204,113,0.4);">
+            <div class="flow-num">STEP 6 &middot; STORAGE</div>
+            <div class="flow-title">RocksDB Persist</div>
+            <div class="flow-detail">atomic WriteBatch<br/>headers + bodies + sigs</div>
+          </div>
+        </div>
+
+        <div class="flow-step consensus" id="fs-tick" style="left:20px;top:210px;width:200px;height:110px" data-id="tick">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(155,89,182,0.2),rgba(108,52,131,0.1));border-color:rgba(155,89,182,0.4);">
+            <div class="flow-num">TICK SYSTEM &middot; 800ms</div>
+            <div class="flow-title">Validator Duties</div>
+            <div class="flow-detail">Interval 0: propose<br/>Interval 1: attest<br/>Interval 2: safe target<br/>Interval 3/4: accept atts</div>
+          </div>
+        </div>
+
+        <div class="flow-step crypto-node" id="fs-agg" style="left:20px;top:380px;width:200px;height:90px" data-id="aggregation">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(243,156,18,0.2),rgba(183,119,13,0.1));border-color:rgba(243,156,18,0.4);">
+            <div class="flow-num">AGGREGATION</div>
+            <div class="flow-title">XMSS Aggregate</div>
+            <div class="flow-detail">leanVM aggregation<br/>gossip signatures &rarr; proofs</div>
+          </div>
+        </div>
+
+        <div class="flow-step net" id="fs-publish" style="left:520px;top:380px;width:200px;height:90px" data-id="publish">
+          <div class="flow-step-inner" style="background:linear-gradient(135deg,rgba(0,180,216,0.2),rgba(0,119,182,0.1));border-color:rgba(0,180,216,0.4);">
+            <div class="flow-num">PUBLISH</div>
+            <div class="flow-title">Gossip Publish</div>
+            <div class="flow-detail">Recipient&lt;PublishBlock&gt;<br/>&rarr; SwarmHandle.publish()</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIEW 3: CRATE LAYERS -->
+    <div id="view-layers" class="view">
+      <div class="layers-canvas" id="layers-canvas">
+
+        <div class="layer-row layer-entry">
+          <div class="layer-header" data-id="main">
+            <div class="layer-lang-icon">Bin</div>
+            <div>
+              <div class="layer-lang-title" style="color:#f4a261;">Entry Point</div>
+              <div class="layer-lang-desc" style="color:#e07b39;">CLI, config, spawns actors, wires Recipient handles via init messages</div>
+            </div>
+            <div class="layer-path">bin/ethlambda/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="main">main.rs (tokio::main)</span>
+            <span class="layer-mod" data-id="main">checkpoint_sync.rs</span>
+            <span class="layer-mod" data-id="main">version.rs (vergen-git2)</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-consensus">
+          <div class="layer-header" data-id="consensus-layer">
+            <div class="layer-lang-icon">BC</div>
+            <div>
+              <div class="layer-lang-title" style="color:#c39bd3;">Blockchain (Consensus Actor)</div>
+              <div class="layer-lang-desc" style="color:#9b59b6;">Actor: fork choice, state transition, validator duties, tick system</div>
+            </div>
+            <div class="layer-path">crates/blockchain/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="blockchain">BlockChainServer (#[actor])</span>
+            <span class="layer-mod" data-id="store">Store (fork choice state)</span>
+            <span class="layer-mod" data-id="keymgr">KeyManager (XMSS signing)</span>
+            <span class="layer-mod" data-id="forkchoice">fork_choice (LMD GHOST)</span>
+            <span class="layer-mod" data-id="statetransition">state_transition (STF)</span>
+            <span class="layer-mod" data-id="tick">Tick system (800ms intervals)</span>
+            <span class="layer-mod" data-id="blockchain">Handler&lt;NewBlock&gt;</span>
+            <span class="layer-mod" data-id="blockchain">Handler&lt;InitP2P&gt;</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-net">
+          <div class="layer-header" data-id="net-layer">
+            <div class="layer-lang-icon">Net</div>
+            <div>
+              <div class="layer-lang-title" style="color:#90e0ef;">Networking (P2P Actor + RPC)</div>
+              <div class="layer-lang-desc" style="color:#00b4d8;">Actor + SwarmAdapter bridge, GossipSub, Req/Resp, Axum HTTP</div>
+            </div>
+            <div class="layer-path">crates/net/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="p2p">P2PServer (#[actor])</span>
+            <span class="layer-mod" data-id="swarmadapter">SwarmAdapter (tokio task)</span>
+            <span class="layer-mod" data-id="swarmadapter">SwarmHandle (command channel)</span>
+            <span class="layer-mod" data-id="gossipsub">GossipSub (blocks + attestations)</span>
+            <span class="layer-mod" data-id="reqresp">Req/Resp (Status + BlocksByRoot)</span>
+            <span class="layer-mod" data-id="p2p">Handler&lt;PublishBlock&gt;</span>
+            <span class="layer-mod" data-id="p2p">Handler&lt;InitBlockChain&gt;</span>
+            <span class="layer-mod" data-id="rpc">RPC (Axum /lean/v0/*)</span>
+            <span class="layer-mod" data-id="rpc">Prometheus /metrics</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-api">
+          <div class="layer-header" data-id="netapi">
+            <div class="layer-lang-icon">API</div>
+            <div>
+              <div class="layer-lang-title" style="color:#76d7c4;">Network API (Message Contract)</div>
+              <div class="layer-lang-desc" style="color:#1abc9c;">Typed messages shared between actors: NewBlock, PublishBlock, InitP2P, etc.</div>
+            </div>
+            <div class="layer-path">crates/net/api/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="netapi">PublishBlock / PublishAttestation</span>
+            <span class="layer-mod" data-id="netapi">NewBlock / NewAttestation</span>
+            <span class="layer-mod" data-id="netapi">FetchBlock</span>
+            <span class="layer-mod" data-id="netapi">InitP2P / InitBlockChain</span>
+            <span class="layer-mod" data-id="netapi">PublishAggregatedAttestation</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-storage">
+          <div class="layer-header" data-id="storage-layer">
+            <div class="layer-lang-icon">DB</div>
+            <div>
+              <div class="layer-lang-title" style="color:#82e0aa;">Storage</div>
+              <div class="layer-lang-desc" style="color:#2ecc71;">RocksDB backend, trait-based API, atomic write batches</div>
+            </div>
+            <div class="layer-path">crates/storage/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="rocksdb">RocksDBBackend</span>
+            <span class="layer-mod" data-id="rocksdb">StorageBackend trait</span>
+            <span class="layer-mod" data-id="rocksdb">StorageReadView / StorageWriteBatch</span>
+            <span class="layer-mod" data-id="rocksdb">10 Tables</span>
+            <span class="layer-mod" data-id="store">Store (wraps backend + state)</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-crypto">
+          <div class="layer-header" data-id="crypto-layer">
+            <div class="layer-lang-icon">Sig</div>
+            <div>
+              <div class="layer-lang-title" style="color:#f8c471;">Cryptography</div>
+              <div class="layer-lang-desc" style="color:#f39c12;">XMSS post-quantum signatures, leanVM aggregation</div>
+            </div>
+            <div class="layer-path">crates/common/crypto/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="crypto">XMSS sign/verify (leansig)</span>
+            <span class="layer-mod" data-id="aggregation">Signature aggregation (leanVM)</span>
+            <span class="layer-mod" data-id="crypto">52B pubkeys, 3112B signatures</span>
+          </div>
+        </div>
+
+        <div class="layer-row layer-types">
+          <div class="layer-header" data-id="types-layer">
+            <div class="layer-lang-icon">T</div>
+            <div>
+              <div class="layer-lang-title" style="color:#f1948a;">Core Types</div>
+              <div class="layer-lang-desc" style="color:#e74c3c;">SSZ-encoded data structures: State, Block, Attestation, Checkpoint</div>
+            </div>
+            <div class="layer-path">crates/common/types/</div>
+          </div>
+          <div class="layer-modules">
+            <span class="layer-mod" data-id="types">State / Block / Attestation</span>
+            <span class="layer-mod" data-id="types">SignedBlockWithAttestation</span>
+            <span class="layer-mod" data-id="types">Checkpoint (root + slot)</span>
+            <span class="layer-mod" data-id="types">GenesisConfig</span>
+            <span class="layer-mod" data-id="types">ShortRoot (truncated display)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIEW 4: CRATE DEPENDENCIES -->
+    <div id="view-deps" class="view">
+      <div class="deps-canvas" id="deps-canvas">
+        <svg id="deps-svg" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;">
+          <defs>
+            <marker id="darr-consensus" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(155,89,182,0.7)"/></marker>
+            <marker id="darr-net" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(0,180,216,0.7)"/></marker>
+            <marker id="darr-storage" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(46,204,113,0.7)"/></marker>
+            <marker id="darr-dim" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(72,79,88,0.7)"/></marker>
+            <marker id="darr-rust" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(224,123,57,0.7)"/></marker>
+            <marker id="darr-crypto" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(243,156,18,0.7)"/></marker>
+            <marker id="darr-api" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(26,188,156,0.7)"/></marker>
+          </defs>
+        </svg>
+
+        <div class="node entry-node" id="dn-main" style="left:400px;top:15px;width:200px;height:48px" data-id="main">
+          <div class="node-inner"><div class="node-title">bin/ethlambda</div><div class="node-sub">entry point + CLI</div></div>
+        </div>
+
+        <!-- Row 1 -->
+        <div class="node consensus" id="dn-blockchain" style="left:100px;top:110px;width:210px;height:52px" data-id="blockchain">
+          <div class="node-inner"><div class="node-title">ethlambda-blockchain</div><div class="node-sub">Actor + store + tick</div></div>
+        </div>
+        <div class="node net" id="dn-p2p" style="left:400px;top:110px;width:200px;height:52px" data-id="p2p">
+          <div class="node-inner"><div class="node-title">ethlambda-p2p</div><div class="node-sub">Actor + SwarmAdapter</div></div>
+        </div>
+        <div class="node net" id="dn-rpc" style="left:700px;top:110px;width:180px;height:52px" data-id="rpc">
+          <div class="node-inner"><div class="node-title">ethlambda-rpc</div><div class="node-sub">Axum HTTP + /metrics</div></div>
+        </div>
+
+        <!-- Row 2: network-api + sub-crates -->
+        <div class="node api-node" id="dn-netapi" style="left:260px;top:210px;width:200px;height:48px" data-id="netapi">
+          <div class="node-inner"><div class="node-title">ethlambda-network-api</div><div class="node-sub">message contract crate</div></div>
+        </div>
+        <div class="node consensus" id="dn-forkchoice" style="left:20px;top:280px;width:185px;height:48px" data-id="forkchoice">
+          <div class="node-inner"><div class="node-title">ethlambda-fork-choice</div><div class="node-sub">LMD GHOST (3SF-mini)</div></div>
+        </div>
+        <div class="node consensus" id="dn-stf" style="left:230px;top:280px;width:210px;height:48px" data-id="statetransition">
+          <div class="node-inner"><div class="node-title">ethlambda-state-transition</div><div class="node-sub">process_slots + process_block</div></div>
+        </div>
+        <div class="node storage-node" id="dn-storage" style="left:500px;top:280px;width:185px;height:48px" data-id="rocksdb">
+          <div class="node-inner"><div class="node-title">ethlambda-storage</div><div class="node-sub">RocksDB + trait API</div></div>
+        </div>
+
+        <!-- Row 3: Common -->
+        <div class="node crypto-node" id="dn-crypto" style="left:20px;top:400px;width:175px;height:48px" data-id="crypto">
+          <div class="node-inner"><div class="node-title">ethlambda-crypto</div><div class="node-sub">XMSS + leansig</div></div>
+        </div>
+        <div class="node types-node" id="dn-types" style="left:230px;top:400px;width:175px;height:48px" data-id="types">
+          <div class="node-inner"><div class="node-title">ethlambda-types</div><div class="node-sub">State, Block, Attestation</div></div>
+        </div>
+        <div class="node storage-node" id="dn-metrics" style="left:450px;top:400px;width:175px;height:48px" data-id="metrics">
+          <div class="node-inner"><div class="node-title">ethlambda-metrics</div><div class="node-sub">Prometheus re-exports</div></div>
+        </div>
+        <div class="node entry-node" id="dn-spawned" style="left:680px;top:400px;width:200px;height:48px" data-id="spawned">
+          <div class="node-inner"><div class="node-title">spawned-concurrency 0.5</div><div class="node-sub">Actor + Recipient framework</div></div>
+        </div>
+
+        <!-- Group boxes -->
+        <div class="group-box" style="left:10px;top:260px;width:445px;height:80px;border-color:rgba(155,89,182,0.2);">
+          <span class="group-label" style="background:rgba(155,89,182,0.15);color:#c39bd3;">Consensus Sub-crates</span>
+        </div>
+        <div class="group-box" style="left:10px;top:380px;width:640px;height:85px;border-color:rgba(255,255,255,0.1);">
+          <span class="group-label" style="background:rgba(255,255,255,0.08);color:#8b949e;">Common / Shared</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <aside id="panel">
+    <div id="panel-header" style="display:none"><div id="panel-title"></div><div id="panel-subtitle"></div></div>
+    <div id="panel-body">
+      <div id="panel-placeholder">
+        <svg width="40" height="40" viewBox="0 0 40 40" fill="none" style="margin:0 auto 12px;display:block;opacity:0.3">
+          <circle cx="20" cy="20" r="18" stroke="#8b949e" stroke-width="1.5"/>
+          <path d="M20 12v10M20 27v2" stroke="#8b949e" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        Click any component to see details
+      </div>
+    </div>
+  </aside>
+</div>
+<div id="tooltip"></div>
+
+<script>
+const COMPONENTS = {
+  main: {
+    title: 'main (Entry Point)',
+    subtitle: 'bin/ethlambda/src/main.rs',
+    lang: 'entry',
+    desc: 'The application entry point using #[tokio::main]. Spawns both actors independently, then wires them together by exchanging typed Recipient handles via InitP2P and InitBlockChain messages. Neither actor holds a direct reference to the other at construction time.',
+    tags: ['tokio::main', 'clap', 'jemalloc', 'actor-wiring'],
+    details: [
+      'BlockChain::spawn() - consensus actor via spawned-concurrency 0.5',
+      'P2P::spawn(built, store) - networking actor with SwarmAdapter',
+      'build_swarm(SwarmConfig) - create libp2p swarm before actor starts',
+      'InitP2P message: gives BlockChain Recipient handles to P2P',
+      'InitBlockChain message: gives P2P Recipient handles to BlockChain',
+      'ethlambda_rpc::start_rpc_server() - Axum HTTP on metrics port',
+      'No mpsc channel between actors; pure Recipient<M> messaging',
+    ],
+  },
+  blockchain: {
+    title: 'BlockChain (Actor)',
+    subtitle: 'crates/blockchain/src/lib.rs',
+    lang: 'consensus',
+    desc: 'The central consensus actor using spawned-concurrency 0.5 #[actor] macro. Sequences all state updates: block processing, attestation handling, fork choice, and validator duties. Communicates with P2P via typed Recipient handles received through InitP2P.',
+    tags: ['#[actor]', 'Handler<M>', 'Recipient', '#[protocol]'],
+    details: [
+      '#[protocol] BlockChainProtocol: Tick (via send_after)',
+      'Handler<InitP2P>: receives P2P recipients at startup',
+      'Handler<NewBlock>: processes incoming blocks from P2P',
+      'Handler<NewAttestation>: gossip attestation handling',
+      'Handler<NewAggregatedAttestation>: aggregated proof handling',
+      '800ms tick system with 5 intervals per 4-second slot',
+      'Publishes via Recipient<PublishBlock>, Recipient<PublishAttestation>',
+      'Fetches missing blocks via Recipient<FetchBlock>',
+    ],
+  },
+  p2p: {
+    title: 'P2P (Actor)',
+    subtitle: 'crates/net/p2p/src/lib.rs',
+    lang: 'net',
+    desc: 'The networking actor, also using spawned-concurrency 0.5 #[actor] macro. Processes swarm events (forwarded from SwarmAdapter via spawn_listener), handles gossip/req-resp, and forwards validated messages to BlockChain via Recipient handles.',
+    tags: ['#[actor]', 'Handler<M>', 'SwarmAdapter', 'spawn_listener'],
+    details: [
+      '#[protocol] P2PProtocol: RetryBlockFetch, RetryPeerRedial',
+      'Handler<InitBlockChain>: receives BlockChain recipients at startup',
+      'Handler<PublishBlock>: publishes blocks via SwarmHandle',
+      'Handler<PublishAttestation>: publishes attestations',
+      'Handler<FetchBlock>: initiates block fetch from peers',
+      'Handler<WrappedSwarmEvent>: processes libp2p events',
+      'spawn_listener(): streams swarm events into actor mailbox',
+      'Swarm construction separated into build_swarm() + P2P::spawn()',
+    ],
+  },
+  swarmadapter: {
+    title: 'SwarmAdapter',
+    subtitle: 'crates/net/p2p/src/swarm_adapter.rs',
+    lang: 'net',
+    desc: 'Bridges the async libp2p swarm (which requires exclusive &mut access) with the actor system. Runs a tokio::select! loop in a background task, forwarding swarm events to the P2P actor and executing commands from it.',
+    tags: ['tokio::spawn', 'SwarmHandle', 'SwarmCommand', 'bridge'],
+    details: [
+      'start_swarm_adapter() -> (Stream<SwarmEvent>, SwarmHandle)',
+      'SwarmHandle: clone-able command sender (publish, dial, request)',
+      'SwarmCommand enum: Publish, Dial, SendRequest, SendResponse',
+      'swarm_loop(): tokio::select! over swarm.next() and cmd_rx.recv()',
+      'Events forwarded as WrappedSwarmEvent via spawn_listener()',
+      'SendRequest returns OutboundRequestId via oneshot channel',
+      'Isolates !Send swarm types from the actor system',
+    ],
+  },
+  netapi: {
+    title: 'Network API (Message Contract)',
+    subtitle: 'crates/net/api/src/lib.rs',
+    lang: 'api',
+    desc: 'Defines the typed message contract between BlockChain and P2P actors. Each message is a struct implementing spawned_concurrency::Message. Actors exchange Recipient<M> handles at startup, enabling type-safe, decoupled communication.',
+    tags: ['send_messages!', 'Recipient<M>', 'Message', 'contract'],
+    details: [
+      'BlockChain -> P2P: PublishBlock, PublishAttestation, FetchBlock',
+      'P2P -> BlockChain: NewBlock, NewAttestation, NewAggregatedAttestation',
+      'Init messages: InitP2P (carries P2P recipients), InitBlockChain',
+      'Replaces the old P2PMessage enum + mpsc::unbounded_channel',
+      'Each actor only knows about message types, not the other actor',
+      'Recipient<M> is type-erased: any actor can handle message M',
+    ],
+  },
+  store: {
+    title: 'Store (Fork Choice State)',
+    subtitle: 'crates/blockchain/src/store.rs',
+    lang: 'consensus',
+    desc: 'The in-memory fork choice store: head, justified/finalized checkpoints, attestation pipeline. Wraps the storage backend for persistence. Called by BlockChain actor handlers.',
+    tags: ['fork-choice', 'attestation-pipeline', 'state'],
+    details: [
+      'Two-phase attestation pipeline: new -> known',
+      'on_tick(): advance slot, promote attestations at intervals 0/3',
+      'on_block(): state transition + fork choice + storage persist',
+      'produce_block_with_signatures(): block building for proposers',
+      'justified_slots: relative indexing from finalized_slot',
+      'Fallback pruning for stalled finalization',
+    ],
+  },
+  keymgr: {
+    title: 'KeyManager',
+    subtitle: 'crates/blockchain/src/key_manager.rs',
+    lang: 'consensus',
+    desc: 'Manages validator private keys and XMSS signing. Slot-based key usage tracking prevents one-time signature reuse.',
+    tags: ['XMSS', 'validator-keys', 'signing'],
+    details: [
+      'HashMap<u64, ValidatorSecretKey> per-validator keys',
+      'sign_attestation() / sign_block()',
+      'Slot-based to prevent XMSS reuse',
+    ],
+  },
+  forkchoice: {
+    title: 'LMD GHOST (Fork Choice)',
+    subtitle: 'crates/blockchain/fork_choice/src/lib.rs',
+    lang: 'consensus',
+    desc: 'Implements the LMD GHOST fork choice algorithm adapted for 3SF-mini. Pure functions: computes canonical head by weighting branches with attestation votes.',
+    tags: ['LMD-GHOST', '3SF-mini', 'pure-functions'],
+    details: [
+      'compute_lmd_ghost_head() - main head selection',
+      'compute_block_weights() - per-block attestation weight',
+      'Walks from justified checkpoint through children',
+      'Heaviest child wins; ties broken by root hash',
+      'min_score threshold for branch pruning',
+    ],
+  },
+  statetransition: {
+    title: 'State Transition Function',
+    subtitle: 'crates/blockchain/state_transition/src/lib.rs',
+    lang: 'consensus',
+    desc: 'Pure functions implementing the Lean Ethereum consensus spec. No side effects: takes State + Block, returns new State.',
+    tags: ['pure functions', 'STF', 'spec', '3SF-mini'],
+    details: [
+      'process_slots() - advance through empty slots',
+      'process_block() - validate header, process attestations',
+      'is_proposer() - deterministic proposer selection',
+      'update_justifications() - 3SF-mini justification rules',
+      'update_finalization() - finalization from justified chain',
+    ],
+  },
+  gossipsub: {
+    title: 'GossipSub',
+    subtitle: 'crates/net/p2p/src/gossipsub/',
+    lang: 'net',
+    desc: 'GossipSub v1.1 for publishing and receiving blocks/attestations. Messages are snappy-compressed SSZ. Now handled as actor messages instead of inline in a select! loop.',
+    tags: ['GossipSub', 'snappy', 'SSZ', 'pubsub'],
+    details: [
+      'Topics: block, attestation subnets, aggregation',
+      'Message encoding: snappy raw + SSZ',
+      'Message IDs: 20-byte truncated SHA256',
+      'handle_gossipsub_message() called from Handler<WrappedSwarmEvent>',
+      'Publishing goes through SwarmHandle.publish()',
+    ],
+  },
+  reqresp: {
+    title: 'Request/Response',
+    subtitle: 'crates/net/p2p/src/req_resp/',
+    lang: 'net',
+    desc: 'Status handshake and BlocksByRoot for block sync. Now handled through the actor event pipeline instead of inline.',
+    tags: ['req/resp', 'Status', 'BlocksByRoot', 'sync'],
+    details: [
+      'STATUS_PROTOCOL_V1: exchange checkpoints',
+      'BLOCKS_BY_ROOT_PROTOCOL_V1: fetch blocks by hash',
+      'Retry scheduling via send_after(RetryBlockFetch)',
+      'Responses sent via SwarmHandle.send_response()',
+    ],
+  },
+  rpc: {
+    title: 'RPC Server',
+    subtitle: 'crates/net/rpc/src/lib.rs',
+    lang: 'net',
+    desc: 'Axum HTTP server for REST APIs, metrics, and profiling. Reads Store directly (not via actor messages).',
+    tags: ['Axum', 'HTTP', 'Prometheus', 'jemalloc'],
+    details: [
+      'GET /lean/v0/states/finalized - SSZ state',
+      'GET /lean/v0/checkpoints/justified - JSON',
+      'GET /lean/v0/fork_choice[/ui] - fork choice',
+      'GET /metrics - Prometheus (lean_* prefix)',
+      'GET /debug/pprof/allocs[/flamegraph] - heap profiling',
+    ],
+  },
+  rocksdb: {
+    title: 'Storage (RocksDB)',
+    subtitle: 'crates/storage/src/',
+    lang: 'storage',
+    desc: 'Trait-based storage with RocksDB backend. 10 typed tables, atomic write batches, separate read/write interfaces.',
+    tags: ['RocksDB', 'trait-based', 'atomic-writes', '10-tables'],
+    details: [
+      'StorageBackend / StorageReadView / StorageWriteBatch traits',
+      'Tables: BlockHeaders, BlockBodies, BlockSignatures, States,',
+      '  LatestKnown/NewAttestations, GossipSigs, AggPayloads,',
+      '  Metadata, LiveChain',
+      'In-memory backend for tests',
+    ],
+  },
+  crypto: {
+    title: 'XMSS Cryptography',
+    subtitle: 'crates/common/crypto/src/lib.rs',
+    lang: 'crypto',
+    desc: 'Post-quantum XMSS via leansig. 52B pubkeys, 3112B signatures. Aggregation via leanVM.',
+    tags: ['XMSS', 'post-quantum', 'leansig', 'leanVM'],
+    details: ['leansig: core sign/verify', 'leanVM: aggregation proofs', 'Slot-based to prevent reuse', '--is-aggregator required for production'],
+  },
+  aggregation: {
+    title: 'Signature Aggregation',
+    subtitle: 'crates/common/crypto/ + blockchain/store',
+    lang: 'crypto',
+    desc: 'Two-phase pipeline: collect gossip XMSS signatures, aggregate via leanVM. Only --is-aggregator nodes perform this.',
+    tags: ['aggregation', 'leanVM', 'is-aggregator'],
+    details: ['GossipSignatures table: individual sigs', 'AggregatedPayloads: proofs', 'Triggered at tick interval 2'],
+  },
+  types: {
+    title: 'Core Types',
+    subtitle: 'crates/common/types/src/',
+    lang: 'types',
+    desc: 'All Lean Ethereum consensus data structures. SSZ-encoded, tree-hashable.',
+    tags: ['SSZ', 'ethereum_ssz', 'tree_hash'],
+    details: ['State, Block, Attestation, Checkpoint', 'SignedBlockWithAttestation', 'GenesisConfig, ShortRoot'],
+  },
+  metrics: {
+    title: 'Metrics',
+    subtitle: 'crates/common/metrics/src/lib.rs',
+    lang: 'storage',
+    desc: 'Prometheus re-exports and TimingGuard. All metrics use lean_ prefix.',
+    tags: ['Prometheus', 'TimingGuard', 'lean_'],
+    details: ['Re-exports: IntGauge, Histogram, etc.', 'TimingGuard: RAII duration', 'gather_default_metrics()'],
+  },
+  tick: {
+    title: 'Tick System',
+    subtitle: 'crates/blockchain/src/lib.rs (on_tick)',
+    lang: 'consensus',
+    desc: 'Every 800ms, a Tick message fires in the BlockChain actor via send_after(). Each 4-second slot has 5 intervals orchestrating validator duties.',
+    tags: ['800ms', '5 intervals', 'send_after', '#[protocol]'],
+    details: [
+      'Interval 0: propose + accept attestations',
+      'Interval 1: produce attestations',
+      'Interval 2: safe target + aggregation',
+      'Interval 3/4: accept accumulated attestations',
+      'Tick is a #[protocol] message, scheduled via send_after()',
+    ],
+  },
+  publish: {
+    title: 'Gossip Publish',
+    subtitle: 'crates/net/p2p/src/gossipsub/',
+    lang: 'net',
+    desc: 'Outbound publishing. BlockChain sends PublishBlock/PublishAttestation via Recipient to P2P actor, which calls SwarmHandle.publish().',
+    tags: ['Recipient<PublishBlock>', 'SwarmHandle', 'outbound'],
+    details: ['Recipient<PublishBlock> -> Handler<PublishBlock> -> SwarmHandle.publish()', 'SSZ + snappy before publish'],
+  },
+  spawned: {
+    title: 'spawned-concurrency 0.5',
+    subtitle: 'external crate (LambdaClass)',
+    lang: 'entry',
+    desc: 'OTP-inspired actor framework for Rust, version 0.5. Provides Actor/Handler traits, ActorRef, typed Recipient<M> for cross-actor messaging, Context for self-scheduling, and spawn_listener for bridging async streams into actor mailboxes.',
+    tags: ['Actor', 'Handler', 'Recipient', 'Context', '#[actor]'],
+    details: [
+      'Actor trait + #[actor] macro: define actor state + handlers',
+      '#[protocol] macro: generates message types for internal use',
+      'Handler<M>: async handle(&mut self, msg, ctx) for each message',
+      'ActorRef<A>: typed handle to send messages to actor A',
+      'Recipient<M>: type-erased handle for message M (cross-actor)',
+      'Context: self-reference for send_after() scheduling',
+      'spawn_listener(): bridge Stream<Item=M> into actor mailbox',
+      'send_after(duration, ctx, msg): delayed message delivery',
+    ],
+  },
+  'consensus-layer': {
+    title: 'Blockchain (Consensus Layer)',
+    subtitle: 'crates/blockchain/',
+    lang: 'consensus',
+    desc: 'The consensus layer: BlockChain actor, fork choice, state transition, validator duty orchestration. Uses #[actor] macro from spawned-concurrency 0.5.',
+    tags: ['blockchain', 'fork-choice', 'state-transition', 'actor'],
+    details: ['BlockChainServer #[actor]: sequences all state updates', 'Handler<M> impls for network-api messages', 'Store + fork choice + state transition'],
+  },
+  'net-layer': {
+    title: 'Networking Layer',
+    subtitle: 'crates/net/',
+    lang: 'net',
+    desc: 'P2P actor + SwarmAdapter bridge + Axum RPC. P2P uses #[actor] macro; the SwarmAdapter runs a tokio task that bridges libp2p swarm events into the actor mailbox.',
+    tags: ['P2P actor', 'SwarmAdapter', 'Axum', 'QUIC'],
+    details: ['P2PServer #[actor]', 'SwarmAdapter: tokio task + SwarmHandle', 'build_swarm() separated from actor spawn', 'spawn_listener() for event stream'],
+  },
+  'storage-layer': { title: 'Storage Layer', subtitle: 'crates/storage/', lang: 'storage', desc: 'RocksDB + in-memory backends. 10 tables, atomic writes.', tags: ['RocksDB', '10-tables'], details: [] },
+  'crypto-layer': { title: 'Cryptography Layer', subtitle: 'crates/common/crypto/', lang: 'crypto', desc: 'XMSS via leansig + leanVM aggregation. Post-quantum.', tags: ['XMSS', 'leansig'], details: [] },
+  'types-layer': { title: 'Core Types Layer', subtitle: 'crates/common/types/', lang: 'types', desc: 'SSZ data structures shared by all crates.', tags: ['SSZ', 'tree_hash'], details: [] },
+};
+
+// Tab switching
+const tabs = document.querySelectorAll('.tab');
+const views = document.querySelectorAll('.view');
+tabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    tabs.forEach(t => t.classList.remove('active'));
+    views.forEach(v => v.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('view-' + tab.dataset.view).classList.add('active');
+    if (tab.dataset.view === 'actors') drawActorArrows();
+    if (tab.dataset.view === 'flow') drawFlowArrows();
+    if (tab.dataset.view === 'deps') drawDepsArrows();
+  });
+});
+
+function showDetail(id) {
+  const data = COMPONENTS[id];
+  if (!data) return;
+  const langColors = {
+    consensus: { bg: 'rgba(155,89,182,0.2)', border: 'var(--consensus)', text: 'var(--consensus-l)' },
+    net:       { bg: 'rgba(0,180,216,0.2)',   border: 'var(--net)',       text: 'var(--net-l)' },
+    storage:   { bg: 'rgba(46,204,113,0.15)', border: 'var(--storage)',   text: 'var(--storage-l)' },
+    crypto:    { bg: 'rgba(243,156,18,0.15)', border: 'var(--crypto)',    text: 'var(--crypto-l)' },
+    types:     { bg: 'rgba(231,76,60,0.15)',  border: 'var(--types)',     text: 'var(--types-l)' },
+    entry:     { bg: 'rgba(224,123,57,0.2)',  border: 'var(--rust)',      text: 'var(--rust-light)' },
+    api:       { bg: 'rgba(26,188,156,0.15)', border: 'var(--api)',       text: 'var(--api-l)' },
+  };
+  const lc = langColors[data.lang] || langColors.entry;
+  const header = document.getElementById('panel-header');
+  const body = document.getElementById('panel-body');
+  const ph = document.getElementById('panel-placeholder');
+  header.style.display = 'block';
+  header.style.borderColor = lc.border;
+  document.getElementById('panel-title').textContent = data.title;
+  document.getElementById('panel-title').style.color = lc.text;
+  document.getElementById('panel-subtitle').textContent = data.subtitle;
+  if (ph) ph.remove();
+  let html = '<div class="section-label">Overview</div><p>' + data.desc + '</p>';
+  if (data.tags?.length) {
+    html += '<div class="section-label">Tags</div>';
+    html += data.tags.map(t => '<span class="tag" style="background:' + lc.bg + ';border:1px solid ' + lc.border + ';color:' + lc.text + ';">' + t + '</span>').join('');
+  }
+  if (data.details?.length) {
+    html += '<div class="section-label">Details</div><ul>' + data.details.map(d => '<li>' + d + '</li>').join('') + '</ul>';
+  }
+  body.innerHTML = html;
+}
+
+document.querySelectorAll('.node[data-id], .flow-step[data-id]').forEach(el => {
+  el.addEventListener('click', e => {
+    document.querySelectorAll('.node.selected, .flow-step.selected').forEach(s => s.classList.remove('selected'));
+    el.classList.add('selected');
+    showDetail(el.dataset.id);
+    e.stopPropagation();
+  });
+});
+document.querySelectorAll('.layer-mod[data-id], .layer-header[data-id]').forEach(el => {
+  el.addEventListener('click', e => { showDetail(el.dataset.id); e.stopPropagation(); });
+});
+document.getElementById('canvas').addEventListener('click', () => {
+  document.querySelectorAll('.node.selected, .flow-step.selected').forEach(s => s.classList.remove('selected'));
+});
+
+function makeArrow(svg, x1, y1, x2, y2, color, markerId, animated) {
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  const mx = (x1 + x2) / 2;
+  path.setAttribute('d', 'M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' ' + mx + ',' + y2 + ' ' + x2 + ',' + y2);
+  path.setAttribute('stroke', color); path.setAttribute('stroke-width', '1.5'); path.setAttribute('fill', 'none');
+  path.setAttribute('marker-end', 'url(#' + markerId + ')');
+  if (animated) { path.setAttribute('stroke-dasharray', '8 4'); path.style.animation = 'flowPulse 1.5s linear infinite'; }
+  svg.appendChild(path);
+}
+
+function getCenter(el, canvas) {
+  const er = el.getBoundingClientRect(); const cr = canvas.getBoundingClientRect();
+  return { cx: er.left - cr.left + er.width / 2, cy: er.top - cr.top + er.height / 2,
+    left: er.left - cr.left, right: er.left - cr.left + er.width,
+    top: er.top - cr.top, bottom: er.top - cr.top + er.height };
+}
+
+function drawActorArrows() {
+  const svg = document.getElementById('actors-svg');
+  while (svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
+  const canvas = document.getElementById('actors-canvas');
+  const pairs = [
+    ['an-main', 'an-blockchain', 'rgba(155,89,182,0.6)', 'arr-consensus'],
+    ['an-main', 'an-p2p',        'rgba(0,180,216,0.6)',  'arr-net'],
+    ['an-main', 'an-rpc',        'rgba(0,180,216,0.6)',  'arr-net'],
+    ['an-blockchain', 'an-store',      'rgba(155,89,182,0.5)', 'arr-consensus'],
+    ['an-blockchain', 'an-keymgr',     'rgba(155,89,182,0.5)', 'arr-consensus'],
+    ['an-store',      'an-forkchoice', 'rgba(155,89,182,0.5)', 'arr-consensus'],
+    ['an-store',      'an-stf',        'rgba(155,89,182,0.5)', 'arr-consensus'],
+    ['an-p2p',        'an-swarmadapter','rgba(0,180,216,0.5)', 'arr-net'],
+    ['an-swarmadapter','an-gossipsub',  'rgba(0,180,216,0.4)', 'arr-net'],
+    ['an-swarmadapter','an-reqresp',    'rgba(0,180,216,0.4)', 'arr-net'],
+    ['an-rpc',        'an-rocksdb',    'rgba(46,204,113,0.5)', 'arr-storage'],
+  ];
+  pairs.forEach(([fromId, toId, color, marker]) => {
+    const from = document.getElementById(fromId); const to = document.getElementById(toId);
+    if (!from || !to) return;
+    const f = getCenter(from, canvas); const t = getCenter(to, canvas);
+    makeArrow(svg, f.cx, f.bottom, t.cx, t.top, color, marker);
+  });
+  // Bidirectional between blockchain and p2p (via network-api)
+  const bc = getCenter(document.getElementById('an-blockchain'), canvas);
+  const p2p = getCenter(document.getElementById('an-p2p'), canvas);
+  const api = getCenter(document.getElementById('an-netapi'), canvas);
+  makeArrow(svg, bc.right, bc.cy - 6, p2p.left, p2p.cy - 6, 'rgba(26,188,156,0.7)', 'arr-api', true);
+  makeArrow(svg, p2p.left, p2p.cy + 6, bc.right, bc.cy + 6, 'rgba(26,188,156,0.7)', 'arr-api', true);
+}
+
+function drawFlowArrows() {
+  const svg = document.getElementById('flow-svg');
+  while (svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
+  const canvas = document.getElementById('flow-canvas');
+  const pairs = [
+    ['fs-gossip',     'fs-decode',     'rgba(0,180,216,0.7)',  'farr-net',       true],
+    ['fs-decode',     'fs-msg',        'rgba(26,188,156,0.7)', 'farr-api',       true],
+    ['fs-msg',        'fs-stf',        'rgba(155,89,182,0.6)', 'farr-consensus', true],
+    ['fs-stf',        'fs-forkchoice', 'rgba(155,89,182,0.6)', 'farr-consensus', false],
+    ['fs-forkchoice', 'fs-storage',    'rgba(46,204,113,0.6)', 'farr-storage',   true],
+    ['fs-tick',       'fs-forkchoice', 'rgba(155,89,182,0.5)', 'farr-consensus', false],
+    ['fs-tick',       'fs-agg',        'rgba(243,156,18,0.6)', 'farr-crypto',    false],
+    ['fs-agg',        'fs-publish',    'rgba(0,180,216,0.6)',  'farr-net',       true],
+    ['fs-msg',        'fs-publish',    'rgba(0,180,216,0.5)',  'farr-net',       false],
+  ];
+  pairs.forEach(([fromId, toId, color, marker, animated]) => {
+    const from = document.getElementById(fromId); const to = document.getElementById(toId);
+    if (!from || !to) return;
+    const f = getCenter(from, canvas); const t = getCenter(to, canvas);
+    let x1, y1, x2, y2;
+    const dx = t.cx - f.cx, dy = t.cy - f.cy;
+    if (Math.abs(dx) > Math.abs(dy)) {
+      if (dx > 0) { x1 = f.right; y1 = f.cy; x2 = t.left; y2 = t.cy; }
+      else { x1 = f.left; y1 = f.cy; x2 = t.right; y2 = t.cy; }
+    } else {
+      if (dy > 0) { x1 = f.cx; y1 = f.bottom; x2 = t.cx; y2 = t.top; }
+      else { x1 = f.cx; y1 = f.top; x2 = t.cx; y2 = t.bottom; }
+    }
+    makeArrow(svg, x1, y1, x2, y2, color, marker, animated);
+  });
+}
+
+function makeDepsArrow(svg, fromEl, toEl, canvas, exitSide, enterSide, color, markerId, animated) {
+  const f = getCenter(fromEl, canvas); const t = getCenter(toEl, canvas);
+  const pt = (rect, side) => {
+    switch (side) { case 'top': return [rect.cx, rect.top]; case 'bottom': return [rect.cx, rect.bottom];
+      case 'left': return [rect.left, rect.cy]; case 'right': return [rect.right, rect.cy]; }
+  };
+  const [x1, y1] = pt(f, exitSide); const [x2, y2] = pt(t, enterSide);
+  const r = 7, dx = x2 - x1, dy = y2 - y1, adx = Math.abs(dx), ady = Math.abs(dy);
+  const sx = Math.sign(dx) || 1, sy = Math.sign(dy) || 1;
+  const isV = s => s === 'top' || s === 'bottom';
+  let d;
+  if (adx < 3 && ady < 3) { d = 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2; }
+  else if (isV(exitSide) && isV(enterSide)) {
+    if (adx < 3) d = 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2;
+    else { const my = (y1+y2)/2, cr = Math.min(r, adx/2, ady/4);
+      d = 'M'+x1+','+y1+' L'+x1+','+(my-cr*sy)+' Q'+x1+','+my+' '+(x1+cr*sx)+','+my+' L'+(x2-cr*sx)+','+my+' Q'+x2+','+my+' '+x2+','+(my+cr*sy)+' L'+x2+','+y2; }
+  } else if (!isV(exitSide) && isV(enterSide)) {
+    const cr = Math.min(r, adx, ady);
+    d = 'M'+x1+','+y1+' L'+(x2-cr*sx)+','+y1+' Q'+x2+','+y1+' '+x2+','+(y1+cr*sy)+' L'+x2+','+y2;
+  } else if (isV(exitSide) && !isV(enterSide)) {
+    const cr = Math.min(r, adx, ady);
+    d = 'M'+x1+','+y1+' L'+x1+','+(y2-cr*sy)+' Q'+x1+','+y2+' '+(x1+cr*sx)+','+y2+' L'+x2+','+y2;
+  } else d = 'M'+x1+','+y1+' L'+x2+','+y2;
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', d); path.setAttribute('stroke', color); path.setAttribute('stroke-width', '1.5');
+  path.setAttribute('fill', 'none'); path.setAttribute('marker-end', 'url(#' + markerId + ')');
+  if (animated) { path.setAttribute('stroke-dasharray', '8 4'); path.style.animation = 'flowPulse 1.5s linear infinite'; }
+  svg.appendChild(path);
+}
+
+function drawDepsArrows() {
+  const svg = document.getElementById('deps-svg');
+  while (svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
+  const canvas = document.getElementById('deps-canvas');
+  const EC = 'rgba(155,89,182,0.55)', NC = 'rgba(0,180,216,0.55)', SC = 'rgba(46,204,113,0.55)';
+  const DC = 'rgba(72,79,88,0.4)', RC = 'rgba(224,123,57,0.55)', AC = 'rgba(26,188,156,0.55)';
+  const edges = [
+    ['dn-main', 'dn-blockchain', 'bottom', 'top', EC, 'darr-consensus', true],
+    ['dn-main', 'dn-p2p',       'bottom', 'top', NC, 'darr-net',       true],
+    ['dn-main', 'dn-rpc',       'bottom', 'top', NC, 'darr-net',       false],
+    ['dn-main', 'dn-netapi',    'bottom', 'top', AC, 'darr-api',       false],
+    ['dn-blockchain', 'dn-netapi',     'bottom', 'top', AC, 'darr-api', true],
+    ['dn-p2p',        'dn-netapi',     'bottom', 'top', AC, 'darr-api', true],
+    ['dn-blockchain', 'dn-forkchoice', 'bottom', 'top', EC, 'darr-consensus', false],
+    ['dn-blockchain', 'dn-stf',        'bottom', 'top', EC, 'darr-consensus', false],
+    ['dn-blockchain', 'dn-storage',    'bottom', 'top', SC, 'darr-storage', false],
+    ['dn-p2p',        'dn-storage',    'bottom', 'top', SC, 'darr-storage', false],
+    ['dn-rpc',        'dn-storage',    'bottom', 'top', SC, 'darr-storage', false],
+    ['dn-forkchoice', 'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
+    ['dn-stf',        'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
+    ['dn-stf',        'dn-crypto',  'bottom', 'top', DC, 'darr-crypto', false],
+    ['dn-storage',    'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
+    ['dn-storage',    'dn-metrics', 'bottom', 'top', SC, 'darr-storage', false],
+    ['dn-blockchain', 'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
+    ['dn-p2p',        'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
+    ['dn-netapi',     'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
+    ['dn-netapi',     'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
+  ];
+  edges.forEach(([fromId, toId, exitSide, enterSide, color, marker, animated]) => {
+    const from = document.getElementById(fromId); const to = document.getElementById(toId);
+    if (!from || !to) return;
+    makeDepsArrow(svg, from, to, canvas, exitSide, enterSide, color, marker, animated);
+  });
+}
+
+window.addEventListener('load', () => {
+  drawActorArrows();
+  window.addEventListener('resize', () => {
+    const v = document.querySelector('.tab.active')?.dataset.view;
+    if (v === 'actors') drawActorArrows();
+    if (v === 'flow') drawFlowArrows();
+    if (v === 'deps') drawDepsArrows();
+  });
+});
+
+const tooltip = document.getElementById('tooltip');
+document.querySelectorAll('.node[data-id], .flow-step[data-id]').forEach(el => {
+  el.addEventListener('mouseenter', () => { const d = COMPONENTS[el.dataset.id]; if (d) { tooltip.textContent = d.title; tooltip.classList.add('visible'); } });
+  el.addEventListener('mousemove', e => { tooltip.style.left = (e.clientX+14)+'px'; tooltip.style.top = (e.clientY+8)+'px'; });
+  el.addEventListener('mouseleave', () => tooltip.classList.remove('visible'));
+});
+</script>
+</body>
+</html>
