@@ -53,7 +53,7 @@ enum RetryMessage {
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
-    pub(crate) last_peer: Option<PeerId>,
+    pub(crate) failed_peers: HashSet<PeerId>,
 }
 
 #[allow(clippy::too_many_arguments)]
