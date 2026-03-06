@@ -136,6 +136,7 @@
   .node {
     position: absolute; border-radius: 8px; cursor: pointer;
     transition: transform 0.15s, box-shadow 0.15s; user-select: none;
+    z-index: 2;
   }
   .node:hover { transform: translateY(-2px) scale(1.02); z-index: 10; }
   .node.selected { z-index: 10; }
@@ -161,14 +162,14 @@
   .api-node .node-inner { background: linear-gradient(135deg, rgba(26,188,156,0.2), rgba(20,143,119,0.12)); border-color: rgba(26,188,156,0.4); }
   .api-node.selected .node-inner, .api-node:hover .node-inner { border-color: var(--api); box-shadow: 0 0 12px rgba(26,188,156,0.3); }
 
-  .group-box { position: absolute; border-radius: 12px; border: 1px dashed; pointer-events: none; }
+  .group-box { position: absolute; border-radius: 12px; border: 1px dashed; pointer-events: none; z-index: 1; }
   .group-label {
     position: absolute; top: -11px; left: 14px; font-size: 10px; font-weight: 700;
     letter-spacing: 1px; text-transform: uppercase; padding: 2px 8px; border-radius: 4px;
   }
 
   #view-actors { padding: 32px; }
-  .actors-canvas { position: relative; width: 900px; height: 560px; margin: 0 auto; }
+  .actors-canvas { position: relative; width: 970px; height: 560px; margin: 0 auto; }
 
   #view-flow { padding: 32px; }
   .flow-canvas { position: relative; width: 920px; height: 620px; margin: 0 auto; }
@@ -278,7 +279,7 @@
         </svg>
 
         <!-- MAIN -->
-        <div class="node entry-node" id="an-main" style="left:350px;top:10px;width:200px;height:52px" data-id="main">
+        <div class="node entry-node" id="an-main" style="left:340px;top:10px;width:200px;height:52px" data-id="main">
           <div class="node-inner"><div class="node-title">main (tokio::main)</div><div class="node-sub">bin/ethlambda</div></div>
         </div>
 
@@ -288,17 +289,17 @@
         </div>
 
         <!-- P2P Actor -->
-        <div class="node net" id="an-p2p" style="left:400px;top:130px;width:220px;height:56px" data-id="p2p">
+        <div class="node net" id="an-p2p" style="left:485px;top:130px;width:200px;height:56px" data-id="p2p">
           <div class="node-inner"><div class="node-title">P2P (Actor)</div><div class="node-sub">spawned-concurrency 0.5</div></div>
         </div>
 
         <!-- RPC -->
-        <div class="node net" id="an-rpc" style="left:700px;top:130px;width:170px;height:56px" data-id="rpc">
+        <div class="node net" id="an-rpc" style="left:750px;top:130px;width:170px;height:56px" data-id="rpc">
           <div class="node-inner"><div class="node-title">RPC Server</div><div class="node-sub">Axum HTTP :5054</div></div>
         </div>
 
         <!-- Network API (bridge) -->
-        <div class="node api-node" id="an-netapi" style="left:310px;top:70px;width:145px;height:40px" data-id="netapi">
+        <div class="node api-node" id="an-netapi" style="left:325px;top:145px;width:145px;height:40px" data-id="netapi">
           <div class="node-inner"><div class="node-title">network-api</div><div class="node-sub">Recipient&lt;M&gt; messages</div></div>
         </div>
 
@@ -317,37 +318,37 @@
         </div>
 
         <!-- P2P internals -->
-        <div class="node net" id="an-swarmadapter" style="left:420px;top:290px;width:190px;height:48px" data-id="swarmadapter">
+        <div class="node net" id="an-swarmadapter" style="left:490px;top:290px;width:190px;height:48px" data-id="swarmadapter">
           <div class="node-inner"><div class="node-title">SwarmAdapter</div><div class="node-sub">tokio task + SwarmHandle</div></div>
         </div>
-        <div class="node net" id="an-gossipsub" style="left:420px;top:390px;width:170px;height:48px" data-id="gossipsub">
+        <div class="node net" id="an-gossipsub" style="left:490px;top:390px;width:170px;height:48px" data-id="gossipsub">
           <div class="node-inner"><div class="node-title">GossipSub</div><div class="node-sub">blocks + attestations</div></div>
         </div>
-        <div class="node net" id="an-reqresp" style="left:420px;top:480px;width:170px;height:48px" data-id="reqresp">
+        <div class="node net" id="an-reqresp" style="left:490px;top:480px;width:170px;height:48px" data-id="reqresp">
           <div class="node-inner"><div class="node-title">Req/Resp</div><div class="node-sub">Status + BlocksByRoot</div></div>
         </div>
 
         <!-- Shared -->
-        <div class="node storage-node" id="an-rocksdb" style="left:680px;top:290px;width:180px;height:48px" data-id="rocksdb">
+        <div class="node storage-node" id="an-rocksdb" style="left:750px;top:290px;width:180px;height:48px" data-id="rocksdb">
           <div class="node-inner"><div class="node-title">RocksDB Backend</div><div class="node-sub">Arc&lt;dyn StorageBackend&gt;</div></div>
         </div>
-        <div class="node crypto-node" id="an-crypto" style="left:680px;top:390px;width:180px;height:48px" data-id="crypto">
+        <div class="node crypto-node" id="an-crypto" style="left:750px;top:390px;width:180px;height:48px" data-id="crypto">
           <div class="node-inner"><div class="node-title">XMSS Crypto</div><div class="node-sub">leansig + leanVM</div></div>
         </div>
 
         <!-- Labels -->
-        <div style="position:absolute;left:320px;top:56px;font-size:9px;color:var(--api-l);font-family:'JetBrains Mono',monospace;pointer-events:none;opacity:0.8;">
+        <div style="position:absolute;left:325px;top:132px;font-size:9px;color:var(--api-l);font-family:'JetBrains Mono',monospace;pointer-events:none;opacity:0.8;z-index:3;">
           InitP2P / InitBlockChain
         </div>
 
         <!-- Group boxes -->
-        <div class="group-box" style="left:10px;top:115px;width:380px;height:340px;border-color:rgba(155,89,182,0.25);">
+        <div class="group-box" style="left:10px;top:115px;width:310px;height:340px;border-color:rgba(155,89,182,0.25);">
           <span class="group-label" style="background:rgba(155,89,182,0.2);color:#c39bd3;">BlockChain Actor (blockchain crate)</span>
         </div>
-        <div class="group-box" style="left:405px;top:115px;width:220px;height:430px;border-color:rgba(0,180,216,0.2);">
+        <div class="group-box" style="left:475px;top:115px;width:220px;height:430px;border-color:rgba(0,180,216,0.2);">
           <span class="group-label" style="background:rgba(0,180,216,0.15);color:#90e0ef;">P2P Actor (p2p crate)</span>
         </div>
-        <div class="group-box" style="left:665px;top:270px;width:215px;height:195px;border-color:rgba(255,255,255,0.1);">
+        <div class="group-box" style="left:735px;top:270px;width:215px;height:195px;border-color:rgba(255,255,255,0.1);">
           <span class="group-label" style="background:rgba(255,255,255,0.08);color:#8b949e;">Shared Infrastructure</span>
         </div>
       </div>
@@ -629,9 +630,7 @@
         <div class="node storage-node" id="dn-metrics" style="left:450px;top:400px;width:175px;height:48px" data-id="metrics">
           <div class="node-inner"><div class="node-title">ethlambda-metrics</div><div class="node-sub">Prometheus re-exports</div></div>
         </div>
-        <div class="node entry-node" id="dn-spawned" style="left:680px;top:400px;width:200px;height:48px" data-id="spawned">
-          <div class="node-inner"><div class="node-title">spawned-concurrency 0.5</div><div class="node-sub">Actor + Recipient framework</div></div>
-        </div>
+
 
         <!-- Group boxes -->
         <div class="group-box" style="left:10px;top:260px;width:445px;height:80px;border-color:rgba(155,89,182,0.2);">
@@ -906,23 +905,6 @@ const COMPONENTS = {
     tags: ['Recipient<PublishBlock>', 'SwarmHandle', 'outbound'],
     details: ['Recipient<PublishBlock> -> Handler<PublishBlock> -> SwarmHandle.publish()', 'SSZ + snappy before publish'],
   },
-  spawned: {
-    title: 'spawned-concurrency 0.5',
-    subtitle: 'external crate (LambdaClass)',
-    lang: 'entry',
-    desc: 'OTP-inspired actor framework for Rust, version 0.5. Provides Actor/Handler traits, ActorRef, typed Recipient<M> for cross-actor messaging, Context for self-scheduling, and spawn_listener for bridging async streams into actor mailboxes.',
-    tags: ['Actor', 'Handler', 'Recipient', 'Context', '#[actor]'],
-    details: [
-      'Actor trait + #[actor] macro: define actor state + handlers',
-      '#[protocol] macro: generates message types for internal use',
-      'Handler<M>: async handle(&mut self, msg, ctx) for each message',
-      'ActorRef<A>: typed handle to send messages to actor A',
-      'Recipient<M>: type-erased handle for message M (cross-actor)',
-      'Context: self-reference for send_after() scheduling',
-      'spawn_listener(): bridge Stream<Item=M> into actor mailbox',
-      'send_after(duration, ctx, msg): delayed message delivery',
-    ],
-  },
   'consensus-layer': {
     title: 'Blockchain (Consensus Layer)',
     subtitle: 'crates/blockchain/',
@@ -1140,9 +1122,6 @@ function drawDepsArrows() {
     ['dn-stf',        'dn-crypto',  'bottom', 'top', DC, 'darr-crypto', false],
     ['dn-storage',    'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
     ['dn-storage',    'dn-metrics', 'bottom', 'top', SC, 'darr-storage', false],
-    ['dn-blockchain', 'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
-    ['dn-p2p',        'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
-    ['dn-netapi',     'dn-spawned', 'right', 'left', RC, 'darr-rust', false],
     ['dn-netapi',     'dn-types',   'bottom', 'top', DC, 'darr-dim', false],
   ];
   edges.forEach(([fromId, toId, exitSide, enterSide, color, marker, animated]) => {
