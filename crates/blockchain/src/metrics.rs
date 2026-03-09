@@ -203,3 +203,75 @@ pub fn inc_pq_sig_aggregated_signatures_invalid() {
         });
     LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL.inc();
 }
+
+/// Start timing attestation signing. Records duration when the guard is dropped.
+pub fn time_pq_sig_attestation_signing() -> TimingGuard {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_pq_sig_attestation_signing_time_seconds",
+                "Time taken to sign an attestation",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS)
+}
+
+/// Start timing attestation signature verification. Records duration when the guard is dropped.
+pub fn time_pq_sig_attestation_verification() -> TimingGuard {
+    static LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_pq_sig_attestation_verification_time_seconds",
+                "Time taken to verify an attestation signature",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS)
+}
+
+/// Start timing attestation signatures building (aggregation). Records duration when the guard is dropped.
+pub fn time_pq_sig_attestation_signatures_building() -> TimingGuard {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_BUILDING_TIME_SECONDS: std::sync::LazyLock<
+        Histogram,
+    > = std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_pq_sig_attestation_signatures_building_time_seconds",
+            "Time taken to build aggregated attestation signatures",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_BUILDING_TIME_SECONDS)
+}
+
+/// Start timing aggregated signature verification. Records duration when the guard is dropped.
+pub fn time_pq_sig_aggregated_signatures_verification() -> TimingGuard {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<
+        Histogram,
+    > = std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_pq_sig_aggregated_signatures_verification_time_seconds",
+            "Time taken to verify an aggregated attestation signature",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+    TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS)
+}
+
+/// Observe a fork choice reorg depth.
+pub fn observe_fork_choice_reorg_depth(depth: u64) {
+    static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_fork_choice_reorg_depth",
+                "Depth of fork choice reorgs (in blocks)",
+                vec![1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0, 50.0, 100.0]
+            )
+            .unwrap()
+        });
+    LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
+}

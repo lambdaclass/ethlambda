@@ -100,6 +100,7 @@ impl KeyManager {
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
+        let _timing = crate::metrics::time_pq_sig_attestation_signing();
         let signature: ValidatorSignature = secret_key
             .sign(slot, message)
             .map_err(|e| KeyManagerError::SigningError(e.to_string()))?;

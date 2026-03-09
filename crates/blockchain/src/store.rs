@@ -46,9 +46,10 @@ fn update_head(store: &mut Store, log_tree: bool) {
         &attestations,
         0,
     );
-    if is_reorg(old_head, new_head, store) {
+    if let Some(depth) = reorg_depth(old_head, new_head, store) {
         metrics::inc_fork_choice_reorgs();
-        info!(%old_head, %new_head, "Fork choice reorg detected");
+        metrics::observe_fork_choice_reorg_depth(depth);
+        info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 
@@ -169,11 +170,13 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         }
 
         // data_root is already the tree_hash_root of the attestation data
+        let _timing = metrics::time_pq_sig_attestation_signatures_building();
         let Ok(proof_data) = aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
             .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures"))
         else {
             continue;
         };
+        drop(_timing);
 
         let participants = aggregation_bits_from_validator_indices(&ids);
         let proof = AggregatedSignatureProof::new(participants, proof_data);
@@ -375,9 +378,11 @@ pub fn on_gossip_attestation(
     let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
     let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
         .map_err(|_| StoreError::SignatureDecodingFailed)?;
+    let _timing = metrics::time_pq_sig_attestation_verification();
     if !signature.is_valid(&validator_pubkey, slot, &data_root) {
         return Err(StoreError::SignatureVerificationFailed);
     }
+    drop(_timing);
 
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
@@ -439,6 +444,7 @@ pub fn on_gossip_aggregated_attestation(
     let data_root = aggregated.data.tree_hash_root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
+    let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
     ethlambda_crypto::verify_aggregated_signature(
         &aggregated.proof.proof_data,
         pubkeys,
@@ -446,6 +452,7 @@ pub fn on_gossip_aggregated_attestation(
         slot,
     )
     .map_err(StoreError::AggregateVerificationFailed)?;
+    drop(_timing);
 
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, aggregated.data.clone());
@@ -1173,6 +1180,7 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
+        let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
         match verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, slot)
         {
             Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
@@ -1181,6 +1189,7 @@ fn verify_signatures(
                 return Err(StoreError::AggregateVerificationFailed(e));
             }
         }
+        drop(_timing);
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
@@ -1204,49 +1213,61 @@ fn verify_signatures(
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
 
+    let _timing = metrics::time_pq_sig_attestation_verification();
     if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
+    drop(_timing);
     Ok(())
 }
 
-/// Check if a head change represents a reorg.
+/// Determine the depth of a reorg between two heads.
 ///
-/// A reorg occurs when the chains diverge - i.e., when walking back from the higher
-/// slot head to the lower slot head's slot, we don't arrive at the lower slot head.
-fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
+/// Returns `Some(depth)` where depth is `old_head_slot - common_ancestor_slot`
+/// when the head change is a reorg, or `None` when it is not (same head or
+/// one chain extends the other).
+fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     if new_head == old_head {
-        return false;
+        return None;
     }
 
-    let Some(old_head_header) = store.get_block_header(&old_head) else {
-        return false;
-    };
+    let old_slot = store.get_block_header(&old_head)?.slot;
+    let new_slot = store.get_block_header(&new_head)?.slot;
 
-    let Some(new_head_header) = store.get_block_header(&new_head) else {
-        return false;
-    };
-
-    let old_slot = old_head_header.slot;
-    let new_slot = new_head_header.slot;
-
-    // Determine which head has the higher slot and walk back from it
-    let (mut current_root, target_slot, target_root) = if new_slot >= old_slot {
+    // Walk the higher chain back to the lower chain's slot to check
+    // if one chain is a prefix of the other (extension, not a reorg).
+    let (higher_head, lower_slot, lower_head) = if new_slot >= old_slot {
         (new_head, old_slot, old_head)
     } else {
         (old_head, new_slot, new_head)
     };
 
-    // Walk back through the chain until we reach the target slot
-    while let Some(current_header) = store.get_block_header(&current_root) {
-        if current_header.slot <= target_slot {
-            // We've reached the target slot - check if we're at the target block
-            return current_root != target_root;
+    let mut walk = higher_head;
+    while let Some(header) = store.get_block_header(&walk) {
+        if header.slot <= lower_slot {
+            break;
         }
-        current_root = current_header.parent_root;
+        walk = header.parent_root;
+    }
+    if walk == lower_head {
+        return None;
     }
 
-    // Couldn't walk back far enough (missing blocks in chain)
-    // Assume the ancestor is behind the latest finalized block
-    false
+    // It's a reorg. Find the common ancestor by walking both chains back,
+    // always advancing whichever is at a higher slot.
+    let mut a = old_head;
+    let mut b = new_head;
+    let mut a_slot = old_slot;
+    let mut b_slot = new_slot;
+    while a != b {
+        if a_slot >= b_slot {
+            a = store.get_block_header(&a)?.parent_root;
+            a_slot = store.get_block_header(&a)?.slot;
+        } else {
+            b = store.get_block_header(&b)?.parent_root;
+            b_slot = store.get_block_header(&b)?.slot;
+        }
+    }
+
+    Some(old_slot.saturating_sub(a_slot))
 }
