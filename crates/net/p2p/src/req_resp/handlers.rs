@@ -14,8 +14,8 @@ use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
 };
 use crate::{
-    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    RetryMessage, req_resp::RequestedBlockRoots,
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer,
+    PendingRequest, RetryMessage, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -40,7 +40,7 @@ pub async fn handle_req_resp_message(
             } => match response {
                 Response::Success { payload } => match payload {
                     ResponsePayload::Status(status) => {
-                        handle_status_response(status, peer).await;
+                        handle_status_response(server, status, peer).await;
                     }
                     ResponsePayload::BlocksByRoot(blocks) => {
                         handle_blocks_by_root_response(server, blocks, peer, request_id).await;
@@ -88,6 +88,10 @@ async fn handle_status_request(
     peer: PeerId,
 ) {
     info!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+    // Store the peer's status from the request
+    server.peer_statuses.insert(peer, request);
+    crate::update_sync_metrics(server);
+
     let our_status = build_status(&server.store);
     server
         .swarm
@@ -100,8 +104,10 @@ async fn handle_status_request(
         .unwrap();
 }
 
-async fn handle_status_response(status: Status, peer: PeerId) {
+async fn handle_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     info!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+    server.peer_statuses.insert(peer, status);
+    crate::update_sync_metrics(server);
 }
 
 async fn handle_blocks_by_root_request(
@@ -284,7 +290,8 @@ async fn handle_fetch_failure(server: &mut P2PServer, root: H256, peer: PeerId) 
         return;
     }
 
-    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+    let backoff_ms =
+        (INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1)).min(MAX_BACKOFF_MS);
     let backoff = Duration::from_millis(backoff_ms);
 
     warn!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");

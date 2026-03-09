@@ -94,3 +94,25 @@ pub fn notify_peer_disconnected(peer_id: &Option<PeerId>, direction: &str, reaso
     let name = resolve(peer_id);
     LEAN_CONNECTED_PEERS.with_label_values(&[name]).dec();
 }
+
+pub fn update_max_peer_head_slot(slot: u64) {
+    static LEAN_MAX_PEER_HEAD_SLOT: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_max_peer_head_slot",
+            "Highest head slot reported by any connected peer"
+        )
+        .unwrap()
+    });
+    LEAN_MAX_PEER_HEAD_SLOT.set(slot as i64);
+}
+
+pub fn update_sync_slot_gap(gap: u64) {
+    static LEAN_SYNC_SLOT_GAP: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_sync_slot_gap",
+            "Slot gap between max peer head and our head (positive = behind)"
+        )
+        .unwrap()
+    });
+    LEAN_SYNC_SLOT_GAP.set(gap as i64);
+}

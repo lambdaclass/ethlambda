@@ -30,7 +30,7 @@ use crate::{
     },
     req_resp::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
-        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
+        STATUS_PROTOCOL_V1, Status, build_status, fetch_block_from_peer,
     },
 };
 
@@ -40,10 +40,11 @@ mod req_resp;
 
 pub use metrics::populate_name_registry;
 
-// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+// 50ms, 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s, 5s, 5s, 5s (~21s total)
 const MAX_FETCH_RETRIES: u32 = 10;
-const INITIAL_BACKOFF_MS: u64 = 5;
+const INITIAL_BACKOFF_MS: u64 = 50;
 const BACKOFF_MULTIPLIER: u64 = 2;
+const MAX_BACKOFF_MS: u64 = 5_000;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 enum RetryMessage {
@@ -214,6 +215,7 @@ pub async fn start_p2p(
         connected_peers: HashSet::new(),
         pending_requests: HashMap::new(),
         request_id_map: HashMap::new(),
+        peer_statuses: HashMap::new(),
         bootnode_addrs,
         retry_tx,
         retry_rx,
@@ -230,6 +232,8 @@ pub(crate) struct Behaviour {
     req_resp: request_response::Behaviour<Codec>,
 }
 
+const STATUS_EXCHANGE_INTERVAL_SECS: u64 = 30;
+
 pub(crate) struct P2PServer {
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
     pub(crate) blockchain: BlockChain,
@@ -241,6 +245,8 @@ pub(crate) struct P2PServer {
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<ethlambda_types::primitives::H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, ethlambda_types::primitives::H256>,
+    /// Latest status reported by each connected peer
+    pub(crate) peer_statuses: HashMap<PeerId, Status>,
     /// Bootnode addresses for redialing when disconnected
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
     /// Channel for scheduling retries (block fetches and peer redials)
@@ -251,6 +257,12 @@ pub(crate) struct P2PServer {
 /// Event loop for the P2P crate.
 /// Processes swarm events, incoming requests, responses, gossip, and outgoing messages from blockchain.
 async fn event_loop(mut server: P2PServer) {
+    let mut status_interval =
+        tokio::time::interval(Duration::from_secs(STATUS_EXCHANGE_INTERVAL_SECS));
+    // The first tick completes immediately; skip it so we don't send status
+    // requests right at startup (we already send one on ConnectionEstablished).
+    status_interval.tick().await;
+
     loop {
         tokio::select! {
             biased;
@@ -272,6 +284,9 @@ async fn event_loop(mut server: P2PServer) {
                     RetryMessage::BlockFetch(root) => handle_retry(&mut server, root).await,
                     RetryMessage::PeerRedial(peer_id) => handle_peer_redial(&mut server, peer_id).await,
                 }
+            }
+            _ = status_interval.tick() => {
+                send_status_to_all_peers(&mut server);
             }
         }
     }
@@ -350,6 +365,7 @@ async fn handle_swarm_event(server: &mut P2PServer, event: SwarmEvent<BehaviourE
             };
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
+                server.peer_statuses.remove(&peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
 
@@ -463,6 +479,49 @@ pub(crate) fn schedule_peer_redial(retry_tx: mpsc::UnboundedSender<RetryMessage>
         tokio::time::sleep(Duration::from_secs(PEER_REDIAL_INTERVAL_SECS)).await;
         let _ = retry_tx.send(RetryMessage::PeerRedial(peer_id));
     });
+}
+
+/// Send a Status request to all connected peers.
+fn send_status_to_all_peers(server: &mut P2PServer) {
+    if server.connected_peers.is_empty() {
+        return;
+    }
+    let our_status = build_status(&server.store);
+    let peers: Vec<_> = server.connected_peers.iter().copied().collect();
+    for peer in peers {
+        server
+            .swarm
+            .behaviour_mut()
+            .req_resp
+            .send_request_with_protocol(
+                &peer,
+                Request::Status(our_status.clone()),
+                libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+            );
+    }
+    trace!(
+        peer_count = server.connected_peers.len(),
+        "Sent status requests to all peers"
+    );
+}
+
+/// Update sync gap metrics from current peer statuses and our head.
+pub(crate) fn update_sync_metrics(server: &P2PServer) {
+    let our_head_slot = server
+        .store
+        .get_block_header(&server.store.head())
+        .map(|h| h.slot)
+        .unwrap_or(0);
+
+    let max_peer_head_slot = server
+        .peer_statuses
+        .values()
+        .map(|s| s.head.slot)
+        .max()
+        .unwrap_or(0);
+
+    metrics::update_max_peer_head_slot(max_peer_head_slot);
+    metrics::update_sync_slot_gap(max_peer_head_slot.saturating_sub(our_head_slot));
 }
 
 pub struct Bootnode {

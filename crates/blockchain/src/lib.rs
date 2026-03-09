@@ -69,6 +69,11 @@ impl BlockChain {
             .duration_since(SystemTime::now())
             .unwrap_or_default();
         send_after(time_until_genesis, handle.clone(), CastMessage::Tick);
+        send_after(
+            time_until_genesis + PENDING_RETRY_INTERVAL,
+            handle.clone(),
+            CastMessage::RetryPendingBlocks,
+        );
         BlockChain { handle }
     }
 
@@ -474,6 +479,41 @@ impl BlockChainServer {
         }
     }
 
+    /// Re-request missing parents for all pending blocks.
+    ///
+    /// After P2P retries exhaust (~21s), pending_requests is cleaned up but
+    /// pending_blocks keeps the orphaned entries forever. This periodic scan
+    /// collects unique missing ancestor roots and re-requests them.
+    fn retry_pending_blocks(&mut self) {
+        if self.pending_blocks.is_empty() {
+            return;
+        }
+
+        // Collect unique missing ancestor roots by resolving the chain
+        let mut missing_roots = HashSet::new();
+        for &block_root in self.pending_blocks.keys() {
+            // Walk up through pending_block_parents to find the deepest missing root
+            // (same resolution logic as process_or_pend_block)
+            let mut missing_root = block_root;
+            while let Some(&ancestor) = self.pending_block_parents.get(&missing_root) {
+                missing_root = ancestor;
+            }
+            missing_roots.insert(missing_root);
+        }
+
+        let pending_count = self.pending_blocks.values().map(|s| s.len()).sum::<usize>();
+        info!(
+            pending_count,
+            missing_roots = missing_roots.len(),
+            "Retrying pending block fetches"
+        );
+        metrics::update_pending_blocks(pending_count as u64);
+
+        for root in missing_roots {
+            self.request_missing_block(root);
+        }
+    }
+
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
         if !self.is_aggregator {
             warn!("Received unaggregated attestation but node is not an aggregator");
@@ -489,12 +529,16 @@ impl BlockChainServer {
     }
 }
 
+/// Interval between periodic pending block retries (3 slot durations).
+const PENDING_RETRY_INTERVAL: Duration = Duration::from_secs(12);
+
 #[derive(Clone, Debug)]
 enum CastMessage {
     NewBlock(SignedBlockWithAttestation),
     NewAttestation(SignedAttestation),
     NewAggregatedAttestation(SignedAggregatedAttestation),
     Tick,
+    RetryPendingBlocks,
 }
 
 impl GenServer for BlockChainServer {
@@ -541,6 +585,10 @@ impl GenServer for BlockChainServer {
             CastMessage::NewAttestation(attestation) => self.on_gossip_attestation(attestation),
             CastMessage::NewAggregatedAttestation(attestation) => {
                 self.on_gossip_aggregated_attestation(attestation);
+            }
+            CastMessage::RetryPendingBlocks => {
+                self.retry_pending_blocks();
+                send_after(PENDING_RETRY_INTERVAL, handle.clone(), message);
             }
         }
         CastResponse::NoReply

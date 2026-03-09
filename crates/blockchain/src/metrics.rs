@@ -43,6 +43,17 @@ pub fn update_validators_count(count: u64) {
     LEAN_VALIDATORS_COUNT.set(count.try_into().unwrap());
 }
 
+pub fn update_pending_blocks(count: u64) {
+    static LEAN_PENDING_BLOCKS: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_pending_blocks",
+            "Number of blocks waiting for missing parents"
+        )
+        .unwrap()
+    });
+    LEAN_PENDING_BLOCKS.set(count.try_into().unwrap());
+}
+
 pub fn update_safe_target_slot(slot: u64) {
     static LEAN_SAFE_TARGET_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
         register_int_gauge!("lean_safe_target_slot", "Safe target slot").unwrap()
