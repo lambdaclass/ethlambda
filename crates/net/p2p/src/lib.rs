@@ -59,7 +59,7 @@ const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
-    pub(crate) last_peer: Option<PeerId>,
+    pub(crate) failed_peers: HashSet<PeerId>,
 }
 
 // --- Swarm construction ---
@@ -316,7 +316,7 @@ impl P2PServer {
     #[send_handler]
     async fn handle_retry_block_fetch(
         &mut self,
-        msg: p2_p_protocol::RetryBlockFetch,
+        msg: p2p_protocol::RetryBlockFetch,
         _ctx: &Context<Self>,
     ) {
         let root = msg.root;
@@ -337,7 +337,7 @@ impl P2PServer {
     #[send_handler]
     async fn handle_retry_peer_redial(
         &mut self,
-        msg: p2_p_protocol::RetryPeerRedial,
+        msg: p2p_protocol::RetryPeerRedial,
         _ctx: &Context<Self>,
     ) {
         let peer_id = msg.peer_id;
@@ -496,7 +496,7 @@ async fn handle_swarm_event(
                     send_after(
                         Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
                         ctx.clone(),
-                        p2_p_protocol::RetryPeerRedial { peer_id },
+                        p2p_protocol::RetryPeerRedial { peer_id },
                     );
                     info!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
                 }
@@ -521,7 +521,7 @@ async fn handle_swarm_event(
                 send_after(
                     Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
                     ctx.clone(),
-                    p2_p_protocol::RetryPeerRedial { peer_id: pid },
+                    p2p_protocol::RetryPeerRedial { peer_id: pid },
                 );
                 info!(%pid, "Scheduled bootnode redial after connection error");
             }

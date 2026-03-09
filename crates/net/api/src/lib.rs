@@ -3,30 +3,63 @@ use ethlambda_types::{
     block::SignedBlockWithAttestation,
     primitives::H256,
 };
+use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::Recipient;
 
 // --- Messages: BlockChain -> P2P ---
 
-spawned_concurrency::send_messages! {
-    PublishBlock { block: SignedBlockWithAttestation };
-    PublishAttestation { attestation: SignedAttestation };
-    PublishAggregatedAttestation { attestation: SignedAggregatedAttestation };
-    FetchBlock { root: H256 }
+pub struct PublishBlock {
+    pub block: SignedBlockWithAttestation,
+}
+impl Message for PublishBlock {
+    type Result = ();
+}
+
+pub struct PublishAttestation {
+    pub attestation: SignedAttestation,
+}
+impl Message for PublishAttestation {
+    type Result = ();
+}
+
+pub struct PublishAggregatedAttestation {
+    pub attestation: SignedAggregatedAttestation,
+}
+impl Message for PublishAggregatedAttestation {
+    type Result = ();
+}
+
+pub struct FetchBlock {
+    pub root: H256,
+}
+impl Message for FetchBlock {
+    type Result = ();
 }
 
 // --- Messages: P2P -> BlockChain ---
 
-spawned_concurrency::send_messages! {
-    NewBlock { block: SignedBlockWithAttestation };
-    NewAttestation { attestation: SignedAttestation };
-    NewAggregatedAttestation { attestation: SignedAggregatedAttestation }
+pub struct NewBlock {
+    pub block: SignedBlockWithAttestation,
+}
+impl Message for NewBlock {
+    type Result = ();
+}
+
+pub struct NewAttestation {
+    pub attestation: SignedAttestation,
+}
+impl Message for NewAttestation {
+    type Result = ();
+}
+
+pub struct NewAggregatedAttestation {
+    pub attestation: SignedAggregatedAttestation,
+}
+impl Message for NewAggregatedAttestation {
+    type Result = ();
 }
 
 // --- Init messages ---
-// Defined manually because #[protocol] requires Clone, and send_messages!
-// doesn't derive it.
-
-use spawned_concurrency::message::Message;
 
 #[derive(Clone)]
 pub struct InitP2P {

@@ -46,8 +46,8 @@ serde_json = "1.0.117"
 serde_yaml_ng = "0.10"
 hex = "0.4"
 
-spawned-concurrency = { git = "https://github.com/lambdaclass/spawned.git", tag = "v0.5.0-rc" }
-spawned-rt = { git = "https://github.com/lambdaclass/spawned.git", tag = "v0.5.0-rc" }
+spawned-concurrency = { git = "https://github.com/lambdaclass/spawned.git", tag = "v0.5.0-rc2" }
+spawned-rt = { git = "https://github.com/lambdaclass/spawned.git", tag = "v0.5.0-rc2" }
 tokio = "1.0"
 
 prometheus = "0.14"
