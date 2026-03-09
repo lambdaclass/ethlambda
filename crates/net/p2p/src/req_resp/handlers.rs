@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use ethlambda_network_api::NewBlock;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -163,9 +162,9 @@ async fn handle_blocks_by_root_response(
         // Clean up tracking for this root
         server.pending_requests.remove(&root);
 
-        if let Some(ref recipient) = server.new_block {
-            let _ = recipient
-                .send(NewBlock { block })
+        if let Some(ref blockchain) = server.blockchain {
+            let _ = blockchain
+                .new_block(block)
                 .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
         }
     }

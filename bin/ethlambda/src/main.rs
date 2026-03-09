@@ -18,7 +18,9 @@ use std::{
 };
 
 use clap::Parser;
-use ethlambda_network_api::{InitBlockChain, InitP2P};
+use ethlambda_network_api::{
+    InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
+};
 use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
@@ -149,20 +151,18 @@ async fn main() -> eyre::Result<()> {
 
     let p2p = P2P::spawn(built, store.clone());
 
-    // Wire actors together via init messages
-    let _ = blockchain.actor_ref().recipient::<InitP2P>().send(InitP2P {
-        publish_block: p2p.actor_ref().recipient(),
-        publish_attestation: p2p.actor_ref().recipient(),
-        publish_aggregated: p2p.actor_ref().recipient(),
-        fetch_block: p2p.actor_ref().recipient(),
-    });
+    // Wire actors together via protocol refs
+    let _ = blockchain
+        .actor_ref()
+        .recipient::<InitP2P>()
+        .send(InitP2P {
+            p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
+        });
     let _ = p2p
         .actor_ref()
         .recipient::<InitBlockChain>()
         .send(InitBlockChain {
-            new_block: blockchain.actor_ref().recipient(),
-            new_attestation: blockchain.actor_ref().recipient(),
-            new_aggregated: blockchain.actor_ref().recipient(),
+            blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
         });
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)

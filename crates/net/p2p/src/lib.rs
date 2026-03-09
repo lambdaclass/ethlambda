@@ -5,8 +5,8 @@ use std::{
 };
 
 use ethlambda_network_api::{
-    FetchBlock, InitBlockChain, NewAggregatedAttestation, NewAttestation, NewBlock,
-    PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+    InitBlockChain, P2PToBlockChainRef,
+    block_chain_to_p2p::{FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock},
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
@@ -28,7 +28,7 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{
-    Actor, ActorRef, ActorStart, Context, Handler, Recipient, send_after, spawn_listener,
+    Actor, ActorRef, ActorStart, Context, Handler, send_after, spawn_listener,
 };
 use tracing::{info, trace, warn};
 
@@ -253,9 +253,7 @@ impl P2P {
         let server = P2PServer {
             swarm_handle,
             store,
-            new_block: None,
-            new_attestation: None,
-            new_aggregated: None,
+            blockchain: None,
             attestation_topic: built.attestation_topic,
             block_topic: built.block_topic,
             aggregation_topic: built.aggregation_topic,
@@ -286,10 +284,8 @@ pub struct P2PServer {
     pub(crate) swarm_handle: SwarmHandle,
     pub(crate) store: Store,
 
-    // BlockChain actor recipients (set via InitBlockChain message)
-    pub(crate) new_block: Option<Recipient<NewBlock>>,
-    pub(crate) new_attestation: Option<Recipient<NewAttestation>>,
-    pub(crate) new_aggregated: Option<Recipient<NewAggregatedAttestation>>,
+    // BlockChain protocol ref (set via InitBlockChain message)
+    pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
     pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
@@ -359,10 +355,8 @@ impl P2PServer {
 
 impl Handler<InitBlockChain> for P2PServer {
     async fn handle(&mut self, msg: InitBlockChain, _ctx: &Context<Self>) {
-        self.new_block = Some(msg.new_block);
-        self.new_attestation = Some(msg.new_attestation);
-        self.new_aggregated = Some(msg.new_aggregated);
-        info!("BlockChain recipients initialized");
+        self.blockchain = Some(msg.blockchain);
+        info!("BlockChain protocol ref initialized");
     }
 }
 

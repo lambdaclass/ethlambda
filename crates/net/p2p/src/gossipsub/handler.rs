@@ -1,4 +1,3 @@
-use ethlambda_network_api::{NewAggregatedAttestation, NewAttestation, NewBlock};
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
@@ -50,11 +49,9 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 attestation_count,
                 "Received block from gossip"
             );
-            if let Some(ref recipient) = server.new_block {
-                let _ = recipient
-                    .send(NewBlock {
-                        block: signed_block,
-                    })
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain
+                    .new_block(signed_block)
                     .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
             }
         }
@@ -79,11 +76,9 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 source_root = %ShortRoot(&aggregation.data.source.root.0),
                 "Received aggregated attestation from gossip"
             );
-            if let Some(ref recipient) = server.new_aggregated {
-                let _ = recipient
-                    .send(NewAggregatedAttestation {
-                        attestation: aggregation,
-                    })
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain
+                    .new_aggregated_attestation(aggregation)
                     .inspect_err(
                         |err| error!(%err, "Failed to forward aggregated attestation to blockchain"),
                     );
@@ -113,11 +108,9 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 source_root = %ShortRoot(&signed_attestation.data.source.root.0),
                 "Received attestation from gossip"
             );
-            if let Some(ref recipient) = server.new_attestation {
-                let _ = recipient
-                    .send(NewAttestation {
-                        attestation: signed_attestation,
-                    })
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain
+                    .new_attestation(signed_attestation)
                     .inspect_err(|err| error!(%err, "Failed to forward attestation to blockchain"));
             }
         }
