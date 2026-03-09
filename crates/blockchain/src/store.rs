@@ -29,6 +29,8 @@ const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
+    metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
     update_head(store, log_tree);
 }
 
@@ -46,9 +48,10 @@ fn update_head(store: &mut Store, log_tree: bool) {
         &attestations,
         0,
     );
-    if is_reorg(old_head, new_head, store) {
+    if let Some(depth) = reorg_depth(old_head, new_head, store) {
         metrics::inc_fork_choice_reorgs();
-        info!(%old_head, %new_head, "Fork choice reorg detected");
+        metrics::observe_fork_choice_reorg_depth(depth);
+        info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
     store.update_checkpoints(ForkCheckpoints::head_only(new_head));
 
@@ -121,6 +124,7 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     if gossip_sigs.is_empty() {
         return Vec::new();
     }
+    let _timing = metrics::time_committee_signatures_aggregation();
 
     let mut new_aggregates: Vec<SignedAggregatedAttestation> = Vec::new();
 
@@ -169,9 +173,11 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         }
 
         // data_root is already the tree_hash_root of the attestation data
-        let Ok(proof_data) = aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
-            .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures"))
-        else {
+        let Ok(proof_data) = {
+            let _timing = metrics::time_pq_sig_aggregated_signatures_building();
+            aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
+        }
+        .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures")) else {
             continue;
         };
 
@@ -199,9 +205,11 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
 
     // Batch-insert all new aggregated payloads in a single commit
     store.insert_new_aggregated_payloads_batch(payload_entries);
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     // Delete aggregated entries from gossip_signatures
     store.delete_gossip_signatures(&keys_to_delete);
+    metrics::update_gossip_signatures(store.gossip_signatures_count());
 
     new_aggregates
 }
@@ -356,7 +364,7 @@ pub fn on_gossip_attestation(
         data: signed_attestation.data,
     };
     validate_attestation_data(store, &attestation.data)
-        .inspect_err(|_| metrics::inc_attestations_invalid("gossip"))?;
+        .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
     let data_root = attestation.data.tree_hash_root();
 
@@ -375,17 +383,24 @@ pub fn on_gossip_attestation(
     let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
     let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
         .map_err(|_| StoreError::SignatureDecodingFailed)?;
-    if !signature.is_valid(&validator_pubkey, slot, &data_root) {
+    let is_valid = {
+        let _timing = metrics::time_pq_sig_attestation_verification();
+        signature.is_valid(&validator_pubkey, slot, &data_root)
+    };
+    if !is_valid {
+        metrics::inc_pq_sig_attestation_signatures_invalid();
         return Err(StoreError::SignatureVerificationFailed);
     }
+    metrics::inc_pq_sig_attestation_signatures_valid();
 
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
     // Store gossip signature for later aggregation at interval 2.
     store.insert_gossip_signature(data_root, attestation.data.slot, validator_id, signature);
+    metrics::update_gossip_signatures(store.gossip_signatures_count());
 
-    metrics::inc_attestations_valid("gossip");
+    metrics::inc_attestations_valid();
 
     let slot = attestation.data.slot;
     let target_slot = attestation.data.target.slot;
@@ -413,7 +428,7 @@ pub fn on_gossip_aggregated_attestation(
     aggregated: SignedAggregatedAttestation,
 ) -> Result<(), StoreError> {
     validate_attestation_data(store, &aggregated.data)
-        .inspect_err(|_| metrics::inc_attestations_invalid("aggregated"))?;
+        .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
     // Verify aggregated proof signature
     let target_state = store
@@ -439,12 +454,15 @@ pub fn on_gossip_aggregated_attestation(
     let data_root = aggregated.data.tree_hash_root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
-    ethlambda_crypto::verify_aggregated_signature(
-        &aggregated.proof.proof_data,
-        pubkeys,
-        &data_root,
-        slot,
-    )
+    {
+        let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
+        ethlambda_crypto::verify_aggregated_signature(
+            &aggregated.proof.proof_data,
+            pubkeys,
+            &data_root,
+            slot,
+        )
+    }
     .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Store attestation data by root (content-addressed, idempotent)
@@ -463,6 +481,7 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect();
     store.insert_new_aggregated_payloads_batch(entries);
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     let slot = aggregated.data.slot;
     let num_participants = aggregated.proof.participants.num_set_bits();
@@ -475,7 +494,7 @@ pub fn on_gossip_aggregated_attestation(
         "Aggregated attestation processed"
     );
 
-    metrics::inc_attestations_valid("aggregated");
+    metrics::inc_attestations_valid();
 
     Ok(())
 }
@@ -586,7 +605,7 @@ fn on_block_core(
 
         for validator_id in &validator_ids {
             known_entries.push(((*validator_id, data_root), payload.clone()));
-            metrics::inc_attestations_valid("block");
+            metrics::inc_attestations_valid();
         }
     }
 
@@ -1173,8 +1192,11 @@ fn verify_signatures(
             })
             .collect::<Result<_, _>>()?;
 
-        match verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, slot)
-        {
+        let verification_result = {
+            let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
+            verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, slot)
+        };
+        match verification_result {
             Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
             Err(e) => {
                 metrics::inc_pq_sig_aggregated_signatures_invalid();
@@ -1210,22 +1232,19 @@ fn verify_signatures(
     Ok(())
 }
 
-/// Check if a head change represents a reorg.
+/// Check if a head change represents a reorg, returning the depth if so.
 ///
 /// A reorg occurs when the chains diverge - i.e., when walking back from the higher
 /// slot head to the lower slot head's slot, we don't arrive at the lower slot head.
-fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
+/// Returns `Some(depth)` where depth is the number of blocks walked back, or `None`
+/// if no reorg occurred.
+fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     if new_head == old_head {
-        return false;
+        return None;
     }
 
-    let Some(old_head_header) = store.get_block_header(&old_head) else {
-        return false;
-    };
-
-    let Some(new_head_header) = store.get_block_header(&new_head) else {
-        return false;
-    };
+    let old_head_header = store.get_block_header(&old_head)?;
+    let new_head_header = store.get_block_header(&new_head)?;
 
     let old_slot = old_head_header.slot;
     let new_slot = new_head_header.slot;
@@ -1237,16 +1256,18 @@ fn is_reorg(old_head: H256, new_head: H256, store: &Store) -> bool {
         (old_head, new_slot, new_head)
     };
 
-    // Walk back through the chain until we reach the target slot
+    // Walk back through the chain until we reach the target slot, counting steps
+    let mut depth: u64 = 0;
     while let Some(current_header) = store.get_block_header(&current_root) {
         if current_header.slot <= target_slot {
             // We've reached the target slot - check if we're at the target block
-            return current_root != target_root;
+            return (current_root != target_root).then_some(depth);
         }
         current_root = current_header.parent_root;
+        depth += 1;
     }
 
     // Couldn't walk back far enough (missing blocks in chain)
     // Assume the ancestor is behind the latest finalized block
-    false
+    None
 }

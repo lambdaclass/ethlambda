@@ -79,35 +79,29 @@ pub fn set_node_start_time() {
 }
 
 /// Increment the valid attestations counter.
-pub fn inc_attestations_valid(source: &str) {
-    static LEAN_ATTESTATIONS_VALID_TOTAL: std::sync::LazyLock<IntCounterVec> =
+pub fn inc_attestations_valid() {
+    static LEAN_ATTESTATIONS_VALID_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
-            register_int_counter_vec!(
+            register_int_counter!(
                 "lean_attestations_valid_total",
-                "Count of valid attestations",
-                &["source"]
+                "Total number of valid attestations"
             )
             .unwrap()
         });
-    LEAN_ATTESTATIONS_VALID_TOTAL
-        .with_label_values(&[source])
-        .inc();
+    LEAN_ATTESTATIONS_VALID_TOTAL.inc();
 }
 
 /// Increment the invalid attestations counter.
-pub fn inc_attestations_invalid(source: &str) {
-    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<IntCounterVec> =
+pub fn inc_attestations_invalid() {
+    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
-            register_int_counter_vec!(
+            register_int_counter!(
                 "lean_attestations_invalid_total",
-                "Count of invalid attestations",
-                &["source"]
+                "Total number of invalid attestations"
             )
             .unwrap()
         });
-    LEAN_ATTESTATIONS_INVALID_TOTAL
-        .with_label_values(&[source])
-        .inc();
+    LEAN_ATTESTATIONS_INVALID_TOTAL.inc();
 }
 
 /// Increment the fork choice reorgs counter.
@@ -130,7 +124,7 @@ pub fn time_fork_choice_block_processing() -> TimingGuard {
             register_histogram!(
                 "lean_fork_choice_block_processing_time_seconds",
                 "Duration to process a block",
-                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0, 1.25, 1.5, 2.0, 4.0]
             )
             .unwrap()
         });
@@ -202,4 +196,178 @@ pub fn inc_pq_sig_aggregated_signatures_invalid() {
             .unwrap()
         });
     LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL.inc();
+}
+
+/// Increment the individual attestation signatures counter.
+pub fn inc_pq_sig_attestation_signatures() {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_pq_sig_attestation_signatures_total",
+                "Total number of individual attestation signatures"
+            )
+            .unwrap()
+        });
+    LEAN_PQ_SIG_ATTESTATION_SIGNATURES_TOTAL.inc();
+}
+
+/// Increment the valid individual attestation signatures counter.
+pub fn inc_pq_sig_attestation_signatures_valid() {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_pq_sig_attestation_signatures_valid_total",
+                "Total number of valid individual attestation signatures"
+            )
+            .unwrap()
+        });
+    LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL.inc();
+}
+
+/// Increment the invalid individual attestation signatures counter.
+pub fn inc_pq_sig_attestation_signatures_invalid() {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_pq_sig_attestation_signatures_invalid_total",
+                "Total number of invalid individual attestation signatures"
+            )
+            .unwrap()
+        });
+    LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL.inc();
+}
+
+/// Start timing individual attestation signing. Records duration when the guard is dropped.
+pub fn time_pq_sig_attestation_signing() -> TimingGuard {
+    static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_pq_sig_attestation_signing_time_seconds",
+                "Time taken to sign an attestation",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS)
+}
+
+/// Start timing individual attestation signature verification. Records duration when the guard is dropped.
+pub fn time_pq_sig_attestation_verification() -> TimingGuard {
+    static LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_pq_sig_attestation_verification_time_seconds",
+                "Time taken to verify an attestation signature",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS)
+}
+
+/// Start timing aggregated signature building. Records duration when the guard is dropped.
+pub fn time_pq_sig_aggregated_signatures_building() -> TimingGuard {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_pq_sig_aggregated_signatures_building_time_seconds",
+                "Time taken to build an aggregated attestation signature",
+                vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS)
+}
+
+/// Start timing aggregated signature verification. Records duration when the guard is dropped.
+pub fn time_pq_sig_aggregated_signatures_verification() -> TimingGuard {
+    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<
+        Histogram,
+    > = std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_pq_sig_aggregated_signatures_verification_time_seconds",
+            "Time taken to verify an aggregated attestation signature",
+            vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0]
+        )
+        .unwrap()
+    });
+    TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS)
+}
+
+/// Start timing committee signatures aggregation. Records duration when the guard is dropped.
+pub fn time_committee_signatures_aggregation() -> TimingGuard {
+    static LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_committee_signatures_aggregation_time_seconds",
+                "Time taken to aggregate committee signatures",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS)
+}
+
+/// Update the gossip signatures gauge.
+pub fn update_gossip_signatures(count: usize) {
+    static LEAN_GOSSIP_SIGNATURES: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_gossip_signatures",
+            "Number of gossip signatures in fork-choice store"
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIP_SIGNATURES.set(count as i64);
+}
+
+/// Update the new aggregated payloads gauge.
+pub fn update_latest_new_aggregated_payloads(count: usize) {
+    static LEAN_LATEST_NEW_AGGREGATED_PAYLOADS: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_latest_new_aggregated_payloads",
+                "Number of new aggregated payload items"
+            )
+            .unwrap()
+        });
+    LEAN_LATEST_NEW_AGGREGATED_PAYLOADS.set(count as i64);
+}
+
+/// Update the known aggregated payloads gauge.
+pub fn update_latest_known_aggregated_payloads(count: usize) {
+    static LEAN_LATEST_KNOWN_AGGREGATED_PAYLOADS: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_latest_known_aggregated_payloads",
+                "Number of known aggregated payload items"
+            )
+            .unwrap()
+        });
+    LEAN_LATEST_KNOWN_AGGREGATED_PAYLOADS.set(count as i64);
+}
+
+/// Set the is_aggregator gauge.
+pub fn set_is_aggregator(is_aggregator: bool) {
+    static LEAN_IS_AGGREGATOR: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_is_aggregator",
+            "Validator's is_aggregator status. True=1, False=0"
+        )
+        .unwrap()
+    });
+    LEAN_IS_AGGREGATOR.set(i64::from(is_aggregator));
+}
+
+/// Observe the depth of a fork choice reorg.
+pub fn observe_fork_choice_reorg_depth(depth: u64) {
+    static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_fork_choice_reorg_depth",
+                "Depth of fork choice reorgs (in blocks)",
+                vec![1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0, 50.0, 100.0]
+            )
+            .unwrap()
+        });
+    LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
 }
