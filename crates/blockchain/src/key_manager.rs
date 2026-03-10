@@ -6,6 +6,8 @@ use ethlambda_types::{
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
 
+use crate::metrics;
+
 /// Error types for KeyManager operations.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyManagerError {
@@ -100,9 +102,13 @@ impl KeyManager {
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
-        let signature: ValidatorSignature = secret_key
-            .sign(slot, message)
-            .map_err(|e| KeyManagerError::SigningError(e.to_string()))?;
+        let signature: ValidatorSignature = {
+            let _timing = metrics::time_pq_sig_attestation_signing();
+            secret_key
+                .sign(slot, message)
+                .map_err(|e| KeyManagerError::SigningError(e.to_string()))
+        }?;
+        metrics::inc_pq_sig_attestation_signatures();
 
         // Convert ValidatorSignature to XmssSignature (FixedVector<u8, SignatureSize>)
         let sig_bytes = signature.to_bytes();

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 /// The tree hash root of an empty block body.
@@ -151,6 +152,11 @@ impl PayloadBuffer {
     fn unique_keys(&self) -> HashSet<SignatureKey> {
         self.entries.iter().map(|(key, _)| *key).collect()
     }
+
+    /// Return the number of entries in the buffer.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // ============ Key Encoding Helpers ============
@@ -206,6 +212,7 @@ pub struct Store {
     backend: Arc<dyn StorageBackend>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
+    gossip_signatures_count: Arc<AtomicUsize>,
 }
 
 impl Store {
@@ -341,11 +348,26 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
+        let initial_gossip_count = Self::count_gossip_signatures(&*backend);
         Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            gossip_signatures_count: Arc::new(AtomicUsize::new(initial_gossip_count)),
         }
+    }
+
+    /// Count existing gossip signatures in the database.
+    ///
+    /// Used once at startup to seed the in-memory counter.
+    fn count_gossip_signatures(backend: &dyn StorageBackend) -> usize {
+        backend
+            .begin_read()
+            .expect("read view")
+            .prefix_iterator(Table::GossipSignatures, &[])
+            .expect("iterator")
+            .filter_map(|r| r.ok())
+            .count()
     }
 
     // ============ Metadata Helpers ============
@@ -569,9 +591,15 @@ impl Store {
     ///
     /// Returns the number of signatures pruned.
     pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
-        self.prune_by_slot(Table::GossipSignatures, finalized_slot, |bytes| {
+        let pruned = self.prune_by_slot(Table::GossipSignatures, finalized_slot, |bytes| {
             StoredSignature::from_ssz_bytes(bytes).ok().map(|s| s.slot)
-        })
+        });
+        self.gossip_signatures_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(pruned))
+            })
+            .unwrap();
+        pruned
     }
 
     /// Prune attestation data by root for slots <= finalized_slot.
@@ -983,17 +1011,38 @@ impl Store {
         self.known_payloads.lock().unwrap().push_batch(drained);
     }
 
+    /// Returns the number of entries in the new (pending) aggregated payloads buffer.
+    pub fn new_aggregated_payloads_count(&self) -> usize {
+        self.new_payloads.lock().unwrap().len()
+    }
+
+    /// Returns the number of entries in the known (fork-choice-active) aggregated payloads buffer.
+    pub fn known_aggregated_payloads_count(&self) -> usize {
+        self.known_payloads.lock().unwrap().len()
+    }
+
+    /// Returns the number of gossip signatures stored.
+    pub fn gossip_signatures_count(&self) -> usize {
+        self.gossip_signatures_count.load(Ordering::Relaxed)
+    }
+
     /// Delete specific gossip signatures by key.
     pub fn delete_gossip_signatures(&mut self, keys: &[SignatureKey]) {
         if keys.is_empty() {
             return;
         }
+        let count = keys.len();
         let encoded_keys: Vec<_> = keys.iter().map(encode_signature_key).collect();
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
             .delete_batch(Table::GossipSignatures, encoded_keys)
             .expect("delete gossip signatures");
         batch.commit().expect("commit");
+        self.gossip_signatures_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(count))
+            })
+            .unwrap();
     }
 
     // ============ Gossip Signatures ============
@@ -1029,14 +1078,28 @@ impl Store {
         signature: ValidatorSignature,
     ) {
         let key = (validator_id, data_root);
+        let encoded_key = encode_signature_key(&key);
+
+        // Check if key already exists to avoid inflating the counter on upsert
+        let is_new = self
+            .backend
+            .begin_read()
+            .expect("read view")
+            .get(Table::GossipSignatures, &encoded_key)
+            .expect("get")
+            .is_none();
 
         let stored = StoredSignature::new(slot, signature);
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encode_signature_key(&key), stored.as_ssz_bytes())];
+        let entries = vec![(encoded_key, stored.as_ssz_bytes())];
         batch
             .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
         batch.commit().expect("commit");
+
+        if is_new {
+            self.gossip_signatures_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // ============ Derived Accessors ============
@@ -1182,6 +1245,7 @@ mod tests {
                 backend,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+                gossip_signatures_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1192,6 +1256,7 @@ mod tests {
                 backend,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+                gossip_signatures_count: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
