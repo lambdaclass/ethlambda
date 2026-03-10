@@ -150,15 +150,19 @@ async fn main() -> eyre::Result<()> {
     let p2p = P2P::spawn(built, store.clone());
 
     // Wire actors together via protocol refs
-    let _ = blockchain.actor_ref().recipient::<InitP2P>().send(InitP2P {
-        p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
-    });
-    let _ = p2p
+    blockchain
         .actor_ref()
+        .recipient::<InitP2P>()
+        .send(InitP2P {
+            p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
+    p2p.actor_ref()
         .recipient::<InitBlockChain>()
         .send(InitBlockChain {
             blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
-        });
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
         .await

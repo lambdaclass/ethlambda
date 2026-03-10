@@ -5,7 +5,7 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{Behaviour, BehaviourEvent, req_resp::Request, req_resp::Response};
 
@@ -118,6 +118,7 @@ async fn swarm_loop(
             }
         }
     }
+    error!("Swarm adapter loop exited — P2P networking is no longer functional");
 }
 
 fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
