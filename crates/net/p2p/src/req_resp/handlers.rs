@@ -294,9 +294,5 @@ async fn handle_fetch_failure(
 
     pending.attempts += 1;
 
-    send_after(
-        backoff,
-        ctx.clone(),
-        p2p_protocol::RetryBlockFetch { root },
-    );
+    send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
 }

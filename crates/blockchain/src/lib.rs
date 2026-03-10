@@ -192,11 +192,9 @@ impl BlockChainServer {
 
             // Publish to gossip network
             if let Some(ref p2p) = self.p2p {
-                let _ = p2p
-                    .publish_attestation(signed_attestation)
-                    .inspect_err(
-                        |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
-                    );
+                let _ = p2p.publish_attestation(signed_attestation).inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
+                );
                 info!(%slot, %validator_id, "Published attestation");
             }
         }

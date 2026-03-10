@@ -6,7 +6,9 @@ use std::{
 
 use ethlambda_network_api::{
     InitBlockChain, P2PToBlockChainRef,
-    block_chain_to_p2p::{FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock},
+    block_chain_to_p2p::{
+        FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+    },
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
