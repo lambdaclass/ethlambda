@@ -1256,7 +1256,9 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
         (old_head, new_slot, new_head)
     };
 
-    // Walk back through the chain until we reach the target slot, counting steps
+    // Walk back through the chain until we reach the target slot, counting steps.
+    // Bounded to avoid unbounded walks in pathological cases.
+    const MAX_REORG_DEPTH: u64 = 128;
     let mut depth: u64 = 0;
     while let Some(current_header) = store.get_block_header(&current_root) {
         if current_header.slot <= target_slot {
@@ -1265,6 +1267,10 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
         }
         current_root = current_header.parent_root;
         depth += 1;
+        if depth >= MAX_REORG_DEPTH {
+            warn!(depth, "Reorg depth exceeded maximum, stopping walk");
+            return Some(depth);
+        }
     }
 
     // Couldn't walk back far enough (missing blocks in chain)
