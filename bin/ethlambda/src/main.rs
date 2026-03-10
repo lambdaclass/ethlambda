@@ -18,7 +18,8 @@ use std::{
 };
 
 use clap::Parser;
-use ethlambda_p2p::{Bootnode, parse_enrs, start_p2p};
+use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
+use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     genesis::GenesisConfig,
@@ -132,23 +133,36 @@ async fn main() -> eyre::Result<()> {
     .await
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
-    let (p2p_tx, p2p_rx) = tokio::sync::mpsc::unbounded_channel();
     // Use first validator ID for subnet subscription
     let first_validator_id = validator_keys.keys().min().copied();
-    let blockchain =
-        BlockChain::spawn(store.clone(), p2p_tx, validator_keys, options.is_aggregator);
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, options.is_aggregator);
 
-    let p2p_handle = tokio::spawn(start_p2p(
-        node_p2p_key,
+    let built = build_swarm(SwarmConfig {
+        node_key: node_p2p_key,
         bootnodes,
-        p2p_socket,
-        blockchain,
-        p2p_rx,
-        store.clone(),
-        first_validator_id,
-        options.attestation_committee_count,
-        options.is_aggregator,
-    ));
+        listening_socket: p2p_socket,
+        validator_id: first_validator_id,
+        attestation_committee_count: options.attestation_committee_count,
+        is_aggregator: options.is_aggregator,
+    })
+    .expect("failed to build swarm");
+
+    let p2p = P2P::spawn(built, store.clone());
+
+    // Wire actors together via protocol refs
+    blockchain
+        .actor_ref()
+        .recipient::<InitP2P>()
+        .send(InitP2P {
+            p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
+    p2p.actor_ref()
+        .recipient::<InitBlockChain>()
+        .send(InitBlockChain {
+            blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
     ethlambda_rpc::start_rpc_server(metrics_socket, store)
         .await
@@ -156,14 +170,7 @@ async fn main() -> eyre::Result<()> {
 
     info!("Node initialized");
 
-    tokio::select! {
-        result = p2p_handle => {
-            panic!("P2P node task has exited unexpectedly: {result:?}");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            // Ctrl-C received, shutting down
-        }
-    }
+    tokio::signal::ctrl_c().await.ok();
     println!("Shutting down...");
 
     Ok(())

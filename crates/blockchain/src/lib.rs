@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
+use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -15,7 +16,6 @@ use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
-use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
 use crate::store::StoreError;
@@ -24,19 +24,6 @@ pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
 pub mod store;
-
-/// Messages sent from the blockchain to the P2P layer.
-#[derive(Clone, Debug)]
-pub enum P2PMessage {
-    /// Publish an attestation to the gossip network.
-    PublishAttestation(SignedAttestation),
-    /// Publish a block to the gossip network.
-    PublishBlock(SignedBlockWithAttestation),
-    /// Publish an aggregated attestation to the gossip network.
-    PublishAggregatedAttestation(SignedAggregatedAttestation),
-    /// Fetch a block by its root hash.
-    FetchBlock(H256),
-}
 
 pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,
@@ -51,7 +38,6 @@ pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER
 impl BlockChain {
     pub fn spawn(
         store: Store,
-        p2p_tx: mpsc::UnboundedSender<P2PMessage>,
         validator_keys: HashMap<u64, ValidatorSecretKey>,
         is_aggregator: bool,
     ) -> BlockChain {
@@ -60,7 +46,7 @@ impl BlockChain {
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
             store,
-            p2p_tx,
+            p2p: None,
             key_manager,
             pending_blocks: HashMap::new(),
             is_aggregator,
@@ -78,30 +64,8 @@ impl BlockChain {
         BlockChain { handle }
     }
 
-    /// Sends a block to the BlockChain for processing.
-    pub fn notify_new_block(&self, block: SignedBlockWithAttestation) {
-        let _ = self
-            .handle
-            .new_block(block)
-            .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new block"));
-    }
-
-    /// Sends an attestation to the BlockChain for processing.
-    pub fn notify_new_attestation(&self, attestation: SignedAttestation) {
-        let _ = self
-            .handle
-            .new_attestation(attestation)
-            .inspect_err(|err| error!(%err, "Failed to notify BlockChain of new attestation"));
-    }
-
-    /// Sends an aggregated attestation to the BlockChain for processing.
-    pub fn notify_new_aggregated_attestation(&self, attestation: SignedAggregatedAttestation) {
-        let _ = self
-            .handle
-            .new_aggregated_attestation(attestation)
-            .inspect_err(
-                |err| error!(%err, "Failed to notify BlockChain of new aggregated attestation"),
-            );
+    pub fn actor_ref(&self) -> &ActorRef<BlockChainServer> {
+        &self.handle
     }
 }
 
@@ -111,9 +75,12 @@ impl BlockChain {
 /// Right now it also handles block processing, but in the future
 /// those updates might be done in parallel with only writes being
 /// processed by this server.
-struct BlockChainServer {
+pub struct BlockChainServer {
     store: Store,
-    p2p_tx: mpsc::UnboundedSender<P2PMessage>,
+
+    // P2P protocol ref (set via InitP2P message)
+    p2p: Option<BlockChainToP2PRef>,
+
     key_manager: key_manager::KeyManager,
 
     // Pending block roots waiting for their parent (block data stored in DB)
@@ -154,11 +121,12 @@ impl BlockChainServer {
             self.is_aggregator,
         );
 
-        for aggregate in new_aggregates {
-            let _ = self
-                .p2p_tx
-                .send(P2PMessage::PublishAggregatedAttestation(aggregate))
-                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        if let Some(ref p2p) = self.p2p {
+            for aggregate in new_aggregates {
+                let _ = p2p
+                    .publish_aggregated_attestation(aggregate)
+                    .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+            }
         }
 
         // Now build and publish the block (after attestations have been accepted)
@@ -224,16 +192,12 @@ impl BlockChainServer {
             };
 
             // Publish to gossip network
-            let Ok(_) = self
-                .p2p_tx
-                .send(P2PMessage::PublishAttestation(signed_attestation))
-                .inspect_err(
+            if let Some(ref p2p) = self.p2p {
+                let _ = p2p.publish_attestation(signed_attestation).inspect_err(
                     |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
-                )
-            else {
-                continue;
-            };
-            info!(%slot, %validator_id, "Published attestation");
+                );
+                info!(%slot, %validator_id, "Published attestation");
+            }
         }
     }
 
@@ -295,13 +259,11 @@ impl BlockChainServer {
         };
 
         // Publish to gossip network
-        let Ok(()) = self
-            .p2p_tx
-            .send(P2PMessage::PublishBlock(signed_block))
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"))
-        else {
-            return;
-        };
+        if let Some(ref p2p) = self.p2p {
+            let _ = p2p
+                .publish_block(signed_block)
+                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"));
+        }
 
         info!(%slot, %validator_id, "Published block");
     }
@@ -427,13 +389,14 @@ impl BlockChainServer {
 
     fn request_missing_block(&mut self, block_root: H256) {
         // Send request to P2P layer (deduplication handled by P2P module)
-        let _ = self
-            .p2p_tx
-            .send(P2PMessage::FetchBlock(block_root))
-            .inspect(|_| info!(%block_root, "Requested missing block from network"))
-            .inspect_err(
-                |err| error!(%block_root, %err, "Failed to send FetchBlock message to P2P"),
-            );
+        if let Some(ref p2p) = self.p2p {
+            let _ = p2p
+                .fetch_block(block_root)
+                .inspect(|_| info!(%block_root, "Requested missing block from network"))
+                .inspect_err(
+                    |err| error!(%block_root, %err, "Failed to send FetchBlock message to P2P"),
+                );
+        }
     }
 
     /// Move pending children of `parent_root` into the work queue for iterative
@@ -485,19 +448,12 @@ impl BlockChainServer {
     }
 }
 
-/// Send-only (fire-and-forget) protocol for the BlockChain actor.
-/// All methods are handled by `#[send_handler]` — equivalent to GenServer `cast`.
+// Protocol trait for internal messages only (tick scheduling).
+// Network-api messages are handled via manual Handler impls to allow
+// Recipient<M> to work across actor boundaries.
 #[protocol]
 pub(crate) trait BlockChainProtocol: Send + Sync {
-    fn new_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
-    fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
-    fn new_aggregated_attestation(
-        &self,
-        attestation: SignedAggregatedAttestation,
-    ) -> Result<(), ActorError>;
-    // TODO: the #[protocol] macro should suppress dead_code for methods only used via send_after.
-    // Surface upstream: https://github.com/lambdaclass/spawned/issues/XXX
-    #[allow(dead_code)]
+    #[allow(dead_code)] // invoked via send_after(Tick), not called directly
     fn tick(&self) -> Result<(), ActorError>;
 }
 
@@ -519,31 +475,35 @@ impl BlockChainServer {
             block_chain_protocol::Tick,
         );
     }
+}
 
-    #[send_handler]
-    async fn handle_new_block(
-        &mut self,
-        msg: block_chain_protocol::NewBlock,
-        _ctx: &Context<Self>,
-    ) {
+// --- Manual Handler impls for network-api messages ---
+
+use ethlambda_network_api::p2p_to_block_chain::{
+    NewAggregatedAttestation, NewAttestation, NewBlock,
+};
+
+impl Handler<InitP2P> for BlockChainServer {
+    async fn handle(&mut self, msg: InitP2P, _ctx: &Context<Self>) {
+        self.p2p = Some(msg.p2p);
+        info!("P2P protocol ref initialized");
+    }
+}
+
+impl Handler<NewBlock> for BlockChainServer {
+    async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
         self.on_block(msg.block);
     }
+}
 
-    #[send_handler]
-    async fn handle_new_attestation(
-        &mut self,
-        msg: block_chain_protocol::NewAttestation,
-        _ctx: &Context<Self>,
-    ) {
+impl Handler<NewAttestation> for BlockChainServer {
+    async fn handle(&mut self, msg: NewAttestation, _ctx: &Context<Self>) {
         self.on_gossip_attestation(msg.attestation);
     }
+}
 
-    #[send_handler]
-    async fn handle_new_aggregated_attestation(
-        &mut self,
-        msg: block_chain_protocol::NewAggregatedAttestation,
-        _ctx: &Context<Self>,
-    ) {
+impl Handler<NewAggregatedAttestation> for BlockChainServer {
+    async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         self.on_gossip_aggregated_attestation(msg.attestation);
     }
 }
