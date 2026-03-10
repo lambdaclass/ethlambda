@@ -49,7 +49,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 attestation_count,
                 "Received block from gossip"
             );
-            server.blockchain.notify_new_block(signed_block).await;
+            server.blockchain.notify_new_block(signed_block);
         }
         Some(AGGREGATION_TOPIC_KIND) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -74,8 +74,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             );
             server
                 .blockchain
-                .notify_new_aggregated_attestation(aggregation)
-                .await;
+                .notify_new_aggregated_attestation(aggregation);
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -101,10 +100,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 source_root = %ShortRoot(&signed_attestation.data.source.root.0),
                 "Received attestation from gossip"
             );
-            server
-                .blockchain
-                .notify_new_attestation(signed_attestation)
-                .await;
+            server.blockchain.notify_new_attestation(signed_attestation);
         }
         _ => {
             trace!("Received message on unknown topic: {}", message.topic);
