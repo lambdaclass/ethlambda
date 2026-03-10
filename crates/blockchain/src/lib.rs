@@ -484,6 +484,8 @@ impl BlockChainServer {
     }
 }
 
+/// Send-only (fire-and-forget) protocol for the BlockChain actor.
+/// All methods are handled by `#[send_handler]` — equivalent to GenServer `cast`.
 #[protocol]
 pub(crate) trait BlockChainProtocol: Send + Sync {
     fn new_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
@@ -492,7 +494,9 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
-    #[allow(dead_code)] // invoked via send_after(Tick), not called directly
+    // TODO: the #[protocol] macro should suppress dead_code for methods only used via send_after.
+    // Surface upstream: https://github.com/lambdaclass/spawned/issues/XXX
+    #[allow(dead_code)]
     fn tick(&self) -> Result<(), ActorError>;
 }
 
