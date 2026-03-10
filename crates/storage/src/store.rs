@@ -348,12 +348,26 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
+        let initial_gossip_count = Self::count_gossip_signatures(&*backend);
         Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
-            gossip_signatures_count: Arc::new(AtomicUsize::new(0)),
+            gossip_signatures_count: Arc::new(AtomicUsize::new(initial_gossip_count)),
         }
+    }
+
+    /// Count existing gossip signatures in the database.
+    ///
+    /// Used once at startup to seed the in-memory counter.
+    fn count_gossip_signatures(backend: &dyn StorageBackend) -> usize {
+        backend
+            .begin_read()
+            .expect("read view")
+            .prefix_iterator(Table::GossipSignatures, &[])
+            .expect("iterator")
+            .filter_map(|r| r.ok())
+            .count()
     }
 
     // ============ Metadata Helpers ============
@@ -581,7 +595,10 @@ impl Store {
             StoredSignature::from_ssz_bytes(bytes).ok().map(|s| s.slot)
         });
         self.gossip_signatures_count
-            .fetch_sub(pruned, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(pruned))
+            })
+            .unwrap();
         pruned
     }
 
@@ -1022,7 +1039,10 @@ impl Store {
             .expect("delete gossip signatures");
         batch.commit().expect("commit");
         self.gossip_signatures_count
-            .fetch_sub(count, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(count))
+            })
+            .unwrap();
     }
 
     // ============ Gossip Signatures ============
@@ -1058,15 +1078,28 @@ impl Store {
         signature: ValidatorSignature,
     ) {
         let key = (validator_id, data_root);
+        let encoded_key = encode_signature_key(&key);
+
+        // Check if key already exists to avoid inflating the counter on upsert
+        let is_new = self
+            .backend
+            .begin_read()
+            .expect("read view")
+            .get(Table::GossipSignatures, &encoded_key)
+            .expect("get")
+            .is_none();
 
         let stored = StoredSignature::new(slot, signature);
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(encode_signature_key(&key), stored.as_ssz_bytes())];
+        let entries = vec![(encoded_key, stored.as_ssz_bytes())];
         batch
             .put_batch(Table::GossipSignatures, entries)
             .expect("put signature");
         batch.commit().expect("commit");
-        self.gossip_signatures_count.fetch_add(1, Ordering::Relaxed);
+
+        if is_new {
+            self.gossip_signatures_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // ============ Derived Accessors ============
