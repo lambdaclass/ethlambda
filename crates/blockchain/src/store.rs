@@ -1174,6 +1174,10 @@ fn verify_signatures(
 
     // Verify each attestation's signature proof
     for (attestation, aggregated_proof) in attestations.iter().zip(attestation_signatures) {
+        if attestation.aggregation_bits != aggregated_proof.participants {
+            return Err(StoreError::ParticipantsMismatch);
+        }
+
         let validator_ids: Vec<_> = validator_indices(&attestation.aggregation_bits).collect();
         if validator_ids.iter().any(|vid| *vid >= num_validators) {
             return Err(StoreError::InvalidValidatorIndex);
