@@ -140,10 +140,6 @@ pub fn verify_aggregated_signature(
 ) -> Result<(), VerificationError> {
     ensure_verifier_ready();
 
-    if proof_data.len() < 10 {
-        return Ok(());
-    }
-
     // Convert public keys
     let lean_pubkeys: Vec<LeanSigPubKey> = public_keys
         .into_iter()
