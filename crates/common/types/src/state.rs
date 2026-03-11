@@ -45,7 +45,8 @@ pub struct State {
 ///
 /// With a 4-second slot, this corresponds to a history
 /// of approximately 12.1 days.
-type HistoricalRootsLimit = U262144; // 2**18
+pub const HISTORICAL_ROOTS_LIMIT: usize = 262_144; // 2**18
+type HistoricalRootsLimit = U262144;
 
 /// List of historical block root hashes up to historical_roots_limit.
 type HistoricalBlockHashes = ssz_types::VariableList<H256, HistoricalRootsLimit>;
