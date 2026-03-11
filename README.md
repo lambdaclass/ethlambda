@@ -109,7 +109,5 @@ Support for older devnet releases is discontinued when the next devnet version i
 Some features we are looking to implement in the near future, in order of priority:
 
 - [Add support for pq-devnet-4](https://github.com/lambdaclass/ethlambda/issues/155)
-- [Use spawned for our P2P event loop](https://github.com/lambdaclass/ethlambda/issues/165) - [WIP](https://github.com/lambdaclass/ethlambda/pull/188)
-- [Observability: more metrics from leanMetrics](https://github.com/lambdaclass/ethlambda/issues/76)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
 - [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
