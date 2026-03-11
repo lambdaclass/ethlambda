@@ -474,5 +474,8 @@ pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         // Mathematical insight: For pronic delta = n(n+1), we have:
         //   4*delta + 1 = 4n(n+1) + 1 = (2n+1)^2
         // Check: 4*delta+1 is an odd perfect square
-        || (4*delta + 1).isqrt().pow(2) == 4*delta + 1 && (4*delta + 1) % 2 == 1
+        || delta
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(1))
+            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
 }
