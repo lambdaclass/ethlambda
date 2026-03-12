@@ -1281,3 +1281,80 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     // Assume the ancestor is behind the latest finalized block
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::{
+        attestation::{AggregatedAttestation, AggregationBits, Attestation, AttestationData},
+        block::{
+            AggregatedSignatureProof, BlockBody, BlockSignatures, BlockWithAttestation,
+            SignedBlockWithAttestation,
+        },
+        checkpoint::Checkpoint,
+        state::State,
+    };
+
+    #[test]
+    fn verify_signatures_rejects_participants_mismatch() {
+        let state = State::from_genesis(1000, vec![]);
+
+        let checkpoint = Checkpoint {
+            root: H256::ZERO,
+            slot: 0,
+        };
+        let attestation_data = AttestationData {
+            slot: 0,
+            head: checkpoint,
+            target: checkpoint,
+            source: checkpoint,
+        };
+
+        // Create attestation with bits [0, 1] set
+        let mut attestation_bits = AggregationBits::with_capacity(4).unwrap();
+        attestation_bits.set(0, true).unwrap();
+        attestation_bits.set(1, true).unwrap();
+
+        // Create proof with different bits [0, 1, 2] set
+        let mut proof_bits = AggregationBits::with_capacity(4).unwrap();
+        proof_bits.set(0, true).unwrap();
+        proof_bits.set(1, true).unwrap();
+        proof_bits.set(2, true).unwrap();
+
+        let attestation = AggregatedAttestation {
+            aggregation_bits: attestation_bits,
+            data: attestation_data.clone(),
+        };
+        let proof = AggregatedSignatureProof::empty(proof_bits);
+
+        let attestations = AggregatedAttestations::new(vec![attestation]).unwrap();
+        let attestation_signatures =
+            ssz_types::VariableList::new(vec![proof]).unwrap();
+
+        let signed_block = SignedBlockWithAttestation {
+            message: BlockWithAttestation {
+                block: Block {
+                    slot: 0,
+                    proposer_index: 0,
+                    parent_root: H256::ZERO,
+                    state_root: H256::ZERO,
+                    body: BlockBody { attestations },
+                },
+                proposer_attestation: Attestation {
+                    validator_id: 0,
+                    data: attestation_data,
+                },
+            },
+            signature: BlockSignatures {
+                attestation_signatures,
+                proposer_signature: ssz_types::FixedVector::from_elem(0),
+            },
+        };
+
+        let result = verify_signatures(&state, &signed_block);
+        assert!(
+            matches!(result, Err(StoreError::ParticipantsMismatch)),
+            "Expected ParticipantsMismatch, got: {result:?}"
+        );
+    }
+}
