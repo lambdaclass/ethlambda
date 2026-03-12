@@ -608,11 +608,11 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
     let mut hasher = sha2::Sha256::new();
-    let decompressed = snap::raw::Decoder::new().decompress_vec(&message.data);
+    let decompressed = gossipsub::decompress_message(&message.data).ok();
 
-    let (domain, data) = match decompressed.as_ref() {
-        Ok(decompressed_data) => (MESSAGE_DOMAIN_VALID_SNAPPY, decompressed_data),
-        Err(_) => (MESSAGE_DOMAIN_INVALID_SNAPPY, &message.data),
+    let (domain, data) = match decompressed.as_deref() {
+        Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
+        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
     };
     let topic = message.topic.as_str().as_bytes();
     let topic_len = (topic.len() as u64).to_le_bytes();
