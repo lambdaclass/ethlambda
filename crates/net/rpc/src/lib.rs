@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::ssz::Encode;
+use ethlambda_types::primitives::{H256, ssz::Encode};
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -57,9 +57,16 @@ async fn get_latest_finalized_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let finalized = store.latest_finalized();
-    let state = store
+    let mut state = store
         .get_state(&finalized.root)
         .expect("finalized state exists");
+
+    // Zero state_root to match the canonical post-state representation.
+    // The spec's state_transition sets state_root to zero during process_block_header,
+    // and only fills it in lazily at the next slot's process_slots.
+    // Serving the canonical form ensures checkpoint sync interoperability.
+    state.latest_block_header.state_root = H256::ZERO;
+
     ssz_response(state.as_ssz_bytes())
 }
 
@@ -178,15 +185,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_latest_finalized_state() {
-        use ethlambda_types::primitives::ssz::Encode;
+        use ethlambda_types::primitives::{H256, ssz::Encode};
 
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
 
-        // Get the expected state from the store
+        // Build expected SSZ with zeroed state_root (canonical post-state form)
         let finalized = store.latest_finalized();
-        let expected_state = store.get_state(&finalized.root).unwrap();
+        let mut expected_state = store.get_state(&finalized.root).unwrap();
+        expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.as_ssz_bytes();
 
         let app = build_api_router(store);
