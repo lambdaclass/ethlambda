@@ -212,9 +212,6 @@ fn process_attestations(
         })
         .collect();
 
-    // For is_justifiable_after checks (must use original value, not updated during iteration)
-    let original_finalized_slot = state.latest_finalized.slot;
-
     // Map roots to their latest slot for pruning.
     //
     // Votes for zero hash are ignored, so we only need the most recent slot
@@ -234,7 +231,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, source, target, original_finalized_slot) {
+        if !is_valid_vote(state, source, target) {
             continue;
         }
 
@@ -276,14 +273,7 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            try_finalize(
-                state,
-                source,
-                target,
-                original_finalized_slot,
-                &mut justifications,
-                &root_to_slot,
-            );
+            try_finalize(state, source, target, &mut justifications, &root_to_slot);
         }
     }
 
@@ -301,12 +291,7 @@ fn process_attestations(
 /// 4. Both checkpoints exist in historical_block_hashes
 /// 5. Target slot > source slot
 /// 6. Target slot is justifiable after the finalized slot
-fn is_valid_vote(
-    state: &State,
-    source: Checkpoint,
-    target: Checkpoint,
-    original_finalized_slot: u64,
-) -> bool {
+fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool {
     // Check that the source is already justified
     if !justified_slots_ops::is_slot_justified(
         &state.justified_slots,
@@ -342,7 +327,7 @@ fn is_valid_vote(
     }
 
     // Ensure the target falls on a slot that can be justified after the finalized one.
-    if !slot_is_justifiable_after(target.slot, original_finalized_slot) {
+    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
         return false;
     }
 
@@ -358,14 +343,12 @@ fn try_finalize(
     state: &mut State,
     source: Checkpoint,
     target: Checkpoint,
-    original_finalized_slot: u64,
     justifications: &mut HashMap<H256, Vec<bool>>,
     root_to_slot: &HashMap<H256, u64>,
 ) {
     // Consider whether finalization can advance.
-    // Use ORIGINAL finalized slot for is_justifiable_after check.
     if ((source.slot + 1)..target.slot)
-        .any(|slot| slot_is_justifiable_after(slot, original_finalized_slot))
+        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
     {
         metrics::inc_finalizations("error");
         return;
