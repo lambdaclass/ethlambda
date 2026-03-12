@@ -5,7 +5,7 @@ use ethlambda_types::{
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
-    state::{JustificationValidators, State},
+    state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
 use tracing::info;
 
@@ -26,6 +26,12 @@ pub enum Error {
     InvalidParent { expected: H256, found: H256 },
     #[error("state root mismatch: expected {expected}, computed {computed}")]
     StateRootMismatch { expected: H256, computed: H256 },
+    #[error("slot gap {gap} would exceed historical roots limit (current: {current}, max: {max})")]
+    SlotGapTooLarge {
+        gap: usize,
+        current: usize,
+        max: usize,
+    },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -135,6 +141,15 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
     }
 
     let num_empty_slots = (block.slot - parent_header.slot - 1) as usize;
+    let current_len = state.historical_block_hashes.len();
+    let new_total = current_len + 1 + num_empty_slots; // +1 for parent_root push
+    if new_total > HISTORICAL_ROOTS_LIMIT {
+        return Err(Error::SlotGapTooLarge {
+            gap: num_empty_slots,
+            current: current_len,
+            max: HISTORICAL_ROOTS_LIMIT,
+        });
+    }
 
     let mut historical_block_hashes: Vec<_> =
         std::mem::take(&mut state.historical_block_hashes).into();
@@ -143,7 +158,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
 
     state.historical_block_hashes = historical_block_hashes
         .try_into()
-        .expect("maximum slots reached");
+        .expect("pre-validated: total does not exceed limit");
 
     // Extend justified_slots to cover slots up to (block.slot - 1)
     //
@@ -212,9 +227,6 @@ fn process_attestations(
         })
         .collect();
 
-    // For is_justifiable_after checks (must use original value, not updated during iteration)
-    let original_finalized_slot = state.latest_finalized.slot;
-
     // Map roots to their latest slot for pruning.
     //
     // Votes for zero hash are ignored, so we only need the most recent slot
@@ -234,7 +246,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, source, target, original_finalized_slot) {
+        if !is_valid_vote(state, source, target) {
             continue;
         }
 
@@ -276,14 +288,7 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            try_finalize(
-                state,
-                source,
-                target,
-                original_finalized_slot,
-                &mut justifications,
-                &root_to_slot,
-            );
+            try_finalize(state, source, target, &mut justifications, &root_to_slot);
         }
     }
 
@@ -301,12 +306,7 @@ fn process_attestations(
 /// 4. Both checkpoints exist in historical_block_hashes
 /// 5. Target slot > source slot
 /// 6. Target slot is justifiable after the finalized slot
-fn is_valid_vote(
-    state: &State,
-    source: Checkpoint,
-    target: Checkpoint,
-    original_finalized_slot: u64,
-) -> bool {
+fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool {
     // Check that the source is already justified
     if !justified_slots_ops::is_slot_justified(
         &state.justified_slots,
@@ -342,7 +342,7 @@ fn is_valid_vote(
     }
 
     // Ensure the target falls on a slot that can be justified after the finalized one.
-    if !slot_is_justifiable_after(target.slot, original_finalized_slot) {
+    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
         return false;
     }
 
@@ -358,14 +358,12 @@ fn try_finalize(
     state: &mut State,
     source: Checkpoint,
     target: Checkpoint,
-    original_finalized_slot: u64,
     justifications: &mut HashMap<H256, Vec<bool>>,
     root_to_slot: &HashMap<H256, u64>,
 ) {
     // Consider whether finalization can advance.
-    // Use ORIGINAL finalized slot for is_justifiable_after check.
     if ((source.slot + 1)..target.slot)
-        .any(|slot| slot_is_justifiable_after(slot, original_finalized_slot))
+        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
     {
         metrics::inc_finalizations("error");
         return;
@@ -474,5 +472,8 @@ pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         // Mathematical insight: For pronic delta = n(n+1), we have:
         //   4*delta + 1 = 4n(n+1) + 1 = (2n+1)^2
         // Check: 4*delta+1 is an odd perfect square
-        || (4*delta + 1).isqrt().pow(2) == 4*delta + 1 && (4*delta + 1) % 2 == 1
+        || delta
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(1))
+            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
 }
