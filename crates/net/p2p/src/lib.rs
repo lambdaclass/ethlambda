@@ -40,7 +40,7 @@ use crate::{
         publish_aggregated_attestation, publish_attestation, publish_block,
     },
     req_resp::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE, Request,
+        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
         STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
     },
     swarm_adapter::SwarmHandle,
@@ -608,11 +608,7 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
     let mut hasher = sha2::Sha256::new();
-    // Check claimed uncompressed size before allocating to prevent decompression bombs.
-    let decompressed = snap::raw::decompress_len(&message.data)
-        .ok()
-        .filter(|&len| len <= MAX_PAYLOAD_SIZE)
-        .and_then(|_| snap::raw::Decoder::new().decompress_vec(&message.data).ok());
+    let decompressed = gossipsub::decompress_message(&message.data).ok();
 
     let (domain, data) = match decompressed.as_deref() {
         Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
