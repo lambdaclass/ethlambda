@@ -1299,15 +1299,11 @@ mod tests {
     fn verify_signatures_rejects_participants_mismatch() {
         let state = State::from_genesis(1000, vec![]);
 
-        let checkpoint = Checkpoint {
-            root: H256::ZERO,
-            slot: 0,
-        };
         let attestation_data = AttestationData {
             slot: 0,
-            head: checkpoint,
-            target: checkpoint,
-            source: checkpoint,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
         };
 
         // Create attestation with bits [0, 1] set
