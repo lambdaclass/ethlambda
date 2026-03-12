@@ -273,13 +273,7 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            try_finalize(
-                state,
-                source,
-                target,
-                &mut justifications,
-                &root_to_slot,
-            );
+            try_finalize(state, source, target, &mut justifications, &root_to_slot);
         }
     }
 
@@ -297,11 +291,7 @@ fn process_attestations(
 /// 4. Both checkpoints exist in historical_block_hashes
 /// 5. Target slot > source slot
 /// 6. Target slot is justifiable after the finalized slot
-fn is_valid_vote(
-    state: &State,
-    source: Checkpoint,
-    target: Checkpoint,
-) -> bool {
+fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool {
     // Check that the source is already justified
     if !justified_slots_ops::is_slot_justified(
         &state.justified_slots,
