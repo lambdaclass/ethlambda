@@ -1324,8 +1324,7 @@ mod tests {
         let proof = AggregatedSignatureProof::empty(proof_bits);
 
         let attestations = AggregatedAttestations::new(vec![attestation]).unwrap();
-        let attestation_signatures =
-            ssz_types::VariableList::new(vec![proof]).unwrap();
+        let attestation_signatures = ssz_types::VariableList::new(vec![proof]).unwrap();
 
         let signed_block = SignedBlockWithAttestation {
             message: BlockWithAttestation {
