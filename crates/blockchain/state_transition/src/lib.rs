@@ -5,7 +5,7 @@ use ethlambda_types::{
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{H256, ssz::TreeHash},
-    state::{JustificationValidators, State},
+    state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
 use tracing::info;
 
@@ -26,6 +26,12 @@ pub enum Error {
     InvalidParent { expected: H256, found: H256 },
     #[error("state root mismatch: expected {expected}, computed {computed}")]
     StateRootMismatch { expected: H256, computed: H256 },
+    #[error("slot gap {gap} would exceed historical roots limit (current: {current}, max: {max})")]
+    SlotGapTooLarge {
+        gap: usize,
+        current: usize,
+        max: usize,
+    },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -135,6 +141,15 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
     }
 
     let num_empty_slots = (block.slot - parent_header.slot - 1) as usize;
+    let current_len = state.historical_block_hashes.len();
+    let new_total = current_len + 1 + num_empty_slots; // +1 for parent_root push
+    if new_total > HISTORICAL_ROOTS_LIMIT {
+        return Err(Error::SlotGapTooLarge {
+            gap: num_empty_slots,
+            current: current_len,
+            max: HISTORICAL_ROOTS_LIMIT,
+        });
+    }
 
     let mut historical_block_hashes: Vec<_> =
         std::mem::take(&mut state.historical_block_hashes).into();
@@ -143,7 +158,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
 
     state.historical_block_hashes = historical_block_hashes
         .try_into()
-        .expect("maximum slots reached");
+        .expect("pre-validated: total does not exceed limit");
 
     // Extend justified_slots to cover slots up to (block.slot - 1)
     //
