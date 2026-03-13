@@ -32,6 +32,8 @@ pub enum Error {
         current: usize,
         max: usize,
     },
+    #[error("zero hash found in justifications_roots")]
+    ZeroHashInJustificationRoots,
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -220,6 +222,14 @@ fn process_attestations(
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
     let _timing = metrics::time_attestations_processing();
+    // Precondition: justifications_roots must not contain zero hashes (spec state.py L389).
+    if state
+        .justifications_roots
+        .iter()
+        .any(|root| root == &H256::ZERO)
+    {
+        return Err(Error::ZeroHashInJustificationRoots);
+    }
     let validator_count = state.validators.len();
     let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
