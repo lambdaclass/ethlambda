@@ -7,7 +7,7 @@ pub fn start_prometheus_metrics_api() -> Router {
 }
 
 pub(crate) async fn get_health() -> impl IntoResponse {
-    let mut response = r#"{"status":"healthy","service":"lean-spec-api"}"#.into_response();
+    let mut response = r#"{"status":"healthy","service":"lean-rpc-api"}"#.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(crate::JSON_CONTENT_TYPE),
