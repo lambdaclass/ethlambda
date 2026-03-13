@@ -284,13 +284,17 @@ fn process_attestations(
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
         // Mark that each validator in this aggregation has voted for the target.
+        // Use get_mut to safely skip bits beyond the validator set — a malicious
+        // attestation could carry aggregation_bits longer than validator_count.
         for (validator_id, _) in attestation
             .aggregation_bits
             .iter()
             .enumerate()
             .filter(|(_, voted)| *voted)
         {
-            votes[validator_id] = true;
+            if let Some(vote) = votes.get_mut(validator_id) {
+                *vote = true;
+            }
         }
 
         // Check whether the vote count crosses the supermajority threshold
@@ -416,10 +420,14 @@ fn try_finalize(
     let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
     justified_slots_ops::shift_window(&mut state.justified_slots, delta);
 
-    // Prune justifications whose roots only appear at now-finalized slots
+    // Prune justifications whose roots only appear at now-finalized slots.
+    // Use .get() instead of direct index — a root may be absent from root_to_slot
+    // if it was never in historical_block_hashes (e.g. carried over from a previous
+    // finalization window). Missing roots are conservatively retained.
     justifications.retain(|root, _| {
-        let slot = root_to_slot[root];
-        slot > state.latest_finalized.slot
+        root_to_slot
+            .get(root)
+            .is_none_or(|&slot| slot > state.latest_finalized.slot)
     });
 }
 
