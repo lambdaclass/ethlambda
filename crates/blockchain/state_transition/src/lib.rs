@@ -66,6 +66,17 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
 }
 
 /// Advance the state through empty slots up to, but not including, target_slot.
+///
+/// The spec (`state.py` process_slots) iterates slot-by-slot in a while loop.
+/// We jump directly to target_slot instead, which is equivalent because:
+///
+/// 1. The state root is only cached on the first iteration (when state_root == ZERO).
+///    After that, subsequent iterations only increment the slot counter.
+/// 2. The hash is computed from the same state in both approaches: slot = current,
+///    state_root = ZERO (the check happens before the slot assignment).
+/// 3. No other state fields are modified in the spec's loop body.
+///
+/// If the spec ever adds per-slot side effects, this must be revisited.
 pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
     let _timing = metrics::time_slots_processing();
 
@@ -76,7 +87,6 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
         });
     }
     if state.latest_block_header.state_root == H256::ZERO {
-        // Special case: cache the state root if not already set.
         state.latest_block_header.state_root = state.tree_hash_root();
     }
     let slots_processed = target_slot - state.slot;
