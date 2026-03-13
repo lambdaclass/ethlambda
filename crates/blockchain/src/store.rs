@@ -1159,6 +1159,8 @@ fn verify_signatures(
     use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
+    let total_start = std::time::Instant::now();
+
     let block = &signed_block.message.block;
     let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
@@ -1173,6 +1175,7 @@ fn verify_signatures(
     let num_validators = validators.len() as u64;
 
     // Verify each attestation's signature proof
+    let aggregated_start = std::time::Instant::now();
     for (attestation, aggregated_proof) in attestations.iter().zip(attestation_signatures) {
         if attestation.aggregation_bits != aggregated_proof.participants {
             return Err(StoreError::ParticipantsMismatch);
@@ -1208,6 +1211,7 @@ fn verify_signatures(
             }
         }
     }
+    let aggregated_elapsed = aggregated_start.elapsed();
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
 
@@ -1230,9 +1234,22 @@ fn verify_signatures(
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
 
+    let proposer_start = std::time::Instant::now();
     if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
+    let proposer_elapsed = proposer_start.elapsed();
+
+    let total_elapsed = total_start.elapsed();
+    info!(
+        slot = block.slot,
+        attestation_count = attestations.len(),
+        aggregated_sigs_ms = aggregated_elapsed.as_millis() as u64,
+        proposer_sig_ms = proposer_elapsed.as_millis() as u64,
+        total_ms = total_elapsed.as_millis() as u64,
+        "Signature verification timing"
+    );
+
     Ok(())
 }
 
