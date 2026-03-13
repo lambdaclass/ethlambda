@@ -1,6 +1,6 @@
 ---
 name: devnet-runner
-description: Manage local development networks for lean consensus testing. Use when users want to (1) Configure a devnet with validator nodes, (2) Start/stop devnet nodes, (3) Regenerate genesis files, (4) Collect and dump node logs to files, (5) Troubleshoot devnet issues.
+description: Manage local development networks for lean consensus testing. Use when users want to (1) Configure a devnet with validator nodes, (2) Start/stop devnet nodes, (3) Regenerate genesis files, (4) Collect and dump node logs to files, (5) Troubleshoot devnet issues, (6) Restart a node with checkpoint sync.
 ---
 
 # Devnet Runner
@@ -390,6 +390,31 @@ Use the `run-devnet-with-timeout.sh` script for timed runs. Remember to include 
 |--------|-------------|
 | `scripts/run-devnet-with-timeout.sh <seconds>` | Run devnet for specified duration, dump logs to repo root, then stop |
 
+## Restarting a Node with Checkpoint Sync
+
+To restart a single node mid-devnet (e.g., to test a new image or checkpoint sync itself):
+
+**Important:** Restart nodes one at a time, waiting for each to fully sync before restarting the next. If 1/3 or more validators are offline simultaneously, finalization stalls because 3SF-mini requires 2/3+ votes to justify checkpoints.
+
+1. Choose a node to restart. If restarting the aggregator, finalization and attestation inclusion in blocks will stop until it catches back up to head.
+2. Identify a healthy node's metrics port to use as checkpoint source
+3. Update the Docker image tag in `client-cmds/<client>-cmd.sh` if needed
+4. **Pull the new image before restarting** to minimize node downtime:
+   ```bash
+   docker pull <image>:<tag>
+   ```
+5. Restart with checkpoint sync:
+   ```bash
+   cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh \
+     --restart-client <node_name> \
+     --checkpoint-sync-url http://127.0.0.1:<source_metrics_port>/lean/v0/states/finalized
+   ```
+
+**Important:** RPC and metrics share the same port (`--metrics-port`). There is no separate RPC port.
+
+See `references/checkpoint-sync.md` for the full procedure, verification steps, and troubleshooting.
+
 ## Reference
 
-See `references/clients.md` for client-specific details (images, ports, configurations).
+- `references/clients.md`: Client-specific details (images, ports, configurations)
+- `references/checkpoint-sync.md`: Restarting nodes with checkpoint sync
