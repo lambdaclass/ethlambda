@@ -1,6 +1,6 @@
 ---
 name: devnet-runner
-description: Manage local development networks for lean consensus testing. Use when users want to (1) Configure a devnet with validator nodes, (2) Start/stop devnet nodes, (3) Regenerate genesis files, (4) Collect and dump node logs to files, (5) Troubleshoot devnet issues, (6) Restart a node with checkpoint sync.
+description: Manage local development networks (devnets) for lean consensus multi-client testing. This skill should be used when the user asks to run a devnet, start or stop devnet nodes, spin up a local testnet, configure validator nodes, regenerate genesis files, change Docker image tags, collect or dump node logs, troubleshoot devnet issues, restart a node with checkpoint sync, run a long-lived devnet with detached containers, or perform rolling restarts to upgrade images.
 ---
 
 # Devnet Runner
@@ -17,19 +17,15 @@ make lean-quickstart
 ## Default Behavior
 
 When starting a devnet, **always**:
-1. **Update validator config** - Edit `lean-quickstart/local-devnet/genesis/validator-config.yaml` to include ONLY the nodes that will run. Remove entries for nodes that won't be started (unless the user explicitly asks to keep them). This is critical because validator indices are assigned to ALL nodes in the config - if a node is in the config but not running, its validators will miss their proposer slots.
+1. **Update validator config** - Edit `lean-quickstart/local-devnet/genesis/validator-config.yaml` to include ONLY the nodes that will run. Remove entries for nodes that won't be started (unless the user explicitly asks to keep them). Validator indices are assigned to ALL nodes in the config; if a node is in the config but not running, its validators will miss their proposer slots. To control which nodes run, always edit this config file rather than using `--node <specific>`, since `--node` does NOT reassign validators and causes missed slots.
 2. **Update client image tags** - If the user specifies a tag (e.g., "use devnet1 tag"), edit the relevant `lean-quickstart/client-cmds/{client}-cmd.sh` file to update the `node_docker` image tag.
-3. **Use run-devnet-with-timeout.sh** - This script runs all nodes in the config with a timeout, dumps logs, then stops them. Do NOT use `--node <specific>` to select nodes - this does not reassign validators.
-4. Run for **20 slots** unless the user specifies otherwise
-5. The script automatically dumps all node logs to `<node_name>.log` files in the repo root and stops the nodes when the timeout expires
-
-**Important:** Only use `--node <specific>` (e.g., `--node zeam_0,ream_0`) if the user explicitly requests it. This flag starts only the specified nodes but does NOT reassign their validators, causing missed slots.
-
-This ensures consistent test runs, clean logs without spurious warnings, and captured output for debugging.
+3. **Use run-devnet-with-timeout.sh** - This script runs all nodes in the config with a timeout, dumps logs, then stops them.
+4. Run for **20 slots** unless the user specifies otherwise.
+5. The script automatically dumps all node logs to `<node_name>.log` files in the repo root and stops the nodes when the timeout expires.
 
 ## Timing Calculation
 
-Total timeout = startup buffer + genesis offset + (slots × 4 seconds)
+Total timeout = startup buffer + genesis offset + (slots x 4 seconds)
 
 | Component | Local Mode | Ansible Mode |
 |-----------|------------|--------------|
@@ -38,23 +34,20 @@ Total timeout = startup buffer + genesis offset + (slots × 4 seconds)
 | Per slot | 4s | 4s |
 
 **Examples (local mode):**
-- 20 slots: 10 + 30 + (20 × 4) = **120s**
-- 50 slots: 10 + 30 + (50 × 4) = **240s**
-- 100 slots: 10 + 30 + (100 × 4) = **440s**
+- 20 slots: 10 + 30 + (20 x 4) = **120s**
+- 50 slots: 10 + 30 + (50 x 4) = **240s**
+- 100 slots: 10 + 30 + (100 x 4) = **440s**
 
 ## Quick Start (Default Workflow)
 
-**Step 1: Configure nodes** - Edit `lean-quickstart/local-devnet/genesis/validator-config.yaml` to keep only the nodes you want to run. Remove all other validator entries. This is critical because validator indices are assigned based on all nodes in the config - if a node is in the config but not running, its validators will miss their slots.
+**Step 1: Configure nodes** - Edit `lean-quickstart/local-devnet/genesis/validator-config.yaml` to keep only the nodes you want to run. See `references/validator-config.md` for the full schema and field reference.
 
-**Step 2: Update image tags (if needed)** - Edit `lean-quickstart/client-cmds/{client}-cmd.sh` to change the Docker image tag in `node_docker`.
+**Step 2: Update image tags (if needed)** - Edit `lean-quickstart/client-cmds/{client}-cmd.sh` to change the Docker image tag in `node_docker`. See `references/clients.md` for current default tags.
 
 **Step 3: Run the devnet**
 ```bash
 # Start devnet with fresh genesis, capture logs directly (20 slots = 120s)
 .claude/skills/devnet-runner/scripts/run-devnet-with-timeout.sh 120
-
-# Stop any remaining nodes (cleanup)
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --stop 2>/dev/null || true
 ```
 
 ## Manual Commands
@@ -72,22 +65,11 @@ cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --stop
 cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis
 ```
 
-### Using --node to Select Specific Nodes (Advanced)
-
-**WARNING:** Only use `--node <specific>` if the user explicitly requests it. This flag does NOT reassign validators - nodes not selected will still have validators assigned to them in the genesis, causing missed slots.
-
-```bash
-# Only use if explicitly requested by user
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ream_0
-```
-
-For normal operation, always modify `validator-config.yaml` to include only the nodes you want, then use `run-devnet-with-timeout.sh` or `--node all`.
-
 ## Command-Line Flags
 
 | Flag | Description |
 |------|-------------|
-| `--node <name\|all>` | **Required.** Node(s) to start. Use `all` to start all nodes in config. **Note:** Using specific node names (e.g., `--node zeam_0,ream_0`) does NOT reassign validators - use only if explicitly requested |
+| `--node <name\|all>` | **Required.** Node(s) to start. Use `all` to start all nodes in config |
 | `--generateGenesis` | Regenerate genesis files. Implies `--cleanData` |
 | `--cleanData` | Clean data directories before starting |
 | `--stop` | Stop running nodes instead of starting them |
@@ -108,169 +90,13 @@ node_docker="--security-opt seccomp=unconfined blockblaz/zeam:devnet1 node \
 node_docker="--security-opt seccomp=unconfined blockblaz/zeam:local node \
 ```
 
-**Current default tags:**
-| Client | Image | Default Tag |
-|--------|-------|-------------|
-| zeam | blockblaz/zeam | devnet1 |
-| ream | ghcr.io/reamlabs/ream | latest |
-| ethlambda | ghcr.io/lambdaclass/ethlambda | local |
-| qlean | qdrvm/qlean-mini | 3a96a1f |
-| lantern | piertwo/lantern | v0.0.1 |
-| lighthouse | hopinheimer/lighthouse | latest |
-| grandine | sifrai/lean | unstable |
+See `references/clients.md` for current default images, tags, and known compatibility issues.
 
-## Configuration Workflow
+## Validator Configuration
 
-### Validator Config File Structure
+**ethlambda note:** ethlambda uses separate API (`--api-port`, default 5052) and metrics (`--metrics-port`, default 5054) HTTP servers. The `metricsPort` from config maps to `--metrics-port`; the API port must be configured separately in `ethlambda-cmd.sh`.
 
-The config file is at `lean-quickstart/local-devnet/genesis/validator-config.yaml`. This is the **single source of truth** for all node configurations.
-
-**Important:** Only include clients that will actually run in the devnet. If a configured validator is offline from the start, it will miss its proposer slots and affect consensus progress. Only include offline validators if you specifically want to test behavior with missing nodes.
-
-**Full schema:**
-```yaml
-shuffle: roundrobin              # Proposer selection algorithm (roundrobin = deterministic turns)
-deployment_mode: local           # 'local' (localhost) or 'ansible' (remote servers)
-
-config:
-  activeEpoch: 18                # Log2 of active signing epochs for hash-sig keys (2^18)
-  keyType: "hash-sig"            # Post-quantum signature scheme
-
-validators:
-  - name: "zeam_0"               # Node identifier: <client>_<index>
-    privkey: "bdf953adc..."      # 64-char hex P2P private key (libp2p identity)
-    enrFields:
-      ip: "127.0.0.1"            # Node IP (127.0.0.1 for local, real IP for ansible)
-      quic: 9001                 # QUIC/UDP port for P2P communication
-    metricsPort: 8081            # HTTP port exposed by the node (see note below)
-    count: 1                     # Number of validator indices assigned to this node
-```
-
-**Field reference:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `shuffle` | Yes | Proposer selection algorithm. Use `roundrobin` for deterministic turn-based proposing |
-| `deployment_mode` | Yes | `local` or `ansible` - determines genesis time offset and config directory |
-| `config.activeEpoch` | Yes | Exponent for hash-sig active epochs (e.g., 18 means 2^18 signatures per period) |
-| `config.keyType` | Yes | Always `hash-sig` for post-quantum support |
-| `name` | Yes | Format: `<client>_<index>`. Client name determines which `client-cmds/*.sh` script runs |
-| `privkey` | Yes | 32-byte hex string (64 chars). Used for P2P identity and ENR generation |
-| `enrFields.ip` | Yes | IP address. Use `127.0.0.1` for local, real IPs for ansible |
-| `enrFields.quic` | Yes | QUIC port. Must be unique per node in local mode |
-| `metricsPort` | Yes | HTTP port exposed by the node. Must be unique per node in local mode. For ethlambda, this maps to `--metrics-port`; the API server uses a separate `--api-port` (default 5052) |
-| `count` | Yes | Number of validator indices. Sum of all counts = total validators |
-
-### Adding a New Validator Node
-
-1. **Choose a unique node name** following `<client>_<index>` convention:
-   ```
-   zeam_0, zeam_1, ream_0, qlean_0, lantern_0, lighthouse_0, grandine_0, ethlambda_0
-   ```
-
-2. **Generate a P2P private key** (64-char hex):
-   ```bash
-   openssl rand -hex 32
-   ```
-
-3. **Assign unique ports** (for local mode):
-   - QUIC: 9001, 9002, 9003... (increment for each node)
-   - Metrics/API: 8081, 8082, 8083... (increment for each node)
-   - **ethlambda note:** ethlambda uses separate API and metrics ports. The `metricsPort` in the config maps to `--metrics-port`. The API server binds to `--api-port` (default 5052) which must also be unique if running multiple ethlambda nodes.
-
-4. **Add the entry to `lean-quickstart/local-devnet/genesis/validator-config.yaml`:**
-   ```yaml
-   validators:
-     # ... existing nodes ...
-
-     - name: "newclient_0"
-       privkey: "<your-64-char-hex-key>"
-       enrFields:
-         ip: "127.0.0.1"          # Use real IP for ansible
-         quic: 9008               # Next available port
-       metricsPort: 8088          # Next available port
-       count: 1
-   ```
-
-5. **Regenerate genesis with new keys:**
-   ```bash
-   cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --forceKeyGen
-   ```
-
-### Removing a Validator Node
-
-1. **Delete the node entry** from `lean-quickstart/local-devnet/genesis/validator-config.yaml`
-
-2. **Regenerate genesis** (required because genesis state must reflect new validator set):
-   ```bash
-   cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis
-   ```
-   Note: `--forceKeyGen` is NOT needed when removing - existing keys for remaining indices are reused.
-
-### Port Allocation Guide (Local Mode)
-
-When running multiple nodes locally, each needs unique ports:
-
-| Node | QUIC Port | Metrics Port |
-|------|-----------|--------------|
-| zeam_0 | 9001 | 8081 |
-| ream_0 | 9002 | 8082 |
-| qlean_0 | 9003 | 8083 |
-| lantern_0 | 9004 | 8084 |
-| lighthouse_0 | 9005 | 8085 |
-| grandine_0 | 9006 | 8086 |
-| ethlambda_0 | 9007 | 8087 |
-
-**ethlambda dual-port note:** ethlambda runs separate API and metrics HTTP servers. The `metricsPort` from `validator-config.yaml` maps to `--metrics-port`. The API server (`--api-port`, default 5052) must also be configured with a unique port if running multiple ethlambda nodes. Update `ethlambda-cmd.sh` in `lean-quickstart` to pass both `--api-port` and `--metrics-port` flags.
-
-For **ansible mode**, all nodes can use the same ports (9001, 8081) since they run on different machines.
-
-### Local vs Ansible Deployment
-
-| Aspect | Local | Ansible |
-|--------|-------|---------|
-| Config file | `lean-quickstart/local-devnet/genesis/validator-config.yaml` | `lean-quickstart/ansible-devnet/genesis/validator-config.yaml` |
-| `deployment_mode` | `local` | `ansible` |
-| IP addresses | `127.0.0.1` for all | Real server IPs |
-| Ports | Must be unique per node | Same port, different machines |
-| Genesis offset | +30 seconds | +360 seconds |
-
-## Node Lifecycle Commands
-
-### Start Nodes
-
-**Preferred method:** Use `run-devnet-with-timeout.sh` after configuring `validator-config.yaml`:
-```bash
-# Edit lean-quickstart/local-devnet/genesis/validator-config.yaml to include only nodes you want, then:
-.claude/skills/devnet-runner/scripts/run-devnet-with-timeout.sh 120
-```
-
-**Alternative (no timeout):**
-```bash
-# All nodes in config
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all
-
-# Fresh start with new genesis
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis
-```
-
-**Advanced (only if explicitly requested):** Start specific nodes without modifying config. Note: validators will NOT be reassigned.
-```bash
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node zeam_0,ream_0
-```
-
-### Stop Nodes
-```bash
-# Via script
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --stop
-
-# Or press Ctrl+C in the terminal running spin-node.sh
-```
-
-### Clean and Restart
-```bash
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --cleanData
-```
+See `references/validator-config.md` for the full schema, field reference, adding/removing nodes, port allocation guide, and local vs ansible deployment differences.
 
 ## Log Collection
 
@@ -296,23 +122,12 @@ for node in $(docker ps --format '{{.Names}}' | grep -E '^(zeam|ream|qlean|lante
 done
 ```
 
-**Follow and save simultaneously:**
-```bash
-docker logs -f zeam_0 2>&1 | tee zeam_0.log
-```
-
-**With timestamps:**
-```bash
-docker logs -t zeam_0 > zeam_0.log 2>&1
-```
-
 ### Data Directory Logs
 
 Client-specific data and file-based logs are stored at:
 ```
 lean-quickstart/local-devnet/data/<node_name>/
 ```
-Example: `lean-quickstart/local-devnet/data/zeam_0/`
 
 ## Common Troubleshooting
 
@@ -351,15 +166,6 @@ lsof -i :8081  # Check metrics port
 lsof -i :5052  # Check ethlambda API port (if using default)
 ```
 
-Update ports in `lean-quickstart/local-devnet/genesis/validator-config.yaml` if needed.
-
-### Docker Permission Issues
-
-Run with sudo:
-```bash
-cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --dockerWithSudo
-```
-
 ### Stale Containers Cause Genesis Mismatch
 
 If you see `UnknownSourceBlock` or `OutOfMemory` deserialization errors, a container from a previous run may still be running with old genesis.
@@ -371,22 +177,11 @@ docker rm -f zeam_0 ethlambda_0 ream_0 qlean_0 lantern_0 grandine_0 2>/dev/null
 
 Or use `run-devnet-with-timeout.sh` which handles cleanup automatically.
 
-### Time-Based Stop
-
-Use the `run-devnet-with-timeout.sh` script for timed runs. Remember to include genesis offset (30s local, 360s ansible) + startup buffer (10s):
+### Docker Permission Issues
 
 ```bash
-# 20 slots: 10 + 30 + 80 = 120s
-.claude/skills/devnet-runner/scripts/run-devnet-with-timeout.sh 120
-
-# 50 slots: 10 + 30 + 200 = 240s
-.claude/skills/devnet-runner/scripts/run-devnet-with-timeout.sh 240
-
-# 100 slots: 10 + 30 + 400 = 440s
-.claude/skills/devnet-runner/scripts/run-devnet-with-timeout.sh 440
+cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh --node all --dockerWithSudo
 ```
-
-**Formula:** duration = 10 + 30 + (slots × 4) seconds (local mode)
 
 ## Scripts
 
@@ -394,31 +189,20 @@ Use the `run-devnet-with-timeout.sh` script for timed runs. Remember to include 
 |--------|-------------|
 | `scripts/run-devnet-with-timeout.sh <seconds>` | Run devnet for specified duration, dump logs to repo root, then stop |
 
-## Restarting a Node with Checkpoint Sync
+## Long-Lived Devnets and Rolling Restarts
 
-To restart a single node mid-devnet (e.g., to test a new image or checkpoint sync itself):
+For persistent devnets on remote servers (e.g., `ssh admin@ethlambda-1`), use detached containers instead of `spin-node.sh`. This allows rolling restarts to upgrade images without losing chain state.
 
-**Important:** Restart nodes one at a time, waiting for each to fully sync before restarting the next. If 1/3 or more validators are offline simultaneously, finalization stalls because 3SF-mini requires 2/3+ votes to justify checkpoints.
+**Key points:**
+- Start containers with `docker run -d --restart unless-stopped` (not `spin-node.sh`)
+- Rolling restart: stop one node, **wait 60 seconds** (gossipsub backoff), start with new image + checkpoint sync
+- Restart non-aggregator nodes first, aggregator last
+- Checkpoint sync URL uses the API port: `http://127.0.0.1:<api-port>/lean/v0/states/finalized`
 
-1. Choose a node to restart. If restarting the aggregator, finalization and attestation inclusion in blocks will stop until it catches back up to head.
-2. Identify a healthy node's API port to use as checkpoint source (ethlambda serves `/lean/v0/states/finalized` on `--api-port`, default 5052)
-3. Update the Docker image tag in `client-cmds/<client>-cmd.sh` if needed
-4. **Pull the new image before restarting** to minimize node downtime:
-   ```bash
-   docker pull <image>:<tag>
-   ```
-5. Restart with checkpoint sync:
-   ```bash
-   cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh \
-     --restart-client <node_name> \
-     --checkpoint-sync-url http://127.0.0.1:<source_api_port>/lean/v0/states/finalized
-   ```
-
-**Important:** ethlambda serves the API (including `/lean/v0/states/finalized`) on `--api-port` (default 5052) and Prometheus metrics on `--metrics-port` (default 5054). Use the API port for checkpoint sync URLs.
-
-See `references/checkpoint-sync.md` for the full procedure, verification steps, and troubleshooting.
+See `references/long-lived-devnet.md` for the full procedure, including starting the devnet, rolling restart steps, verification, and troubleshooting.
 
 ## Reference
 
-- `references/clients.md`: Client-specific details (images, ports, configurations)
-- `references/checkpoint-sync.md`: Restarting nodes with checkpoint sync
+- `references/clients.md`: Client-specific details (images, ports, known issues)
+- `references/validator-config.md`: Full config schema, field reference, adding/removing nodes, port allocation
+- `references/long-lived-devnet.md`: Persistent devnets with detached containers and rolling restarts
