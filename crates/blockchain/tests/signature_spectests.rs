@@ -55,7 +55,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         store::on_tick(&mut st, block_time_ms, true, false);
 
         // Process the block (this includes signature verification)
-        let result = store::on_block(&mut st, signed_block);
+        let result = store::on_block(&mut st, signed_block, &[]);
 
         // Step 3: Check that it succeeded or failed as expected
         match (result.is_ok(), test.expect_exception.as_ref()) {
