@@ -210,7 +210,7 @@ pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool
     // Guard: the spec (validator.py L25) does `slot % num_validators` without
     // checking for zero, which would panic on division by zero. This can't
     // happen in practice (genesis always has at least one validator), but we
-    // guard explicitly to avoid UB from crafted inputs.
+    // guard explicitly to avoid panics from crafted inputs.
     if num_validators == 0 {
         return false;
     }
