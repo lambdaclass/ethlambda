@@ -368,7 +368,7 @@ pub fn set_attestation_committee_count(count: u64) {
             )
             .unwrap()
         });
-    LEAN_ATTESTATION_COMMITTEE_COUNT.set(count.try_into().unwrap());
+    LEAN_ATTESTATION_COMMITTEE_COUNT.set(count.try_into().unwrap_or_default());
 }
 
 /// Observe the depth of a fork choice reorg.
