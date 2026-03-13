@@ -11,15 +11,20 @@ mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 
-pub async fn start_rpc_server(address: SocketAddr, store: Store) -> Result<(), std::io::Error> {
-    let metrics_router = metrics::start_prometheus_metrics_api();
+pub async fn start_api_server(address: SocketAddr, store: Store) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store);
+
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, api_router).await?;
+
+    Ok(())
+}
+
+pub async fn start_metrics_server(address: SocketAddr) -> Result<(), std::io::Error> {
+    let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
-    let app = Router::new()
-        .merge(metrics_router)
-        .merge(api_router)
-        .merge(debug_router);
+    let app = Router::new().merge(metrics_router).merge(debug_router);
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
@@ -30,6 +35,7 @@ pub async fn start_rpc_server(address: SocketAddr, store: Store) -> Result<(), s
 /// Build the API router with the given store.
 fn build_api_router(store: Store) -> Router {
     Router::new()
+        .route("/lean/v0/health", get(metrics::get_health))
         .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
         .route(
             "/lean/v0/checkpoints/justified",

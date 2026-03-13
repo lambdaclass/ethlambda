@@ -142,7 +142,7 @@ validators:
     enrFields:
       ip: "127.0.0.1"            # Node IP (127.0.0.1 for local, real IP for ansible)
       quic: 9001                 # QUIC/UDP port for P2P communication
-    metricsPort: 8081            # Prometheus metrics endpoint port
+    metricsPort: 8081            # HTTP port exposed by the node (see note below)
     count: 1                     # Number of validator indices assigned to this node
 ```
 
@@ -158,7 +158,7 @@ validators:
 | `privkey` | Yes | 32-byte hex string (64 chars). Used for P2P identity and ENR generation |
 | `enrFields.ip` | Yes | IP address. Use `127.0.0.1` for local, real IPs for ansible |
 | `enrFields.quic` | Yes | QUIC port. Must be unique per node in local mode |
-| `metricsPort` | Yes | Prometheus metrics port. Must be unique per node in local mode |
+| `metricsPort` | Yes | HTTP port exposed by the node. Must be unique per node in local mode. For ethlambda, this maps to `--metrics-port`; the API server uses a separate `--api-port` (default 5052) |
 | `count` | Yes | Number of validator indices. Sum of all counts = total validators |
 
 ### Adding a New Validator Node
@@ -175,7 +175,8 @@ validators:
 
 3. **Assign unique ports** (for local mode):
    - QUIC: 9001, 9002, 9003... (increment for each node)
-   - Metrics: 8081, 8082, 8083... (increment for each node)
+   - Metrics/API: 8081, 8082, 8083... (increment for each node)
+   - **ethlambda note:** ethlambda uses separate API and metrics ports. The `metricsPort` in the config maps to `--metrics-port`. The API server binds to `--api-port` (default 5052) which must also be unique if running multiple ethlambda nodes.
 
 4. **Add the entry to `lean-quickstart/local-devnet/genesis/validator-config.yaml`:**
    ```yaml
@@ -219,6 +220,8 @@ When running multiple nodes locally, each needs unique ports:
 | lighthouse_0 | 9005 | 8085 |
 | grandine_0 | 9006 | 8086 |
 | ethlambda_0 | 9007 | 8087 |
+
+**ethlambda dual-port note:** ethlambda runs separate API and metrics HTTP servers. The `metricsPort` from `validator-config.yaml` maps to `--metrics-port`. The API server (`--api-port`, default 5052) must also be configured with a unique port if running multiple ethlambda nodes. Update `ethlambda-cmd.sh` in `lean-quickstart` to pass both `--api-port` and `--metrics-port` flags.
 
 For **ansible mode**, all nodes can use the same ports (9001, 8081) since they run on different machines.
 
@@ -345,6 +348,7 @@ Check if ports are in use:
 ```bash
 lsof -i :9001  # Check QUIC port
 lsof -i :8081  # Check metrics port
+lsof -i :5052  # Check ethlambda API port (if using default)
 ```
 
 Update ports in `lean-quickstart/local-devnet/genesis/validator-config.yaml` if needed.
@@ -397,7 +401,7 @@ To restart a single node mid-devnet (e.g., to test a new image or checkpoint syn
 **Important:** Restart nodes one at a time, waiting for each to fully sync before restarting the next. If 1/3 or more validators are offline simultaneously, finalization stalls because 3SF-mini requires 2/3+ votes to justify checkpoints.
 
 1. Choose a node to restart. If restarting the aggregator, finalization and attestation inclusion in blocks will stop until it catches back up to head.
-2. Identify a healthy node's metrics port to use as checkpoint source
+2. Identify a healthy node's API port to use as checkpoint source (ethlambda serves `/lean/v0/states/finalized` on `--api-port`, default 5052)
 3. Update the Docker image tag in `client-cmds/<client>-cmd.sh` if needed
 4. **Pull the new image before restarting** to minimize node downtime:
    ```bash
@@ -407,10 +411,10 @@ To restart a single node mid-devnet (e.g., to test a new image or checkpoint syn
    ```bash
    cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh \
      --restart-client <node_name> \
-     --checkpoint-sync-url http://127.0.0.1:<source_metrics_port>/lean/v0/states/finalized
+     --checkpoint-sync-url http://127.0.0.1:<source_api_port>/lean/v0/states/finalized
    ```
 
-**Important:** RPC and metrics share the same port (`--metrics-port`). There is no separate RPC port.
+**Important:** ethlambda serves the API (including `/lean/v0/states/finalized`) on `--api-port` (default 5052) and Prometheus metrics on `--metrics-port` (default 5054). Use the API port for checkpoint sync URLs.
 
 See `references/checkpoint-sync.md` for the full procedure, verification steps, and troubleshooting.
 

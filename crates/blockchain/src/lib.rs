@@ -103,6 +103,13 @@ impl BlockChainServer {
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
+        // Fail fast: a state with zero validators is invalid and would cause
+        // panics in proposer selection and attestation processing.
+        if self.store.head_state().validators.is_empty() {
+            error!("Head state has no validators, skipping tick");
+            return;
+        }
+
         // Update current slot metric
         metrics::update_current_slot(slot);
 

@@ -7085,7 +7085,8 @@ dependencies = [
 [[package]]
 name = "spawned-concurrency"
 version = "0.5.0"
-source = "git+https://github.com/lambdaclass/spawned.git?tag=v0.5.0-rc2#c728b223d77828a00e521f37a783a9ea1c6046b2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc21166874e8cd7584ea795c223303160461f0bb1b571bc23e92ca2abb7c5149"
 dependencies = [
  "futures",
  "pin-project-lite",
@@ -7098,7 +7099,8 @@ dependencies = [
 [[package]]
 name = "spawned-macros"
 version = "0.5.0"
-source = "git+https://github.com/lambdaclass/spawned.git?tag=v0.5.0-rc2#c728b223d77828a00e521f37a783a9ea1c6046b2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d64742b41741dfebd5b5ba4dbc4cbc5cc91f4a2cf8107191007d64295682973"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7122,7 +7124,8 @@ dependencies = [
 [[package]]
 name = "spawned-rt"
 version = "0.5.0"
-source = "git+https://github.com/lambdaclass/spawned.git?tag=v0.5.0-rc2#c728b223d77828a00e521f37a783a9ea1c6046b2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e270e6606a118708120671f2d171316762fa832cab73699c714c23aaafe6eb"
 dependencies = [
  "ctrlc",
  "tokio",

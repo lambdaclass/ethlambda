@@ -49,7 +49,9 @@ struct CliOptions {
     #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
-    metrics_address: IpAddr,
+    http_address: IpAddr,
+    #[arg(long, default_value = "5052")]
+    api_port: u16,
     #[arg(long, default_value = "5054")]
     metrics_port: u16,
     #[arg(long)]
@@ -86,7 +88,8 @@ async fn main() -> eyre::Result<()> {
         options.attestation_committee_count,
     );
 
-    let metrics_socket = SocketAddr::new(options.metrics_address, options.metrics_port);
+    let api_socket = SocketAddr::new(options.http_address, options.api_port);
+    let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
@@ -167,9 +170,16 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    ethlambda_rpc::start_rpc_server(metrics_socket, store)
-        .await
-        .unwrap();
+    tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+            .await
+            .inspect_err(|err| error!(%err, "Metrics server failed"));
+    });
+    tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_api_server(api_socket, store)
+            .await
+            .inspect_err(|err| error!(%err, "API server failed"));
+    });
 
     info!("Node initialized");
 

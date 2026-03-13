@@ -3,13 +3,11 @@ use ethlambda_metrics::gather_default_metrics;
 use tracing::warn;
 
 pub fn start_prometheus_metrics_api() -> Router {
-    Router::new()
-        .route("/metrics", get(get_metrics))
-        .route("/lean/v0/health", get(get_health))
+    Router::new().route("/metrics", get(get_metrics))
 }
 
 pub(crate) async fn get_health() -> impl IntoResponse {
-    let mut response = r#"{"status":"healthy","service":"lean-spec-api"}"#.into_response();
+    let mut response = r#"{"status":"healthy","service":"lean-rpc-api"}"#.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(crate::JSON_CONTENT_TYPE),
