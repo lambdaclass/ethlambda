@@ -15,7 +15,8 @@
 #
 # Ports:
 #   QUIC (P2P):    9001-9004 (UDP)
-#   Metrics/RPC:   8081-8084 (TCP)  -- serves /lean/v0/* API and /metrics
+#   API RPC:       8081-8084 (TCP)  -- serves /lean/v0/* API endpoints
+#   Metrics:       8085-8088 (TCP)  -- serves /metrics and /debug/pprof/*
 #
 # Prerequisites:
 #   - Podman (rootless, with dockerCompat) for genesis generation tools:
@@ -74,11 +75,12 @@ let
     let
       name = "ethlambda_${toString idx}";
       gossipPort = 9001 + idx;
-      metricsPort = 8081 + idx;
+      apiPort = 8081 + idx;
+      metricsPort = 8085 + idx;
       aggregatorArgs = lib.optionals (idx == 0) [ "--is-aggregator" ];
     in
     {
-      description = "ethlambda node ${toString idx} (gossip=${toString gossipPort}, rpc=${toString metricsPort})";
+      description = "ethlambda node ${toString idx} (gossip=${toString gossipPort}, api=${toString apiPort}, metrics=${toString metricsPort})";
       after = [ "setup-devnet.service" ];
       requires = [ "setup-devnet.service" ];
       path = with pkgs; [ bash coreutils ];
@@ -92,7 +94,8 @@ let
           "--gossipsub-port" (toString gossipPort)
           "--node-id" name
           "--node-key" "${genesisDir}/${name}.key"
-          "--metrics-address" "0.0.0.0"
+          "--http-address" "0.0.0.0"
+          "--api-port" (toString apiPort)
           "--metrics-port" (toString metricsPort)
         ] ++ aggregatorArgs);
         Restart = "on-failure";
