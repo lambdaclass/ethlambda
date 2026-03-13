@@ -212,6 +212,11 @@ fn process_attestations(
     let _timing = metrics::time_attestations_processing();
     let validator_count = state.validators.len();
     let mut attestations_processed: u64 = 0;
+    // Capture the original finalized slot before attestation processing.
+    // The spec uses self.latest_finalized.slot (immutable) for justifiability
+    // checks (Rule 6) and finalization gap checks, while using a local mutable
+    // finalized_slot for is_slot_justified (Rules 1-2) and window shifts.
+    let original_finalized_slot = state.latest_finalized.slot;
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
         .iter()
@@ -246,7 +251,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, source, target) {
+        if !is_valid_vote(state, source, target, original_finalized_slot) {
             continue;
         }
 
@@ -288,7 +293,14 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            try_finalize(state, source, target, &mut justifications, &root_to_slot);
+            try_finalize(
+                state,
+                source,
+                target,
+                original_finalized_slot,
+                &mut justifications,
+                &root_to_slot,
+            );
         }
     }
 
@@ -306,7 +318,12 @@ fn process_attestations(
 /// 4. Both checkpoints exist in historical_block_hashes
 /// 5. Target slot > source slot
 /// 6. Target slot is justifiable after the finalized slot
-fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool {
+fn is_valid_vote(
+    state: &State,
+    source: Checkpoint,
+    target: Checkpoint,
+    original_finalized_slot: u64,
+) -> bool {
     // Check that the source is already justified
     if !justified_slots_ops::is_slot_justified(
         &state.justified_slots,
@@ -342,7 +359,9 @@ fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool 
     }
 
     // Ensure the target falls on a slot that can be justified after the finalized one.
-    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
+    // Uses the original finalized slot from before attestation processing, matching
+    // the spec's use of self.latest_finalized.slot (immutable).
+    if !slot_is_justifiable_after(target.slot, original_finalized_slot) {
         return false;
     }
 
@@ -358,12 +377,15 @@ fn try_finalize(
     state: &mut State,
     source: Checkpoint,
     target: Checkpoint,
+    original_finalized_slot: u64,
     justifications: &mut HashMap<H256, Vec<bool>>,
     root_to_slot: &HashMap<H256, u64>,
 ) {
     // Consider whether finalization can advance.
+    // Uses the original finalized slot from before attestation processing, matching
+    // the spec's use of self.latest_finalized.slot (immutable).
     if ((source.slot + 1)..target.slot)
-        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
+        .any(|slot| slot_is_justifiable_after(slot, original_finalized_slot))
     {
         metrics::inc_finalizations("error");
         return;
