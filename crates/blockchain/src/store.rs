@@ -909,6 +909,14 @@ pub enum StoreError {
 
     #[error("Validator {validator_index} is not the proposer for slot {slot}")]
     NotProposer { validator_index: u64, slot: u64 },
+
+    #[error(
+        "Proposer attestation validator_id {attestation_id} does not match block proposer_index {proposer_index}"
+    )]
+    ProposerAttestationMismatch {
+        attestation_id: u64,
+        proposer_index: u64,
+    },
 }
 
 /// Build an AggregationBits bitfield from a list of validator indices.
@@ -1210,6 +1218,13 @@ fn verify_signatures(
     }
 
     let proposer_attestation = &signed_block.message.proposer_attestation;
+
+    if proposer_attestation.validator_id != block.proposer_index {
+        return Err(StoreError::ProposerAttestationMismatch {
+            attestation_id: proposer_attestation.validator_id,
+            proposer_index: block.proposer_index,
+        });
+    }
 
     let proposer_signature =
         ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
