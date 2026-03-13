@@ -87,17 +87,19 @@ validators:
 
 When running multiple nodes locally, each needs unique ports:
 
-| Node | QUIC Port | Metrics Port |
-|------|-----------|--------------|
-| zeam_0 | 9001 | 8081 |
-| ream_0 | 9002 | 8082 |
-| qlean_0 | 9003 | 8083 |
-| lantern_0 | 9004 | 8084 |
-| lighthouse_0 | 9005 | 8085 |
-| grandine_0 | 9006 | 8086 |
-| ethlambda_0 | 9007 | 8087 |
+| Node | QUIC Port | Metrics Port | API Port (ethlambda only) |
+|------|-----------|--------------|--------------------------|
+| zeam_0 | 9001 | 8081 | n/a |
+| ream_0 | 9002 | 8082 | n/a |
+| qlean_0 | 9003 | 8083 | n/a |
+| lantern_0 | 9004 | 8084 | n/a |
+| lighthouse_0 | 9005 | 8085 | n/a |
+| grandine_0 | 9006 | 8086 | n/a |
+| ethlambda_0 | 9007 | 8087 | 5052 |
 
-For **ansible mode**, all nodes can use the same ports (9001, 8081) since they run on different machines.
+When running **multiple ethlambda nodes** locally, each needs a unique `--api-port` (e.g., 5052, 5053, 5054, 5055) since `validator-config.yaml` has no `apiPort` field. Pass `--api-port` directly in `ethlambda-cmd.sh` or `docker run`.
+
+For **ansible mode**, all nodes can use the same ports (9001, 8081, 5052) since they run on different machines.
 
 ## Local vs Ansible Deployment
 

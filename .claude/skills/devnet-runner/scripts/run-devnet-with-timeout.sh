@@ -34,7 +34,7 @@ kill $PID 2>/dev/null
 wait $PID 2>/dev/null
 
 # Explicitly stop and remove containers (spin-node.sh may not clean up on kill)
-echo "Stopping containers..."
+echo "Stopping and removing containers..."
 for node in $(docker ps --format '{{.Names}}' | grep -E '^(zeam|ream|qlean|lantern|lighthouse|grandine|ethlambda)_'); do
   docker rm -f "$node" 2>/dev/null
 done

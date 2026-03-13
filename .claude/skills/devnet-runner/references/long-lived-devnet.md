@@ -48,15 +48,40 @@ for d in ethlambda_0 ethlambda_1 ethlambda_2 ethlambda_3; do
 done
 
 # Start each node (adjust ports, node-id, aggregator flag per validator-config.yaml)
+# ethlambda runs two HTTP servers: --api-port (API) and --metrics-port (metrics)
+# Both must be unique per node to avoid bind conflicts with --network host
 docker run -d --restart unless-stopped --name ethlambda_0 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_0:/data \
   $IMAGE \
   --custom-network-config-dir /config \
   --gossipsub-port 9001 --node-id ethlambda_0 \
   --node-key /config/ethlambda_0.key \
-  --metrics-address 0.0.0.0 --metrics-port 8081
+  --http-address 0.0.0.0 --api-port 5052 --metrics-port 8081
 
-# Repeat for other nodes, adding --is-aggregator to the aggregator node
+docker run -d --restart unless-stopped --name ethlambda_1 --network host \
+  -v $GENESIS:/config -v $DATA/ethlambda_1:/data \
+  $IMAGE \
+  --custom-network-config-dir /config \
+  --gossipsub-port 9002 --node-id ethlambda_1 \
+  --node-key /config/ethlambda_1.key \
+  --http-address 0.0.0.0 --api-port 5053 --metrics-port 8082
+
+docker run -d --restart unless-stopped --name ethlambda_2 --network host \
+  -v $GENESIS:/config -v $DATA/ethlambda_2:/data \
+  $IMAGE \
+  --custom-network-config-dir /config \
+  --gossipsub-port 9003 --node-id ethlambda_2 \
+  --node-key /config/ethlambda_2.key \
+  --http-address 0.0.0.0 --api-port 5054 --metrics-port 8083
+
+docker run -d --restart unless-stopped --name ethlambda_3 --network host \
+  -v $GENESIS:/config -v $DATA/ethlambda_3:/data \
+  $IMAGE \
+  --custom-network-config-dir /config \
+  --gossipsub-port 9004 --node-id ethlambda_3 \
+  --node-key /config/ethlambda_3.key \
+  --is-aggregator \
+  --http-address 0.0.0.0 --api-port 5055 --metrics-port 8084
 ```
 
 Do NOT include `--checkpoint-sync-url` in the initial start. Nodes start from genesis.
@@ -101,8 +126,9 @@ docker pull $NEW_IMAGE
 
 # 2. Pick a healthy peer's API port as checkpoint source
 #    (any running node that is NOT the one being restarted)
-#    ethlambda serves /lean/v0/states/finalized on --api-port (default 5052)
-CHECKPOINT_SOURCE_PORT=5052  # e.g., ethlambda_3's API port
+#    ethlambda serves /lean/v0/states/finalized on --api-port
+#    Port assignments: ethlambda_0=5052, _1=5053, _2=5054, _3=5055
+CHECKPOINT_SOURCE_PORT=5055  # ethlambda_3's API port (not the node being restarted)
 
 # 3. Stop and remove the container
 docker rm -f ethlambda_0
@@ -118,7 +144,7 @@ docker run -d --restart unless-stopped --name ethlambda_0 --network host \
   --custom-network-config-dir /config \
   --gossipsub-port 9001 --node-id ethlambda_0 \
   --node-key /config/ethlambda_0.key \
-  --metrics-address 0.0.0.0 --metrics-port 8081 \
+  --http-address 0.0.0.0 --api-port 5052 --metrics-port 8081 \
   --checkpoint-sync-url http://127.0.0.1:$CHECKPOINT_SOURCE_PORT/lean/v0/states/finalized
 ```
 
