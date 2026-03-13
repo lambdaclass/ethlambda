@@ -40,6 +40,8 @@ Ports are configured per-node in `validator-config.yaml`. Typical port assignmen
 
 **Note:** Adjust ports to avoid conflicts when running multiple nodes.
 
+**ethlambda dual-port note:** ethlambda runs separate API (`--api-port`, default 5052) and metrics (`--metrics-port`, default 5054) HTTP servers. Both share a bind address (`--http-address`, default `127.0.0.1`). The `metricsPort` from `validator-config.yaml` maps to `--metrics-port`. The API port must be configured separately in `ethlambda-cmd.sh`.
+
 ## Client-Specific Configuration Notes
 
 ### zeam
@@ -83,6 +85,10 @@ Ports are configured per-node in `validator-config.yaml`. Typical port assignmen
 - Image: `ghcr.io/lambdaclass/ethlambda:local`
 - Rust implementation by LambdaClass
 - Command file: `client-cmds/ethlambda-cmd.sh`
+- **Dual HTTP servers:** Runs separate API and metrics servers on independent ports
+  - `--http-address` (default `127.0.0.1`): shared bind address
+  - `--api-port` (default `5052`): API server (health, states, checkpoints, fork choice)
+  - `--metrics-port` (default `5054`): metrics server (Prometheus, pprof)
 
 ## Changing Docker Images
 
@@ -112,6 +118,7 @@ To use a different image or tag:
 
 | Issue | Image Tags Affected | Description |
 |-------|---------------------|-------------|
+| Separate API and metrics ports | PR #210+ | ethlambda now uses `--http-address`, `--api-port`, and `--metrics-port` instead of the old single `--metrics-address`/`--metrics-port`. `ethlambda-cmd.sh` in lean-quickstart must pass both `--api-port` and `--metrics-port` |
 | Manifest unknown warning | local | Docker shows "manifest unknown" but falls back to local image - can be ignored |
 | NoPeersSubscribedToTopic | all | Expected warning when no peers are connected to gossipsub topics |
 
@@ -125,5 +132,5 @@ These are set by `spin-node.sh` and available in client command scripts:
 | `$configDir` | Genesis config directory path |
 | `$dataDir` | Data directory path |
 | `$quicPort` | QUIC port from config |
-| `$metricsPort` | Metrics port from config |
+| `$metricsPort` | Metrics port from config. For ethlambda, maps to `--metrics-port`; API server needs separate `--api-port` |
 | `$privkey` | P2P private key |

@@ -11,15 +11,15 @@ Restarting a node with checkpoint sync instead of replaying from genesis. Useful
 ## Prerequisites
 
 - A running devnet with at least one healthy node to serve the checkpoint state
-- The checkpoint source node's RPC must be reachable (same port as `--metrics-port`)
+- The checkpoint source node's API must be reachable (`--api-port`, default 5052)
 
 ## Key Concepts
 
-**RPC and metrics share the same port.** ethlambda serves both Prometheus metrics (`/metrics`) and the Lean API (`/lean/v0/...`) on the `--metrics-port`. There is no separate RPC port.
+**ethlambda runs separate API and metrics servers.** The API (`/lean/v0/...`, including health and states) is served on `--api-port` (default 5052). Prometheus metrics (`/metrics`) and pprof are served on `--metrics-port` (default 5054). Both share the bind address `--http-address` (default `127.0.0.1`).
 
-**Checkpoint sync URL format:**
+**Checkpoint sync URL format (uses the API port):**
 ```
-http://<host>:<metrics-port>/lean/v0/states/finalized
+http://<host>:<api-port>/lean/v0/states/finalized
 ```
 
 **The node must have the same genesis config.** Checkpoint sync verifies the downloaded state against the local genesis config (genesis time, validator pubkeys, validator count). The `--custom-network-config-dir` must point to the same genesis used by the rest of the devnet.
@@ -42,16 +42,16 @@ validators:
 
 ### Step 2: Identify a checkpoint source
 
-Pick any other running node's metrics port as the checkpoint source. The port is configured as `metricsPort` in `validator-config.yaml`.
+Pick any other running node's API port as the checkpoint source. For ethlambda, the API is served on `--api-port` (default 5052). For other clients, the API may share the `metricsPort` from `validator-config.yaml`.
 
 For local devnets (host networking), the URL is:
 ```
-http://127.0.0.1:<metrics-port>/lean/v0/states/finalized
+http://127.0.0.1:<api-port>/lean/v0/states/finalized
 ```
 
 Verify the endpoint is reachable:
 ```bash
-curl -s http://127.0.0.1:<metrics-port>/lean/v0/health
+curl -s http://127.0.0.1:<api-port>/lean/v0/health
 # Should return: {"status":"healthy","service":"lean-spec-api"}
 ```
 
@@ -77,7 +77,7 @@ docker pull <image>:<new_tag>
 ```bash
 cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh \
   --restart-client <node_name> \
-  --checkpoint-sync-url http://127.0.0.1:<source_metrics_port>/lean/v0/states/finalized
+  --checkpoint-sync-url http://127.0.0.1:<source_api_port>/lean/v0/states/finalized
 ```
 
 This automatically:

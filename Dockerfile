@@ -59,10 +59,9 @@ COPY --from=builder /app/ethlambda /usr/local/bin
 # Copy licenses
 COPY LICENSE ./
 
-# Lighthouse-compatible default ports:
 # 9000/tcp, 9000/udp - P2P networking
 # 9001/udp - QUIC connections
-# 5052 - HTTP API
+# 5052 - API RPC
 # 5054 - Prometheus metrics
 EXPOSE 9000/tcp 9000/udp 9001/udp 5052 5054
 ENTRYPOINT ["/usr/local/bin/ethlambda"]

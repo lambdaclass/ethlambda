@@ -3,9 +3,7 @@ use ethlambda_metrics::gather_default_metrics;
 use tracing::warn;
 
 pub fn start_prometheus_metrics_api() -> Router {
-    Router::new()
-        .route("/metrics", get(get_metrics))
-        .route("/lean/v0/health", get(get_health))
+    Router::new().route("/metrics", get(get_metrics))
 }
 
 pub(crate) async fn get_health() -> impl IntoResponse {
