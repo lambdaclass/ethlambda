@@ -61,7 +61,7 @@ COPY LICENSE ./
 
 # 9000/tcp, 9000/udp - P2P networking
 # 9001/udp - QUIC connections
-# 5054 - API RPC
-# 5055 - Prometheus metrics
-EXPOSE 9000/tcp 9000/udp 9001/udp 5054 5055
+# 5052 - API RPC
+# 5054 - Prometheus metrics
+EXPOSE 9000/tcp 9000/udp 9001/udp 5052 5054
 ENTRYPOINT ["/usr/local/bin/ethlambda"]

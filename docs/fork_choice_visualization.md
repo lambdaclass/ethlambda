@@ -9,7 +9,7 @@ A browser-based real-time visualization of the LMD GHOST fork choice tree, serve
 | `GET /lean/v0/fork_choice/ui` | Interactive D3.js visualization page |
 | `GET /lean/v0/fork_choice` | JSON snapshot of the fork choice tree |
 
-Both endpoints are served on the API port (`--api-port`, default `5054`).
+Both endpoints are served on the API port (`--api-port`, default `5052`).
 
 ## Quick Start
 
@@ -32,10 +32,10 @@ cargo run --release -- \
   --custom-network-config-dir ./config \
   --node-key ./keys/node.key \
   --node-id 0 \
-  --api-port 5054
+  --api-port 5052
 ```
 
-Then open http://localhost:5054/lean/v0/fork_choice/ui.
+Then open http://localhost:5052/lean/v0/fork_choice/ui.
 
 ## Visualization Guide
 
@@ -71,7 +71,7 @@ Then open http://localhost:5054/lean/v0/fork_choice/ui.
 ## JSON API
 
 ```bash
-curl -s http://localhost:5054/lean/v0/fork_choice | jq .
+curl -s http://localhost:5052/lean/v0/fork_choice | jq .
 ```
 
 Response schema:

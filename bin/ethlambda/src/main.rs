@@ -50,9 +50,9 @@ struct CliOptions {
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
     http_address: IpAddr,
-    #[arg(long, default_value = "5054")]
+    #[arg(long, default_value = "5052")]
     api_port: u16,
-    #[arg(long, default_value = "5055")]
+    #[arg(long, default_value = "5054")]
     metrics_port: u16,
     #[arg(long)]
     node_key: PathBuf,
