@@ -73,6 +73,7 @@ The following links, repos, companies and projects have been important in the de
 - [Ethereum](https://ethereum.org/en/)
 - [LeanEthereum](https://github.com/leanEthereum)
 - [Zeam](https://github.com/blockblaz/zeam)
+- [Lantern](https://github.com/Pier-Two/lantern)
 
 If we forgot to include anyone, please file an issue so we can add you. We always strive to reference the inspirations and code we use, but as an organization with multiple people, mistakes can happen, and someone might forget to include a reference.
 
