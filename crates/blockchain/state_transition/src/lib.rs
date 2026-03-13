@@ -150,6 +150,10 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         state.latest_finalized.root = parent_root;
     }
 
+    // Guard: reject blocks whose slot gap would overflow historical_block_hashes.
+    // The spec relies on the SSZ list limit (HISTORICAL_ROOTS_LIMIT) to enforce
+    // this implicitly during serialization. We check explicitly before allocating
+    // to prevent OOM from a crafted block with a large slot gap.
     let num_empty_slots = (block.slot - parent_header.slot - 1) as usize;
     let current_len = state.historical_block_hashes.len();
     let new_total = current_len + 1 + num_empty_slots; // +1 for parent_root push
