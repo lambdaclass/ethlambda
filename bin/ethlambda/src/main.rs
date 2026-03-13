@@ -168,14 +168,14 @@ async fn main() -> eyre::Result<()> {
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
     tokio::spawn(async move {
-        if let Err(err) = ethlambda_rpc::start_metrics_server(metrics_socket).await {
-            error!(%err, "Metrics server failed");
-        }
+        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+            .await
+            .inspect_err(|err| error!(%err, "Metrics server failed"));
     });
     tokio::spawn(async move {
-        if let Err(err) = ethlambda_rpc::start_api_server(api_socket, store).await {
-            error!(%err, "API server failed");
-        }
+        let _ = ethlambda_rpc::start_api_server(api_socket, store)
+            .await
+            .inspect_err(|err| error!(%err, "API server failed"));
     });
 
     info!("Node initialized");
