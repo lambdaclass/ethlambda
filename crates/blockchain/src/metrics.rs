@@ -358,6 +358,19 @@ pub fn set_is_aggregator(is_aggregator: bool) {
     LEAN_IS_AGGREGATOR.set(i64::from(is_aggregator));
 }
 
+/// Set the attestation committee count gauge.
+pub fn set_attestation_committee_count(count: u64) {
+    static LEAN_ATTESTATION_COMMITTEE_COUNT: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_attestation_committee_count",
+                "Number of attestation committees (ATTESTATION_COMMITTEE_COUNT)"
+            )
+            .unwrap()
+        });
+    LEAN_ATTESTATION_COMMITTEE_COUNT.set(count as i64);
+}
+
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =

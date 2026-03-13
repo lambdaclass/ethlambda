@@ -82,6 +82,9 @@ async fn main() -> eyre::Result<()> {
     // Set node info metrics
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
+    ethlambda_blockchain::metrics::set_attestation_committee_count(
+        options.attestation_committee_count,
+    );
 
     let metrics_socket = SocketAddr::new(options.metrics_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
