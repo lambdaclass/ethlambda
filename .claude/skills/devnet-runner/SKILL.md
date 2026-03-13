@@ -401,7 +401,7 @@ To restart a single node mid-devnet (e.g., to test a new image or checkpoint syn
 **Important:** Restart nodes one at a time, waiting for each to fully sync before restarting the next. If 1/3 or more validators are offline simultaneously, finalization stalls because 3SF-mini requires 2/3+ votes to justify checkpoints.
 
 1. Choose a node to restart. If restarting the aggregator, finalization and attestation inclusion in blocks will stop until it catches back up to head.
-2. Identify a healthy node's metrics port to use as checkpoint source
+2. Identify a healthy node's API port to use as checkpoint source (ethlambda serves `/lean/v0/states/finalized` on `--api-port`, default 5052)
 3. Update the Docker image tag in `client-cmds/<client>-cmd.sh` if needed
 4. **Pull the new image before restarting** to minimize node downtime:
    ```bash
@@ -411,10 +411,10 @@ To restart a single node mid-devnet (e.g., to test a new image or checkpoint syn
    ```bash
    cd lean-quickstart && NETWORK_DIR=local-devnet ./spin-node.sh \
      --restart-client <node_name> \
-     --checkpoint-sync-url http://127.0.0.1:<source_metrics_port>/lean/v0/states/finalized
+     --checkpoint-sync-url http://127.0.0.1:<source_api_port>/lean/v0/states/finalized
    ```
 
-**Important:** RPC and metrics share the same port (`--metrics-port`). There is no separate RPC port.
+**Important:** ethlambda serves the API (including `/lean/v0/states/finalized`) on `--api-port` (default 5052) and Prometheus metrics on `--metrics-port` (default 5054). Use the API port for checkpoint sync URLs.
 
 See `references/checkpoint-sync.md` for the full procedure, verification steps, and troubleshooting.
 
