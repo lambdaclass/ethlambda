@@ -693,10 +693,16 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
             .get_block_header(&target_block_root)
             .expect("parent block exists");
     }
-    // Ensure target is at or after the source (latest_justified) to maintain
-    // the invariant: source.slot <= target.slot. When a block advances
-    // latest_justified between safe_target updates (interval 2), the walk-back
-    // above can land on a slot behind the new justified checkpoint.
+    // Guard: clamp target to latest_justified (not in the spec).
+    //
+    // The spec's walk-back has no lower bound, so it can produce attestations
+    // where target.slot < source.slot (source = latest_justified). These would
+    // fail is_valid_vote Rule 5 (target.slot > source.slot) and be discarded,
+    // but producing them wastes work and pollutes the network.
+    //
+    // This happens when a block advances latest_justified between safe_target
+    // updates (interval 2), causing the walk-back to land behind the new
+    // justified checkpoint.
     //
     // See https://github.com/blockblaz/zeam/blob/697c293879e922942965cdb1da3c6044187ae00e/pkgs/node/src/forkchoice.zig#L654-L659
     let latest_justified = store.latest_justified();
