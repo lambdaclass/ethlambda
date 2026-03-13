@@ -45,18 +45,19 @@ crates/
 - Communication via `mpsc::unbounded_channel`
 - Shared storage via `Arc<dyn StorageBackend>` (clone Store, share backend)
 
-### Tick-Based Validator Duties (4-second slots, 4 intervals per slot)
+### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
-Interval 0: Proposer check → accept attestations → build/publish block
-Interval 1: Non-proposers produce attestations
-Interval 2: Safe target update (fork choice with 2/3 threshold)
-Interval 3: Accept accumulated attestations
+Interval 0: Block proposal → accept attestations if proposal exists
+Interval 1: Vote propagation (no action)
+Interval 2: Aggregation (aggregators create proofs from gossip signatures)
+Interval 3: Safe target update (fork choice)
+Interval 4: Accept accumulated attestations
 ```
 
 ### Attestation Pipeline
 ```
 Gossip → Signature verification → new_attestations (pending)
-  ↓ (intervals 0/3)
+  ↓ (intervals 0/4)
 promote → known_attestations (fork choice active)
   ↓
 Fork choice head update
