@@ -84,6 +84,9 @@ async fn main() -> eyre::Result<()> {
     // Set node info metrics
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
+    ethlambda_blockchain::metrics::set_attestation_committee_count(
+        options.attestation_committee_count,
+    );
 
     let api_socket = SocketAddr::new(options.http_address, options.api_port);
     let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
