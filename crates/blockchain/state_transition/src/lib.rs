@@ -24,6 +24,8 @@ pub enum Error {
     InvalidProposer { expected: u64, found: u64 },
     #[error("parent root mismatch: expected {expected}, found {found}")]
     InvalidParent { expected: H256, found: H256 },
+    #[error("no validators in state")]
+    NoValidators,
     #[error("state root mismatch: expected {expected}, computed {computed}")]
     StateRootMismatch { expected: H256, computed: H256 },
     #[error("slot gap {gap} would exceed historical roots limit (current: {current}, max: {max})")]
@@ -124,7 +126,9 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
             block_slot: block.slot,
         });
     }
-    let expected_proposer = current_proposer(block.slot, state.validators.len() as u64);
+    let num_validators = state.validators.len() as u64;
+    let expected_proposer =
+        current_proposer(block.slot, num_validators).ok_or(Error::NoValidators)?;
     if block.proposer_index != expected_proposer {
         return Err(Error::InvalidProposer {
             expected: expected_proposer,
@@ -195,26 +199,22 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
     Ok(())
 }
 
-/// Determine if a validator is the proposer for a given slot.
+/// Determine the proposer for a given slot using round-robin selection.
 ///
-/// Uses round-robin proposer selection based on slot number and total
-/// validator count, following the lean protocol specification.
-fn current_proposer(slot: u64, num_validators: u64) -> u64 {
-    slot % num_validators
+/// Returns `None` when `num_validators` is zero. The spec (validator.py L25)
+/// does `slot % num_validators` without checking for zero, which would panic
+/// on division by zero. This can't happen in practice (genesis always has at
+/// least one validator), but we guard explicitly to avoid panics from crafted
+/// inputs.
+fn current_proposer(slot: u64, num_validators: u64) -> Option<u64> {
+    (num_validators > 0).then(|| slot % num_validators)
 }
 
 /// Check if a validator is the proposer for a given slot.
 ///
 /// Proposer selection uses simple round-robin: `slot % num_validators`.
 pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
-    // Guard: the spec (validator.py L25) does `slot % num_validators` without
-    // checking for zero, which would panic on division by zero. This can't
-    // happen in practice (genesis always has at least one validator), but we
-    // guard explicitly to avoid panics from crafted inputs.
-    if num_validators == 0 {
-        return false;
-    }
-    current_proposer(slot, num_validators) == validator_index
+    current_proposer(slot, num_validators) == Some(validator_index)
 }
 
 /// Apply attestations and update justification/finalization
