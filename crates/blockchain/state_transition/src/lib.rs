@@ -284,15 +284,17 @@ fn process_attestations(
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
         // Mark that each validator in this aggregation has voted for the target.
-        // Skip bits beyond validator_count — a malicious attestation could have
-        // aggregation_bits longer than the actual validator set, causing OOB panic.
+        // Use get_mut to safely skip bits beyond the validator set — a malicious
+        // attestation could carry aggregation_bits longer than validator_count.
         for (validator_id, _) in attestation
             .aggregation_bits
             .iter()
             .enumerate()
-            .filter(|(id, voted)| *voted && *id < validator_count)
+            .filter(|(_, voted)| *voted)
         {
-            votes[validator_id] = true;
+            if let Some(vote) = votes.get_mut(validator_id) {
+                *vote = true;
+            }
         }
 
         // Check whether the vote count crosses the supermajority threshold
