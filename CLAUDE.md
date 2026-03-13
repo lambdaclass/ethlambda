@@ -32,7 +32,7 @@ crates/
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
-    └─ rpc/                 # Axum HTTP: /lean/v0/{states,checkpoints,health} + /metrics
+    └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
   storage/                  # RocksDB backend, in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
 ```
@@ -274,6 +274,34 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Message IDs
 - 20-byte truncated SHA256 of: domain (valid/invalid snappy) + topic + data
+
+## HTTP Servers (API + Metrics)
+
+The RPC crate runs **two independent Axum servers** on separate ports, allowing different network policies for API and metrics.
+
+### CLI Flags
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--http-address` | `127.0.0.1` | Bind address shared by both servers |
+| `--api-port` | `5052` | API server port |
+| `--metrics-port` | `5054` | Metrics server port |
+
+### API Server (`:5052`)
+- `GET /lean/v0/health` — health check
+- `GET /lean/v0/states/finalized` — latest finalized state (SSZ)
+- `GET /lean/v0/checkpoints/justified` — justified checkpoint (JSON)
+- `GET /lean/v0/fork_choice` — fork choice tree (JSON)
+- `GET /lean/v0/fork_choice/ui` — interactive D3.js visualization
+- Requires `Store` access
+
+### Metrics Server (`:5054`)
+- `GET /metrics` — Prometheus-compatible metrics endpoint
+- `GET /debug/pprof/allocs` — heap profiling
+- `GET /debug/pprof/allocs/flamegraph` — heap flamegraph
+- No store access needed (reads from global prometheus registry)
+
+### Startup
+Both servers are spawned as independent `tokio::spawn` tasks from `main.rs`. Bind failures are logged via `error!()` but do not crash the node.
 
 ## Configuration Files
 
