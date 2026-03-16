@@ -6,12 +6,12 @@ use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
-    attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
-    block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
-    checkpoint::Checkpoint,
+    attestation::{SignedAggregatedAttestation, SignedAttestation},
+    block::{BlockSignatures, SignedBlock},
     primitives::{H256, ssz::TreeHash},
-    signature::ValidatorSecretKey,
 };
+
+use crate::key_manager::ValidatorKeyPair;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
@@ -38,7 +38,7 @@ pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER
 impl BlockChain {
     pub fn spawn(
         store: Store,
-        validator_keys: HashMap<u64, ValidatorSecretKey>,
+        validator_keys: HashMap<u64, ValidatorKeyPair>,
         is_aggregator: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(is_aggregator);
@@ -141,7 +141,7 @@ impl BlockChainServer {
             self.propose_block(slot, validator_id);
         }
 
-        // Produce attestations at interval 1 (proposer already attested in block)
+        // Produce attestations at interval 1 (all validators including proposer)
         if interval == 1 {
             self.produce_attestations(slot);
         }
@@ -164,22 +164,11 @@ impl BlockChainServer {
     }
 
     fn produce_attestations(&mut self, slot: u64) {
-        // Get the head state to determine number of validators
-        let head_state = self.store.head_state();
-
-        let num_validators = head_state.validators.len() as u64;
-
         // Produce attestation data once for all validators
         let attestation_data = store::produce_attestation_data(&self.store, slot);
 
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
-            // Skip if this validator is the slot proposer
-            if is_proposer(validator_id, slot, num_validators) {
-                info!(%slot, %validator_id, "Skipping attestation for proposer");
-                continue;
-            }
-
             // Sign the attestation
             let Ok(signature) = self
                 .key_manager
@@ -220,37 +209,19 @@ impl BlockChainServer {
             return;
         };
 
-        // Create proposer's attestation (attests to the new block)
-        let proposer_attestation = Attestation {
-            validator_id,
-            data: AttestationData {
-                slot,
-                head: Checkpoint {
-                    root: block.tree_hash_root(),
-                    slot: block.slot,
-                },
-                target: store::get_attestation_target(&self.store),
-                source: self.store.latest_justified(),
-            },
-        };
-
-        // Sign the proposer's attestation
+        // Sign the block root with the proposal key
+        let block_root = block.tree_hash_root();
         let Ok(proposer_signature) = self
             .key_manager
-            .sign_attestation(validator_id, &proposer_attestation.data)
-            .inspect_err(
-                |err| error!(%slot, %validator_id, %err, "Failed to sign proposer attestation"),
-            )
+            .sign_block_root(validator_id, slot as u32, &block_root)
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
         else {
             return;
         };
 
-        // Assemble SignedBlockWithAttestation
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block,
-                proposer_attestation,
-            },
+        // Assemble SignedBlock
+        let signed_block = SignedBlock {
+            message: block,
             signature: BlockSignatures {
                 proposer_signature,
                 attestation_signatures: attestation_signatures
@@ -275,11 +246,9 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    fn process_block(
-        &mut self,
-        signed_block: SignedBlockWithAttestation,
-    ) -> Result<(), StoreError> {
-        store::on_block(&mut self.store, signed_block)?;
+    fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
+        let validator_ids = self.key_manager.validator_ids();
+        store::on_block(&mut self.store, signed_block, &validator_ids)?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
@@ -291,7 +260,7 @@ impl BlockChainServer {
     }
 
     /// Process a newly received block.
-    fn on_block(&mut self, signed_block: SignedBlockWithAttestation) {
+    fn on_block(&mut self, signed_block: SignedBlock) {
         let mut queue = VecDeque::new();
         queue.push_back(signed_block);
 
@@ -313,13 +282,13 @@ impl BlockChainServer {
     /// the caller to process next (iteratively, avoiding deep recursion).
     fn process_or_pend_block(
         &mut self,
-        signed_block: SignedBlockWithAttestation,
-        queue: &mut VecDeque<SignedBlockWithAttestation>,
+        signed_block: SignedBlock,
+        queue: &mut VecDeque<SignedBlock>,
     ) {
-        let slot = signed_block.block.block.slot;
-        let block_root = signed_block.block.block.tree_hash_root();
-        let parent_root = signed_block.block.block.parent_root;
-        let proposer = signed_block.block.block.proposer_index;
+        let slot = signed_block.message.slot;
+        let block_root = signed_block.message.tree_hash_root();
+        let parent_root = signed_block.message.parent_root;
+        let proposer = signed_block.message.proposer_index;
 
         // Never process blocks at or below the finalized slot — they are
         // already part of the canonical chain and cannot affect fork choice.
@@ -425,11 +394,7 @@ impl BlockChainServer {
 
     /// Move pending children of `parent_root` into the work queue for iterative
     /// processing. This replaces the old recursive `process_pending_children`.
-    fn collect_pending_children(
-        &mut self,
-        parent_root: H256,
-        queue: &mut VecDeque<SignedBlockWithAttestation>,
-    ) {
+    fn collect_pending_children(&mut self, parent_root: H256, queue: &mut VecDeque<SignedBlock>) {
         let Some(child_roots) = self.pending_blocks.remove(&parent_root) else {
             return;
         };
@@ -450,7 +415,7 @@ impl BlockChainServer {
                 continue;
             };
 
-            let slot = child_block.block.block.slot;
+            let slot = child_block.message.slot;
             trace!(%parent_root, %slot, "Processing pending child block");
 
             queue.push_back(child_block);

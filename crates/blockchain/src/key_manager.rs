@@ -19,55 +19,35 @@ pub enum KeyManagerError {
     SignatureConversionError(String),
 }
 
-/// Manages validator secret keys for signing attestations.
+/// A validator's dual XMSS key pair for attestation and block proposal signing.
 ///
-/// The KeyManager stores a mapping of validator IDs to their secret keys
-/// and provides methods to sign attestations on behalf of validators.
+/// Each key is independent and advances its OTS preparation separately,
+/// allowing the validator to sign both an attestation and a block proposal
+/// within the same slot.
+pub struct ValidatorKeyPair {
+    pub attestation_key: ValidatorSecretKey,
+    pub proposal_key: ValidatorSecretKey,
+}
+
+/// Manages validator secret keys for signing attestations and block proposals.
+///
+/// Each validator has two independent XMSS keys: one for attestation signing
+/// and one for block proposal signing.
 pub struct KeyManager {
-    keys: HashMap<u64, ValidatorSecretKey>,
+    keys: HashMap<u64, ValidatorKeyPair>,
 }
 
 impl KeyManager {
-    /// Creates a new KeyManager with the given mapping of validator IDs to secret keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `keys` - A HashMap mapping validator IDs (u64) to their secret keys
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut keys = HashMap::new();
-    /// keys.insert(0, ValidatorSecretKey::from_bytes(&key_bytes)?);
-    /// let key_manager = KeyManager::new(keys);
-    /// ```
-    pub fn new(keys: HashMap<u64, ValidatorSecretKey>) -> Self {
+    pub fn new(keys: HashMap<u64, ValidatorKeyPair>) -> Self {
         Self { keys }
     }
 
     /// Returns a list of all registered validator IDs.
-    ///
-    /// The returned vector contains all validator IDs that have keys registered
-    /// in this KeyManager instance.
     pub fn validator_ids(&self) -> Vec<u64> {
         self.keys.keys().copied().collect()
     }
 
-    /// Signs an attestation for the specified validator.
-    ///
-    /// This method computes the message hash from the attestation data and signs it
-    /// using the validator's secret key.
-    ///
-    /// # Arguments
-    ///
-    /// * `validator_id` - The ID of the validator whose key should be used for signing
-    /// * `attestation_data` - The attestation data to sign
-    ///
-    /// # Returns
-    ///
-    /// Returns an `XmssSignature` (3112 bytes) on success, or a `KeyManagerError` if:
-    /// - The validator ID is not found in the KeyManager
-    /// - The signing operation fails
+    /// Signs an attestation using the validator's attestation key.
     pub fn sign_attestation(
         &mut self,
         validator_id: u64,
@@ -75,47 +55,66 @@ impl KeyManager {
     ) -> Result<XmssSignature, KeyManagerError> {
         let message_hash = attestation_data.tree_hash_root();
         let slot = attestation_data.slot as u32;
-        self.sign_message(validator_id, slot, &message_hash)
+        self.sign_with_attestation_key(validator_id, slot, &message_hash)
     }
 
-    /// Signs a message hash for the specified validator.
-    ///
-    /// # Arguments
-    ///
-    /// * `validator_id` - The ID of the validator whose key should be used for signing
-    /// * `slot` - The slot number used in the XMSS signature scheme
-    /// * `message` - The message hash to sign
-    ///
-    /// # Returns
-    ///
-    /// Returns an `XmssSignature` (3112 bytes) on success, or a `KeyManagerError` if:
-    /// - The validator ID is not found in the KeyManager
-    /// - The signing operation fails
-    fn sign_message(
+    /// Signs a block root using the validator's proposal key.
+    pub fn sign_block_root(
+        &mut self,
+        validator_id: u64,
+        slot: u32,
+        block_root: &H256,
+    ) -> Result<XmssSignature, KeyManagerError> {
+        self.sign_with_proposal_key(validator_id, slot, block_root)
+    }
+
+    fn sign_with_attestation_key(
         &mut self,
         validator_id: u64,
         slot: u32,
         message: &H256,
     ) -> Result<XmssSignature, KeyManagerError> {
-        let secret_key = self
+        let key_pair = self
             .keys
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
         let signature: ValidatorSignature = {
             let _timing = metrics::time_pq_sig_attestation_signing();
-            secret_key
+            key_pair
+                .attestation_key
                 .sign(slot, message)
                 .map_err(|e| KeyManagerError::SigningError(e.to_string()))
         }?;
         metrics::inc_pq_sig_attestation_signatures();
 
-        // Convert ValidatorSignature to XmssSignature (FixedVector<u8, SignatureSize>)
         let sig_bytes = signature.to_bytes();
-        let xmss_sig = XmssSignature::try_from(sig_bytes)
-            .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))?;
+        XmssSignature::try_from(sig_bytes)
+            .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))
+    }
 
-        Ok(xmss_sig)
+    fn sign_with_proposal_key(
+        &mut self,
+        validator_id: u64,
+        slot: u32,
+        message: &H256,
+    ) -> Result<XmssSignature, KeyManagerError> {
+        let key_pair = self
+            .keys
+            .get_mut(&validator_id)
+            .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
+
+        let signature: ValidatorSignature = {
+            let _timing = metrics::time_pq_sig_attestation_signing();
+            key_pair
+                .proposal_key
+                .sign(slot, message)
+                .map_err(|e| KeyManagerError::SigningError(e.to_string()))
+        }?;
+
+        let sig_bytes = signature.to_bytes();
+        XmssSignature::try_from(sig_bytes)
+            .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))
     }
 }
 
@@ -136,7 +135,20 @@ mod tests {
         let mut key_manager = KeyManager::new(keys);
         let message = H256::default();
 
-        let result = key_manager.sign_message(123, 0, &message);
+        let result = key_manager.sign_with_attestation_key(123, 0, &message);
+        assert!(matches!(
+            result,
+            Err(KeyManagerError::ValidatorKeyNotFound(123))
+        ));
+    }
+
+    #[test]
+    fn test_sign_block_root_validator_not_found() {
+        let keys = HashMap::new();
+        let mut key_manager = KeyManager::new(keys);
+        let message = H256::default();
+
+        let result = key_manager.sign_block_root(123, 0, &message);
         assert!(matches!(
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))

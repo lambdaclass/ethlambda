@@ -144,7 +144,9 @@ fn verify_checkpoint_state(
         .zip(expected_validators.iter())
         .enumerate()
     {
-        if state_val.pubkey != expected_val.pubkey {
+        if state_val.attestation_pubkey != expected_val.attestation_pubkey
+            || state_val.proposal_pubkey != expected_val.proposal_pubkey
+        {
             return Err(CheckpointSyncError::ValidatorPubkeyMismatch { index: i });
         }
     }
@@ -230,14 +232,16 @@ mod tests {
 
     fn create_test_validator() -> Validator {
         Validator {
-            pubkey: [1u8; 52],
+            attestation_pubkey: [1u8; 52],
+            proposal_pubkey: [11u8; 52],
             index: 0,
         }
     }
 
     fn create_different_validator() -> Validator {
         Validator {
-            pubkey: [2u8; 52],
+            attestation_pubkey: [2u8; 52],
+            proposal_pubkey: [22u8; 52],
             index: 0,
         }
     }
@@ -245,7 +249,8 @@ mod tests {
     fn create_validators_with_indices(count: usize) -> Vec<Validator> {
         (0..count)
             .map(|i| Validator {
-                pubkey: [i as u8 + 1; 52],
+                attestation_pubkey: [i as u8 + 1; 52],
+                proposal_pubkey: [i as u8 + 101; 52],
                 index: i as u64,
             })
             .collect()

@@ -18,6 +18,7 @@ use std::{
 };
 
 use clap::Parser;
+use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
@@ -237,13 +238,16 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
 #[derive(Debug, Deserialize)]
 struct AnnotatedValidator {
     index: u64,
-    #[serde(rename = "pubkey_hex")]
+    #[serde(rename = "attestation_pubkey_hex")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    _pubkey: ValidatorPubkeyBytes,
-    privkey_file: PathBuf,
+    _attestation_pubkey: ValidatorPubkeyBytes,
+    #[serde(rename = "proposal_pubkey_hex")]
+    #[serde(deserialize_with = "deser_pubkey_hex")]
+    _proposal_pubkey: ValidatorPubkeyBytes,
+    attestation_privkey_file: PathBuf,
+    proposal_privkey_file: PathBuf,
 }
 
-// Taken from ethrex-common
 pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -262,12 +266,11 @@ fn read_validator_keys(
     validators_path: impl AsRef<Path>,
     validator_keys_dir: impl AsRef<Path>,
     node_id: &str,
-) -> HashMap<u64, ValidatorSecretKey> {
+) -> HashMap<u64, ValidatorKeyPair> {
     let validators_path = validators_path.as_ref();
     let validator_keys_dir = validator_keys_dir.as_ref();
     let validators_yaml =
         std::fs::read_to_string(validators_path).expect("Failed to read validators file");
-    // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
     let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
         serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
 
@@ -280,32 +283,46 @@ fn read_validator_keys(
     for validator in validator_vec {
         let validator_index = validator.index;
 
-        // Resolve the secret key file path relative to the validators config directory
-        let secret_key_path = if validator.privkey_file.is_absolute() {
-            validator.privkey_file.clone()
-        } else {
-            validator_keys_dir.join(&validator.privkey_file)
+        let resolve_path = |file: &PathBuf| -> PathBuf {
+            if file.is_absolute() {
+                file.clone()
+            } else {
+                validator_keys_dir.join(file)
+            }
         };
 
-        info!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, "Loading validator secret key");
+        let att_key_path = resolve_path(&validator.attestation_privkey_file);
+        let prop_key_path = resolve_path(&validator.proposal_privkey_file);
 
-        // Read the hex-encoded secret key file
-        let secret_key_bytes =
-            std::fs::read(&secret_key_path).expect("Failed to read validator secret key file");
+        info!(node_id=%node_id, index=validator_index, attestation_key=?att_key_path, proposal_key=?prop_key_path, "Loading validator key pair");
 
-        // Parse the secret key
-        let secret_key = ValidatorSecretKey::from_bytes(&secret_key_bytes).unwrap_or_else(|err| {
-            error!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, ?err, "Failed to parse validator secret key");
-            std::process::exit(1);
-        });
+        let load_key = |path: &Path, purpose: &str| -> ValidatorSecretKey {
+            let bytes = std::fs::read(path).unwrap_or_else(|err| {
+                error!(node_id=%node_id, index=validator_index, file=?path, %err, "Failed to read {purpose} key file");
+                std::process::exit(1);
+            });
+            ValidatorSecretKey::from_bytes(&bytes).unwrap_or_else(|err| {
+                error!(node_id=%node_id, index=validator_index, file=?path, ?err, "Failed to parse {purpose} key");
+                std::process::exit(1);
+            })
+        };
 
-        validator_keys.insert(validator_index, secret_key);
+        let attestation_key = load_key(&att_key_path, "attestation");
+        let proposal_key = load_key(&prop_key_path, "proposal");
+
+        validator_keys.insert(
+            validator_index,
+            ValidatorKeyPair {
+                attestation_key,
+                proposal_key,
+            },
+        );
     }
 
     info!(
         node_id = %node_id,
         count = validator_keys.len(),
-        "Loaded validator secret keys"
+        "Loaded validator key pairs"
     );
 
     validator_keys
