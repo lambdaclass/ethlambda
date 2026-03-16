@@ -7,7 +7,7 @@ use ethlambda_types::{
     primitives::{H256, ssz::TreeHash},
     state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 mod justified_slots_ops;
 pub mod metrics;
@@ -283,18 +283,23 @@ fn process_attestations(
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
+        // Reject attestations with aggregation_bits longer than the validator set.
+        // The spec would crash (IndexError) on OOB access; Zeam and Lantern reject.
+        if attestation.aggregation_bits.len() > validator_count {
+            warn!(
+                bits_len = attestation.aggregation_bits.len(),
+                validator_count, "Skipping attestation: aggregation_bits exceeds validator count"
+            );
+            continue;
+        }
         // Mark that each validator in this aggregation has voted for the target.
-        // Use get_mut to safely skip bits beyond the validator set — a malicious
-        // attestation could carry aggregation_bits longer than validator_count.
         for (validator_id, _) in attestation
             .aggregation_bits
             .iter()
             .enumerate()
             .filter(|(_, voted)| *voted)
         {
-            if let Some(vote) = votes.get_mut(validator_id) {
-                *vote = true;
-            }
+            votes[validator_id] = true;
         }
 
         // Check whether the vote count crosses the supermajority threshold
@@ -420,14 +425,19 @@ fn try_finalize(
     let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
     justified_slots_ops::shift_window(&mut state.justified_slots, delta);
 
-    // Prune justifications whose roots only appear at now-finalized slots.
-    // Use .get() instead of direct index — a root may be absent from root_to_slot
-    // if it was never in historical_block_hashes (e.g. carried over from a previous
-    // finalization window). Missing roots are conservatively retained.
-    justifications.retain(|root, _| {
-        root_to_slot
-            .get(root)
-            .is_none_or(|&slot| slot > state.latest_finalized.slot)
+    // Prune justifications whose roots are at or below the finalized slot.
+    // The spec asserts all roots must be in root_to_slot (state.py L560).
+    // A missing root means its slot <= finalized_slot, so prune it.
+    justifications.retain(|root, _| match root_to_slot.get(root) {
+        Some(&slot) => slot > state.latest_finalized.slot,
+        None => {
+            warn!(
+                root = %ShortRoot(&root.0),
+                finalized_slot = state.latest_finalized.slot,
+                "Justification root missing from root_to_slot, pruning"
+            );
+            false
+        }
     });
 }
 
