@@ -1,4 +1,4 @@
-use super::common::{Block, ProposerAttestation, TestInfo, TestState};
+use super::common::{Block, TestInfo, TestState};
 use ethlambda_types::primitives::H256;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -58,8 +58,6 @@ pub struct ForkChoiceStep {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockStepData {
     pub block: Block,
-    #[serde(rename = "proposerAttestation")]
-    pub proposer_attestation: ProposerAttestation,
     #[serde(rename = "blockRootLabel")]
     pub block_root_label: Option<String>,
 }

@@ -7,8 +7,8 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{Attestation, AttestationData},
-    block::{Block, BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
+    attestation::AttestationData,
+    block::{Block, BlockSignatures, SignedBlock},
     primitives::{H256, VariableList, ssz::TreeHash},
     state::State,
 };
@@ -59,7 +59,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let signed_block = build_signed_block(block_data);
 
                     let block_time_ms =
-                        genesis_time * 1000 + signed_block.block.block.slot * MILLISECONDS_PER_SLOT;
+                        genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true, false);
@@ -104,15 +104,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttestation {
+fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
     let block: Block = block_data.block.into();
-    let proposer_attestation: Attestation = block_data.proposer_attestation.into();
 
-    SignedBlockWithAttestation {
-        block: BlockWithAttestation {
-            block,
-            proposer_attestation,
-        },
+    SignedBlock {
+        message: block,
         signature: BlockSignatures {
             proposer_signature: Default::default(),
             attestation_signatures: VariableList::empty(),

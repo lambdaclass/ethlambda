@@ -1,5 +1,5 @@
 use ethlambda_types::{
-    block::SignedBlockWithAttestation,
+    block::SignedBlock,
     checkpoint::Checkpoint,
     primitives::{
         H256,
@@ -94,7 +94,7 @@ impl std::fmt::Debug for ResponseCode {
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-    BlocksByRoot(Vec<SignedBlockWithAttestation>),
+    BlocksByRoot(Vec<SignedBlock>),
 }
 
 #[derive(Debug, Clone, Encode, Decode)]

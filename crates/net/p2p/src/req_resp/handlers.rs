@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::ssz::TreeHash;
-use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
+use ethlambda_types::{block::SignedBlock, primitives::H256};
 
 use super::{
     BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRootRequest, Request, Response, ResponsePayload, Status,
@@ -125,7 +125,7 @@ async fn handle_blocks_by_root_request(
 
 async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
-    blocks: Vec<SignedBlockWithAttestation>,
+    blocks: Vec<SignedBlock>,
     peer: PeerId,
     request_id: request_response::OutboundRequestId,
     ctx: &Context<P2PServer>,
@@ -146,7 +146,7 @@ async fn handle_blocks_by_root_response(
     }
 
     for block in blocks {
-        let root = block.block.block.tree_hash_root();
+        let root = block.message.tree_hash_root();
 
         // Validate that this block matches what we requested
         if root != requested_root {

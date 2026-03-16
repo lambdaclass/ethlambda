@@ -12,7 +12,7 @@ use super::{
     },
 };
 
-use ethlambda_types::block::SignedBlockWithAttestation;
+use ethlambda_types::block::SignedBlock;
 use ethlambda_types::primitives::ssz::Decode as SszDecode;
 
 #[derive(Debug, Clone, Default)]
@@ -202,7 +202,7 @@ where
 /// Returns `Err` if:
 /// - I/O error occurs while reading response codes or payloads (except `UnexpectedEof`
 ///   which signals normal stream termination)
-/// - Block payload cannot be SSZ-decoded into `SignedBlockWithAttestation` (InvalidData)
+/// - Block payload cannot be SSZ-decoded into `SignedBlock` (InvalidData)
 ///
 /// Note: Error chunks from the peer (non-SUCCESS response codes) do not cause this
 /// function to return `Err` - they are logged and skipped.
@@ -233,7 +233,7 @@ where
             continue;
         }
 
-        let block = SignedBlockWithAttestation::from_ssz_bytes(&payload)
+        let block = SignedBlock::from_ssz_bytes(&payload)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
         blocks.push(block);
     }
