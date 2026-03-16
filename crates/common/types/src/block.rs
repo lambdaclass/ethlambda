@@ -2,9 +2,7 @@ use serde::Serialize;
 use ssz_types::typenum::U1048576;
 
 use crate::{
-    attestation::{
-        AggregatedAttestation, AggregationBits, Attestation, XmssSignature, validator_indices,
-    },
+    attestation::{AggregatedAttestation, AggregationBits, XmssSignature, validator_indices},
     primitives::{
         ByteList, H256,
         ssz::{Decode, Encode, TreeHash},
@@ -12,29 +10,24 @@ use crate::{
     state::ValidatorRegistryLimit,
 };
 
-/// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
+/// Envelope carrying a block and its aggregated signatures.
 #[derive(Clone, Encode, Decode)]
-pub struct SignedBlockWithAttestation {
-    /// The block plus an attestation from proposer being signed.
-    pub block: BlockWithAttestation,
+pub struct SignedBlock {
+    /// The block being signed.
+    pub message: Block,
 
     /// Aggregated signature payload for the block.
     ///
-    /// Signatures remain in attestation order followed by the proposer signature
-    /// over entire block. For devnet 1, however the proposer signature is just
-    /// over block.proposer_attestation since leanVM is not yet performant enough
-    /// to aggregate signatures with sufficient throughput.
-    ///
-    /// Eventually this field will be replaced by a SNARK (which represents the
-    /// aggregation of all signatures).
+    /// Contains per-attestation aggregated proofs and the proposer's signature
+    /// over the block root using the proposal key.
     pub signature: BlockSignatures,
 }
 
 // Manual Debug impl because leanSig signatures don't implement Debug.
-impl core::fmt::Debug for SignedBlockWithAttestation {
+impl core::fmt::Debug for SignedBlock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SignedBlockWithAttestation")
-            .field("block", &self.block)
+        f.debug_struct("SignedBlock")
+            .field("message", &self.message)
             .field("signature", &"...")
             .finish()
     }
@@ -52,7 +45,7 @@ pub struct BlockSignatures {
     /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
     pub attestation_signatures: AttestationSignatures,
 
-    /// Signature for the proposer's attestation.
+    /// Proposer's signature over the block root using the proposal key.
     pub proposer_signature: XmssSignature,
 }
 
@@ -108,54 +101,6 @@ impl AggregatedSignatureProof {
     /// Returns the validator indices that are set in the participants bitfield.
     pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
         validator_indices(&self.participants)
-    }
-}
-
-/// Bundle containing a block and the proposer's attestation.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
-pub struct BlockWithAttestation {
-    /// The proposed block message.
-    pub block: Block,
-
-    /// The proposer's attestation corresponding to this block.
-    pub proposer_attestation: Attestation,
-}
-
-/// Stored block signatures and proposer attestation.
-///
-/// This type stores the data needed to reconstruct a `SignedBlockWithAttestation`
-/// when combined with a `Block` from the blocks table.
-#[derive(Clone, Encode, Decode)]
-pub struct BlockSignaturesWithAttestation {
-    /// The proposer's attestation for this block.
-    pub proposer_attestation: Attestation,
-
-    /// The aggregated signatures for the block.
-    pub signatures: BlockSignatures,
-}
-
-impl BlockSignaturesWithAttestation {
-    /// Create from a SignedBlockWithAttestation by consuming it.
-    ///
-    /// Takes ownership to avoid cloning large signature data.
-    pub fn from_signed_block(signed_block: SignedBlockWithAttestation) -> Self {
-        Self {
-            proposer_attestation: signed_block.block.proposer_attestation,
-            signatures: signed_block.signature,
-        }
-    }
-
-    /// Reconstruct a SignedBlockWithAttestation given the block.
-    ///
-    /// Consumes self to avoid cloning large signature data.
-    pub fn to_signed_block(self, block: Block) -> SignedBlockWithAttestation {
-        SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block,
-                proposer_attestation: self.proposer_attestation,
-            },
-            signature: self.signatures,
-        }
     }
 }
 

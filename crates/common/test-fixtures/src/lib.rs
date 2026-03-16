@@ -92,15 +92,20 @@ impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Validator {
     index: u64,
+    #[serde(rename = "attestationPubkey")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    pubkey: ValidatorPubkeyBytes,
+    attestation_pubkey: ValidatorPubkeyBytes,
+    #[serde(rename = "proposalPubkey")]
+    #[serde(deserialize_with = "deser_pubkey_hex")]
+    proposal_pubkey: ValidatorPubkeyBytes,
 }
 
 impl From<Validator> for DomainValidator {
     fn from(value: Validator) -> Self {
         Self {
             index: value.index,
-            pubkey: value.pubkey,
+            attestation_pubkey: value.attestation_pubkey,
+            proposal_pubkey: value.proposal_pubkey,
         }
     }
 }
