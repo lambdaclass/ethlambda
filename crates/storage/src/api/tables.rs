@@ -5,7 +5,7 @@ pub enum Table {
     BlockHeaders,
     /// Block body storage: H256 -> BlockBody
     BlockBodies,
-    /// Block signatures storage: H256 -> BlockSignaturesWithAttestation
+    /// Block signatures storage: H256 -> BlockSignatures
     ///
     /// Stored separately from blocks because the genesis block has no signatures.
     /// All other blocks must have an entry in this table.

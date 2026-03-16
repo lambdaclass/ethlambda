@@ -13,10 +13,7 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
-        BlockWithAttestation, SignedBlockWithAttestation,
-    },
+    block::{Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock},
     checkpoint::Checkpoint,
     primitives::{
         H256,
@@ -742,7 +739,7 @@ impl Store {
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
-    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) {
         let mut batch = self.backend.begin_write().expect("write batch");
         write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
@@ -755,7 +752,7 @@ impl Store {
     /// only storing signatures for non-genesis blocks.
     ///
     /// Takes ownership to avoid cloning large signature data.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
@@ -774,7 +771,7 @@ impl Store {
     ///
     /// Returns None if any of the components are not found.
     /// Note: Genesis block has no entry in BlockSignatures table.
-    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
+    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.as_ssz_bytes();
 
@@ -792,10 +789,12 @@ impl Store {
         };
 
         let block = Block::from_header_and_body(header, body);
-        let signatures =
-            BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
-        Some(signatures.to_signed_block(block))
+        Some(SignedBlock {
+            message: block,
+            signature,
+        })
     }
 
     // ============ States ============
@@ -1149,20 +1148,12 @@ impl Store {
 fn write_signed_block(
     batch: &mut dyn StorageWriteBatch,
     root: &H256,
-    signed_block: SignedBlockWithAttestation,
+    signed_block: SignedBlock,
 ) -> Block {
-    let SignedBlockWithAttestation {
-        block: BlockWithAttestation {
-            block,
-            proposer_attestation,
-        },
+    let SignedBlock {
+        message: block,
         signature,
     } = signed_block;
-
-    let signatures = BlockSignaturesWithAttestation {
-        proposer_attestation,
-        signatures: signature,
-    };
 
     let header = block.header();
     let root_bytes = root.as_ssz_bytes();
@@ -1180,7 +1171,7 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    let sig_entries = vec![(root_bytes, signatures.as_ssz_bytes())];
+    let sig_entries = vec![(root_bytes, signature.as_ssz_bytes())];
     batch
         .put_batch(Table::BlockSignatures, sig_entries)
         .expect("put block signatures");
