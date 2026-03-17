@@ -83,8 +83,8 @@ const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 /// ~1 day of block history at 4-second slots (86400 / 4 = 21600).
 const BLOCKS_TO_KEEP: usize = 21_600;
 
-/// ~1 hour of state history at 4-second slots (3600 / 4 = 900).
-const STATES_TO_KEEP: usize = 900;
+/// ~3.3 hours of state history at 4-second slots (12000 / 4 = 3000).
+const STATES_TO_KEEP: usize = 3_000;
 
 const _: () = assert!(
     BLOCKS_TO_KEEP >= STATES_TO_KEEP,
@@ -1480,9 +1480,9 @@ mod tests {
 
         store.prune_old_data();
 
-        // 905 headers total. Top 900 by slot are kept in the retention window,
+        // 3005 headers total. Top 3000 by slot are kept in the retention window,
         // leaving 5 candidates. 2 are protected (finalized + justified),
-        // so 3 are pruned → 905 - 3 = 902 states remaining.
+        // so 3 are pruned → 3005 - 3 = 3002 states remaining.
         assert_eq!(
             count_entries(backend.as_ref(), Table::States),
             STATES_TO_KEEP + 2
