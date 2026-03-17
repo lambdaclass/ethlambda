@@ -7,7 +7,7 @@ use ethlambda_types::{
     primitives::{H256, ssz::TreeHash},
     state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 mod justified_slots_ops;
 pub mod metrics;
@@ -283,6 +283,15 @@ fn process_attestations(
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
+        // Reject attestations with aggregation_bits longer than the validator set.
+        // The spec would crash (IndexError) on OOB access; Zeam and Lantern reject.
+        if attestation.aggregation_bits.len() > validator_count {
+            warn!(
+                bits_len = attestation.aggregation_bits.len(),
+                validator_count, "Skipping attestation: aggregation_bits exceeds validator count"
+            );
+            continue;
+        }
         // Mark that each validator in this aggregation has voted for the target.
         for (validator_id, _) in attestation
             .aggregation_bits
@@ -416,10 +425,19 @@ fn try_finalize(
     let delta = (state.latest_finalized.slot - old_finalized_slot) as usize;
     justified_slots_ops::shift_window(&mut state.justified_slots, delta);
 
-    // Prune justifications whose roots only appear at now-finalized slots
-    justifications.retain(|root, _| {
-        let slot = root_to_slot[root];
-        slot > state.latest_finalized.slot
+    // Prune justifications whose roots are at or below the finalized slot.
+    // The spec asserts all roots must be in root_to_slot (state.py L560).
+    // A missing root means its slot <= finalized_slot, so prune it.
+    justifications.retain(|root, _| match root_to_slot.get(root) {
+        Some(&slot) => slot > state.latest_finalized.slot,
+        None => {
+            warn!(
+                root = %ShortRoot(&root.0),
+                finalized_slot = state.latest_finalized.slot,
+                "Justification root missing from root_to_slot, pruning"
+            );
+            false
+        }
     });
 }
 
