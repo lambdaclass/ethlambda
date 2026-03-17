@@ -83,8 +83,8 @@ const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 /// ~1 day of block history at 4-second slots (86400 / 4 = 21600).
 const BLOCKS_TO_KEEP: usize = 21_600;
 
-/// ~1 hour of state history at 4-second slots (3600 / 4 = 900).
-const STATES_TO_KEEP: usize = 900;
+/// ~3.3 hours of state history at 4-second slots (12000 / 4 = 3000).
+const STATES_TO_KEEP: usize = 3_000;
 
 const _: () = assert!(
     BLOCKS_TO_KEEP >= STATES_TO_KEEP,
