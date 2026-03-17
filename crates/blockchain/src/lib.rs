@@ -314,6 +314,12 @@ impl BlockChainServer {
         let parent_root = signed_block.message.block.parent_root;
         let proposer = signed_block.message.block.proposer_index;
 
+        // Never process blocks at or below the finalized slot — they are
+        // already part of the canonical chain and cannot affect fork choice.
+        if slot <= self.store.latest_finalized().slot {
+            return;
+        }
+
         // Check if parent state exists before attempting to process
         if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
