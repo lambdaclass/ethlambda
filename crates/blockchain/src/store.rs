@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_crypto::aggregate_signatures;
+use ethlambda_fork_choice::{ProtoArray, VoteTracker};
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
@@ -24,6 +25,42 @@ use tracing::{info, trace, warn};
 
 use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
+/// In-memory fork choice state managed alongside the Store.
+///
+/// Maintains the proto-array tree and vote tracker for incremental head computation.
+/// Initialized from the live chain at startup and updated on each block/tick.
+pub struct ForkChoiceState {
+    pub proto_array: ProtoArray,
+    pub vote_tracker: VoteTracker,
+}
+
+impl ForkChoiceState {
+    /// Build fork choice state from the current live chain in the store.
+    pub fn from_store(store: &Store) -> Self {
+        let mut proto_array = ProtoArray::new();
+
+        // Load all blocks from live chain and insert in topological order (by slot)
+        let blocks = store.get_live_chain();
+        let mut sorted: Vec<_> = blocks.into_iter().collect();
+        sorted.sort_by_key(|(_, (slot, _))| *slot);
+
+        for (root, (slot, parent_root)) in sorted {
+            proto_array.on_block(root, parent_root, slot);
+        }
+
+        // Initialize vote tracker with current known attestations
+        let mut vote_tracker = VoteTracker::new();
+        let attestations = store.extract_latest_known_attestations();
+        let mut deltas = vote_tracker.compute_deltas(&attestations, &proto_array);
+        proto_array.apply_score_changes(&mut deltas);
+
+        Self {
+            proto_array,
+            vote_tracker,
+        }
+    }
+}
+
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Number of attestation committees per slot.
@@ -37,27 +74,46 @@ fn compute_subnet_id(validator_id: u64) -> u64 {
 }
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    update_head(store, fc, log_tree);
 }
 
 /// Update the head based on the fork choice rule.
 ///
-/// When `log_tree` is true, also computes block weights and logs an ASCII
-/// fork choice tree to the terminal.
-fn update_head(store: &mut Store, log_tree: bool) {
-    let blocks = store.get_live_chain();
+/// Uses proto-array for incremental head computation. When `log_tree` is true,
+/// falls back to the full spec implementation for tree visualization.
+fn update_head(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
     let attestations = store.extract_latest_known_attestations();
+    let justified_root = store.latest_justified().root;
+
+    // Incremental fork choice via proto-array
+    let mut deltas = fc
+        .vote_tracker
+        .compute_deltas(&attestations, &fc.proto_array);
+    fc.proto_array.apply_score_changes(&mut deltas);
+    let new_head = fc.proto_array.find_head(justified_root);
+
+    // Debug oracle: verify proto-array matches spec implementation
+    #[cfg(debug_assertions)]
+    {
+        let blocks = store.get_live_chain();
+        let (spec_head, _) = ethlambda_fork_choice::compute_lmd_ghost_head(
+            justified_root,
+            &blocks,
+            &attestations,
+            0,
+        );
+        assert_eq!(
+            new_head, spec_head,
+            "proto-array diverged from spec: proto={:?} spec={:?}",
+            new_head, spec_head
+        );
+    }
+
     let old_head = store.head();
-    let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
-        &blocks,
-        &attestations,
-        0,
-    );
     if let Some(depth) = reorg_depth(old_head, new_head, store) {
         metrics::inc_fork_choice_reorgs();
         metrics::observe_fork_choice_reorg_depth(depth);
@@ -88,6 +144,12 @@ fn update_head(store: &mut Store, log_tree: bool) {
     }
 
     if log_tree {
+        let blocks = store.get_live_chain();
+        let weights = ethlambda_fork_choice::compute_block_weights(
+            store.latest_justified().slot,
+            &blocks,
+            &attestations,
+        );
         let tree = crate::fork_choice_tree::format_fork_choice_tree(
             &blocks,
             &weights,
@@ -299,6 +361,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(
     store: &mut Store,
+    fc: &mut ForkChoiceState,
     timestamp_ms: u64,
     has_proposal: bool,
     is_aggregator: bool,
@@ -333,7 +396,7 @@ pub fn on_tick(
             0 => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false);
+                    accept_new_attestations(store, fc, false);
                 }
             }
             1 => {
@@ -346,12 +409,12 @@ pub fn on_tick(
                 }
             }
             3 => {
-                // Update safe target for validators
+                // Update safe target for validators (uses spec implementation, not proto-array)
                 update_safe_target(store);
             }
             4 => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true);
+                accept_new_attestations(store, fc, true);
             }
             _ => unreachable!("slots only have 5 intervals"),
         }
@@ -523,10 +586,11 @@ pub fn on_gossip_aggregated_attestation(
 /// and stores them for future block building. Use this for all production paths.
 pub fn on_block(
     store: &mut Store,
+    fc: &mut ForkChoiceState,
     signed_block: SignedBlockWithAttestation,
     local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, true, local_validator_ids)
+    on_block_core(store, fc, signed_block, true, local_validator_ids)
 }
 
 /// Process a new block without signature verification.
@@ -535,9 +599,10 @@ pub fn on_block(
 /// where signatures are absent or irrelevant (e.g., fork choice spec tests).
 pub fn on_block_without_verification(
     store: &mut Store,
+    fc: &mut ForkChoiceState,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, false, &[])
+    on_block_core(store, fc, signed_block, false, &[])
 }
 
 /// Core block processing logic.
@@ -546,6 +611,7 @@ pub fn on_block_without_verification(
 /// for future block building. When false, all signature checks are skipped.
 fn on_block_core(
     store: &mut Store,
+    fc: &mut ForkChoiceState,
     signed_block: SignedBlockWithAttestation,
     verify: bool,
     local_validator_ids: &[u64],
@@ -598,6 +664,16 @@ fn on_block_core(
         store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
     }
 
+    // Prune proto-array on finalization advance and reset vote tracker
+    // (must happen after store.update_checkpoints which prunes storage)
+    if let Some(finalized) = finalized {
+        fc.proto_array.prune(finalized.root);
+        fc.vote_tracker.reset();
+    }
+
+    // Register block in proto-array for incremental fork choice
+    fc.proto_array.on_block(block_root, block.parent_root, slot);
+
     // Store signed block and state
     store.insert_signed_block(block_root, signed_block.clone());
     store.insert_state(block_root, post_state);
@@ -642,7 +718,7 @@ fn on_block_core(
     // Update forkchoice head based on new block and attestations
     // IMPORTANT: This must happen BEFORE processing proposer attestation
     // to prevent the proposer from gaining circular weight advantage.
-    update_head(store, false);
+    update_head(store, fc, false);
 
     if !verify {
         // Without sig verification, insert directly with a dummy proof
@@ -775,15 +851,15 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 ///
 /// Ensures store is up-to-date and processes any pending attestations
 /// before returning the canonical head.
-fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
+fn get_proposal_head(store: &mut Store, fc: &mut ForkChoiceState, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
-    on_tick(store, slot_time_ms, true, false);
+    on_tick(store, fc, slot_time_ms, true, false);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false);
+    accept_new_attestations(store, fc, false);
 
     store.head()
 }
@@ -794,11 +870,12 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
 /// with `block.body.attestations`.
 pub fn produce_block_with_signatures(
     store: &mut Store,
+    fc: &mut ForkChoiceState,
     slot: u64,
     validator_index: u64,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>), StoreError> {
     // Get parent block and state to build upon
-    let head_root = get_proposal_head(store, slot);
+    let head_root = get_proposal_head(store, fc, slot);
     let head_state = store
         .get_state(&head_root)
         .ok_or(StoreError::MissingParentState {

@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use ethlambda_types::{attestation::AttestationData, primitives::H256};
 
+mod proto_array;
+pub use proto_array::{ProtoArray, VoteTracker};
+
 /// Compute per-block attestation weights for the fork choice tree.
 ///
 /// For each validator attestation, walks backward from the attestation's head

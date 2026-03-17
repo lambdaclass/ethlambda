@@ -39,6 +39,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
+        let mut fc = store::ForkChoiceState::from_store(&store);
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
@@ -62,8 +63,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         + signed_block.message.block.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time_ms, true, false);
-                    let result = store::on_block_without_verification(&mut store, signed_block);
+                    store::on_tick(&mut store, &mut fc, block_time_ms, true, false);
+                    let result =
+                        store::on_block_without_verification(&mut store, &mut fc, signed_block);
 
                     match (result.is_ok(), step.valid) {
                         (true, false) => {
@@ -87,7 +89,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 "tick" => {
                     let timestamp_ms = step.time.expect("tick step missing time") * 1000;
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp_ms, false, false);
+                    store::on_tick(&mut store, &mut fc, timestamp_ms, false, false);
                 }
                 other => {
                     // Fail for unsupported step types for now
