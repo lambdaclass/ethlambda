@@ -1486,7 +1486,7 @@ mod tests {
         let head_root = root(total_states as u64 - 1);
         store.update_checkpoints(ForkCheckpoints::head_only(head_root));
 
-        // 905 headers total. Top 3000 by slot are kept in the retention window,
+        // 3005 headers total. Top 3000 by slot are kept in the retention window,
         // leaving 5 candidates. 2 are protected (finalized + justified),
         // so 3 are pruned → 3005 - 3 = 3002 states remaining.
         assert_eq!(
