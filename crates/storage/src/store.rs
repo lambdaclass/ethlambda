@@ -350,8 +350,7 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        let initial_gossip_count = Self::count_gossip_signatures(&*backend);
-        let table_bytes = Self::scan_table_bytes(&*backend);
+        let (table_bytes, initial_gossip_count) = Self::scan_tables(&*backend);
         Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
@@ -361,33 +360,26 @@ impl Store {
         }
     }
 
-    /// Count existing gossip signatures in the database.
-    ///
-    /// Used once at startup to seed the in-memory counter.
-    fn count_gossip_signatures(backend: &dyn StorageBackend) -> usize {
-        backend
-            .begin_read()
-            .expect("read view")
-            .prefix_iterator(Table::GossipSignatures, &[])
-            .expect("iterator")
-            .filter_map(|r| r.ok())
-            .count()
-    }
-
-    /// Scan all tables and sum key + value bytes. Used once at startup.
-    fn scan_table_bytes(backend: &dyn StorageBackend) -> [AtomicU64; TABLE_COUNT] {
+    /// Scan all tables at startup: compute byte sizes and gossip signature count in one pass.
+    fn scan_tables(backend: &dyn StorageBackend) -> ([AtomicU64; TABLE_COUNT], usize) {
         let view = backend.begin_read().expect("read view");
         let result: [AtomicU64; TABLE_COUNT] = std::array::from_fn(|_| AtomicU64::new(0));
+        let mut gossip_count = 0usize;
         for table in ALL_TABLES {
-            let bytes: u64 = view
+            let mut table_total = 0u64;
+            for (k, v) in view
                 .prefix_iterator(table, &[])
                 .expect("iterator")
                 .filter_map(|r| r.ok())
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum();
-            result[table.index()].store(bytes, Ordering::Relaxed);
+            {
+                table_total += (k.len() + v.len()) as u64;
+                if table == Table::GossipSignatures {
+                    gossip_count += 1;
+                }
+            }
+            result[table.index()].store(table_total, Ordering::Relaxed);
         }
-        result
+        (result, gossip_count)
     }
 
     // ============ Metadata Helpers ============
@@ -604,7 +596,7 @@ impl Store {
     ///
     /// Returns the number of signatures pruned.
     pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
-        let (pruned, _) = self.prune_by_slot(Table::GossipSignatures, finalized_slot, |bytes| {
+        let pruned = self.prune_by_slot(Table::GossipSignatures, finalized_slot, |bytes| {
             StoredSignature::from_ssz_bytes(bytes).ok().map(|s| s.slot)
         });
         self.gossip_signatures_count
@@ -619,11 +611,9 @@ impl Store {
     ///
     /// Returns the number of entries pruned.
     pub fn prune_attestation_data_by_root(&mut self, finalized_slot: u64) -> usize {
-        let (pruned, _) =
-            self.prune_by_slot(Table::AttestationDataByRoot, finalized_slot, |bytes| {
-                AttestationData::from_ssz_bytes(bytes).ok().map(|d| d.slot)
-            });
-        pruned
+        self.prune_by_slot(Table::AttestationDataByRoot, finalized_slot, |bytes| {
+            AttestationData::from_ssz_bytes(bytes).ok().map(|d| d.slot)
+        })
     }
 
     /// Prune old states beyond the retention window.
@@ -667,15 +657,7 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count > 0 {
-            // Sum byte sizes of entries being deleted
-            let view = self.backend.begin_read().expect("read view");
-            let mut deleted_bytes = 0u64;
-            for key in &keys_to_delete {
-                if let Some(value) = view.get(Table::States, key).expect("get") {
-                    deleted_bytes += (key.len() + value.len()) as u64;
-                }
-            }
-            drop(view);
+            let deleted_bytes = self.sum_entry_bytes(Table::States, &keys_to_delete);
 
             let mut batch = self.backend.begin_write().expect("write batch");
             batch
@@ -727,23 +709,9 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count > 0 {
-            // Sum byte sizes across all three block tables
-            let view = self.backend.begin_read().expect("read view");
-            let mut header_bytes = 0u64;
-            let mut body_bytes = 0u64;
-            let mut sig_bytes = 0u64;
-            for key in &keys_to_delete {
-                if let Some(v) = view.get(Table::BlockHeaders, key).expect("get") {
-                    header_bytes += (key.len() + v.len()) as u64;
-                }
-                if let Some(v) = view.get(Table::BlockBodies, key).expect("get") {
-                    body_bytes += (key.len() + v.len()) as u64;
-                }
-                if let Some(v) = view.get(Table::BlockSignatures, key).expect("get") {
-                    sig_bytes += (key.len() + v.len()) as u64;
-                }
-            }
-            drop(view);
+            let header_bytes = self.sum_entry_bytes(Table::BlockHeaders, &keys_to_delete);
+            let body_bytes = self.sum_entry_bytes(Table::BlockBodies, &keys_to_delete);
+            let sig_bytes = self.sum_entry_bytes(Table::BlockSignatures, &keys_to_delete);
 
             let mut batch = self.backend.begin_write().expect("write batch");
             batch
@@ -784,11 +752,10 @@ impl Store {
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
     pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        let (_, written) = write_signed_block(batch.as_mut(), &root, signed_block);
+        // Don't track bytes here: pending blocks are re-inserted via insert_signed_block
+        // which overwrites the same keys, so tracking here would double-count.
+        write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
-        self.add_table_bytes(Table::BlockHeaders, written.headers);
-        self.add_table_bytes(Table::BlockBodies, written.bodies);
-        self.add_table_bytes(Table::BlockSignatures, written.signatures);
     }
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -1041,13 +1008,12 @@ impl Store {
 
     /// Prune entries from a table where the slot (extracted via `get_slot`) is <= `finalized_slot`.
     /// Returns the number of entries pruned.
-    /// Returns (count_pruned, bytes_pruned).
     fn prune_by_slot(
         &mut self,
         table: Table,
         finalized_slot: u64,
         get_slot: impl Fn(&[u8]) -> Option<u64>,
-    ) -> (usize, u64) {
+    ) -> usize {
         let view = self.backend.begin_read().expect("read view");
         let mut to_delete = vec![];
         let mut deleted_bytes = 0u64;
@@ -1073,7 +1039,7 @@ impl Store {
             batch.commit().expect("commit");
             self.sub_table_bytes(table, deleted_bytes);
         }
-        (count, deleted_bytes)
+        count
     }
 
     /// Promotes all new aggregated payloads to known, making them active in fork choice.
@@ -1112,6 +1078,18 @@ impl Store {
         self.table_bytes[table.index()].fetch_sub(bytes, Ordering::Relaxed);
     }
 
+    /// Sum key + value bytes for a set of keys in a table.
+    fn sum_entry_bytes(&self, table: Table, keys: &[Vec<u8>]) -> u64 {
+        let view = self.backend.begin_read().expect("read view");
+        let mut bytes = 0u64;
+        for key in keys {
+            if let Some(v) = view.get(table, key).expect("get") {
+                bytes += (key.len() + v.len()) as u64;
+            }
+        }
+        bytes
+    }
+
     /// Delete specific gossip signatures by key.
     pub fn delete_gossip_signatures(&mut self, keys: &[SignatureKey]) {
         if keys.is_empty() {
@@ -1120,14 +1098,7 @@ impl Store {
         let count = keys.len();
         let encoded_keys: Vec<_> = keys.iter().map(encode_signature_key).collect();
 
-        let view = self.backend.begin_read().expect("read view");
-        let mut deleted_bytes = 0u64;
-        for key in &encoded_keys {
-            if let Some(v) = view.get(Table::GossipSignatures, key).expect("get") {
-                deleted_bytes += (key.len() + v.len()) as u64;
-            }
-        }
-        drop(view);
+        let deleted_bytes = self.sum_entry_bytes(Table::GossipSignatures, &encoded_keys);
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
@@ -1178,13 +1149,13 @@ impl Store {
         let encoded_key = encode_signature_key(&key);
 
         // Check if key already exists to avoid inflating the counter on upsert
-        let old_value_len = self
+        let is_new = self
             .backend
             .begin_read()
             .expect("read view")
             .get(Table::GossipSignatures, &encoded_key)
-            .expect("get");
-        let is_new = old_value_len.is_none();
+            .expect("get")
+            .is_none();
 
         let stored = StoredSignature::new(slot, signature);
         let value = stored.as_ssz_bytes();
