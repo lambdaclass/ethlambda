@@ -209,14 +209,9 @@ pub fn build_swarm(
     // attestation_committee_count is validated to be >= 1 by clap at CLI parse time.
     let subnet_id = config
         .validator_id
-        .map(|vid| vid % config.attestation_committee_count);
-    metrics::set_attestation_committee_subnet(subnet_id.unwrap_or(0));
-
-    let attestation_topic_kind = match subnet_id {
-        Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
-        // Non-validators use subnet 0 for publishing
-        None => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_0"),
-    };
+        .map(|vid| vid % config.attestation_committee_count)
+        .unwrap_or(0);
+    let attestation_topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
     let attestation_topic_str =
         format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
     let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
@@ -228,6 +223,7 @@ pub fn build_swarm(
             .behaviour_mut()
             .gossipsub
             .subscribe(&attestation_topic)?;
+        metrics::set_attestation_committee_subnet(subnet_id);
         info!(%attestation_topic_kind, "Subscribed to attestation subnet");
     }
 
