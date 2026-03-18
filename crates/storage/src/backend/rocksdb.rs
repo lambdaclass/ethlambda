@@ -61,6 +61,17 @@ impl StorageBackend for RocksDBBackend {
             batch: WriteBatch::default(),
         }))
     }
+
+    fn estimate_table_bytes(&self, table: Table) -> u64 {
+        let Some(cf) = self.db.cf_handle(cf_name(table)) else {
+            return 0;
+        };
+        self.db
+            .property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
 }
 
 /// Read-only view into RocksDB.

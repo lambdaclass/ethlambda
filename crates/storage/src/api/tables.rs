@@ -26,11 +26,8 @@ pub enum Table {
     LiveChain,
 }
 
-/// Number of tables.
-pub const TABLE_COUNT: usize = 8;
-
 /// All table variants.
-pub const ALL_TABLES: [Table; TABLE_COUNT] = [
+pub const ALL_TABLES: [Table; 8] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
@@ -42,20 +39,6 @@ pub const ALL_TABLES: [Table; TABLE_COUNT] = [
 ];
 
 impl Table {
-    /// Index into a fixed-size array. Matches the order in [`ALL_TABLES`].
-    pub fn index(self) -> usize {
-        match self {
-            Table::BlockHeaders => 0,
-            Table::BlockBodies => 1,
-            Table::BlockSignatures => 2,
-            Table::States => 3,
-            Table::GossipSignatures => 4,
-            Table::AttestationDataByRoot => 5,
-            Table::Metadata => 6,
-            Table::LiveChain => 7,
-        }
-    }
-
     /// Human-readable name for metrics labels.
     pub fn name(self) -> &'static str {
         match self {

@@ -286,7 +286,7 @@ impl BlockChainServer {
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
         for table in ALL_TABLES {
-            metrics::update_table_bytes(table.name(), self.store.table_bytes(table));
+            metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
         Ok(())
     }
