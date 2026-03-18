@@ -77,7 +77,7 @@ pub fn set_attestation_committee_subnet(subnet_id: u64) {
         )
         .unwrap()
     });
-    LEAN_ATTESTATION_COMMITTEE_SUBNET.set(subnet_id.try_into().unwrap());
+    LEAN_ATTESTATION_COMMITTEE_SUBNET.set(subnet_id.try_into().unwrap_or_default());
 }
 
 /// Notify that a peer connection event occurred.
