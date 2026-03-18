@@ -211,6 +211,8 @@ pub fn build_swarm(
         .validator_id
         .map(|vid| vid % config.attestation_committee_count)
         .unwrap_or(0);
+    metrics::set_attestation_committee_subnet(subnet_id);
+
     let attestation_topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
     let attestation_topic_str =
         format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
@@ -223,7 +225,6 @@ pub fn build_swarm(
             .behaviour_mut()
             .gossipsub
             .subscribe(&attestation_topic)?;
-        metrics::set_attestation_committee_subnet(subnet_id);
         info!(%attestation_topic_kind, "Subscribed to attestation subnet");
     }
 
