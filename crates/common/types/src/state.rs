@@ -28,7 +28,7 @@ pub struct State {
     /// A bitfield indicating which historical slots were justified
     pub justified_slots: JustifiedSlots,
     /// Registry of validators tracked by the state
-    pub validators: SszList<Validator, 4096>,
+    pub validators: SszList<Validator, VALIDATOR_REGISTRY_LIMIT>,
     /// Roots of justified blocks
     pub justifications_roots: JustificationRoots,
     /// A bitlist of validators who participated in justifications
@@ -50,10 +50,14 @@ pub type JustifiedSlots = SszBitlist<HISTORICAL_ROOTS_LIMIT>;
 /// List of justified block roots up to historical_roots_limit.
 pub type JustificationRoots = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
+/// Maximum number of validators in the registry.
+pub const VALIDATOR_REGISTRY_LIMIT: usize = 4096;
+
 /// Bitlist for tracking validator justifications per historical root.
 ///
-/// Maximum size is HISTORICAL_ROOTS_LIMIT × VALIDATOR_REGISTRY_LIMIT = 262144 × 4096 = 1,073,741,824.
-pub type JustificationValidators = SszBitlist<1_073_741_824>;
+/// Maximum size is HISTORICAL_ROOTS_LIMIT × VALIDATOR_REGISTRY_LIMIT.
+pub type JustificationValidators =
+    SszBitlist<{ HISTORICAL_ROOTS_LIMIT * VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Represents a validator's static metadata and operational interface.
 #[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
@@ -71,12 +75,15 @@ impl Validator {
     }
 }
 
+/// Size of an XMSS public key in bytes.
+pub const PUBKEY_SIZE: usize = 52;
+
 /// 52-byte XMSS public key bytes.
 ///
 /// Wrapped as a newtype because libssz only provides SszEncode/SszDecode/HashTreeRoot
 /// for common byte array sizes (4, 20, 32, 48, 96); 52 is specific to XMSS keys.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ValidatorPubkeyBytes(pub [u8; 52]);
+pub struct ValidatorPubkeyBytes(pub [u8; PUBKEY_SIZE]);
 
 impl serde::Serialize for ValidatorPubkeyBytes {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -85,8 +92,8 @@ impl serde::Serialize for ValidatorPubkeyBytes {
 }
 
 impl std::ops::Deref for ValidatorPubkeyBytes {
-    type Target = [u8; 52];
-    fn deref(&self) -> &[u8; 52] {
+    type Target = [u8; PUBKEY_SIZE];
+    fn deref(&self) -> &[u8; PUBKEY_SIZE] {
         &self.0
     }
 }
@@ -94,7 +101,7 @@ impl std::ops::Deref for ValidatorPubkeyBytes {
 impl TryFrom<Vec<u8>> for ValidatorPubkeyBytes {
     type Error = Vec<u8>;
     fn try_from(v: Vec<u8>) -> Result<Self, Self::Error> {
-        let arr: [u8; 52] = v.as_slice().try_into().map_err(|_| v)?;
+        let arr: [u8; PUBKEY_SIZE] = v.as_slice().try_into().map_err(|_| v)?;
         Ok(Self(arr))
     }
 }
@@ -104,10 +111,10 @@ impl ssz::SszEncode for ValidatorPubkeyBytes {
         true
     }
     fn fixed_size() -> usize {
-        52
+        PUBKEY_SIZE
     }
     fn encoded_len(&self) -> usize {
-        52
+        PUBKEY_SIZE
     }
     fn ssz_append(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.0);
@@ -119,16 +126,16 @@ impl ssz::SszDecode for ValidatorPubkeyBytes {
         true
     }
     fn fixed_size() -> usize {
-        52
+        PUBKEY_SIZE
     }
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
-        if bytes.len() != 52 {
+        if bytes.len() != PUBKEY_SIZE {
             return Err(ssz::DecodeError::InvalidFixedLength {
-                expected: 52,
+                expected: PUBKEY_SIZE,
                 got: bytes.len(),
             });
         }
-        let arr: [u8; 52] = bytes.try_into().unwrap();
+        let arr: [u8; PUBKEY_SIZE] = bytes.try_into().unwrap();
         Ok(Self(arr))
     }
 }

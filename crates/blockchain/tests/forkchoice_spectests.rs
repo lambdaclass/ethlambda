@@ -13,6 +13,7 @@ use ethlambda_types::{
         SignedBlockWithAttestation,
     },
     primitives::{H256, ssz::HashTreeRoot},
+    signature::SIGNATURE_SIZE,
     state::State,
 };
 
@@ -117,7 +118,7 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttest
             proposer_attestation,
         },
         signature: BlockSignatures {
-            proposer_signature: XmssSignature::try_from(vec![0u8; 3112]).unwrap(),
+            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
             attestation_signatures: AttestationSignatures::new(),
         },
     }
