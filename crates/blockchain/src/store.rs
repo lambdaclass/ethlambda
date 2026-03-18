@@ -498,17 +498,11 @@ pub fn on_gossip_aggregated_attestation(
             ((validator_id, data_root), payload)
         })
         .collect();
+    let num_participants = entries.len();
     store.insert_new_aggregated_payloads_batch(entries);
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     let slot = aggregated.data.slot;
-    let num_participants: u32 = aggregated
-        .proof
-        .participants
-        .as_bytes()
-        .iter()
-        .map(|b| b.count_ones())
-        .sum();
     info!(
         slot,
         num_participants,
