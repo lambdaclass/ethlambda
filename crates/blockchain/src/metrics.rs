@@ -308,6 +308,21 @@ pub fn time_committee_signatures_aggregation() -> TimingGuard {
     TimingGuard::new(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS)
 }
 
+/// Update a table byte size gauge.
+pub fn update_table_bytes(table_name: &str, bytes: u64) {
+    static LEAN_TABLE_BYTES: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_table_bytes",
+            "Byte size of a storage table (key + value bytes)",
+            &["table"]
+        )
+        .unwrap()
+    });
+    LEAN_TABLE_BYTES
+        .with_label_values(&[table_name])
+        .set(bytes as i64);
+}
+
 /// Update the gossip signatures gauge.
 pub fn update_gossip_signatures(count: usize) {
     static LEAN_GOSSIP_SIGNATURES: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
-use ethlambda_storage::Store;
+use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
@@ -285,6 +285,9 @@ impl BlockChainServer {
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
+        for table in ALL_TABLES {
+            metrics::update_table_bytes(table.name(), self.store.table_bytes(table));
+        }
         Ok(())
     }
 
