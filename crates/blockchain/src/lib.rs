@@ -313,6 +313,11 @@ impl BlockChainServer {
         while let Some(block) = queue.pop_front() {
             self.process_or_pend_block(block, &mut queue);
         }
+
+        // Prune old states and blocks AFTER the entire cascade completes.
+        // Running this mid-cascade would delete states that pending children
+        // still need, causing re-processing loops when fallback pruning is active.
+        self.store.prune_old_data();
     }
 
     /// Try to process a single block. If its parent state is missing, store it

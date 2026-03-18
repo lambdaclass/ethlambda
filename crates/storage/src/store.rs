@@ -83,8 +83,8 @@ const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 /// ~1 day of block history at 4-second slots (86400 / 4 = 21600).
 const BLOCKS_TO_KEEP: usize = 21_600;
 
-/// ~1 hour of state history at 4-second slots (3600 / 4 = 900).
-const STATES_TO_KEEP: usize = 900;
+/// ~3.3 hours of state history at 4-second slots (12000 / 4 = 3000).
+const STATES_TO_KEEP: usize = 3_000;
 
 const _: () = assert!(
     BLOCKS_TO_KEEP >= STATES_TO_KEEP,
@@ -470,50 +470,38 @@ impl Store {
         batch.put_batch(Table::Metadata, entries).expect("put");
         batch.commit().expect("commit");
 
-        // Prune after successful checkpoint update
+        // Lightweight pruning that should happen immediately on finalization advance:
+        // live chain index, signatures, and attestation data. These are cheap and
+        // affect fork choice correctness (live chain) or attestation processing.
+        // Heavy state/block pruning is deferred to prune_old_data().
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
             let pruned_chain = self.prune_live_chain(finalized.slot);
-
-            // Prune signatures and attestation data for finalized slots
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
             let pruned_att_data = self.prune_attestation_data_by_root(finalized.slot);
-            // Prune old states before blocks: state pruning uses headers for slot lookup
-            let protected_roots = [finalized.root, self.latest_justified().root];
-            let pruned_states = self.prune_old_states(&protected_roots);
-            let pruned_blocks = self.prune_old_blocks(&protected_roots);
 
-            if pruned_chain > 0
-                || pruned_sigs > 0
-                || pruned_att_data > 0
-                || pruned_states > 0
-                || pruned_blocks > 0
-            {
+            if pruned_chain > 0 || pruned_sigs > 0 || pruned_att_data > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_chain,
-                    pruned_sigs,
-                    pruned_att_data,
-                    pruned_states,
-                    pruned_blocks,
-                    "Pruned finalized data"
+                    pruned_chain, pruned_sigs, pruned_att_data, "Pruned finalized data"
                 );
             }
-        } else {
-            // Fallback pruning when finalization is stalled.
-            // When finalization doesn't advance, the normal pruning path above never
-            // triggers. Prune old states and blocks on every head update to keep
-            // storage bounded. The prune methods are no-ops when within retention limits.
-            let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
-            let pruned_states = self.prune_old_states(&protected_roots);
-            let pruned_blocks = self.prune_old_blocks(&protected_roots);
-            if pruned_states > 0 || pruned_blocks > 0 {
-                info!(
-                    pruned_states,
-                    pruned_blocks, "Fallback pruning (finalization stalled)"
-                );
-            }
+        }
+    }
+
+    /// Prune old states and blocks to keep storage bounded.
+    ///
+    /// This is separated from `update_checkpoints` so callers can defer heavy
+    /// pruning until after a batch of blocks has been fully processed. Running
+    /// this mid-cascade would delete states that pending children still need,
+    /// causing infinite re-processing loops when fallback pruning is active.
+    pub fn prune_old_data(&mut self) {
+        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
+        let pruned_states = self.prune_old_states(&protected_roots);
+        let pruned_blocks = self.prune_old_blocks(&protected_roots);
+        if pruned_states > 0 || pruned_blocks > 0 {
+            info!(pruned_states, pruned_blocks, "Pruned old states and blocks");
         }
     }
 
@@ -1486,9 +1474,15 @@ mod tests {
         let head_root = root(total_states as u64 - 1);
         store.update_checkpoints(ForkCheckpoints::head_only(head_root));
 
-        // 905 headers total. Top 900 by slot are kept in the retention window,
+        // update_checkpoints no longer prunes states/blocks inline — the caller
+        // must invoke prune_old_data() separately (after a block cascade completes).
+        assert_eq!(count_entries(backend.as_ref(), Table::States), total_states);
+
+        store.prune_old_data();
+
+        // 3005 headers total. Top 3000 by slot are kept in the retention window,
         // leaving 5 candidates. 2 are protected (finalized + justified),
-        // so 3 are pruned → 905 - 3 = 902 states remaining.
+        // so 3 are pruned → 3005 - 3 = 3002 states remaining.
         assert_eq!(
             count_entries(backend.as_ref(), Table::States),
             STATES_TO_KEEP + 2
@@ -1530,6 +1524,7 @@ mod tests {
         // Use the last inserted root as head
         let head_root = root(STATES_TO_KEEP as u64 - 1);
         store.update_checkpoints(ForkCheckpoints::head_only(head_root));
+        store.prune_old_data();
 
         // Nothing should be pruned (within retention window)
         assert_eq!(
