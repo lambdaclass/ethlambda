@@ -210,6 +210,8 @@ pub fn build_swarm(
     let subnet_id = config
         .validator_id
         .map(|vid| vid % config.attestation_committee_count);
+    metrics::set_attestation_committee_subnet(subnet_id.unwrap_or(0));
+
     let attestation_topic_kind = match subnet_id {
         Some(id) => format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{id}"),
         // Non-validators use subnet 0 for publishing
