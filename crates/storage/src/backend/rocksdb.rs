@@ -66,11 +66,19 @@ impl StorageBackend for RocksDBBackend {
         let Some(cf) = self.db.cf_handle(cf_name(table)) else {
             return 0;
         };
-        self.db
+        let sst_bytes = self
+            .db
             .property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
             .ok()
             .flatten()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let memtable_bytes = self
+            .db
+            .property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        sst_bytes + memtable_bytes
     }
 }
 
