@@ -39,7 +39,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
-        let mut fc = store::ForkChoiceState::from_store(&store);
+        let mut fc = store::ForkChoice::from_store(&store);
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();

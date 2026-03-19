@@ -25,21 +25,61 @@ use tracing::{info, trace, warn};
 
 use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
-/// In-memory fork choice state managed alongside the Store.
+/// Per-pool fork choice state: proto-array tree + vote tracker.
 ///
-/// Maintains the proto-array tree and vote tracker for incremental head computation.
-/// Initialized from the live chain at startup and updated on each block/tick.
-pub struct ForkChoiceState {
-    pub proto_array: ProtoArray,
-    pub vote_tracker: VoteTracker,
+/// Each instance tracks one attestation pool independently.
+struct ForkChoiceState {
+    proto_array: ProtoArray,
+    vote_tracker: VoteTracker,
 }
 
 impl ForkChoiceState {
-    /// Build fork choice state from the current live chain in the store.
+    /// Compute vote deltas and apply them to the proto-array in one step.
+    fn apply_attestations(&mut self, attestations: &HashMap<u64, AttestationData>) {
+        let mut deltas = self
+            .vote_tracker
+            .compute_deltas(attestations, &self.proto_array);
+        self.proto_array.apply_score_changes(&mut deltas);
+    }
+}
+
+/// In-memory fork choice state managed alongside the Store.
+///
+/// Wraps two independent `ForkChoiceState` instances:
+/// - `head`: fed with known attestations, used for head selection
+/// - `safe_target`: fed with known + new attestations, used for safe target with 2/3 threshold
+///
+/// Both share the same block tree topology but track votes independently.
+pub struct ForkChoice {
+    head: ForkChoiceState,
+    safe_target: ForkChoiceState,
+}
+
+impl ForkChoice {
+    /// Build fork choice from the current live chain in the store.
     pub fn from_store(store: &Store) -> Self {
+        let proto_array = Self::build_proto_array(store);
+
+        let mut head = ForkChoiceState {
+            proto_array: proto_array.clone(),
+            vote_tracker: VoteTracker::new(),
+        };
+        let mut safe_target = ForkChoiceState {
+            proto_array,
+            vote_tracker: VoteTracker::new(),
+        };
+
+        // Initialize weights with current known attestations
+        let attestations = store.extract_latest_known_attestations();
+        head.apply_attestations(&attestations);
+        safe_target.apply_attestations(&attestations);
+
+        Self { head, safe_target }
+    }
+
+    fn build_proto_array(store: &Store) -> ProtoArray {
         let mut proto_array = ProtoArray::new();
 
-        // Load all blocks from live chain and insert in topological order (by slot)
         let blocks = store.get_live_chain();
         let mut sorted: Vec<_> = blocks.into_iter().collect();
         sorted.sort_by_key(|(_, (slot, _))| *slot);
@@ -48,25 +88,23 @@ impl ForkChoiceState {
             proto_array.on_block(root, parent_root, slot);
         }
 
-        let vote_tracker = VoteTracker::new();
-        let mut fc = Self {
-            proto_array,
-            vote_tracker,
-        };
-
-        // Initialize weights with current known attestations
-        let attestations = store.extract_latest_known_attestations();
-        fc.apply_attestations(&attestations);
-
-        fc
+        proto_array
     }
 
-    /// Compute vote deltas and apply them to the proto-array in one step.
-    pub fn apply_attestations(&mut self, attestations: &HashMap<u64, AttestationData>) {
-        let mut deltas = self
-            .vote_tracker
-            .compute_deltas(attestations, &self.proto_array);
-        self.proto_array.apply_score_changes(&mut deltas);
+    /// Register a new block in both proto-arrays.
+    fn on_block(&mut self, root: H256, parent_root: H256, slot: u64) {
+        self.head.proto_array.on_block(root, parent_root, slot);
+        self.safe_target
+            .proto_array
+            .on_block(root, parent_root, slot);
+    }
+
+    /// Prune both proto-arrays and reset both vote trackers on finalization.
+    fn prune_and_reset(&mut self, finalized_root: H256) {
+        self.head.proto_array.prune(finalized_root);
+        self.head.vote_tracker.reset();
+        self.safe_target.proto_array.prune(finalized_root);
+        self.safe_target.vote_tracker.reset();
     }
 }
 
@@ -83,7 +121,7 @@ fn compute_subnet_id(validator_id: u64) -> u64 {
 }
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store, fc: &mut ForkChoice, log_tree: bool) {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
@@ -94,13 +132,13 @@ fn accept_new_attestations(store: &mut Store, fc: &mut ForkChoiceState, log_tree
 ///
 /// Uses proto-array for incremental head computation. When `log_tree` is true,
 /// falls back to the full spec implementation for tree visualization.
-fn update_head(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
+fn update_head(store: &mut Store, fc: &mut ForkChoice, log_tree: bool) {
     let attestations = store.extract_latest_known_attestations();
     let justified_root = store.latest_justified().root;
 
     // Incremental fork choice via proto-array
-    fc.apply_attestations(&attestations);
-    let new_head = fc.proto_array.find_head(justified_root);
+    fc.head.apply_attestations(&attestations);
+    let new_head = fc.head.proto_array.find_head(justified_root);
 
     // Debug oracle: verify proto-array matches spec implementation
     #[cfg(debug_assertions)]
@@ -168,13 +206,15 @@ fn update_head(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
 }
 
 /// Update the safe target for attestation.
-fn update_safe_target(store: &mut Store) {
+///
+/// Uses the safe-target proto-array with the merged attestation pool (known + new)
+/// and a 2/3 majority threshold.
+fn update_safe_target(store: &mut Store, fc: &mut ForkChoice) {
     let head_state = store.get_state(&store.head()).expect("head state exists");
     let num_validators = head_state.validators.len() as u64;
 
-    let min_target_score = (num_validators * 2).div_ceil(3);
+    let min_target_score = (num_validators * 2).div_ceil(3) as i64;
 
-    let blocks = store.get_live_chain();
     // Merge both attestation pools (keys only — skip payload deserialization).
     // At interval 3 the migration (interval 4) hasn't run yet, so attestations
     // that entered "known" directly (proposer's own attestation in block body,
@@ -184,12 +224,33 @@ fn update_safe_target(store: &mut Store) {
         .chain(store.iter_new_aggregated_payload_keys())
         .collect();
     let attestations = store.extract_latest_attestations(all_keys.into_iter());
-    let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
-        &blocks,
-        &attestations,
-        min_target_score,
-    );
+
+    let justified_root = store.latest_justified().root;
+
+    // Incremental fork choice via safe-target proto-array
+    fc.safe_target.apply_attestations(&attestations);
+    let safe_target = fc
+        .safe_target
+        .proto_array
+        .find_head_with_threshold(justified_root, min_target_score);
+
+    // Debug oracle: verify proto-array matches spec implementation
+    #[cfg(debug_assertions)]
+    {
+        let blocks = store.get_live_chain();
+        let (spec_safe_target, _) = ethlambda_fork_choice::compute_lmd_ghost_head(
+            justified_root,
+            &blocks,
+            &attestations,
+            min_target_score as u64,
+        );
+        assert_eq!(
+            safe_target, spec_safe_target,
+            "proto-array safe-target diverged from spec: proto={:?} spec={:?}",
+            safe_target, spec_safe_target
+        );
+    }
+
     store.set_safe_target(safe_target);
 }
 
@@ -367,7 +428,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(
     store: &mut Store,
-    fc: &mut ForkChoiceState,
+    fc: &mut ForkChoice,
     timestamp_ms: u64,
     has_proposal: bool,
     is_aggregator: bool,
@@ -415,8 +476,8 @@ pub fn on_tick(
                 }
             }
             3 => {
-                // Update safe target for validators (uses spec implementation, not proto-array)
-                update_safe_target(store);
+                // Update safe target for validators
+                update_safe_target(store, fc);
             }
             4 => {
                 // End of slot - accept accumulated attestations and log tree
@@ -592,7 +653,7 @@ pub fn on_gossip_aggregated_attestation(
 /// and stores them for future block building. Use this for all production paths.
 pub fn on_block(
     store: &mut Store,
-    fc: &mut ForkChoiceState,
+    fc: &mut ForkChoice,
     signed_block: SignedBlockWithAttestation,
     local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
@@ -605,7 +666,7 @@ pub fn on_block(
 /// where signatures are absent or irrelevant (e.g., fork choice spec tests).
 pub fn on_block_without_verification(
     store: &mut Store,
-    fc: &mut ForkChoiceState,
+    fc: &mut ForkChoice,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
     on_block_core(store, fc, signed_block, false, &[])
@@ -617,7 +678,7 @@ pub fn on_block_without_verification(
 /// for future block building. When false, all signature checks are skipped.
 fn on_block_core(
     store: &mut Store,
-    fc: &mut ForkChoiceState,
+    fc: &mut ForkChoice,
     signed_block: SignedBlockWithAttestation,
     verify: bool,
     local_validator_ids: &[u64],
@@ -670,15 +731,14 @@ fn on_block_core(
         store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
     }
 
-    // Prune proto-array on finalization advance and reset vote tracker
+    // Prune both proto-arrays on finalization advance and reset vote trackers
     // (must happen after store.update_checkpoints which prunes storage)
     if let Some(finalized) = finalized {
-        fc.proto_array.prune(finalized.root);
-        fc.vote_tracker.reset();
+        fc.prune_and_reset(finalized.root);
     }
 
-    // Register block in proto-array for incremental fork choice
-    fc.proto_array.on_block(block_root, block.parent_root, slot);
+    // Register block in both proto-arrays for incremental fork choice
+    fc.on_block(block_root, block.parent_root, slot);
 
     // Store signed block and state
     store.insert_signed_block(block_root, signed_block.clone());
@@ -857,7 +917,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 ///
 /// Ensures store is up-to-date and processes any pending attestations
 /// before returning the canonical head.
-fn get_proposal_head(store: &mut Store, fc: &mut ForkChoiceState, slot: u64) -> H256 {
+fn get_proposal_head(store: &mut Store, fc: &mut ForkChoice, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
@@ -876,7 +936,7 @@ fn get_proposal_head(store: &mut Store, fc: &mut ForkChoiceState, slot: u64) -> 
 /// with `block.body.attestations`.
 pub fn produce_block_with_signatures(
     store: &mut Store,
-    fc: &mut ForkChoiceState,
+    fc: &mut ForkChoice,
     slot: u64,
     validator_index: u64,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>), StoreError> {

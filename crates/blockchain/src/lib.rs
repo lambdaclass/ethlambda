@@ -18,7 +18,7 @@ use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tracing::{error, info, trace, warn};
 
-use crate::store::{ForkChoiceState, StoreError};
+use crate::store::{ForkChoice, StoreError};
 
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
@@ -44,7 +44,7 @@ impl BlockChain {
         metrics::set_is_aggregator(is_aggregator);
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
-        let fork_choice = ForkChoiceState::from_store(&store);
+        let fork_choice = ForkChoice::from_store(&store);
         let handle = BlockChainServer {
             store,
             fork_choice,
@@ -81,7 +81,7 @@ pub struct BlockChainServer {
     store: Store,
 
     /// Incremental fork choice state (proto-array + vote tracker).
-    fork_choice: ForkChoiceState,
+    fork_choice: ForkChoice,
 
     // P2P protocol ref (set via InitP2P message)
     p2p: Option<BlockChainToP2PRef>,

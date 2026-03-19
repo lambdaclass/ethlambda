@@ -52,7 +52,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Advance time to the block's slot
         let block_time_ms =
             genesis_time * 1000 + signed_block.message.block.slot * MILLISECONDS_PER_SLOT;
-        let mut fc = store::ForkChoiceState::from_store(&st);
+        let mut fc = store::ForkChoice::from_store(&st);
         store::on_tick(&mut st, &mut fc, block_time_ms, true, false);
 
         // Process the block (this includes signature verification)

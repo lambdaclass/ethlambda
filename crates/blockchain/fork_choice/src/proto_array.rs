@@ -81,12 +81,24 @@ impl ProtoArray {
     /// Follows `best_child` pointers from the justified root down to a leaf.
     /// Returns the justified root itself if it has no children.
     pub fn find_head(&self, justified_root: H256) -> H256 {
+        self.find_head_with_threshold(justified_root, 0)
+    }
+
+    /// Find the head with a minimum weight threshold.
+    ///
+    /// Like `find_head`, but stops descending when the best child's subtree
+    /// weight is below `min_score`. Since `best_child` always points to the
+    /// heaviest child, if it doesn't meet the threshold, no child can.
+    pub fn find_head_with_threshold(&self, justified_root: H256, min_score: i64) -> H256 {
         let Some(&start_idx) = self.indices.get(&justified_root) else {
             return justified_root;
         };
 
         let mut current_idx = start_idx;
         while let Some(best_child_idx) = self.nodes[current_idx].best_child {
+            if self.nodes[best_child_idx].weight < min_score {
+                break;
+            }
             current_idx = best_child_idx;
         }
 
@@ -513,5 +525,88 @@ mod tests {
         pa.apply_score_changes(&mut deltas);
 
         assert_eq!(pa.find_head(h(2)), h(4));
+    }
+
+    // ==================== Threshold tests ====================
+
+    #[test]
+    fn threshold_stops_at_branch_below_min_score() {
+        //          anchor(0)
+        //             |
+        //           a(1)
+        //          /     \
+        //        b(2)    c(2)
+        // 2 votes for b, 1 vote for c → threshold=2 stops at b, threshold=3 stops at a
+        let mut pa = ProtoArray::new();
+        pa.on_block(h(0), H256::ZERO, 0);
+        pa.on_block(h(1), h(0), 1);
+        pa.on_block(h(2), h(1), 2); // b
+        pa.on_block(h(3), h(1), 2); // c
+
+        let mut vt = VoteTracker::new();
+        let mut att = HashMap::new();
+        att.insert(0, make_attestation(h(2), 2));
+        att.insert(1, make_attestation(h(2), 2));
+        att.insert(2, make_attestation(h(3), 2));
+        let mut deltas = vt.compute_deltas(&att, &pa);
+        pa.apply_score_changes(&mut deltas);
+
+        // No threshold → follows best_child to b (weight 2 > c weight 1)
+        assert_eq!(pa.find_head_with_threshold(h(0), 0), h(2));
+        // Threshold=2 → b meets it (weight=2), so head=b
+        assert_eq!(pa.find_head_with_threshold(h(0), 2), h(2));
+        // Threshold=3 → b doesn't meet it (weight=2 < 3), stop at a
+        assert_eq!(pa.find_head_with_threshold(h(0), 3), h(1));
+    }
+
+    #[test]
+    fn threshold_returns_justified_when_no_child_qualifies() {
+        //   anchor(0) -> a(1)
+        // 1 vote for a, threshold=2 → stop at anchor
+        let mut pa = ProtoArray::new();
+        pa.on_block(h(0), H256::ZERO, 0);
+        pa.on_block(h(1), h(0), 1);
+
+        let mut vt = VoteTracker::new();
+        let mut att = HashMap::new();
+        att.insert(0, make_attestation(h(1), 1));
+        let mut deltas = vt.compute_deltas(&att, &pa);
+        pa.apply_score_changes(&mut deltas);
+
+        assert_eq!(pa.find_head_with_threshold(h(0), 2), h(0));
+    }
+
+    #[test]
+    fn threshold_walks_deep_chain_until_weight_drops() {
+        // anchor(0) -> a(1) -> b(2) -> c(3)
+        // 3 votes for c, threshold=3 → walks all the way to c
+        // Then move 1 vote to b: c has weight=2, b has weight=3
+        // threshold=3 → walks to b but stops before c
+        let mut pa = ProtoArray::new();
+        pa.on_block(h(0), H256::ZERO, 0);
+        pa.on_block(h(1), h(0), 1);
+        pa.on_block(h(2), h(1), 2);
+        pa.on_block(h(3), h(2), 3);
+
+        let mut vt = VoteTracker::new();
+        let mut att = HashMap::new();
+        att.insert(0, make_attestation(h(3), 3));
+        att.insert(1, make_attestation(h(3), 3));
+        att.insert(2, make_attestation(h(3), 3));
+        let mut deltas = vt.compute_deltas(&att, &pa);
+        pa.apply_score_changes(&mut deltas);
+
+        assert_eq!(pa.find_head_with_threshold(h(0), 3), h(3));
+
+        // Move validator 2 to vote for b instead of c
+        let mut att2 = HashMap::new();
+        att2.insert(0, make_attestation(h(3), 3));
+        att2.insert(1, make_attestation(h(3), 3));
+        att2.insert(2, make_attestation(h(2), 2));
+        let mut deltas = vt.compute_deltas(&att2, &pa);
+        pa.apply_score_changes(&mut deltas);
+
+        // c now has weight=2 (below threshold=3), b has weight=3 (meets threshold)
+        assert_eq!(pa.find_head_with_threshold(h(0), 3), h(2));
     }
 }
