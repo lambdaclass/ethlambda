@@ -48,16 +48,25 @@ impl ForkChoiceState {
             proto_array.on_block(root, parent_root, slot);
         }
 
-        // Initialize vote tracker with current known attestations
-        let mut vote_tracker = VoteTracker::new();
-        let attestations = store.extract_latest_known_attestations();
-        let mut deltas = vote_tracker.compute_deltas(&attestations, &proto_array);
-        proto_array.apply_score_changes(&mut deltas);
-
-        Self {
+        let vote_tracker = VoteTracker::new();
+        let mut fc = Self {
             proto_array,
             vote_tracker,
-        }
+        };
+
+        // Initialize weights with current known attestations
+        let attestations = store.extract_latest_known_attestations();
+        fc.apply_attestations(&attestations);
+
+        fc
+    }
+
+    /// Compute vote deltas and apply them to the proto-array in one step.
+    pub fn apply_attestations(&mut self, attestations: &HashMap<u64, AttestationData>) {
+        let mut deltas = self
+            .vote_tracker
+            .compute_deltas(attestations, &self.proto_array);
+        self.proto_array.apply_score_changes(&mut deltas);
     }
 }
 
@@ -90,10 +99,7 @@ fn update_head(store: &mut Store, fc: &mut ForkChoiceState, log_tree: bool) {
     let justified_root = store.latest_justified().root;
 
     // Incremental fork choice via proto-array
-    let mut deltas = fc
-        .vote_tracker
-        .compute_deltas(&attestations, &fc.proto_array);
-    fc.proto_array.apply_score_changes(&mut deltas);
+    fc.apply_attestations(&attestations);
     let new_head = fc.proto_array.find_head(justified_root);
 
     // Debug oracle: verify proto-array matches spec implementation
