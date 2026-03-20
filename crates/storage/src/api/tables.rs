@@ -37,3 +37,19 @@ pub const ALL_TABLES: [Table; 8] = [
     Table::Metadata,
     Table::LiveChain,
 ];
+
+impl Table {
+    /// Human-readable name for metrics labels.
+    pub fn name(self) -> &'static str {
+        match self {
+            Table::BlockHeaders => "block_headers",
+            Table::BlockBodies => "block_bodies",
+            Table::BlockSignatures => "block_signatures",
+            Table::States => "states",
+            Table::GossipSignatures => "gossip_signatures",
+            Table::AttestationDataByRoot => "attestation_data_by_root",
+            Table::Metadata => "metadata",
+            Table::LiveChain => "live_chain",
+        }
+    }
+}
