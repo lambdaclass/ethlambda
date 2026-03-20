@@ -2,6 +2,41 @@
 
 use ethlambda_metrics::*;
 
+static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_attestations_invalid_total",
+            "Total number of invalid attestations"
+        )
+        .unwrap()
+    });
+
+static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_pq_sig_aggregated_signatures_invalid_total",
+            "Total number of invalid aggregated signatures"
+        )
+        .unwrap()
+    });
+
+static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_pq_sig_attestation_signatures_invalid_total",
+            "Total number of invalid individual attestation signatures"
+        )
+        .unwrap()
+    });
+
+/// Initialize metrics that may never be incremented so they appear in Prometheus with value 0.
+/// When adding a new module-scope counter above, add a corresponding `LazyLock::force` call here.
+pub fn init() {
+    std::sync::LazyLock::force(&LEAN_ATTESTATIONS_INVALID_TOTAL);
+    std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL);
+    std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
+}
+
 pub fn update_head_slot(slot: u64) {
     static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
         register_int_gauge!("lean_head_slot", "Latest slot of the lean chain").unwrap()
@@ -93,14 +128,6 @@ pub fn inc_attestations_valid() {
 
 /// Increment the invalid attestations counter.
 pub fn inc_attestations_invalid() {
-    static LEAN_ATTESTATIONS_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
-        std::sync::LazyLock::new(|| {
-            register_int_counter!(
-                "lean_attestations_invalid_total",
-                "Total number of invalid attestations"
-            )
-            .unwrap()
-        });
     LEAN_ATTESTATIONS_INVALID_TOTAL.inc();
 }
 
@@ -187,14 +214,6 @@ pub fn inc_pq_sig_aggregated_signatures_valid() {
 
 /// Increment the invalid aggregated signatures counter.
 pub fn inc_pq_sig_aggregated_signatures_invalid() {
-    static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
-        std::sync::LazyLock::new(|| {
-            register_int_counter!(
-                "lean_pq_sig_aggregated_signatures_invalid_total",
-                "Total number of invalid aggregated signatures"
-            )
-            .unwrap()
-        });
     LEAN_PQ_SIG_AGGREGATED_SIGNATURES_INVALID_TOTAL.inc();
 }
 
@@ -226,14 +245,6 @@ pub fn inc_pq_sig_attestation_signatures_valid() {
 
 /// Increment the invalid individual attestation signatures counter.
 pub fn inc_pq_sig_attestation_signatures_invalid() {
-    static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<IntCounter> =
-        std::sync::LazyLock::new(|| {
-            register_int_counter!(
-                "lean_pq_sig_attestation_signatures_invalid_total",
-                "Total number of invalid individual attestation signatures"
-            )
-            .unwrap()
-        });
     LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL.inc();
 }
 

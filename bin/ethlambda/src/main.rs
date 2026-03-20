@@ -81,7 +81,8 @@ async fn main() -> eyre::Result<()> {
 
     let options = CliOptions::parse();
 
-    // Set node info metrics
+    // Initialize metrics
+    ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
     ethlambda_blockchain::metrics::set_attestation_committee_count(
