@@ -84,6 +84,14 @@ static LEAN_IS_AGGREGATOR: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::
     .unwrap()
 });
 
+static LEAN_IS_SYNCING: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_is_syncing",
+        "Whether the node is currently syncing. True=1, False=0"
+    )
+    .unwrap()
+});
+
 static LEAN_ATTESTATION_COMMITTEE_COUNT: std::sync::LazyLock<IntGauge> =
     std::sync::LazyLock::new(|| {
         register_int_gauge!(
@@ -293,6 +301,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_LATEST_NEW_AGGREGATED_PAYLOADS);
     std::sync::LazyLock::force(&LEAN_LATEST_KNOWN_AGGREGATED_PAYLOADS);
     std::sync::LazyLock::force(&LEAN_IS_AGGREGATOR);
+    std::sync::LazyLock::force(&LEAN_IS_SYNCING);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_COMMITTEE_COUNT);
     std::sync::LazyLock::force(&LEAN_TABLE_BYTES);
     // Counters
@@ -465,6 +474,11 @@ pub fn update_latest_known_aggregated_payloads(count: usize) {
 /// Set the is_aggregator gauge.
 pub fn set_is_aggregator(is_aggregator: bool) {
     LEAN_IS_AGGREGATOR.set(i64::from(is_aggregator));
+}
+
+/// Set the is_syncing gauge.
+pub fn set_is_syncing(is_syncing: bool) {
+    LEAN_IS_SYNCING.set(i64::from(is_syncing));
 }
 
 /// Set the attestation committee count gauge.

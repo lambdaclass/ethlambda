@@ -35,6 +35,10 @@ pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
+/// Number of slots our head can lag behind the current slot before
+/// validator duties are suppressed. During sync we lack a complete view
+/// of the chain, so proposing or attesting would cast uninformed votes.
+pub const SYNC_TOLERANCE_SLOTS: u64 = 2;
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -51,6 +55,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             is_aggregator,
             pending_block_parents: HashMap::new(),
+            is_syncing: true, // assume syncing until on_tick proves otherwise
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -92,35 +97,49 @@ pub struct BlockChainServer {
 
     /// Whether this node acts as a committee aggregator.
     is_aggregator: bool,
+    /// Whether this node is still catching up to the chain head.
+    /// When true, block proposal and attestation duties are skipped.
+    is_syncing: bool,
 }
 
 impl BlockChainServer {
     fn on_tick(&mut self, timestamp_ms: u64) {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
-        // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
-        // Fail fast: a state with zero validators is invalid and would cause
-        // panics in proposer selection and attestation processing.
         if self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
 
-        // Update current slot metric
         metrics::update_current_slot(slot);
 
+        // Determine sync status: suppress validator duties while our head is
+        // more than SYNC_TOLERANCE_SLOTS behind the current slot.
+        // Log once per transition to avoid spam.
+        let head_slot = self.store.head_slot();
+        let behind_by = slot.saturating_sub(head_slot);
+        let now_syncing = behind_by > SYNC_TOLERANCE_SLOTS;
+        if now_syncing != self.is_syncing {
+            if now_syncing {
+                info!(%slot, %head_slot, %behind_by, "Node is syncing, pausing validator duties");
+            } else {
+                info!(%slot, %head_slot, "Sync complete, resuming validator duties");
+            }
+            self.is_syncing = now_syncing;
+            metrics::set_is_syncing(self.is_syncing);
+        }
+
         // At interval 0, check if we will propose (but don't build the block yet).
-        // Tick forkchoice first to accept attestations, then build the block
-        // using the freshly-accepted attestations.
-        let proposer_validator_id = (interval == 0 && slot > 0)
+        // Skip entirely while syncing — no complete chain view.
+        let proposer_validator_id = (!self.is_syncing && interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
-        // Tick the store first - this accepts attestations at interval 0 if we have a proposal
+        // Tick the store first — accepts attestations at interval 0 if we have a proposal
         let new_aggregates = store::on_tick(
             &mut self.store,
             timestamp_ms,
@@ -136,19 +155,18 @@ impl BlockChainServer {
             }
         }
 
-        // Now build and publish the block (after attestations have been accepted)
+        // Propose block at interval 0 (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
             self.propose_block(slot, validator_id);
         }
 
-        // Produce attestations at interval 1 (proposer already attested in block)
-        if interval == 1 {
+        // Produce attestations at interval 1 (proposer already attested in block).
+        // Skip while syncing.
+        if !self.is_syncing && interval == 1 {
             self.produce_attestations(slot);
         }
 
-        // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
-        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
     }
 
