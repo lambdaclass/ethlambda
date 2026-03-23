@@ -46,6 +46,7 @@ impl BlockChain {
         is_aggregator: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(is_aggregator);
+        metrics::set_is_syncing(true);
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
