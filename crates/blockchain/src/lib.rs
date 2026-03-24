@@ -18,7 +18,7 @@ use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tracing::{error, info, trace, warn};
 
-use crate::store::StoreError;
+use crate::store::{ForkChoice, StoreError};
 
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
@@ -44,8 +44,10 @@ impl BlockChain {
         metrics::set_is_aggregator(is_aggregator);
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
+        let fork_choice = ForkChoice::from_store(&store);
         let handle = BlockChainServer {
             store,
+            fork_choice,
             p2p: None,
             key_manager,
             pending_blocks: HashMap::new(),
@@ -77,6 +79,9 @@ impl BlockChain {
 /// processed by this server.
 pub struct BlockChainServer {
     store: Store,
+
+    /// Incremental fork choice state (proto-array + vote tracker).
+    fork_choice: ForkChoice,
 
     // P2P protocol ref (set via InitP2P message)
     p2p: Option<BlockChainToP2PRef>,
@@ -123,6 +128,7 @@ impl BlockChainServer {
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         let new_aggregates = store::on_tick(
             &mut self.store,
+            &mut self.fork_choice,
             timestamp_ms,
             proposer_validator_id.is_some(),
             self.is_aggregator,
@@ -213,10 +219,13 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let Ok((block, attestation_signatures)) = store::produce_block_with_signatures(
+            &mut self.store,
+            &mut self.fork_choice,
+            slot,
+            validator_id,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
             return;
         };
 
@@ -280,7 +289,12 @@ impl BlockChainServer {
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
         let validator_ids = self.key_manager.validator_ids();
-        store::on_block(&mut self.store, signed_block, &validator_ids)?;
+        store::on_block(
+            &mut self.store,
+            &mut self.fork_choice,
+            signed_block,
+            &validator_ids,
+        )?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
