@@ -69,6 +69,9 @@ struct CliOptions {
     /// Number of attestation committees (subnets) per slot
     #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
     attestation_committee_count: u64,
+    /// Directory for RocksDB storage
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -130,7 +133,10 @@ async fn main() -> eyre::Result<()> {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let backend = Arc::new(RocksDBBackend::open("./data").expect("Failed to open RocksDB"));
+    std::fs::create_dir_all(&options.data_dir).expect("Failed to create data directory");
+    let backend =
+        Arc::new(RocksDBBackend::open(&options.data_dir).expect("Failed to open RocksDB"));
+    info!(data_dir = %options.data_dir.display(), "Initialized DB");
 
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),

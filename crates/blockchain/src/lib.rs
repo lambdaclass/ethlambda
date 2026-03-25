@@ -266,7 +266,7 @@ impl BlockChainServer {
 
         // Assemble SignedBlockWithAttestation
         let signed_block = SignedBlockWithAttestation {
-            message: BlockWithAttestation {
+            block: BlockWithAttestation {
                 block,
                 proposer_attestation,
             },
@@ -336,10 +336,10 @@ impl BlockChainServer {
         signed_block: SignedBlockWithAttestation,
         queue: &mut VecDeque<SignedBlockWithAttestation>,
     ) {
-        let slot = signed_block.message.block.slot;
-        let block_root = signed_block.message.block.tree_hash_root();
-        let parent_root = signed_block.message.block.parent_root;
-        let proposer = signed_block.message.block.proposer_index;
+        let slot = signed_block.block.block.slot;
+        let block_root = signed_block.block.block.tree_hash_root();
+        let parent_root = signed_block.block.block.parent_root;
+        let proposer = signed_block.block.block.proposer_index;
 
         // Check if parent state exists before attempting to process
         if !self.store.has_state(&parent_root) {
@@ -461,7 +461,7 @@ impl BlockChainServer {
                 continue;
             };
 
-            let slot = child_block.message.block.slot;
+            let slot = child_block.block.block.slot;
             trace!(%parent_root, %slot, "Processing pending child block");
 
             queue.push_back(child_block);
