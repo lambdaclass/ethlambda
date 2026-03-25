@@ -133,9 +133,8 @@ async fn main() -> eyre::Result<()> {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let backend = Arc::new(
-        RocksDBBackend::open(&options.data_dir).expect("Failed to open RocksDB"),
-    );
+    let backend =
+        Arc::new(RocksDBBackend::open(&options.data_dir).expect("Failed to open RocksDB"));
 
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),
