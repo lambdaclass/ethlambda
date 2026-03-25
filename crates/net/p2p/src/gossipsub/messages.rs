@@ -14,8 +14,7 @@ pub const NETWORK_NAME: &str = "devnet0";
 
 /// Build an attestation subnet topic for the given subnet ID.
 pub fn attestation_subnet_topic(subnet_id: u64) -> libp2p::gossipsub::IdentTopic {
-    let topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
     libp2p::gossipsub::IdentTopic::new(format!(
-        "/leanconsensus/{NETWORK_NAME}/{topic_kind}/ssz_snappy"
+        "/leanconsensus/{NETWORK_NAME}/{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}/ssz_snappy"
     ))
 }
