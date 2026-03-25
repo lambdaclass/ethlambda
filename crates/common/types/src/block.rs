@@ -16,13 +16,13 @@ use crate::{
 #[derive(Clone, Encode, Decode)]
 pub struct SignedBlockWithAttestation {
     /// The block plus an attestation from proposer being signed.
-    pub message: BlockWithAttestation,
+    pub block: BlockWithAttestation,
 
     /// Aggregated signature payload for the block.
     ///
     /// Signatures remain in attestation order followed by the proposer signature
-    /// over entire message. For devnet 1, however the proposer signature is just
-    /// over message.proposer_attestation since leanVM is not yet performant enough
+    /// over entire block. For devnet 1, however the proposer signature is just
+    /// over block.proposer_attestation since leanVM is not yet performant enough
     /// to aggregate signatures with sufficient throughput.
     ///
     /// Eventually this field will be replaced by a SNARK (which represents the
@@ -34,7 +34,7 @@ pub struct SignedBlockWithAttestation {
 impl core::fmt::Debug for SignedBlockWithAttestation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SignedBlockWithAttestation")
-            .field("message", &self.message)
+            .field("block", &self.block)
             .field("signature", &"...")
             .finish()
     }
@@ -140,7 +140,7 @@ impl BlockSignaturesWithAttestation {
     /// Takes ownership to avoid cloning large signature data.
     pub fn from_signed_block(signed_block: SignedBlockWithAttestation) -> Self {
         Self {
-            proposer_attestation: signed_block.message.proposer_attestation,
+            proposer_attestation: signed_block.block.proposer_attestation,
             signatures: signed_block.signature,
         }
     }
@@ -150,7 +150,7 @@ impl BlockSignaturesWithAttestation {
     /// Consumes self to avoid cloning large signature data.
     pub fn to_signed_block(self, block: Block) -> SignedBlockWithAttestation {
         SignedBlockWithAttestation {
-            message: BlockWithAttestation {
+            block: BlockWithAttestation {
                 block,
                 proposer_attestation: self.proposer_attestation,
             },

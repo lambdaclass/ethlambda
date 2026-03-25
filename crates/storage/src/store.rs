@@ -1128,11 +1128,10 @@ fn write_signed_block(
     signed_block: SignedBlockWithAttestation,
 ) -> Block {
     let SignedBlockWithAttestation {
-        message:
-            BlockWithAttestation {
-                block,
-                proposer_attestation,
-            },
+        block: BlockWithAttestation {
+            block,
+            proposer_attestation,
+        },
         signature,
     } = signed_block;
 

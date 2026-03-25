@@ -39,11 +39,11 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             else {
                 return;
             };
-            let slot = signed_block.message.block.slot;
-            let block_root = signed_block.message.block.tree_hash_root();
-            let proposer = signed_block.message.block.proposer_index;
-            let parent_root = signed_block.message.block.parent_root;
-            let attestation_count = signed_block.message.block.body.attestations.len();
+            let slot = signed_block.block.block.slot;
+            let block_root = signed_block.block.block.tree_hash_root();
+            let proposer = signed_block.block.block.proposer_index;
+            let parent_root = signed_block.block.block.parent_root;
+            let attestation_count = signed_block.block.block.body.attestations.len();
             info!(
                 %slot,
                 proposer,
@@ -156,11 +156,11 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
 }
 
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
-    let slot = signed_block.message.block.slot;
-    let proposer = signed_block.message.block.proposer_index;
-    let block_root = signed_block.message.block.tree_hash_root();
-    let parent_root = signed_block.message.block.parent_root;
-    let attestation_count = signed_block.message.block.body.attestations.len();
+    let slot = signed_block.block.block.slot;
+    let proposer = signed_block.block.block.proposer_index;
+    let block_root = signed_block.block.block.tree_hash_root();
+    let parent_root = signed_block.block.block.parent_root;
+    let attestation_count = signed_block.block.block.body.attestations.len();
 
     // Encode to SSZ
     let ssz_bytes = signed_block.as_ssz_bytes();

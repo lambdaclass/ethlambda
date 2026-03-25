@@ -533,7 +533,7 @@ fn on_block_core(
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
 
-    let block = &signed_block.message.block;
+    let block = &signed_block.block.block;
     let block_root = block.tree_hash_root();
     let slot = block.slot;
 
@@ -558,8 +558,8 @@ fn on_block_core(
         verify_signatures(&parent_state, &signed_block)?;
     }
 
-    let block = signed_block.message.block.clone();
-    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block = signed_block.block.block.clone();
+    let proposer_attestation = signed_block.block.proposer_attestation.clone();
 
     // Execute state transition function to compute post-block state
     let mut post_state = parent_state;
@@ -1175,7 +1175,7 @@ fn verify_signatures(
     use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
-    let block = &signed_block.message.block;
+    let block = &signed_block.block.block;
     let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
@@ -1225,7 +1225,7 @@ fn verify_signatures(
         }
     }
 
-    let proposer_attestation = &signed_block.message.proposer_attestation;
+    let proposer_attestation = &signed_block.block.proposer_attestation;
 
     if proposer_attestation.validator_id != block.proposer_index {
         return Err(StoreError::ProposerAttestationMismatch {
@@ -1350,7 +1350,7 @@ mod tests {
         let attestation_signatures = ssz_types::VariableList::new(vec![proof]).unwrap();
 
         let signed_block = SignedBlockWithAttestation {
-            message: BlockWithAttestation {
+            block: BlockWithAttestation {
                 block: Block {
                     slot: 0,
                     proposer_index: 0,

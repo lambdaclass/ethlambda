@@ -146,7 +146,7 @@ async fn handle_blocks_by_root_response(
     }
 
     for block in blocks {
-        let root = block.message.block.tree_hash_root();
+        let root = block.block.block.tree_hash_root();
 
         // Validate that this block matches what we requested
         if root != requested_root {
