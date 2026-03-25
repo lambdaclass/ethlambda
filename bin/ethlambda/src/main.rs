@@ -69,6 +69,10 @@ struct CliOptions {
     /// Number of attestation committees (subnets) per slot
     #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
     attestation_committee_count: u64,
+    /// Subnet IDs this aggregator should subscribe to (comma-separated).
+    /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
+    aggregate_subnet_ids: Option<Vec<u64>>,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
@@ -146,17 +150,17 @@ async fn main() -> eyre::Result<()> {
     .await
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
-    // Use first validator ID for subnet subscription
-    let first_validator_id = validator_keys.keys().min().copied();
+    let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
     let blockchain = BlockChain::spawn(store.clone(), validator_keys, options.is_aggregator);
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
-        validator_id: first_validator_id,
+        validator_ids,
         attestation_committee_count: options.attestation_committee_count,
         is_aggregator: options.is_aggregator,
+        aggregate_subnet_ids: options.aggregate_subnet_ids,
     })
     .expect("failed to build swarm");
 

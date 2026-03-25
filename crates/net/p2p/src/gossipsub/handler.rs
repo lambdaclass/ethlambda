@@ -123,6 +123,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
 pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
     let slot = attestation.data.slot;
     let validator = attestation.validator_id;
+    let subnet_id = validator % server.attestation_committee_count;
 
     // Encode to SSZ
     let ssz_bytes = attestation.as_ssz_bytes();
@@ -130,13 +131,25 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
 
+    // Look up subscribed topic or construct on-the-fly for gossipsub fanout
+    let topic = server
+        .attestation_topics
+        .get(&subnet_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let network = "devnet0";
+            let topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
+            libp2p::gossipsub::IdentTopic::new(format!(
+                "/leanconsensus/{network}/{topic_kind}/ssz_snappy"
+            ))
+        });
+
     // Publish to the attestation subnet topic
-    server
-        .swarm_handle
-        .publish(server.attestation_topic.clone(), compressed);
+    server.swarm_handle.publish(topic, compressed);
     info!(
         %slot,
         validator,
+        subnet_id,
         target_slot = attestation.data.target.slot,
         target_root = %ShortRoot(&attestation.data.target.root.0),
         source_slot = attestation.data.source.slot,

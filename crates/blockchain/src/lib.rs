@@ -279,8 +279,7 @@ impl BlockChainServer {
         &mut self,
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
-        let validator_ids = self.key_manager.validator_ids();
-        store::on_block(&mut self.store, signed_block, &validator_ids)?;
+        store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
@@ -454,8 +453,7 @@ impl BlockChainServer {
             warn!("Received unaggregated attestation but node is not an aggregator");
             return;
         }
-        let validator_ids = self.key_manager.validator_ids();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, &validator_ids)
+        let _ = store::on_gossip_attestation(&mut self.store, attestation)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 

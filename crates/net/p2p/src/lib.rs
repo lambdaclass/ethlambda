@@ -78,15 +78,17 @@ pub struct SwarmConfig {
     pub node_key: Vec<u8>,
     pub bootnodes: Vec<Bootnode>,
     pub listening_socket: SocketAddr,
-    pub validator_id: Option<u64>,
+    pub validator_ids: Vec<u64>,
     pub attestation_committee_count: u64,
     pub is_aggregator: bool,
+    pub aggregate_subnet_ids: Option<Vec<u64>>,
 }
 
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
@@ -205,34 +207,48 @@ pub fn build_swarm(
         .subscribe(&aggregation_topic)
         .unwrap();
 
-    // Build attestation subnet topic (needed for publishing even without subscribing)
-    // attestation_committee_count is validated to be >= 1 by clap at CLI parse time.
-    let subnet_id = config
-        .validator_id
+    // Compute the set of subnets to subscribe to.
+    // Validators subscribe for gossipsub mesh health; aggregators additionally
+    // subscribe to any explicitly requested subnets.
+    let validator_subnets: HashSet<u64> = config
+        .validator_ids
+        .iter()
         .map(|vid| vid % config.attestation_committee_count)
-        .unwrap_or(0);
-    metrics::set_attestation_committee_subnet(subnet_id);
+        .collect();
 
-    let attestation_topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
-    let attestation_topic_str =
-        format!("/leanconsensus/{network}/{attestation_topic_kind}/ssz_snappy");
-    let attestation_topic = libp2p::gossipsub::IdentTopic::new(attestation_topic_str);
+    let mut subscribe_subnets: HashSet<u64> = validator_subnets.clone();
 
-    // Only aggregators subscribe to attestation subnets; non-aggregators
-    // publish via gossipsub's fanout mechanism without subscribing.
     if config.is_aggregator {
-        swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&attestation_topic)?;
-        info!(%attestation_topic_kind, "Subscribed to attestation subnet");
+        if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
+            subscribe_subnets.extend(explicit_ids);
+        }
+        // Aggregator with no validators and no explicit subnets: fallback to subnet 0
+        if subscribe_subnets.is_empty() {
+            subscribe_subnets.insert(0);
+        }
+    }
+
+    // Report lowest validator subnet for backward-compatible metric
+    let metric_subnet = validator_subnets.iter().copied().min().unwrap_or(0);
+    metrics::set_attestation_committee_subnet(metric_subnet);
+
+    // Build topics and subscribe
+    let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
+    for &subnet_id in &subscribe_subnets {
+        let topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
+        let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
+        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
+        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+        info!(%topic_kind, "Subscribed to attestation subnet");
+        attestation_topics.insert(subnet_id, topic);
     }
 
     info!(socket=%config.listening_socket, "P2P node started");
 
     Ok(BuiltSwarm {
         swarm,
-        attestation_topic,
+        attestation_topics,
+        attestation_committee_count: config.attestation_committee_count,
         block_topic,
         aggregation_topic,
         bootnode_addrs,
@@ -255,7 +271,8 @@ impl P2P {
             swarm_handle,
             store,
             blockchain: None,
-            attestation_topic: built.attestation_topic,
+            attestation_topics: built.attestation_topics,
+            attestation_committee_count: built.attestation_committee_count,
             block_topic: built.block_topic,
             aggregation_topic: built.aggregation_topic,
             connected_peers: HashSet::new(),
@@ -288,7 +305,8 @@ pub struct P2PServer {
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
-    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
 
