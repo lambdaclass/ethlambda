@@ -9,7 +9,10 @@ use tracing::{error, info, trace};
 
 use super::{
     encoding::{compress_message, decompress_message},
-    messages::{AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND},
+    messages::{
+        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        attestation_subnet_topic,
+    },
 };
 use crate::P2PServer;
 
@@ -136,13 +139,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .attestation_topics
         .get(&subnet_id)
         .cloned()
-        .unwrap_or_else(|| {
-            let network = "devnet0";
-            let topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
-            libp2p::gossipsub::IdentTopic::new(format!(
-                "/leanconsensus/{network}/{topic_kind}/ssz_snappy"
-            ))
-        });
+        .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
     // Publish to the attestation subnet topic
     server.swarm_handle.publish(topic, compressed);

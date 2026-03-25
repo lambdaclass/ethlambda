@@ -36,7 +36,7 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{
-        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        AGGREGATION_TOPIC_KIND, BLOCK_TOPIC_KIND, NETWORK_NAME, attestation_subnet_topic,
         publish_aggregated_attestation, publish_attestation, publish_block,
     },
     req_resp::{
@@ -186,10 +186,8 @@ pub fn build_swarm(
         .listen_on(addr)
         .expect("failed to bind gossipsub listening address");
 
-    let network = "devnet0";
-
     // Subscribe to block topic (all nodes)
-    let block_topic_str = format!("/leanconsensus/{network}/{BLOCK_TOPIC_KIND}/ssz_snappy");
+    let block_topic_str = format!("/leanconsensus/{NETWORK_NAME}/{BLOCK_TOPIC_KIND}/ssz_snappy");
     let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
     swarm
         .behaviour_mut()
@@ -199,7 +197,7 @@ pub fn build_swarm(
 
     // Subscribe to aggregation topic (all validators)
     let aggregation_topic_str =
-        format!("/leanconsensus/{network}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
+        format!("/leanconsensus/{NETWORK_NAME}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
     let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
     swarm
         .behaviour_mut()
@@ -235,11 +233,9 @@ pub fn build_swarm(
     // Build topics and subscribe
     let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
     for &subnet_id in &subscribe_subnets {
-        let topic_kind = format!("{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}");
-        let topic_str = format!("/leanconsensus/{network}/{topic_kind}/ssz_snappy");
-        let topic = libp2p::gossipsub::IdentTopic::new(topic_str);
+        let topic = attestation_subnet_topic(subnet_id);
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-        info!(%topic_kind, "Subscribed to attestation subnet");
+        info!(subnet_id, "Subscribed to attestation subnet");
         attestation_topics.insert(subnet_id, topic);
     }
 
