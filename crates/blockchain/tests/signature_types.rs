@@ -56,7 +56,7 @@ pub struct TestSignedBlockWithAttestation {
 
 impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
     fn from(value: TestSignedBlockWithAttestation) -> Self {
-        let message = BlockWithAttestation {
+        let block = BlockWithAttestation {
             block: value.message.block.into(),
             proposer_attestation: value.message.proposer_attestation.into(),
         };
@@ -82,7 +82,7 @@ impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
             .expect("too many attestation signatures");
 
         SignedBlockWithAttestation {
-            message,
+            block,
             signature: BlockSignatures {
                 attestation_signatures,
                 proposer_signature,

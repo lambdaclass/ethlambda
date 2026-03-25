@@ -26,16 +26,6 @@ use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
-/// Number of attestation committees per slot.
-/// With ATTESTATION_COMMITTEE_COUNT = 1, all validators are in subnet 0.
-const ATTESTATION_COMMITTEE_COUNT: u64 = 1;
-
-/// Compute the attestation subnet ID for a validator.
-#[allow(clippy::modulo_one)]
-fn compute_subnet_id(validator_id: u64) -> u64 {
-    validator_id % ATTESTATION_COMMITTEE_COUNT
-}
-
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
@@ -367,7 +357,6 @@ pub fn on_tick(
 pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: SignedAttestation,
-    local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
@@ -407,16 +396,10 @@ pub fn on_gossip_attestation(
     // Store attestation data by root (content-addressed, idempotent)
     store.insert_attestation_data_by_root(data_root, attestation.data.clone());
 
-    // Store gossip signature for later aggregation at interval 2,
-    // only if the attester is in the same subnet as one of our validators.
-    let attester_subnet = compute_subnet_id(validator_id);
-    let in_our_subnet = local_validator_ids
-        .iter()
-        .any(|&vid| compute_subnet_id(vid) == attester_subnet);
-    if in_our_subnet {
-        store.insert_gossip_signature(data_root, attestation.data.slot, validator_id, signature);
-        metrics::update_gossip_signatures(store.gossip_signatures_count());
-    }
+    // Store gossip signature unconditionally for later aggregation at interval 2.
+    // Subnet filtering is handled at the P2P subscription layer.
+    store.insert_gossip_signature(data_root, attestation.data.slot, validator_id, signature);
+    metrics::update_gossip_signatures(store.gossip_signatures_count());
 
     metrics::inc_attestations_valid();
 
@@ -524,9 +507,8 @@ pub fn on_gossip_aggregated_attestation(
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
-    local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, true, local_validator_ids)
+    on_block_core(store, signed_block, true)
 }
 
 /// Process a new block without signature verification.
@@ -537,7 +519,7 @@ pub fn on_block_without_verification(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
 ) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, false, &[])
+    on_block_core(store, signed_block, false)
 }
 
 /// Core block processing logic.
@@ -548,11 +530,10 @@ fn on_block_core(
     store: &mut Store,
     signed_block: SignedBlockWithAttestation,
     verify: bool,
-    local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
 
-    let block = &signed_block.message.block;
+    let block = &signed_block.block.block;
     let block_root = H256(block.hash_tree_root());
     let slot = block.slot;
 
@@ -577,8 +558,8 @@ fn on_block_core(
         verify_signatures(&parent_state, &signed_block)?;
     }
 
-    let block = signed_block.message.block.clone();
-    let proposer_attestation = signed_block.message.proposer_attestation.clone();
+    let block = signed_block.block.block.clone();
+    let proposer_attestation = signed_block.block.proposer_attestation.clone();
 
     // Execute state transition function to compute post-block state
     let mut post_state = parent_state;
@@ -653,23 +634,17 @@ fn on_block_core(
         };
         store.insert_new_aggregated_payload((proposer_vid, proposer_data_root), payload);
     } else {
-        // Store the proposer's signature for potential future block building,
-        // only if the proposer is in the same subnet as one of our validators.
-        let proposer_subnet = compute_subnet_id(proposer_vid);
-        let in_our_subnet = local_validator_ids
-            .iter()
-            .any(|&vid| compute_subnet_id(vid) == proposer_subnet);
-        if in_our_subnet {
-            let proposer_sig =
-                ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-                    .map_err(|_| StoreError::SignatureDecodingFailed)?;
-            store.insert_gossip_signature(
-                proposer_data_root,
-                proposer_attestation.data.slot,
-                proposer_vid,
-                proposer_sig,
-            );
-        }
+        // Store the proposer's signature unconditionally for future block building.
+        // Subnet filtering is handled at the P2P subscription layer.
+        let proposer_sig =
+            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
+                .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        store.insert_gossip_signature(
+            proposer_data_root,
+            proposer_attestation.data.slot,
+            proposer_vid,
+            proposer_sig,
+        );
     }
 
     info!(%slot, %block_root, %state_root, "Processed new block");
@@ -1197,7 +1172,7 @@ fn verify_signatures(
     use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
-    let block = &signed_block.message.block;
+    let block = &signed_block.block.block;
     let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
@@ -1247,7 +1222,7 @@ fn verify_signatures(
         }
     }
 
-    let proposer_attestation = &signed_block.message.proposer_attestation;
+    let proposer_attestation = &signed_block.block.proposer_attestation;
 
     if proposer_attestation.validator_id != block.proposer_index {
         return Err(StoreError::ProposerAttestationMismatch {
@@ -1375,7 +1350,7 @@ mod tests {
         let attestation_signatures = AttestationSignatures::try_from(vec![proof]).unwrap();
 
         let signed_block = SignedBlockWithAttestation {
-            message: BlockWithAttestation {
+            block: BlockWithAttestation {
                 block: Block {
                     slot: 0,
                     proposer_index: 0,

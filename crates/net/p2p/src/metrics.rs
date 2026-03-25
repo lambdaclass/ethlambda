@@ -68,6 +68,18 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .unwrap()
 });
 
+/// Set the attestation committee subnet gauge.
+pub fn set_attestation_committee_subnet(subnet_id: u64) {
+    static LEAN_ATTESTATION_COMMITTEE_SUBNET: LazyLock<IntGauge> = LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_attestation_committee_subnet",
+            "Node's attestation committee subnet"
+        )
+        .unwrap()
+    });
+    LEAN_ATTESTATION_COMMITTEE_SUBNET.set(subnet_id.try_into().unwrap_or_default());
+}
+
 /// Notify that a peer connection event occurred.
 ///
 /// If `result` is "success", the connected peer count is incremented.

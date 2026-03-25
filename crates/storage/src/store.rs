@@ -1004,6 +1004,11 @@ impl Store {
         self.gossip_signatures_count.load(Ordering::Relaxed)
     }
 
+    /// Estimated live data size in bytes for a table, as reported by the backend.
+    pub fn estimate_table_bytes(&self, table: Table) -> u64 {
+        self.backend.estimate_table_bytes(table)
+    }
+
     /// Delete specific gossip signatures by key.
     pub fn delete_gossip_signatures(&mut self, keys: &[SignatureKey]) {
         if keys.is_empty() {
@@ -1113,11 +1118,10 @@ fn write_signed_block(
     signed_block: SignedBlockWithAttestation,
 ) -> Block {
     let SignedBlockWithAttestation {
-        message:
-            BlockWithAttestation {
-                block,
-                proposer_attestation,
-            },
+        block: BlockWithAttestation {
+            block,
+            proposer_attestation,
+        },
         signature,
     } = signed_block;
 
