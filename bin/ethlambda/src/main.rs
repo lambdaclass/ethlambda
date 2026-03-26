@@ -137,11 +137,11 @@ async fn main() -> eyre::Result<()> {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
-    let data_dir = std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
+    let data_dir =
+        std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
     info!(data_dir = %data_dir.display(), "Initializing DB");
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-    let backend =
-        Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
+    let backend = Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
 
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),
