@@ -69,7 +69,6 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |`lean_validators_count`| Gauge | Number of validators managed by a node | On scrape |  | ✅(*) |
 |`lean_is_aggregator`| Gauge | Validator's `is_aggregator` status. True=1, False=0 | On node start | | ✅ |
 |`lean_is_syncing`| Gauge | Whether the node is currently syncing. True=1, False=0 | On sync state change | | ✅ |
-|`lean_is_syncing`| Gauge | Whether the node is currently syncing. True=1, False=0 | On sync state change | | ✅ |
 
 ## Network Metrics
 
