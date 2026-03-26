@@ -321,6 +321,15 @@ impl BlockChainServer {
         let parent_root = signed_block.block.block.parent_root;
         let proposer = signed_block.block.block.proposer_index;
 
+        // Never process blocks at or below the finalized slot — they are
+        // already part of the canonical chain and cannot affect fork choice.
+        // Discard any pending children: since we won't process this block,
+        // children referencing it as parent would remain stuck indefinitely.
+        if slot <= self.store.latest_finalized().slot {
+            self.discard_pending_subtree(block_root);
+            return;
+        }
+
         // Check if parent state exists before attempting to process
         if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
@@ -445,6 +454,20 @@ impl BlockChainServer {
             trace!(%parent_root, %slot, "Processing pending child block");
 
             queue.push_back(child_block);
+        }
+    }
+
+    /// Recursively discard a block and all its pending descendants.
+    ///
+    /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
+    /// children that would otherwise remain stuck in the pending maps indefinitely.
+    fn discard_pending_subtree(&mut self, block_root: H256) {
+        let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
+            return;
+        };
+        for child_root in child_roots {
+            self.pending_block_parents.remove(&child_root);
+            self.discard_pending_subtree(child_root);
         }
     }
 
