@@ -141,7 +141,7 @@ async fn main() -> eyre::Result<()> {
     info!(data_dir = %data_dir.display(), "Initializing DB");
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
     let backend =
-        Arc::new(RocksDBBackend::open(&options.data_dir).expect("Failed to open RocksDB"));
+        Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
 
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),
