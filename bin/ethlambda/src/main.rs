@@ -137,6 +137,7 @@ async fn main() -> eyre::Result<()> {
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
 
+    info!(data_dir = %std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone()).display(), "Initializing DB");
     std::fs::create_dir_all(&options.data_dir).expect("Failed to create data directory");
     let backend =
         Arc::new(RocksDBBackend::open(&options.data_dir).expect("Failed to open RocksDB"));
