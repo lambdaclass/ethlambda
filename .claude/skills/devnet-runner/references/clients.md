@@ -42,53 +42,9 @@ Ports are configured per-node in `validator-config.yaml`. Typical port assignmen
 
 **ethlambda dual-port note:** ethlambda runs separate API (`--api-port`, default 5052) and metrics (`--metrics-port`, default 5054) HTTP servers. Both share a bind address (`--http-address`, default `127.0.0.1`). The `metricsPort` from `validator-config.yaml` maps to `--metrics-port`. The API port must be configured separately in `ethlambda-cmd.sh`.
 
-## Client-Specific Configuration Notes
+## Client Command Files
 
-### zeam
-
-- Image: `blockblaz/zeam:devnet1`
-- Native Zig implementation
-- Command file: `client-cmds/zeam-cmd.sh`
-
-### ream
-
-- Image: `ghcr.io/reamlabs/ream:latest`
-- Rust implementation by Ream Labs
-- Command file: `client-cmds/ream-cmd.sh`
-
-### qlean
-
-- Image: `qdrvm/qlean-mini:3a96a1f`
-- Uses specific commit hash for stability
-- Command file: `client-cmds/qlean-cmd.sh`
-
-### lantern
-
-- Image: `piertwo/lantern:v0.0.1`
-- PierTwo implementation
-- Command file: `client-cmds/lantern-cmd.sh`
-
-### lighthouse
-
-- Image: `hopinheimer/lighthouse:latest`
-- Fork of the standard Rust Lighthouse client
-- Command file: `client-cmds/lighthouse-cmd.sh`
-
-### grandine
-
-- Image: `sifrai/lean:unstable`
-- High-performance client by Sifrai
-- Command file: `client-cmds/grandine-cmd.sh`
-
-### ethlambda
-
-- Image: `ghcr.io/lambdaclass/ethlambda:local`
-- Rust implementation by LambdaClass
-- Command file: `client-cmds/ethlambda-cmd.sh`
-- **Dual HTTP servers:** Runs separate API and metrics servers on independent ports
-  - `--http-address` (default `127.0.0.1`): shared bind address
-  - `--api-port` (default `5052`): API server (health, states, checkpoints, fork choice)
-  - `--metrics-port` (default `5054`): metrics server (Prometheus, pprof)
+Each client's Docker configuration is in `client-cmds/{client}-cmd.sh` (e.g., `zeam-cmd.sh`, `ream-cmd.sh`, `ethlambda-cmd.sh`). Edit the `node_docker` variable to change image/tag.
 
 ## Changing Docker Images
 
