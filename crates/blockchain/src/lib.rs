@@ -298,8 +298,7 @@ impl BlockChainServer {
         &mut self,
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
-        let validator_ids = self.key_manager.validator_ids();
-        store::on_block(&mut self.store, signed_block, &validator_ids)?;
+        store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
@@ -340,6 +339,15 @@ impl BlockChainServer {
         let block_root = signed_block.block.block.tree_hash_root();
         let parent_root = signed_block.block.block.parent_root;
         let proposer = signed_block.block.block.proposer_index;
+
+        // Never process blocks at or below the finalized slot — they are
+        // already part of the canonical chain and cannot affect fork choice.
+        // Discard any pending children: since we won't process this block,
+        // children referencing it as parent would remain stuck indefinitely.
+        if slot <= self.store.latest_finalized().slot {
+            self.discard_pending_subtree(block_root);
+            return;
+        }
 
         // Check if parent state exists before attempting to process
         if !self.store.has_state(&parent_root) {
@@ -468,13 +476,26 @@ impl BlockChainServer {
         }
     }
 
+    /// Recursively discard a block and all its pending descendants.
+    ///
+    /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
+    /// children that would otherwise remain stuck in the pending maps indefinitely.
+    fn discard_pending_subtree(&mut self, block_root: H256) {
+        let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
+            return;
+        };
+        for child_root in child_roots {
+            self.pending_block_parents.remove(&child_root);
+            self.discard_pending_subtree(child_root);
+        }
+    }
+
     fn on_gossip_attestation(&mut self, attestation: SignedAttestation) {
         if !self.is_aggregator {
             warn!("Received unaggregated attestation but node is not an aggregator");
             return;
         }
-        let validator_ids = self.key_manager.validator_ids();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, &validator_ids)
+        let _ = store::on_gossip_attestation(&mut self.store, attestation)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 
