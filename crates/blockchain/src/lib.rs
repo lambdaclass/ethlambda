@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
-use ethlambda_storage::Store;
+use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
@@ -247,7 +247,7 @@ impl BlockChainServer {
 
         // Assemble SignedBlockWithAttestation
         let signed_block = SignedBlockWithAttestation {
-            message: BlockWithAttestation {
+            block: BlockWithAttestation {
                 block,
                 proposer_attestation,
             },
@@ -279,12 +279,14 @@ impl BlockChainServer {
         &mut self,
         signed_block: SignedBlockWithAttestation,
     ) -> Result<(), StoreError> {
-        let validator_ids = self.key_manager.validator_ids();
-        store::on_block(&mut self.store, signed_block, &validator_ids)?;
+        store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
+        for table in ALL_TABLES {
+            metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
+        }
         Ok(())
     }
 
@@ -299,6 +301,11 @@ impl BlockChainServer {
         while let Some(block) = queue.pop_front() {
             self.process_or_pend_block(block, &mut queue);
         }
+
+        // Prune old states and blocks AFTER the entire cascade completes.
+        // Running this mid-cascade would delete states that pending children
+        // still need, causing re-processing loops when fallback pruning is active.
+        self.store.prune_old_data();
     }
 
     /// Try to process a single block. If its parent state is missing, store it
@@ -309,10 +316,10 @@ impl BlockChainServer {
         signed_block: SignedBlockWithAttestation,
         queue: &mut VecDeque<SignedBlockWithAttestation>,
     ) {
-        let slot = signed_block.message.block.slot;
-        let block_root = signed_block.message.block.tree_hash_root();
-        let parent_root = signed_block.message.block.parent_root;
-        let proposer = signed_block.message.block.proposer_index;
+        let slot = signed_block.block.block.slot;
+        let block_root = signed_block.block.block.tree_hash_root();
+        let parent_root = signed_block.block.block.parent_root;
+        let proposer = signed_block.block.block.proposer_index;
 
         // Never process blocks at or below the finalized slot — they are
         // already part of the canonical chain and cannot affect fork choice.
@@ -440,7 +447,7 @@ impl BlockChainServer {
                 continue;
             };
 
-            let slot = child_block.message.block.slot;
+            let slot = child_block.block.block.slot;
             trace!(%parent_root, %slot, "Processing pending child block");
 
             queue.push_back(child_block);
@@ -452,8 +459,7 @@ impl BlockChainServer {
             warn!("Received unaggregated attestation but node is not an aggregator");
             return;
         }
-        let validator_ids = self.key_manager.validator_ids();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, &validator_ids)
+        let _ = store::on_gossip_attestation(&mut self.store, attestation)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 

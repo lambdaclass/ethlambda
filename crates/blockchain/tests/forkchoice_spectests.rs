@@ -58,8 +58,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
                     let signed_block = build_signed_block(block_data);
 
-                    let block_time_ms = genesis_time * 1000
-                        + signed_block.message.block.slot * MILLISECONDS_PER_SLOT;
+                    let block_time_ms =
+                        genesis_time * 1000 + signed_block.block.block.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true, false);
@@ -109,7 +109,7 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlockWithAttest
     let proposer_attestation: Attestation = block_data.proposer_attestation.into();
 
     SignedBlockWithAttestation {
-        message: BlockWithAttestation {
+        block: BlockWithAttestation {
             block,
             proposer_attestation,
         },

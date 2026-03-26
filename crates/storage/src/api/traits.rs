@@ -13,6 +13,13 @@ pub trait StorageBackend: Send + Sync {
 
     /// Begin a write batch.
     fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, Error>;
+
+    /// Estimated live data size in bytes for a table.
+    /// Returns 0 if the backend does not support this (e.g. in-memory).
+    fn estimate_table_bytes(&self, table: Table) -> u64 {
+        let _ = table;
+        0
+    }
 }
 
 /// A read-only view of the storage.
