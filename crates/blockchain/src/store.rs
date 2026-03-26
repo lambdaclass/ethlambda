@@ -559,7 +559,7 @@ fn on_block_core(
         // Validate cryptographic signatures
         verify_signatures(&parent_state, &signed_block)?;
     }
-    let sig_verification_ms = sig_verification_start.elapsed().as_millis() as u64;
+    let sig_verification = sig_verification_start.elapsed();
 
     let block = signed_block.block.block.clone();
     let proposer_attestation = signed_block.block.proposer_attestation.clone();
@@ -568,7 +568,7 @@ fn on_block_core(
     let state_transition_start = std::time::Instant::now();
     let mut post_state = parent_state;
     ethlambda_state_transition::state_transition(&mut post_state, &block)?;
-    let state_transition_ms = state_transition_start.elapsed().as_millis() as u64;
+    let state_transition = state_transition_start.elapsed();
 
     // Cache the state root in the latest block header
     let state_root = block.state_root;
@@ -652,14 +652,14 @@ fn on_block_core(
         );
     }
 
-    let block_total_ms = block_start.elapsed().as_millis() as u64;
+    let block_total = block_start.elapsed();
     info!(
         %slot,
         %block_root,
         %state_root,
-        sig_verification_ms,
-        state_transition_ms,
-        block_total_ms,
+        ?sig_verification,
+        ?state_transition,
+        ?block_total,
         "Processed new block"
     );
     Ok(())
@@ -1243,6 +1243,8 @@ fn verify_signatures(
     }
     let aggregated_elapsed = aggregated_start.elapsed();
 
+    let proposer_start = std::time::Instant::now();
+
     let proposer_attestation = &signed_block.block.proposer_attestation;
 
     if proposer_attestation.validator_id != block.proposer_index {
@@ -1271,7 +1273,6 @@ fn verify_signatures(
         .expect("slot exceeds u32");
     let message = proposer_attestation.data.tree_hash_root();
 
-    let proposer_start = std::time::Instant::now();
     if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
@@ -1281,9 +1282,9 @@ fn verify_signatures(
     info!(
         slot = block.slot,
         attestation_count = attestations.len(),
-        aggregated_sigs_ms = aggregated_elapsed.as_millis() as u64,
-        proposer_sig_ms = proposer_elapsed.as_millis() as u64,
-        total_ms = total_elapsed.as_millis() as u64,
+        ?aggregated_elapsed,
+        ?proposer_elapsed,
+        ?total_elapsed,
         "Signature verification timing"
     );
 
