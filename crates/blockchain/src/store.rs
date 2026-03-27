@@ -1041,9 +1041,9 @@ fn build_block(
 
         let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
-        // Sort by target.slot for deterministic processing order
+        // Sort by target.slot then data_root for fully deterministic processing order
         let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
-        sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
+        sorted_entries.sort_by_key(|(data_root, (data, _))| (data.target.slot, **data_root));
 
         loop {
             let mut found_new = false;
