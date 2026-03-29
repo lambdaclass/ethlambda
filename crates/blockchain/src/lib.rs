@@ -136,7 +136,7 @@ impl BlockChainServer {
 
         // At interval 0, check if we will propose (but don't build the block yet).
         // Skip entirely while syncing — no complete chain view.
-        let proposer_validator_id = (!self.is_syncing && interval == 0 && slot > 0)
+        let proposer_validator_id = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
