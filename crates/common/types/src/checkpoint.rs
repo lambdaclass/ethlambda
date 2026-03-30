@@ -7,7 +7,18 @@ use crate::primitives::{
 
 /// Represents a checkpoint in the chain's history.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Encode,
+    Decode,
+    TreeHash,
 )]
 pub struct Checkpoint {
     /// The root hash of the checkpoint's block.

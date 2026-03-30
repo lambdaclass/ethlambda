@@ -17,7 +17,7 @@ pub struct Attestation {
 }
 
 /// Attestation content describing the validator's observed chain view.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode, TreeHash)]
 pub struct AttestationData {
     /// The slot for which the attestation is made.
     pub slot: u64,
