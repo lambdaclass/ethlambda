@@ -27,6 +27,11 @@ pub struct RocksDBBackend {
     db: Arc<DBWithThreadMode<MultiThreaded>>,
 }
 
+/// Column families from previous versions that are no longer used.
+/// RocksDB requires all existing CFs to be listed when opening a database,
+/// so we include these to allow seamless upgrades from older versions.
+const DEPRECATED_CF_NAMES: &[&str] = &["gossip_signatures", "attestation_data_by_root"];
+
 impl RocksDBBackend {
     /// Open a RocksDB database at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -34,13 +39,23 @@ impl RocksDBBackend {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cf_descriptors: Vec<_> = ALL_TABLES
+        let mut cf_descriptors: Vec<_> = ALL_TABLES
             .iter()
             .map(|t| ColumnFamilyDescriptor::new(cf_name(*t), Options::default()))
             .collect();
 
+        // Include deprecated CFs so RocksDB can open databases from older versions.
+        for name in DEPRECATED_CF_NAMES {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(*name, Options::default()));
+        }
+
         let db =
             DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&opts, path, cf_descriptors)?;
+
+        // Drop deprecated column families (idempotent — ignored if already absent).
+        for name in DEPRECATED_CF_NAMES {
+            let _ = db.drop_cf(name);
+        }
 
         Ok(Self { db: Arc::new(db) })
     }
