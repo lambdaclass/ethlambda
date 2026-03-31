@@ -379,7 +379,7 @@ pub fn on_gossip_attestation(
     store.insert_gossip_signature(hashed, validator_id, signature);
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 
-    metrics::inc_attestations_valid();
+    metrics::inc_attestations_valid(1);
 
     let slot = attestation.data.slot;
     let target_slot = attestation.data.target.slot;
@@ -460,7 +460,7 @@ pub fn on_gossip_aggregated_attestation(
         "Aggregated attestation processed"
     );
 
-    metrics::inc_attestations_valid();
+    metrics::inc_attestations_valid(1);
 
     Ok(())
 }
@@ -565,9 +565,8 @@ fn on_block_core(
     {
         known_entries.push((HashedAttestationData::new(att.data.clone()), proof.clone()));
         // Count each participating validator as a valid attestation
-        for _ in validator_indices(&att.aggregation_bits) {
-            metrics::inc_attestations_valid();
-        }
+        let count = validator_indices(&att.aggregation_bits).count() as u64;
+        metrics::inc_attestations_valid(count);
     }
 
     // Process proposer attestation as pending (enters "new" stage via gossip path)
