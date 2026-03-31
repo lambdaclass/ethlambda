@@ -151,7 +151,7 @@ impl PayloadBuffer {
         let mut map: HashMap<H256, Vec<AggregatedSignatureProof>> = HashMap::new();
         let mut seen: HashMap<H256, HashSet<Vec<u8>>> = HashMap::new();
         for ((_vid, data_root), payload) in &self.entries {
-            let key_bytes = payload.proof.participants.as_bytes().to_vec();
+            let key_bytes = payload.proof.participants.to_ssz();
             if seen.entry(*data_root).or_default().insert(key_bytes) {
                 map.entry(*data_root)
                     .or_default()

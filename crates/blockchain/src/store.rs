@@ -483,7 +483,7 @@ pub fn on_gossip_aggregated_attestation(
             ((validator_id, data_root), payload)
         })
         .collect();
-    let num_participants = entries.len();
+    let num_participants = aggregated.proof.participants.count_ones();
     store.insert_new_aggregated_payloads_batch(entries);
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
