@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use ethlambda_types::primitives::ssz::{DecodeError, HashTreeRoot, SszDecode};
+use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator};
+use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
@@ -194,10 +195,11 @@ mod tests {
     use super::*;
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::checkpoint::Checkpoint;
-    use ethlambda_types::primitives::{H256, SszList};
+    use ethlambda_types::primitives::H256;
     use ethlambda_types::state::{
         ChainConfig, JustificationValidators, JustifiedSlots, ValidatorPubkeyBytes,
     };
+    use libssz_types::SszList;
 
     // Helper to create valid test state
     fn create_test_state(slot: u64, validators: Vec<Validator>, genesis_time: u64) -> State {

@@ -1,14 +1,17 @@
 use serde::Serialize;
 
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+use libssz_types::SszList;
+
 use crate::{
     attestation::{
         AggregatedAttestation, AggregationBits, Attestation, XmssSignature, validator_indices,
     },
-    primitives::{
-        ByteList, H256, SszList,
-        ssz::{HashTreeRoot, SszDecode, SszEncode},
-    },
+    primitives::{self, ByteList, H256},
 };
+
+// Convenience trait for calling hash_tree_root() without a hasher argument
+use primitives::HashTreeRoot as _;
 
 /// Envelope carrying a block, an attestation from proposer, and aggregated signatures.
 #[derive(Clone, SszEncode, SszDecode)]

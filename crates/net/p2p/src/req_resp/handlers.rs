@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
-use ethlambda_types::primitives::ssz::HashTreeRoot;
+use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 
 use super::{

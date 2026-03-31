@@ -12,7 +12,7 @@ use ethlambda_types::{
         AttestationSignatures, Block, BlockSignatures, BlockWithAttestation,
         SignedBlockWithAttestation,
     },
-    primitives::{H256, ssz::HashTreeRoot},
+    primitives::{H256, HashTreeRoot as _},
     signature::SIGNATURE_SIZE,
     state::State,
 };

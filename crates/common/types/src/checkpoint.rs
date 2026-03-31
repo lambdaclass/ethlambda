@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::primitives::{
-    H256,
-    ssz::{HashTreeRoot, SszDecode, SszEncode},
-};
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+
+use crate::primitives::H256;
 
 /// Represents a checkpoint in the chain's history.
 #[derive(

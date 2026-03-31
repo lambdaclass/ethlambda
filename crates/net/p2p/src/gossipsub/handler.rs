@@ -2,12 +2,10 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::SignedBlockWithAttestation,
-    primitives::{
-        H256,
-        ssz::{HashTreeRoot, SszDecode, SszEncode},
-    },
+    primitives::{H256, HashTreeRoot as _},
 };
 use libp2p::gossipsub::Event;
+use libssz::{SszDecode, SszEncode};
 use tracing::{error, info, trace};
 
 use super::{

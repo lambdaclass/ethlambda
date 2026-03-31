@@ -1,14 +1,16 @@
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+use libssz_types::{SszBitlist, SszList};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     block::{BlockBody, BlockHeader},
     checkpoint::Checkpoint,
-    primitives::{
-        H256, SszBitlist, SszList,
-        ssz::{HashTreeRoot, SszDecode, SszEncode},
-    },
+    primitives::{self, H256},
     signature::{SignatureParseError, ValidatorPublicKey},
 };
+
+// Convenience trait for calling hash_tree_root() without a hasher argument
+use primitives::HashTreeRoot as _;
 
 /// The main consensus state object
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]

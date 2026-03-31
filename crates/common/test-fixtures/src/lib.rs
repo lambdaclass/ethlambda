@@ -5,12 +5,13 @@ use ethlambda_types::{
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     checkpoint::Checkpoint as DomainCheckpoint,
-    primitives::{H256, SszList},
+    primitives::H256,
     state::{
         ChainConfig, JustificationValidators, JustifiedSlots, State, Validator as DomainValidator,
         ValidatorPubkeyBytes,
     },
 };
+use libssz_types::SszList;
 use serde::Deserialize;
 
 // ============================================================================

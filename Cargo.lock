@@ -1973,6 +1973,8 @@ dependencies = [
  "ethlambda-types",
  "eyre",
  "hex",
+ "libssz",
+ "libssz-types",
  "reqwest",
  "serde",
  "serde_yaml_ng",
@@ -2061,6 +2063,7 @@ dependencies = [
  "libssz",
  "libssz-derive",
  "libssz-merkle",
+ "libssz-types",
  "rand 0.8.5",
  "sha2",
  "snap",
@@ -2081,6 +2084,7 @@ dependencies = [
  "ethlambda-types",
  "http-body-util",
  "jemalloc_pprof",
+ "libssz",
  "serde",
  "serde_json",
  "tokio",
@@ -2109,6 +2113,7 @@ version = "0.1.0"
 dependencies = [
  "ethlambda-types",
  "libssz",
+ "libssz-derive",
  "rocksdb",
  "tempfile",
  "tracing",
@@ -2120,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "ethlambda-types",
  "hex",
+ "libssz-types",
  "serde",
 ]
 

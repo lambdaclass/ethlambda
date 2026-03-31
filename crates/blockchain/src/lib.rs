@@ -9,7 +9,7 @@ use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::HashTreeRoot},
+    primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSecretKey,
 };
 use spawned_concurrency::actor;

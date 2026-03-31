@@ -4,7 +4,7 @@ use ethlambda_types::{
     ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::HashTreeRoot},
+    primitives::{H256, HashTreeRoot as _},
     state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
 use tracing::{info, warn};
@@ -465,7 +465,7 @@ fn serialize_justifications(
         .for_each(|(i, _)| {
             justifications_validators
                 .set(i, true)
-                .expect("index within capacity");
+                .expect("we just updated the capacity");
         });
     state.justifications_roots = justification_roots
         .try_into()

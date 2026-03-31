@@ -25,7 +25,7 @@ pub fn is_slot_justified(slots: &JustifiedSlots, finalized_slot: u64, target_slo
 /// Mark a slot as justified. No-op if slot is finalized.
 pub fn set_justified(slots: &mut JustifiedSlots, finalized_slot: u64, target_slot: u64) {
     if let Some(idx) = relative_index(target_slot, finalized_slot) {
-        slots.set(idx, true).expect("index within capacity");
+        slots.set(idx, true).expect("index out of bounds");
     }
 }
 
@@ -63,7 +63,7 @@ pub fn shift_window(slots: &mut JustifiedSlots, delta: usize) {
     let mut new_bits = JustifiedSlots::with_length(remaining).expect("capacity limit exceeded");
     for i in 0..remaining {
         if slots.get(i + delta).unwrap_or(false) {
-            new_bits.set(i, true).expect("index within capacity");
+            new_bits.set(i, true).unwrap();
         }
     }
     *slots = new_bits;

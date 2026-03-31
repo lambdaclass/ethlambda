@@ -1,12 +1,7 @@
-use crate::{
-    block::AggregatedSignatureProof,
-    checkpoint::Checkpoint,
-    primitives::{
-        SszBitlist, SszVector,
-        ssz::{HashTreeRoot, SszDecode, SszEncode},
-    },
-    signature::SIGNATURE_SIZE,
-};
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+use libssz_types::{SszBitlist, SszVector};
+
+use crate::{block::AggregatedSignatureProof, checkpoint::Checkpoint, signature::SIGNATURE_SIZE};
 
 /// Validator specific attestation wrapping shared attestation data.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]

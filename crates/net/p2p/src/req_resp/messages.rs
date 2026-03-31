@@ -1,11 +1,8 @@
 use ethlambda_types::{
-    block::SignedBlockWithAttestation,
-    checkpoint::Checkpoint,
-    primitives::{
-        H256, SszList,
-        ssz::{SszDecode, SszEncode},
-    },
+    block::SignedBlockWithAttestation, checkpoint::Checkpoint, primitives::H256,
 };
+use libssz_derive::{SszDecode, SszEncode};
+use libssz_types::SszList;
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";

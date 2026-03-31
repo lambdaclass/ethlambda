@@ -16,7 +16,7 @@ use ethlambda_types::{
         SignedBlockWithAttestation,
     },
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::HashTreeRoot},
+    primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
     state::State,
 };
@@ -950,7 +950,7 @@ fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
     for &vid in bits {
         aggregation_bits
             .set(vid as usize, true)
-            .expect("index within capacity");
+            .expect("capacity support highest validator id");
     }
     aggregation_bits
 }

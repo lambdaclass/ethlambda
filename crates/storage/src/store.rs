@@ -19,13 +19,11 @@ use ethlambda_types::{
         BlockWithAttestation, SignedBlockWithAttestation,
     },
     checkpoint::Checkpoint,
-    primitives::{
-        H256,
-        ssz::{HashTreeRoot, SszDecode, SszEncode},
-    },
+    primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
     state::{ChainConfig, State},
 };
+use libssz::{SszDecode, SszEncode};
 use tracing::info;
 
 /// Key for looking up individual validator signatures.

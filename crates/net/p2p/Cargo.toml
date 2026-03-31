@@ -42,6 +42,7 @@ ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4d
 libssz.workspace = true
 libssz-derive.workspace = true
 libssz-merkle.workspace = true
+libssz-types.workspace = true
 
 sha2 = "0.10"
 

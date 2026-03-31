@@ -53,7 +53,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        primitives::{H256, ssz::HashTreeRoot},
+        primitives::{H256, HashTreeRoot as _},
         state::{State, Validator},
     };
 
