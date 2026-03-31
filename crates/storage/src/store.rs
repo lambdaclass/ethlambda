@@ -10,7 +10,7 @@ static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().t
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::AttestationData,
+    attestation::{AttestationData, HashedAttestationData},
     block::{
         AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
         BlockWithAttestation, SignedBlockWithAttestation,
@@ -123,12 +123,8 @@ impl PayloadBuffer {
     }
 
     /// Insert proofs for an attestation, FIFO-evicting oldest data_root if at capacity.
-    fn push(
-        &mut self,
-        data_root: H256,
-        att_data: AttestationData,
-        proof: AggregatedSignatureProof,
-    ) {
+    fn push(&mut self, hashed: HashedAttestationData, proof: AggregatedSignatureProof) {
+        let (data_root, att_data) = hashed.into_parts();
         if let Some(entry) = self.data.get_mut(&data_root) {
             entry.proofs.push(proof);
         } else {
@@ -149,24 +145,23 @@ impl PayloadBuffer {
         }
     }
 
-    /// Insert a batch of (data_root, attestation_data, proof) entries.
-    fn push_batch(&mut self, entries: Vec<(H256, AttestationData, AggregatedSignatureProof)>) {
-        for (data_root, att_data, proof) in entries {
-            self.push(data_root, att_data, proof);
+    /// Insert a batch of (hashed_attestation_data, proof) entries.
+    fn push_batch(&mut self, entries: Vec<(HashedAttestationData, AggregatedSignatureProof)>) {
+        for (hashed, proof) in entries {
+            self.push(hashed, proof);
         }
     }
 
     /// Take all entries, leaving the buffer empty.
-    fn drain(&mut self) -> Vec<(H256, AttestationData, AggregatedSignatureProof)> {
+    fn drain(&mut self) -> Vec<(HashedAttestationData, AggregatedSignatureProof)> {
         self.order.clear();
         self.data
             .drain()
-            .flat_map(|(root, entry)| {
-                let data = entry.data;
+            .flat_map(|(_, entry)| {
                 entry
                     .proofs
                     .into_iter()
-                    .map(move |proof| (root, data.clone(), proof))
+                    .map(move |proof| (HashedAttestationData::new(entry.data.clone()), proof))
             })
             .collect()
     }
@@ -211,8 +206,8 @@ struct GossipDataEntry {
 /// Gossip signatures grouped by attestation data (via data_root).
 type GossipSignatureMap = HashMap<H256, GossipDataEntry>;
 
-/// Gossip signatures snapshot: (data_root, attestation_data, Vec<(validator_id, signature)>).
-pub type GossipSignatureSnapshot = Vec<(H256, AttestationData, Vec<(u64, ValidatorSignature)>)>;
+/// Gossip signatures snapshot: (hashed_attestation_data, Vec<(validator_id, signature)>).
+pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, ValidatorSignature)>)>;
 
 /// Encode a LiveChain key (slot, root) to bytes.
 /// Layout: slot (8 bytes big-endian) || root (32 bytes)
@@ -876,20 +871,16 @@ impl Store {
     /// Insert a single proof into the known (fork-choice-active) buffer.
     pub fn insert_known_aggregated_payload(
         &mut self,
-        data_root: H256,
-        att_data: AttestationData,
+        hashed: HashedAttestationData,
         proof: AggregatedSignatureProof,
     ) {
-        self.known_payloads
-            .lock()
-            .unwrap()
-            .push(data_root, att_data, proof);
+        self.known_payloads.lock().unwrap().push(hashed, proof);
     }
 
     /// Batch-insert proofs into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(H256, AttestationData, AggregatedSignatureProof)>,
+        entries: Vec<(HashedAttestationData, AggregatedSignatureProof)>,
     ) {
         self.known_payloads.lock().unwrap().push_batch(entries);
     }
@@ -902,20 +893,16 @@ impl Store {
     /// Insert a single proof into the new (pending) buffer.
     pub fn insert_new_aggregated_payload(
         &mut self,
-        data_root: H256,
-        att_data: AttestationData,
+        hashed: HashedAttestationData,
         proof: AggregatedSignatureProof,
     ) {
-        self.new_payloads
-            .lock()
-            .unwrap()
-            .push(data_root, att_data, proof);
+        self.new_payloads.lock().unwrap().push(hashed, proof);
     }
 
     /// Batch-insert proofs into the new buffer.
     pub fn insert_new_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(H256, AttestationData, AggregatedSignatureProof)>,
+        entries: Vec<(HashedAttestationData, AggregatedSignatureProof)>,
     ) {
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
@@ -978,14 +965,14 @@ impl Store {
     pub fn iter_gossip_signatures(&self) -> GossipSignatureSnapshot {
         let gossip = self.gossip_signatures.lock().unwrap();
         gossip
-            .iter()
-            .map(|(root, entry)| {
+            .values()
+            .map(|entry| {
                 let sigs: Vec<_> = entry
                     .signatures
                     .iter()
                     .map(|e| (e.validator_id, e.signature.clone()))
                     .collect();
-                (*root, entry.data.clone(), sigs)
+                (HashedAttestationData::new(entry.data.clone()), sigs)
             })
             .collect()
     }
@@ -993,11 +980,11 @@ impl Store {
     /// Stores a gossip signature for later aggregation.
     pub fn insert_gossip_signature(
         &mut self,
-        data_root: H256,
-        att_data: AttestationData,
+        hashed: HashedAttestationData,
         validator_id: u64,
         signature: ValidatorSignature,
     ) {
+        let (data_root, att_data) = hashed.into_parts();
         let mut gossip = self.gossip_signatures.lock().unwrap();
         let entry = gossip.entry(data_root).or_insert_with(|| GossipDataEntry {
             data: att_data,
@@ -1485,15 +1472,13 @@ mod tests {
         // Insert 3 distinct attestation data entries (different slots → different roots)
         for slot in 1..=3u64 {
             let data = make_att_data(slot);
-            let data_root = data.tree_hash_root();
-            buf.push(data_root, data, make_proof());
+            buf.push(HashedAttestationData::new(data), make_proof());
         }
         assert_eq!(buf.len(), 3);
 
         // Pushing a 4th should evict the oldest (slot 1)
         let data = make_att_data(4);
-        let data_root = data.tree_hash_root();
-        buf.push(data_root, data, make_proof());
+        buf.push(HashedAttestationData::new(data), make_proof());
         assert_eq!(buf.len(), 3);
 
         // The oldest (slot 1) should be gone
@@ -1508,9 +1493,9 @@ mod tests {
         let data_root = data.tree_hash_root();
 
         // Insert 3 proofs for the same attestation data
-        buf.push(data_root, data.clone(), make_proof());
-        buf.push(data_root, data.clone(), make_proof());
-        buf.push(data_root, data, make_proof());
+        buf.push(HashedAttestationData::new(data.clone()), make_proof());
+        buf.push(HashedAttestationData::new(data.clone()), make_proof());
+        buf.push(HashedAttestationData::new(data), make_proof());
 
         // Should be 1 distinct data entry with 3 proofs
         assert_eq!(buf.len(), 1);
@@ -1521,10 +1506,9 @@ mod tests {
     fn payload_buffer_drain_empties_buffer() {
         let mut buf = PayloadBuffer::new(10);
         let data = make_att_data(1);
-        let data_root = data.tree_hash_root();
 
-        buf.push(data_root, data.clone(), make_proof());
-        buf.push(data_root, data, make_proof());
+        buf.push(HashedAttestationData::new(data.clone()), make_proof());
+        buf.push(HashedAttestationData::new(data), make_proof());
 
         let drained = buf.drain();
         assert_eq!(drained.len(), 2); // 2 proofs flattened
@@ -1538,8 +1522,8 @@ mod tests {
         let data = make_att_data(1);
         let data_root = data.tree_hash_root();
 
-        store.insert_new_aggregated_payload(data_root, data.clone(), make_proof());
-        store.insert_new_aggregated_payload(data_root, data, make_proof());
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data.clone()), make_proof());
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data), make_proof());
 
         assert_eq!(store.new_payloads.lock().unwrap().len(), 1);
         assert_eq!(store.known_payloads.lock().unwrap().len(), 0);
@@ -1562,9 +1546,8 @@ mod tests {
         let mut store = Store::test_store();
         let cloned = store.clone();
         let data = make_att_data(1);
-        let data_root = data.tree_hash_root();
 
-        store.insert_new_aggregated_payload(data_root, data, make_proof());
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data), make_proof());
 
         // Modification on original should be visible in clone
         assert_eq!(cloned.new_payloads.lock().unwrap().len(), 1);

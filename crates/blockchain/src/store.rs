@@ -9,7 +9,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
-        SignedAggregatedAttestation, SignedAttestation, validator_indices,
+        HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
     block::{
         AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
@@ -128,10 +128,11 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     let validators = &head_state.validators;
 
     let mut keys_to_delete: Vec<(u64, H256)> = Vec::new();
-    let mut payload_entries: Vec<(H256, AttestationData, AggregatedSignatureProof)> = Vec::new();
+    let mut payload_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
 
-    for (data_root, data, validator_sigs) in &gossip_groups {
-        let slot = data.slot;
+    for (hashed, validator_sigs) in &gossip_groups {
+        let data_root = hashed.root();
+        let slot = hashed.data().slot;
 
         let mut sigs = vec![];
         let mut pubkeys = vec![];
@@ -156,7 +157,7 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         // data_root is already the tree_hash_root of the attestation data
         let Ok(proof_data) = {
             let _timing = metrics::time_pq_sig_aggregated_signatures_building();
-            aggregate_signatures(pubkeys, sigs, data_root, slot as u32)
+            aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
         }
         .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures")) else {
             continue;
@@ -166,15 +167,15 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         let proof = AggregatedSignatureProof::new(participants, proof_data);
 
         new_aggregates.push(SignedAggregatedAttestation {
-            data: data.clone(),
+            data: hashed.data().clone(),
             proof: proof.clone(),
         });
 
         // One entry per attestation data (not per validator)
-        payload_entries.push((*data_root, data.clone(), proof));
+        payload_entries.push((hashed.clone(), proof));
 
         // Only delete successfully aggregated signatures
-        keys_to_delete.extend(ids.iter().map(|vid| (*vid, *data_root)));
+        keys_to_delete.extend(ids.iter().map(|vid| (*vid, data_root)));
 
         metrics::inc_pq_sig_aggregated_signatures();
         metrics::inc_pq_sig_attestations_in_aggregated_signatures(ids.len() as u64);
@@ -345,7 +346,8 @@ pub fn on_gossip_attestation(
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
-    let data_root = attestation.data.tree_hash_root();
+    let hashed = HashedAttestationData::new(attestation.data.clone());
+    let data_root = hashed.root();
 
     let target = attestation.data.target;
     let target_state = store
@@ -374,7 +376,7 @@ pub fn on_gossip_attestation(
 
     // Store gossip signature unconditionally for later aggregation at interval 2.
     // Subnet filtering is handled at the P2P subscription layer.
-    store.insert_gossip_signature(data_root, attestation.data.clone(), validator_id, signature);
+    store.insert_gossip_signature(hashed, validator_id, signature);
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 
     metrics::inc_attestations_valid();
@@ -428,7 +430,8 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let data_root = aggregated.data.tree_hash_root();
+    let hashed = HashedAttestationData::new(aggregated.data.clone());
+    let data_root = hashed.root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     {
@@ -443,11 +446,7 @@ pub fn on_gossip_aggregated_attestation(
     .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Store one proof per attestation data (not per validator)
-    store.insert_new_aggregated_payload(
-        data_root,
-        aggregated.data.clone(),
-        aggregated.proof.clone(),
-    );
+    store.insert_new_aggregated_payload(hashed, aggregated.proof.clone());
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     let slot = aggregated.data.slot;
@@ -559,13 +558,12 @@ fn on_block_core(
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
     // Store one proof per attestation data in known aggregated payloads.
-    let mut known_entries: Vec<(H256, AttestationData, AggregatedSignatureProof)> = Vec::new();
+    let mut known_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
     {
-        let data_root = att.data.tree_hash_root();
-        known_entries.push((data_root, att.data.clone(), proof.clone()));
+        known_entries.push((HashedAttestationData::new(att.data.clone()), proof.clone()));
         // Count each participating validator as a valid attestation
         for _ in validator_indices(&att.aggregation_bits) {
             metrics::inc_attestations_valid();
@@ -575,7 +573,7 @@ fn on_block_core(
     // Process proposer attestation as pending (enters "new" stage via gossip path)
     // The proposer's attestation should NOT affect this block's fork choice position.
     let proposer_vid = proposer_attestation.validator_id;
-    let proposer_data_root = proposer_attestation.data.tree_hash_root();
+    let proposer_hashed = HashedAttestationData::new(proposer_attestation.data.clone());
 
     store.insert_known_aggregated_payloads_batch(known_entries);
 
@@ -588,23 +586,14 @@ fn on_block_core(
         // Without sig verification, insert directly with a dummy proof
         let participants = aggregation_bits_from_validator_indices(&[proposer_vid]);
         let proof = AggregatedSignatureProof::empty(participants);
-        store.insert_new_aggregated_payload(
-            proposer_data_root,
-            proposer_attestation.data.clone(),
-            proof,
-        );
+        store.insert_new_aggregated_payload(proposer_hashed, proof);
     } else {
         // Store the proposer's signature unconditionally for future block building.
         // Subnet filtering is handled at the P2P subscription layer.
         let proposer_sig =
             ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(
-            proposer_data_root,
-            proposer_attestation.data.clone(),
-            proposer_vid,
-            proposer_sig,
-        );
+        store.insert_gossip_signature(proposer_hashed, proposer_vid, proposer_sig);
     }
 
     let block_total = block_start.elapsed();
