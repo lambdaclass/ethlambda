@@ -229,14 +229,14 @@ mod tests {
 
     fn create_test_validator() -> Validator {
         Validator {
-            pubkey: ([1u8; 52]),
+            pubkey: [1u8; 52],
             index: 0,
         }
     }
 
     fn create_different_validator() -> Validator {
         Validator {
-            pubkey: ([2u8; 52]),
+            pubkey: [2u8; 52],
             index: 0,
         }
     }
@@ -244,7 +244,7 @@ mod tests {
     fn create_validators_with_indices(count: usize) -> Vec<Validator> {
         (0..count)
             .map(|i| Validator {
-                pubkey: ([i as u8 + 1; 52]),
+                pubkey: [i as u8 + 1; 52],
                 index: i as u64,
             })
             .collect()
