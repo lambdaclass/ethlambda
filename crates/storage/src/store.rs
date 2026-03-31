@@ -14,8 +14,8 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 use ethlambda_types::{
     attestation::AttestationData,
     block::{
-        Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation, BlockWithAttestation,
-        SignedBlockWithAttestation,
+        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
+        BlockWithAttestation, SignedBlockWithAttestation,
     },
     checkpoint::Checkpoint,
     primitives::{
@@ -144,6 +144,21 @@ impl PayloadBuffer {
         let mut map: HashMap<SignatureKey, Vec<StoredAggregatedPayload>> = HashMap::new();
         for (key, payload) in &self.entries {
             map.entry(*key).or_default().push(payload.clone());
+        }
+        map
+    }
+
+    /// Group entries by data_root, deduplicating proofs by participant bitfield.
+    fn grouped_by_data_root(&self) -> HashMap<H256, Vec<AggregatedSignatureProof>> {
+        let mut map: HashMap<H256, Vec<AggregatedSignatureProof>> = HashMap::new();
+        let mut seen: HashMap<H256, HashSet<Vec<u8>>> = HashMap::new();
+        for ((_vid, data_root), payload) in &self.entries {
+            let key_bytes = payload.proof.participants.as_ssz_bytes();
+            if seen.entry(*data_root).or_default().insert(key_bytes) {
+                map.entry(*data_root)
+                    .or_default()
+                    .push(payload.proof.clone());
+            }
         }
         map
     }
@@ -888,6 +903,11 @@ impl Store {
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.
     // Promoted from "new" payloads at specific intervals (0 with proposal, 4).
+
+    /// Group known payloads by data_root with deduplicated proofs.
+    pub fn known_payloads_by_data_root(&self) -> HashMap<H256, Vec<AggregatedSignatureProof>> {
+        self.known_payloads.lock().unwrap().grouped_by_data_root()
+    }
 
     /// Iterates over all known aggregated payloads, grouped by key.
     pub fn iter_known_aggregated_payloads(
