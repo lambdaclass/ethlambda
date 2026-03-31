@@ -503,11 +503,7 @@ pub fn on_gossip_aggregated_attestation(
 ///
 /// This is the safe default: it always verifies cryptographic signatures
 /// and stores them for future block building. Use this for all production paths.
-pub fn on_block(
-    store: &mut Store,
-    signed_block: SignedBlock,
-    local_validator_ids: &[u64],
-) -> Result<(), StoreError> {
+pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
     on_block_core(store, signed_block, true)
 }
 
@@ -530,7 +526,6 @@ fn on_block_core(
     store: &mut Store,
     signed_block: SignedBlock,
     verify: bool,
-    _local_validator_ids: &[u64],
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();

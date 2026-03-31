@@ -247,8 +247,7 @@ impl BlockChainServer {
     }
 
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
-        let validator_ids = self.key_manager.validator_ids();
-        store::on_block(&mut self.store, signed_block, &validator_ids)?;
+        store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
