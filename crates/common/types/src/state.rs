@@ -81,10 +81,8 @@ impl Validator {
 pub const PUBKEY_SIZE: usize = 52;
 
 /// 52-byte XMSS public key bytes.
-///
-/// Wrapped as a newtype because libssz only provides SszEncode/SszDecode/HashTreeRoot
-/// for common byte array sizes (4, 20, 32, 48, 96); 52 is specific to XMSS keys.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
+#[ssz(transparent)]
 pub struct ValidatorPubkeyBytes(pub [u8; PUBKEY_SIZE]);
 
 impl serde::Serialize for ValidatorPubkeyBytes {
@@ -108,46 +106,6 @@ impl TryFrom<Vec<u8>> for ValidatorPubkeyBytes {
     }
 }
 
-impl libssz::SszEncode for ValidatorPubkeyBytes {
-    fn is_fixed_size() -> bool {
-        true
-    }
-    fn fixed_size() -> usize {
-        PUBKEY_SIZE
-    }
-    fn encoded_len(&self) -> usize {
-        PUBKEY_SIZE
-    }
-    fn ssz_append(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.0);
-    }
-}
-
-impl libssz::SszDecode for ValidatorPubkeyBytes {
-    fn is_fixed_size() -> bool {
-        true
-    }
-    fn fixed_size() -> usize {
-        PUBKEY_SIZE
-    }
-    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
-        if bytes.len() != PUBKEY_SIZE {
-            return Err(libssz::DecodeError::InvalidFixedLength {
-                expected: PUBKEY_SIZE,
-                got: bytes.len(),
-            });
-        }
-        let arr: [u8; PUBKEY_SIZE] = bytes.try_into().unwrap();
-        Ok(Self(arr))
-    }
-}
-
-impl libssz_merkle::HashTreeRoot for ValidatorPubkeyBytes {
-    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
-        libssz_merkle::merkleize(hasher, &libssz_merkle::pack(&self.0), None)
-    }
-}
-
 impl State {
     pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {
         let genesis_header = BlockHeader {
@@ -155,7 +113,7 @@ impl State {
             proposer_index: 0,
             parent_root: H256::ZERO,
             state_root: H256::ZERO,
-            body_root: H256(BlockBody::default().hash_tree_root()),
+            body_root: BlockBody::default().hash_tree_root(),
         };
         let validators = SszList::try_from(validators).unwrap();
         let justified_slots = JustifiedSlots::new();

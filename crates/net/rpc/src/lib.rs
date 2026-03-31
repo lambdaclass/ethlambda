@@ -118,7 +118,7 @@ pub(crate) mod test_utils {
             proposer_index: 0,
             parent_root: H256::ZERO,
             state_root: H256::ZERO,
-            body_root: H256(BlockBody::default().hash_tree_root()),
+            body_root: BlockBody::default().hash_tree_root(),
         };
 
         let genesis_checkpoint = Checkpoint {
@@ -185,7 +185,7 @@ mod tests {
             checkpoint,
             json!({
                 "slot": expected.slot,
-                "root": format!("{:#x}", expected.root)
+                "root": format!("{}", expected.root)
             })
         );
     }

@@ -6,8 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 ///
 /// Used to detect genesis/anchor blocks that have no attestations,
 /// allowing us to skip storing empty bodies and reconstruct them on read.
-static EMPTY_BODY_ROOT: LazyLock<H256> =
-    LazyLock::new(|| H256(BlockBody::default().hash_tree_root()));
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 use crate::types::{StoredAggregatedPayload, StoredSignature};
@@ -281,7 +280,7 @@ impl Store {
         anchor_state.latest_block_header.state_root = H256::ZERO;
 
         // Compute state root with zeroed header
-        let anchor_state_root = H256(anchor_state.hash_tree_root());
+        let anchor_state_root = anchor_state.hash_tree_root();
 
         // Validate: original must be zero (genesis) or match computed (checkpoint sync)
         assert!(
@@ -292,7 +291,7 @@ impl Store {
         // Populate the correct state_root
         anchor_state.latest_block_header.state_root = anchor_state_root;
 
-        let anchor_block_root = H256(anchor_state.latest_block_header.hash_tree_root());
+        let anchor_block_root = anchor_state.latest_block_header.hash_tree_root();
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,

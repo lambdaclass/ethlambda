@@ -368,7 +368,7 @@ pub fn on_gossip_attestation(
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
-    let data_root = H256(attestation.data.hash_tree_root());
+    let data_root = attestation.data.hash_tree_root();
 
     let target = attestation.data.target;
     let target_state = store
@@ -454,7 +454,7 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let data_root = H256(aggregated.data.hash_tree_root());
+    let data_root = aggregated.data.hash_tree_root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     {
@@ -537,7 +537,7 @@ fn on_block_core(
     let block_start = std::time::Instant::now();
 
     let block = &signed_block.block.block;
-    let block_root = H256(block.hash_tree_root());
+    let block_root = block.hash_tree_root();
     let slot = block.slot;
 
     // Skip duplicate blocks (idempotent operation)
@@ -602,7 +602,7 @@ fn on_block_core(
         .iter()
         .zip(attestation_signatures.iter())
     {
-        let data_root = H256(att.data.hash_tree_root());
+        let data_root = att.data.hash_tree_root();
         att_data_entries.push((data_root, att.data.clone()));
 
         let validator_ids: Vec<_> = validator_indices(&att.aggregation_bits).collect();
@@ -620,7 +620,7 @@ fn on_block_core(
     // Process proposer attestation as pending (enters "new" stage via gossip path)
     // The proposer's attestation should NOT affect this block's fork choice position.
     let proposer_vid = proposer_attestation.validator_id;
-    let proposer_data_root = H256(proposer_attestation.data.hash_tree_root());
+    let proposer_data_root = proposer_attestation.data.hash_tree_root();
     att_data_entries.push((proposer_data_root, proposer_attestation.data.clone()));
 
     // Batch-insert all attestation data (body + proposer) in a single commit
@@ -1113,7 +1113,7 @@ fn build_block(
     let mut post_state = head_state.clone();
     process_slots(&mut post_state, slot)?;
     process_block(&mut post_state, &final_block)?;
-    final_block.state_root = H256(post_state.hash_tree_root());
+    final_block.state_root = post_state.hash_tree_root();
 
     Ok((final_block, aggregated_signatures))
 }
@@ -1156,7 +1156,7 @@ fn verify_signatures(
         }
 
         let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let message = H256(attestation.data.hash_tree_root());
+        let message = attestation.data.hash_tree_root();
 
         // Collect public keys for all participating validators
         let public_keys: Vec<_> = validator_ids
@@ -1210,7 +1210,7 @@ fn verify_signatures(
         .slot
         .try_into()
         .expect("slot exceeds u32");
-    let message = H256(proposer_attestation.data.hash_tree_root());
+    let message = proposer_attestation.data.hash_tree_root();
 
     if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
         return Err(StoreError::ProposerSignatureVerificationFailed);

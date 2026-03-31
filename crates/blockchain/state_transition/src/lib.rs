@@ -59,7 +59,7 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
     // )
     // .unwrap();
 
-    let computed_state_root = H256(state.hash_tree_root());
+    let computed_state_root = state.hash_tree_root();
     if block.state_root != computed_state_root {
         return Err(Error::StateRootMismatch {
             expected: block.state_root,
@@ -91,7 +91,7 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
         });
     }
     if state.latest_block_header.state_root == H256::ZERO {
-        state.latest_block_header.state_root = H256(state.hash_tree_root());
+        state.latest_block_header.state_root = state.hash_tree_root();
     }
     let slots_processed = target_slot - state.slot;
     state.slot = target_slot;
@@ -138,7 +138,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         });
     }
     // TODO: this is redundant in normal operation
-    let parent_root = H256(parent_header.hash_tree_root());
+    let parent_root = parent_header.hash_tree_root();
     if block.parent_root != parent_root {
         return Err(Error::InvalidParent {
             expected: parent_root,
@@ -196,7 +196,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         slot: block.slot,
         proposer_index: block.proposer_index,
         parent_root: block.parent_root,
-        body_root: H256(block.body.hash_tree_root()),
+        body_root: block.body.hash_tree_root(),
         // Zeroed out until local state root computation.
         // This is later filled with the state root after all processing is done.
         state_root: H256::ZERO,

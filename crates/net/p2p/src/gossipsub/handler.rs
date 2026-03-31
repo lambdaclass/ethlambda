@@ -2,7 +2,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::SignedBlockWithAttestation,
-    primitives::{H256, HashTreeRoot as _},
+    primitives::HashTreeRoot as _,
 };
 use libp2p::gossipsub::Event;
 use libssz::{SszDecode, SszEncode};
@@ -41,7 +41,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 return;
             };
             let slot = signed_block.block.block.slot;
-            let block_root = H256(signed_block.block.block.hash_tree_root());
+            let block_root = signed_block.block.block.hash_tree_root();
             let proposer = signed_block.block.block.proposer_index;
             let parent_root = signed_block.block.block.parent_root;
             let attestation_count = signed_block.block.block.body.attestations.len();
@@ -159,7 +159,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
     let slot = signed_block.block.block.slot;
     let proposer = signed_block.block.block.proposer_index;
-    let block_root = H256(signed_block.block.block.hash_tree_root());
+    let block_root = signed_block.block.block.hash_tree_root();
     let parent_root = signed_block.block.block.parent_root;
     let attestation_count = signed_block.block.block.body.attestations.len();
 

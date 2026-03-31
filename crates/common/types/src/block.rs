@@ -204,18 +204,18 @@ impl Block {
             proposer_index: self.proposer_index,
             parent_root: self.parent_root,
             state_root: self.state_root,
-            body_root: H256(self.body.hash_tree_root()),
+            body_root: self.body.hash_tree_root(),
         }
     }
 
     /// Reconstruct a block from header and body.
     ///
-    /// The caller should ensure that `header.body_root` matches `H256(body.hash_tree_root())`.
+    /// The caller should ensure that `header.body_root` matches `body.hash_tree_root()`.
     /// This is verified with a debug assertion but not in release builds.
     pub fn from_header_and_body(header: BlockHeader, body: BlockBody) -> Self {
         debug_assert_eq!(
             header.body_root,
-            H256(body.hash_tree_root()),
+            body.hash_tree_root(),
             "body root mismatch"
         );
         Self {

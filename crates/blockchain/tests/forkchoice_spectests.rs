@@ -56,7 +56,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // Register block label if present
                     if let Some(ref label) = block_data.block_root_label {
                         let block: Block = block_data.block.clone().into();
-                        let root = H256(block.hash_tree_root());
+                        let root = block.hash_tree_root();
                         block_registry.insert(label.clone(), root);
                     }
 

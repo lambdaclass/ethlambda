@@ -4,8 +4,11 @@
 /// via blanket impl, so callers can use `value.hash_tree_root()` without passing
 /// a hasher explicitly.
 pub trait HashTreeRoot: libssz_merkle::HashTreeRoot {
-    fn hash_tree_root(&self) -> libssz_merkle::Node {
-        libssz_merkle::HashTreeRoot::hash_tree_root(self, &libssz_merkle::Sha2Hasher)
+    fn hash_tree_root(&self) -> H256 {
+        H256(libssz_merkle::HashTreeRoot::hash_tree_root(
+            self,
+            &libssz_merkle::Sha2Hasher,
+        ))
     }
 }
 
@@ -16,7 +19,7 @@ pub type ByteList<const N: usize> = libssz_types::SszList<u8, N>;
 /// 256-bit hash digest used as a block root, state root, etc.
 ///
 /// Encoded as a fixed 32-byte array (transparent SSZ wrapper).
-/// Serialized as a `"0x..."` hex string (without prefix for lowercase display).
+/// Serialized as a `"0x..."` hex string.
 #[derive(
     Debug,
     Clone,
@@ -36,7 +39,7 @@ pub struct H256(pub [u8; 32]);
 
 impl serde::Serialize for H256 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format!("{:x}", self))
+        serializer.serialize_str(&format!("{self}"))
     }
 }
 
@@ -71,9 +74,9 @@ impl H256 {
     }
 
     pub fn from_slice(bytes: &[u8]) -> Self {
-        let mut arr = [0u8; 32];
-        let len = bytes.len().min(32);
-        arr[..len].copy_from_slice(&bytes[..len]);
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .expect("H256::from_slice requires exactly 32 bytes");
         Self(arr)
     }
 }
@@ -102,5 +105,51 @@ impl std::fmt::LowerHex for H256 {
 impl std::fmt::Display for H256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "0x{:x}", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h256_serialize_has_0x_prefix() {
+        let h = H256([0xab; 32]);
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.starts_with("\"0x"), "expected 0x prefix, got: {json}");
+    }
+
+    #[test]
+    fn h256_roundtrip_serialization() {
+        let h = H256([0xab; 32]);
+        let json = serde_json::to_string(&h).unwrap();
+        let deserialized: H256 = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, deserialized);
+    }
+
+    #[test]
+    fn h256_deserialize_without_prefix() {
+        let hex_str = format!("\"{}\"", hex::encode([0xcd; 32]));
+        let h: H256 = serde_json::from_str(&hex_str).unwrap();
+        assert_eq!(h, H256([0xcd; 32]));
+    }
+
+    #[test]
+    fn h256_from_slice_exact_32_bytes() {
+        let bytes = [0x42u8; 32];
+        let h = H256::from_slice(&bytes);
+        assert_eq!(h.0, bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "H256::from_slice requires exactly 32 bytes")]
+    fn h256_from_slice_too_short() {
+        H256::from_slice(&[0u8; 31]);
+    }
+
+    #[test]
+    #[should_panic(expected = "H256::from_slice requires exactly 32 bytes")]
+    fn h256_from_slice_too_long() {
+        H256::from_slice(&[0u8; 33]);
     }
 }

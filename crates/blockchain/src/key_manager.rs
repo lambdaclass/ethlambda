@@ -73,7 +73,7 @@ impl KeyManager {
         validator_id: u64,
         attestation_data: &AttestationData,
     ) -> Result<XmssSignature, KeyManagerError> {
-        let message_hash = H256(attestation_data.hash_tree_root());
+        let message_hash = attestation_data.hash_tree_root();
         let slot = attestation_data.slot as u32;
         self.sign_message(validator_id, slot, &message_hash)
     }

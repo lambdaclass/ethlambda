@@ -176,13 +176,13 @@ fn verify_checkpoint_state(
     let block_root = state.latest_block_header.hash_tree_root();
 
     if state.latest_block_header.slot == state.latest_finalized.slot
-        && block_root != state.latest_finalized.root.0
+        && block_root != state.latest_finalized.root
     {
         return Err(CheckpointSyncError::BlockHeaderFinalizedRootMismatch);
     }
 
     if state.latest_block_header.slot == state.latest_justified.slot
-        && block_root != state.latest_justified.root.0
+        && block_root != state.latest_justified.root
     {
         return Err(CheckpointSyncError::BlockHeaderJustifiedRootMismatch);
     }
@@ -376,7 +376,7 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 50;
-        let block_root = H256(state.latest_block_header.hash_tree_root());
+        let block_root = state.latest_block_header.hash_tree_root();
         state.latest_finalized.slot = 50;
         state.latest_finalized.root = block_root;
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
@@ -398,7 +398,7 @@ mod tests {
         let validators = vec![create_test_validator()];
         let mut state = create_test_state(100, validators.clone(), 1000);
         state.latest_block_header.slot = 90;
-        let block_root = H256(state.latest_block_header.hash_tree_root());
+        let block_root = state.latest_block_header.hash_tree_root();
         state.latest_justified.slot = 90;
         state.latest_justified.root = block_root;
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_ok());
