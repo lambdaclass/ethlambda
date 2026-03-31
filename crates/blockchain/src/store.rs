@@ -973,24 +973,30 @@ fn extend_proofs_greedily(
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
 
     while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators
+        // Pick proof covering the most uncovered validators (count only, no allocation)
         let best = remaining_indices
             .iter()
             .map(|&idx| {
-                let new_coverage: Vec<u64> = proofs[idx]
+                let count = proofs[idx]
                     .participant_indices()
                     .filter(|vid| !covered.contains(vid))
-                    .collect();
-                (idx, new_coverage)
+                    .count();
+                (idx, count)
             })
-            .max_by_key(|(_, cov)| cov.len());
+            .max_by_key(|&(_, count)| count);
 
-        let Some((best_idx, new_covered)) = best else {
+        let Some((best_idx, best_count)) = best else {
             break;
         };
-        if new_covered.is_empty() {
+        if best_count == 0 {
             break;
         }
+
+        // Collect coverage only for the winning proof
+        let new_covered: Vec<u64> = proofs[best_idx]
+            .participant_indices()
+            .filter(|vid| !covered.contains(vid))
+            .collect();
 
         let proof = &proofs[best_idx];
         attestations.push(AggregatedAttestation {
