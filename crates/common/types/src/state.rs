@@ -65,46 +65,27 @@ pub type JustificationValidators =
 #[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
     /// XMSS one-time signature public key.
+    #[serde(serialize_with = "serialize_pubkey_hex")]
     pub pubkey: ValidatorPubkeyBytes,
     /// Validator index in the registry.
     pub index: u64,
 }
 
+fn serialize_pubkey_hex<S>(pubkey: &ValidatorPubkeyBytes, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&hex::encode(pubkey))
+}
+
 impl Validator {
     pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
         // TODO: make this unfallible by moving check to the constructor
-        ValidatorPublicKey::from_bytes(&self.pubkey.0)
+        ValidatorPublicKey::from_bytes(&self.pubkey)
     }
 }
 
-/// Size of an XMSS public key in bytes.
-pub const PUBKEY_SIZE: usize = 52;
-
-/// 52-byte XMSS public key bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
-#[ssz(transparent)]
-pub struct ValidatorPubkeyBytes(pub [u8; PUBKEY_SIZE]);
-
-impl serde::Serialize for ValidatorPubkeyBytes {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(self.0))
-    }
-}
-
-impl std::ops::Deref for ValidatorPubkeyBytes {
-    type Target = [u8; PUBKEY_SIZE];
-    fn deref(&self) -> &[u8; PUBKEY_SIZE] {
-        &self.0
-    }
-}
-
-impl TryFrom<Vec<u8>> for ValidatorPubkeyBytes {
-    type Error = Vec<u8>;
-    fn try_from(v: Vec<u8>) -> Result<Self, Self::Error> {
-        let arr: [u8; PUBKEY_SIZE] = v.as_slice().try_into().map_err(|_| v)?;
-        Ok(Self(arr))
-    }
-}
+pub type ValidatorPubkeyBytes = [u8; 52];
 
 impl State {
     pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {

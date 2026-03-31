@@ -17,7 +17,7 @@ impl GenesisConfig {
             .iter()
             .enumerate()
             .map(|(i, pubkey)| Validator {
-                pubkey: pubkey.clone(),
+                pubkey: *pubkey,
                 index: i as u64,
             })
             .collect()
@@ -85,15 +85,15 @@ GENESIS_VALIDATORS:
         assert_eq!(config.genesis_time, 1770407233);
         assert_eq!(config.genesis_validators.len(), 3);
         assert_eq!(
-            config.genesis_validators[0].0,
+            config.genesis_validators[0],
             hex::decode(PUBKEY_A).unwrap().as_slice()
         );
         assert_eq!(
-            config.genesis_validators[1].0,
+            config.genesis_validators[1],
             hex::decode(PUBKEY_B).unwrap().as_slice()
         );
         assert_eq!(
-            config.genesis_validators[2].0,
+            config.genesis_validators[2],
             hex::decode(PUBKEY_C).unwrap().as_slice()
         );
     }

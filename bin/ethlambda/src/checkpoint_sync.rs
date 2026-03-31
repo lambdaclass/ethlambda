@@ -196,9 +196,7 @@ mod tests {
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::primitives::H256;
-    use ethlambda_types::state::{
-        ChainConfig, JustificationValidators, JustifiedSlots, ValidatorPubkeyBytes,
-    };
+    use ethlambda_types::state::{ChainConfig, JustificationValidators, JustifiedSlots};
     use libssz_types::SszList;
 
     // Helper to create valid test state
@@ -231,14 +229,14 @@ mod tests {
 
     fn create_test_validator() -> Validator {
         Validator {
-            pubkey: ValidatorPubkeyBytes([1u8; 52]),
+            pubkey: ([1u8; 52]),
             index: 0,
         }
     }
 
     fn create_different_validator() -> Validator {
         Validator {
-            pubkey: ValidatorPubkeyBytes([2u8; 52]),
+            pubkey: ([2u8; 52]),
             index: 0,
         }
     }
@@ -246,7 +244,7 @@ mod tests {
     fn create_validators_with_indices(count: usize) -> Vec<Validator> {
         (0..count)
             .map(|i| Validator {
-                pubkey: ValidatorPubkeyBytes([i as u8 + 1; 52]),
+                pubkey: ([i as u8 + 1; 52]),
                 index: i as u64,
             })
             .collect()
