@@ -13,7 +13,9 @@ use crate::types::{StoredAggregatedPayload, StoredSignature};
 
 use ethlambda_types::{
     attestation::AttestationData,
-    block::{AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock},
+    block::{
+        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
+    },
     checkpoint::Checkpoint,
     primitives::{
         H256,
