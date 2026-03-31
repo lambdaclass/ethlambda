@@ -106,16 +106,17 @@ pub struct BlockChainServer {
 impl BlockChainServer {
     fn on_tick(&mut self, timestamp_ms: u64) {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-
+        // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
-
+        // Fail fast: a state with zero validators is invalid and would cause
+        // panics in proposer selection and attestation processing.
         if self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
-
+         // Update current slot metric
         metrics::update_current_slot(slot);
 
         // Determine sync status: suppress validator duties while our head is
@@ -167,8 +168,9 @@ impl BlockChainServer {
         if !self.is_syncing && interval == 1 {
             self.produce_attestations(slot);
         }
-
+        // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
+        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
     }
 
