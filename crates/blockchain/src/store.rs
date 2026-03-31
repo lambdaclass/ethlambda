@@ -1150,18 +1150,15 @@ fn verify_signatures(
             return Err(StoreError::ParticipantsMismatch);
         }
 
-        let validator_ids: Vec<_> = validator_indices(&attestation.aggregation_bits).collect();
-        if validator_ids.iter().any(|vid| *vid >= num_validators) {
-            return Err(StoreError::InvalidValidatorIndex);
-        }
-
         let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.tree_hash_root();
 
-        // Collect public keys for all participating validators
-        let public_keys: Vec<_> = validator_ids
-            .iter()
-            .map(|&vid| {
+        // Collect public keys with bounds check in a single pass
+        let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
+            .map(|vid| {
+                if vid >= num_validators {
+                    return Err(StoreError::InvalidValidatorIndex);
+                }
                 validators[vid as usize]
                     .get_pubkey()
                     .map_err(|_| StoreError::PubkeyDecodingFailed(vid))

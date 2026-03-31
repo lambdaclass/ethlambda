@@ -227,6 +227,10 @@ pub struct Store {
     backend: Arc<dyn StorageBackend>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
+    /// Cached count of GossipSignatures table entries, used only for metrics.
+    /// Safe because all Store mutations happen on the BlockChain actor's single thread.
+    /// If concurrent writes are ever introduced, the read-then-write in
+    /// insert_gossip_signature must be made atomic to prevent counter drift.
     gossip_signatures_count: Arc<AtomicUsize>,
 }
 
