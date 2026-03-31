@@ -948,7 +948,9 @@ fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
         AggregationBits::with_length(max_id + 1).expect("validator count exceeds limit");
 
     for &vid in bits {
-        aggregation_bits.set(vid as usize, true);
+        aggregation_bits
+            .set(vid as usize, true)
+            .expect("index within capacity");
     }
     aggregation_bits
 }
@@ -1303,14 +1305,14 @@ mod tests {
 
         // Create attestation with bits [0, 1] set
         let mut attestation_bits = AggregationBits::with_length(4).unwrap();
-        attestation_bits.set(0, true);
-        attestation_bits.set(1, true);
+        attestation_bits.set(0, true).unwrap();
+        attestation_bits.set(1, true).unwrap();
 
         // Create proof with different bits [0, 1, 2] set
         let mut proof_bits = AggregationBits::with_length(4).unwrap();
-        proof_bits.set(0, true);
-        proof_bits.set(1, true);
-        proof_bits.set(2, true);
+        proof_bits.set(0, true).unwrap();
+        proof_bits.set(1, true).unwrap();
+        proof_bits.set(2, true).unwrap();
 
         let attestation = AggregatedAttestation {
             aggregation_bits: attestation_bits,

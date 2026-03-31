@@ -15,5 +15,8 @@ ethlambda-types.workspace = true
 tracing.workspace = true
 rocksdb.workspace = true
 
+# Required by derive macros (SszEncode, SszDecode expand to code referencing libssz)
+libssz.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

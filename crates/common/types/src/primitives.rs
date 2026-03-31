@@ -1,11 +1,28 @@
 // Re-export SSZ traits and types to avoid users having to depend on these directly
 pub mod ssz {
-    pub use ssz::{ContainerDecoder, ContainerEncoder, DecodeError, SszDecode, SszEncode};
-    pub use ssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-    pub use ssz_merkle::HashTreeRoot;
+    pub use libssz::{ContainerDecoder, ContainerEncoder, DecodeError, SszDecode, SszEncode};
+    // Derive macro (macro namespace: used in #[derive(HashTreeRoot)])
+    pub use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+    pub use libssz_merkle::{Sha2Hasher, Sha256Hasher};
+
+    /// Default hasher for hash_tree_root computations.
+    pub const HASHER: Sha2Hasher = Sha2Hasher;
+
+    /// Convenience trait that wraps libssz_merkle::HashTreeRoot with the default Sha2Hasher.
+    ///
+    /// All types that derive `HashTreeRoot` automatically implement this via blanket impl,
+    /// so callers can use `value.hash_tree_root()` without passing a hasher explicitly.
+    // (type namespace: coexists with the derive macro of the same name in macro namespace)
+    pub trait HashTreeRoot: libssz_merkle::HashTreeRoot {
+        fn hash_tree_root(&self) -> libssz_merkle::Node {
+            libssz_merkle::HashTreeRoot::hash_tree_root(self, &HASHER)
+        }
+    }
+
+    impl<T: libssz_merkle::HashTreeRoot> HashTreeRoot for T {}
 }
 
-pub use ssz_types::{SszBitlist, SszBitvector, SszList, SszVector};
+pub use libssz_types::{SszBitlist, SszBitvector, SszList, SszVector};
 
 pub type ByteList<const N: usize> = SszList<u8, N>;
 
@@ -23,9 +40,9 @@ pub type ByteList<const N: usize> = SszList<u8, N>;
     PartialOrd,
     Ord,
     Hash,
-    ssz_derive::SszEncode,
-    ssz_derive::SszDecode,
-    ssz_derive::HashTreeRoot,
+    libssz_derive::SszEncode,
+    libssz_derive::SszDecode,
+    libssz_derive::HashTreeRoot,
 )]
 #[ssz(transparent)]
 pub struct H256(pub [u8; 32]);

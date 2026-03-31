@@ -106,7 +106,7 @@ impl TryFrom<Vec<u8>> for ValidatorPubkeyBytes {
     }
 }
 
-impl ssz::SszEncode for ValidatorPubkeyBytes {
+impl libssz::SszEncode for ValidatorPubkeyBytes {
     fn is_fixed_size() -> bool {
         true
     }
@@ -121,16 +121,16 @@ impl ssz::SszEncode for ValidatorPubkeyBytes {
     }
 }
 
-impl ssz::SszDecode for ValidatorPubkeyBytes {
+impl libssz::SszDecode for ValidatorPubkeyBytes {
     fn is_fixed_size() -> bool {
         true
     }
     fn fixed_size() -> usize {
         PUBKEY_SIZE
     }
-    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
         if bytes.len() != PUBKEY_SIZE {
-            return Err(ssz::DecodeError::InvalidFixedLength {
+            return Err(libssz::DecodeError::InvalidFixedLength {
                 expected: PUBKEY_SIZE,
                 got: bytes.len(),
             });
@@ -140,9 +140,9 @@ impl ssz::SszDecode for ValidatorPubkeyBytes {
     }
 }
 
-impl ssz_merkle::HashTreeRoot for ValidatorPubkeyBytes {
-    fn hash_tree_root(&self) -> ssz_merkle::Node {
-        ssz_merkle::merkleize(&ssz_merkle::pack(&self.0), None)
+impl libssz_merkle::HashTreeRoot for ValidatorPubkeyBytes {
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        libssz_merkle::merkleize(hasher, &libssz_merkle::pack(&self.0), None)
     }
 }
 

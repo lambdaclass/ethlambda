@@ -58,10 +58,10 @@ clap = { version = "4.3", features = ["derive", "env"] }
 leansig = { git = "https://github.com/leanEthereum/leanSig.git", rev = "73bedc26ed961b110df7ac2e234dc11361a4bf25" }
 
 # SSZ implementation
-ssz = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
-ssz-derive = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
-ssz-merkle = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
-ssz-types = { git = "https://github.com/lambdaclass/libssz.git", rev = "a6ffa33862fa6b032b2c7e56cfb71a44038e6336" }
+libssz = "0.2"
+libssz-derive = "0.2"
+libssz-merkle = "0.2"
+libssz-types = "0.2"
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }

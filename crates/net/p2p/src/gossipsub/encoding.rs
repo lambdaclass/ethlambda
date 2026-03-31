@@ -53,7 +53,7 @@ pub fn compress_message(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::block::SignedBlockWithAttestation;
-    use ssz::SszDecode;
+    use libssz::SszDecode;
 
     #[test]
     #[ignore = "Test data uses old BlockSignatures field order (proposer_signature, attestation_signatures). Needs regeneration with correct order (attestation_signatures, proposer_signature)."]

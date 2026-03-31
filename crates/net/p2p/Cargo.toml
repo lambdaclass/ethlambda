@@ -39,9 +39,9 @@ ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
 
 # SSZ
-ssz.workspace = true
-ssz-derive.workspace = true
-ssz-merkle.workspace = true
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
 
 sha2 = "0.10"
 

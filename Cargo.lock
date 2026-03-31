@@ -2058,13 +2058,13 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
  "rand 0.8.5",
  "sha2",
  "snap",
  "spawned-concurrency 0.5.0",
- "ssz",
- "ssz-derive",
- "ssz-merkle",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2108,6 +2108,7 @@ name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
+ "libssz",
  "rocksdb",
  "tempfile",
  "tracing",
@@ -2128,12 +2129,12 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "leansig",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
  "serde",
  "serde_yaml_ng",
- "ssz",
- "ssz-derive",
- "ssz-merkle",
- "ssz-types",
  "thiserror 2.0.17",
 ]
 
@@ -4344,6 +4345,47 @@ dependencies = [
  "libz-sys",
  "lz4-sys",
  "zstd-sys",
+]
+
+[[package]]
+name = "libssz"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54193e6560611847aceb81ae53c75aa7031b50304bead95ec935f97af79378f2"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "libssz-derive"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bb6393ec2e9b660bbcb0d9d74aac7b3c351c7b4440dcc24e9d344e62cf4bf10"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "libssz-merkle"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37acd26ea2fbecfd8af8121780a385284cfb6d6f4c2f77648a9798b5d95a87d8"
+dependencies = [
+ "libssz",
+ "sha2",
+]
+
+[[package]]
+name = "libssz-types"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc4f9486929bd568731a599e9b4914aa44a0b4ecbd38c702151fe97210c323"
+dependencies = [
+ "libssz",
+ "libssz-merkle",
+ "smallvec",
 ]
 
 [[package]]
@@ -7094,43 +7136,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "ssz"
-version = "0.1.0"
-source = "git+https://github.com/lambdaclass/libssz.git?rev=a6ffa33862fa6b032b2c7e56cfb71a44038e6336#a6ffa33862fa6b032b2c7e56cfb71a44038e6336"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
-name = "ssz-derive"
-version = "0.1.0"
-source = "git+https://github.com/lambdaclass/libssz.git?rev=a6ffa33862fa6b032b2c7e56cfb71a44038e6336#a6ffa33862fa6b032b2c7e56cfb71a44038e6336"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.111",
-]
-
-[[package]]
-name = "ssz-merkle"
-version = "0.1.0"
-source = "git+https://github.com/lambdaclass/libssz.git?rev=a6ffa33862fa6b032b2c7e56cfb71a44038e6336#a6ffa33862fa6b032b2c7e56cfb71a44038e6336"
-dependencies = [
- "sha2",
- "ssz",
-]
-
-[[package]]
-name = "ssz-types"
-version = "0.1.0"
-source = "git+https://github.com/lambdaclass/libssz.git?rev=a6ffa33862fa6b032b2c7e56cfb71a44038e6336#a6ffa33862fa6b032b2c7e56cfb71a44038e6336"
-dependencies = [
- "smallvec",
- "ssz",
- "ssz-merkle",
 ]
 
 [[package]]

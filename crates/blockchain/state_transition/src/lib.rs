@@ -463,7 +463,9 @@ fn serialize_justifications(
         .enumerate()
         .filter(|(_, voted)| **voted)
         .for_each(|(i, _)| {
-            justifications_validators.set(i, true);
+            justifications_validators
+                .set(i, true)
+                .expect("index within capacity");
         });
     state.justifications_roots = justification_roots
         .try_into()

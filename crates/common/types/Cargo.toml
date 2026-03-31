@@ -16,10 +16,10 @@ hex.workspace = true
 
 leansig.workspace = true
 
-ssz.workspace = true
-ssz-derive.workspace = true
-ssz-merkle.workspace = true
-ssz-types.workspace = true
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
+libssz-types.workspace = true
 
 [dev-dependencies]
 serde_yaml_ng.workspace = true
