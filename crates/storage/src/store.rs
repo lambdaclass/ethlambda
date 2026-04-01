@@ -139,16 +139,6 @@ impl PayloadBuffer {
             entry.proofs.push(proof);
             self.total_proofs += 1;
         } else {
-            // Evict oldest data_roots until under capacity
-            while self.total_proofs >= self.capacity {
-                if let Some(evicted) = self.order.pop_front() {
-                    if let Some(removed) = self.data.remove(&evicted) {
-                        self.total_proofs -= removed.proofs.len();
-                    }
-                } else {
-                    break;
-                }
-            }
             self.data.insert(
                 data_root,
                 PayloadEntry {
@@ -158,6 +148,16 @@ impl PayloadBuffer {
             );
             self.order.push_back(data_root);
             self.total_proofs += 1;
+        }
+        // Evict oldest data_roots until under capacity
+        while self.total_proofs > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                if let Some(removed) = self.data.remove(&evicted) {
+                    self.total_proofs -= removed.proofs.len();
+                }
+            } else {
+                break;
+            }
         }
     }
 
