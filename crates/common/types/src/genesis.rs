@@ -59,7 +59,9 @@ mod tests {
     const ATT_PUBKEY_A: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800";
     const PROP_PUBKEY_A: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
     const ATT_PUBKEY_B: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410";
+    const PROP_PUBKEY_B: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800";
     const ATT_PUBKEY_C: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
+    const PROP_PUBKEY_C: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410";
 
     const TEST_CONFIG_YAML: &str = r#"# Genesis Settings
 GENESIS_TIME: 1770407233
@@ -100,8 +102,16 @@ GENESIS_VALIDATORS:
             hex::decode(ATT_PUBKEY_B).unwrap().as_slice()
         );
         assert_eq!(
+            config.genesis_validators[1].proposal_pubkey,
+            hex::decode(PROP_PUBKEY_B).unwrap().as_slice()
+        );
+        assert_eq!(
             config.genesis_validators[2].attestation_pubkey,
             hex::decode(ATT_PUBKEY_C).unwrap().as_slice()
+        );
+        assert_eq!(
+            config.genesis_validators[2].proposal_pubkey,
+            hex::decode(PROP_PUBKEY_C).unwrap().as_slice()
         );
     }
 

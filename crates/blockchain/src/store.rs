@@ -993,7 +993,7 @@ fn extend_proofs_greedily(
 ///
 /// Returns the block and a list of attestation signature proofs
 /// (one per attestation in block.body.attestations). The proposer signature
-/// proof is NOT included; it is appended by the caller.
+/// is NOT included; it is appended by the caller.
 fn build_block(
     head_state: &State,
     slot: u64,

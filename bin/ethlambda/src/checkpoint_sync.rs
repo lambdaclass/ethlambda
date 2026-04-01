@@ -34,7 +34,7 @@ pub enum CheckpointSyncError {
         expected: u64,
         got: u64,
     },
-    #[error("validator {index} pubkey mismatch")]
+    #[error("validator {index} pubkey mismatch (attestation or proposal key)")]
     ValidatorPubkeyMismatch { index: usize },
     #[error("finalized slot cannot exceed state slot")]
     FinalizedExceedsStateSlot,

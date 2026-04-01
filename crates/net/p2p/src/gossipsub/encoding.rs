@@ -58,7 +58,7 @@ mod tests {
     #[test]
     #[ignore = "devnet3 SSZ fixture — needs devnet4 block (SignedBlock without BlockWithAttestation wrapper)"]
     fn test_decode_block() {
-        let block_bytes = include_bytes!("../../test_data/signed_block_with_attestation.ssz");
+        let block_bytes = include_bytes!("../../test_data/signed_block.ssz");
         let _block = SignedBlock::from_ssz_bytes(block_bytes).unwrap();
     }
 }
