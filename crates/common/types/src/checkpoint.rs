@@ -12,6 +12,7 @@ use crate::primitives::H256;
     Default,
     PartialEq,
     Eq,
+    Hash,
     Serialize,
     Deserialize,
     SszEncode,

@@ -1,7 +1,12 @@
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitlist, SszVector};
 
-use crate::{block::AggregatedSignatureProof, checkpoint::Checkpoint, signature::SIGNATURE_SIZE};
+use crate::{
+    block::AggregatedSignatureProof,
+    checkpoint::Checkpoint,
+    primitives::{H256, HashTreeRoot as _},
+    signature::SIGNATURE_SIZE,
+};
 
 /// Validator specific attestation wrapping shared attestation data.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
@@ -14,7 +19,7 @@ pub struct Attestation {
 }
 
 /// Attestation content describing the validator's observed chain view.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AttestationData {
     /// The slot for which the attestation is made.
     pub slot: u64,
@@ -78,4 +83,42 @@ pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + 
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
     pub proof: AggregatedSignatureProof,
+}
+
+/// Attestation data paired with its precomputed tree hash root.
+///
+/// Private fields ensure that `root == data.tree_hash_root()` is always true.
+/// The only way to construct this is via [`HashedAttestationData::new`] or
+/// [`From<AttestationData>`], both of which compute the root from the data.
+#[derive(Debug, Clone)]
+pub struct HashedAttestationData {
+    root: H256,
+    data: AttestationData,
+}
+
+impl HashedAttestationData {
+    pub fn new(data: AttestationData) -> Self {
+        Self {
+            root: data.hash_tree_root(),
+            data,
+        }
+    }
+
+    pub fn root(&self) -> H256 {
+        self.root
+    }
+
+    pub fn data(&self) -> &AttestationData {
+        &self.data
+    }
+
+    pub fn into_parts(self) -> (H256, AttestationData) {
+        (self.root, self.data)
+    }
+}
+
+impl From<AttestationData> for HashedAttestationData {
+    fn from(data: AttestationData) -> Self {
+        Self::new(data)
+    }
 }

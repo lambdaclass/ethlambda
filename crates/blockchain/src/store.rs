@@ -4,12 +4,12 @@ use ethlambda_crypto::aggregate_signatures;
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
-use ethlambda_storage::{ForkCheckpoints, SignatureKey, Store, StoredAggregatedPayload};
+use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
-        SignedAggregatedAttestation, SignedAttestation, validator_indices,
+        HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
     block::{
         AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
@@ -97,15 +97,11 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools (keys only — skip payload deserialization).
+    // Merge both attestation pools (known + new).
     // At interval 3 the migration (interval 4) hasn't run yet, so attestations
     // that entered "known" directly (proposer's own attestation in block body,
     // node's self-attestation) would be invisible without this merge.
-    let all_keys: HashSet<SignatureKey> = store
-        .iter_known_aggregated_payload_keys()
-        .chain(store.iter_new_aggregated_payload_keys())
-        .collect();
-    let attestations = store.extract_latest_attestations(all_keys.into_iter());
+    let attestations = store.extract_latest_all_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -120,8 +116,8 @@ fn update_safe_target(store: &mut Store) {
 /// Collects individual gossip signatures, aggregates them by attestation data,
 /// and stores the resulting proofs in the new aggregated payloads buffer.
 fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
-    let gossip_sigs: Vec<(SignatureKey, _)> = store.iter_gossip_signatures().collect();
-    if gossip_sigs.is_empty() {
+    let gossip_groups = store.iter_gossip_signatures();
+    if gossip_groups.is_empty() {
         return Vec::new();
     }
     let _timing = metrics::time_committee_signatures_aggregation();
@@ -131,32 +127,18 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     let head_state = store.head_state();
     let validators = &head_state.validators;
 
-    // Group gossip signatures by data_root for batch aggregation
-    let mut groups: HashMap<H256, Vec<(u64, ValidatorSignature)>> = HashMap::new();
-    let mut keys_to_delete: Vec<SignatureKey> = Vec::new();
-    let mut payload_entries: Vec<(SignatureKey, StoredAggregatedPayload)> = Vec::new();
+    let mut keys_to_delete: Vec<(u64, H256)> = Vec::new();
+    let mut payload_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
 
-    for ((validator_id, data_root), stored_sig) in &gossip_sigs {
-        if let Ok(sig) = stored_sig.to_validator_signature() {
-            groups
-                .entry(*data_root)
-                .or_default()
-                .push((*validator_id, sig));
-        }
-    }
-
-    for (data_root, validators_and_sigs) in groups {
-        let Some(data) = store.get_attestation_data_by_root(&data_root) else {
-            continue;
-        };
-
-        let slot = data.slot;
+    for (hashed, validator_sigs) in &gossip_groups {
+        let data_root = hashed.root();
+        let slot = hashed.data().slot;
 
         let mut sigs = vec![];
         let mut pubkeys = vec![];
         let mut ids = vec![];
 
-        for (vid, sig) in &validators_and_sigs {
+        for (vid, sig) in validator_sigs {
             let Some(validator) = validators.get(*vid as usize) else {
                 continue;
             };
@@ -185,16 +167,12 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         let proof = AggregatedSignatureProof::new(participants, proof_data);
 
         new_aggregates.push(SignedAggregatedAttestation {
-            data: data.clone(),
+            data: hashed.data().clone(),
             proof: proof.clone(),
         });
 
-        let payload = StoredAggregatedPayload { slot, proof };
-
-        // Collect entries for batch insert
-        for vid in &ids {
-            payload_entries.push(((*vid, data_root), payload.clone()));
-        }
+        // One entry per attestation data (not per validator)
+        payload_entries.push((hashed.clone(), proof));
 
         // Only delete successfully aggregated signatures
         keys_to_delete.extend(ids.iter().map(|vid| (*vid, data_root)));
@@ -368,7 +346,8 @@ pub fn on_gossip_attestation(
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
-    let data_root = attestation.data.hash_tree_root();
+    let hashed = HashedAttestationData::new(attestation.data.clone());
+    let data_root = hashed.root();
 
     let target = attestation.data.target;
     let target_state = store
@@ -395,15 +374,12 @@ pub fn on_gossip_attestation(
     }
     metrics::inc_pq_sig_attestation_signatures_valid();
 
-    // Store attestation data by root (content-addressed, idempotent)
-    store.insert_attestation_data_by_root(data_root, attestation.data.clone());
-
     // Store gossip signature unconditionally for later aggregation at interval 2.
     // Subnet filtering is handled at the P2P subscription layer.
-    store.insert_gossip_signature(data_root, attestation.data.slot, validator_id, signature);
+    store.insert_gossip_signature(hashed, validator_id, signature);
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 
-    metrics::inc_attestations_valid();
+    metrics::inc_attestations_valid(1);
 
     let slot = attestation.data.slot;
     let target_slot = attestation.data.target.slot;
@@ -454,7 +430,8 @@ pub fn on_gossip_aggregated_attestation(
         })
         .collect::<Result<_, _>>()?;
 
-    let data_root = aggregated.data.hash_tree_root();
+    let hashed = HashedAttestationData::new(aggregated.data.clone());
+    let data_root = hashed.root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
     {
@@ -468,23 +445,9 @@ pub fn on_gossip_aggregated_attestation(
     }
     .map_err(StoreError::AggregateVerificationFailed)?;
 
-    // Store attestation data by root (content-addressed, idempotent)
-    store.insert_attestation_data_by_root(data_root, aggregated.data.clone());
-
-    // Store one aggregated payload per participating validator (batch insert)
-    let entries: Vec<_> = aggregated
-        .proof
-        .participant_indices()
-        .map(|validator_id| {
-            let payload = StoredAggregatedPayload {
-                slot: aggregated.data.slot,
-                proof: aggregated.proof.clone(),
-            };
-            ((validator_id, data_root), payload)
-        })
-        .collect();
+    // Store one proof per attestation data (not per validator)
+    store.insert_new_aggregated_payload(hashed, aggregated.proof.clone());
     let num_participants = aggregated.proof.participants.count_ones();
-    store.insert_new_aggregated_payloads_batch(entries);
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
     let slot = aggregated.data.slot;
@@ -497,7 +460,7 @@ pub fn on_gossip_aggregated_attestation(
         "Aggregated attestation processed"
     );
 
-    metrics::inc_attestations_valid();
+    metrics::inc_attestations_valid(1);
 
     Ok(())
 }
@@ -594,37 +557,23 @@ fn on_block_core(
     let aggregated_attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
-    // Process block body attestations.
-    // Store attestation data by root and proofs in known aggregated payloads.
-    let mut att_data_entries: Vec<(H256, AttestationData)> = Vec::new();
-    let mut known_entries: Vec<(SignatureKey, StoredAggregatedPayload)> = Vec::new();
+    // Store one proof per attestation data in known aggregated payloads.
+    let mut known_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
     {
-        let data_root = att.data.hash_tree_root();
-        att_data_entries.push((data_root, att.data.clone()));
-
-        let validator_ids: Vec<_> = validator_indices(&att.aggregation_bits).collect();
-        let payload = StoredAggregatedPayload {
-            slot: att.data.slot,
-            proof: proof.clone(),
-        };
-
-        for validator_id in &validator_ids {
-            known_entries.push(((*validator_id, data_root), payload.clone()));
-            metrics::inc_attestations_valid();
-        }
+        known_entries.push((HashedAttestationData::new(att.data.clone()), proof.clone()));
+        // Count each participating validator as a valid attestation
+        let count = validator_indices(&att.aggregation_bits).count() as u64;
+        metrics::inc_attestations_valid(count);
     }
 
     // Process proposer attestation as pending (enters "new" stage via gossip path)
     // The proposer's attestation should NOT affect this block's fork choice position.
     let proposer_vid = proposer_attestation.validator_id;
-    let proposer_data_root = proposer_attestation.data.hash_tree_root();
-    att_data_entries.push((proposer_data_root, proposer_attestation.data.clone()));
+    let proposer_hashed = HashedAttestationData::new(proposer_attestation.data.clone());
 
-    // Batch-insert all attestation data (body + proposer) in a single commit
-    store.insert_attestation_data_by_root_batch(att_data_entries);
     store.insert_known_aggregated_payloads_batch(known_entries);
 
     // Update forkchoice head based on new block and attestations
@@ -635,23 +584,15 @@ fn on_block_core(
     if !verify {
         // Without sig verification, insert directly with a dummy proof
         let participants = aggregation_bits_from_validator_indices(&[proposer_vid]);
-        let payload = StoredAggregatedPayload {
-            slot: proposer_attestation.data.slot,
-            proof: AggregatedSignatureProof::empty(participants),
-        };
-        store.insert_new_aggregated_payload((proposer_vid, proposer_data_root), payload);
+        let proof = AggregatedSignatureProof::empty(participants);
+        store.insert_new_aggregated_payload(proposer_hashed, proof);
     } else {
         // Store the proposer's signature unconditionally for future block building.
         // Subnet filtering is handled at the P2P subscription layer.
         let proposer_sig =
             ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
                 .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(
-            proposer_data_root,
-            proposer_attestation.data.slot,
-            proposer_vid,
-            proposer_sig,
-        );
+        store.insert_gossip_signature(proposer_hashed, proposer_vid, proposer_sig);
     }
 
     let block_total = block_start.elapsed();
@@ -740,12 +681,32 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 }
 
 /// Produce attestation data for the given slot.
+///
+/// The attestation source comes from the head state's justified checkpoint,
+/// not the store-wide global max. This ensures voting aligns with the block
+/// builder's attestation filter (which also uses head state).
+///
+/// See: <https://github.com/leanEthereum/leanSpec/pull/506>
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
-    // Get the head block the validator sees for this slot
+    let head_root = store.head();
+    let head_state = store.get_state(&head_root).expect("head state exists");
+
+    // Derive source from head state's justified checkpoint.
+    // At genesis the checkpoint root is H256::ZERO; substitute the real
+    // genesis block root so attestation validation can look it up.
+    let source = if head_state.latest_block_header.slot == 0 {
+        Checkpoint {
+            root: head_root,
+            slot: head_state.latest_justified.slot,
+        }
+    } else {
+        head_state.latest_justified
+    };
+
     let head_checkpoint = Checkpoint {
-        root: store.head(),
+        root: head_root,
         slot: store
-            .get_block_header(&store.head())
+            .get_block_header(&head_root)
             .expect("head block exists")
             .slot,
     };
@@ -758,7 +719,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
+        source,
     }
 }
 
@@ -807,20 +768,10 @@ pub fn produce_block_with_signatures(
         });
     }
 
+    // Get known aggregated payloads: data_root -> (AttestationData, Vec<proof>)
+    let aggregated_payloads = store.known_aggregated_payloads();
+
     let known_block_roots = store.get_block_roots();
-
-    // Group payloads by data_root with deduplicated proofs
-    let proofs_by_data_root = store.known_payloads_by_data_root();
-
-    // Resolve AttestationData for each data_root
-    let aggregated_payloads: HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)> =
-        proofs_by_data_root
-            .into_iter()
-            .filter_map(|(data_root, proofs)| {
-                let data = store.get_attestation_data_by_root(&data_root)?;
-                Some((data_root, (data, proofs)))
-            })
-            .collect();
 
     let (block, signatures) = build_block(
         &head_state,
@@ -973,24 +924,30 @@ fn extend_proofs_greedily(
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
 
     while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators
+        // Pick proof covering the most uncovered validators (count only, no allocation)
         let best = remaining_indices
             .iter()
             .map(|&idx| {
-                let new_coverage: Vec<u64> = proofs[idx]
+                let count = proofs[idx]
                     .participant_indices()
                     .filter(|vid| !covered.contains(vid))
-                    .collect();
-                (idx, new_coverage)
+                    .count();
+                (idx, count)
             })
-            .max_by_key(|(_, cov)| cov.len());
+            .max_by_key(|&(_, count)| count);
 
-        let Some((best_idx, new_covered)) = best else {
+        let Some((best_idx, best_count)) = best else {
             break;
         };
-        if new_covered.is_empty() {
+        if best_count == 0 {
             break;
         }
+
+        // Collect coverage only for the winning proof
+        let new_covered: Vec<u64> = proofs[best_idx]
+            .participant_indices()
+            .filter(|vid| !covered.contains(vid))
+            .collect();
 
         let proof = &proofs[best_idx];
         attestations.push(AggregatedAttestation {
@@ -1150,18 +1107,15 @@ fn verify_signatures(
             return Err(StoreError::ParticipantsMismatch);
         }
 
-        let validator_ids: Vec<_> = validator_indices(&attestation.aggregation_bits).collect();
-        if validator_ids.iter().any(|vid| *vid >= num_validators) {
-            return Err(StoreError::InvalidValidatorIndex);
-        }
-
         let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.hash_tree_root();
 
-        // Collect public keys for all participating validators
-        let public_keys: Vec<_> = validator_ids
-            .iter()
-            .map(|&vid| {
+        // Collect public keys with bounds check in a single pass
+        let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
+            .map(|vid| {
+                if vid >= num_validators {
+                    return Err(StoreError::InvalidValidatorIndex);
+                }
                 validators[vid as usize]
                     .get_pubkey()
                     .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
@@ -1347,6 +1301,73 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::ParticipantsMismatch)),
             "Expected ParticipantsMismatch, got: {result:?}"
+        );
+    }
+
+    /// Attestation source must come from the head state's justified checkpoint,
+    /// not the store-wide global max.
+    ///
+    /// When a non-head fork block advances store.latest_justified past
+    /// head_state.latest_justified, using the store value causes every
+    /// attestation to be rejected by the block builder (which filters
+    /// by head state), producing blocks with 0 attestations.
+    ///
+    /// See: <https://github.com/leanEthereum/leanSpec/pull/506>
+    #[test]
+    fn produce_attestation_data_uses_head_state_justified() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        // Create a store at genesis with 3 validators.
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let genesis_block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body: BlockBody {
+                attestations: AggregatedAttestations::default(),
+            },
+        };
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+
+        let head_root = store.head();
+
+        // The head state's justified checkpoint is what the block builder
+        // filters attestations against. At genesis the root is H256::ZERO,
+        // so we apply the same correction used in produce_attestation_data.
+        let head_state = store.get_state(&head_root).expect("head state exists");
+        let head_justified = Checkpoint {
+            root: head_root,
+            slot: head_state.latest_justified.slot,
+        };
+
+        // Simulate a non-head fork advancing the store's global justified
+        // past what the head chain has seen.
+        let higher_justified = Checkpoint {
+            root: H256([0x99; 32]),
+            slot: 42,
+        };
+        store.update_checkpoints(ForkCheckpoints::new(
+            head_root,
+            Some(higher_justified),
+            None,
+        ));
+
+        // Precondition: the global max is strictly ahead of the head state.
+        assert!(
+            store.latest_justified().slot > head_justified.slot,
+            "store justified should be ahead of head state justified"
+        );
+
+        // Produce attestation data. The source must come from the head state
+        // (slot 0), not from the global max (slot 42).
+        let attestation = produce_attestation_data(&store, 1);
+
+        assert_eq!(
+            attestation.source, head_justified,
+            "source must match head state's justified checkpoint, not store-wide max"
         );
     }
 }
