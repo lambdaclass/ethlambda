@@ -740,12 +740,32 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 }
 
 /// Produce attestation data for the given slot.
+///
+/// The attestation source comes from the head state's justified checkpoint,
+/// not the store-wide global max. This ensures voting aligns with the block
+/// builder's attestation filter (which also uses head state).
+///
+/// See: <https://github.com/leanEthereum/leanSpec/pull/506>
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
-    // Get the head block the validator sees for this slot
+    let head_root = store.head();
+    let head_state = store.get_state(&head_root).expect("head state exists");
+
+    // Derive source from head state's justified checkpoint.
+    // At genesis the checkpoint root is H256::ZERO; substitute the real
+    // genesis block root so attestation validation can look it up.
+    let source = if head_state.latest_block_header.slot == 0 {
+        Checkpoint {
+            root: head_root,
+            slot: head_state.latest_justified.slot,
+        }
+    } else {
+        head_state.latest_justified
+    };
+
     let head_checkpoint = Checkpoint {
-        root: store.head(),
+        root: head_root,
         slot: store
-            .get_block_header(&store.head())
+            .get_block_header(&head_root)
             .expect("head block exists")
             .slot,
     };
@@ -758,7 +778,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
+        source,
     }
 }
 
