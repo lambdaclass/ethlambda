@@ -1,4 +1,4 @@
-use super::common::{Block, TestInfo, TestState};
+use super::common::{self, Block, TestInfo, TestState};
 use ethlambda_types::primitives::H256;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -57,9 +57,29 @@ pub struct ForkChoiceStep {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockStepData {
-    pub block: Block,
+    pub slot: u64,
+    #[serde(rename = "proposerIndex")]
+    pub proposer_index: u64,
+    #[serde(rename = "parentRoot")]
+    pub parent_root: H256,
+    #[serde(rename = "stateRoot")]
+    pub state_root: H256,
+    pub body: common::BlockBody,
     #[serde(rename = "blockRootLabel")]
     pub block_root_label: Option<String>,
+}
+
+impl BlockStepData {
+    pub fn to_block(&self) -> ethlambda_types::block::Block {
+        Block {
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            parent_root: self.parent_root,
+            state_root: self.state_root,
+            body: self.body.clone(),
+        }
+        .into()
+    }
 }
 
 // ============================================================================
