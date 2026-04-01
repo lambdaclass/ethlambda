@@ -681,12 +681,32 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 }
 
 /// Produce attestation data for the given slot.
+///
+/// The attestation source comes from the head state's justified checkpoint,
+/// not the store-wide global max. This ensures voting aligns with the block
+/// builder's attestation filter (which also uses head state).
+///
+/// See: <https://github.com/leanEthereum/leanSpec/pull/506>
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
-    // Get the head block the validator sees for this slot
+    let head_root = store.head();
+    let head_state = store.get_state(&head_root).expect("head state exists");
+
+    // Derive source from head state's justified checkpoint.
+    // At genesis the checkpoint root is H256::ZERO; substitute the real
+    // genesis block root so attestation validation can look it up.
+    let source = if head_state.latest_block_header.slot == 0 {
+        Checkpoint {
+            root: head_root,
+            slot: head_state.latest_justified.slot,
+        }
+    } else {
+        head_state.latest_justified
+    };
+
     let head_checkpoint = Checkpoint {
-        root: store.head(),
+        root: head_root,
         slot: store
-            .get_block_header(&store.head())
+            .get_block_header(&head_root)
             .expect("head block exists")
             .slot,
     };
@@ -699,7 +719,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
+        source,
     }
 }
 
@@ -904,24 +924,30 @@ fn extend_proofs_greedily(
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
 
     while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators
+        // Pick proof covering the most uncovered validators (count only, no allocation)
         let best = remaining_indices
             .iter()
             .map(|&idx| {
-                let new_coverage: Vec<u64> = proofs[idx]
+                let count = proofs[idx]
                     .participant_indices()
                     .filter(|vid| !covered.contains(vid))
-                    .collect();
-                (idx, new_coverage)
+                    .count();
+                (idx, count)
             })
-            .max_by_key(|(_, cov)| cov.len());
+            .max_by_key(|&(_, count)| count);
 
-        let Some((best_idx, new_covered)) = best else {
+        let Some((best_idx, best_count)) = best else {
             break;
         };
-        if new_covered.is_empty() {
+        if best_count == 0 {
             break;
         }
+
+        // Collect coverage only for the winning proof
+        let new_covered: Vec<u64> = proofs[best_idx]
+            .participant_indices()
+            .filter(|vid| !covered.contains(vid))
+            .collect();
 
         let proof = &proofs[best_idx];
         attestations.push(AggregatedAttestation {
@@ -1081,18 +1107,15 @@ fn verify_signatures(
             return Err(StoreError::ParticipantsMismatch);
         }
 
-        let validator_ids: Vec<_> = validator_indices(&attestation.aggregation_bits).collect();
-        if validator_ids.iter().any(|vid| *vid >= num_validators) {
-            return Err(StoreError::InvalidValidatorIndex);
-        }
-
         let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
         let message = attestation.data.tree_hash_root();
 
-        // Collect public keys for all participating validators
-        let public_keys: Vec<_> = validator_ids
-            .iter()
-            .map(|&vid| {
+        // Collect public keys with bounds check in a single pass
+        let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
+            .map(|vid| {
+                if vid >= num_validators {
+                    return Err(StoreError::InvalidValidatorIndex);
+                }
                 validators[vid as usize]
                     .get_pubkey()
                     .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
@@ -1275,6 +1298,73 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::ParticipantsMismatch)),
             "Expected ParticipantsMismatch, got: {result:?}"
+        );
+    }
+
+    /// Attestation source must come from the head state's justified checkpoint,
+    /// not the store-wide global max.
+    ///
+    /// When a non-head fork block advances store.latest_justified past
+    /// head_state.latest_justified, using the store value causes every
+    /// attestation to be rejected by the block builder (which filters
+    /// by head state), producing blocks with 0 attestations.
+    ///
+    /// See: <https://github.com/leanEthereum/leanSpec/pull/506>
+    #[test]
+    fn produce_attestation_data_uses_head_state_justified() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        // Create a store at genesis with 3 validators.
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let genesis_block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body: BlockBody {
+                attestations: AggregatedAttestations::default(),
+            },
+        };
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+
+        let head_root = store.head();
+
+        // The head state's justified checkpoint is what the block builder
+        // filters attestations against. At genesis the root is H256::ZERO,
+        // so we apply the same correction used in produce_attestation_data.
+        let head_state = store.get_state(&head_root).expect("head state exists");
+        let head_justified = Checkpoint {
+            root: head_root,
+            slot: head_state.latest_justified.slot,
+        };
+
+        // Simulate a non-head fork advancing the store's global justified
+        // past what the head chain has seen.
+        let higher_justified = Checkpoint {
+            root: H256::repeat_byte(0x99),
+            slot: 42,
+        };
+        store.update_checkpoints(ForkCheckpoints::new(
+            head_root,
+            Some(higher_justified),
+            None,
+        ));
+
+        // Precondition: the global max is strictly ahead of the head state.
+        assert!(
+            store.latest_justified().slot > head_justified.slot,
+            "store justified should be ahead of head state justified"
+        );
+
+        // Produce attestation data. The source must come from the head state
+        // (slot 0), not from the global max (slot 42).
+        let attestation = produce_attestation_data(&store, 1);
+
+        assert_eq!(
+            attestation.source, head_justified,
+            "source must match head state's justified checkpoint, not store-wide max"
         );
     }
 }
