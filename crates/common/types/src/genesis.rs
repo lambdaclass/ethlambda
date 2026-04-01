@@ -134,24 +134,24 @@ GENESIS_VALIDATORS:
         let state = State::from_genesis(config.genesis_time, validators);
         let root = state.tree_hash_root();
 
-        // Pin the state root so changes are caught immediately.
-        // NOTE: This hash changed in devnet4 due to the Validator SSZ layout change
-        // (single pubkey → attestation_pubkey + proposal_pubkey) and test data change.
-        // Will be recomputed once we can run this test.
-        // For now, just verify the root is deterministic by checking it's non-zero.
-        assert_ne!(
-            root,
-            crate::primitives::H256::ZERO,
-            "state root should be non-zero"
-        );
+        // Pin the state root so SSZ layout changes are caught immediately.
+        let expected_state_root: crate::primitives::H256 =
+            hex::decode("babcdc9235a29dfc0d605961df51cfc85732f85291c2beea8b7510a92ec458fe")
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+        assert_eq!(root, expected_state_root, "state root mismatch");
 
         let mut block = state.latest_block_header;
         block.state_root = root;
         let block_root = block.tree_hash_root();
-        assert_ne!(
-            block_root,
-            crate::primitives::H256::ZERO,
-            "block root should be non-zero"
-        );
+        let expected_block_root: crate::primitives::H256 =
+            hex::decode("66a8beaa81d2aaeac7212d4bf8f5fea2bd22d479566a33a83c891661c21235ef")
+                .unwrap()
+                .as_slice()
+                .try_into()
+                .unwrap();
+        assert_eq!(block_root, expected_block_root, "block root mismatch");
     }
 }

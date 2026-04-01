@@ -94,10 +94,9 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools (keys only — skip payload deserialization).
-    // At interval 3 the migration (interval 4) hasn't run yet, so attestations
-    // that entered "known" directly (proposer's own attestation in block body,
-    // node's self-attestation) would be invisible without this merge.
+    // Include both known and new attestation pools to compute safe target.
+    // At interval 3, gossip signature aggregation hasn't been promoted yet, so we must
+    // merge both pools to get a complete view for safe target computation.
     let all_keys: HashSet<SignatureKey> = store
         .iter_known_aggregated_payload_keys()
         .chain(store.iter_new_aggregated_payload_keys())

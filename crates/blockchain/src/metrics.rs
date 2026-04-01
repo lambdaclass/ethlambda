@@ -194,6 +194,15 @@ static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<Int
         .unwrap()
     });
 
+static LEAN_PQ_SIG_PROPOSAL_SIGNATURES_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_pq_sig_proposal_signatures_total",
+            "Total number of individual proposal signatures"
+        )
+        .unwrap()
+    });
+
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -221,6 +230,16 @@ static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogr
         register_histogram!(
             "lean_pq_sig_attestation_signing_time_seconds",
             "Time taken to sign an attestation",
+            vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_PQ_SIG_PROPOSAL_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_pq_sig_proposal_signing_time_seconds",
+            "Time taken to sign a block proposal",
             vec![0.005, 0.01, 0.025, 0.05, 0.1, 1.0]
         )
         .unwrap()
@@ -306,10 +325,12 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
+    std::sync::LazyLock::force(&LEAN_PQ_SIG_PROPOSAL_SIGNATURES_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_PQ_SIG_PROPOSAL_SIGNING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS);
@@ -415,9 +436,19 @@ pub fn inc_pq_sig_attestation_signatures_invalid() {
     LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL.inc();
 }
 
+/// Increment the individual proposal signatures counter.
+pub fn inc_pq_sig_proposal_signatures() {
+    LEAN_PQ_SIG_PROPOSAL_SIGNATURES_TOTAL.inc();
+}
+
 /// Start timing individual attestation signing. Records duration when the guard is dropped.
 pub fn time_pq_sig_attestation_signing() -> TimingGuard {
     TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS)
+}
+
+/// Start timing individual proposal signing. Records duration when the guard is dropped.
+pub fn time_pq_sig_proposal_signing() -> TimingGuard {
+    TimingGuard::new(&LEAN_PQ_SIG_PROPOSAL_SIGNING_TIME_SECONDS)
 }
 
 /// Start timing individual attestation signature verification. Records duration when the guard is dropped.
