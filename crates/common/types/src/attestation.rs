@@ -1,7 +1,10 @@
 use crate::{
     block::AggregatedSignatureProof,
     checkpoint::Checkpoint,
-    primitives::ssz::{Decode, Encode, TreeHash},
+    primitives::{
+        H256,
+        ssz::{Decode, Encode, TreeHash},
+    },
     signature::SignatureSize,
     state::ValidatorRegistryLimit,
 };
@@ -17,7 +20,7 @@ pub struct Attestation {
 }
 
 /// Attestation content describing the validator's observed chain view.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode, TreeHash)]
 pub struct AttestationData {
     /// The slot for which the attestation is made.
     pub slot: u64,
@@ -76,4 +79,42 @@ pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + 
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
     pub proof: AggregatedSignatureProof,
+}
+
+/// Attestation data paired with its precomputed tree hash root.
+///
+/// Private fields ensure that `root == data.tree_hash_root()` is always true.
+/// The only way to construct this is via [`HashedAttestationData::new`] or
+/// [`From<AttestationData>`], both of which compute the root from the data.
+#[derive(Debug, Clone)]
+pub struct HashedAttestationData {
+    root: H256,
+    data: AttestationData,
+}
+
+impl HashedAttestationData {
+    pub fn new(data: AttestationData) -> Self {
+        Self {
+            root: data.tree_hash_root(),
+            data,
+        }
+    }
+
+    pub fn root(&self) -> H256 {
+        self.root
+    }
+
+    pub fn data(&self) -> &AttestationData {
+        &self.data
+    }
+
+    pub fn into_parts(self) -> (H256, AttestationData) {
+        (self.root, self.data)
+    }
+}
+
+impl From<AttestationData> for HashedAttestationData {
+    fn from(data: AttestationData) -> Self {
+        Self::new(data)
+    }
 }

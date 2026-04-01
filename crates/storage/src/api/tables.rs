@@ -12,10 +12,6 @@ pub enum Table {
     BlockSignatures,
     /// State storage: H256 -> State
     States,
-    /// Gossip signatures: SignatureKey -> ValidatorSignature
-    GossipSignatures,
-    /// Attestation data indexed by tree hash root: H256 -> AttestationData
-    AttestationDataByRoot,
     /// Metadata: string keys -> various scalar values
     Metadata,
     /// Live chain index: (slot || root) -> parent_root
@@ -27,13 +23,11 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 8] = [
+pub const ALL_TABLES: [Table; 6] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
     Table::States,
-    Table::GossipSignatures,
-    Table::AttestationDataByRoot,
     Table::Metadata,
     Table::LiveChain,
 ];
@@ -46,8 +40,6 @@ impl Table {
             Table::BlockBodies => "block_bodies",
             Table::BlockSignatures => "block_signatures",
             Table::States => "states",
-            Table::GossipSignatures => "gossip_signatures",
-            Table::AttestationDataByRoot => "attestation_data_by_root",
             Table::Metadata => "metadata",
             Table::LiveChain => "live_chain",
         }
