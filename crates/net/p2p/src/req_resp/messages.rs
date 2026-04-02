@@ -1,12 +1,8 @@
 use ethlambda_types::{
-    block::SignedBlockWithAttestation,
-    checkpoint::Checkpoint,
-    primitives::{
-        H256,
-        ssz::{Decode, Encode},
-    },
+    block::SignedBlockWithAttestation, checkpoint::Checkpoint, primitives::H256,
 };
-use ssz_types::typenum;
+use libssz_derive::{SszDecode, SszEncode};
+use libssz_types::SszList;
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
@@ -97,20 +93,17 @@ pub enum ResponsePayload {
     BlocksByRoot(Vec<SignedBlockWithAttestation>),
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct Status {
     pub finalized: Checkpoint,
     pub head: Checkpoint,
 }
 
-type MaxRequestBlocks = typenum::U1024;
-type MaxErrorMessageLength = typenum::U256;
-
-pub type RequestedBlockRoots = ssz_types::VariableList<H256, MaxRequestBlocks>;
+pub type RequestedBlockRoots = SszList<H256, 1024>;
 
 /// Error message type for non-success responses.
 /// SSZ-encoded as List[byte, 256] per spec.
-pub type ErrorMessage = ssz_types::VariableList<u8, MaxErrorMessageLength>;
+pub type ErrorMessage = SszList<u8, 256>;
 
 /// Helper to create an ErrorMessage from a string.
 /// Debug builds panic if message exceeds 256 bytes (programming error).
@@ -132,10 +125,10 @@ pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
         bytes
     };
 
-    ErrorMessage::new(truncated.to_vec()).expect("error message fits in 256 bytes")
+    ErrorMessage::try_from(truncated.to_vec()).expect("error message fits in 256 bytes")
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct BlocksByRootRequest {
     pub roots: RequestedBlockRoots,
 }

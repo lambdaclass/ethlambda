@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ethlambda-types.workspace = true
+libssz-types.workspace = true
 
 serde.workspace = true
 hex.workspace = true

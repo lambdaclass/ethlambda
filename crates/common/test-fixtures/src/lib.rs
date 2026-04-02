@@ -5,9 +5,13 @@ use ethlambda_types::{
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     checkpoint::Checkpoint as DomainCheckpoint,
-    primitives::{BitList, H256, VariableList},
-    state::{ChainConfig, State, Validator as DomainValidator, ValidatorPubkeyBytes},
+    primitives::H256,
+    state::{
+        ChainConfig, JustificationValidators, JustifiedSlots, State, Validator as DomainValidator,
+        ValidatorPubkeyBytes,
+    },
 };
+use libssz_types::SszList;
 use serde::Deserialize;
 
 // ============================================================================
@@ -133,10 +137,17 @@ pub struct TestState {
 impl From<TestState> for State {
     fn from(value: TestState) -> Self {
         let historical_block_hashes =
-            VariableList::new(value.historical_block_hashes.data).unwrap();
-        let validators =
-            VariableList::new(value.validators.data.into_iter().map(Into::into).collect()).unwrap();
-        let justifications_roots = VariableList::new(value.justifications_roots.data).unwrap();
+            SszList::try_from(value.historical_block_hashes.data).unwrap();
+        let validators = SszList::try_from(
+            value
+                .validators
+                .data
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let justifications_roots = SszList::try_from(value.justifications_roots.data).unwrap();
 
         State {
             config: value.config.into(),
@@ -145,10 +156,10 @@ impl From<TestState> for State {
             latest_justified: value.latest_justified.into(),
             latest_finalized: value.latest_finalized.into(),
             historical_block_hashes,
-            justified_slots: BitList::with_capacity(0).unwrap(),
+            justified_slots: JustifiedSlots::new(),
             validators,
             justifications_roots,
-            justifications_validators: BitList::with_capacity(0).unwrap(),
+            justifications_validators: JustificationValidators::new(),
         }
     }
 }
@@ -193,9 +204,9 @@ impl From<BlockBody> for DomainBlockBody {
             .data
             .into_iter()
             .map(Into::into)
-            .collect();
+            .collect::<Vec<_>>();
         Self {
-            attestations: VariableList::new(attestations).expect("too many attestations"),
+            attestations: SszList::try_from(attestations).expect("too many attestations"),
         }
     }
 }
@@ -227,9 +238,9 @@ pub struct AggregationBits {
 
 impl From<AggregationBits> for DomainAggregationBits {
     fn from(value: AggregationBits) -> Self {
-        let mut bits = DomainAggregationBits::with_capacity(value.data.len()).unwrap();
-        for (i, &b) in value.data.iter().enumerate() {
-            bits.set(i, b).unwrap();
+        let mut bits = DomainAggregationBits::new();
+        for &b in value.data.iter() {
+            bits.push(b).unwrap();
         }
         bits
     }

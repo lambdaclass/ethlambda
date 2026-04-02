@@ -9,7 +9,7 @@ use ethlambda_types::{
     attestation::{Attestation, AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, BlockWithAttestation, SignedBlockWithAttestation},
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::TreeHash},
+    primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSecretKey,
 };
 use spawned_concurrency::actor;
@@ -226,7 +226,7 @@ impl BlockChainServer {
             data: AttestationData {
                 slot,
                 head: Checkpoint {
-                    root: block.tree_hash_root(),
+                    root: block.hash_tree_root(),
                     slot: block.slot,
                 },
                 target: store::get_attestation_target(&self.store),
@@ -317,7 +317,7 @@ impl BlockChainServer {
         queue: &mut VecDeque<SignedBlockWithAttestation>,
     ) {
         let slot = signed_block.block.block.slot;
-        let block_root = signed_block.block.block.tree_hash_root();
+        let block_root = signed_block.block.block.hash_tree_root();
         let parent_root = signed_block.block.block.parent_root;
         let proposer = signed_block.block.block.proposer_index;
 

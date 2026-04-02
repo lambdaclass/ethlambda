@@ -2,9 +2,8 @@ use leansig::{
     serialization::Serializable,
     signature::{SignatureScheme, SigningError},
 };
-use ssz_types::typenum::{Diff, U488, U3600};
 
-use crate::primitives::{H256, ssz::DecodeError};
+use crate::primitives::H256;
 
 /// The XMSS signature scheme used for validator signatures.
 ///
@@ -24,7 +23,13 @@ pub type LeanSigSecretKey = <LeanSignatureScheme as SignatureScheme>::SecretKey;
 
 pub type Signature = LeanSigSignature;
 
-pub type SignatureSize = Diff<U3600, U488>;
+/// Size of an XMSS signature in bytes (3112 = 3600 - 488).
+pub const SIGNATURE_SIZE: usize = 3112;
+
+/// Error returned when parsing signature or key bytes fails.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("signature parse error: {0}")]
+pub struct SignatureParseError(pub String);
 
 #[derive(Clone)]
 pub struct ValidatorSignature {
@@ -32,8 +37,9 @@ pub struct ValidatorSignature {
 }
 
 impl ValidatorSignature {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let sig = LeanSigSignature::from_bytes(bytes)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
+        let sig = LeanSigSignature::from_bytes(bytes)
+            .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sig })
     }
 
@@ -42,7 +48,7 @@ impl ValidatorSignature {
     }
 
     pub fn is_valid(&self, pubkey: &ValidatorPublicKey, slot: u32, message: &H256) -> bool {
-        LeanSignatureScheme::verify(&pubkey.inner, slot, message, &self.inner)
+        LeanSignatureScheme::verify(&pubkey.inner, slot, &message.0, &self.inner)
     }
 
     pub fn into_inner(self) -> LeanSigSignature {
@@ -56,8 +62,9 @@ pub struct ValidatorPublicKey {
 }
 
 impl ValidatorPublicKey {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let pk = LeanSigPublicKey::from_bytes(bytes)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
+        let pk = LeanSigPublicKey::from_bytes(bytes)
+            .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: pk })
     }
 
@@ -76,8 +83,9 @@ pub struct ValidatorSecretKey {
 }
 
 impl ValidatorSecretKey {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let sk = LeanSigSecretKey::from_bytes(bytes)?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
+        let sk = LeanSigSecretKey::from_bytes(bytes)
+            .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sk })
     }
 
@@ -86,7 +94,7 @@ impl ValidatorSecretKey {
     /// The slot is used as part of the XMSS signature scheme to track
     /// one-time signature usage.
     pub fn sign(&self, slot: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
-        let sig = LeanSignatureScheme::sign(&self.inner, slot, message)?;
+        let sig = LeanSignatureScheme::sign(&self.inner, slot, &message.0)?;
         Ok(ValidatorSignature { inner: sig })
     }
 }

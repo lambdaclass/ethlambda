@@ -53,7 +53,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        primitives::ssz::TreeHash,
+        primitives::HashTreeRoot as _,
         state::{State, Validator},
     };
 
@@ -67,7 +67,7 @@ GENESIS_TIME: 1770407233
 # Key Settings
 ACTIVE_EPOCH: 18
 
-# Validator Settings  
+# Validator Settings
 VALIDATOR_COUNT: 3
 
 # Genesis Validator Pubkeys
@@ -133,7 +133,7 @@ GENESIS_VALIDATORS:
             })
             .collect();
         let state = State::from_genesis(config.genesis_time, validators);
-        let root = state.tree_hash_root();
+        let root = state.hash_tree_root();
 
         // Pin the state root so changes are caught immediately.
         let expected =
@@ -146,7 +146,7 @@ GENESIS_VALIDATORS:
                 .unwrap();
         let mut block = state.latest_block_header;
         block.state_root = root;
-        let block_root = block.tree_hash_root();
+        let block_root = block.hash_tree_root();
         assert_eq!(
             block_root.as_slice(),
             &expected_block_root[..],

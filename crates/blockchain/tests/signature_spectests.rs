@@ -5,7 +5,7 @@ use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     block::{Block, SignedBlockWithAttestation},
-    primitives::ssz::TreeHash,
+    primitives::HashTreeRoot as _,
     state::State,
 };
 
@@ -37,7 +37,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             slot: anchor_state.latest_block_header.slot,
             proposer_index: anchor_state.latest_block_header.proposer_index,
             parent_root: anchor_state.latest_block_header.parent_root,
-            state_root: anchor_state.tree_hash_root(),
+            state_root: anchor_state.hash_tree_root(),
             body: Default::default(),
         };
 

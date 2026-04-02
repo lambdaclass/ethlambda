@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 ///
 /// Used to detect genesis/anchor blocks that have no attestations,
 /// allowing us to skip storing empty bodies and reconstruct them on read.
-static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().tree_hash_root());
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
@@ -16,13 +16,11 @@ use ethlambda_types::{
         BlockWithAttestation, SignedBlockWithAttestation,
     },
     checkpoint::Checkpoint,
-    primitives::{
-        H256,
-        ssz::{Decode, Encode, TreeHash},
-    },
+    primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
     state::{ChainConfig, State},
 };
+use libssz::{SszDecode, SszEncode};
 use tracing::info;
 
 /// Checkpoints to update in the forkchoice store.
@@ -319,7 +317,7 @@ impl Store {
         anchor_state.latest_block_header.state_root = H256::ZERO;
 
         // Compute state root with zeroed header
-        let anchor_state_root = anchor_state.tree_hash_root();
+        let anchor_state_root = anchor_state.hash_tree_root();
 
         // Validate: original must be zero (genesis) or match computed (checkpoint sync)
         assert!(
@@ -330,7 +328,7 @@ impl Store {
         // Populate the correct state_root
         anchor_state.latest_block_header.state_root = anchor_state_root;
 
-        let anchor_block_root = anchor_state.latest_block_header.tree_hash_root();
+        let anchor_block_root = anchor_state.latest_block_header.hash_tree_root();
 
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
@@ -343,18 +341,12 @@ impl Store {
 
             // Metadata
             let metadata_entries = vec![
-                (KEY_TIME.to_vec(), 0u64.as_ssz_bytes()),
-                (KEY_CONFIG.to_vec(), anchor_state.config.as_ssz_bytes()),
-                (KEY_HEAD.to_vec(), anchor_block_root.as_ssz_bytes()),
-                (KEY_SAFE_TARGET.to_vec(), anchor_block_root.as_ssz_bytes()),
-                (
-                    KEY_LATEST_JUSTIFIED.to_vec(),
-                    anchor_checkpoint.as_ssz_bytes(),
-                ),
-                (
-                    KEY_LATEST_FINALIZED.to_vec(),
-                    anchor_checkpoint.as_ssz_bytes(),
-                ),
+                (KEY_TIME.to_vec(), 0u64.to_ssz()),
+                (KEY_CONFIG.to_vec(), anchor_state.config.to_ssz()),
+                (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
+                (KEY_SAFE_TARGET.to_vec(), anchor_block_root.to_ssz()),
+                (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
+                (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
             ];
             batch
                 .put_batch(Table::Metadata, metadata_entries)
@@ -362,8 +354,8 @@ impl Store {
 
             // Block header
             let header_entries = vec![(
-                anchor_block_root.as_ssz_bytes(),
-                anchor_state.latest_block_header.as_ssz_bytes(),
+                anchor_block_root.to_ssz(),
+                anchor_state.latest_block_header.to_ssz(),
             )];
             batch
                 .put_batch(Table::BlockHeaders, header_entries)
@@ -371,17 +363,14 @@ impl Store {
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
-                let body_entries = vec![(anchor_block_root.as_ssz_bytes(), body.as_ssz_bytes())];
+                let body_entries = vec![(anchor_block_root.to_ssz(), body.to_ssz())];
                 batch
                     .put_batch(Table::BlockBodies, body_entries)
                     .expect("put block body");
             }
 
             // State
-            let state_entries = vec![(
-                anchor_block_root.as_ssz_bytes(),
-                anchor_state.as_ssz_bytes(),
-            )];
+            let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
             batch
                 .put_batch(Table::States, state_entries)
                 .expect("put state");
@@ -389,7 +378,7 @@ impl Store {
             // Live chain index
             let index_entries = vec![(
                 encode_live_chain_key(anchor_state.latest_block_header.slot, &anchor_block_root),
-                anchor_state.latest_block_header.parent_root.as_ssz_bytes(),
+                anchor_state.latest_block_header.parent_root.to_ssz(),
             )];
             batch
                 .put_batch(Table::LiveChain, index_entries)
@@ -410,7 +399,7 @@ impl Store {
 
     // ============ Metadata Helpers ============
 
-    fn get_metadata<T: Decode>(&self, key: &[u8]) -> T {
+    fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
         let view = self.backend.begin_read().expect("read view");
         let bytes = view
             .get(Table::Metadata, key)
@@ -419,10 +408,10 @@ impl Store {
         T::from_ssz_bytes(&bytes).expect("valid encoding")
     }
 
-    fn set_metadata<T: Encode>(&self, key: &[u8], value: &T) {
+    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
-            .put_batch(Table::Metadata, vec![(key.to_vec(), value.as_ssz_bytes())])
+            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
             .expect("put metadata");
         batch.commit().expect("commit");
     }
@@ -494,14 +483,14 @@ impl Store {
         // Read old finalized slot before updating metadata
         let old_finalized_slot = self.latest_finalized().slot;
 
-        let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.as_ssz_bytes())];
+        let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
         if let Some(justified) = checkpoints.justified {
-            entries.push((KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()));
+            entries.push((KEY_LATEST_JUSTIFIED.to_vec(), justified.to_ssz()));
         }
 
         if let Some(finalized) = checkpoints.finalized {
-            entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()));
+            entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()));
         }
 
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -650,8 +639,7 @@ impl Store {
         // Sort by slot descending (newest first)
         entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        let protected: HashSet<Vec<u8>> =
-            protected_roots.iter().map(|r| r.as_ssz_bytes()).collect();
+        let protected: HashSet<Vec<u8>> = protected_roots.iter().map(|r| r.to_ssz()).collect();
 
         // Skip the retention window, collect remaining keys for deletion
         let keys_to_delete: Vec<Vec<u8>> = entries
@@ -700,8 +688,7 @@ impl Store {
         // Sort by slot descending (newest first)
         entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        let protected: HashSet<Vec<u8>> =
-            protected_roots.iter().map(|r| r.as_ssz_bytes()).collect();
+        let protected: HashSet<Vec<u8>> = protected_roots.iter().map(|r| r.to_ssz()).collect();
 
         let keys_to_delete: Vec<Vec<u8>> = entries
             .into_iter()
@@ -730,7 +717,7 @@ impl Store {
     /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.as_ssz_bytes())
+        view.get(Table::BlockHeaders, &root.to_ssz())
             .expect("get")
             .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
     }
@@ -765,7 +752,7 @@ impl Store {
 
         let index_entries = vec![(
             encode_live_chain_key(block.slot, &root),
-            block.parent_root.as_ssz_bytes(),
+            block.parent_root.to_ssz(),
         )];
         batch
             .put_batch(Table::LiveChain, index_entries)
@@ -780,7 +767,7 @@ impl Store {
     /// Note: Genesis block has no entry in BlockSignatures table.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
         let view = self.backend.begin_read().expect("read view");
-        let key = root.as_ssz_bytes();
+        let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
         let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
@@ -807,7 +794,7 @@ impl Store {
     /// Returns the state for the given block root.
     pub fn get_state(&self, root: &H256) -> Option<State> {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.as_ssz_bytes())
+        view.get(Table::States, &root.to_ssz())
             .expect("get")
             .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
     }
@@ -815,7 +802,7 @@ impl Store {
     /// Returns whether a state exists for the given block root.
     pub fn has_state(&self, root: &H256) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.as_ssz_bytes())
+        view.get(Table::States, &root.to_ssz())
             .expect("get")
             .is_some()
     }
@@ -823,7 +810,7 @@ impl Store {
     /// Stores a state indexed by block root.
     pub fn insert_state(&mut self, root: H256, state: State) {
         let mut batch = self.backend.begin_write().expect("write batch");
-        let entries = vec![(root.as_ssz_bytes(), state.as_ssz_bytes())];
+        let entries = vec![(root.to_ssz(), state.to_ssz())];
         batch.put_batch(Table::States, entries).expect("put state");
         batch.commit().expect("commit");
     }
@@ -1066,22 +1053,22 @@ fn write_signed_block(
     };
 
     let header = block.header();
-    let root_bytes = root.as_ssz_bytes();
+    let root_bytes = root.to_ssz();
 
-    let header_entries = vec![(root_bytes.clone(), header.as_ssz_bytes())];
+    let header_entries = vec![(root_bytes.clone(), header.to_ssz())];
     batch
         .put_batch(Table::BlockHeaders, header_entries)
         .expect("put block header");
 
     // Skip storing empty bodies - they can be reconstructed from the header's body_root
     if header.body_root != *EMPTY_BODY_ROOT {
-        let body_entries = vec![(root_bytes.clone(), block.body.as_ssz_bytes())];
+        let body_entries = vec![(root_bytes.clone(), block.body.to_ssz())];
         batch
             .put_batch(Table::BlockBodies, body_entries)
             .expect("put block body");
     }
 
-    let sig_entries = vec![(root_bytes, signatures.as_ssz_bytes())];
+    let sig_entries = vec![(root_bytes, signatures.to_ssz())];
     batch
         .put_batch(Table::BlockSignatures, sig_entries)
         .expect("put block signatures");
@@ -1104,12 +1091,9 @@ mod tests {
             body_root: H256::ZERO,
         };
         let mut batch = backend.begin_write().expect("write batch");
-        let key = root.as_ssz_bytes();
+        let key = root.to_ssz();
         batch
-            .put_batch(
-                Table::BlockHeaders,
-                vec![(key.clone(), header.as_ssz_bytes())],
-            )
+            .put_batch(Table::BlockHeaders, vec![(key.clone(), header.to_ssz())])
             .expect("put header");
         batch
             .put_batch(Table::BlockBodies, vec![(key.clone(), vec![0u8; 4])])
@@ -1123,7 +1107,7 @@ mod tests {
     /// Insert a dummy state for a given root.
     fn insert_state(backend: &dyn StorageBackend, root: H256) {
         let mut batch = backend.begin_write().expect("write batch");
-        let key = root.as_ssz_bytes();
+        let key = root.to_ssz();
         batch
             .put_batch(Table::States, vec![(key, vec![0u8; 4])])
             .expect("put state");
@@ -1142,9 +1126,7 @@ mod tests {
     /// Check if a key exists in a table.
     fn has_key(backend: &dyn StorageBackend, table: Table, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(table, &root.as_ssz_bytes())
-            .expect("get")
-            .is_some()
+        view.get(table, &root.to_ssz()).expect("get").is_some()
     }
 
     /// Generate a deterministic H256 root from an index.
@@ -1357,8 +1339,8 @@ mod tests {
             .put_batch(
                 Table::Metadata,
                 vec![
-                    (KEY_LATEST_FINALIZED.to_vec(), finalized.as_ssz_bytes()),
-                    (KEY_LATEST_JUSTIFIED.to_vec(), justified.as_ssz_bytes()),
+                    (KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()),
+                    (KEY_LATEST_JUSTIFIED.to_vec(), justified.to_ssz()),
                 ],
             )
             .expect("put checkpoints");
@@ -1470,13 +1452,13 @@ mod tests {
 
     fn make_proof() -> AggregatedSignatureProof {
         use ethlambda_types::attestation::AggregationBits;
-        AggregatedSignatureProof::empty(AggregationBits::with_capacity(0).unwrap())
+        AggregatedSignatureProof::empty(AggregationBits::new())
     }
 
     /// Create a proof with a specific validator bit set (distinct participants).
     fn make_proof_for_validator(vid: usize) -> AggregatedSignatureProof {
         use ethlambda_types::attestation::AggregationBits;
-        let mut bits = AggregationBits::with_capacity(vid + 1).unwrap();
+        let mut bits = AggregationBits::with_length(vid + 1).unwrap();
         bits.set(vid, true).unwrap();
         AggregatedSignatureProof::empty(bits)
     }
@@ -1508,14 +1490,14 @@ mod tests {
 
         // The oldest (slot 1) should be gone
         let att_data_1 = make_att_data(1);
-        assert!(!buf.data.contains_key(&att_data_1.tree_hash_root()));
+        assert!(!buf.data.contains_key(&att_data_1.hash_tree_root()));
     }
 
     #[test]
     fn payload_buffer_multiple_proofs_per_data() {
         let mut buf = PayloadBuffer::new(10);
         let data = make_att_data(1);
-        let data_root = data.tree_hash_root();
+        let data_root = data.hash_tree_root();
 
         // Insert 3 proofs with distinct participants for the same attestation data
         buf.push(
@@ -1560,7 +1542,7 @@ mod tests {
     fn promote_moves_new_to_known() {
         let mut store = Store::test_store();
         let data = make_att_data(1);
-        let data_root = data.tree_hash_root();
+        let data_root = data.hash_tree_root();
 
         store.insert_new_aggregated_payload(
             HashedAttestationData::new(data.clone()),

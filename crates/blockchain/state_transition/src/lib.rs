@@ -4,7 +4,7 @@ use ethlambda_types::{
     ShortRoot,
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
-    primitives::{H256, ssz::TreeHash},
+    primitives::{H256, HashTreeRoot as _},
     state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
 };
 use tracing::{info, warn};
@@ -59,7 +59,7 @@ pub fn state_transition(state: &mut State, block: &Block) -> Result<(), Error> {
     // )
     // .unwrap();
 
-    let computed_state_root = state.tree_hash_root();
+    let computed_state_root = state.hash_tree_root();
     if block.state_root != computed_state_root {
         return Err(Error::StateRootMismatch {
             expected: block.state_root,
@@ -91,7 +91,7 @@ pub fn process_slots(state: &mut State, target_slot: u64) -> Result<(), Error> {
         });
     }
     if state.latest_block_header.state_root == H256::ZERO {
-        state.latest_block_header.state_root = state.tree_hash_root();
+        state.latest_block_header.state_root = state.hash_tree_root();
     }
     let slots_processed = target_slot - state.slot;
     state.slot = target_slot;
@@ -138,7 +138,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         });
     }
     // TODO: this is redundant in normal operation
-    let parent_root = parent_header.tree_hash_root();
+    let parent_root = parent_header.hash_tree_root();
     if block.parent_root != parent_root {
         return Err(Error::InvalidParent {
             expected: parent_root,
@@ -172,7 +172,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
     }
 
     let mut historical_block_hashes: Vec<_> =
-        std::mem::take(&mut state.historical_block_hashes).into();
+        std::mem::take(&mut state.historical_block_hashes).into_inner();
     historical_block_hashes.push(parent_root);
     historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
 
@@ -196,7 +196,7 @@ fn process_block_header(state: &mut State, block: &Block) -> Result<(), Error> {
         slot: block.slot,
         proposer_index: block.proposer_index,
         parent_root: block.parent_root,
-        body_root: block.body.tree_hash_root(),
+        body_root: block.body.hash_tree_root(),
         // Zeroed out until local state root computation.
         // This is later filled with the state root after all processing is done.
         state_root: H256::ZERO,
@@ -245,12 +245,9 @@ fn process_attestations(
         .iter()
         .enumerate()
         .map(|(i, root)| {
-            let votes = state
-                .justifications_validators
-                .iter()
-                .skip(i * validator_count)
-                .take(validator_count)
-                .collect();
+            let votes = (i * validator_count..(i + 1) * validator_count)
+                .map(|j| state.justifications_validators.get(j) == Some(true))
+                .collect::<Vec<bool>>();
             (*root, votes)
         })
         .collect();
@@ -293,13 +290,14 @@ fn process_attestations(
             continue;
         }
         // Mark that each validator in this aggregation has voted for the target.
-        for (validator_id, _) in attestation
-            .aggregation_bits
-            .iter()
+        for (validator_id, voted) in votes
+            .iter_mut()
             .enumerate()
-            .filter(|(_, voted)| *voted)
+            .take(attestation.aggregation_bits.len())
         {
-            votes[validator_id] = true;
+            if attestation.aggregation_bits.get(validator_id) == Some(true) {
+                *voted = true;
+            }
         }
 
         // Check whether the vote count crosses the supermajority threshold
@@ -457,7 +455,7 @@ fn serialize_justifications(
         roots
     };
     let mut justifications_validators =
-        JustificationValidators::with_capacity(justification_roots.len() * validator_count)
+        JustificationValidators::with_length(justification_roots.len() * validator_count)
             .expect("maximum validator justifications reached");
     justification_roots
         .iter()
@@ -467,7 +465,7 @@ fn serialize_justifications(
         .for_each(|(i, _)| {
             justifications_validators
                 .set(i, true)
-                .expect("we just updated the capacity")
+                .expect("we just updated the capacity");
         });
     state.justifications_roots = justification_roots
         .try_into()
