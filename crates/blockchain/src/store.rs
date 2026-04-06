@@ -521,16 +521,14 @@ fn on_block_core(
 
     // Each unique AttestationData must appear at most once per block.
     let attestations = &signed_block.block.block.body.attestations;
-    let unique_count = attestations
-        .iter()
-        .map(|att| &att.data)
-        .collect::<HashSet<_>>()
-        .len();
-    if unique_count != attestations.len() {
-        return Err(StoreError::DuplicateAttestationData {
-            count: attestations.len(),
-            unique: unique_count,
-        });
+    let mut seen = HashSet::with_capacity(attestations.len());
+    for att in attestations {
+        if !seen.insert(&att.data) {
+            return Err(StoreError::DuplicateAttestationData {
+                count: attestations.len(),
+                unique: seen.len(),
+            });
+        }
     }
 
     let sig_verification_start = std::time::Instant::now();
@@ -961,13 +959,15 @@ fn compact_attestations(
     let mut order: Vec<AttestationData> = Vec::new();
     let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
     for (i, att) in attestations.iter().enumerate() {
-        groups
-            .entry(att.data.clone())
-            .or_insert_with(|| {
-                order.push(att.data.clone());
-                Vec::new()
-            })
-            .push(i);
+        match groups.entry(att.data.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                order.push(e.key().clone());
+                e.insert(vec![i]);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().push(i);
+            }
+        }
     }
 
     // Fast path: no duplicates
@@ -975,41 +975,52 @@ fn compact_attestations(
         return (attestations, proofs);
     }
 
+    // Wrap in Option so we can .take() items by index without cloning
+    let mut items: Vec<Option<(AggregatedAttestation, AggregatedSignatureProof)>> =
+        attestations.into_iter().zip(proofs).map(Some).collect();
+
     let mut compacted_atts = Vec::with_capacity(order.len());
     let mut compacted_proofs = Vec::with_capacity(order.len());
 
-    for data in &order {
-        let indices = &groups[data];
+    for data in order {
+        let indices = &groups[&data];
         if indices.len() == 1 {
-            let i = indices[0];
-            compacted_atts.push(attestations[i].clone());
-            compacted_proofs.push(proofs[i].clone());
+            let (att, proof) = items[indices[0]].take().expect("index used once");
+            compacted_atts.push(att);
+            compacted_proofs.push(proof);
             continue;
         }
 
-        let all_empty = indices.iter().all(|&i| proofs[i].proof_data.is_empty());
+        let all_empty = indices
+            .iter()
+            .all(|&i| items[i].as_ref().unwrap().1.proof_data.is_empty());
 
         if all_empty {
-            // Merge: union all participant bitfields, empty proof
-            let mut merged_bits = attestations[indices[0]].aggregation_bits.clone();
-            for &idx in &indices[1..] {
-                merged_bits =
-                    union_aggregation_bits(&merged_bits, &attestations[idx].aggregation_bits);
+            // Merge: take all entries and fold their participant bitfields
+            let mut merged_bits = None;
+            for &idx in indices {
+                let (att, _) = items[idx].take().expect("index used once");
+                merged_bits = Some(match merged_bits {
+                    None => att.aggregation_bits,
+                    Some(acc) => union_aggregation_bits(&acc, &att.aggregation_bits),
+                });
             }
+            let merged_bits = merged_bits.expect("group is non-empty");
+            compacted_proofs.push(AggregatedSignatureProof::empty(merged_bits.clone()));
             compacted_atts.push(AggregatedAttestation {
-                aggregation_bits: merged_bits.clone(),
-                data: data.clone(),
+                aggregation_bits: merged_bits,
+                data,
             });
-            compacted_proofs.push(AggregatedSignatureProof::empty(merged_bits));
         } else {
             // Cannot merge real proofs; keep the one with the most participants
             let best_idx = indices
                 .iter()
                 .copied()
-                .max_by_key(|&i| proofs[i].participant_indices().count())
+                .max_by_key(|&i| items[i].as_ref().unwrap().1.participant_indices().count())
                 .expect("group is non-empty");
-            compacted_atts.push(attestations[best_idx].clone());
-            compacted_proofs.push(proofs[best_idx].clone());
+            let (att, proof) = items[best_idx].take().expect("index used once");
+            compacted_atts.push(att);
+            compacted_proofs.push(proof);
         }
     }
 
