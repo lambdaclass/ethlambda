@@ -26,6 +26,16 @@ use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
+/// Maximum number of aggregated attestations (and corresponding signature proofs)
+/// that build_block will include in a single block.
+///
+/// With XMSS aggregated proofs averaging ~253 KB each, 24 attestations produce
+/// a block of ~6 MiB SSZ, well within the 10 MiB MAX_PAYLOAD_SIZE gossip limit
+/// while leaving headroom for the proposer signature and block header.
+///
+/// See: https://github.com/lambdaclass/ethlambda/issues/259
+const MAX_ATTESTATIONS_PER_BLOCK: usize = 24;
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
@@ -915,15 +925,17 @@ fn extend_proofs_greedily(
     selected_proofs: &mut Vec<AggregatedSignatureProof>,
     attestations: &mut Vec<AggregatedAttestation>,
     att_data: &AttestationData,
+    budget: usize,
 ) {
-    if proofs.is_empty() {
+    if proofs.is_empty() || budget == 0 {
         return;
     }
 
     let mut covered: HashSet<u64> = HashSet::new();
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
+    let mut added = 0;
 
-    while !remaining_indices.is_empty() {
+    while !remaining_indices.is_empty() && added < budget {
         // Pick proof covering the most uncovered validators (count only, no allocation)
         let best = remaining_indices
             .iter()
@@ -961,6 +973,7 @@ fn extend_proofs_greedily(
 
         covered.extend(new_covered);
         remaining_indices.remove(&best_idx);
+        added += 1;
     }
 }
 
@@ -1006,6 +1019,11 @@ fn build_block(
             let mut found_new = false;
 
             for &(data_root, (att_data, proofs)) in &sorted_entries {
+                let remaining =
+                    MAX_ATTESTATIONS_PER_BLOCK.saturating_sub(aggregated_attestations.len());
+                if remaining == 0 {
+                    break;
+                }
                 if processed_data_roots.contains(data_root) {
                     continue;
                 }
@@ -1024,6 +1042,7 @@ fn build_block(
                     &mut aggregated_signatures,
                     &mut aggregated_attestations,
                     att_data,
+                    remaining,
                 );
             }
 
@@ -1306,18 +1325,13 @@ mod tests {
 
     /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259
     ///
-    /// build_block greedily includes every matching attestation from the payload
-    /// pool with no size cap. During stall recovery the pool can grow large
-    /// enough that the SSZ-encoded SignedBlockWithAttestation exceeds the
-    /// MAX_PAYLOAD_SIZE (10 MiB), causing gossip publish failures and peer
-    /// rejection.
-    ///
-    /// This test simulates a stall scenario by populating the payload pool with
-    /// 50 distinct attestation entries, each carrying a ~253 KB proof (realistic
-    /// XMSS aggregated proof size). build_block includes all of them, producing
-    /// a block whose wire encoding exceeds the 10 MiB limit.
+    /// Simulates a stall scenario by populating the payload pool with 50
+    /// distinct attestation entries, each carrying a ~253 KB proof (realistic
+    /// XMSS aggregated proof size). Without the MAX_ATTESTATIONS_PER_BLOCK cap
+    /// this would produce a 12.4 MiB block, exceeding the 10 MiB gossip limit.
+    /// Verifies that build_block respects the cap and stays under the limit.
     #[test]
-    fn build_block_exceeds_max_payload_size_during_stall() {
+    fn build_block_respects_max_payload_size_during_stall() {
         use libssz::SszEncode;
         use libssz_types::SszList;
 
@@ -1401,10 +1415,11 @@ mod tests {
         )
         .expect("build_block should succeed");
 
-        // The block should have included all attestation entries
-        assert!(
-            block.body.attestations.len() > 0,
-            "block should contain attestations from the payload pool"
+        // The cap should have been enforced: 24 out of 50 entries included
+        assert_eq!(
+            block.body.attestations.len(),
+            MAX_ATTESTATIONS_PER_BLOCK,
+            "block should contain exactly MAX_ATTESTATIONS_PER_BLOCK attestations"
         );
 
         // Construct the full signed block as it would be sent over gossip
