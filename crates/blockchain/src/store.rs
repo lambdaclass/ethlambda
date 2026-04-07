@@ -1030,7 +1030,6 @@ fn build_block(
                 if accumulated_proof_bytes >= MAX_ATTESTATION_PROOF_BYTES {
                     break;
                 }
-                let remaining_bytes = MAX_ATTESTATION_PROOF_BYTES - accumulated_proof_bytes;
                 if processed_data_roots.contains(data_root) {
                     continue;
                 }
@@ -1044,6 +1043,7 @@ fn build_block(
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
+                let remaining_bytes = MAX_ATTESTATION_PROOF_BYTES - accumulated_proof_bytes;
                 let consumed = extend_proofs_greedily(
                     proofs,
                     &mut aggregated_signatures,
