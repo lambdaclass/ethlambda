@@ -115,3 +115,63 @@ impl ValidatorSecretKey {
         self.inner.advance_preparation();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leansig::serialization::Serializable;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    const LEAVES_PER_BOTTOM_TREE: u32 = 1 << 16; // 65,536
+
+    /// Generate a ValidatorSecretKey with 3 bottom trees so advance_preparation can be tested.
+    ///
+    /// This is slow (~minutes) because it computes 3 bottom trees of 65,536 leaves each.
+    fn generate_key_with_three_bottom_trees() -> ValidatorSecretKey {
+        let mut rng = StdRng::seed_from_u64(42);
+        // Request enough active epochs for 3 bottom trees (> 2 * 65,536)
+        let num_active_epochs = (LEAVES_PER_BOTTOM_TREE as usize) * 2 + 1;
+        let (_pk, sk) = LeanSignatureScheme::key_gen(&mut rng, 0, num_active_epochs);
+        let sk_bytes = sk.to_bytes();
+        ValidatorSecretKey::from_bytes(&sk_bytes).expect("valid secret key")
+    }
+
+    #[test]
+    #[ignore = "slow: generates production-size XMSS key (~minutes)"]
+    fn test_advance_preparation_duration() {
+        println!("Generating XMSS key with 3 bottom trees (this takes a while)...");
+        let keygen_start = std::time::Instant::now();
+        let mut sk = generate_key_with_three_bottom_trees();
+        println!("Key generation took: {:?}", keygen_start.elapsed());
+
+        // Initial window covers [0, 131072)
+        assert!(sk.is_prepared_for(0));
+        assert!(sk.is_prepared_for(LEAVES_PER_BOTTOM_TREE - 1));
+        assert!(sk.is_prepared_for(2 * LEAVES_PER_BOTTOM_TREE - 1));
+        assert!(!sk.is_prepared_for(2 * LEAVES_PER_BOTTOM_TREE));
+
+        // Time the advance_preparation call
+        let advance_start = std::time::Instant::now();
+        sk.advance_preparation();
+        let advance_duration = advance_start.elapsed();
+
+        println!("advance_preparation() took: {advance_duration:?}");
+
+        // Window should now cover [65536, 196608)
+        assert!(!sk.is_prepared_for(0));
+        assert!(sk.is_prepared_for(LEAVES_PER_BOTTOM_TREE));
+        assert!(sk.is_prepared_for(3 * LEAVES_PER_BOTTOM_TREE - 1));
+
+        // Verify signing works in the new window
+        let message = H256::from([42u8; 32]);
+        let slot = 2 * LEAVES_PER_BOTTOM_TREE; // slot 131,072 — the one that crashed the devnet
+        let sign_start = std::time::Instant::now();
+        let result = sk.sign(slot, &message);
+        println!("Signing at slot {slot} took: {:?}", sign_start.elapsed());
+        assert!(
+            result.is_ok(),
+            "signing should succeed after advance: {}",
+            result.err().map_or(String::new(), |e| e.to_string())
+        );
+    }
+}
