@@ -1371,8 +1371,10 @@ mod tests {
 
         // Simulate a stall: populate the payload pool with many distinct entries.
         // Each has a unique target (different slot) and a large proof payload.
-        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)> =
-            HashMap::new();
+        let mut aggregated_payloads: HashMap<
+            H256,
+            (AttestationData, Vec<AggregatedSignatureProof>),
+        > = HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
             let target_slot = (i + 1) as u64;
