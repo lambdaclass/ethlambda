@@ -1304,6 +1304,151 @@ mod tests {
         );
     }
 
+    /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259
+    ///
+    /// build_block greedily includes every matching attestation from the payload
+    /// pool with no size cap. During stall recovery the pool can grow large
+    /// enough that the SSZ-encoded SignedBlockWithAttestation exceeds the
+    /// MAX_PAYLOAD_SIZE (10 MiB), causing gossip publish failures and peer
+    /// rejection.
+    ///
+    /// This test simulates a stall scenario by populating the payload pool with
+    /// 50 distinct attestation entries, each carrying a ~253 KB proof (realistic
+    /// XMSS aggregated proof size). build_block includes all of them, producing
+    /// a block whose wire encoding exceeds the 10 MiB limit.
+    #[test]
+    fn build_block_exceeds_max_payload_size_during_stall() {
+        use libssz::SszEncode;
+        use libssz_types::SszList;
+
+        const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB (spec limit)
+        const PROOF_SIZE: usize = 253 * 1024; // ~253 KB realistic XMSS proof
+        const NUM_VALIDATORS: usize = 50;
+        const NUM_PAYLOAD_ENTRIES: usize = 50;
+
+        // Create genesis state with NUM_VALIDATORS validators.
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+        let head_state = State::from_genesis(1000, validators);
+
+        // process_slots fills in the genesis header's state_root before
+        // process_block_header computes the parent hash. Simulate that here.
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        // Proposer for slot 1 with NUM_VALIDATORS validators: 1 % 50 = 1
+        let proposer_index = 1u64;
+        let slot = 1u64;
+
+        // The genesis edge case in build_block sets current_justified to:
+        //   Checkpoint { root: parent_root, slot: 0 }
+        let source = Checkpoint {
+            root: parent_root,
+            slot: 0,
+        };
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+
+        // Simulate a stall: populate the payload pool with many distinct entries.
+        // Each has a unique target (different slot) and a large proof payload.
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)> =
+            HashMap::new();
+
+        for i in 0..NUM_PAYLOAD_ENTRIES {
+            let target_slot = (i + 1) as u64;
+            let att_data = AttestationData {
+                slot: target_slot,
+                head: Checkpoint {
+                    root: parent_root,
+                    slot: 0,
+                },
+                target: Checkpoint {
+                    root: H256([target_slot as u8; 32]),
+                    slot: target_slot,
+                },
+                source,
+            };
+
+            // Use the real hash_tree_root as the data_root key
+            let data_root = att_data.hash_tree_root();
+
+            // Create a single large proof per entry (one validator per proof)
+            let validator_id = i % NUM_VALIDATORS;
+            let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+            bits.set(validator_id, true).unwrap();
+
+            let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
+            let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
+            let proof = AggregatedSignatureProof::new(bits, proof_data);
+
+            aggregated_payloads.insert(data_root, (att_data, vec![proof]));
+        }
+
+        // Build the block; this should succeed (the bug: no size guard)
+        let (block, signatures) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        // The block should have included all attestation entries
+        assert!(
+            block.body.attestations.len() > 0,
+            "block should contain attestations from the payload pool"
+        );
+
+        // Construct the full signed block as it would be sent over gossip
+        let attestation_sigs: Vec<AggregatedSignatureProof> = signatures;
+        let signed_block = SignedBlockWithAttestation {
+            block: BlockWithAttestation {
+                block,
+                proposer_attestation: Attestation {
+                    validator_id: proposer_index,
+                    data: AttestationData {
+                        slot,
+                        head: Checkpoint {
+                            root: parent_root,
+                            slot: 0,
+                        },
+                        target: Checkpoint {
+                            root: parent_root,
+                            slot: 0,
+                        },
+                        source,
+                    },
+                },
+            },
+            signature: BlockSignatures {
+                attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        };
+
+        // SSZ-encode: this is exactly what publish_block does before compression
+        let ssz_bytes = signed_block.to_ssz();
+
+        // build_block must not produce blocks that exceed the gossip wire limit.
+        assert!(
+            ssz_bytes.len() <= MAX_PAYLOAD_SIZE,
+            "block with {} attestations is {} bytes SSZ, \
+             which exceeds MAX_PAYLOAD_SIZE ({} bytes). \
+             build_block must enforce a size cap (issue #259).",
+            signed_block.block.block.body.attestations.len(),
+            ssz_bytes.len(),
+            MAX_PAYLOAD_SIZE,
+        );
+    }
+
     /// Attestation source must come from the head state's justified checkpoint,
     /// not the store-wide global max.
     ///
