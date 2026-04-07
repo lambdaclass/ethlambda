@@ -53,7 +53,7 @@ pub fn compress_message(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::block::SignedBlock;
-    use ssz::Decode;
+    use libssz::SszDecode;
 
     #[test]
     #[ignore = "devnet3 SSZ fixture — needs devnet4 block (SignedBlock without BlockWithAttestation wrapper)"]

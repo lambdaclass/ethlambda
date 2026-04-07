@@ -1,17 +1,18 @@
 use serde::Serialize;
-use ssz_types::typenum::U1048576;
+
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+use libssz_types::SszList;
 
 use crate::{
     attestation::{AggregatedAttestation, AggregationBits, XmssSignature, validator_indices},
-    primitives::{
-        ByteList, H256,
-        ssz::{Decode, Encode, TreeHash},
-    },
-    state::ValidatorRegistryLimit,
+    primitives::{self, ByteList, H256},
 };
 
+// Convenience trait for calling hash_tree_root() without a hasher argument
+use primitives::HashTreeRoot as _;
+
 /// Envelope carrying a block and its aggregated signatures.
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, SszEncode, SszDecode)]
 pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
@@ -34,7 +35,7 @@ impl core::fmt::Debug for SignedBlock {
 }
 
 /// Signature payload for the block.
-#[derive(Clone, Encode, Decode)]
+#[derive(Clone, SszEncode, SszDecode)]
 pub struct BlockSignatures {
     /// Attestation signatures for the aggregated attestations in the block body.
     ///
@@ -56,8 +57,7 @@ pub struct BlockSignatures {
 /// It contains:
 ///     - the participants bitfield,
 ///     - proof bytes from leanVM signature aggregation.
-pub type AttestationSignatures =
-    ssz_types::VariableList<AggregatedSignatureProof, ValidatorRegistryLimit>;
+pub type AttestationSignatures = SszList<AggregatedSignatureProof, 4096>;
 
 /// Cryptographic proof that a set of validators signed a message.
 ///
@@ -69,7 +69,7 @@ pub type AttestationSignatures =
 /// The proof can verify that all participants signed the same message in the
 /// same epoch, using a single verification operation instead of checking
 /// each signature individually.
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,
@@ -77,7 +77,7 @@ pub struct AggregatedSignatureProof {
     pub proof_data: ByteListMiB,
 }
 
-pub type ByteListMiB = ByteList<U1048576>;
+pub type ByteListMiB = ByteList<1_048_576>;
 
 impl AggregatedSignatureProof {
     /// Create a new aggregated signature proof.
@@ -94,7 +94,7 @@ impl AggregatedSignatureProof {
     pub fn empty(participants: AggregationBits) -> Self {
         Self {
             participants,
-            proof_data: ByteList::empty(),
+            proof_data: SszList::new(),
         }
     }
 
@@ -112,7 +112,7 @@ impl AggregatedSignatureProof {
 ///
 /// Headers are smaller than full blocks. They're useful for tracking the chain
 /// without storing everything.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockHeader {
     /// The slot in which the block was proposed
     pub slot: u64,
@@ -127,7 +127,7 @@ pub struct BlockHeader {
 }
 
 /// A complete block including header and body.
-#[derive(Debug, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Block {
     /// The slot in which the block was proposed.
     pub slot: u64,
@@ -149,18 +149,18 @@ impl Block {
             proposer_index: self.proposer_index,
             parent_root: self.parent_root,
             state_root: self.state_root,
-            body_root: self.body.tree_hash_root(),
+            body_root: self.body.hash_tree_root(),
         }
     }
 
     /// Reconstruct a block from header and body.
     ///
-    /// The caller should ensure that `header.body_root` matches `body.tree_hash_root()`.
+    /// The caller should ensure that `header.body_root` matches `body.hash_tree_root()`.
     /// This is verified with a debug assertion but not in release builds.
     pub fn from_header_and_body(header: BlockHeader, body: BlockBody) -> Self {
         debug_assert_eq!(
             header.body_root,
-            body.tree_hash_root(),
+            body.hash_tree_root(),
             "body root mismatch"
         );
         Self {
@@ -177,7 +177,7 @@ impl Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
-#[derive(Debug, Default, Clone, Encode, Decode, TreeHash)]
+#[derive(Debug, Default, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///
@@ -187,5 +187,4 @@ pub struct BlockBody {
 }
 
 /// List of aggregated attestations included in a block.
-pub type AggregatedAttestations =
-    ssz_types::VariableList<AggregatedAttestation, ValidatorRegistryLimit>;
+pub type AggregatedAttestations = SszList<AggregatedAttestation, 4096>;

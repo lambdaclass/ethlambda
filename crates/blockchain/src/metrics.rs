@@ -377,8 +377,8 @@ pub fn set_node_start_time() {
 }
 
 /// Increment the valid attestations counter.
-pub fn inc_attestations_valid() {
-    LEAN_ATTESTATIONS_VALID_TOTAL.inc();
+pub fn inc_attestations_valid(count: u64) {
+    LEAN_ATTESTATIONS_VALID_TOTAL.inc_by(count);
 }
 
 /// Increment the invalid attestations counter.

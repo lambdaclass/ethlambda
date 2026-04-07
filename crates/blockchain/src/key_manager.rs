@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
-    primitives::{H256, ssz::TreeHash},
+    primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
 
@@ -53,7 +53,7 @@ impl KeyManager {
         validator_id: u64,
         attestation_data: &AttestationData,
     ) -> Result<XmssSignature, KeyManagerError> {
-        let message_hash = attestation_data.tree_hash_root();
+        let message_hash = attestation_data.hash_tree_root();
         let slot = attestation_data.slot as u32;
         self.sign_with_attestation_key(validator_id, slot, &message_hash)
     }

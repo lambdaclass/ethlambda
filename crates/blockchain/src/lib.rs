@@ -8,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
-    primitives::{H256, ssz::TreeHash},
+    primitives::{H256, HashTreeRoot as _},
 };
 
 use crate::key_manager::ValidatorKeyPair;
@@ -210,7 +210,7 @@ impl BlockChainServer {
         };
 
         // Sign the block root with the proposal key
-        let block_root = block.tree_hash_root();
+        let block_root = block.hash_tree_root();
         let Ok(proposer_signature) = self
             .key_manager
             .sign_block_root(validator_id, slot as u32, &block_root)
@@ -285,7 +285,7 @@ impl BlockChainServer {
         queue: &mut VecDeque<SignedBlock>,
     ) {
         let slot = signed_block.message.slot;
-        let block_root = signed_block.message.tree_hash_root();
+        let block_root = signed_block.message.hash_tree_root();
         let parent_root = signed_block.message.parent_root;
         let proposer = signed_block.message.proposer_index;
 

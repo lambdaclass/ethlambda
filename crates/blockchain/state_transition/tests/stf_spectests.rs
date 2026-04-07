@@ -194,11 +194,14 @@ fn compare_post_states(
         }
     }
     if let Some(justified_slots) = justified_slots {
-        let post_slots: Vec<_> = post_state
-            .justified_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, bit)| if bit { Some(i as u64) } else { None })
+        let post_slots: Vec<_> = (0..post_state.justified_slots.len())
+            .filter_map(|i| {
+                if post_state.justified_slots.get(i) == Some(true) {
+                    Some(i as u64)
+                } else {
+                    None
+                }
+            })
             .collect();
         if post_slots != justified_slots.data {
             return Err(format!(
@@ -219,7 +222,9 @@ fn compare_post_states(
         }
     }
     if let Some(justifications_validators) = justifications_validators {
-        let post_validators: Vec<_> = post_state.justifications_validators.iter().collect();
+        let post_validators: Vec<_> = (0..post_state.justifications_validators.len())
+            .map(|i| post_state.justifications_validators.get(i) == Some(true))
+            .collect();
         if post_validators != justifications_validators.data {
             return Err(format!(
                 "justifications_validators mismatch: expected {:?}, got {:?}",

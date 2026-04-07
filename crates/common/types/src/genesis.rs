@@ -52,7 +52,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        primitives::ssz::TreeHash,
+        primitives::HashTreeRoot as _,
         state::{State, Validator},
     };
 
@@ -142,26 +142,22 @@ GENESIS_VALIDATORS:
         let config: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
         let validators = config.validators();
         let state = State::from_genesis(config.genesis_time, validators);
-        let root = state.tree_hash_root();
+        let root = state.hash_tree_root();
 
         // Pin the state root so SSZ layout changes are caught immediately.
-        let expected_state_root: crate::primitives::H256 =
-            hex::decode("babcdc9235a29dfc0d605961df51cfc85732f85291c2beea8b7510a92ec458fe")
-                .unwrap()
-                .as_slice()
-                .try_into()
-                .unwrap();
+        let expected_state_root = crate::primitives::H256::from_slice(
+            &hex::decode("babcdc9235a29dfc0d605961df51cfc85732f85291c2beea8b7510a92ec458fe")
+                .unwrap(),
+        );
         assert_eq!(root, expected_state_root, "state root mismatch");
 
         let mut block = state.latest_block_header;
         block.state_root = root;
-        let block_root = block.tree_hash_root();
-        let expected_block_root: crate::primitives::H256 =
-            hex::decode("66a8beaa81d2aaeac7212d4bf8f5fea2bd22d479566a33a83c891661c21235ef")
-                .unwrap()
-                .as_slice()
-                .try_into()
-                .unwrap();
+        let block_root = block.hash_tree_root();
+        let expected_block_root = crate::primitives::H256::from_slice(
+            &hex::decode("66a8beaa81d2aaeac7212d4bf8f5fea2bd22d479566a33a83c891661c21235ef")
+                .unwrap(),
+        );
         assert_eq!(block_root, expected_block_root, "block root mismatch");
     }
 }

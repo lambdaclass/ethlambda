@@ -123,5 +123,5 @@ where
     let value = String::deserialize(d)?;
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
         .map_err(|_| D::Error::custom("XmssSignature value is not valid hex"))?;
-    XmssSignature::new(bytes).map_err(|_| D::Error::custom("XmssSignature length != 3112"))
+    XmssSignature::try_from(bytes).map_err(|_| D::Error::custom("XmssSignature length != 3112"))
 }

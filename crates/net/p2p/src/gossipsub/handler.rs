@@ -2,9 +2,10 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::SignedBlock,
-    primitives::ssz::{Decode, Encode, TreeHash},
+    primitives::HashTreeRoot as _,
 };
 use libp2p::gossipsub::Event;
+use libssz::{SszDecode, SszEncode};
 use tracing::{error, info, trace};
 
 use super::{
@@ -40,7 +41,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 return;
             };
             let slot = signed_block.message.slot;
-            let block_root = signed_block.message.tree_hash_root();
+            let block_root = signed_block.message.hash_tree_root();
             let proposer = signed_block.message.proposer_index;
             let parent_root = signed_block.message.parent_root;
             let attestation_count = signed_block.message.body.attestations.len();
@@ -129,7 +130,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     let subnet_id = validator % server.attestation_committee_count;
 
     // Encode to SSZ
-    let ssz_bytes = attestation.as_ssz_bytes();
+    let ssz_bytes = attestation.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
@@ -158,12 +159,12 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
 pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
     let slot = signed_block.message.slot;
     let proposer = signed_block.message.proposer_index;
-    let block_root = signed_block.message.tree_hash_root();
+    let block_root = signed_block.message.hash_tree_root();
     let parent_root = signed_block.message.parent_root;
     let attestation_count = signed_block.message.body.attestations.len();
 
     // Encode to SSZ
-    let ssz_bytes = signed_block.as_ssz_bytes();
+    let ssz_bytes = signed_block.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
@@ -189,7 +190,7 @@ pub async fn publish_aggregated_attestation(
     let slot = attestation.data.slot;
 
     // Encode to SSZ
-    let ssz_bytes = attestation.as_ssz_bytes();
+    let ssz_bytes = attestation.to_ssz();
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);

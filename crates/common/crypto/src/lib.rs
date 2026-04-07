@@ -2,12 +2,12 @@ use std::sync::Once;
 
 use ethlambda_types::{
     block::ByteListMiB,
-    primitives::{
-        H256,
-        ssz::{Decode, Encode},
-    },
+    primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
+// ethereum_ssz Encode/Decode traits are needed for Devnet2XmssAggregateSignature,
+// which is an external type from lean-multisig that uses the old ethereum_ssz API.
+use ethereum_ssz::{Decode, Encode};
 use lean_multisig::{
     Devnet2XmssAggregateSignature, ProofError, XmssAggregateError, xmss_aggregate_signatures,
     xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
@@ -109,12 +109,12 @@ pub fn aggregate_signatures(
         .collect();
 
     // Aggregate using lean-multisig
-    let aggregate = xmss_aggregate_signatures(&lean_pubkeys, &lean_sigs, message, slot)
+    let aggregate = xmss_aggregate_signatures(&lean_pubkeys, &lean_sigs, &message.0, slot)
         .map_err(AggregationError::AggregationFailed)?;
 
     let serialized = aggregate.as_ssz_bytes();
     let serialized_len = serialized.len();
-    ByteListMiB::new(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
+    ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
 }
 
 /// Verify an aggregated signature proof.
@@ -151,7 +151,7 @@ pub fn verify_aggregated_signature(
         .map_err(|_| VerificationError::DeserializationFailed)?;
 
     // Verify using lean-multisig
-    xmss_verify_aggregated_signatures(&lean_pubkeys, message, &aggregate, slot)?;
+    xmss_verify_aggregated_signatures(&lean_pubkeys, &message.0, &aggregate, slot)?;
 
     Ok(())
 }
@@ -183,7 +183,7 @@ mod tests {
 
         let (pk, sk) = LeanSignatureScheme::key_gen(&mut rng, activation_epoch as usize, lifetime);
 
-        let sig = LeanSignatureScheme::sign(&sk, signing_epoch, message).unwrap();
+        let sig = LeanSignatureScheme::sign(&sk, signing_epoch, &message.0).unwrap();
 
         // Convert to ethlambda types via bytes
         let pk_bytes = pk.to_bytes();

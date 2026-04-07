@@ -1,23 +1,19 @@
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+use libssz_types::{SszBitlist, SszList};
 use serde::{Deserialize, Serialize};
-use ssz_types::typenum::{U4096, U262144};
 
 use crate::{
     block::{BlockBody, BlockHeader},
     checkpoint::Checkpoint,
-    primitives::{
-        H256,
-        ssz::{Decode, DecodeError, Encode, TreeHash},
-    },
-    signature::ValidatorPublicKey,
+    primitives::{self, H256},
+    signature::{SignatureParseError, ValidatorPublicKey},
 };
 
-// Constants
-
-/// The maximum number of validators that can be in the registry.
-pub type ValidatorRegistryLimit = U4096;
+// Convenience trait for calling hash_tree_root() without a hasher argument
+use primitives::HashTreeRoot as _;
 
 /// The main consensus state object
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
     /// The chain's configuration parameters
     pub config: ChainConfig,
@@ -34,7 +30,7 @@ pub struct State {
     /// A bitfield indicating which historical slots were justified
     pub justified_slots: JustifiedSlots,
     /// Registry of validators tracked by the state
-    pub validators: ssz_types::VariableList<Validator, ValidatorRegistryLimit>,
+    pub validators: SszList<Validator, VALIDATOR_REGISTRY_LIMIT>,
     /// Roots of justified blocks
     pub justifications_roots: JustificationRoots,
     /// A bitlist of validators who participated in justifications
@@ -46,27 +42,31 @@ pub struct State {
 /// With a 4-second slot, this corresponds to a history
 /// of approximately 12.1 days.
 pub const HISTORICAL_ROOTS_LIMIT: usize = 262_144; // 2**18
-type HistoricalRootsLimit = U262144;
 
 /// List of historical block root hashes up to historical_roots_limit.
-type HistoricalBlockHashes = ssz_types::VariableList<H256, HistoricalRootsLimit>;
+type HistoricalBlockHashes = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
 /// Bitlist tracking justified slots up to historical roots limit.
-pub type JustifiedSlots = ssz_types::BitList<HistoricalRootsLimit>;
+pub type JustifiedSlots = SszBitlist<HISTORICAL_ROOTS_LIMIT>;
 
 /// List of justified block roots up to historical_roots_limit.
-pub type JustificationRoots = ssz_types::VariableList<H256, HistoricalRootsLimit>;
+pub type JustificationRoots = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
+
+/// Maximum number of validators in the registry.
+pub const VALIDATOR_REGISTRY_LIMIT: usize = 4096;
 
 /// Bitlist for tracking validator justifications per historical root.
+///
+/// Maximum size is HISTORICAL_ROOTS_LIMIT × VALIDATOR_REGISTRY_LIMIT.
 pub type JustificationValidators =
-    ssz_types::BitList<ssz_types::typenum::Prod<HistoricalRootsLimit, ValidatorRegistryLimit>>;
+    SszBitlist<{ HISTORICAL_ROOTS_LIMIT * VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Represents a validator's static metadata and operational interface.
 ///
 /// Each validator has two independent XMSS keys: one for signing attestations
 /// and one for signing block proposals. This allows signing both in the same
 /// slot without violating OTS (one-time signature) constraints.
-#[derive(Debug, Clone, Serialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
     /// XMSS public key used for attestation signing.
     #[serde(serialize_with = "serialize_pubkey_hex")]
@@ -86,11 +86,11 @@ where
 }
 
 impl Validator {
-    pub fn get_attestation_pubkey(&self) -> Result<ValidatorPublicKey, DecodeError> {
+    pub fn get_attestation_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
         ValidatorPublicKey::from_bytes(&self.attestation_pubkey)
     }
 
-    pub fn get_proposal_pubkey(&self) -> Result<ValidatorPublicKey, DecodeError> {
+    pub fn get_proposal_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
         ValidatorPublicKey::from_bytes(&self.proposal_pubkey)
     }
 }
@@ -104,13 +104,11 @@ impl State {
             proposer_index: 0,
             parent_root: H256::ZERO,
             state_root: H256::ZERO,
-            body_root: BlockBody::default().tree_hash_root(),
+            body_root: BlockBody::default().hash_tree_root(),
         };
-        let validators = ssz_types::VariableList::new(validators).unwrap();
-        let justified_slots =
-            JustifiedSlots::with_capacity(0).expect("failed to initialize empty list");
-        let justifications_validators =
-            JustificationValidators::with_capacity(0).expect("failed to initialize empty list");
+        let validators = SszList::try_from(validators).unwrap();
+        let justified_slots = JustifiedSlots::new();
+        let justifications_validators = JustificationValidators::new();
 
         Self {
             config: ChainConfig { genesis_time },
@@ -127,7 +125,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ChainConfig {
     pub genesis_time: u64,
 }

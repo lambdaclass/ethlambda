@@ -7,9 +7,10 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::AttestationData,
-    block::{Block, BlockSignatures, SignedBlock},
-    primitives::{H256, VariableList, ssz::TreeHash},
+    attestation::{AttestationData, XmssSignature},
+    block::{AttestationSignatures, Block, BlockSignatures, SignedBlock},
+    primitives::{H256, HashTreeRoot as _},
+    signature::SIGNATURE_SIZE,
     state::State,
 };
 
@@ -62,7 +63,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // Register block label if present
                     if let Some(ref label) = block_data.block_root_label {
                         let block: Block = block_data.to_block();
-                        let root = H256::from(block.tree_hash_root());
+                        let root = block.hash_tree_root();
                         block_registry.insert(label.clone(), root);
                     }
 
@@ -120,8 +121,8 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
     SignedBlock {
         message: block,
         signature: BlockSignatures {
-            proposer_signature: Default::default(),
-            attestation_signatures: VariableList::empty(),
+            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            attestation_signatures: AttestationSignatures::new(),
         },
     }
 }
@@ -290,12 +291,8 @@ fn validate_attestation_check(
     let location = check.location.as_str();
 
     let attestations: HashMap<u64, AttestationData> = match location {
-        "new" => {
-            st.extract_latest_attestations(st.iter_new_aggregated_payloads().map(|(key, _)| key))
-        }
-        "known" => {
-            st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key))
-        }
+        "new" => st.extract_latest_new_attestations(),
+        "known" => st.extract_latest_known_attestations(),
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
@@ -375,8 +372,7 @@ fn validate_lexicographic_head_among(
     }
 
     let blocks = st.get_live_chain();
-    let known_attestations: HashMap<u64, AttestationData> =
-        st.extract_latest_attestations(st.iter_known_aggregated_payloads().map(|(key, _)| key));
+    let known_attestations: HashMap<u64, AttestationData> = st.extract_latest_known_attestations();
 
     // Resolve all fork labels to roots and compute their weights
     // Map: label -> (root, slot, weight)
