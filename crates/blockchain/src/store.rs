@@ -23,6 +23,15 @@ use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
+/// Maximum bytes of attestation proof data that build_block will accumulate.
+///
+/// Derived from the 10 MiB MAX_PAYLOAD_SIZE gossip limit with a 1 MiB margin
+/// for the block header, proposer signature, attestation metadata, bitlists,
+/// and SSZ encoding overhead.
+///
+/// See: https://github.com/lambdaclass/ethlambda/issues/259
+const MAX_ATTESTATION_PROOF_BYTES: usize = 9 * 1024 * 1024;
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
@@ -873,18 +882,21 @@ fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
 ///
 /// For a single attestation data entry, picks proofs that cover the most
 /// uncovered validators. Each selected proof produces one AggregatedAttestation.
+/// Returns the total proof_data bytes consumed.
 fn extend_proofs_greedily(
     proofs: &[AggregatedSignatureProof],
     selected_proofs: &mut Vec<AggregatedSignatureProof>,
     attestations: &mut Vec<AggregatedAttestation>,
     att_data: &AttestationData,
-) {
-    if proofs.is_empty() {
-        return;
+    remaining_bytes: usize,
+) -> usize {
+    if proofs.is_empty() || remaining_bytes == 0 {
+        return 0;
     }
 
     let mut covered: HashSet<u64> = HashSet::new();
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
+    let mut bytes_consumed = 0;
 
     while !remaining_indices.is_empty() {
         // Pick proof covering the most uncovered validators (count only, no allocation)
@@ -906,13 +918,18 @@ fn extend_proofs_greedily(
             break;
         }
 
+        let proof = &proofs[best_idx];
+        let proof_bytes = proof.proof_data.len();
+        if bytes_consumed + proof_bytes > remaining_bytes {
+            break;
+        }
+
         // Collect coverage only for the winning proof
-        let new_covered: Vec<u64> = proofs[best_idx]
+        let new_covered: Vec<u64> = proof
             .participant_indices()
             .filter(|vid| !covered.contains(vid))
             .collect();
 
-        let proof = &proofs[best_idx];
         attestations.push(AggregatedAttestation {
             aggregation_bits: proof.participants.clone(),
             data: att_data.clone(),
@@ -924,7 +941,10 @@ fn extend_proofs_greedily(
 
         covered.extend(new_covered);
         remaining_indices.remove(&best_idx);
+        bytes_consumed += proof_bytes;
     }
+
+    bytes_consumed
 }
 
 /// Build a valid block on top of this state.
@@ -945,6 +965,7 @@ fn build_block(
 ) -> Result<(Block, Vec<AggregatedSignatureProof>), StoreError> {
     let mut aggregated_attestations: Vec<AggregatedAttestation> = Vec::new();
     let mut aggregated_signatures: Vec<AggregatedSignatureProof> = Vec::new();
+    let mut accumulated_proof_bytes: usize = 0;
 
     if !aggregated_payloads.is_empty() {
         // Genesis edge case: when building on genesis (slot 0),
@@ -969,6 +990,9 @@ fn build_block(
             let mut found_new = false;
 
             for &(data_root, (att_data, proofs)) in &sorted_entries {
+                if accumulated_proof_bytes >= MAX_ATTESTATION_PROOF_BYTES {
+                    break;
+                }
                 if processed_data_roots.contains(data_root) {
                     continue;
                 }
@@ -982,15 +1006,18 @@ fn build_block(
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
-                extend_proofs_greedily(
+                let remaining_bytes = MAX_ATTESTATION_PROOF_BYTES - accumulated_proof_bytes;
+                let consumed = extend_proofs_greedily(
                     proofs,
                     &mut aggregated_signatures,
                     &mut aggregated_attestations,
                     att_data,
+                    remaining_bytes,
                 );
+                accumulated_proof_bytes += consumed;
             }
 
-            if !found_new {
+            if !found_new || accumulated_proof_bytes >= MAX_ATTESTATION_PROOF_BYTES {
                 break;
             }
 
@@ -1241,6 +1268,150 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::ParticipantsMismatch)),
             "Expected ParticipantsMismatch, got: {result:?}"
+        );
+    }
+
+    /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259
+    ///
+    /// Simulates a stall scenario by populating the payload pool with 50
+    /// distinct attestation entries, each carrying a ~253 KB proof (realistic
+    /// XMSS aggregated proof size). Without the byte budget cap this would
+    /// produce a 12.4 MiB block, exceeding the 10 MiB gossip limit.
+    /// Verifies that build_block respects the cap and stays under the limit.
+    #[test]
+    fn build_block_respects_max_payload_size_during_stall() {
+        use libssz::SszEncode;
+        use libssz_types::SszList;
+
+        const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB (spec limit)
+        const PROOF_SIZE: usize = 253 * 1024; // ~253 KB realistic XMSS proof
+        const NUM_VALIDATORS: usize = 50;
+        const NUM_PAYLOAD_ENTRIES: usize = 50;
+
+        // Create genesis state with NUM_VALIDATORS validators.
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+        let head_state = State::from_genesis(1000, validators);
+
+        // process_slots fills in the genesis header's state_root before
+        // process_block_header computes the parent hash. Simulate that here.
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        // Proposer for slot 1 with NUM_VALIDATORS validators: 1 % 50 = 1
+        let proposer_index = 1u64;
+        let slot = 1u64;
+
+        // The genesis edge case in build_block sets current_justified to:
+        //   Checkpoint { root: parent_root, slot: 0 }
+        let source = Checkpoint {
+            root: parent_root,
+            slot: 0,
+        };
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+
+        // Simulate a stall: populate the payload pool with many distinct entries.
+        // Each has a unique target (different slot) and a large proof payload.
+        let mut aggregated_payloads: HashMap<
+            H256,
+            (AttestationData, Vec<AggregatedSignatureProof>),
+        > = HashMap::new();
+
+        for i in 0..NUM_PAYLOAD_ENTRIES {
+            let target_slot = (i + 1) as u64;
+            let att_data = AttestationData {
+                slot: target_slot,
+                head: Checkpoint {
+                    root: parent_root,
+                    slot: 0,
+                },
+                target: Checkpoint {
+                    root: H256([target_slot as u8; 32]),
+                    slot: target_slot,
+                },
+                source,
+            };
+
+            // Use the real hash_tree_root as the data_root key
+            let data_root = att_data.hash_tree_root();
+
+            // Create a single large proof per entry (one validator per proof)
+            let validator_id = i % NUM_VALIDATORS;
+            let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+            bits.set(validator_id, true).unwrap();
+
+            let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
+            let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
+            let proof = AggregatedSignatureProof::new(bits, proof_data);
+
+            aggregated_payloads.insert(data_root, (att_data, vec![proof]));
+        }
+
+        // Build the block; this should succeed (the bug: no size guard)
+        let (block, signatures) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        // The byte budget should have been enforced: fewer than 50 entries included
+        let attestation_count = block.body.attestations.len();
+        assert!(attestation_count > 0, "block should contain attestations");
+        assert!(
+            attestation_count < NUM_PAYLOAD_ENTRIES,
+            "byte budget should have capped attestations below the pool size"
+        );
+
+        // Construct the full signed block as it would be sent over gossip
+        let attestation_sigs: Vec<AggregatedSignatureProof> = signatures;
+        let signed_block = SignedBlockWithAttestation {
+            block: BlockWithAttestation {
+                block,
+                proposer_attestation: Attestation {
+                    validator_id: proposer_index,
+                    data: AttestationData {
+                        slot,
+                        head: Checkpoint {
+                            root: parent_root,
+                            slot: 0,
+                        },
+                        target: Checkpoint {
+                            root: parent_root,
+                            slot: 0,
+                        },
+                        source,
+                    },
+                },
+            },
+            signature: BlockSignatures {
+                attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        };
+
+        // SSZ-encode: this is exactly what publish_block does before compression
+        let ssz_bytes = signed_block.to_ssz();
+
+        // build_block must not produce blocks that exceed the gossip wire limit.
+        assert!(
+            ssz_bytes.len() <= MAX_PAYLOAD_SIZE,
+            "block with {} attestations is {} bytes SSZ, \
+             which exceeds MAX_PAYLOAD_SIZE ({} bytes). \
+             build_block must enforce a size cap (issue #259).",
+            signed_block.block.block.body.attestations.len(),
+            ssz_bytes.len(),
+            MAX_PAYLOAD_SIZE,
         );
     }
 
