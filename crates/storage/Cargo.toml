@@ -15,5 +15,8 @@ ethlambda-types.workspace = true
 tracing.workspace = true
 rocksdb.workspace = true
 
+libssz.workspace = true
+libssz-derive.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

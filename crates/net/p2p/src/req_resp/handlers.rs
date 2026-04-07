@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
-use ethlambda_types::primitives::ssz::TreeHash;
+use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlockWithAttestation, primitives::H256};
 
 use super::{
@@ -146,7 +146,7 @@ async fn handle_blocks_by_root_response(
     }
 
     for block in blocks {
-        let root = block.block.block.tree_hash_root();
+        let root = block.block.block.hash_tree_root();
 
         // Validate that this block matches what we requested
         if root != requested_root {
@@ -231,7 +231,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     };
 
     // Create BlocksByRoot request with single root
-    let mut roots = RequestedBlockRoots::empty();
+    let mut roots = RequestedBlockRoots::new();
     if let Err(err) = roots.push(root) {
         error!(%root, ?err, "Failed to create BlocksByRoot request");
         return false;
