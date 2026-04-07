@@ -1,6 +1,6 @@
 use leansig::{
     serialization::Serializable,
-    signature::{SignatureScheme, SigningError},
+    signature::{SignatureScheme, SignatureSchemeSecretKey as _, SigningError},
 };
 
 use crate::primitives::H256;
@@ -96,5 +96,22 @@ impl ValidatorSecretKey {
     pub fn sign(&self, slot: u32, message: &H256) -> Result<ValidatorSignature, SigningError> {
         let sig = LeanSignatureScheme::sign(&self.inner, slot, &message.0)?;
         Ok(ValidatorSignature { inner: sig })
+    }
+
+    /// Returns true if the key is prepared to sign at the given slot.
+    ///
+    /// XMSS keys maintain a sliding window of two bottom trees. Only slots
+    /// within this window can be signed without advancing the preparation.
+    pub fn is_prepared_for(&self, slot: u32) -> bool {
+        self.inner.get_prepared_interval().contains(&(slot as u64))
+    }
+
+    /// Advance the prepared window forward by one bottom tree.
+    ///
+    /// Each call slides the window by sqrt(LIFETIME) = 65,536 slots.
+    /// If the window is already at the end of the key's activation interval,
+    /// this is a no-op.
+    pub fn advance_preparation(&mut self) {
+        self.inner.advance_preparation();
     }
 }

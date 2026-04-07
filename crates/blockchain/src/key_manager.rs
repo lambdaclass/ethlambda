@@ -5,6 +5,7 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
+use tracing::info;
 
 use crate::metrics;
 
@@ -101,6 +102,21 @@ impl KeyManager {
             .keys
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
+
+        // Advance XMSS key preparation window if the slot is outside the current window.
+        // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
+        if !secret_key.is_prepared_for(slot) {
+            info!(validator_id, slot, "Advancing XMSS key preparation window");
+            while !secret_key.is_prepared_for(slot) {
+                secret_key.advance_preparation();
+                if !secret_key.is_prepared_for(slot) {
+                    return Err(KeyManagerError::SigningError(format!(
+                        "XMSS key exhausted for validator {validator_id}: \
+                         slot {slot} is beyond the key's activation interval"
+                    )));
+                }
+            }
+        }
 
         let signature: ValidatorSignature = {
             let _timing = metrics::time_pq_sig_attestation_signing();
