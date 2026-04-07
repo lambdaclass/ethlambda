@@ -2000,6 +2000,8 @@ dependencies = [
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
+ "libssz",
+ "libssz-types",
  "serde",
  "serde_json",
  "spawned-concurrency 0.5.0",
