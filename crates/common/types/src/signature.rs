@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use leansig::{
     serialization::Serializable,
     signature::{SignatureScheme, SignatureSchemeSecretKey as _, SigningError},
@@ -104,6 +106,11 @@ impl ValidatorSecretKey {
     /// within this window can be signed without advancing the preparation.
     pub fn is_prepared_for(&self, slot: u32) -> bool {
         self.inner.get_prepared_interval().contains(&(slot as u64))
+    }
+
+    /// Returns the slot range currently covered by the prepared window.
+    pub fn get_prepared_interval(&self) -> Range<u64> {
+        self.inner.get_prepared_interval()
     }
 
     /// Advance the prepared window forward by one bottom tree.
