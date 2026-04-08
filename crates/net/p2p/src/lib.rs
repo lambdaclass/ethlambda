@@ -205,39 +205,48 @@ pub fn build_swarm(
         .subscribe(&aggregation_topic)
         .unwrap();
 
-    // Compute the set of subnets to subscribe to.
-    // Validators subscribe for gossipsub mesh health; aggregators additionally
-    // subscribe to any explicitly requested subnets.
-    let validator_subnets: HashSet<u64> = config
-        .validator_ids
-        .iter()
-        .map(|vid| vid % config.attestation_committee_count)
-        .collect();
-
-    let mut subscribe_subnets: HashSet<u64> = validator_subnets.clone();
-
+    // Aggregators subscribe to attestation subnets to receive unaggregated
+    // attestations. Non-aggregators don't need to subscribe; they publish via
+    // gossipsub fanout.
     if config.is_aggregator {
+        let mut aggregate_subnets: HashSet<u64> = config
+            .validator_ids
+            .iter()
+            .map(|vid| vid % config.attestation_committee_count)
+            .collect();
         if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
-            subscribe_subnets.extend(explicit_ids);
+            aggregate_subnets.extend(explicit_ids);
         }
         // Aggregator with no validators and no explicit subnets: fallback to subnet 0
-        if subscribe_subnets.is_empty() {
-            subscribe_subnets.insert(0);
+        if aggregate_subnets.is_empty() {
+            aggregate_subnets.insert(0);
+        }
+        for &subnet_id in &aggregate_subnets {
+            let topic = attestation_subnet_topic(subnet_id);
+            swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+            info!(subnet_id, "Subscribed to attestation subnet");
         }
     }
 
-    // Report lowest validator subnet for backward-compatible metric
-    let metric_subnet = validator_subnets.iter().copied().min().unwrap_or(0);
-    metrics::set_attestation_committee_subnet(metric_subnet);
-
-    // Build topics and subscribe
+    // Build topic cache (avoids string allocation on every publish).
+    // Includes validator subnets and any explicit aggregate_subnet_ids.
     let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
-    for &subnet_id in &subscribe_subnets {
-        let topic = attestation_subnet_topic(subnet_id);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-        info!(subnet_id, "Subscribed to attestation subnet");
-        attestation_topics.insert(subnet_id, topic);
+    for &vid in &config.validator_ids {
+        let subnet_id = vid % config.attestation_committee_count;
+        attestation_topics
+            .entry(subnet_id)
+            .or_insert_with(|| attestation_subnet_topic(subnet_id));
     }
+    if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
+        for &subnet_id in explicit_ids {
+            attestation_topics
+                .entry(subnet_id)
+                .or_insert_with(|| attestation_subnet_topic(subnet_id));
+        }
+    }
+
+    let metric_subnet = attestation_topics.keys().copied().min().unwrap_or(0);
+    metrics::set_attestation_committee_subnet(metric_subnet);
 
     info!(socket=%config.listening_socket, "P2P node started");
 

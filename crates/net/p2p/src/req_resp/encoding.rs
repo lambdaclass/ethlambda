@@ -52,6 +52,14 @@ where
     T: AsyncWrite + Unpin,
 {
     let uncompressed_size = encoded.len();
+    // Stop ourselves from sending messages our peers won't receive.
+    // Leave some leeway for response codes and the varint encoding of the size.
+    if uncompressed_size > MAX_PAYLOAD_SIZE - 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message size exceeds maximum allowed",
+        ));
+    }
     let mut compressor = FrameEncoder::new(encoded);
 
     let mut buf = Vec::new();
