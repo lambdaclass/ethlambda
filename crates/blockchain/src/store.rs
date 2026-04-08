@@ -1398,7 +1398,8 @@ mod tests {
         // Create genesis state with NUM_VALIDATORS validators.
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
                 index: i as u64,
             })
             .collect();
@@ -1482,25 +1483,8 @@ mod tests {
 
         // Construct the full signed block as it would be sent over gossip
         let attestation_sigs: Vec<AggregatedSignatureProof> = signatures;
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block,
-                proposer_attestation: Attestation {
-                    validator_id: proposer_index,
-                    data: AttestationData {
-                        slot,
-                        head: Checkpoint {
-                            root: parent_root,
-                            slot: 0,
-                        },
-                        target: Checkpoint {
-                            root: parent_root,
-                            slot: 0,
-                        },
-                        source,
-                    },
-                },
-            },
+        let signed_block = SignedBlock {
+            message: block,
             signature: BlockSignatures {
                 attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
                 proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
@@ -1516,7 +1500,7 @@ mod tests {
             "block with {} attestations is {} bytes SSZ, \
              which exceeds MAX_PAYLOAD_SIZE ({} bytes). \
              build_block must enforce a size cap (issue #259).",
-            signed_block.block.block.body.attestations.len(),
+            signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
         );
@@ -1771,19 +1755,13 @@ mod tests {
         ])
         .unwrap();
 
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block: Block {
-                    slot: 1,
-                    proposer_index: 0,
-                    parent_root: head_root,
-                    state_root: H256::ZERO,
-                    body: BlockBody { attestations },
-                },
-                proposer_attestation: Attestation {
-                    validator_id: 0,
-                    data: att_data,
-                },
+        let signed_block = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: head_root,
+                state_root: H256::ZERO,
+                body: BlockBody { attestations },
             },
             signature: BlockSignatures {
                 attestation_signatures,
