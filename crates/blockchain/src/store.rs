@@ -528,6 +528,18 @@ fn on_block_core(
                 slot,
             })?;
 
+    // Each unique AttestationData must appear at most once per block.
+    let attestations = &signed_block.block.block.body.attestations;
+    let mut seen = HashSet::with_capacity(attestations.len());
+    for att in attestations {
+        if !seen.insert(&att.data) {
+            return Err(StoreError::DuplicateAttestationData {
+                count: attestations.len(),
+                unique: seen.len(),
+            });
+        }
+    }
+
     let sig_verification_start = std::time::Instant::now();
     if verify {
         // Validate cryptographic signatures
@@ -892,6 +904,11 @@ pub enum StoreError {
         attestation_id: u64,
         proposer_index: u64,
     },
+
+    #[error(
+        "Block contains duplicate AttestationData entries: {count} entries but only {unique} unique"
+    )]
+    DuplicateAttestationData { count: usize, unique: usize },
 }
 
 /// Build an AggregationBits bitfield from a list of validator indices.
@@ -913,6 +930,92 @@ fn aggregation_bits_from_validator_indices(bits: &[u64]) -> AggregationBits {
             .expect("capacity support highest validator id");
     }
     aggregation_bits
+}
+
+/// Compute the bitwise union (OR) of two AggregationBits bitfields.
+fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> AggregationBits {
+    let max_len = a.len().max(b.len());
+    if max_len == 0 {
+        return AggregationBits::with_length(0).expect("zero-length bitlist");
+    }
+    let mut result = AggregationBits::with_length(max_len).expect("union exceeds bitlist capacity");
+    for i in 0..max_len {
+        if a.get(i).unwrap_or(false) || b.get(i).unwrap_or(false) {
+            result.set(i, true).expect("index within capacity");
+        }
+    }
+    result
+}
+
+/// Compact attestations so each AttestationData appears at most once.
+///
+/// For each group of entries sharing the same AttestationData:
+/// - Single entry: kept as-is.
+/// - Multiple entries: merged into one with unioned participant bitfields.
+fn compact_attestations(
+    attestations: Vec<AggregatedAttestation>,
+    proofs: Vec<AggregatedSignatureProof>,
+) -> (Vec<AggregatedAttestation>, Vec<AggregatedSignatureProof>) {
+    debug_assert_eq!(attestations.len(), proofs.len());
+
+    if attestations.len() <= 1 {
+        return (attestations, proofs);
+    }
+
+    // Group indices by AttestationData, preserving first-occurrence order
+    let mut order: Vec<AttestationData> = Vec::new();
+    let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
+    for (i, att) in attestations.iter().enumerate() {
+        match groups.entry(att.data.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                order.push(e.key().clone());
+                e.insert(vec![i]);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().push(i);
+            }
+        }
+    }
+
+    // Fast path: no duplicates
+    if order.len() == attestations.len() {
+        return (attestations, proofs);
+    }
+
+    // Wrap in Option so we can .take() items by index without cloning
+    let mut items: Vec<Option<(AggregatedAttestation, AggregatedSignatureProof)>> =
+        attestations.into_iter().zip(proofs).map(Some).collect();
+
+    let mut compacted_atts = Vec::with_capacity(order.len());
+    let mut compacted_proofs = Vec::with_capacity(order.len());
+
+    for data in order {
+        let indices = &groups[&data];
+        if indices.len() == 1 {
+            let (att, proof) = items[indices[0]].take().expect("index used once");
+            compacted_atts.push(att);
+            compacted_proofs.push(proof);
+            continue;
+        }
+
+        // Merge: take all entries and fold their participant bitfields
+        let mut merged_bits = None;
+        for &idx in indices {
+            let (att, _) = items[idx].take().expect("index used once");
+            merged_bits = Some(match merged_bits {
+                None => att.aggregation_bits,
+                Some(acc) => union_aggregation_bits(&acc, &att.aggregation_bits),
+            });
+        }
+        let merged_bits = merged_bits.expect("group is non-empty");
+        compacted_proofs.push(AggregatedSignatureProof::empty(merged_bits.clone()));
+        compacted_atts.push(AggregatedAttestation {
+            aggregation_bits: merged_bits,
+            data,
+        });
+    }
+
+    (compacted_atts, compacted_proofs)
 }
 
 /// Greedily select proofs maximizing new validator coverage.
@@ -1082,6 +1185,10 @@ fn build_block(
             }
         }
     }
+
+    // Compact: ensure each AttestationData appears at most once
+    let (aggregated_attestations, aggregated_signatures) =
+        compact_attestations(aggregated_attestations, aggregated_signatures);
 
     // Build final block
     let attestations: AggregatedAttestations = aggregated_attestations
@@ -1539,6 +1646,221 @@ mod tests {
         assert_eq!(
             attestation.source, head_justified,
             "source must match head state's justified checkpoint, not store-wide max"
+        );
+    }
+
+    fn make_att_data(slot: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
+
+    fn make_bits(indices: &[usize]) -> AggregationBits {
+        let max = indices.iter().copied().max().unwrap_or(0);
+        let mut bits = AggregationBits::with_length(max + 1).unwrap();
+        for &i in indices {
+            bits.set(i, true).unwrap();
+        }
+        bits
+    }
+
+    #[test]
+    fn compact_attestations_no_duplicates() {
+        let data_a = make_att_data(1);
+        let data_b = make_att_data(2);
+        let bits_a = make_bits(&[0]);
+        let bits_b = make_bits(&[1]);
+
+        let atts = vec![
+            AggregatedAttestation {
+                aggregation_bits: bits_a.clone(),
+                data: data_a.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_b.clone(),
+                data: data_b.clone(),
+            },
+        ];
+        let proofs = vec![
+            AggregatedSignatureProof::empty(bits_a),
+            AggregatedSignatureProof::empty(bits_b),
+        ];
+
+        let (out_atts, out_proofs) = compact_attestations(atts.clone(), proofs.clone());
+        assert_eq!(out_atts.len(), 2);
+        assert_eq!(out_proofs.len(), 2);
+        assert_eq!(out_atts[0].data, data_a);
+        assert_eq!(out_atts[1].data, data_b);
+    }
+
+    #[test]
+    fn compact_attestations_merges_empty_proofs() {
+        let data = make_att_data(1);
+        let bits_a = make_bits(&[0]);
+        let bits_b = make_bits(&[1, 2]);
+
+        let atts = vec![
+            AggregatedAttestation {
+                aggregation_bits: bits_a.clone(),
+                data: data.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_b.clone(),
+                data: data.clone(),
+            },
+        ];
+        let proofs = vec![
+            AggregatedSignatureProof::empty(bits_a),
+            AggregatedSignatureProof::empty(bits_b),
+        ];
+
+        let (out_atts, out_proofs) = compact_attestations(atts, proofs);
+        assert_eq!(out_atts.len(), 1, "should merge into one");
+        assert_eq!(out_proofs.len(), 1);
+        assert_eq!(out_atts[0].data, data);
+
+        // Merged participants should cover validators 0, 1, 2
+        let merged = &out_atts[0].aggregation_bits;
+        assert!(merged.get(0).unwrap());
+        assert!(merged.get(1).unwrap());
+        assert!(merged.get(2).unwrap());
+        assert!(out_proofs[0].proof_data.is_empty());
+    }
+
+    #[test]
+    fn compact_attestations_preserves_order() {
+        let data_a = make_att_data(1);
+        let data_b = make_att_data(2);
+        let data_c = make_att_data(3);
+
+        let bits_0 = make_bits(&[0]);
+        let bits_1 = make_bits(&[1]);
+        let bits_2 = make_bits(&[2]);
+
+        // Order: A, B, A, C - A has duplicates
+        let atts = vec![
+            AggregatedAttestation {
+                aggregation_bits: bits_0.clone(),
+                data: data_a.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_1.clone(),
+                data: data_b.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_2.clone(),
+                data: data_a.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_0.clone(),
+                data: data_c.clone(),
+            },
+        ];
+        let proofs = vec![
+            AggregatedSignatureProof::empty(bits_0.clone()),
+            AggregatedSignatureProof::empty(bits_1),
+            AggregatedSignatureProof::empty(bits_2),
+            AggregatedSignatureProof::empty(bits_0),
+        ];
+
+        let (out_atts, _) = compact_attestations(atts, proofs);
+        assert_eq!(out_atts.len(), 3);
+        // First-occurrence order: A, B, C
+        assert_eq!(out_atts[0].data, data_a);
+        assert_eq!(out_atts[1].data, data_b);
+        assert_eq!(out_atts[2].data, data_c);
+    }
+
+    #[test]
+    fn on_block_rejects_duplicate_attestation_data() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let genesis_block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body: BlockBody {
+                attestations: AggregatedAttestations::default(),
+            },
+        };
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+
+        let head_root = store.head();
+        let att_data = AttestationData {
+            slot: 0,
+            head: Checkpoint {
+                root: head_root,
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: head_root,
+                slot: 0,
+            },
+            source: Checkpoint {
+                root: head_root,
+                slot: 0,
+            },
+        };
+
+        let bits_a = make_bits(&[0]);
+        let bits_b = make_bits(&[1]);
+
+        // Two attestations with the SAME data - should be rejected
+        let attestations = AggregatedAttestations::try_from(vec![
+            AggregatedAttestation {
+                aggregation_bits: bits_a.clone(),
+                data: att_data.clone(),
+            },
+            AggregatedAttestation {
+                aggregation_bits: bits_b.clone(),
+                data: att_data.clone(),
+            },
+        ])
+        .unwrap();
+
+        let attestation_signatures = AttestationSignatures::try_from(vec![
+            AggregatedSignatureProof::empty(bits_a),
+            AggregatedSignatureProof::empty(bits_b),
+        ])
+        .unwrap();
+
+        let signed_block = SignedBlockWithAttestation {
+            block: BlockWithAttestation {
+                block: Block {
+                    slot: 1,
+                    proposer_index: 0,
+                    parent_root: head_root,
+                    state_root: H256::ZERO,
+                    body: BlockBody { attestations },
+                },
+                proposer_attestation: Attestation {
+                    validator_id: 0,
+                    data: att_data,
+                },
+            },
+            signature: BlockSignatures {
+                attestation_signatures,
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::DuplicateAttestationData {
+                    count: 2,
+                    unique: 1,
+                })
+            ),
+            "Expected DuplicateAttestationData, got: {result:?}"
         );
     }
 }
