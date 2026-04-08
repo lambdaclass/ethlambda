@@ -228,13 +228,21 @@ pub fn build_swarm(
         }
     }
 
-    // Build topic cache for all validators (avoids string allocation on every publish).
+    // Build topic cache (avoids string allocation on every publish).
+    // Includes validator subnets and any explicit aggregate_subnet_ids.
     let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
     for &vid in &config.validator_ids {
         let subnet_id = vid % config.attestation_committee_count;
         attestation_topics
             .entry(subnet_id)
             .or_insert_with(|| attestation_subnet_topic(subnet_id));
+    }
+    if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
+        for &subnet_id in explicit_ids {
+            attestation_topics
+                .entry(subnet_id)
+                .or_insert_with(|| attestation_subnet_topic(subnet_id));
+        }
     }
 
     let metric_subnet = attestation_topics.keys().copied().min().unwrap_or(0);
