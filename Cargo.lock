@@ -2141,6 +2141,7 @@ dependencies = [
  "libssz-derive",
  "libssz-merkle",
  "libssz-types",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "serde_yaml_ng",
