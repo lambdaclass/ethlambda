@@ -951,9 +951,7 @@ fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> Aggregati
 ///
 /// For each group of entries sharing the same AttestationData:
 /// - Single entry: kept as-is.
-/// - Multiple entries with empty proof_data: merged into one with unioned participants.
-/// - Multiple entries with real proof_data: keeps only the proof with the most participants
-///   (recursive cryptographic aggregation is not yet supported in lean-multisig).
+/// - Multiple entries: merged into one with unioned participant bitfields.
 fn compact_attestations(
     attestations: Vec<AggregatedAttestation>,
     proofs: Vec<AggregatedSignatureProof>,
@@ -1000,37 +998,21 @@ fn compact_attestations(
             continue;
         }
 
-        let all_empty = indices
-            .iter()
-            .all(|&i| items[i].as_ref().unwrap().1.proof_data.is_empty());
-
-        if all_empty {
-            // Merge: take all entries and fold their participant bitfields
-            let mut merged_bits = None;
-            for &idx in indices {
-                let (att, _) = items[idx].take().expect("index used once");
-                merged_bits = Some(match merged_bits {
-                    None => att.aggregation_bits,
-                    Some(acc) => union_aggregation_bits(&acc, &att.aggregation_bits),
-                });
-            }
-            let merged_bits = merged_bits.expect("group is non-empty");
-            compacted_proofs.push(AggregatedSignatureProof::empty(merged_bits.clone()));
-            compacted_atts.push(AggregatedAttestation {
-                aggregation_bits: merged_bits,
-                data,
+        // Merge: take all entries and fold their participant bitfields
+        let mut merged_bits = None;
+        for &idx in indices {
+            let (att, _) = items[idx].take().expect("index used once");
+            merged_bits = Some(match merged_bits {
+                None => att.aggregation_bits,
+                Some(acc) => union_aggregation_bits(&acc, &att.aggregation_bits),
             });
-        } else {
-            // Cannot merge real proofs; keep the one with the most participants
-            let best_idx = indices
-                .iter()
-                .copied()
-                .max_by_key(|&i| items[i].as_ref().unwrap().1.participant_indices().count())
-                .expect("group is non-empty");
-            let (att, proof) = items[best_idx].take().expect("index used once");
-            compacted_atts.push(att);
-            compacted_proofs.push(proof);
         }
+        let merged_bits = merged_bits.expect("group is non-empty");
+        compacted_proofs.push(AggregatedSignatureProof::empty(merged_bits.clone()));
+        compacted_atts.push(AggregatedAttestation {
+            aggregation_bits: merged_bits,
+            data,
+        });
     }
 
     (compacted_atts, compacted_proofs)
@@ -1746,40 +1728,6 @@ mod tests {
         assert!(merged.get(1).unwrap());
         assert!(merged.get(2).unwrap());
         assert!(out_proofs[0].proof_data.is_empty());
-    }
-
-    #[test]
-    fn compact_attestations_real_proofs_keeps_best() {
-        use ethlambda_types::block::ByteListMiB;
-
-        let data = make_att_data(1);
-        let bits_small = make_bits(&[0]);
-        let bits_large = make_bits(&[1, 2, 3]);
-
-        let dummy_proof_data: ByteListMiB = vec![0xABu8; 64].try_into().unwrap();
-
-        let atts = vec![
-            AggregatedAttestation {
-                aggregation_bits: bits_small.clone(),
-                data: data.clone(),
-            },
-            AggregatedAttestation {
-                aggregation_bits: bits_large.clone(),
-                data: data.clone(),
-            },
-        ];
-        let proofs = vec![
-            AggregatedSignatureProof::new(bits_small, dummy_proof_data.clone()),
-            AggregatedSignatureProof::new(bits_large.clone(), dummy_proof_data),
-        ];
-
-        let (out_atts, out_proofs) = compact_attestations(atts, proofs);
-        assert_eq!(out_atts.len(), 1, "should keep only the best");
-        assert_eq!(out_proofs.len(), 1);
-
-        // Should keep the one with 3 participants (validators 1, 2, 3)
-        assert_eq!(out_atts[0].aggregation_bits, bits_large);
-        assert!(!out_proofs[0].proof_data.is_empty());
     }
 
     #[test]
