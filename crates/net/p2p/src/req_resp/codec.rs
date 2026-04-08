@@ -2,10 +2,10 @@ use std::io;
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libssz::{SszDecode, SszEncode};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::{
-    encoding::{decode_payload, write_payload},
+    encoding::{MAX_PAYLOAD_SIZE, decode_payload, write_payload},
     messages::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, ErrorMessage, Request, Response, ResponseCode, ResponsePayload,
         STATUS_PROTOCOL_V1, Status,
@@ -109,10 +109,21 @@ impl libp2p::request_response::Codec for Codec {
                         write_payload(io, &encoded).await
                     }
                     ResponsePayload::BlocksByRoot(blocks) => {
-                        // Write each block as separate chunk
+                        // Write each block as a separate chunk.
+                        // Encode first, then check size before writing the SUCCESS
+                        // code byte. This avoids corrupting the stream if a block
+                        // exceeds MAX_PAYLOAD_SIZE (the SUCCESS byte would already
+                        // be on the wire with no payload following).
                         for block in blocks {
-                            io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
                             let encoded = block.to_ssz();
+                            if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+                                warn!(
+                                    size = encoded.len(),
+                                    "Skipping oversized block in BlocksByRoot response"
+                                );
+                                continue;
+                            }
+                            io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
                             write_payload(io, &encoded).await?;
                         }
                         // Empty response if no blocks found (stream just ends)
