@@ -81,6 +81,7 @@
               (rustToolchain pkgs)
               pkg-config
               cargo-watch
+              elan
             ];
 
             buildInputs = with pkgs; [
