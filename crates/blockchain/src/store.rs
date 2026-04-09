@@ -35,6 +35,17 @@ const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 /// See: https://github.com/lambdaclass/ethlambda/issues/259
 const MAX_ATTESTATION_PROOF_BYTES: usize = 9 * 1024 * 1024;
 
+/// Post-block checkpoints extracted from the state transition in `build_block`.
+///
+/// When building a block, the state transition processes attestations that may
+/// advance justification/finalization. These checkpoints reflect the post-state
+/// values, which the proposer needs for its attestation (since the block hasn't
+/// been imported into the store yet).
+pub struct PostBlockCheckpoints {
+    pub justified: Checkpoint,
+    pub finalized: Checkpoint,
+}
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
@@ -621,6 +632,28 @@ fn on_block_core(
 ///
 /// NOTE: this assumes that we have all the blocks from the head back to the latest finalized.
 pub fn get_attestation_target(store: &Store) -> Checkpoint {
+    get_attestation_target_with_checkpoints(
+        store,
+        store.latest_justified(),
+        store.latest_finalized(),
+    )
+}
+
+/// Calculate target checkpoint using the provided justified and finalized checkpoints
+/// instead of reading them from the store.
+///
+/// This is needed by the proposer, whose block hasn't been imported yet but whose
+/// state transition may have advanced justification/finalization.
+///
+/// Note: the walk-back still starts from `store.head()` (the pre-import head), not
+/// the new block. This is correct because the new block is only 1 slot ahead with less than 2/3 of votes — the
+/// walk-back immediately reaches the same chain. The important fix is using the
+/// post-state justified/finalized for the justifiability check and clamping guard.
+pub fn get_attestation_target_with_checkpoints(
+    store: &Store,
+    justified: Checkpoint,
+    finalized: Checkpoint,
+) -> Checkpoint {
     // Start from current head
     let mut target_block_root = store.head();
     let mut target_header = store
@@ -647,7 +680,7 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
         }
     }
 
-    let finalized_slot = store.latest_finalized().slot;
+    let finalized_slot = finalized.slot;
 
     // Ensure target is in justifiable slot range
     //
@@ -661,7 +694,7 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
             .get_block_header(&target_block_root)
             .expect("parent block exists");
     }
-    // Guard: clamp target to latest_justified (not in the spec).
+    // Guard: clamp target to justified (not in the spec).
     //
     // The spec's walk-back has no lower bound, so it can produce attestations
     // where target.slot < source.slot (source = latest_justified). These would
@@ -673,14 +706,13 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
     // justified checkpoint.
     //
     // See https://github.com/blockblaz/zeam/blob/697c293879e922942965cdb1da3c6044187ae00e/pkgs/node/src/forkchoice.zig#L654-L659
-    let latest_justified = store.latest_justified();
-    if target_header.slot < latest_justified.slot {
+    if target_header.slot < justified.slot {
         warn!(
             target_slot = target_header.slot,
-            justified_slot = latest_justified.slot,
+            justified_slot = justified.slot,
             "Attestation target walked behind justified source, clamping to justified"
         );
-        return latest_justified;
+        return justified;
     }
 
     Checkpoint {
@@ -757,7 +789,7 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
-) -> Result<(Block, Vec<AggregatedSignatureProof>), StoreError> {
+) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
     let head_state = store
@@ -782,7 +814,7 @@ pub fn produce_block_with_signatures(
 
     let known_block_roots = store.get_block_roots();
 
-    let (block, signatures) = build_block(
+    let (block, signatures, post_checkpoints) = build_block(
         &head_state,
         slot,
         validator_index,
@@ -791,7 +823,7 @@ pub fn produce_block_with_signatures(
         &aggregated_payloads,
     )?;
 
-    Ok((block, signatures))
+    Ok((block, signatures, post_checkpoints))
 }
 
 /// Errors that can occur during Store operations.
@@ -999,7 +1031,7 @@ fn build_block(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)>,
-) -> Result<(Block, Vec<AggregatedSignatureProof>), StoreError> {
+) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     let mut aggregated_attestations: Vec<AggregatedAttestation> = Vec::new();
     let mut aggregated_signatures: Vec<AggregatedSignatureProof> = Vec::new();
     let mut accumulated_proof_bytes: usize = 0;
@@ -1099,7 +1131,12 @@ fn build_block(
     process_block(&mut post_state, &final_block)?;
     final_block.state_root = post_state.hash_tree_root();
 
-    Ok((final_block, aggregated_signatures))
+    let post_checkpoints = PostBlockCheckpoints {
+        justified: post_state.latest_justified,
+        finalized: post_state.latest_finalized,
+    };
+
+    Ok((final_block, aggregated_signatures, post_checkpoints))
 }
 
 /// Verify all signatures in a signed block.
@@ -1415,7 +1452,7 @@ mod tests {
         }
 
         // Build the block; this should succeed (the bug: no size guard)
-        let (block, signatures) = build_block(
+        let (block, signatures, _post_checkpoints) = build_block(
             &head_state,
             slot,
             proposer_index,
