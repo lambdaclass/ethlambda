@@ -149,12 +149,11 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
             data,
             ignore_no_peers,
         } => {
-            if let Err(err) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                let is_expected =
-                    ignore_no_peers && matches!(err, PublishError::NoPeersSubscribedToTopic);
-                if !is_expected {
-                    warn!(%err, "Swarm adapter: publish failed");
-                }
+            let result = swarm.behaviour_mut().gossipsub.publish(topic, data);
+            if let Err(err) = result
+                && !(ignore_no_peers && matches!(err, PublishError::NoPeersSubscribedToTopic))
+            {
+                warn!(%err, "Swarm adapter: publish failed");
             }
         }
         SwarmCommand::Dial(addr) => {
