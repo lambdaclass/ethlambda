@@ -36,3 +36,4 @@ CLAUDE.local.md
 
 # Log output by make run-devnet
 devnet.log
+.worktrees/

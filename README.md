@@ -6,10 +6,23 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 
 ### Prerequisites
 
+**Using [Nix](https://github.com/DeterminateSystems/nix-installer?tab=readme-ov-file#install-determinate-nix) (recommended):**
+
+```sh
+nix develop                  # interactive shell (bash)
+nix develop -c zsh           # interactive shell (zsh)
+nix develop -c cargo build   # run a single command
+```
+
+This provides Rust, Lean 4, and all other dependencies. No manual installation needed.
+
+**Manual installation:**
+
 - [Rust](https://rust-lang.org/tools/install)
 - [Git](https://git-scm.com/install)
 - [Docker](https://www.docker.com/get-started)
 - [yq](https://github.com/mikefarah/yq#install)
+- [elan](https://github.com/leanprover/elan) (for formal verification / `--features lean-ffi`)
 
 ### Building and testing
 
@@ -27,6 +40,19 @@ make docker-build DOCKER_TAG=local
 ```
 
 Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
+
+### Formal verification
+
+Key consensus functions have been [formally verified in Lean 4](./formal/README.md).
+The verified implementations can be compiled into the binary via FFI:
+
+```sh
+cargo build --features lean-ffi   # use verified Lean implementation
+cargo test --features lean-ffi    # run tests through Lean
+```
+
+This requires Lean 4 (provided by `nix develop` or [elan](https://github.com/leanprover/elan)).
+Without the feature flag, the native Rust implementation is used.
 
 ### Running in a devnet
 
