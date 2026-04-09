@@ -148,7 +148,9 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     // NoPeersSubscribedToTopic. Use best-effort to suppress the expected warning;
     // the aggregator already self-delivered its attestation locally.
     if server.is_aggregator {
-        server.swarm_handle.publish_ignore_no_peers(topic, compressed);
+        server
+            .swarm_handle
+            .publish_ignore_no_peers(topic, compressed);
     } else {
         server.swarm_handle.publish(topic, compressed);
     }
