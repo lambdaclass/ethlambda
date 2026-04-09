@@ -202,7 +202,7 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures)) =
+        let Ok((block, attestation_signatures, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {

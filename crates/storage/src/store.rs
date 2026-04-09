@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 /// The tree hash root of an empty block body.
@@ -204,17 +204,15 @@ impl PayloadBuffer {
     }
 }
 
-/// Individual validator signature received via gossip.
-#[derive(Clone)]
-struct GossipSignatureEntry {
-    validator_id: u64,
-    signature: ValidatorSignature,
-}
-
 /// Gossip signatures grouped by attestation data.
+///
+/// Signatures are stored in a `BTreeMap` keyed by validator_id to guarantee
+/// ascending iteration order. XMSS aggregate proofs are order-dependent:
+/// verification reconstructs pubkeys from the participation bitfield (low-to-high),
+/// so aggregation must produce them in the same ascending order.
 struct GossipDataEntry {
     data: AttestationData,
-    signatures: Vec<GossipSignatureEntry>,
+    signatures: BTreeMap<u64, ValidatorSignature>,
 }
 
 /// Gossip signatures grouped by attestation data (via data_root).
@@ -259,8 +257,7 @@ pub struct Store {
     backend: Arc<dyn StorageBackend>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
-    /// In-memory gossip signatures: data_root → (AttestationData, Vec<GossipSignatureEntry>).
-    /// Transient data consumed at interval 2 aggregation.
+    /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureMap>>,
 }
 
@@ -948,7 +945,7 @@ impl Store {
     // Gossip signatures are individual validator signatures received via P2P.
     // They're transient (consumed at interval 2 aggregation) so stored in-memory.
     // Keyed by AttestationData (via data_root) matching the leanSpec structure:
-    //   gossip_signatures: dict[AttestationData, set[GossipSignatureEntry]]
+    //   gossip_signatures: dict[AttestationData, set[GossipSignature]]
 
     /// Delete gossip entries for the given (validator_id, data_root) pairs.
     pub fn delete_gossip_signatures(&mut self, keys: &[(u64, H256)]) {
@@ -958,7 +955,7 @@ impl Store {
         let mut gossip = self.gossip_signatures.lock().unwrap();
         for &(vid, data_root) in keys {
             if let Some(entry) = gossip.get_mut(&data_root) {
-                entry.signatures.retain(|e| e.validator_id != vid);
+                entry.signatures.remove(&vid);
                 if entry.signatures.is_empty() {
                     gossip.remove(&data_root);
                 }
@@ -975,7 +972,7 @@ impl Store {
                 let sigs: Vec<_> = entry
                     .signatures
                     .iter()
-                    .map(|e| (e.validator_id, e.signature.clone()))
+                    .map(|(&vid, sig)| (vid, sig.clone()))
                     .collect();
                 (HashedAttestationData::new(entry.data.clone()), sigs)
             })
@@ -993,19 +990,9 @@ impl Store {
         let mut gossip = self.gossip_signatures.lock().unwrap();
         let entry = gossip.entry(data_root).or_insert_with(|| GossipDataEntry {
             data: att_data,
-            signatures: Vec::new(),
+            signatures: BTreeMap::new(),
         });
-        // Avoid duplicates for same validator
-        if !entry
-            .signatures
-            .iter()
-            .any(|e| e.validator_id == validator_id)
-        {
-            entry.signatures.push(GossipSignatureEntry {
-                validator_id,
-                signature,
-            });
-        }
+        entry.signatures.entry(validator_id).or_insert(signature);
     }
 
     // ============ Derived Accessors ============
