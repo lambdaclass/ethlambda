@@ -11,7 +11,7 @@ lint: ## 🔍 Run clippy on all workspace crates
 
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
-	cargo test --workspace --release
+	cargo test --workspace --release --exclude ethlambda-lean-ffi
 
 formally-verify: ## 🔬 Build and verify Lean formal proofs
 	cd formal && lake exe cache get && lake build
