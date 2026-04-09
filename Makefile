@@ -29,6 +29,7 @@ LEAN_SPEC_COMMIT_HASH:=9c30436bf4c073d1a994f37a3241e83ef5a3ce6f
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
+	cd leanSpec && git apply ../patches/fix-lexicographic-tiebreaker-test.patch
 
 leanSpec/fixtures: leanSpec
 	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures

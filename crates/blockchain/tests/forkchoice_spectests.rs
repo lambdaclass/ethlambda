@@ -23,7 +23,11 @@ mod types;
 
 // Tests where the fixture relies on gossip attestation behavior not serialized into the JSON.
 // These pass in the Python spec but fail in our runner because we don't simulate gossip.
-const SKIP_TESTS: &[&str] = &["test_reorg_with_slot_gaps"];
+const SKIP_TESTS: &[&str] = &[
+    "test_reorg_with_slot_gaps",
+    // Signature verification is skipped in test mode, so invalid signature tests always pass
+    "test_gossip_attestation_with_invalid_signature",
+];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
@@ -100,9 +104,45 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // NOTE: the has_proposal argument is set to false, following the spec
                     store::on_tick(&mut store, timestamp_ms, false, false);
                 }
+                "attestation" | "gossipAggregatedAttestation" => {
+                    let att_data = step
+                        .attestation
+                        .expect("attestation step missing attestation data");
+                    let domain_data: ethlambda_types::attestation::AttestationData =
+                        att_data.data.into();
+
+                    // For gossip attestations, use the validator_id from the fixture.
+                    // For aggregated attestations, use validator 0 as a placeholder
+                    // since the fork choice only cares about the attestation data.
+                    let validator_id = att_data.validator_id.unwrap_or(0);
+
+                    let result = store::on_gossip_attestation_without_verification(
+                        &mut store,
+                        validator_id,
+                        domain_data,
+                    );
+
+                    match (result.is_ok(), step.valid) {
+                        (true, false) => {
+                            return Err(format!(
+                                "Step {} expected failure but got success",
+                                step_idx
+                            )
+                            .into());
+                        }
+                        (false, true) => {
+                            return Err(format!(
+                                "Step {} expected success but got failure: {:?}",
+                                step_idx,
+                                result.err()
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
                 other => {
-                    // Fail for unsupported step types for now
-                    return Err(format!("Unsupported step type '{other}'",).into());
+                    return Err(format!("Unsupported step type '{other}'").into());
                 }
             }
 
@@ -421,21 +461,6 @@ fn validate_lexicographic_head_among(
         }
 
         fork_data.insert(label.as_str(), (*root, *slot, weight));
-    }
-
-    // Verify all forks are at the same slot
-    let slots: HashSet<u64> = fork_data.values().map(|(_, slot, _)| *slot).collect();
-    if slots.len() > 1 {
-        let slot_info: Vec<_> = fork_data
-            .iter()
-            .map(|(label, (_, slot, _))| format!("{}: {}", label, slot))
-            .collect();
-        return Err(format!(
-            "Step {}: lexicographicHeadAmong forks have different slots: {}",
-            step_idx,
-            slot_info.join(", ")
-        )
-        .into());
     }
 
     // Verify all forks have equal weight

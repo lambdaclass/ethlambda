@@ -52,7 +52,17 @@ pub struct ForkChoiceStep {
     #[serde(rename = "stepType")]
     pub step_type: String,
     pub block: Option<BlockStepData>,
+    pub attestation: Option<AttestationStepData>,
     pub time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttestationStepData {
+    #[serde(rename = "validatorId")]
+    pub validator_id: Option<u64>,
+    pub data: common::AttestationData,
+    #[allow(dead_code)]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

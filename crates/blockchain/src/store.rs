@@ -500,6 +500,37 @@ pub fn on_block_without_verification(
     on_block_core(store, signed_block, false)
 }
 
+/// Process a gossip attestation without signature verification.
+///
+/// Validates the attestation data and inserts it directly into the known
+/// attestation payloads (bypassing the gossip → aggregate → promote pipeline).
+/// Use only in tests where signatures are absent (e.g., fork choice spec tests).
+pub fn on_gossip_attestation_without_verification(
+    store: &mut Store,
+    validator_id: u64,
+    data: AttestationData,
+) -> Result<(), StoreError> {
+    validate_attestation_data(store, &data)?;
+
+    // Validate the validator index exists in the target state
+    let target_state = store
+        .get_state(&data.target.root)
+        .ok_or(StoreError::MissingTargetState(data.target.root))?;
+    if validator_id >= target_state.validators.len() as u64 {
+        return Err(StoreError::InvalidValidatorIndex);
+    }
+
+    let bits = aggregation_bits_from_validator_indices(&[validator_id]);
+    let proof = AggregatedSignatureProof::empty(bits);
+    let hashed = HashedAttestationData::new(data);
+    store.insert_known_aggregated_payload(hashed, proof);
+
+    // Recalculate fork choice head after inserting the attestation
+    update_head(store, false);
+
+    Ok(())
+}
+
 /// Core block processing logic.
 ///
 /// When `verify` is true, cryptographic signatures are validated and stored
