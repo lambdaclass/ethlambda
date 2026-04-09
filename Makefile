@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test
+.PHONY: help fmt lint docker-build run-devnet test formally-verify
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -12,6 +12,9 @@ lint: ## 🔍 Run clippy on all workspace crates
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
 	cargo test --workspace --release
+
+formally-verify: ## 🔬 Build and verify Lean formal proofs
+	cd formal && lake exe cache get && lake build
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
