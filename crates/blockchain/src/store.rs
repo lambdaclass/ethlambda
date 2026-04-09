@@ -644,6 +644,11 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 ///
 /// This is needed by the proposer, whose block hasn't been imported yet but whose
 /// state transition may have advanced justification/finalization.
+///
+/// Note: the walk-back still starts from `store.head()` (the pre-import head), not
+/// the new block. This is correct because the new block is only 1 slot ahead — the
+/// walk-back immediately reaches the same chain. The important fix is using the
+/// post-state justified/finalized for the justifiability check and clamping guard.
 pub fn get_attestation_target_with_checkpoints(
     store: &Store,
     justified: Checkpoint,
