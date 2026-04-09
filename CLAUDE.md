@@ -35,6 +35,10 @@ crates/
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
   storage/                  # RocksDB backend, in-memory for tests
     └─ src/api/             # StorageBackend trait + Table enum
+formal/                     # Lean 4 formal verification (see formal/README.md)
+  EthLambda/                # Implementation lib (no Mathlib, compiled into binary via FFI)
+  EthLambdaProofs/          # Proofs lib (Mathlib, verification only)
+  lean-ffi/                 # Rust FFI crate (builds Lean C IR, links leanrt)
 ```
 
 ## Key Architecture Patterns
@@ -89,6 +93,28 @@ make run-devnet                                          # Run local devnet with
 ### Testing with Local Devnet
 
 See `.claude/skills/test-pr-devnet/SKILL.md` for multi-client devnet testing workflows.
+
+## Formal Verification
+
+Lean 4 proofs live in `formal/`. Two libraries: `EthLambda` (implementation, no Mathlib) and
+`EthLambdaProofs` (theorems, uses Mathlib). See `formal/README.md` for details.
+
+### Building
+```bash
+make formally-verify                         # Build both Lean libraries
+```
+
+### Lean FFI
+The `lean-ffi` Cargo feature replaces Rust implementations with formally verified Lean code
+via C FFI. The Lean runtime is statically linked (+2 MB binary size).
+
+```bash
+cargo build --features lean-ffi              # Use verified Lean implementation
+cargo test --features lean-ffi               # Run all tests through Lean
+```
+
+The feature flag threads through `ethlambda` → `ethlambda-blockchain` → `ethlambda-state-transition`.
+Without it, the native Rust implementation is used and no Lean toolchain is needed.
 
 ## Important Patterns & Idioms
 
