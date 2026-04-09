@@ -1,6 +1,3 @@
-[features]
-lean-ffi = ["ethlambda-blockchain/lean-ffi"]
-
 [package]
 name = "ethlambda"
 version.workspace = true
@@ -37,3 +34,6 @@ tikv-jemallocator.workspace = true
 
 [build-dependencies]
 vergen-git2.workspace = true
+
+[features]
+lean-ffi = ["ethlambda-blockchain/lean-ffi"]

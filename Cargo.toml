@@ -14,7 +14,7 @@ members = [
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
-    "crates/lean-ffi",
+    "formal/lean-ffi",
 ]
 
 [workspace.package]
@@ -39,7 +39,7 @@ ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
-ethlambda-lean-ffi = { path = "crates/lean-ffi" }
+ethlambda-lean-ffi = { path = "formal/lean-ffi" }
 
 tracing = "0.1"
 thiserror = "2.0.9"
@@ -70,9 +70,15 @@ vergen-git2 = { version = "9", features = ["rustc"] }
 
 rand = "0.9"
 rocksdb = "0.24"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
 eyre = "0.6"
 
 # Allocator + heap profiling
-tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
+tikv-jemallocator = { version = "0.6", features = [
+    "stats",
+    "unprefixed_malloc_on_supported_platforms",
+    "profiling",
+] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
