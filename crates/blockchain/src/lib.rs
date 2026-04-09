@@ -224,14 +224,16 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures)) =
+        let Ok((block, attestation_signatures, post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
             return;
         };
 
-        // Create proposer's attestation (attests to the new block)
+        // Create proposer's attestation using post-block checkpoints because
+        // the block's attestations may have advanced justification/finalization
+        // but the block hasn't been imported into the store yet.
         let proposer_attestation = Attestation {
             validator_id,
             data: AttestationData {
@@ -240,8 +242,12 @@ impl BlockChainServer {
                     root: block.hash_tree_root(),
                     slot: block.slot,
                 },
-                target: store::get_attestation_target(&self.store),
-                source: self.store.latest_justified(),
+                target: store::get_attestation_target_with_checkpoints(
+                    &self.store,
+                    post_checkpoints.justified,
+                    post_checkpoints.finalized,
+                ),
+                source: post_checkpoints.justified,
             },
         };
 
