@@ -13,6 +13,8 @@ pub enum SwarmCommand {
     Publish {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
+        /// When true, silently ignore publish failures (e.g., NoPeersSubscribedToTopic).
+        best_effort: bool,
     },
     Dial(Multiaddr),
     SendRequest {
@@ -37,7 +39,25 @@ impl SwarmHandle {
     pub fn publish(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Publish { topic, data })
+            .send(SwarmCommand::Publish {
+                topic,
+                data,
+                best_effort: false,
+            })
+            .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
+    }
+
+    /// Publish without logging on failure. Used when the sender is also subscribed
+    /// to the topic (e.g., aggregator publishing its own attestation to a subnet it
+    /// subscribes to), where NoPeersSubscribedToTopic is expected.
+    pub fn publish_best_effort(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::Publish {
+                topic,
+                data,
+                best_effort: true,
+            })
             .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
     }
 
@@ -123,12 +143,15 @@ async fn swarm_loop(
 
 fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
     match cmd {
-        SwarmCommand::Publish { topic, data } => {
-            let _ = swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(topic, data)
-                .inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"));
+        SwarmCommand::Publish {
+            topic,
+            data,
+            best_effort,
+        } => {
+            let result = swarm.behaviour_mut().gossipsub.publish(topic, data);
+            if !best_effort {
+                let _ = result.inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"));
+            }
         }
         SwarmCommand::Dial(addr) => {
             let _ = swarm
