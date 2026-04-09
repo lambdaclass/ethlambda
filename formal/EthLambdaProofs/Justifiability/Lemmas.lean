@@ -2,16 +2,13 @@
 Copyright (c) 2026 ethlambda contributors. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
-import EthLambda.Justifiability.Defs
+import EthLambdaProofs.Justifiability.Defs
 
 /-!
 # Core Algebraic Lemmas for Justifiability
-
-Foundational lemmas used by the pronic detection and classification theorems.
 -/
 
-/-- The fundamental identity: `4 * n * (n + 1) + 1 = (2 * n + 1) ^ 2`.
-    This connects pronic numbers to odd perfect squares. -/
+/-- The fundamental identity: `4 * n * (n + 1) + 1 = (2 * n + 1) ^ 2`. -/
 theorem pronic_identity (n : ℕ) : 4 * (n * (n + 1)) + 1 = (2 * n + 1) ^ 2 := by
   ring
 

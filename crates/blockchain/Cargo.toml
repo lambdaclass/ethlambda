@@ -1,3 +1,6 @@
+[features]
+lean-ffi = ["ethlambda-state-transition/lean-ffi"]
+
 [package]
 name = "ethlambda-blockchain"
 authors.workspace = true

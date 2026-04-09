@@ -9,9 +9,13 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+lean-ffi = ["dep:ethlambda-lean-ffi"]
+
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-lean-ffi = { workspace = true, optional = true }
 
 thiserror.workspace = true
 tracing.workspace = true

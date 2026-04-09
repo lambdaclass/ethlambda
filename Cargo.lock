@@ -2032,6 +2032,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-lean-ffi"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "ethlambda-metrics"
 version = "0.1.0"
 dependencies = [
@@ -2099,6 +2106,7 @@ name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
+ "ethlambda-lean-ffi",
  "ethlambda-metrics",
  "ethlambda-test-fixtures",
  "ethlambda-types",

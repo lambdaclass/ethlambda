@@ -1,0 +1,14 @@
+[package]
+name = "ethlambda-lean-ffi"
+description = "FFI bindings to formally verified Lean4 consensus functions"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[build-dependencies]
+cc = "1"

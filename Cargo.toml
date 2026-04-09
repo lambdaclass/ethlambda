@@ -14,6 +14,7 @@ members = [
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
+    "crates/lean-ffi",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+ethlambda-lean-ffi = { path = "crates/lean-ffi" }
 
 tracing = "0.1"
 thiserror = "2.0.9"

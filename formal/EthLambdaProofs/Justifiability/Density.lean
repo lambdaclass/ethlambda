@@ -2,18 +2,10 @@
 Copyright (c) 2026 ethlambda contributors. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
-import EthLambda.Justifiability.Classification
+import EthLambdaProofs.Justifiability.Classification
 
 /-!
 # Density Bound for Justifiable Slots
-
-Proves that justifiable deltas up to `N` grow as `O(√N)`,
-which ensures that unjustifiable gaps funnel votes effectively.
-
-The bound `2 * √N + 8` comes from:
-- At most 6 values ≤ 5
-- At most `√N + 1` perfect squares below `N`
-- At most `√N + 1` pronic numbers below `N`
 -/
 
 noncomputable instance : DecidablePred Justifiable := fun _ => Classical.dec _

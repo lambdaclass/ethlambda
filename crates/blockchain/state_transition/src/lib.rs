@@ -496,6 +496,17 @@ fn checkpoint_exists(state: &State, checkpoint: Checkpoint) -> bool {
 /// scenarios, validators may vote for many different slots, making none of them
 /// reach the supermajority threshold. By having unjustifiable slots, we can
 /// funnel votes towards only some slots, increasing finalization chances.
+/// When the `lean-ffi` feature is enabled, this calls the formally verified
+/// Lean4 implementation via FFI. The Lean implementation has been proven correct
+/// for all natural numbers (see `formal/EthLambda/Justifiability/`).
+///
+/// Without the feature, uses the native Rust implementation.
+#[cfg(feature = "lean-ffi")]
+pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
+    ethlambda_lean_ffi::slot_is_justifiable_after(slot, finalized_slot)
+}
+
+#[cfg(not(feature = "lean-ffi"))]
 pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
     let Some(delta) = slot.checked_sub(finalized_slot) else {
         // Candidate slot must not be before finalized slot

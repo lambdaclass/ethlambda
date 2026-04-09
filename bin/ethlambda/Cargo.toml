@@ -1,3 +1,6 @@
+[features]
+lean-ffi = ["ethlambda-blockchain/lean-ffi"]
+
 [package]
 name = "ethlambda"
 version.workspace = true

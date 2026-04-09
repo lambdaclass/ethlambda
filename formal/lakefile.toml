@@ -1,10 +1,10 @@
 name = "EthLambda"
 version = "0.1.0"
 keywords = ["math"]
-defaultTargets = ["EthLambda"]
+defaultTargets = ["EthLambda", "EthLambdaProofs"]
 
 [leanOptions]
-pp.unicode.fun = true # pretty-prints `fun a ↦ b`
+pp.unicode.fun = true
 relaxedAutoImplicit = false
 weak.linter.mathlibStandardSet = true
 maxSynthPendingDepth = 3
@@ -14,5 +14,10 @@ name = "mathlib"
 scope = "leanprover-community"
 rev = "v4.29.0"
 
+# Implementation lib: no Mathlib, compiled into Rust binary via FFI
 [[lean_lib]]
 name = "EthLambda"
+
+# Proofs lib: imports Mathlib + EthLambda, verification only
+[[lean_lib]]
+name = "EthLambdaProofs"

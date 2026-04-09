@@ -2,16 +2,10 @@
 Copyright (c) 2026 ethlambda contributors. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
-import EthLambda.Justifiability.PronicDetection
+import EthLambdaProofs.Justifiability.PronicDetection
 
 /-!
 # Classification Theorem
-
-The main theorem: the computable `justifiable` function (mirroring the Rust implementation)
-agrees with the mathematical `Justifiable` predicate for all natural numbers.
-
-This proves the Rust implementation correct (modulo `u64` overflow,
-which `Nat` avoids).
 -/
 
 /-- The classification theorem: `Justifiable` ↔ computable sqrt-based check. -/

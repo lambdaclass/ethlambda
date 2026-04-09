@@ -2,13 +2,10 @@
 Copyright (c) 2026 ethlambda contributors. All rights reserved.
 Released under Apache 2.0 license as described in the file LICENSE.
 -/
-import EthLambda.Justifiability.Defs
+import EthLambdaProofs.Justifiability.Defs
 
 /-!
 # Justifiable Slots Are Infinite
-
-Proves that there are infinitely many justifiable deltas,
-which is the foundation for the liveness argument of 3SF-mini.
 -/
 
 /-- Perfect squares are always justifiable. -/
