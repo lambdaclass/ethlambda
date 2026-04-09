@@ -4,4 +4,4 @@ import EthLambdaProofs.Justifiability.PronicDetection
 import EthLambdaProofs.Justifiability.Classification
 import EthLambdaProofs.Justifiability.Infinite
 import EthLambdaProofs.Justifiability.Density
-import EthLambdaProofs.Justifiability.Bridge
+import EthLambdaProofs.Justifiability.ImplEquivalence
