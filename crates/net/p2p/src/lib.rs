@@ -92,6 +92,7 @@ pub struct BuiltSwarm {
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    pub(crate) is_aggregator: bool,
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -257,6 +258,7 @@ pub fn build_swarm(
         block_topic,
         aggregation_topic,
         bootnode_addrs,
+        is_aggregator: config.is_aggregator,
     })
 }
 
@@ -280,6 +282,7 @@ impl P2P {
             attestation_committee_count: built.attestation_committee_count,
             block_topic: built.block_topic,
             aggregation_topic: built.aggregation_topic,
+            is_aggregator: built.is_aggregator,
             connected_peers: HashSet::new(),
             pending_requests: HashMap::new(),
             request_id_map: HashMap::new(),
@@ -314,6 +317,7 @@ pub struct P2PServer {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) is_aggregator: bool,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<H256, PendingRequest>,
