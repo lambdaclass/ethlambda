@@ -67,7 +67,10 @@ mod tests {
     #[test]
     fn test_perfect_squares() {
         for &d in &[9, 16, 25, 36, 49, 64, 100] {
-            assert!(justifiable(d), "delta={d} (perfect square) should be justifiable");
+            assert!(
+                justifiable(d),
+                "delta={d} (perfect square) should be justifiable"
+            );
         }
     }
 
@@ -75,7 +78,11 @@ mod tests {
     fn test_pronic_numbers() {
         for n in 2..=10u64 {
             let d = n * (n + 1);
-            assert!(justifiable(d), "delta={d} (pronic {n}*{}) should be justifiable", n + 1);
+            assert!(
+                justifiable(d),
+                "delta={d} (pronic {n}*{}) should be justifiable",
+                n + 1
+            );
         }
     }
 
@@ -88,9 +95,9 @@ mod tests {
 
     #[test]
     fn test_slot_api() {
-        assert!(slot_is_justifiable_after(100, 100));  // delta=0
-        assert!(slot_is_justifiable_after(109, 100));  // delta=9 (square)
+        assert!(slot_is_justifiable_after(100, 100)); // delta=0
+        assert!(slot_is_justifiable_after(109, 100)); // delta=9 (square)
         assert!(!slot_is_justifiable_after(107, 100)); // delta=7
-        assert!(!slot_is_justifiable_after(50, 100));  // slot < finalized
+        assert!(!slot_is_justifiable_after(50, 100)); // slot < finalized
     }
 }

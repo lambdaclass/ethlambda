@@ -3,8 +3,7 @@ use std::process::Command;
 
 fn main() {
     // 1. Build the Lean formal project (includes FFI exports)
-    let lean_project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../formal");
+    let lean_project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../formal");
     let status = Command::new("lake")
         .arg("build")
         .arg("EthLambda")
@@ -35,7 +34,10 @@ fn main() {
     let mut build = cc::Build::new();
 
     let eth_root = ir_dir.join("EthLambda.c");
-    assert!(eth_root.exists(), "EthLambda.c not found; did `lake build EthLambda` succeed?");
+    assert!(
+        eth_root.exists(),
+        "EthLambda.c not found; did `lake build EthLambda` succeed?"
+    );
     build.file(&eth_root);
 
     collect_c_files(&ir_dir.join("EthLambda"), &mut build);
