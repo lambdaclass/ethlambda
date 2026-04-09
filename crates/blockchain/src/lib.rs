@@ -220,11 +220,9 @@ impl BlockChainServer {
             return;
         };
 
-        // Create proposer's attestation (attests to the new block)
-        //
-        // Use post-block checkpoints from the state transition rather than the
-        // store's current values. The block's attestations may have advanced
-        // justification/finalization, but the block hasn't been imported yet.
+        // Create proposer's attestation using post-block checkpoints because
+        // the block's attestations may have advanced justification/finalization
+        // but the block hasn't been imported into the store yet.
         let proposer_attestation = Attestation {
             validator_id,
             data: AttestationData {
