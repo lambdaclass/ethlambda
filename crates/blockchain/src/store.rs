@@ -1194,14 +1194,14 @@ fn verify_signatures(
         })
         .collect::<Result<_, StoreError>>()?;
 
-    // Run expensive signature verification in parallel
+    // Run expensive signature verification in parallel.
+    // into_par_iter() moves each tuple, avoiding a clone of public_keys.
     use rayon::prelude::*;
-    verification_inputs
-        .par_iter()
-        .try_for_each(|(proof_data, public_keys, message, slot)| {
+    verification_inputs.into_par_iter().try_for_each(
+        |(proof_data, public_keys, message, slot)| {
             let result = {
                 let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
-                verify_aggregated_signature(proof_data, public_keys.clone(), message, *slot)
+                verify_aggregated_signature(proof_data, public_keys, &message, slot)
             };
             match result {
                 Ok(()) => {
@@ -1213,7 +1213,8 @@ fn verify_signatures(
                     Err(StoreError::AggregateVerificationFailed(e))
                 }
             }
-        })?;
+        },
+    )?;
 
     let aggregated_elapsed = aggregated_start.elapsed();
 
