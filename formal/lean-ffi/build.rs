@@ -51,15 +51,15 @@ fn main() {
     // 4. Link the Lean runtime statically (self-contained binary)
     println!("cargo:rustc-link-search=native={lean_lib}");
     println!("cargo:rustc-link-search=native={lean_dep_lib}");
+    // Lean's bundled libc++ lives under <prefix>/lib/libc/
+    let lean_libc = format!("{lean_prefix}/lib/libc");
+    println!("cargo:rustc-link-search=native={lean_libc}");
     println!("cargo:rustc-link-lib=static=leanrt");
     println!("cargo:rustc-link-lib=static=Init");
     println!("cargo:rustc-link-lib=static=gmp");
     println!("cargo:rustc-link-lib=static=uv");
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
+    // leanc uses Clang and links against libc++ on all platforms
+    println!("cargo:rustc-link-lib=c++");
 
     // 5. Rebuild when any Lean source changes
     println!("cargo:rerun-if-changed=../EthLambda");
