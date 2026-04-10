@@ -187,6 +187,17 @@ impl BlockChainServer {
                 signature,
             };
 
+            // Self-deliver: store our own attestation locally for aggregation.
+            // Gossipsub does not deliver messages back to the sender, so without
+            // this the aggregator never sees its own validator's signature in
+            // gossip_signatures and it is excluded from aggregated proofs.
+            if self.is_aggregator {
+                let _ = store::on_gossip_attestation(&mut self.store, signed_attestation.clone())
+                    .inspect_err(|err| {
+                        warn!(%slot, %validator_id, %err, "Self-delivery of attestation failed")
+                    });
+            }
+
             // Publish to gossip network
             if let Some(ref p2p) = self.p2p {
                 let _ = p2p.publish_attestation(signed_attestation).inspect_err(
