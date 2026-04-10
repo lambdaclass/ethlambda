@@ -188,27 +188,25 @@ fn validate_checks(
     if checks.time.is_some() {
         return Err(format!("Step {}: 'time' check not supported", step_idx).into());
     }
-    if checks.head_root_label.is_some() && checks.head_root.is_none() {
-        return Err(format!(
-            "Step {}: 'headRootLabel' without 'headRoot' not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_justified_root_label.is_some() && checks.latest_justified_root.is_none() {
-        return Err(format!(
-            "Step {}: 'latestJustifiedRootLabel' without 'latestJustifiedRoot' not supported",
-            step_idx
-        )
-        .into());
-    }
-    if checks.latest_finalized_root_label.is_some() && checks.latest_finalized_root.is_none() {
-        return Err(format!(
-            "Step {}: 'latestFinalizedRootLabel' without 'latestFinalizedRoot' not supported",
-            step_idx
-        )
-        .into());
-    }
+    // Resolve headRootLabel to headRoot if only the label is provided
+    let resolved_head_root = checks.head_root.or_else(|| {
+        checks
+            .head_root_label
+            .as_ref()
+            .and_then(|label| block_registry.get(label).copied())
+    });
+    let resolved_justified_root = checks.latest_justified_root.or_else(|| {
+        checks
+            .latest_justified_root_label
+            .as_ref()
+            .and_then(|label| block_registry.get(label).copied())
+    });
+    let resolved_finalized_root = checks.latest_finalized_root.or_else(|| {
+        checks
+            .latest_finalized_root_label
+            .as_ref()
+            .and_then(|label| block_registry.get(label).copied())
+    });
     if checks.safe_target.is_some() {
         return Err(format!("Step {}: 'safeTarget' check not supported", step_idx).into());
     }
@@ -258,8 +256,8 @@ fn validate_checks(
         }
     }
 
-    // Validate headRoot
-    if let Some(ref expected_root) = checks.head_root {
+    // Validate headRoot (resolved from headRootLabel if headRoot not provided)
+    if let Some(ref expected_root) = resolved_head_root {
         let head_root = st.head();
         if head_root != *expected_root {
             return Err(format!(
@@ -282,8 +280,8 @@ fn validate_checks(
         }
     }
 
-    // Validate latestJustifiedRoot
-    if let Some(ref expected_root) = checks.latest_justified_root {
+    // Validate latestJustifiedRoot (resolved from label if root not provided)
+    if let Some(ref expected_root) = resolved_justified_root {
         let justified = st.latest_justified();
         if justified.root != *expected_root {
             return Err(format!(
@@ -306,8 +304,8 @@ fn validate_checks(
         }
     }
 
-    // Validate latestFinalizedRoot
-    if let Some(ref expected_root) = checks.latest_finalized_root {
+    // Validate latestFinalizedRoot (resolved from label if root not provided)
+    if let Some(ref expected_root) = resolved_finalized_root {
         let finalized = st.latest_finalized();
         if finalized.root != *expected_root {
             return Err(format!(

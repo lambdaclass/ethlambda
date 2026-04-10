@@ -49,13 +49,14 @@ pub struct VerifySignaturesTest {
 /// Signed block with signature bundle (devnet4: no proposer attestation wrapper)
 #[derive(Debug, Clone, Deserialize)]
 pub struct TestSignedBlock {
-    pub message: Block,
+    #[serde(alias = "message")]
+    pub block: Block,
     pub signature: TestSignatureBundle,
 }
 
 impl From<TestSignedBlock> for SignedBlock {
     fn from(value: TestSignedBlock) -> Self {
-        let block = value.message.into();
+        let block = value.block.into();
         let proposer_signature = value.signature.proposer_signature;
 
         let attestation_signatures: AttestationSignatures = value
@@ -123,5 +124,10 @@ where
     let value = String::deserialize(d)?;
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
         .map_err(|_| D::Error::custom("XmssSignature value is not valid hex"))?;
-    XmssSignature::try_from(bytes).map_err(|_| D::Error::custom("XmssSignature length != 3112"))
+    XmssSignature::try_from(bytes).map_err(|_| {
+        D::Error::custom(format!(
+            "XmssSignature length != {}",
+            ethlambda_types::signature::SIGNATURE_SIZE
+        ))
+    })
 }
