@@ -136,7 +136,8 @@ async fn main() -> eyre::Result<()> {
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
-        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
+        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
+            .expect("Failed to load validator keys");
 
     let data_dir =
         std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
@@ -238,12 +239,6 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
 #[derive(Debug, Deserialize)]
 struct AnnotatedValidator {
     index: u64,
-    #[serde(rename = "attestation_pubkey_hex")]
-    #[serde(deserialize_with = "deser_pubkey_hex")]
-    _attestation_pubkey: ValidatorPubkeyBytes,
-    #[serde(rename = "proposal_pubkey_hex")]
-    #[serde(deserialize_with = "deser_pubkey_hex")]
-    _proposal_pubkey: ValidatorPubkeyBytes,
     attestation_privkey_file: PathBuf,
     proposal_privkey_file: PathBuf,
 }
@@ -266,17 +261,18 @@ fn read_validator_keys(
     validators_path: impl AsRef<Path>,
     validator_keys_dir: impl AsRef<Path>,
     node_id: &str,
-) -> HashMap<u64, ValidatorKeyPair> {
+) -> Result<HashMap<u64, ValidatorKeyPair>, String> {
     let validators_path = validators_path.as_ref();
     let validator_keys_dir = validator_keys_dir.as_ref();
-    let validators_yaml =
-        std::fs::read_to_string(validators_path).expect("Failed to read validators file");
+    let validators_yaml = std::fs::read_to_string(validators_path)
+        .map_err(|err| format!("Failed to read validators file: {err}"))?;
     let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
-        serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
+        serde_yaml_ng::from_str(&validators_yaml)
+            .map_err(|err| format!("Failed to parse validators file: {err}"))?;
 
     let validator_vec = validator_infos
         .get(node_id)
-        .unwrap_or_else(|| panic!("Node ID '{}' not found in validators config", node_id));
+        .ok_or_else(|| format!("Node ID '{node_id}' not found in validators config"))?;
 
     let mut validator_keys = HashMap::new();
 
@@ -294,21 +290,21 @@ fn read_validator_keys(
         let att_key_path = resolve_path(&validator.attestation_privkey_file);
         let prop_key_path = resolve_path(&validator.proposal_privkey_file);
 
-        info!(node_id=%node_id, index=validator_index, attestation_key=?att_key_path, proposal_key=?prop_key_path, "Loading validator key pair");
+        info!(%node_id, index=validator_index, attestation_key=?att_key_path, proposal_key=?prop_key_path, "Loading validator key pair");
 
-        let load_key = |path: &Path, purpose: &str| -> ValidatorSecretKey {
-            let bytes = std::fs::read(path).unwrap_or_else(|err| {
-                error!(node_id=%node_id, index=validator_index, file=?path, %err, "Failed to read {purpose} key file");
-                std::process::exit(1);
-            });
-            ValidatorSecretKey::from_bytes(&bytes).unwrap_or_else(|err| {
-                error!(node_id=%node_id, index=validator_index, file=?path, ?err, "Failed to parse {purpose} key");
-                std::process::exit(1);
-            })
+        let load_key = |path: &Path, purpose: &str| -> Result<ValidatorSecretKey, String> {
+            let bytes = std::fs::read(path).map_err(|err| {
+                format!(
+                    "Failed to read {purpose} key file {}: {err}",
+                    path.display()
+                )
+            })?;
+            ValidatorSecretKey::from_bytes(&bytes)
+                .map_err(|err| format!("Failed to parse {purpose} key {}: {err:?}", path.display()))
         };
 
-        let attestation_key = load_key(&att_key_path, "attestation");
-        let proposal_key = load_key(&prop_key_path, "proposal");
+        let attestation_key = load_key(&att_key_path, "attestation")?;
+        let proposal_key = load_key(&prop_key_path, "proposal")?;
 
         validator_keys.insert(
             validator_index,
@@ -320,12 +316,12 @@ fn read_validator_keys(
     }
 
     info!(
-        node_id = %node_id,
+        %node_id,
         count = validator_keys.len(),
         "Loaded validator key pairs"
     );
 
-    validator_keys
+    Ok(validator_keys)
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
