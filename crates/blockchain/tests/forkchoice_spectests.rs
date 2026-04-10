@@ -8,7 +8,7 @@ use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
-    block::{AttestationSignatures, Block, BlockSignatures, SignedBlock},
+    block::{AggregatedSignatureProof, Block, BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
     signature::SIGNATURE_SIZE,
     state::State,
@@ -158,11 +158,22 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
     let block: Block = block_data.to_block();
 
+    // Build one empty proof per attestation, matching the aggregation_bits from
+    // each attestation in the block body. on_block_core zips attestations with
+    // signatures, so they must be the same length for attestations to reach
+    // fork choice.
+    let proofs: Vec<_> = block
+        .body
+        .attestations
+        .iter()
+        .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
+        .collect();
+
     SignedBlock {
         message: block,
         signature: BlockSignatures {
             proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            attestation_signatures: AttestationSignatures::new(),
+            attestation_signatures: proofs.try_into().expect("attestation proofs within limit"),
         },
     }
 }
