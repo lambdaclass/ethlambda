@@ -1199,8 +1199,10 @@ fn verify_signatures(
     verification_inputs
         .par_iter()
         .try_for_each(|(proof_data, public_keys, message, slot)| {
-            let result =
-                verify_aggregated_signature(proof_data, public_keys.clone(), message, *slot);
+            let result = {
+                let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
+                verify_aggregated_signature(proof_data, public_keys.clone(), message, *slot)
+            };
             match result {
                 Ok(()) => {
                     metrics::inc_pq_sig_aggregated_signatures_valid();
