@@ -91,6 +91,16 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
+### Container Releases
+
+Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
+
+| Tag | Description |
+|-----|-------------|
+| `devnetX` | Stable image for a specific devnet (e.g. `devnet3`) |
+| `latest` | Alias for the stable image of the currently running devnet |
+| `unstable` | Development builds; promoted to `devnetX`/`latest` once tested |
+
 ### pq-devnet-3
 
 We are running the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` is available for this version.
@@ -112,3 +122,4 @@ Some features we are looking to implement in the near future, in order of priori
 - [Add support for pq-devnet-4](https://github.com/lambdaclass/ethlambda/issues/155)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
 - [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
+- [Formal verification of the STF](https://github.com/lambdaclass/ethlambda/issues/272)
