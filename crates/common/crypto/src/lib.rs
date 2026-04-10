@@ -5,15 +5,11 @@ use ethlambda_types::{
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
-// ethereum_ssz Encode/Decode traits are needed for Devnet2XmssAggregateSignature,
-// which is an external type from lean-multisig that uses the old ethereum_ssz API.
-use ethereum_ssz::{Decode, Encode};
 use lean_multisig::{
-    Devnet2XmssAggregateSignature, ProofError, XmssAggregateError, xmss_aggregate_signatures,
-    xmss_aggregation_setup_prover, xmss_aggregation_setup_verifier,
-    xmss_verify_aggregated_signatures,
+    AggregatedXMSS, ProofError, setup_prover, setup_verifier, xmss_aggregate,
+    xmss_verify_aggregation,
 };
-use rec_aggregation::xmss_aggregate::config::{LeanSigPubKey, LeanSigSignature};
+use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
 
 // Lazy initialization for prover and verifier setup
@@ -22,12 +18,12 @@ static VERIFIER_INIT: Once = Once::new();
 
 /// Ensure the prover is initialized. Safe to call multiple times.
 pub fn ensure_prover_ready() {
-    PROVER_INIT.call_once(xmss_aggregation_setup_prover);
+    PROVER_INIT.call_once(setup_prover);
 }
 
 /// Ensure the verifier is initialized. Safe to call multiple times.
 pub fn ensure_verifier_ready() {
-    VERIFIER_INIT.call_once(xmss_aggregation_setup_verifier);
+    VERIFIER_INIT.call_once(setup_verifier);
 }
 
 /// Error type for signature aggregation operations.
@@ -39,8 +35,8 @@ pub enum AggregationError {
     #[error("public key count ({0}) does not match signature count ({1})")]
     CountMismatch(usize, usize),
 
-    #[error("aggregation failed: {0:?}")]
-    AggregationFailed(XmssAggregateError),
+    #[error("aggregation panicked")]
+    AggregationPanicked,
 
     #[error("proof size too big: {0} bytes")]
     ProofTooBig(usize),
@@ -96,23 +92,17 @@ pub fn aggregate_signatures(
 
     ensure_prover_ready();
 
-    // Convert public keys
-    let lean_pubkeys: Vec<LeanSigPubKey> = public_keys
+    // Zip public keys and signatures into (XmssPublicKey, XmssSignature) pairs
+    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
         .into_iter()
-        .map(ValidatorPublicKey::into_inner)
+        .zip(signatures)
+        .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
 
-    // Convert signatures
-    let lean_sigs: Vec<LeanSigSignature> = signatures
-        .into_iter()
-        .map(ValidatorSignature::into_inner)
-        .collect();
+    // Aggregate using lean-multisig (no recursive children at this level)
+    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&[], raw_xmss, &message.0, slot, 1);
 
-    // Aggregate using lean-multisig
-    let aggregate = xmss_aggregate_signatures(&lean_pubkeys, &lean_sigs, &message.0, slot)
-        .map_err(AggregationError::AggregationFailed)?;
-
-    let serialized = aggregate.as_ssz_bytes();
+    let serialized = aggregate.serialize();
     let serialized_len = serialized.len();
     ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
 }
@@ -124,9 +114,9 @@ pub fn aggregate_signatures(
 ///
 /// # Arguments
 ///
+/// * `proof_data` - The serialized aggregated proof
 /// * `public_keys` - The public keys of the validators who allegedly signed
 /// * `message` - The 32-byte message that was allegedly signed
-/// * `proof_data` - The serialized aggregated proof
 /// * `slot` - The slot in which the signatures were allegedly created
 ///
 /// # Returns
@@ -147,11 +137,11 @@ pub fn verify_aggregated_signature(
         .collect();
 
     // Deserialize the aggregate proof
-    let aggregate = Devnet2XmssAggregateSignature::from_ssz_bytes(proof_data.iter().as_slice())
-        .map_err(|_| VerificationError::DeserializationFailed)?;
+    let aggregate = AggregatedXMSS::deserialize(proof_data.iter().as_slice())
+        .ok_or(VerificationError::DeserializationFailed)?;
 
     // Verify using lean-multisig
-    xmss_verify_aggregated_signatures(&lean_pubkeys, &message.0, &aggregate, slot)?;
+    xmss_verify_aggregation(lean_pubkeys, &aggregate, &message.0, slot)?;
 
     Ok(())
 }
@@ -307,10 +297,9 @@ mod tests {
     }
 
     // ── Cross-client XMSS compatibility tests (ream) ────────────────────
-    // Verify that signatures produced by the ream client (Rust) can be
-    // decoded and verified by ethlambda.
-    // Test vectors were produced by ream (slot 5, all-zeros message) and
-    // are also used in leanSpec PR #433 for Python-side cross-client testing.
+    // TODO: Update these test vectors with Poseidon1 signatures from the ream client.
+    // The current vectors were generated with Poseidon2 and are no longer valid.
+
     /// 52-byte XMSS public key produced by ream.
     const REAM_PUBLIC_KEY_HEX: &str = "7bbaf95bd653c827b5775e00b973b24d50ab4743db3373244f29c95fdf4ccc628788ba2b5b9d635acdb25770e8ceef66bfdecd0a";
 
@@ -344,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Poseidon2 test vectors - needs Poseidon1 vectors from ream"]
     fn test_cross_client_verify_ream_signature() {
         let pk = ream_pubkey();
         let sig = ream_signature();
@@ -354,6 +344,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Poseidon2 test vectors - needs Poseidon1 vectors from ream"]
     fn test_cross_client_ream_signature_rejects_wrong_message() {
         let pk = ream_pubkey();
         let sig = ream_signature();
@@ -365,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Poseidon2 test vectors - needs Poseidon1 vectors from ream"]
     fn test_cross_client_ream_signature_rejects_wrong_slot() {
         let pk = ream_pubkey();
         let sig = ream_signature();
