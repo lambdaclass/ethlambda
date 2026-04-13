@@ -1164,40 +1164,58 @@ fn verify_signatures(
     let validators = &state.validators;
     let num_validators = validators.len() as u64;
 
-    // Verify each attestation's signature proof
+    // Verify each attestation's signature proof in parallel
     let aggregated_start = std::time::Instant::now();
-    for (attestation, aggregated_proof) in attestations.iter().zip(attestation_signatures) {
-        if attestation.aggregation_bits != aggregated_proof.participants {
-            return Err(StoreError::ParticipantsMismatch);
-        }
 
-        let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-        let message = attestation.data.hash_tree_root();
-
-        // Collect public keys with bounds check in a single pass
-        let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
-            .map(|vid| {
-                if vid >= num_validators {
-                    return Err(StoreError::InvalidValidatorIndex);
-                }
-                validators[vid as usize]
-                    .get_pubkey()
-                    .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let verification_result = {
-            let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
-            verify_aggregated_signature(&aggregated_proof.proof_data, public_keys, &message, slot)
-        };
-        match verification_result {
-            Ok(()) => metrics::inc_pq_sig_aggregated_signatures_valid(),
-            Err(e) => {
-                metrics::inc_pq_sig_aggregated_signatures_invalid();
-                return Err(StoreError::AggregateVerificationFailed(e));
+    // Prepare verification inputs sequentially (cheap: bit checks + pubkey lookups)
+    let verification_inputs: Vec<_> = attestations
+        .iter()
+        .zip(attestation_signatures)
+        .map(|(attestation, aggregated_proof)| {
+            if attestation.aggregation_bits != aggregated_proof.participants {
+                return Err(StoreError::ParticipantsMismatch);
             }
-        }
-    }
+
+            let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
+            let message = attestation.data.hash_tree_root();
+
+            let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
+                .map(|vid| {
+                    if vid >= num_validators {
+                        return Err(StoreError::InvalidValidatorIndex);
+                    }
+                    validators[vid as usize]
+                        .get_pubkey()
+                        .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
+                })
+                .collect::<Result<_, _>>()?;
+
+            Ok((&aggregated_proof.proof_data, public_keys, message, slot))
+        })
+        .collect::<Result<_, StoreError>>()?;
+
+    // Run expensive signature verification in parallel.
+    // into_par_iter() moves each tuple, avoiding a clone of public_keys.
+    use rayon::prelude::*;
+    verification_inputs.into_par_iter().try_for_each(
+        |(proof_data, public_keys, message, slot)| {
+            let result = {
+                let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
+                verify_aggregated_signature(proof_data, public_keys, &message, slot)
+            };
+            match result {
+                Ok(()) => {
+                    metrics::inc_pq_sig_aggregated_signatures_valid();
+                    Ok(())
+                }
+                Err(e) => {
+                    metrics::inc_pq_sig_aggregated_signatures_invalid();
+                    Err(StoreError::AggregateVerificationFailed(e))
+                }
+            }
+        },
+    )?;
+
     let aggregated_elapsed = aggregated_start.elapsed();
 
     let proposer_start = std::time::Instant::now();
