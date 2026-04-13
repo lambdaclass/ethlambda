@@ -201,8 +201,24 @@ For persistent devnets on remote servers (e.g., `ssh admin@ethlambda-1`), use de
 
 See `references/long-lived-devnet.md` for the full procedure, including starting the devnet, rolling restart steps, verification, and troubleshooting.
 
+## Testing Network Instability
+
+Use `docker pause` to simulate validator failures and observe consensus degradation (finalization stalls, attestation backlog, block processing time increases).
+
+**Quick start:**
+```bash
+# Pause 2 non-aggregator nodes (causes loss of supermajority, finalization stalls)
+docker pause ethlambda_0 ethlambda_1
+
+# Recover
+docker unpause ethlambda_0 ethlambda_1
+```
+
+See `references/instability-testing.md` for detailed scenarios, data extraction scripts, and analysis procedures.
+
 ## Reference
 
 - `references/clients.md`: Client-specific details (images, ports, known issues)
 - `references/validator-config.md`: Full config schema, field reference, adding/removing nodes, port allocation
 - `references/long-lived-devnet.md`: Persistent devnets with detached containers and rolling restarts
+- `references/instability-testing.md`: Simulating validator failures, non-finality, and measuring block processing under load
