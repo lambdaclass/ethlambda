@@ -35,6 +35,11 @@ pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
+/// Maximum number of distinct AttestationData entries per block.
+///
+/// See: leanSpec commit 0c9528a (PR #536).
+pub const MAX_ATTESTATIONS_DATA: usize = 16;
+
 impl BlockChain {
     pub fn spawn(
         store: Store,

@@ -24,12 +24,11 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-LEAN_SPEC_COMMIT_HASH:=9c30436bf4c073d1a994f37a3241e83ef5a3ce6f
+LEAN_SPEC_COMMIT_HASH:=45e87fd8a56ac3849ae25906e96960cc116f8d81
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
-	cd leanSpec && git apply ../patches/fix-lexicographic-tiebreaker-test.patch
 
 leanSpec/fixtures: leanSpec
 	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures
