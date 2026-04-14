@@ -261,10 +261,58 @@ static LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<H
         register_histogram!(
             "lean_committee_signatures_aggregation_time_seconds",
             "Time taken to aggregate committee signatures",
-            vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+            vec![0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0]
         )
         .unwrap()
     });
+
+static LEAN_BLOCK_AGGREGATED_PAYLOADS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_aggregated_payloads",
+            "Number of aggregated_payloads in a block",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_building_payload_aggregation_time_seconds",
+            "Time taken to build aggregated_payloads during block building",
+            vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BUILDING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_building_time_seconds",
+            "Time taken to build a block",
+            vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BUILDING_SUCCESS_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_block_building_success_total",
+            "Successful block builds"
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
+    });
+
+static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
+    register_int_gauge_vec!("lean_node_sync_status", "Node sync status", &["status"]).unwrap()
+});
 
 static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
@@ -314,6 +362,12 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_SUCCESS_TOTAL);
+    std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_FAILURES_TOTAL);
+    std::sync::LazyLock::force(&LEAN_NODE_SYNC_STATUS);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
 }
 
@@ -475,4 +529,38 @@ pub fn set_attestation_committee_count(count: u64) {
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
+}
+
+/// Observe the number of aggregated payloads in a produced block.
+pub fn observe_block_aggregated_payloads(count: usize) {
+    LEAN_BLOCK_AGGREGATED_PAYLOADS.observe(count as f64);
+}
+
+/// Start timing payload aggregation during block building. Records duration when the guard is dropped.
+pub fn time_block_building_payload_aggregation() -> TimingGuard {
+    TimingGuard::new(&LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS)
+}
+
+/// Start timing block building. Records duration when the guard is dropped.
+pub fn time_block_building() -> TimingGuard {
+    TimingGuard::new(&LEAN_BLOCK_BUILDING_TIME_SECONDS)
+}
+
+/// Increment the successful block builds counter.
+pub fn inc_block_building_success() {
+    LEAN_BLOCK_BUILDING_SUCCESS_TOTAL.inc();
+}
+
+/// Increment the failed block builds counter.
+pub fn inc_block_building_failures() {
+    LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
+}
+
+/// Set the node sync status. Sets the given status label to 1 and all others to 0.
+pub fn set_sync_status(status: &str) {
+    for label in &["idle", "syncing", "synced"] {
+        LEAN_NODE_SYNC_STATUS
+            .with_label_values(&[label])
+            .set(i64::from(*label == status));
+    }
 }

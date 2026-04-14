@@ -95,6 +95,54 @@ pub fn notify_peer_connected(peer_id: &Option<PeerId>, direction: &str, result: 
     }
 }
 
+static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<ethlambda_metrics::Histogram> = LazyLock::new(|| {
+    ethlambda_metrics::register_histogram!(
+        "lean_gossip_block_size_bytes",
+        "Bytes size of a gossip block message",
+        vec![
+            10000.0, 50000.0, 100000.0, 250000.0, 500000.0, 1000000.0, 2000000.0, 5000000.0
+        ]
+    )
+    .unwrap()
+});
+
+static LEAN_GOSSIP_ATTESTATION_SIZE_BYTES: LazyLock<ethlambda_metrics::Histogram> =
+    LazyLock::new(|| {
+        ethlambda_metrics::register_histogram!(
+            "lean_gossip_attestation_size_bytes",
+            "Bytes size of a gossip attestation message",
+            vec![512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<ethlambda_metrics::Histogram> =
+    LazyLock::new(|| {
+        ethlambda_metrics::register_histogram!(
+            "lean_gossip_aggregation_size_bytes",
+            "Bytes size of a gossip aggregated attestation message",
+            vec![
+                1024.0, 4096.0, 16384.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0
+            ]
+        )
+        .unwrap()
+    });
+
+/// Observe the compressed size of a gossip block message.
+pub fn observe_gossip_block_size(bytes: usize) {
+    LEAN_GOSSIP_BLOCK_SIZE_BYTES.observe(bytes as f64);
+}
+
+/// Observe the compressed size of a gossip attestation message.
+pub fn observe_gossip_attestation_size(bytes: usize) {
+    LEAN_GOSSIP_ATTESTATION_SIZE_BYTES.observe(bytes as f64);
+}
+
+/// Observe the compressed size of a gossip aggregated attestation message.
+pub fn observe_gossip_aggregation_size(bytes: usize) {
+    LEAN_GOSSIP_AGGREGATION_SIZE_BYTES.observe(bytes as f64);
+}
+
 /// Notify that a peer disconnected.
 ///
 /// Decrements the connected peer count and increments the disconnection event counter.

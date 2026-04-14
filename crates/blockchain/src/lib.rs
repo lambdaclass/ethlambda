@@ -222,11 +222,16 @@ impl BlockChainServer {
     /// Build and publish a block for the given slot and validator.
     fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
+        let _block_timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
         let Ok((block, attestation_signatures, post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+            store::produce_block_with_signatures(&mut self.store, slot, validator_id).inspect_err(
+                |err| {
+                    metrics::inc_block_building_failures();
+                    error!(%slot, %validator_id, %err, "Failed to build block");
+                },
+            )
         else {
             return;
         };
@@ -278,9 +283,12 @@ impl BlockChainServer {
 
         // Process the block locally before publishing
         if let Err(err) = self.process_block(signed_block.clone()) {
+            metrics::inc_block_building_failures();
             error!(%slot, %validator_id, %err, "Failed to process built block");
             return;
         };
+
+        metrics::inc_block_building_success();
 
         // Publish to gossip network
         if let Some(ref p2p) = self.p2p {

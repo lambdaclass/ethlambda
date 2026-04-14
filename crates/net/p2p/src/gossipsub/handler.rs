@@ -15,7 +15,7 @@ use super::{
         attestation_subnet_topic,
     },
 };
-use crate::P2PServer;
+use crate::{P2PServer, metrics};
 
 pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
@@ -29,6 +29,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let topic_kind = message.topic.as_str().split("/").nth(3);
     match topic_kind {
         Some(BLOCK_TOPIC_KIND) => {
+            metrics::observe_gossip_block_size(message.data.len());
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
             else {
@@ -60,6 +61,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(AGGREGATION_TOPIC_KIND) => {
+            metrics::observe_gossip_aggregation_size(message.data.len());
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
             else {
@@ -89,6 +91,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
+            metrics::observe_gossip_attestation_size(message.data.len());
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
             else {
