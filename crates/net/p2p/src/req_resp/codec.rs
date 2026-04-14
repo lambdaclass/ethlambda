@@ -17,7 +17,6 @@ use ethlambda_types::block::SignedBlock;
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
 
-#[async_trait::async_trait]
 impl libp2p::request_response::Codec for Codec {
     type Protocol = libp2p::StreamProtocol;
     type Request = Request;
