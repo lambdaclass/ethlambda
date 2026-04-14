@@ -550,4 +550,3 @@ pub fn inc_block_building_success() {
 pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
 }
-
