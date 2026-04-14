@@ -102,12 +102,6 @@ jobs:
         if: steps.cache-fixtures.outputs.cache-hit != 'true' && steps.cache-prod-keys.outputs.cache-hit != 'true'
         working-directory: leanSpec
         run: uv run python -m consensus_testing.keys --download --scheme prod
-        continue-on-error: true
-
-      - name: Generate production keys (fallback if download unavailable)
-        if: steps.cache-fixtures.outputs.cache-hit != 'true' && steps.cache-prod-keys.outputs.cache-hit != 'true'
-        working-directory: leanSpec
-        run: uv run python -m consensus_testing.keys --scheme prod --count 12 --max-slot 100
 
       - name: Generate test fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
