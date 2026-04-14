@@ -2210,6 +2210,7 @@ dependencies = [
 name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
+ "datatest-stable 0.3.3",
  "hex",
  "leansig",
  "libssz",

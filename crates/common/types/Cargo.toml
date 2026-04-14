@@ -25,3 +25,10 @@ libssz-types.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 rand.workspace = true
+
+datatest-stable = "0.3.3"
+
+[[test]]
+name = "ssz_spectests"
+path = "tests/ssz_spectests.rs"
+harness = false
