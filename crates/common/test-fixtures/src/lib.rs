@@ -131,7 +131,7 @@ pub struct TestState {
     #[serde(rename = "historicalBlockHashes")]
     pub historical_block_hashes: Container<H256>,
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Container<u64>,
+    pub justified_slots: Container<bool>,
     pub validators: Container<Validator>,
     #[serde(rename = "justificationsRoots")]
     pub justifications_roots: Container<H256>,
@@ -154,6 +154,16 @@ impl From<TestState> for State {
         .unwrap();
         let justifications_roots = SszList::try_from(value.justifications_roots.data).unwrap();
 
+        let mut justified_slots = JustifiedSlots::new();
+        for &b in &value.justified_slots.data {
+            justified_slots.push(b).unwrap();
+        }
+
+        let mut justifications_validators = JustificationValidators::new();
+        for &b in &value.justifications_validators.data {
+            justifications_validators.push(b).unwrap();
+        }
+
         State {
             config: value.config.into(),
             slot: value.slot,
@@ -161,10 +171,10 @@ impl From<TestState> for State {
             latest_justified: value.latest_justified.into(),
             latest_finalized: value.latest_finalized.into(),
             historical_block_hashes,
-            justified_slots: JustifiedSlots::new(),
+            justified_slots,
             validators,
             justifications_roots,
-            justifications_validators: JustificationValidators::new(),
+            justifications_validators,
         }
     }
 }
