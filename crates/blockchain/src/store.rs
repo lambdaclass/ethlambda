@@ -19,7 +19,10 @@ use ethlambda_types::{
 };
 use tracing::{info, trace, warn};
 
-use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
+use crate::{
+    INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    metrics,
+};
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
@@ -574,6 +577,13 @@ fn on_block_core(
             });
         }
     }
+    // Reject blocks exceeding the per-block distinct-attestation-data cap (leanSpec #536).
+    if seen.len() > MAX_ATTESTATIONS_DATA {
+        return Err(StoreError::TooManyAttestationData {
+            count: seen.len(),
+            max: MAX_ATTESTATIONS_DATA,
+        });
+    }
 
     let sig_verification_start = std::time::Instant::now();
     if verify {
@@ -935,6 +945,9 @@ pub enum StoreError {
         "Block contains duplicate AttestationData entries: {count} entries but only {unique} unique"
     )]
     DuplicateAttestationData { count: usize, unique: usize },
+
+    #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
+    TooManyAttestationData { count: usize, max: usize },
 }
 
 /// Build an AggregationBits bitfield from a list of validator indices.
@@ -1161,6 +1174,10 @@ fn build_block(
                 }
                 if processed_data_roots.contains(data_root) {
                     continue;
+                }
+                // Cap distinct AttestationData entries per block (leanSpec #536).
+                if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
+                    break;
                 }
                 if !known_block_roots.contains(&att_data.head.root) {
                     continue;
