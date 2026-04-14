@@ -895,8 +895,16 @@ impl Store {
     /// Cheap check (no cloning) to short-circuit before calling the more
     /// expensive `existing_proofs_for_data` which clones all proof bytes.
     pub fn proof_count_for_data(&self, data_root: &H256) -> usize {
-        let new = self.new_payloads.lock().unwrap().proof_count_for_root(data_root);
-        let known = self.known_payloads.lock().unwrap().proof_count_for_root(data_root);
+        let new = self
+            .new_payloads
+            .lock()
+            .unwrap()
+            .proof_count_for_root(data_root);
+        let known = self
+            .known_payloads
+            .lock()
+            .unwrap()
+            .proof_count_for_root(data_root);
         new + known
     }
 
@@ -911,7 +919,11 @@ impl Store {
         data_root: &H256,
     ) -> (Vec<AggregatedSignatureProof>, Vec<AggregatedSignatureProof>) {
         let new = self.new_payloads.lock().unwrap().proofs_for_root(data_root);
-        let known = self.known_payloads.lock().unwrap().proofs_for_root(data_root);
+        let known = self
+            .known_payloads
+            .lock()
+            .unwrap()
+            .proofs_for_root(data_root);
         (new, known)
     }
 

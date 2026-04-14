@@ -184,8 +184,7 @@ pub fn aggregate_proofs(
     let deserialized = deserialize_children(children)?;
     let children_refs = to_children_refs(&deserialized);
 
-    let (_sorted_pubkeys, aggregate) =
-        xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
+    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
 
     serialize_aggregate(aggregate)
 }

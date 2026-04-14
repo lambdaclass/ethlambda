@@ -193,9 +193,15 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             continue;
         }
 
-        let Some((proof, all_ids)) =
-            try_aggregate(&child_proofs, pubkeys, sigs, &raw_ids, &data_root, slot, &head_state)
-        else {
+        let Some((proof, all_ids)) = try_aggregate(
+            &child_proofs,
+            pubkeys,
+            sigs,
+            &raw_ids,
+            &data_root,
+            slot,
+            &head_state,
+        ) else {
             continue;
         };
 
@@ -235,9 +241,15 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             continue;
         }
 
-        let Some((proof, all_ids)) =
-            try_aggregate(&child_proofs, vec![], vec![], &[], data_root, att_data.slot, &head_state)
-        else {
+        let Some((proof, all_ids)) = try_aggregate(
+            &child_proofs,
+            vec![],
+            vec![],
+            &[],
+            data_root,
+            att_data.slot,
+            &head_state,
+        ) else {
             continue;
         };
 
@@ -288,12 +300,7 @@ fn try_aggregate(
         let participant_ids: Vec<u64> = proof.participant_indices().collect();
         let child_pubkeys: Vec<ValidatorPublicKey> = participant_ids
             .iter()
-            .filter_map(|&vid| {
-                validators
-                    .get(vid as usize)?
-                    .get_attestation_pubkey()
-                    .ok()
-            })
+            .filter_map(|&vid| validators.get(vid as usize)?.get_attestation_pubkey().ok())
             .collect();
         if child_pubkeys.len() != participant_ids.len() {
             warn!(
@@ -315,7 +322,13 @@ fn try_aggregate(
     let slot_u32: u32 = slot.try_into().expect("slot exceeds u32");
     let proof_data = {
         let _timing = metrics::time_pq_sig_aggregated_signatures_building();
-        aggregate_mixed(children_for_aggregation, raw_pubkeys, raw_sigs, data_root, slot_u32)
+        aggregate_mixed(
+            children_for_aggregation,
+            raw_pubkeys,
+            raw_sigs,
+            data_root,
+            slot_u32,
+        )
     }
     .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures"))
     .ok()?;
@@ -326,7 +339,10 @@ fn try_aggregate(
     all_ids.dedup();
 
     let participants = aggregation_bits_from_validator_indices(&all_ids);
-    Some((AggregatedSignatureProof::new(participants, proof_data), all_ids))
+    Some((
+        AggregatedSignatureProof::new(participants, proof_data),
+        all_ids,
+    ))
 }
 
 /// Greedy set-cover selection of proofs to maximize validator coverage.
