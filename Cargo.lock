@@ -2126,7 +2126,6 @@ dependencies = [
 name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "ethlambda-metrics",
  "ethlambda-network-api",
  "ethlambda-storage",
