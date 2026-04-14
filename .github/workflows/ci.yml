@@ -81,6 +81,11 @@ jobs:
         working-directory: leanSpec
         run: uv sync --no-progress
 
+      - name: Generate Poseidon1 production keys
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        working-directory: leanSpec
+        run: uv run python -m consensus_testing.keys --scheme prod --count 12 --max-slot 100
+
       - name: Generate test fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         working-directory: leanSpec
