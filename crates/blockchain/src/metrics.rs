@@ -310,10 +310,6 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
-static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
-    register_int_gauge_vec!("lean_node_sync_status", "Node sync status", &["status"]).unwrap()
-});
-
 static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -367,7 +363,6 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_SUCCESS_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_FAILURES_TOTAL);
-    std::sync::LazyLock::force(&LEAN_NODE_SYNC_STATUS);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
 }
 
@@ -556,11 +551,3 @@ pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
 }
 
-/// Set the node sync status. Sets the given status label to 1 and all others to 0.
-pub fn set_sync_status(status: &str) {
-    for label in &["idle", "syncing", "synced"] {
-        LEAN_NODE_SYNC_STATUS
-            .with_label_values(&[label])
-            .set(i64::from(*label == status));
-    }
-}

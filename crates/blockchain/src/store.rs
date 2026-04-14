@@ -814,7 +814,6 @@ pub fn produce_block_with_signatures(
 
     let known_block_roots = store.get_block_roots();
 
-    let _payload_timing = metrics::time_block_building_payload_aggregation();
     let (block, signatures, post_checkpoints) = build_block(
         &head_state,
         slot,
@@ -823,7 +822,6 @@ pub fn produce_block_with_signatures(
         &known_block_roots,
         &aggregated_payloads,
     )?;
-    drop(_payload_timing);
 
     metrics::observe_block_aggregated_payloads(signatures.len());
 
@@ -1041,6 +1039,8 @@ fn build_block(
     let mut accumulated_proof_bytes: usize = 0;
 
     if !aggregated_payloads.is_empty() {
+        let _payload_timing = metrics::time_block_building_payload_aggregation();
+
         // Genesis edge case: when building on genesis (slot 0),
         // process_block_header will set latest_justified.root = parent_root.
         // Derive this upfront so attestation filtering matches.
