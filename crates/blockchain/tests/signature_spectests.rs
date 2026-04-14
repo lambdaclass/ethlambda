@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    block::{Block, SignedBlockWithAttestation},
+    block::{Block, SignedBlock},
     primitives::HashTreeRoot as _,
     state::State,
 };
@@ -47,11 +47,10 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
 
         // Step 2: Run the state transition function with the block fixture
-        let signed_block: SignedBlockWithAttestation = test.signed_block_with_attestation.into();
+        let signed_block: SignedBlock = test.signed_block.into();
 
         // Advance time to the block's slot
-        let block_time_ms =
-            genesis_time * 1000 + signed_block.block.block.slot * MILLISECONDS_PER_SLOT;
+        let block_time_ms = genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
         store::on_tick(&mut st, block_time_ms, true, false);
 
         // Process the block (this includes signature verification)

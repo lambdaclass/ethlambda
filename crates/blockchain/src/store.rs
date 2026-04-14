@@ -11,10 +11,7 @@ use ethlambda_types::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
         HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
-    block::{
-        AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody,
-        SignedBlockWithAttestation,
-    },
+    block::{AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody, SignedBlock},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -22,7 +19,10 @@ use ethlambda_types::{
 };
 use tracing::{info, trace, warn};
 
-use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
+use crate::{
+    INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    metrics,
+};
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
@@ -118,9 +118,8 @@ fn update_safe_target(store: &mut Store) {
 
     let blocks = store.get_live_chain();
     // Merge both attestation pools (known + new).
-    // At interval 3 the migration (interval 4) hasn't run yet, so attestations
-    // that entered "known" directly (proposer's own attestation in block body,
-    // node's self-attestation) would be invisible without this merge.
+    // At interval 3 the promotion (interval 4) hasn't run yet, so we must
+    // merge both pools to get a complete view for safe target computation.
     let attestations = store.extract_latest_all_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
@@ -162,7 +161,7 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             let Some(validator) = validators.get(*vid as usize) else {
                 continue;
             };
-            let Ok(pubkey) = validator.get_pubkey() else {
+            let Ok(pubkey) = validator.get_attestation_pubkey() else {
                 continue;
             };
             sigs.push(sig.clone());
@@ -377,7 +376,7 @@ pub fn on_gossip_attestation(
         return Err(StoreError::InvalidValidatorIndex);
     }
     let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_pubkey()
+        .get_attestation_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
     // Verify the validator's XMSS signature
@@ -445,7 +444,7 @@ pub fn on_gossip_aggregated_attestation(
         .iter()
         .map(|&vid| {
             validators[vid as usize]
-                .get_pubkey()
+                .get_attestation_pubkey()
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
         })
         .collect::<Result<_, _>>()?;
@@ -489,10 +488,7 @@ pub fn on_gossip_aggregated_attestation(
 ///
 /// This is the safe default: it always verifies cryptographic signatures
 /// and stores them for future block building. Use this for all production paths.
-pub fn on_block(
-    store: &mut Store,
-    signed_block: SignedBlockWithAttestation,
-) -> Result<(), StoreError> {
+pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
     on_block_core(store, signed_block, true)
 }
 
@@ -502,9 +498,40 @@ pub fn on_block(
 /// where signatures are absent or irrelevant (e.g., fork choice spec tests).
 pub fn on_block_without_verification(
     store: &mut Store,
-    signed_block: SignedBlockWithAttestation,
+    signed_block: SignedBlock,
 ) -> Result<(), StoreError> {
     on_block_core(store, signed_block, false)
+}
+
+/// Process a gossip attestation without signature verification.
+///
+/// Validates the attestation data and inserts it directly into the known
+/// attestation payloads (bypassing the gossip → aggregate → promote pipeline).
+/// Use only in tests where signatures are absent (e.g., fork choice spec tests).
+pub fn on_gossip_attestation_without_verification(
+    store: &mut Store,
+    validator_id: u64,
+    data: AttestationData,
+) -> Result<(), StoreError> {
+    validate_attestation_data(store, &data)?;
+
+    // Validate the validator index exists in the target state
+    let target_state = store
+        .get_state(&data.target.root)
+        .ok_or(StoreError::MissingTargetState(data.target.root))?;
+    if validator_id >= target_state.validators.len() as u64 {
+        return Err(StoreError::InvalidValidatorIndex);
+    }
+
+    let bits = aggregation_bits_from_validator_indices(&[validator_id]);
+    let proof = AggregatedSignatureProof::empty(bits);
+    let hashed = HashedAttestationData::new(data);
+    store.insert_known_aggregated_payload(hashed, proof);
+
+    // Recalculate fork choice head after inserting the attestation
+    update_head(store, false);
+
+    Ok(())
 }
 
 /// Core block processing logic.
@@ -513,13 +540,13 @@ pub fn on_block_without_verification(
 /// for future block building. When false, all signature checks are skipped.
 fn on_block_core(
     store: &mut Store,
-    signed_block: SignedBlockWithAttestation,
+    signed_block: SignedBlock,
     verify: bool,
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
-    let block = &signed_block.block.block;
+    let block = &signed_block.message;
     let block_root = block.hash_tree_root();
     let slot = block.slot;
 
@@ -540,7 +567,7 @@ fn on_block_core(
             })?;
 
     // Each unique AttestationData must appear at most once per block.
-    let attestations = &signed_block.block.block.body.attestations;
+    let attestations = &signed_block.message.body.attestations;
     let mut seen = HashSet::with_capacity(attestations.len());
     for att in attestations {
         if !seen.insert(&att.data) {
@@ -550,6 +577,13 @@ fn on_block_core(
             });
         }
     }
+    // Reject blocks exceeding the per-block distinct-attestation-data cap (leanSpec #536).
+    if seen.len() > MAX_ATTESTATIONS_DATA {
+        return Err(StoreError::TooManyAttestationData {
+            count: seen.len(),
+            max: MAX_ATTESTATIONS_DATA,
+        });
+    }
 
     let sig_verification_start = std::time::Instant::now();
     if verify {
@@ -558,8 +592,7 @@ fn on_block_core(
     }
     let sig_verification = sig_verification_start.elapsed();
 
-    let block = signed_block.block.block.clone();
-    let proposer_attestation = signed_block.block.proposer_attestation.clone();
+    let block = signed_block.message.clone();
 
     // Execute state transition function to compute post-block state
     let state_transition_start = std::time::Instant::now();
@@ -601,31 +634,10 @@ fn on_block_core(
         metrics::inc_attestations_valid(count);
     }
 
-    // Process proposer attestation as pending (enters "new" stage via gossip path)
-    // The proposer's attestation should NOT affect this block's fork choice position.
-    let proposer_vid = proposer_attestation.validator_id;
-    let proposer_hashed = HashedAttestationData::new(proposer_attestation.data.clone());
-
     store.insert_known_aggregated_payloads_batch(known_entries);
 
     // Update forkchoice head based on new block and attestations
-    // IMPORTANT: This must happen BEFORE processing proposer attestation
-    // to prevent the proposer from gaining circular weight advantage.
     update_head(store, false);
-
-    if !verify {
-        // Without sig verification, insert directly with a dummy proof
-        let participants = aggregation_bits_from_validator_indices(&[proposer_vid]);
-        let proof = AggregatedSignatureProof::empty(participants);
-        store.insert_new_aggregated_payload(proposer_hashed, proof);
-    } else {
-        // Store the proposer's signature unconditionally for future block building.
-        // Subnet filtering is handled at the P2P subscription layer.
-        let proposer_sig =
-            ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-                .map_err(|_| StoreError::SignatureDecodingFailed)?;
-        store.insert_gossip_signature(proposer_hashed, proposer_vid, proposer_sig);
-    }
 
     let block_total = block_start.elapsed();
     info!(
@@ -930,17 +942,12 @@ pub enum StoreError {
     NotProposer { validator_index: u64, slot: u64 },
 
     #[error(
-        "Proposer attestation validator_id {attestation_id} does not match block proposer_index {proposer_index}"
-    )]
-    ProposerAttestationMismatch {
-        attestation_id: u64,
-        proposer_index: u64,
-    },
-
-    #[error(
         "Block contains duplicate AttestationData entries: {count} entries but only {unique} unique"
     )]
     DuplicateAttestationData { count: usize, unique: usize },
+
+    #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
+    TooManyAttestationData { count: usize, max: usize },
 }
 
 /// Build an AggregationBits bitfield from a list of validator indices.
@@ -1126,7 +1133,7 @@ fn extend_proofs_greedily(
 ///
 /// Returns the block and a list of attestation signature proofs
 /// (one per attestation in block.body.attestations). The proposer signature
-/// proof is NOT included; it is appended by the caller.
+/// is NOT included; it is appended by the caller.
 fn build_block(
     head_state: &State,
     slot: u64,
@@ -1167,6 +1174,10 @@ fn build_block(
                 }
                 if processed_data_roots.contains(data_root) {
                     continue;
+                }
+                // Cap distinct AttestationData entries per block (leanSpec #536).
+                if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
+                    break;
                 }
                 if !known_block_roots.contains(&att_data.head.root) {
                     continue;
@@ -1249,16 +1260,13 @@ fn build_block(
 /// Verify all signatures in a signed block.
 ///
 /// Each attestation has a corresponding proof in the signature list.
-fn verify_signatures(
-    state: &State,
-    signed_block: &SignedBlockWithAttestation,
-) -> Result<(), StoreError> {
+fn verify_signatures(state: &State, signed_block: &SignedBlock) -> Result<(), StoreError> {
     use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
     let total_start = std::time::Instant::now();
 
-    let block = &signed_block.block.block;
+    let block = &signed_block.message;
     let attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
@@ -1286,13 +1294,14 @@ fn verify_signatures(
             let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
             let message = attestation.data.hash_tree_root();
 
+            // Collect attestation public keys with bounds check in a single pass
             let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
                 .map(|vid| {
                     if vid >= num_validators {
                         return Err(StoreError::InvalidValidatorIndex);
                     }
                     validators[vid as usize]
-                        .get_pubkey()
+                        .get_attestation_pubkey()
                         .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
                 })
                 .collect::<Result<_, _>>()?;
@@ -1327,15 +1336,7 @@ fn verify_signatures(
 
     let proposer_start = std::time::Instant::now();
 
-    let proposer_attestation = &signed_block.block.proposer_attestation;
-
-    if proposer_attestation.validator_id != block.proposer_index {
-        return Err(StoreError::ProposerAttestationMismatch {
-            attestation_id: proposer_attestation.validator_id,
-            proposer_index: block.proposer_index,
-        });
-    }
-
+    // Verify proposer signature over block root using proposal key
     let proposer_signature =
         ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
             .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
@@ -1345,17 +1346,13 @@ fn verify_signatures(
         .ok_or(StoreError::InvalidValidatorIndex)?;
 
     let proposer_pubkey = proposer
-        .get_pubkey()
+        .get_proposal_pubkey()
         .map_err(|_| StoreError::PubkeyDecodingFailed(proposer.index))?;
 
-    let slot = proposer_attestation
-        .data
-        .slot
-        .try_into()
-        .expect("slot exceeds u32");
-    let message = proposer_attestation.data.hash_tree_root();
+    let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
+    let block_root = block.hash_tree_root();
 
-    if !proposer_signature.is_valid(&proposer_pubkey, slot, &message) {
+    if !proposer_signature.is_valid(&proposer_pubkey, slot, &block_root) {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
     let proposer_elapsed = proposer_start.elapsed();
@@ -1423,12 +1420,10 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{
-            AggregatedAttestation, AggregationBits, Attestation, AttestationData, XmssSignature,
-        },
+        attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
         block::{
             AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
-            BlockWithAttestation, SignedBlockWithAttestation,
+            SignedBlock,
         },
         checkpoint::Checkpoint,
         signature::SIGNATURE_SIZE,
@@ -1459,26 +1454,20 @@ mod tests {
 
         let attestation = AggregatedAttestation {
             aggregation_bits: attestation_bits,
-            data: attestation_data.clone(),
+            data: attestation_data,
         };
         let proof = AggregatedSignatureProof::empty(proof_bits);
 
         let attestations = AggregatedAttestations::try_from(vec![attestation]).unwrap();
         let attestation_signatures = AttestationSignatures::try_from(vec![proof]).unwrap();
 
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block: Block {
-                    slot: 0,
-                    proposer_index: 0,
-                    parent_root: H256::ZERO,
-                    state_root: H256::ZERO,
-                    body: BlockBody { attestations },
-                },
-                proposer_attestation: Attestation {
-                    validator_id: 0,
-                    data: attestation_data,
-                },
+        let signed_block = SignedBlock {
+            message: Block {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody { attestations },
             },
             signature: BlockSignatures {
                 attestation_signatures,
@@ -1513,7 +1502,8 @@ mod tests {
         // Create genesis state with NUM_VALIDATORS validators.
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
                 index: i as u64,
             })
             .collect();
@@ -1597,25 +1587,8 @@ mod tests {
 
         // Construct the full signed block as it would be sent over gossip
         let attestation_sigs: Vec<AggregatedSignatureProof> = signatures;
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block,
-                proposer_attestation: Attestation {
-                    validator_id: proposer_index,
-                    data: AttestationData {
-                        slot,
-                        head: Checkpoint {
-                            root: parent_root,
-                            slot: 0,
-                        },
-                        target: Checkpoint {
-                            root: parent_root,
-                            slot: 0,
-                        },
-                        source,
-                    },
-                },
-            },
+        let signed_block = SignedBlock {
+            message: block,
             signature: BlockSignatures {
                 attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
                 proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
@@ -1631,7 +1604,7 @@ mod tests {
             "block with {} attestations is {} bytes SSZ, \
              which exceeds MAX_PAYLOAD_SIZE ({} bytes). \
              build_block must enforce a size cap (issue #259).",
-            signed_block.block.block.body.attestations.len(),
+            signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
         );
@@ -1886,19 +1859,13 @@ mod tests {
         ])
         .unwrap();
 
-        let signed_block = SignedBlockWithAttestation {
-            block: BlockWithAttestation {
-                block: Block {
-                    slot: 1,
-                    proposer_index: 0,
-                    parent_root: head_root,
-                    state_root: H256::ZERO,
-                    body: BlockBody { attestations },
-                },
-                proposer_attestation: Attestation {
-                    validator_id: 0,
-                    data: att_data,
-                },
+        let signed_block = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: head_root,
+                state_root: H256::ZERO,
+                body: BlockBody { attestations },
             },
             signature: BlockSignatures {
                 attestation_signatures,

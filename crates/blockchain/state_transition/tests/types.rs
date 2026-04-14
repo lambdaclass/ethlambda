@@ -71,7 +71,7 @@ pub struct PostState {
     pub historical_block_hashes: Option<Container<H256>>,
 
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Option<Container<u64>>,
+    pub justified_slots: Option<Container<bool>>,
 
     #[serde(rename = "justificationsRoots")]
     pub justifications_roots: Option<Container<H256>>,

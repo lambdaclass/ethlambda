@@ -55,7 +55,7 @@ prometheus = "0.14"
 clap = { version = "4.3", features = ["derive", "env"] }
 
 # XMSS signatures
-leansig = { git = "https://github.com/leanEthereum/leanSig.git", rev = "73bedc26ed961b110df7ac2e234dc11361a4bf25" }
+leansig = { git = "https://github.com/leanEthereum/leanSig", branch = "devnet4" }
 
 # SSZ implementation
 libssz = "0.2"
@@ -67,7 +67,7 @@ libssz-types = "0.2"
 vergen-git2 = { version = "9", features = ["rustc"] }
 
 rayon = "1.11"
-rand = "0.9"
+rand = "0.10"
 rocksdb = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 eyre = "0.6"
@@ -75,3 +75,4 @@ eyre = "0.6"
 # Allocator + heap profiling
 tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
+

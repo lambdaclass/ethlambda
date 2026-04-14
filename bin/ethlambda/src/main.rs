@@ -18,6 +18,7 @@ use std::{
 };
 
 use clap::Parser;
+use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
@@ -135,7 +136,8 @@ async fn main() -> eyre::Result<()> {
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
-        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id);
+        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
+            .expect("Failed to load validator keys");
 
     let data_dir =
         std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
@@ -234,16 +236,22 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
     parse_enrs(enrs)
 }
 
-#[derive(Debug, Deserialize)]
+/// One entry in `annotated_validators.yaml` as emitted by `lean-quickstart`'s
+/// genesis generator.
+///
+/// Each validator appears twice in the file under its node name: once with the
+/// attester key and once with the proposer key. The role is determined by the
+/// `_attester_` / `_proposer_` substring in `privkey_file`.
+#[derive(Debug, Deserialize, Clone)]
 struct AnnotatedValidator {
     index: u64,
-    #[serde(rename = "pubkey_hex")]
-    #[serde(deserialize_with = "deser_pubkey_hex")]
-    _pubkey: ValidatorPubkeyBytes,
+    /// Parsed for hex-format validation only; not cross-checked against the
+    /// loaded secret key since leansig doesn't expose any pk getters.
+    #[serde(rename = "pubkey_hex", deserialize_with = "deser_pubkey_hex")]
+    _pubkey_hex: ValidatorPubkeyBytes,
     privkey_file: PathBuf,
 }
 
-// Taken from ethrex-common
 pub fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -258,57 +266,133 @@ where
     Ok(pubkey)
 }
 
+#[derive(Debug)]
+enum ValidatorKeyRole {
+    Attestation,
+    Proposal,
+}
+
+/// Classify a privkey file as attestation or proposal based on the filename.
+///
+/// Matches zeam's (`pkgs/cli/src/node.zig:540`) and lantern's
+/// (`client_keys.c:606`) routing, which lets all three clients share the
+/// `lean-quickstart` generator output unchanged.
+fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("non-utf8 filename '{}'", file.display()))?;
+    let is_attester = name.contains("attester");
+    let is_proposer = name.contains("proposer");
+    match (is_attester, is_proposer) {
+        (true, false) => Ok(ValidatorKeyRole::Attestation),
+        (false, true) => Ok(ValidatorKeyRole::Proposal),
+        (false, false) => Err(format!(
+            "filename '{name}' must contain 'attester' or 'proposer'"
+        )),
+        (true, true) => Err(format!(
+            "filename '{name}' contains both 'attester' and 'proposer'; ambiguous"
+        )),
+    }
+}
+
+#[derive(Default)]
+struct RoleSlots {
+    attestation: Option<PathBuf>,
+    proposal: Option<PathBuf>,
+}
+
 fn read_validator_keys(
     validators_path: impl AsRef<Path>,
     validator_keys_dir: impl AsRef<Path>,
     node_id: &str,
-) -> HashMap<u64, ValidatorSecretKey> {
+) -> Result<HashMap<u64, ValidatorKeyPair>, String> {
     let validators_path = validators_path.as_ref();
     let validator_keys_dir = validator_keys_dir.as_ref();
-    let validators_yaml =
-        std::fs::read_to_string(validators_path).expect("Failed to read validators file");
-    // File is a map from validator name to its annotated info (the info is inside a vec for some reason)
+    let validators_yaml = std::fs::read_to_string(validators_path)
+        .map_err(|err| format!("Failed to read validators file: {err}"))?;
     let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
-        serde_yaml_ng::from_str(&validators_yaml).expect("Failed to parse validators file");
+        serde_yaml_ng::from_str(&validators_yaml)
+            .map_err(|err| format!("Failed to parse validators file: {err}"))?;
 
     let validator_vec = validator_infos
         .get(node_id)
-        .unwrap_or_else(|| panic!("Node ID '{}' not found in validators config", node_id));
+        .ok_or_else(|| format!("Node ID '{node_id}' not found in validators config"))?;
+
+    let resolve_path = |file: &Path| -> PathBuf {
+        if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            validator_keys_dir.join(file)
+        }
+    };
+
+    // Group entries per validator index, routing each to its role slot.
+    let mut grouped: BTreeMap<u64, RoleSlots> = BTreeMap::new();
+    for entry in validator_vec {
+        let role = classify_role(&entry.privkey_file)?;
+        let path = resolve_path(&entry.privkey_file);
+        let slots = grouped.entry(entry.index).or_default();
+        let target = match role {
+            ValidatorKeyRole::Attestation => &mut slots.attestation,
+            ValidatorKeyRole::Proposal => &mut slots.proposal,
+        };
+        if target.is_some() {
+            return Err(format!(
+                "validator {}: duplicate {role:?} entry",
+                entry.index
+            ));
+        }
+        *target = Some(path);
+    }
+
+    let load_key = |path: &Path, purpose: &str| -> Result<ValidatorSecretKey, String> {
+        let bytes = std::fs::read(path).map_err(|err| {
+            format!(
+                "Failed to read {purpose} key file {}: {err}",
+                path.display()
+            )
+        })?;
+        ValidatorSecretKey::from_bytes(&bytes)
+            .map_err(|err| format!("Failed to parse {purpose} key {}: {err:?}", path.display()))
+    };
 
     let mut validator_keys = HashMap::new();
+    for (idx, slots) in grouped {
+        let att_path = slots
+            .attestation
+            .ok_or_else(|| format!("validator {idx}: missing attester entry"))?;
+        let prop_path = slots
+            .proposal
+            .ok_or_else(|| format!("validator {idx}: missing proposer entry"))?;
 
-    for validator in validator_vec {
-        let validator_index = validator.index;
+        info!(
+            %node_id,
+            index = idx,
+            attestation_key = ?att_path,
+            proposal_key = ?prop_path,
+            "Loading validator key pair"
+        );
 
-        // Resolve the secret key file path relative to the validators config directory
-        let secret_key_path = if validator.privkey_file.is_absolute() {
-            validator.privkey_file.clone()
-        } else {
-            validator_keys_dir.join(&validator.privkey_file)
-        };
+        let attestation_key = load_key(&att_path, "attestation")?;
+        let proposal_key = load_key(&prop_path, "proposal")?;
 
-        info!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, "Loading validator secret key");
-
-        // Read the hex-encoded secret key file
-        let secret_key_bytes =
-            std::fs::read(&secret_key_path).expect("Failed to read validator secret key file");
-
-        // Parse the secret key
-        let secret_key = ValidatorSecretKey::from_bytes(&secret_key_bytes).unwrap_or_else(|err| {
-            error!(node_id=%node_id, index=validator_index, secret_key_file=?secret_key_path, ?err, "Failed to parse validator secret key");
-            std::process::exit(1);
-        });
-
-        validator_keys.insert(validator_index, secret_key);
+        validator_keys.insert(
+            idx,
+            ValidatorKeyPair {
+                attestation_key,
+                proposal_key,
+            },
+        );
     }
 
     info!(
-        node_id = %node_id,
+        %node_id,
         count = validator_keys.len(),
-        "Loaded validator secret keys"
+        "Loaded validator key pairs"
     );
 
-    validator_keys
+    Ok(validator_keys)
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {

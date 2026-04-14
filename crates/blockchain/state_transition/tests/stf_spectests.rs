@@ -194,14 +194,8 @@ fn compare_post_states(
         }
     }
     if let Some(justified_slots) = justified_slots {
-        let post_slots: Vec<_> = (0..post_state.justified_slots.len())
-            .filter_map(|i| {
-                if post_state.justified_slots.get(i) == Some(true) {
-                    Some(i as u64)
-                } else {
-                    None
-                }
-            })
+        let post_slots: Vec<bool> = (0..justified_slots.data.len())
+            .map(|i| post_state.justified_slots.get(i) == Some(true))
             .collect();
         if post_slots != justified_slots.data {
             return Err(format!(
