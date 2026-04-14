@@ -185,6 +185,11 @@ impl PayloadBuffer {
         self.data.len()
     }
 
+    /// Return the number of proofs for a given data_root without cloning.
+    fn proof_count_for_root(&self, data_root: &H256) -> usize {
+        self.data.get(data_root).map_or(0, |e| e.proofs.len())
+    }
+
     /// Return cloned proofs for a given data_root, or empty vec if none.
     fn proofs_for_root(&self, data_root: &H256) -> Vec<AggregatedSignatureProof> {
         self.data
@@ -883,6 +888,16 @@ impl Store {
             .iter()
             .map(|(root, entry)| (*root, (entry.data.clone(), entry.proofs.clone())))
             .collect()
+    }
+
+    /// Combined proof count for a data_root across new and known buffers.
+    ///
+    /// Cheap check (no cloning) to short-circuit before calling the more
+    /// expensive `existing_proofs_for_data` which clones all proof bytes.
+    pub fn proof_count_for_data(&self, data_root: &H256) -> usize {
+        let new = self.new_payloads.lock().unwrap().proof_count_for_root(data_root);
+        let known = self.known_payloads.lock().unwrap().proof_count_for_root(data_root);
+        new + known
     }
 
     /// Look up existing proofs for a given data_root from both new and known buffers.

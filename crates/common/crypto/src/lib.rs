@@ -95,22 +95,18 @@ pub fn aggregate_signatures(
 
     ensure_prover_ready();
 
-    // Zip public keys and signatures into (XmssPublicKey, XmssSignature) pairs
     let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
         .into_iter()
         .zip(signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
 
-    // Aggregate using lean-multisig (no recursive children at this level).
     // log_inv_rate=2 matches the devnet-4 cross-client convention (zeam, ream,
     // grandine, lantern's c-leanvm-xmss all use 2). Ethlambda previously
     // hardcoded 1, which produced proofs incompatible with every other client.
     let (_sorted_pubkeys, aggregate) = xmss_aggregate(&[], raw_xmss, &message.0, slot, 2);
 
-    let serialized = aggregate.serialize();
-    let serialized_len = serialized.len();
-    ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
+    serialize_aggregate(aggregate)
 }
 
 /// Aggregate both existing proofs (children) and raw XMSS signatures in a single call.

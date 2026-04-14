@@ -154,10 +154,9 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     let mut keys_to_delete: Vec<(u64, H256)> = Vec::new();
     let mut payload_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
 
-    // Index gossip signatures by data_root for the new-payload-only pass.
-    let gossip_by_root: HashMap<H256, &Vec<(u64, ValidatorSignature)>> = gossip_groups
+    let gossip_roots: HashSet<H256> = gossip_groups
         .iter()
-        .map(|(hashed, sigs)| (hashed.root(), sigs))
+        .map(|(hashed, _)| hashed.root())
         .collect();
 
     // --- Pass 1: attestation data with gossip signatures ---
@@ -167,11 +166,10 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
         let data_root = hashed.root();
         let slot = hashed.data().slot;
 
-        // Phase 1: Select existing proofs as children (greedy set-cover).
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
         let (child_proofs, covered) = select_proofs_greedily(&new_proofs, &known_proofs);
 
-        // Phase 2: Fill uncovered validators with raw gossip signatures.
+        // Collect raw gossip signatures for uncovered validators.
         let mut sigs = vec![];
         let mut pubkeys = vec![];
         let mut raw_ids = vec![];
@@ -191,12 +189,10 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             raw_ids.push(*vid);
         }
 
-        // Need at least one raw signature OR at least 2 children to merge.
         if raw_ids.is_empty() && child_proofs.len() < 2 {
             continue;
         }
 
-        // Phase 3: Aggregate.
         let Some((proof, all_ids)) =
             try_aggregate(&child_proofs, pubkeys, sigs, &raw_ids, &data_root, slot, &head_state)
         else {
@@ -223,8 +219,13 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     // These entries have 0 raw signatures; they're only aggregated if 2+ existing
     // proofs can be merged into one (pure recursive aggregation).
     for (data_root, att_data) in &new_payload_keys {
-        if gossip_by_root.contains_key(data_root) {
-            continue; // Already processed in pass 1
+        if gossip_roots.contains(data_root) {
+            continue;
+        }
+
+        // Short-circuit: avoid cloning proofs when there aren't enough to merge.
+        if store.proof_count_for_data(data_root) < 2 {
+            continue;
         }
 
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
