@@ -35,11 +35,14 @@ pub enum AggregationError {
     #[error("public key count ({0}) does not match signature count ({1})")]
     CountMismatch(usize, usize),
 
-    #[error("aggregation panicked")]
-    AggregationPanicked,
-
     #[error("proof size too big: {0} bytes")]
     ProofTooBig(usize),
+
+    #[error("child proof deserialization failed at index {0}")]
+    ChildDeserializationFailed(usize),
+
+    #[error("need at least 2 children for recursive aggregation, got {0}")]
+    InsufficientChildren(usize),
 }
 
 /// Error type for signature verification operations.
@@ -104,6 +107,52 @@ pub fn aggregate_signatures(
     // grandine, lantern's c-leanvm-xmss all use 2). Ethlambda previously
     // hardcoded 1, which produced proofs incompatible with every other client.
     let (_sorted_pubkeys, aggregate) = xmss_aggregate(&[], raw_xmss, &message.0, slot, 2);
+
+    let serialized = aggregate.serialize();
+    let serialized_len = serialized.len();
+    ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
+}
+
+/// Recursively aggregate multiple already-aggregated proofs into one.
+///
+/// Each child is a `(public_keys, proof_data)` pair where `public_keys` are the
+/// attestation public keys of the validators covered by that child proof, and
+/// `proof_data` is the serialized `AggregatedXMSS`. At least 2 children are required.
+///
+/// This is used during block building to compact multiple proofs sharing the same
+/// `AttestationData` into a single merged proof (leanSpec PR #510).
+pub fn aggregate_proofs(
+    children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    message: &H256,
+    slot: u32,
+) -> Result<ByteListMiB, AggregationError> {
+    if children.len() < 2 {
+        return Err(AggregationError::InsufficientChildren(children.len()));
+    }
+
+    ensure_prover_ready();
+
+    // Convert each child: deserialize proof and convert public keys
+    let deserialized: Vec<(Vec<LeanSigPubKey>, AggregatedXMSS)> = children
+        .into_iter()
+        .enumerate()
+        .map(|(i, (pubkeys, proof_data))| {
+            let lean_pks: Vec<LeanSigPubKey> =
+                pubkeys.into_iter().map(|pk| pk.into_inner()).collect();
+            let aggregate = AggregatedXMSS::deserialize(proof_data.iter().as_slice())
+                .ok_or(AggregationError::ChildDeserializationFailed(i))?;
+            Ok((lean_pks, aggregate))
+        })
+        .collect::<Result<Vec<_>, AggregationError>>()?;
+
+    // Build references for xmss_aggregate: &[(&[XmssPublicKey], AggregatedXMSS)]
+    let children_refs: Vec<(&[LeanSigPubKey], AggregatedXMSS)> = deserialized
+        .iter()
+        .map(|(pks, agg)| (pks.as_slice(), agg.clone()))
+        .collect();
+
+    // No raw XMSS signatures; purely recursive merge of existing proofs.
+    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
 
     let serialized = aggregate.serialize();
     let serialized_len = serialized.len();

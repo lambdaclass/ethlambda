@@ -23,11 +23,8 @@ mod types;
 
 // Tests where the fixture relies on gossip attestation behavior not serialized into the JSON.
 // These pass in the Python spec but fail in our runner because we don't simulate gossip.
-const SKIP_TESTS: &[&str] = &[
-    "test_reorg_with_slot_gaps",
-    // Signature verification is skipped in test mode, so invalid signature tests always pass
-    "test_gossip_attestation_with_invalid_signature",
-];
+// Signature verification is skipped in test mode, so invalid signature tests always pass.
+const SKIP_TESTS: &[&str] = &["test_gossip_attestation_with_invalid_signature"];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
