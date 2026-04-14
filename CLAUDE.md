@@ -338,7 +338,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 ## Common Gotchas
 
 ### Aggregator Flag Required for Finalization
-- At least one node **must** be started with `--is-aggregator` to finalize blocks in production
+- At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
 - The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
