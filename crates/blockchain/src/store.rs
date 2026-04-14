@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use ethlambda_crypto::{aggregate_proofs, aggregate_signatures};
+use ethlambda_crypto::{aggregate_mixed, aggregate_proofs};
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
@@ -14,7 +14,7 @@ use ethlambda_types::{
     block::{AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody, SignedBlock},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
+    signature::{ValidatorPublicKey, ValidatorSignature},
     state::State,
 };
 use tracing::{info, trace, warn};
@@ -121,13 +121,27 @@ fn update_safe_target(store: &mut Store) {
     store.set_safe_target(safe_target);
 }
 
-/// Aggregate committee signatures at interval 2.
+/// Aggregate committee signatures at interval 2 using mixed aggregation.
 ///
-/// Collects individual gossip signatures, aggregates them by attestation data,
-/// and stores the resulting proofs in the new aggregated payloads buffer.
+/// Iterates over the union of attestation data with gossip signatures OR pending
+/// new payloads (`new.keys() | gossip_sigs.keys()` in the spec). For each entry:
+///
+/// 1. **Selects** existing proofs from new/known payload buffers (greedy set-cover)
+/// 2. **Fills** uncovered validators with raw gossip signatures
+/// 3. **Aggregates** both children proofs and raw signatures in a single `xmss_aggregate` call
+///
+/// This matches the spec's incremental proof-building strategy: previous proofs
+/// are fed as children so only genuinely new signatures are aggregated from scratch,
+/// keeping proof trees shallow and avoiding redundant cryptographic work.
+///
+/// Results are inserted into the new (pending) payload buffer. They become
+/// fork-choice-active after `accept_new_attestations` promotes them to known
+/// at interval 0 (with proposal) or interval 4.
 fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAttestation> {
     let gossip_groups = store.iter_gossip_signatures();
-    if gossip_groups.is_empty() {
+    let new_payload_keys = store.new_payload_keys();
+
+    if gossip_groups.is_empty() && new_payload_keys.is_empty() {
         return Vec::new();
     }
     let _timing = metrics::time_committee_signatures_aggregation();
@@ -140,15 +154,32 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
     let mut keys_to_delete: Vec<(u64, H256)> = Vec::new();
     let mut payload_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
 
+    // Index gossip signatures by data_root for the new-payload-only pass.
+    let gossip_by_root: HashMap<H256, &Vec<(u64, ValidatorSignature)>> = gossip_groups
+        .iter()
+        .map(|(hashed, sigs)| (hashed.root(), sigs))
+        .collect();
+
+    // --- Pass 1: attestation data with gossip signatures ---
+    //
+    // Each entry may also have existing proofs (new/known) that become children.
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let slot = hashed.data().slot;
 
+        // Phase 1: Select existing proofs as children (greedy set-cover).
+        let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
+        let (child_proofs, covered) = select_proofs_greedily(&new_proofs, &known_proofs);
+
+        // Phase 2: Fill uncovered validators with raw gossip signatures.
         let mut sigs = vec![];
         let mut pubkeys = vec![];
-        let mut ids = vec![];
+        let mut raw_ids = vec![];
 
         for (vid, sig) in validator_sigs {
+            if covered.contains(vid) {
+                continue;
+            }
             let Some(validator) = validators.get(*vid as usize) else {
                 continue;
             };
@@ -157,51 +188,189 @@ fn aggregate_committee_signatures(store: &mut Store) -> Vec<SignedAggregatedAtte
             };
             sigs.push(sig.clone());
             pubkeys.push(pubkey);
-            ids.push(*vid);
+            raw_ids.push(*vid);
         }
 
-        if ids.is_empty() {
+        // Need at least one raw signature OR at least 2 children to merge.
+        if raw_ids.is_empty() && child_proofs.len() < 2 {
             continue;
         }
 
-        // data_root is already the tree_hash_root of the attestation data
-        let Ok(proof_data) = {
-            let _timing = metrics::time_pq_sig_aggregated_signatures_building();
-            aggregate_signatures(pubkeys, sigs, &data_root, slot as u32)
-        }
-        .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures")) else {
+        // Phase 3: Aggregate.
+        let Some((proof, all_ids)) =
+            try_aggregate(&child_proofs, pubkeys, sigs, &raw_ids, &data_root, slot, &head_state)
+        else {
             continue;
         };
-
-        let participants = aggregation_bits_from_validator_indices(&ids);
-        let proof = AggregatedSignatureProof::new(participants, proof_data);
 
         new_aggregates.push(SignedAggregatedAttestation {
             data: hashed.data().clone(),
             proof: proof.clone(),
         });
-
-        // One entry per attestation data (not per validator)
         payload_entries.push((hashed.clone(), proof));
 
-        // Only delete successfully aggregated signatures
-        keys_to_delete.extend(ids.iter().map(|vid| (*vid, data_root)));
+        // Delete all gossip sigs for this data: raw ones were consumed,
+        // covered ones are redundant (already captured in child proofs).
+        keys_to_delete.extend(validator_sigs.iter().map(|(vid, _)| (*vid, data_root)));
 
         metrics::inc_pq_sig_aggregated_signatures();
-        metrics::inc_pq_sig_attestations_in_aggregated_signatures(ids.len() as u64);
+        metrics::inc_pq_sig_attestations_in_aggregated_signatures(all_ids.len() as u64);
     }
 
-    // Batch-insert aggregated payloads directly into known (immediately usable
-    // for block building and fork choice). Gossip-received aggregated attestations
-    // still go through new -> known promotion.
-    store.insert_known_aggregated_payloads_batch(payload_entries);
-    metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
+    // --- Pass 2: attestation data with new payloads but no gossip signatures ---
+    //
+    // Matches the `new.keys()` part of the spec's `new.keys() | gossip_sigs.keys()`.
+    // These entries have 0 raw signatures; they're only aggregated if 2+ existing
+    // proofs can be merged into one (pure recursive aggregation).
+    for (data_root, att_data) in &new_payload_keys {
+        if gossip_by_root.contains_key(data_root) {
+            continue; // Already processed in pass 1
+        }
 
-    // Delete aggregated entries from gossip_signatures
+        let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
+        let (child_proofs, _covered) = select_proofs_greedily(&new_proofs, &known_proofs);
+
+        if child_proofs.len() < 2 {
+            continue;
+        }
+
+        let Some((proof, all_ids)) =
+            try_aggregate(&child_proofs, vec![], vec![], &[], data_root, att_data.slot, &head_state)
+        else {
+            continue;
+        };
+
+        let hashed = HashedAttestationData::new(att_data.clone());
+        new_aggregates.push(SignedAggregatedAttestation {
+            data: att_data.clone(),
+            proof: proof.clone(),
+        });
+        payload_entries.push((hashed, proof));
+
+        metrics::inc_pq_sig_aggregated_signatures();
+        metrics::inc_pq_sig_attestations_in_aggregated_signatures(all_ids.len() as u64);
+    }
+
+    // Insert into new (pending) payloads. They become fork-choice-active after
+    // accept_new_attestations promotes them to known at interval 0/4.
+    store.insert_new_aggregated_payloads_batch(payload_entries);
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
+
+    // Delete consumed/redundant gossip signatures
     store.delete_gossip_signatures(&keys_to_delete);
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 
     new_aggregates
+}
+
+/// Resolve child pubkeys, call `aggregate_mixed`, and build the combined proof.
+///
+/// Returns `None` if aggregation fails (pubkey resolution or cryptographic error).
+/// On success returns the proof and the full set of covered validator IDs.
+fn try_aggregate(
+    child_proofs: &[AggregatedSignatureProof],
+    raw_pubkeys: Vec<ValidatorPublicKey>,
+    raw_sigs: Vec<ValidatorSignature>,
+    raw_ids: &[u64],
+    data_root: &H256,
+    slot: u64,
+    head_state: &State,
+) -> Option<(AggregatedSignatureProof, Vec<u64>)> {
+    let validators = &head_state.validators;
+
+    // Resolve each child's participant pubkeys. Skip children whose pubkeys
+    // can't be fully resolved: passing fewer pubkeys than the proof expects
+    // would produce an invalid aggregate.
+    let mut children_for_aggregation = Vec::with_capacity(child_proofs.len());
+    let mut accepted_child_ids: Vec<u64> = Vec::new();
+    for proof in child_proofs {
+        let participant_ids: Vec<u64> = proof.participant_indices().collect();
+        let child_pubkeys: Vec<ValidatorPublicKey> = participant_ids
+            .iter()
+            .filter_map(|&vid| {
+                validators
+                    .get(vid as usize)?
+                    .get_attestation_pubkey()
+                    .ok()
+            })
+            .collect();
+        if child_pubkeys.len() != participant_ids.len() {
+            warn!(
+                expected = participant_ids.len(),
+                resolved = child_pubkeys.len(),
+                "Skipping child proof: could not resolve all participant pubkeys"
+            );
+            continue;
+        }
+        accepted_child_ids.extend(&participant_ids);
+        children_for_aggregation.push((child_pubkeys, proof.proof_data.clone()));
+    }
+
+    // Re-check after potentially dropping children with unresolvable pubkeys.
+    if raw_ids.is_empty() && children_for_aggregation.len() < 2 {
+        return None;
+    }
+
+    let slot_u32: u32 = slot.try_into().expect("slot exceeds u32");
+    let proof_data = {
+        let _timing = metrics::time_pq_sig_aggregated_signatures_building();
+        aggregate_mixed(children_for_aggregation, raw_pubkeys, raw_sigs, data_root, slot_u32)
+    }
+    .inspect_err(|err| warn!(%err, "Failed to aggregate committee signatures"))
+    .ok()?;
+
+    let mut all_ids: Vec<u64> = raw_ids.to_vec();
+    all_ids.extend(&accepted_child_ids);
+    all_ids.sort_unstable();
+    all_ids.dedup();
+
+    let participants = aggregation_bits_from_validator_indices(&all_ids);
+    Some((AggregatedSignatureProof::new(participants, proof_data), all_ids))
+}
+
+/// Greedy set-cover selection of proofs to maximize validator coverage.
+///
+/// Processes proof sets in priority order (new before known). Within each set,
+/// repeatedly picks the proof covering the most uncovered validators until
+/// no proof adds new coverage. This keeps the number of children minimal
+/// while maximizing the validators we can skip re-aggregating from scratch.
+fn select_proofs_greedily(
+    new_proofs: &[AggregatedSignatureProof],
+    known_proofs: &[AggregatedSignatureProof],
+) -> (Vec<AggregatedSignatureProof>, HashSet<u64>) {
+    let mut selected: Vec<AggregatedSignatureProof> = Vec::new();
+    let mut covered: HashSet<u64> = HashSet::new();
+
+    for proof_set in [new_proofs, known_proofs] {
+        let mut remaining: Vec<&AggregatedSignatureProof> = proof_set.iter().collect();
+
+        while !remaining.is_empty() {
+            let best_idx = remaining
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, p)| {
+                    p.participant_indices()
+                        .filter(|vid| !covered.contains(vid))
+                        .count()
+                })
+                .map(|(i, _)| i)
+                .expect("remaining is non-empty");
+
+            let new_coverage: HashSet<u64> = remaining[best_idx]
+                .participant_indices()
+                .filter(|vid| !covered.contains(vid))
+                .collect();
+
+            if new_coverage.is_empty() {
+                break;
+            }
+
+            selected.push(remaining.swap_remove(best_idx).clone());
+            covered.extend(new_coverage);
+        }
+    }
+
+    (selected, covered)
 }
 
 /// Validate incoming attestation before processing.

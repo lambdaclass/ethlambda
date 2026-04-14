@@ -185,6 +185,21 @@ impl PayloadBuffer {
         self.data.len()
     }
 
+    /// Return cloned proofs for a given data_root, or empty vec if none.
+    fn proofs_for_root(&self, data_root: &H256) -> Vec<AggregatedSignatureProof> {
+        self.data
+            .get(data_root)
+            .map_or_else(Vec::new, |e| e.proofs.clone())
+    }
+
+    /// Return attestation data entries keyed by data_root.
+    fn attestation_data_keys(&self) -> Vec<(H256, AttestationData)> {
+        self.data
+            .iter()
+            .map(|(&root, entry)| (root, entry.data.clone()))
+            .collect()
+    }
+
     /// Extract per-validator latest attestations from proofs' participation bits.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
@@ -868,6 +883,29 @@ impl Store {
             .iter()
             .map(|(root, entry)| (*root, (entry.data.clone(), entry.proofs.clone())))
             .collect()
+    }
+
+    /// Look up existing proofs for a given data_root from both new and known buffers.
+    ///
+    /// Returns `(new_proofs, known_proofs)` in priority order: new payloads first
+    /// (uncommitted work from the current round), then known payloads (already active
+    /// in fork choice). This ordering is used by greedy proof selection to prefer
+    /// reusing recent work.
+    pub fn existing_proofs_for_data(
+        &self,
+        data_root: &H256,
+    ) -> (Vec<AggregatedSignatureProof>, Vec<AggregatedSignatureProof>) {
+        let new = self.new_payloads.lock().unwrap().proofs_for_root(data_root);
+        let known = self.known_payloads.lock().unwrap().proofs_for_root(data_root);
+        (new, known)
+    }
+
+    /// Return attestation data entries from the new (pending) payload buffer.
+    ///
+    /// Used to iterate over data that has pending proofs but may lack gossip
+    /// signatures, matching the spec's `new.keys() | gossip_sigs.keys()` union.
+    pub fn new_payload_keys(&self) -> Vec<(H256, AttestationData)> {
+        self.new_payloads.lock().unwrap().attestation_data_keys()
     }
 
     /// Insert a single proof into the known (fork-choice-active) buffer.

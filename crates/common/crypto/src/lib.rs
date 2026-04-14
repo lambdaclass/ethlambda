@@ -113,6 +113,59 @@ pub fn aggregate_signatures(
     ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
 }
 
+/// Aggregate both existing proofs (children) and raw XMSS signatures in a single call.
+///
+/// This is the spec's gossip-time mixed aggregation: existing proofs from previous
+/// rounds are fed as children, and only genuinely new signatures go as `raw_xmss`.
+/// This avoids re-aggregating from scratch each round and keeps proof trees shallow.
+///
+/// Requires at least one raw signature OR at least 2 children. A lone child proof
+/// is already valid and needs no further aggregation.
+///
+/// # Panics
+///
+/// Panics if any deserialized child proof is cryptographically invalid (e.g., was
+/// produced for a different message or slot). This is an upstream constraint of
+/// `xmss_aggregate`.
+pub fn aggregate_mixed(
+    children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    raw_public_keys: Vec<ValidatorPublicKey>,
+    raw_signatures: Vec<ValidatorSignature>,
+    message: &H256,
+    slot: u32,
+) -> Result<ByteListMiB, AggregationError> {
+    if raw_public_keys.len() != raw_signatures.len() {
+        return Err(AggregationError::CountMismatch(
+            raw_public_keys.len(),
+            raw_signatures.len(),
+        ));
+    }
+
+    // Need at least one raw signature OR at least 2 children to merge.
+    if raw_public_keys.is_empty() && children.len() < 2 {
+        if children.is_empty() {
+            return Err(AggregationError::EmptyInput);
+        }
+        return Err(AggregationError::InsufficientChildren(children.len()));
+    }
+
+    ensure_prover_ready();
+
+    let deserialized = deserialize_children(children)?;
+    let children_refs = to_children_refs(&deserialized);
+
+    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = raw_public_keys
+        .into_iter()
+        .zip(raw_signatures)
+        .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
+        .collect();
+
+    let (_sorted_pubkeys, aggregate) =
+        xmss_aggregate(&children_refs, raw_xmss, &message.0, slot, 2);
+
+    serialize_aggregate(aggregate)
+}
+
 /// Recursively aggregate multiple already-aggregated proofs into one.
 ///
 /// Each child is a `(public_keys, proof_data)` pair where `public_keys` are the
@@ -132,8 +185,21 @@ pub fn aggregate_proofs(
 
     ensure_prover_ready();
 
-    // Convert each child: deserialize proof and convert public keys
-    let deserialized: Vec<(Vec<LeanSigPubKey>, AggregatedXMSS)> = children
+    let deserialized = deserialize_children(children)?;
+    let children_refs = to_children_refs(&deserialized);
+
+    let (_sorted_pubkeys, aggregate) =
+        xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
+
+    serialize_aggregate(aggregate)
+}
+
+/// Deserialize child proofs from `(public_keys, proof_bytes)` pairs into
+/// lean-multisig types.
+fn deserialize_children(
+    children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+) -> Result<Vec<(Vec<LeanSigPubKey>, AggregatedXMSS)>, AggregationError> {
+    children
         .into_iter()
         .enumerate()
         .map(|(i, (pubkeys, proof_data))| {
@@ -143,17 +209,21 @@ pub fn aggregate_proofs(
                 .ok_or(AggregationError::ChildDeserializationFailed(i))?;
             Ok((lean_pks, aggregate))
         })
-        .collect::<Result<Vec<_>, AggregationError>>()?;
+        .collect()
+}
 
-    // Build references for xmss_aggregate: &[(&[XmssPublicKey], AggregatedXMSS)]
-    let children_refs: Vec<(&[LeanSigPubKey], AggregatedXMSS)> = deserialized
+/// Build the reference slice that `xmss_aggregate` expects.
+fn to_children_refs(
+    deserialized: &[(Vec<LeanSigPubKey>, AggregatedXMSS)],
+) -> Vec<(&[LeanSigPubKey], AggregatedXMSS)> {
+    deserialized
         .iter()
         .map(|(pks, agg)| (pks.as_slice(), agg.clone()))
-        .collect();
+        .collect()
+}
 
-    // No raw XMSS signatures; purely recursive merge of existing proofs.
-    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
-
+/// Serialize an `AggregatedXMSS` into the `ByteListMiB` wire format.
+fn serialize_aggregate(aggregate: AggregatedXMSS) -> Result<ByteListMiB, AggregationError> {
     let serialized = aggregate.serialize();
     let serialized_len = serialized.len();
     ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
