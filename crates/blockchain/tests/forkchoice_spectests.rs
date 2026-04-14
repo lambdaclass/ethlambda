@@ -104,16 +104,54 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // NOTE: the has_proposal argument is set to false, following the spec
                     store::on_tick(&mut store, timestamp_ms, false, false);
                 }
-                "attestation" | "gossipAggregatedAttestation" => {
+                "attestation" => {
                     let att_data = step
                         .attestation
                         .expect("attestation step missing attestation data");
                     let domain_data: ethlambda_types::attestation::AttestationData =
                         att_data.data.into();
+                    let validator_id = att_data
+                        .validator_id
+                        .expect("attestation step missing validator_id");
 
-                    // For gossip attestations, use the validator_id from the fixture.
-                    // For aggregated attestations, use validator 0 as a placeholder
-                    // since the fork choice only cares about the attestation data.
+                    let result = store::on_gossip_attestation_without_verification(
+                        &mut store,
+                        validator_id,
+                        domain_data,
+                    );
+
+                    match (result.is_ok(), step.valid) {
+                        (true, false) => {
+                            return Err(format!(
+                                "Step {} expected failure but got success",
+                                step_idx
+                            )
+                            .into());
+                        }
+                        (false, true) => {
+                            return Err(format!(
+                                "Step {} expected success but got failure: {:?}",
+                                step_idx,
+                                result.err()
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
+                "gossipAggregatedAttestation" => {
+                    // Aggregated attestation fixtures carry only attestation data
+                    // (no aggregated proof or participant list), so we use the same
+                    // non-verification path. This inserts directly into known payloads,
+                    // bypassing the new→known promotion pipeline that the production
+                    // `on_gossip_aggregated_attestation` uses.
+                    // TODO: route through a proper aggregated path once fixtures
+                    // include proof data and the test runner simulates promotion.
+                    let att_data = step
+                        .attestation
+                        .expect("gossipAggregatedAttestation step missing attestation data");
+                    let domain_data: ethlambda_types::attestation::AttestationData =
+                        att_data.data.into();
                     let validator_id = att_data.validator_id.unwrap_or(0);
 
                     let result = store::on_gossip_attestation_without_verification(

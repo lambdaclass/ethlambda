@@ -142,14 +142,10 @@ impl KeyManager {
             }
         }
 
-        let signature: ValidatorSignature = {
-            let _timing = metrics::time_pq_sig_proposal_signing();
-            key_pair
-                .proposal_key
-                .sign(slot, message)
-                .map_err(|e| KeyManagerError::SigningError(e.to_string()))
-        }?;
-        metrics::inc_pq_sig_proposal_signatures();
+        let signature: ValidatorSignature = key_pair
+            .proposal_key
+            .sign(slot, message)
+            .map_err(|e| KeyManagerError::SigningError(e.to_string()))?;
 
         let sig_bytes = signature.to_bytes();
         XmssSignature::try_from(sig_bytes)
