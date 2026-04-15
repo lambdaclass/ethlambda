@@ -15,7 +15,7 @@ use super::{
         attestation_subnet_topic,
     },
 };
-use crate::P2PServer;
+use crate::{P2PServer, metrics};
 
 pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
@@ -34,6 +34,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             else {
                 return;
             };
+            metrics::observe_gossip_block_size(uncompressed_data.len());
 
             let Ok(signed_block) = SignedBlock::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped block"))
@@ -65,6 +66,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             else {
                 return;
             };
+            metrics::observe_gossip_aggregation_size(uncompressed_data.len());
 
             let Ok(aggregation) = SignedAggregatedAttestation::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped aggregation"))
@@ -94,6 +96,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             else {
                 return;
             };
+            metrics::observe_gossip_attestation_size(uncompressed_data.len());
 
             let Ok(signed_attestation) = SignedAttestation::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped attestation"))

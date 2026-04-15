@@ -68,6 +68,68 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .unwrap()
 });
 
+// --- Gossip Message Size Histograms ---
+
+static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_gossip_block_size_bytes",
+        "Bytes size of a gossip block message",
+        vec![
+            10_000.0,
+            50_000.0,
+            100_000.0,
+            250_000.0,
+            500_000.0,
+            1_000_000.0,
+            2_000_000.0,
+            5_000_000.0
+        ]
+    )
+    .unwrap()
+});
+
+static LEAN_GOSSIP_ATTESTATION_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_gossip_attestation_size_bytes",
+        "Bytes size of a gossip attestation message",
+        vec![512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
+    )
+    .unwrap()
+});
+
+static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_gossip_aggregation_size_bytes",
+        "Bytes size of a gossip aggregated attestation message",
+        vec![
+            1024.0,
+            4096.0,
+            16384.0,
+            65536.0,
+            131_072.0,
+            262_144.0,
+            524_288.0,
+            1_048_576.0
+        ]
+    )
+    .unwrap()
+});
+
+/// Observe the size of a gossip block message.
+pub fn observe_gossip_block_size(bytes: usize) {
+    LEAN_GOSSIP_BLOCK_SIZE_BYTES.observe(bytes as f64);
+}
+
+/// Observe the size of a gossip attestation message.
+pub fn observe_gossip_attestation_size(bytes: usize) {
+    LEAN_GOSSIP_ATTESTATION_SIZE_BYTES.observe(bytes as f64);
+}
+
+/// Observe the size of a gossip aggregated attestation message.
+pub fn observe_gossip_aggregation_size(bytes: usize) {
+    LEAN_GOSSIP_AGGREGATION_SIZE_BYTES.observe(bytes as f64);
+}
+
 /// Set the attestation committee subnet gauge.
 pub fn set_attestation_committee_subnet(subnet_id: u64) {
     static LEAN_ATTESTATION_COMMITTEE_SUBNET: LazyLock<IntGauge> = LazyLock::new(|| {
