@@ -2188,8 +2188,10 @@ name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
+ "leansig",
  "libssz",
  "libssz-derive",
+ "rand 0.10.0",
  "rocksdb",
  "tempfile",
  "tracing",
