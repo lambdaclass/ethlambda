@@ -144,8 +144,14 @@ pub fn aggregate_mixed(
 
     ensure_prover_ready();
 
-    let deserialized = deserialize_children(children)?;
-    let children_refs = to_children_refs(&deserialized);
+    // Split deserialized children into parallel Vecs so we can borrow pubkey
+    // slices (required by xmss_aggregate's tuple type) while moving the large
+    // AggregatedXMSS values into the children list without cloning. `pks_list`
+    // must outlive `children_refs`.
+    let (pks_list, aggs): (Vec<Vec<LeanSigPubKey>>, Vec<AggregatedXMSS>) =
+        deserialize_children(children)?.into_iter().unzip();
+    let children_refs: Vec<(&[LeanSigPubKey], AggregatedXMSS)> =
+        pks_list.iter().map(Vec::as_slice).zip(aggs).collect();
 
     let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = raw_public_keys
         .into_iter()
@@ -178,8 +184,11 @@ pub fn aggregate_proofs(
 
     ensure_prover_ready();
 
-    let deserialized = deserialize_children(children)?;
-    let children_refs = to_children_refs(&deserialized);
+    // See `aggregate_mixed` for why this unzip-and-rezip dance is needed.
+    let (pks_list, aggs): (Vec<Vec<LeanSigPubKey>>, Vec<AggregatedXMSS>) =
+        deserialize_children(children)?.into_iter().unzip();
+    let children_refs: Vec<(&[LeanSigPubKey], AggregatedXMSS)> =
+        pks_list.iter().map(Vec::as_slice).zip(aggs).collect();
 
     let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
 
@@ -201,16 +210,6 @@ fn deserialize_children(
                 .ok_or(AggregationError::ChildDeserializationFailed(i))?;
             Ok((lean_pks, aggregate))
         })
-        .collect()
-}
-
-/// Build the reference slice that `xmss_aggregate` expects.
-fn to_children_refs(
-    deserialized: &[(Vec<LeanSigPubKey>, AggregatedXMSS)],
-) -> Vec<(&[LeanSigPubKey], AggregatedXMSS)> {
-    deserialized
-        .iter()
-        .map(|(pks, agg)| (pks.as_slice(), agg.clone()))
         .collect()
 }
 
