@@ -47,7 +47,7 @@ impl BlockChain {
         is_aggregator: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(is_aggregator);
-        metrics::set_node_sync_status("idle");
+        metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
@@ -279,16 +279,11 @@ impl BlockChainServer {
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
 
         // Update sync status based on head slot vs wall clock slot
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let current_slot = now_ms.saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
+        let current_slot = self.store.time() / INTERVALS_PER_SLOT;
         let status = if head_slot >= current_slot {
-            "synced"
+            metrics::SyncStatus::Synced
         } else {
-            "syncing"
+            metrics::SyncStatus::Syncing
         };
         metrics::set_node_sync_status(status);
 

@@ -324,6 +324,25 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
 
 // --- Sync Status ---
 
+/// Node synchronization status.
+pub enum SyncStatus {
+    Idle,
+    Syncing,
+    Synced,
+}
+
+impl SyncStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SyncStatus::Idle => "idle",
+            SyncStatus::Syncing => "syncing",
+            SyncStatus::Synced => "synced",
+        }
+    }
+
+    const ALL: &[&str] = &["idle", "syncing", "synced"];
+}
+
 static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
     register_int_gauge_vec!("lean_node_sync_status", "Node sync status", &["status"]).unwrap()
 });
@@ -563,10 +582,11 @@ pub fn inc_block_building_failures() {
 }
 
 /// Set the node sync status. Sets the given status label to 1 and all others to 0.
-pub fn set_node_sync_status(status: &str) {
-    for label in &["idle", "syncing", "synced"] {
+pub fn set_node_sync_status(status: SyncStatus) {
+    let active = status.as_str();
+    for label in SyncStatus::ALL {
         LEAN_NODE_SYNC_STATUS
             .with_label_values(&[label])
-            .set(i64::from(*label == status));
+            .set(i64::from(*label == active));
     }
 }
