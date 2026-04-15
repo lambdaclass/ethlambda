@@ -97,20 +97,20 @@ Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the followin
 
 | Tag | Description |
 |-----|-------------|
-| `devnetX` | Stable image for a specific devnet (e.g. `devnet3`) |
+| `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
 | `latest` | Alias for the stable image of the currently running devnet |
 | `unstable` | Development builds; promoted to `devnetX`/`latest` once tested |
 | `sha-XXXXXXX` | Specific commit |
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.
 
-### pq-devnet-3
-
-We are running the [pq-devnet-3 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-3.md). A Docker tag `devnet3` is available for this version.
-
 ### pq-devnet-4
 
-We are working on adding support for the [pq-devnet-4 spec](https://github.com/leanEthereum/pm/blob/main/breakout-rooms/leanConsensus/pq-interop/pq-devnet-4.md). A Docker tag `devnet4` will be published for this version.
+We are running the `pq-devnet-4` spec. A Docker tag `devnet4` is available for this version.
+
+### pq-devnet-5
+
+[We are working on adding support for the `pq-devnet-5` spec](https://github.com/lambdaclass/ethlambda/issues/285). A Docker tag `devnet5` will be published for this version.
 
 ### Older devnets
 
@@ -122,7 +122,7 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [Add support for pq-devnet-4](https://github.com/lambdaclass/ethlambda/issues/155)
+- [Add support for pq-devnet-5](https://github.com/lambdaclass/ethlambda/issues/285)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
 - [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
 - [Formal verification of the STF](https://github.com/lambdaclass/ethlambda/issues/272)
