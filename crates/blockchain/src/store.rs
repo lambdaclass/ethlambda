@@ -1341,8 +1341,6 @@ fn build_block(
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)>,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
-    // Paired (attestation, proof) tuples so the two can never drift out of
-    // sync. Unzipped once at the end for the block body and signatures list.
     let mut selected: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = Vec::new();
 
     if !aggregated_payloads.is_empty() {
@@ -1423,7 +1421,6 @@ fn build_block(
     // aggregation so each AttestationData appears at most once (leanSpec #510).
     let compacted = compact_attestations(selected, head_state)?;
 
-    // Unzip paired entries into the parallel lists the block expects.
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
 
