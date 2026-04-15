@@ -1,7 +1,7 @@
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::SignedBlockWithAttestation,
+    block::SignedBlock,
     primitives::HashTreeRoot as _,
 };
 use libp2p::gossipsub::Event;
@@ -35,16 +35,16 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                 return;
             };
 
-            let Ok(signed_block) = SignedBlockWithAttestation::from_ssz_bytes(&uncompressed_data)
+            let Ok(signed_block) = SignedBlock::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped block"))
             else {
                 return;
             };
-            let slot = signed_block.block.block.slot;
-            let block_root = signed_block.block.block.hash_tree_root();
-            let proposer = signed_block.block.block.proposer_index;
-            let parent_root = signed_block.block.block.parent_root;
-            let attestation_count = signed_block.block.block.body.attestations.len();
+            let slot = signed_block.message.slot;
+            let block_root = signed_block.message.hash_tree_root();
+            let proposer = signed_block.message.proposer_index;
+            let parent_root = signed_block.message.parent_root;
+            let attestation_count = signed_block.message.body.attestations.len();
             info!(
                 %slot,
                 proposer,
@@ -166,12 +166,12 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     );
 }
 
-pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlockWithAttestation) {
-    let slot = signed_block.block.block.slot;
-    let proposer = signed_block.block.block.proposer_index;
-    let block_root = signed_block.block.block.hash_tree_root();
-    let parent_root = signed_block.block.block.parent_root;
-    let attestation_count = signed_block.block.block.body.attestations.len();
+pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
+    let slot = signed_block.message.slot;
+    let proposer = signed_block.message.proposer_index;
+    let block_root = signed_block.message.hash_tree_root();
+    let parent_root = signed_block.message.parent_root;
+    let attestation_count = signed_block.message.body.attestations.len();
 
     // Encode to SSZ
     let ssz_bytes = signed_block.to_ssz();

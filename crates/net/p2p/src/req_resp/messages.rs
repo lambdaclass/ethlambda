@@ -1,6 +1,4 @@
-use ethlambda_types::{
-    block::SignedBlockWithAttestation, checkpoint::Checkpoint, primitives::H256,
-};
+use ethlambda_types::{block::SignedBlock, checkpoint::Checkpoint, primitives::H256};
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 
@@ -90,7 +88,7 @@ impl std::fmt::Debug for ResponseCode {
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-    BlocksByRoot(Vec<SignedBlockWithAttestation>),
+    BlocksByRoot(Vec<SignedBlock>),
 }
 
 #[derive(Debug, Clone, SszEncode, SszDecode)]

@@ -1,7 +1,12 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use ethlambda_state_transition::state_transition;
-use ethlambda_types::{block::Block, state::State};
+use ethlambda_types::{
+    block::Block,
+    primitives::{H256, HashTreeRoot as _},
+    state::State,
+};
 
 use crate::types::PostState;
 
@@ -24,8 +29,13 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let mut pre_state: State = test.pre.into();
         let mut result = Ok(());
 
-        for block in test.blocks {
+        // Build a block registry mapping "block_N" labels to hash tree roots.
+        // Labels are 1-indexed: "block_1" is the first block in the array.
+        let mut block_registry: HashMap<String, H256> = HashMap::new();
+        for (i, block) in test.blocks.into_iter().enumerate() {
             let block: Block = block.into();
+            let label = format!("block_{}", i + 1);
+            block_registry.insert(label, block.hash_tree_root());
             result = state_transition(&mut pre_state, &block);
             if result.is_err() {
                 break;
@@ -34,7 +44,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let post_state = pre_state;
         match (result, test.post) {
             (Ok(_), Some(expected_post)) => {
-                compare_post_states(&post_state, &expected_post)?;
+                compare_post_states(&post_state, &expected_post, &block_registry)?;
             }
             (Ok(_), None) => {
                 return Err(
@@ -55,9 +65,24 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
+fn resolve_label(
+    label: &str,
+    block_registry: &HashMap<String, H256>,
+) -> datatest_stable::Result<H256> {
+    block_registry.get(label).copied().ok_or_else(|| {
+        format!(
+            "label '{}' not found in block registry. Available: {:?}",
+            label,
+            block_registry.keys().collect::<Vec<_>>()
+        )
+        .into()
+    })
+}
+
 fn compare_post_states(
     post_state: &State,
     expected_post: &PostState,
+    block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
     let PostState {
         config_genesis_time,
@@ -77,6 +102,11 @@ fn compare_post_states(
         justifications_roots,
         justifications_validators,
         validator_count,
+        latest_justified_root_label,
+        latest_finalized_root_label,
+        justifications_roots_labels,
+        justifications_roots_count,
+        justifications_validators_count,
     } = expected_post;
     if let Some(config_genesis_time) = config_genesis_time
         && post_state.config.genesis_time != *config_genesis_time
@@ -194,14 +224,8 @@ fn compare_post_states(
         }
     }
     if let Some(justified_slots) = justified_slots {
-        let post_slots: Vec<_> = (0..post_state.justified_slots.len())
-            .filter_map(|i| {
-                if post_state.justified_slots.get(i) == Some(true) {
-                    Some(i as u64)
-                } else {
-                    None
-                }
-            })
+        let post_slots: Vec<bool> = (0..justified_slots.data.len())
+            .map(|i| post_state.justified_slots.get(i) == Some(true))
             .collect();
         if post_slots != justified_slots.data {
             return Err(format!(
@@ -239,6 +263,57 @@ fn compare_post_states(
             return Err(format!(
                 "validator count mismatch: expected {}, got {}",
                 validator_count, count
+            )
+            .into());
+        }
+    }
+    if let Some(label) = latest_justified_root_label {
+        let expected = resolve_label(label, block_registry)?;
+        if post_state.latest_justified.root != expected {
+            return Err(format!(
+                "latest_justified.root mismatch (via label '{label}'): expected {expected:?}, got {:?}",
+                post_state.latest_justified.root
+            )
+            .into());
+        }
+    }
+    if let Some(label) = latest_finalized_root_label {
+        let expected = resolve_label(label, block_registry)?;
+        if post_state.latest_finalized.root != expected {
+            return Err(format!(
+                "latest_finalized.root mismatch (via label '{label}'): expected {expected:?}, got {:?}",
+                post_state.latest_finalized.root
+            )
+            .into());
+        }
+    }
+    if let Some(labels) = justifications_roots_labels {
+        let expected_roots: Vec<H256> = labels
+            .iter()
+            .map(|label| resolve_label(label, block_registry))
+            .collect::<datatest_stable::Result<Vec<_>>>()?;
+        let post_roots: Vec<_> = post_state.justifications_roots.iter().copied().collect();
+        if post_roots != expected_roots {
+            return Err(format!(
+                "justifications_roots mismatch (via labels {labels:?}): expected {expected_roots:?}, got {post_roots:?}",
+            )
+            .into());
+        }
+    }
+    if let Some(expected_count) = justifications_roots_count {
+        let count = post_state.justifications_roots.len() as u64;
+        if count != *expected_count {
+            return Err(format!(
+                "justifications_roots count mismatch: expected {expected_count}, got {count}",
+            )
+            .into());
+        }
+    }
+    if let Some(expected_count) = justifications_validators_count {
+        let count = post_state.justifications_validators.len() as u64;
+        if count != *expected_count {
+            return Err(format!(
+                "justifications_validators count mismatch: expected {expected_count}, got {count}",
             )
             .into());
         }

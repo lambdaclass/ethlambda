@@ -10,9 +10,9 @@ use crate::primitives::H256;
 /// The XMSS signature scheme used for validator signatures.
 ///
 /// This is a post-quantum secure signature scheme based on hash functions.
-/// The specific instantiation uses Poseidon hashing with a 32-bit lifetime
-/// (2^32 signatures per key), dimension 64, and base 8.
-pub type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
+/// Uses Poseidon1 hashing with an aborting hypercube message hash,
+/// 32-bit lifetime (2^32 signatures per key), dimension 46, and base 8.
+pub type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::SchemeAbortingTargetSumLifetime32Dim46Base8;
 
 /// The public key type from the leansig library.
 pub type LeanSigPublicKey = <LeanSignatureScheme as SignatureScheme>::PublicKey;
@@ -25,8 +25,10 @@ pub type LeanSigSecretKey = <LeanSignatureScheme as SignatureScheme>::SecretKey;
 
 pub type Signature = LeanSigSignature;
 
-/// Size of an XMSS signature in bytes (3112 = 3600 - 488).
-pub const SIGNATURE_SIZE: usize = 3112;
+/// Size of an XMSS signature in bytes.
+///
+/// Computed from: path(32*8*4) + rho(7*4) + hashes(46*8*4) + ssz_offsets(3*4) = 2536
+pub const SIGNATURE_SIZE: usize = 2536;
 
 /// Error returned when parsing signature or key bytes fails.
 #[derive(Debug, Clone, thiserror::Error)]

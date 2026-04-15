@@ -24,7 +24,8 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-LEAN_SPEC_COMMIT_HASH:=d39d10195414921e979e2fdd43723d89cee13c8b
+# 2026-04-14
+LEAN_SPEC_COMMIT_HASH:=76d4792ecd9d5bbcab60bfb022b72b590946b511
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch

@@ -1,8 +1,7 @@
-use super::common::{AggregationBits, Block, Container, ProposerAttestation, TestInfo, TestState};
+use super::common::{AggregationBits, Block, Container, TestInfo, TestState};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, BlockWithAttestation,
-    SignedBlockWithAttestation,
+    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -34,8 +33,8 @@ pub struct VerifySignaturesTest {
     pub lean_env: String,
     #[serde(rename = "anchorState")]
     pub anchor_state: TestState,
-    #[serde(rename = "signedBlockWithAttestation")]
-    pub signed_block_with_attestation: TestSignedBlockWithAttestation,
+    #[serde(rename = "signedBlock")]
+    pub signed_block: TestSignedBlock,
     #[serde(rename = "expectException")]
     pub expect_exception: Option<String>,
     #[serde(rename = "_info")]
@@ -47,57 +46,40 @@ pub struct VerifySignaturesTest {
 // Signed Block Types
 // ============================================================================
 
-/// Signed block with attestation and signature
+/// Signed block with signature bundle (devnet4: no proposer attestation wrapper)
 #[derive(Debug, Clone, Deserialize)]
-pub struct TestSignedBlockWithAttestation {
-    pub message: TestBlockWithAttestation,
+pub struct TestSignedBlock {
+    #[serde(alias = "message")]
+    pub block: Block,
     pub signature: TestSignatureBundle,
 }
 
-impl From<TestSignedBlockWithAttestation> for SignedBlockWithAttestation {
-    fn from(value: TestSignedBlockWithAttestation) -> Self {
-        let block = BlockWithAttestation {
-            block: value.message.block.into(),
-            proposer_attestation: value.message.proposer_attestation.into(),
-        };
-
+impl From<TestSignedBlock> for SignedBlock {
+    fn from(value: TestSignedBlock) -> Self {
+        let block = value.block.into();
         let proposer_signature = value.signature.proposer_signature;
 
-        // Convert attestation signatures to AggregatedSignatureProof.
-        // Each proof contains the participants bitfield from the test data.
-        // The proof_data is currently empty (placeholder for future leanVM aggregation).
         let attestation_signatures: AttestationSignatures = value
             .signature
             .attestation_signatures
             .data
             .into_iter()
             .map(|att_sig| {
-                // Convert participants bitfield
                 let participants: EthAggregationBits = att_sig.participants.into();
-                // Create proof with participants but empty proof_data
                 AggregatedSignatureProof::empty(participants)
             })
             .collect::<Vec<_>>()
             .try_into()
             .expect("too many attestation signatures");
 
-        SignedBlockWithAttestation {
-            block,
+        SignedBlock {
+            message: block,
             signature: BlockSignatures {
                 attestation_signatures,
                 proposer_signature,
             },
         }
     }
-}
-
-/// Block with proposer attestation (the message that gets signed)
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TestBlockWithAttestation {
-    pub block: Block,
-    #[serde(rename = "proposerAttestation")]
-    pub proposer_attestation: ProposerAttestation,
 }
 
 // ============================================================================
@@ -115,7 +97,6 @@ pub struct TestSignatureBundle {
 }
 
 /// Attestation signature from a validator
-/// Note: proofData is for future SNARK aggregation, currently just placeholder
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct AttestationSignature {
@@ -143,5 +124,10 @@ where
     let value = String::deserialize(d)?;
     let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
         .map_err(|_| D::Error::custom("XmssSignature value is not valid hex"))?;
-    XmssSignature::try_from(bytes).map_err(|_| D::Error::custom("XmssSignature length != 3112"))
+    XmssSignature::try_from(bytes).map_err(|_| {
+        D::Error::custom(format!(
+            "XmssSignature length != {}",
+            ethlambda_types::signature::SIGNATURE_SIZE
+        ))
+    })
 }
