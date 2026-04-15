@@ -12,7 +12,7 @@ use crate::{
 use primitives::HashTreeRoot as _;
 
 /// Envelope carrying a block and its aggregated signatures.
-#[derive(Clone, SszEncode, SszDecode)]
+#[derive(Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
@@ -35,7 +35,7 @@ impl core::fmt::Debug for SignedBlock {
 }
 
 /// Signature payload for the block.
-#[derive(Clone, SszEncode, SszDecode)]
+#[derive(Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockSignatures {
     /// Attestation signatures for the aggregated attestations in the block body.
     ///
@@ -69,7 +69,7 @@ pub type AttestationSignatures = SszList<AggregatedSignatureProof, 4096>;
 /// The proof can verify that all participants signed the same message in the
 /// same epoch, using a single verification operation instead of checking
 /// each signature individually.
-#[derive(Debug, Clone, SszEncode, SszDecode)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AggregatedSignatureProof {
     /// Bitfield indicating which validators' signatures are included.
     pub participants: AggregationBits,
