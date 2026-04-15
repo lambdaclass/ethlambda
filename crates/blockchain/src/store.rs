@@ -1169,11 +1169,6 @@ fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> Aggregati
 /// - Single entry: kept as-is.
 /// - Multiple entries: merged into one using recursive proof aggregation
 ///   (leanSpec PR #510).
-///
-/// The input pairs each attestation with its signature proof so the two
-/// Vecs can never drift out of sync (the prior signature used separate
-/// `Vec<AggregatedAttestation>` and `Vec<AggregatedSignatureProof>` guarded
-/// by a debug-only length assertion).
 fn compact_attestations(
     entries: Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
     head_state: &State,
@@ -1275,8 +1270,7 @@ fn compact_attestations(
 /// the underlying aggregation scheme.
 ///
 /// Each selected proof is appended to `selected` paired with its
-/// corresponding AggregatedAttestation so the two lists can never drift
-/// out of sync.
+/// corresponding AggregatedAttestation.
 fn extend_proofs_greedily(
     proofs: &[AggregatedSignatureProof],
     selected: &mut Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
