@@ -139,9 +139,6 @@ pub fn aggregate_mixed(
 
     // Need at least one raw signature OR at least 2 children to merge.
     if raw_public_keys.is_empty() && children.len() < 2 {
-        if children.is_empty() {
-            return Err(AggregationError::EmptyInput);
-        }
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
 
