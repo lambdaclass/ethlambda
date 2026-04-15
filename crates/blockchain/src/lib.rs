@@ -47,6 +47,7 @@ impl BlockChain {
         is_aggregator: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(is_aggregator);
+        metrics::set_node_sync_status("idle");
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
         let handle = BlockChainServer {
@@ -217,11 +218,14 @@ impl BlockChainServer {
     fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
+        let _timing = metrics::time_block_building();
+
         // Build the block with attestation signatures
         let Ok((block, attestation_signatures, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
+            metrics::inc_block_building_failures();
             return;
         };
 
@@ -232,6 +236,7 @@ impl BlockChainServer {
             .sign_block_root(validator_id, slot as u32, &block_root)
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
         else {
+            metrics::inc_block_building_failures();
             return;
         };
 
@@ -249,8 +254,11 @@ impl BlockChainServer {
         // Process the block locally before publishing
         if let Err(err) = self.process_block(signed_block.clone()) {
             error!(%slot, %validator_id, %err, "Failed to process built block");
+            metrics::inc_block_building_failures();
             return;
         };
+
+        metrics::inc_block_building_success();
 
         // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
@@ -264,10 +272,26 @@ impl BlockChainServer {
 
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
         store::on_block(&mut self.store, signed_block)?;
-        metrics::update_head_slot(self.store.head_slot());
+        let head_slot = self.store.head_slot();
+        metrics::update_head_slot(head_slot);
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
+
+        // Update sync status based on head slot vs wall clock slot
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let current_slot = now_ms.saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
+        let status = if head_slot >= current_slot {
+            "synced"
+        } else {
+            "syncing"
+        };
+        metrics::set_node_sync_status(status);
+
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
