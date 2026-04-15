@@ -17,12 +17,11 @@ ethlambda-types.workspace = true
 
 spawned-concurrency.workspace = true
 
-async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
 
 # Fork with request-response feature for outbound protocol selection
-libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "cd6cc3b1e5db2c5e23e133c2201c23b063fc4895", features = [
+libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c", features = [
     "full",
 ] }
 
