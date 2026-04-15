@@ -356,12 +356,12 @@ pub fn on_tick(
 /// at interval 2. Only aggregator nodes receive unaggregated gossip attestations.
 pub fn on_gossip_attestation(
     store: &mut Store,
-    signed_attestation: SignedAttestation,
+    signed_attestation: &SignedAttestation,
 ) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
         validator_id,
-        data: signed_attestation.data,
+        data: signed_attestation.data.clone(),
     };
     validate_attestation_data(store, &attestation.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
