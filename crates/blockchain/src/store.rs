@@ -1169,21 +1169,23 @@ fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> Aggregati
 /// - Single entry: kept as-is.
 /// - Multiple entries: merged into one using recursive proof aggregation
 ///   (leanSpec PR #510).
+///
+/// The input pairs each attestation with its signature proof so the two
+/// Vecs can never drift out of sync (the prior signature used separate
+/// `Vec<AggregatedAttestation>` and `Vec<AggregatedSignatureProof>` guarded
+/// by a debug-only length assertion).
 fn compact_attestations(
-    attestations: Vec<AggregatedAttestation>,
-    proofs: Vec<AggregatedSignatureProof>,
+    entries: Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
     head_state: &State,
-) -> Result<(Vec<AggregatedAttestation>, Vec<AggregatedSignatureProof>), StoreError> {
-    debug_assert_eq!(attestations.len(), proofs.len());
-
-    if attestations.len() <= 1 {
-        return Ok((attestations, proofs));
+) -> Result<Vec<(AggregatedAttestation, AggregatedSignatureProof)>, StoreError> {
+    if entries.len() <= 1 {
+        return Ok(entries);
     }
 
     // Group indices by AttestationData, preserving first-occurrence order
     let mut order: Vec<AttestationData> = Vec::new();
     let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
-    for (i, att) in attestations.iter().enumerate() {
+    for (i, (att, _)) in entries.iter().enumerate() {
         match groups.entry(att.data.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 order.push(e.key().clone());
@@ -1196,23 +1198,21 @@ fn compact_attestations(
     }
 
     // Fast path: no duplicates
-    if order.len() == attestations.len() {
-        return Ok((attestations, proofs));
+    if order.len() == entries.len() {
+        return Ok(entries);
     }
 
     // Wrap in Option so we can .take() items by index without cloning
     let mut items: Vec<Option<(AggregatedAttestation, AggregatedSignatureProof)>> =
-        attestations.into_iter().zip(proofs).map(Some).collect();
+        entries.into_iter().map(Some).collect();
 
-    let mut compacted_atts = Vec::with_capacity(order.len());
-    let mut compacted_proofs = Vec::with_capacity(order.len());
+    let mut compacted = Vec::with_capacity(order.len());
 
     for data in order {
         let indices = &groups[&data];
         if indices.len() == 1 {
-            let (att, proof) = items[indices[0]].take().expect("index used once");
-            compacted_atts.push(att);
-            compacted_proofs.push(proof);
+            let item = items[indices[0]].take().expect("index used once");
+            compacted.push(item);
             continue;
         }
 
@@ -1253,25 +1253,33 @@ fn compact_attestations(
             .map_err(StoreError::SignatureAggregationFailed)?;
 
         let merged_proof = AggregatedSignatureProof::new(merged_bits.clone(), merged_proof_data);
-
-        compacted_proofs.push(merged_proof);
-        compacted_atts.push(AggregatedAttestation {
+        let merged_att = AggregatedAttestation {
             aggregation_bits: merged_bits,
             data,
-        });
+        };
+        compacted.push((merged_att, merged_proof));
     }
 
-    Ok((compacted_atts, compacted_proofs))
+    Ok(compacted)
 }
 
 /// Greedily select proofs maximizing new validator coverage.
 ///
 /// For a single attestation data entry, picks proofs that cover the most
-/// uncovered validators. Each selected proof produces one AggregatedAttestation.
+/// uncovered validators. A proof is selected as long as it adds at least
+/// one previously-uncovered validator; partially-overlapping participants
+/// between selected proofs are allowed. `compact_attestations` later feeds
+/// these proofs as children to `aggregate_proofs`, which delegates to
+/// `xmss_aggregate` — that function tracks duplicate pubkeys across
+/// children via its `dup_pub_keys` machinery, so overlap is supported by
+/// the underlying aggregation scheme.
+///
+/// Each selected proof is appended to `selected` paired with its
+/// corresponding AggregatedAttestation so the two lists can never drift
+/// out of sync.
 fn extend_proofs_greedily(
     proofs: &[AggregatedSignatureProof],
-    selected_proofs: &mut Vec<AggregatedSignatureProof>,
-    attestations: &mut Vec<AggregatedAttestation>,
+    selected: &mut Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
     att_data: &AttestationData,
 ) {
     if proofs.is_empty() {
@@ -1309,16 +1317,16 @@ fn extend_proofs_greedily(
             .filter(|vid| !covered.contains(vid))
             .collect();
 
-        attestations.push(AggregatedAttestation {
+        let att = AggregatedAttestation {
             aggregation_bits: proof.participants.clone(),
             data: att_data.clone(),
-        });
-        selected_proofs.push(proof.clone());
+        };
 
         metrics::inc_pq_sig_aggregated_signatures();
         metrics::inc_pq_sig_attestations_in_aggregated_signatures(new_covered.len() as u64);
 
         covered.extend(new_covered);
+        selected.push((att, proof.clone()));
         remaining_indices.remove(&best_idx);
     }
 }
@@ -1339,8 +1347,9 @@ fn build_block(
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)>,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
-    let mut aggregated_attestations: Vec<AggregatedAttestation> = Vec::new();
-    let mut aggregated_signatures: Vec<AggregatedSignatureProof> = Vec::new();
+    // Paired (attestation, proof) tuples so the two can never drift out of
+    // sync. Unzipped once at the end for the block body and signatures list.
+    let mut selected: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = Vec::new();
 
     if !aggregated_payloads.is_empty() {
         // Genesis edge case: when building on genesis (slot 0),
@@ -1382,12 +1391,7 @@ fn build_block(
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
-                extend_proofs_greedily(
-                    proofs,
-                    &mut aggregated_signatures,
-                    &mut aggregated_attestations,
-                    att_data,
-                );
+                extend_proofs_greedily(proofs, &mut selected, att_data);
             }
 
             if !found_new {
@@ -1395,8 +1399,10 @@ fn build_block(
             }
 
             // Check if justification advanced
-            let attestations: AggregatedAttestations = aggregated_attestations
-                .clone()
+            let attestations: AggregatedAttestations = selected
+                .iter()
+                .map(|(att, _)| att.clone())
+                .collect::<Vec<_>>()
                 .try_into()
                 .expect("attestation count exceeds limit");
             let candidate = Block {
@@ -1421,8 +1427,11 @@ fn build_block(
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
-    let (aggregated_attestations, aggregated_signatures) =
-        compact_attestations(aggregated_attestations, aggregated_signatures, head_state)?;
+    let compacted = compact_attestations(selected, head_state)?;
+
+    // Unzip paired entries into the parallel lists the block expects.
+    let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
+        compacted.into_iter().unzip();
 
     // Build final block
     let attestations: AggregatedAttestations = aggregated_attestations
@@ -1891,28 +1900,28 @@ mod tests {
         let bits_a = make_bits(&[0]);
         let bits_b = make_bits(&[1]);
 
-        let atts = vec![
-            AggregatedAttestation {
-                aggregation_bits: bits_a.clone(),
-                data: data_a.clone(),
-            },
-            AggregatedAttestation {
-                aggregation_bits: bits_b.clone(),
-                data: data_b.clone(),
-            },
-        ];
-        let proofs = vec![
-            AggregatedSignatureProof::empty(bits_a),
-            AggregatedSignatureProof::empty(bits_b),
+        let entries = vec![
+            (
+                AggregatedAttestation {
+                    aggregation_bits: bits_a.clone(),
+                    data: data_a.clone(),
+                },
+                AggregatedSignatureProof::empty(bits_a),
+            ),
+            (
+                AggregatedAttestation {
+                    aggregation_bits: bits_b.clone(),
+                    data: data_b.clone(),
+                },
+                AggregatedSignatureProof::empty(bits_b),
+            ),
         ];
 
         let state = State::from_genesis(1000, vec![]);
-        let (out_atts, out_proofs) =
-            compact_attestations(atts.clone(), proofs.clone(), &state).unwrap();
-        assert_eq!(out_atts.len(), 2);
-        assert_eq!(out_proofs.len(), 2);
-        assert_eq!(out_atts[0].data, data_a);
-        assert_eq!(out_atts[1].data, data_b);
+        let out = compact_attestations(entries, &state).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.data, data_a);
+        assert_eq!(out[1].0.data, data_b);
     }
 
     #[test]
@@ -1925,32 +1934,36 @@ mod tests {
         let bits_1 = make_bits(&[1]);
         let bits_2 = make_bits(&[2]);
 
-        let atts = vec![
-            AggregatedAttestation {
-                aggregation_bits: bits_0.clone(),
-                data: data_a.clone(),
-            },
-            AggregatedAttestation {
-                aggregation_bits: bits_1.clone(),
-                data: data_b.clone(),
-            },
-            AggregatedAttestation {
-                aggregation_bits: bits_2.clone(),
-                data: data_c.clone(),
-            },
-        ];
-        let proofs = vec![
-            AggregatedSignatureProof::empty(bits_0),
-            AggregatedSignatureProof::empty(bits_1),
-            AggregatedSignatureProof::empty(bits_2),
+        let entries = vec![
+            (
+                AggregatedAttestation {
+                    aggregation_bits: bits_0.clone(),
+                    data: data_a.clone(),
+                },
+                AggregatedSignatureProof::empty(bits_0),
+            ),
+            (
+                AggregatedAttestation {
+                    aggregation_bits: bits_1.clone(),
+                    data: data_b.clone(),
+                },
+                AggregatedSignatureProof::empty(bits_1),
+            ),
+            (
+                AggregatedAttestation {
+                    aggregation_bits: bits_2.clone(),
+                    data: data_c.clone(),
+                },
+                AggregatedSignatureProof::empty(bits_2),
+            ),
         ];
 
         let state = State::from_genesis(1000, vec![]);
-        let (out_atts, _) = compact_attestations(atts, proofs, &state).unwrap();
-        assert_eq!(out_atts.len(), 3);
-        assert_eq!(out_atts[0].data, data_a);
-        assert_eq!(out_atts[1].data, data_b);
-        assert_eq!(out_atts[2].data, data_c);
+        let out = compact_attestations(entries, &state).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0.data, data_a);
+        assert_eq!(out[1].0.data, data_b);
+        assert_eq!(out[2].0.data, data_c);
     }
 
     #[test]
@@ -2035,5 +2048,66 @@ mod tests {
             ),
             "Expected DuplicateAttestationData, got: {result:?}"
         );
+    }
+
+    /// A partially-overlapping proof is still selected as long as it adds at
+    /// least one previously-uncovered validator. The greedy prefers the
+    /// largest proof first, then picks additional proofs whose coverage
+    /// extends `covered`. The resulting overlap is handled downstream by
+    /// `aggregate_proofs` → `xmss_aggregate` (which tracks duplicate pubkeys
+    /// across children via its `dup_pub_keys` machinery).
+    #[test]
+    fn extend_proofs_greedily_allows_overlap_when_it_adds_coverage() {
+        let data = make_att_data(1);
+
+        // Distinct sizes to avoid tie-breaking ambiguity (HashSet iteration
+        // order differs between debug/release):
+        //   A = {0, 1, 2, 3}  (4 validators — largest, picked first)
+        //   B = {2, 3, 4}     (overlaps A on {2,3} but adds validator 4)
+        //   C = {1, 2}        (subset of A — adds nothing, must be skipped)
+        let proof_a = AggregatedSignatureProof::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = AggregatedSignatureProof::empty(make_bits(&[2, 3, 4]));
+        let proof_c = AggregatedSignatureProof::empty(make_bits(&[1, 2]));
+
+        let mut selected = Vec::new();
+        extend_proofs_greedily(&[proof_a, proof_b, proof_c], &mut selected, &data);
+
+        assert_eq!(
+            selected.len(),
+            2,
+            "A and B selected (B adds validator 4); C adds nothing and is skipped"
+        );
+
+        let covered: HashSet<u64> = selected
+            .iter()
+            .flat_map(|(_, p)| p.participant_indices())
+            .collect();
+        assert_eq!(covered, HashSet::from([0, 1, 2, 3, 4]));
+
+        // Attestation bits mirror the proof's participants for each entry.
+        for (att, proof) in &selected {
+            assert_eq!(att.aggregation_bits, proof.participants);
+            assert_eq!(att.data, data);
+        }
+    }
+
+    /// When no proof contributes new coverage (subset of a previously selected
+    /// proof), greedy terminates without selecting it.
+    #[test]
+    fn extend_proofs_greedily_stops_when_no_new_coverage() {
+        let data = make_att_data(1);
+
+        // B's participants are a subset of A's. After picking A, B offers zero
+        // new coverage and must not be selected (its inclusion would also
+        // violate the disjoint invariant).
+        let proof_a = AggregatedSignatureProof::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = AggregatedSignatureProof::empty(make_bits(&[1, 2]));
+
+        let mut selected = Vec::new();
+        extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data);
+
+        assert_eq!(selected.len(), 1);
+        let covered: HashSet<u64> = selected[0].1.participant_indices().collect();
+        assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
     }
 }
