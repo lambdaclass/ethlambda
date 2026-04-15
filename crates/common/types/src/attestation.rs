@@ -35,7 +35,7 @@ pub struct AttestationData {
 }
 
 /// Validator attestation bundled with its signature.
-#[derive(Debug, Clone, SszEncode, SszDecode)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAttestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,
@@ -79,7 +79,7 @@ pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + 
 }
 
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
-#[derive(Debug, Clone, SszEncode, SszDecode)]
+#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
     pub proof: AggregatedSignatureProof,

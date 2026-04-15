@@ -48,7 +48,7 @@ crates/
 ### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
 Interval 0: Block proposal → accept attestations if proposal exists
-Interval 1: Vote propagation (no action)
+Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregation (aggregators create proofs from gossip signatures)
 Interval 3: Safe target update (fork choice)
 Interval 4: Accept accumulated attestations
@@ -106,7 +106,7 @@ let byte: u8 = code.into();
 ### Ownership for Large Structures
 ```rust
 // Prefer taking ownership to avoid cloning large data (signatures ~3KB)
-pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) { ... }
+pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) { ... }
 
 // Add .clone() at call site if needed - makes cost explicit
 store.insert_signed_block(block_root, signed_block.clone());
@@ -310,8 +310,8 @@ Both servers are spawned as independent `tokio::spawn` tasks from `main.rs`. Bin
 ```yaml
 GENESIS_TIME: 1770407233
 GENESIS_VALIDATORS:
-  - "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
-  - "b7b0f72e24801b02bda64073cb4de6699a416b37..."
+  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+    proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
@@ -338,10 +338,9 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 ## Common Gotchas
 
 ### Aggregator Flag Required for Finalization
-- At least one node **must** be started with `--is-aggregator` to finalize blocks in production (without `skip-signature-verification`)
+- At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
 - The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
-- With `skip-signature-verification` (tests only), attestations bypass aggregation and go directly to `new_aggregated_payloads`, so the flag is not needed
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
 ### Signature Verification
@@ -363,7 +362,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 |-------|-------------|---------|
 | `BlockHeaders` | H256 → BlockHeader | Block headers by root |
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
-| `BlockSignatures` | H256 → BlockSignaturesWithAttestation | Signatures (absent for genesis) |
+| `BlockSignatures` | H256 → BlockSignatures | Signatures (absent for genesis) |
 | `States` | H256 → State | Beacon states by root |
 | `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
 | `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |

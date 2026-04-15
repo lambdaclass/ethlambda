@@ -12,8 +12,7 @@ use crate::api::{StorageBackend, StorageWriteBatch, Table};
 use ethlambda_types::{
     attestation::{AttestationData, HashedAttestationData},
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignaturesWithAttestation,
-        BlockWithAttestation, SignedBlockWithAttestation,
+        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -184,6 +183,26 @@ impl PayloadBuffer {
     /// Return the number of distinct attestation messages in the buffer.
     fn len(&self) -> usize {
         self.data.len()
+    }
+
+    /// Return the number of proofs for a given data_root without cloning.
+    fn proof_count_for_root(&self, data_root: &H256) -> usize {
+        self.data.get(data_root).map_or(0, |e| e.proofs.len())
+    }
+
+    /// Return cloned proofs for a given data_root, or empty vec if none.
+    fn proofs_for_root(&self, data_root: &H256) -> Vec<AggregatedSignatureProof> {
+        self.data
+            .get(data_root)
+            .map_or_else(Vec::new, |e| e.proofs.clone())
+    }
+
+    /// Return attestation data entries keyed by data_root.
+    fn attestation_data_keys(&self) -> Vec<(H256, AttestationData)> {
+        self.data
+            .iter()
+            .map(|(&root, entry)| (root, entry.data.clone()))
+            .collect()
     }
 
     /// Extract per-validator latest attestations from proofs' participation bits.
@@ -730,7 +749,7 @@ impl Store {
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
-    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) {
         let mut batch = self.backend.begin_write().expect("write batch");
         write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
@@ -743,7 +762,7 @@ impl Store {
     /// only storing signatures for non-genesis blocks.
     ///
     /// Takes ownership to avoid cloning large signature data.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlockWithAttestation) {
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) {
         let mut batch = self.backend.begin_write().expect("write batch");
         let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
@@ -762,7 +781,7 @@ impl Store {
     ///
     /// Returns None if any of the components are not found.
     /// Note: Genesis block has no entry in BlockSignatures table.
-    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlockWithAttestation> {
+    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
@@ -780,10 +799,12 @@ impl Store {
         };
 
         let block = Block::from_header_and_body(header, body);
-        let signatures =
-            BlockSignaturesWithAttestation::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
-        Some(signatures.to_signed_block(block))
+        Some(SignedBlock {
+            message: block,
+            signature,
+        })
     }
 
     // ============ States ============
@@ -867,6 +888,51 @@ impl Store {
             .iter()
             .map(|(root, entry)| (*root, (entry.data.clone(), entry.proofs.clone())))
             .collect()
+    }
+
+    /// Combined proof count for a data_root across new and known buffers.
+    ///
+    /// Cheap check (no cloning) to short-circuit before calling the more
+    /// expensive `existing_proofs_for_data` which clones all proof bytes.
+    pub fn proof_count_for_data(&self, data_root: &H256) -> usize {
+        let new = self
+            .new_payloads
+            .lock()
+            .unwrap()
+            .proof_count_for_root(data_root);
+        let known = self
+            .known_payloads
+            .lock()
+            .unwrap()
+            .proof_count_for_root(data_root);
+        new + known
+    }
+
+    /// Look up existing proofs for a given data_root from both new and known buffers.
+    ///
+    /// Returns `(new_proofs, known_proofs)` in priority order: new payloads first
+    /// (uncommitted work from the current round), then known payloads (already active
+    /// in fork choice). This ordering is used by greedy proof selection to prefer
+    /// reusing recent work.
+    pub fn existing_proofs_for_data(
+        &self,
+        data_root: &H256,
+    ) -> (Vec<AggregatedSignatureProof>, Vec<AggregatedSignatureProof>) {
+        let new = self.new_payloads.lock().unwrap().proofs_for_root(data_root);
+        let known = self
+            .known_payloads
+            .lock()
+            .unwrap()
+            .proofs_for_root(data_root);
+        (new, known)
+    }
+
+    /// Return attestation data entries from the new (pending) payload buffer.
+    ///
+    /// Used to iterate over data that has pending proofs but may lack gossip
+    /// signatures, matching the spec's `new.keys() | gossip_sigs.keys()` union.
+    pub fn new_payload_keys(&self) -> Vec<(H256, AttestationData)> {
+        self.new_payloads.lock().unwrap().attestation_data_keys()
     }
 
     /// Insert a single proof into the known (fork-choice-active) buffer.
@@ -1024,20 +1090,12 @@ impl Store {
 fn write_signed_block(
     batch: &mut dyn StorageWriteBatch,
     root: &H256,
-    signed_block: SignedBlockWithAttestation,
+    signed_block: SignedBlock,
 ) -> Block {
-    let SignedBlockWithAttestation {
-        block: BlockWithAttestation {
-            block,
-            proposer_attestation,
-        },
+    let SignedBlock {
+        message: block,
         signature,
     } = signed_block;
-
-    let signatures = BlockSignaturesWithAttestation {
-        proposer_attestation,
-        signatures: signature,
-    };
 
     let header = block.header();
     let root_bytes = root.to_ssz();
@@ -1055,7 +1113,7 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    let sig_entries = vec![(root_bytes, signatures.to_ssz())];
+    let sig_entries = vec![(root_bytes, signature.to_ssz())];
     batch
         .put_batch(Table::BlockSignatures, sig_entries)
         .expect("put block signatures");

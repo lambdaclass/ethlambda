@@ -62,11 +62,18 @@ pub type JustificationValidators =
     SszBitlist<{ HISTORICAL_ROOTS_LIMIT * VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Represents a validator's static metadata and operational interface.
+///
+/// Each validator has two independent XMSS keys: one for signing attestations
+/// and one for signing block proposals. This allows signing both in the same
+/// slot without violating OTS (one-time signature) constraints.
 #[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
-    /// XMSS one-time signature public key.
+    /// XMSS public key used for attestation signing.
     #[serde(serialize_with = "serialize_pubkey_hex")]
-    pub pubkey: ValidatorPubkeyBytes,
+    pub attestation_pubkey: ValidatorPubkeyBytes,
+    /// XMSS public key used for block proposal signing.
+    #[serde(serialize_with = "serialize_pubkey_hex")]
+    pub proposal_pubkey: ValidatorPubkeyBytes,
     /// Validator index in the registry.
     pub index: u64,
 }
@@ -79,9 +86,12 @@ where
 }
 
 impl Validator {
-    pub fn get_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
-        // TODO: make this unfallible by moving check to the constructor
-        ValidatorPublicKey::from_bytes(&self.pubkey)
+    pub fn get_attestation_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
+        ValidatorPublicKey::from_bytes(&self.attestation_pubkey)
+    }
+
+    pub fn get_proposal_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
+        ValidatorPublicKey::from_bytes(&self.proposal_pubkey)
     }
 }
 

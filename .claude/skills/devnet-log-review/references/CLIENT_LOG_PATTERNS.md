@@ -54,7 +54,6 @@ ethlambda_p2p: Published block to gossipsub slot=X proposer=Y
 ```
 ethlambda_blockchain: Published attestation slot=X validator_id=Y
 ethlambda_p2p::gossipsub::handler: Received new attestation from gossipsub, sending for processing slot=X validator=Y
-ethlambda_blockchain: Skipping attestation for proposer slot=X (expected: proposers don't attest to their own slot)
 ```
 
 ### Block Processing

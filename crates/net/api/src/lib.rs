@@ -1,6 +1,6 @@
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::SignedBlockWithAttestation,
+    block::SignedBlock,
     primitives::H256,
 };
 use spawned_concurrency::error::ActorError;
@@ -11,7 +11,7 @@ use spawned_concurrency::protocol;
 
 #[protocol]
 pub trait BlockChainToP2P: Send + Sync {
-    fn publish_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
+    fn publish_block(&self, block: SignedBlock) -> Result<(), ActorError>;
     fn publish_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn publish_aggregated_attestation(
         &self,
@@ -24,7 +24,7 @@ pub trait BlockChainToP2P: Send + Sync {
 
 #[protocol]
 pub trait P2PToBlockChain: Send + Sync {
-    fn new_block(&self, block: SignedBlockWithAttestation) -> Result<(), ActorError>;
+    fn new_block(&self, block: SignedBlock) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
         &self,

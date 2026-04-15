@@ -96,15 +96,20 @@ impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Validator {
     index: u64,
+    #[serde(rename = "attestationPubkey")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
-    pubkey: ValidatorPubkeyBytes,
+    attestation_pubkey: ValidatorPubkeyBytes,
+    #[serde(rename = "proposalPubkey")]
+    #[serde(deserialize_with = "deser_pubkey_hex")]
+    proposal_pubkey: ValidatorPubkeyBytes,
 }
 
 impl From<Validator> for DomainValidator {
     fn from(value: Validator) -> Self {
         Self {
             index: value.index,
-            pubkey: value.pubkey,
+            attestation_pubkey: value.attestation_pubkey,
+            proposal_pubkey: value.proposal_pubkey,
         }
     }
 }
@@ -126,7 +131,7 @@ pub struct TestState {
     #[serde(rename = "historicalBlockHashes")]
     pub historical_block_hashes: Container<H256>,
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Container<u64>,
+    pub justified_slots: Container<bool>,
     pub validators: Container<Validator>,
     #[serde(rename = "justificationsRoots")]
     pub justifications_roots: Container<H256>,
@@ -149,6 +154,16 @@ impl From<TestState> for State {
         .unwrap();
         let justifications_roots = SszList::try_from(value.justifications_roots.data).unwrap();
 
+        let mut justified_slots = JustifiedSlots::new();
+        for &b in &value.justified_slots.data {
+            justified_slots.push(b).unwrap();
+        }
+
+        let mut justifications_validators = JustificationValidators::new();
+        for &b in &value.justifications_validators.data {
+            justifications_validators.push(b).unwrap();
+        }
+
         State {
             config: value.config.into(),
             slot: value.slot,
@@ -156,10 +171,10 @@ impl From<TestState> for State {
             latest_justified: value.latest_justified.into(),
             latest_finalized: value.latest_finalized.into(),
             historical_block_hashes,
-            justified_slots: JustifiedSlots::new(),
+            justified_slots,
             validators,
             justifications_roots,
-            justifications_validators: JustificationValidators::new(),
+            justifications_validators,
         }
     }
 }

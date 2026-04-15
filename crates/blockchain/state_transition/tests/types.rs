@@ -71,7 +71,7 @@ pub struct PostState {
     pub historical_block_hashes: Option<Container<H256>>,
 
     #[serde(rename = "justifiedSlots")]
-    pub justified_slots: Option<Container<u64>>,
+    pub justified_slots: Option<Container<bool>>,
 
     #[serde(rename = "justificationsRoots")]
     pub justifications_roots: Option<Container<H256>>,
@@ -81,4 +81,18 @@ pub struct PostState {
 
     #[serde(rename = "validatorCount")]
     pub validator_count: Option<u64>,
+
+    // Label-based root checks: "block_N" labels resolved to hash_tree_root of the Nth block.
+    #[serde(rename = "latestJustifiedRootLabel")]
+    pub latest_justified_root_label: Option<String>,
+    #[serde(rename = "latestFinalizedRootLabel")]
+    pub latest_finalized_root_label: Option<String>,
+    #[serde(rename = "justificationsRootsLabels")]
+    pub justifications_roots_labels: Option<Vec<String>>,
+
+    // Count checks for variable-length collections.
+    #[serde(rename = "justificationsRootsCount")]
+    pub justifications_roots_count: Option<u64>,
+    #[serde(rename = "justificationsValidatorsCount")]
+    pub justifications_validators_count: Option<u64>,
 }
