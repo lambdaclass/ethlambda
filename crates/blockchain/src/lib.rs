@@ -471,8 +471,10 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
+        // Non-aggregators subscribe to their attestation subnet for mesh health,
+        // so they see unaggregated attestations arrive. Only aggregators need to
+        // store and aggregate them.
         if !self.is_aggregator {
-            warn!("Received unaggregated attestation but node is not an aggregator");
             return;
         }
         let _ = store::on_gossip_attestation(&mut self.store, attestation)
