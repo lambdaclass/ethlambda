@@ -280,8 +280,7 @@ impl GossipSignatureBuffer {
         let (data_root, att_data) = hashed.into_parts();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
-            let is_new = !entry.signatures.contains_key(&validator_id);
-            entry.signatures.insert(validator_id, signature);
+            let is_new = entry.signatures.insert(validator_id, signature).is_none();
             if is_new {
                 self.total_signatures += 1;
             }
@@ -1755,7 +1754,7 @@ mod tests {
     // ============ GossipSignatureBuffer Tests ============
 
     fn make_dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::{LeanSigSignature, LeanSignatureScheme};
+        use ethlambda_types::signature::LeanSignatureScheme;
         use leansig::{serialization::Serializable, signature::SignatureScheme};
         use rand::{SeedableRng, rngs::StdRng};
 
