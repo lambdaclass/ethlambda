@@ -270,7 +270,7 @@ impl GossipSignatureBuffer {
 
     /// Insert a gossip signature, FIFO-evicting oldest data_roots when over capacity.
     ///
-    /// First-write-wins: if (validator_id, data_root) already exists, the signature is ignored.
+    /// Last-write-wins: if (validator_id, data_root) already exists, the signature is overwritten.
     fn insert(
         &mut self,
         hashed: HashedAttestationData,
@@ -280,12 +280,11 @@ impl GossipSignatureBuffer {
         let (data_root, att_data) = hashed.into_parts();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
-            // First-write-wins: skip if this validator already has a sig
-            if entry.signatures.contains_key(&validator_id) {
-                return;
-            }
+            let is_new = !entry.signatures.contains_key(&validator_id);
             entry.signatures.insert(validator_id, signature);
-            self.total_signatures += 1;
+            if is_new {
+                self.total_signatures += 1;
+            }
         } else {
             let mut signatures = BTreeMap::new();
             signatures.insert(validator_id, signature);
@@ -1802,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn gossip_buffer_dedup_first_write_wins() {
+    fn gossip_buffer_dedup_last_write_wins() {
         let mut buf = GossipSignatureBuffer::new(100);
         let data = make_att_data(1);
         let hashed = HashedAttestationData::new(data);
@@ -1810,6 +1809,7 @@ mod tests {
         buf.insert(hashed.clone(), 0, make_dummy_sig());
         buf.insert(hashed.clone(), 0, make_dummy_sig());
 
+        // Last-write-wins: overwrites the signature but count stays at 1
         assert_eq!(buf.total_signatures(), 1);
         assert_eq!(buf.len(), 1);
     }
