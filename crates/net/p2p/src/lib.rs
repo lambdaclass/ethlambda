@@ -36,8 +36,8 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{
-        AGGREGATION_TOPIC_KIND, BLOCK_TOPIC_KIND, NETWORK_NAME, attestation_subnet_topic,
-        publish_aggregated_attestation, publish_attestation, publish_block,
+        aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
+        publish_attestation, publish_block,
     },
     req_resp::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
@@ -51,6 +51,7 @@ pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
 
+pub use gossipsub::ForkDigest;
 pub use metrics::populate_name_registry;
 
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
@@ -82,6 +83,8 @@ pub struct SwarmConfig {
     pub attestation_committee_count: u64,
     pub is_aggregator: bool,
     pub aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Fork digest embedded in all gossipsub topic strings.
+    pub fork_digest: ForkDigest,
 }
 
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
@@ -93,6 +96,7 @@ pub struct BuiltSwarm {
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
     pub(crate) is_aggregator: bool,
+    pub(crate) fork_digest: ForkDigest,
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -188,8 +192,7 @@ pub fn build_swarm(
         .expect("failed to bind gossipsub listening address");
 
     // Subscribe to block topic (all nodes)
-    let block_topic_str = format!("/leanconsensus/{NETWORK_NAME}/{BLOCK_TOPIC_KIND}/ssz_snappy");
-    let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
+    let block_topic = block_topic(&config.fork_digest);
     swarm
         .behaviour_mut()
         .gossipsub
@@ -197,9 +200,7 @@ pub fn build_swarm(
         .unwrap();
 
     // Subscribe to aggregation topic (all validators)
-    let aggregation_topic_str =
-        format!("/leanconsensus/{NETWORK_NAME}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
-    let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
+    let aggregation_topic = aggregation_topic(&config.fork_digest);
     swarm
         .behaviour_mut()
         .gossipsub
@@ -223,7 +224,7 @@ pub fn build_swarm(
             aggregate_subnets.insert(0);
         }
         for &subnet_id in &aggregate_subnets {
-            let topic = attestation_subnet_topic(subnet_id);
+            let topic = attestation_subnet_topic(&config.fork_digest, subnet_id);
             swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
             info!(subnet_id, "Subscribed to attestation subnet");
         }
@@ -236,13 +237,13 @@ pub fn build_swarm(
         let subnet_id = vid % config.attestation_committee_count;
         attestation_topics
             .entry(subnet_id)
-            .or_insert_with(|| attestation_subnet_topic(subnet_id));
+            .or_insert_with(|| attestation_subnet_topic(&config.fork_digest, subnet_id));
     }
     if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
         for &subnet_id in explicit_ids {
             attestation_topics
                 .entry(subnet_id)
-                .or_insert_with(|| attestation_subnet_topic(subnet_id));
+                .or_insert_with(|| attestation_subnet_topic(&config.fork_digest, subnet_id));
         }
     }
 
@@ -259,6 +260,7 @@ pub fn build_swarm(
         aggregation_topic,
         bootnode_addrs,
         is_aggregator: config.is_aggregator,
+        fork_digest: config.fork_digest,
     })
 }
 
@@ -287,6 +289,7 @@ impl P2P {
             pending_requests: HashMap::new(),
             request_id_map: HashMap::new(),
             bootnode_addrs: built.bootnode_addrs,
+            fork_digest: built.fork_digest,
         };
         let handle = server.start();
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
@@ -318,6 +321,7 @@ pub struct P2PServer {
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) is_aggregator: bool,
+    pub(crate) fork_digest: ForkDigest,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<H256, PendingRequest>,
