@@ -514,17 +514,9 @@ pub fn time_pq_sig_aggregated_signatures_verification() -> TimingGuard {
     TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS)
 }
 
-/// Start timing committee signatures aggregation. Records duration when the guard is dropped.
-pub fn time_committee_signatures_aggregation() -> TimingGuard {
-    TimingGuard::new(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS)
-}
-
-/// Observe a committee signatures aggregation duration directly.
-///
-/// Used by the off-thread aggregation worker: the duration is tracked in the
-/// worker and reported back to the actor via an `AggregationDone` message,
-/// where we observe it here rather than using a drop-guard across a thread
-/// boundary.
+/// Observe committee-signature aggregation duration. Measured in the
+/// off-thread worker and reported back via an `AggregationDone` message, so a
+/// drop-guard that crosses the thread boundary is not appropriate here.
 pub fn observe_committee_signatures_aggregation(elapsed: std::time::Duration) {
     LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS.observe(elapsed.as_secs_f64());
 }

@@ -137,13 +137,8 @@ struct AggregationSession {
     _deadline_timer: spawned_concurrency::tasks::TimerHandle,
 }
 
-// -------------------------------------------------------------------------
-// Worker → actor messages and deadline self-message
-// -------------------------------------------------------------------------
-
-/// Fire-and-forget message from the aggregation worker: one successfully
-/// produced aggregate.
-pub struct AggregateProduced {
+/// One successful aggregate streamed back from the worker.
+pub(crate) struct AggregateProduced {
     session_id: u64,
     output: AggregatedGroupOutput,
 }
@@ -151,9 +146,8 @@ impl Message for AggregateProduced {
     type Result = ();
 }
 
-/// Fire-and-forget message from the aggregation worker, sent after the worker
-/// loop exits (either by running out of jobs or on cancellation).
-pub struct AggregationDone {
+/// Emitted by the worker after its loop exits (completion or cancellation).
+pub(crate) struct AggregationDone {
     session_id: u64,
     groups_considered: usize,
     groups_aggregated: usize,
@@ -166,9 +160,9 @@ impl Message for AggregationDone {
     type Result = ();
 }
 
-/// Self-message scheduled via `send_after` at interval-2 start. Fires the
-/// worker's cancellation token so no new `try_aggregate` calls start.
-pub struct AggregationDeadline {
+/// Self-message scheduled via `send_after` at interval-2 start. Cancels the
+/// session's token so the worker stops starting new aggregations.
+pub(crate) struct AggregationDeadline {
     session_id: u64,
 }
 impl Message for AggregationDeadline {
@@ -208,9 +202,6 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        // Interval 2 on an aggregator: kick off the off-thread aggregation worker.
-        // The actor continues processing other messages while the worker runs;
-        // results stream back as `AggregateProduced` messages.
         if interval == 2 && self.is_aggregator {
             self.start_aggregation_session(slot, ctx).await;
         }
@@ -640,10 +631,9 @@ impl BlockChainServer {
     }
 
     /// Actor lifecycle hook: wait for any in-flight aggregation worker to exit
-    /// before the actor is fully stopped. The worker's cancellation token is a
-    /// child of the actor's cancellation token, so by the time `stopped` runs
-    /// the worker has already been asked to exit; we only wait for its current
-    /// `try_aggregate` call to finish (bounded at PRIOR_WORKER_JOIN_TIMEOUT).
+    /// before the actor is fully stopped. We cancel the session's token and
+    /// wait up to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current
+    /// `aggregate_job` call to finish (the proof itself cannot be interrupted).
     #[stopped]
     async fn on_stopped(&mut self, _ctx: &Context<Self>) {
         let Some(session) = self.current_aggregation.take() else {
@@ -732,8 +722,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
 impl Handler<AggregationDone> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
-        // Record the metric observation here: the histogram measures one
-        // aggregation session end-to-end (snapshot to worker exit).
+        store::finalize_aggregation_session(&self.store);
         metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
 
         let aggregation_elapsed = msg.total_elapsed;

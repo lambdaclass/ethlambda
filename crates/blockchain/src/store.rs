@@ -130,35 +130,32 @@ fn update_safe_target(store: &mut Store) {
 /// worker that only needs to run the expensive `aggregate_mixed` call. Holding
 /// this struct requires no store access.
 pub struct AggregationJob {
-    pub hashed: HashedAttestationData,
-    pub data_root: H256,
-    pub slot: u64,
+    pub(crate) hashed: HashedAttestationData,
+    pub(crate) slot: u64,
     /// Pre-resolved `(participant_pubkeys, proof_data)` pairs for children
     /// selected via greedy coverage.
-    pub children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
-    pub accepted_child_ids: Vec<u64>,
-    pub raw_pubkeys: Vec<ValidatorPublicKey>,
-    pub raw_sigs: Vec<ValidatorSignature>,
-    pub raw_ids: Vec<u64>,
+    pub(crate) children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    pub(crate) accepted_child_ids: Vec<u64>,
+    pub(crate) raw_pubkeys: Vec<ValidatorPublicKey>,
+    pub(crate) raw_sigs: Vec<ValidatorSignature>,
+    pub(crate) raw_ids: Vec<u64>,
     /// Gossip-signature keys to delete on successful aggregation.
-    pub keys_to_delete: Vec<(u64, H256)>,
+    pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
 /// All input needed to run a session of committee-signature aggregation off-thread.
 pub struct AggregationSnapshot {
-    pub jobs: Vec<AggregationJob>,
-    pub groups_considered: usize,
+    pub(crate) jobs: Vec<AggregationJob>,
+    pub(crate) groups_considered: usize,
 }
 
 /// Result of one successful aggregation group. Carried back to the actor thread
 /// as a message payload so the store can be updated and gossip publish fired.
 pub struct AggregatedGroupOutput {
-    pub hashed: HashedAttestationData,
-    pub proof: AggregatedSignatureProof,
-    pub participants: Vec<u64>,
-    pub raw_sigs_count: usize,
-    pub children_count: usize,
-    pub keys_to_delete: Vec<(u64, H256)>,
+    pub(crate) hashed: HashedAttestationData,
+    pub(crate) proof: AggregatedSignatureProof,
+    pub(crate) participants: Vec<u64>,
+    pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
@@ -188,95 +185,88 @@ pub fn snapshot_aggregation_inputs(store: &Store) -> Option<AggregationSnapshot>
 
     let mut jobs = Vec::with_capacity(groups_considered);
 
-    // --- Pass 1: attestation data with gossip signatures ---
+    // Pass 1: attestation data with gossip signatures (may also reuse existing proofs as children).
     for (hashed, validator_sigs) in &gossip_groups {
-        let data_root = hashed.root();
-        let slot = hashed.data().slot;
-
-        let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
-        let (child_proofs, covered) = select_proofs_greedily(&new_proofs, &known_proofs);
-
-        let mut raw_sigs = Vec::new();
-        let mut raw_pubkeys = Vec::new();
-        let mut raw_ids = Vec::new();
-        for (vid, sig) in validator_sigs {
-            if covered.contains(vid) {
-                continue;
-            }
-            let Some(validator) = validators.get(*vid as usize) else {
-                continue;
-            };
-            let Ok(pubkey) = validator.get_attestation_pubkey() else {
-                continue;
-            };
-            raw_sigs.push(sig.clone());
-            raw_pubkeys.push(pubkey);
-            raw_ids.push(*vid);
+        if let Some(job) = build_job(store, validators, hashed.clone(), Some(validator_sigs)) {
+            jobs.push(job);
         }
-
-        let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
-
-        if raw_ids.is_empty() && children.len() < 2 {
-            continue;
-        }
-
-        let keys_to_delete: Vec<(u64, H256)> = validator_sigs
-            .iter()
-            .map(|(vid, _)| (*vid, data_root))
-            .collect();
-
-        jobs.push(AggregationJob {
-            hashed: hashed.clone(),
-            data_root,
-            slot,
-            children,
-            accepted_child_ids,
-            raw_pubkeys,
-            raw_sigs,
-            raw_ids,
-            keys_to_delete,
-        });
     }
 
-    // --- Pass 2: attestation data with new payloads but no gossip signatures ---
+    // Pass 2: attestation data with pending proofs but no gossip signatures — pure recursive merge.
     for (data_root, att_data) in &new_payload_keys {
         if gossip_roots.contains(data_root) {
             continue;
         }
-
+        // Cheap pre-check to skip the expensive `existing_proofs_for_data` clone when
+        // fewer than 2 proofs are present (merge needs at least 2).
         if store.proof_count_for_data(data_root) < 2 {
             continue;
         }
-
-        let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
-        let (child_proofs, _covered) = select_proofs_greedily(&new_proofs, &known_proofs);
-
-        if child_proofs.len() < 2 {
-            continue;
+        let hashed = HashedAttestationData::new(att_data.clone());
+        if let Some(job) = build_job(store, validators, hashed, None) {
+            jobs.push(job);
         }
-
-        let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
-
-        if children.len() < 2 {
-            continue;
-        }
-
-        jobs.push(AggregationJob {
-            hashed: HashedAttestationData::new(att_data.clone()),
-            data_root: *data_root,
-            slot: att_data.slot,
-            children,
-            accepted_child_ids,
-            raw_pubkeys: Vec::new(),
-            raw_sigs: Vec::new(),
-            raw_ids: Vec::new(),
-            keys_to_delete: Vec::new(),
-        });
     }
 
     Some(AggregationSnapshot {
         jobs,
         groups_considered,
+    })
+}
+
+/// Build one `AggregationJob` for a given attestation data. Returns `None` when
+/// there is not enough material for a viable aggregation (no raw sigs and fewer
+/// than two children). `validator_sigs` is `None` for Pass 2 (payload-only).
+fn build_job(
+    store: &Store,
+    validators: &[ethlambda_types::state::Validator],
+    hashed: HashedAttestationData,
+    validator_sigs: Option<&[(u64, ValidatorSignature)]>,
+) -> Option<AggregationJob> {
+    let data_root = hashed.root();
+    let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
+    let (child_proofs, covered) = select_proofs_greedily(&new_proofs, &known_proofs);
+
+    let mut raw_sigs = Vec::new();
+    let mut raw_pubkeys = Vec::new();
+    let mut raw_ids = Vec::new();
+    for (vid, sig) in validator_sigs.into_iter().flatten() {
+        if covered.contains(vid) {
+            continue;
+        }
+        let Some(validator) = validators.get(*vid as usize) else {
+            continue;
+        };
+        let Ok(pubkey) = validator.get_attestation_pubkey() else {
+            continue;
+        };
+        raw_sigs.push(sig.clone());
+        raw_pubkeys.push(pubkey);
+        raw_ids.push(*vid);
+    }
+
+    let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
+
+    if raw_ids.is_empty() && children.len() < 2 {
+        return None;
+    }
+
+    let keys_to_delete: Vec<(u64, H256)> = validator_sigs
+        .into_iter()
+        .flatten()
+        .map(|(vid, _)| (*vid, data_root))
+        .collect();
+
+    let slot = hashed.data().slot;
+    Some(AggregationJob {
+        hashed,
+        slot,
+        children,
+        accepted_child_ids,
+        raw_pubkeys,
+        raw_sigs,
+        raw_ids,
+        keys_to_delete,
     })
 }
 
@@ -321,8 +311,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     }
 
     let slot_u32: u32 = job.slot.try_into().expect("slot exceeds u32");
-    let raw_sigs_count = job.raw_ids.len();
-    let children_count = job.children.len();
+    let data_root = job.hashed.root();
 
     let proof_data = {
         let _timing = metrics::time_pq_sig_aggregated_signatures_building();
@@ -330,7 +319,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
             job.children,
             job.raw_pubkeys,
             job.raw_sigs,
-            &job.data_root,
+            &data_root,
             slot_u32,
         )
     }
@@ -348,23 +337,28 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
         hashed: job.hashed,
         proof: AggregatedSignatureProof::new(aggregation_bits, proof_data),
         participants,
-        raw_sigs_count,
-        children_count,
         keys_to_delete: job.keys_to_delete,
     })
 }
 
-/// Apply a worker-produced aggregate to the store: insert the new payload and
-/// delete its consumed/redundant gossip signatures. Idempotent wrt the gossip
-/// delete — absent keys are silently skipped.
+/// Apply a worker-produced aggregate to the store. Called per message on the
+/// actor thread; gauge metrics that depend on total counts are batched into
+/// `finalize_aggregation_session` so we pay one lock per session instead of
+/// one per aggregate. Idempotent wrt the gossip delete.
 pub fn apply_aggregated_group(store: &mut Store, output: &AggregatedGroupOutput) {
     store.insert_new_aggregated_payload(output.hashed.clone(), output.proof.clone());
-    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     store.delete_gossip_signatures(&output.keys_to_delete);
-    metrics::update_gossip_signatures(store.gossip_signatures_count());
 
     metrics::inc_pq_sig_aggregated_signatures();
     metrics::inc_pq_sig_attestations_in_aggregated_signatures(output.participants.len() as u64);
+}
+
+/// End-of-session gauge refresh. Called once after the worker finishes so the
+/// `lean_latest_new_aggregated_payloads` and `lean_gossip_signatures` gauges
+/// settle on the final counts instead of being churned per aggregate.
+pub fn finalize_aggregation_session(store: &Store) {
+    metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
+    metrics::update_gossip_signatures(store.gossip_signatures_count());
 }
 
 /// Greedy set-cover selection of proofs to maximize validator coverage.
