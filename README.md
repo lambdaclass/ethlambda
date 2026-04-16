@@ -40,6 +40,13 @@ make run-devnet
 This generates fresh genesis files and starts all configured clients with metrics enabled.
 Press `Ctrl+C` to stop all nodes.
 
+> **Note:** On Linux, QUIC performance benefits from larger UDP receive buffers. If you see warnings about buffer sizes, increase the kernel limit:
+> ```sh
+> sudo sysctl -w net.core.rmem_max=7340032
+> sudo sysctl -w net.core.wmem_max=7340032
+> ```
+> To persist across reboots, add to `/etc/sysctl.conf`. For Docker, pass `--sysctl net.core.rmem_max=7340032 --sysctl net.core.wmem_max=7340032`.
+
 > **Important:** When running nodes manually (outside `make run-devnet`), at least one node must be started with `--is-aggregator` for attestations to be aggregated and included in blocks. Without this flag, the network will produce blocks but never finalize.
 
 For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
