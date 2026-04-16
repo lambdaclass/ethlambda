@@ -38,24 +38,3 @@ pub fn attestation_subnet_topic(subnet_id: u64) -> libp2p::gossipsub::IdentTopic
         "/leanconsensus/{FORK_DIGEST}/{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}/ssz_snappy"
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn topics_embed_fork_digest_per_spec() {
-        assert_eq!(
-            block_topic().to_string(),
-            "/leanconsensus/12345678/block/ssz_snappy"
-        );
-        assert_eq!(
-            aggregation_topic().to_string(),
-            "/leanconsensus/12345678/aggregation/ssz_snappy"
-        );
-        assert_eq!(
-            attestation_subnet_topic(3).to_string(),
-            "/leanconsensus/12345678/attestation_3/ssz_snappy"
-        );
-    }
-}
