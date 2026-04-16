@@ -7,13 +7,13 @@
 // TODO: derive dynamically once the spec defines fork identification.
 pub const FORK_DIGEST: &str = "12345678";
 
-/// Topic name for block gossip.
+/// Topic kind for block gossip
 pub const BLOCK_TOPIC_KIND: &str = "block";
-/// Topic name prefix for per-committee attestation subnets.
+/// Topic kind prefix for per-committee attestation subnets.
 ///
 /// Full topic format: `/leanconsensus/{FORK_DIGEST}/attestation_{subnet_id}/ssz_snappy`
 pub const ATTESTATION_SUBNET_TOPIC_PREFIX: &str = "attestation";
-/// Topic name for aggregated attestation gossip.
+/// Topic kind for aggregated attestation gossip.
 ///
 /// Full topic format: `/leanconsensus/{FORK_DIGEST}/aggregation/ssz_snappy`
 pub const AGGREGATION_TOPIC_KIND: &str = "aggregation";
