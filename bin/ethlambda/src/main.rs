@@ -20,7 +20,7 @@ use std::{
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, ForkDigest, P2P, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     genesis::GenesisConfig,
@@ -164,10 +164,6 @@ async fn main() -> eyre::Result<()> {
         attestation_committee_count: options.attestation_committee_count,
         is_aggregator: options.is_aggregator,
         aggregate_subnet_ids: options.aggregate_subnet_ids,
-        // TODO: derive from fork version + genesis validators root once the
-        // spec defines how (see leanEthereum/leanSpec#622). Until then all
-        // clients agree on this placeholder value.
-        fork_digest: ForkDigest::DUMMY,
     })
     .expect("failed to build swarm");
 

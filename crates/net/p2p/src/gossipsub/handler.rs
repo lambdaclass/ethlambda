@@ -143,7 +143,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .attestation_topics
         .get(&subnet_id)
         .cloned()
-        .unwrap_or_else(|| attestation_subnet_topic(&server.fork_digest, subnet_id));
+        .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
     // Publish to the attestation subnet topic.
     // Aggregators are subscribed to the subnet, so gossipsub uses mesh (not fanout).
