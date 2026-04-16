@@ -20,3 +20,5 @@ libssz-derive.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+leansig.workspace = true
+rand.workspace = true
