@@ -223,11 +223,13 @@ pub fn build_swarm(
 
     let mut subscription_subnets = validator_subnets;
     if config.is_aggregator {
-        if subscription_subnets.is_empty() {
-            subscription_subnets.insert(0);
-        }
         if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
             subscription_subnets.extend(explicit_ids);
+        }
+        // Fall back to subnet 0 only when the aggregator has no validators
+        // and no explicit subnets — otherwise leave the set as configured.
+        if subscription_subnets.is_empty() {
+            subscription_subnets.insert(0);
         }
     }
 
