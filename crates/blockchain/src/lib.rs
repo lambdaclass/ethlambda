@@ -198,7 +198,7 @@ impl BlockChainServer {
             // this the aggregator never sees its own validator's signature in
             // gossip_signatures and it is excluded from aggregated proofs.
             if self.is_aggregator {
-                let _ = store::on_gossip_attestation(&mut self.store, &signed_attestation)
+                let _ = store::on_gossip_attestation(&mut self.store, &signed_attestation, true)
                     .inspect_err(|err| {
                         warn!(%slot, %validator_id, %err, "Self-delivery of attestation failed")
                     });
@@ -471,13 +471,7 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
-        // Non-aggregators subscribe to their attestation subnet for mesh health,
-        // so they see unaggregated attestations arrive. Only aggregators need to
-        // store and aggregate them.
-        if !self.is_aggregator {
-            return;
-        }
-        let _ = store::on_gossip_attestation(&mut self.store, attestation)
+        let _ = store::on_gossip_attestation(&mut self.store, attestation, self.is_aggregator)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 

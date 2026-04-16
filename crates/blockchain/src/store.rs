@@ -528,11 +528,14 @@ pub fn on_tick(
 
 /// Process a gossiped attestation with signature verification.
 ///
-/// Verifies the validator's XMSS signature and stores it for later aggregation
-/// at interval 2. Only aggregator nodes receive unaggregated gossip attestations.
+/// Every subscriber validates the attestation data and verifies the XMSS
+/// signature so invalid messages get caught at the edge. Only aggregators
+/// store the signature for later aggregation at interval 2; non-aggregators
+/// drop it after verification.
 pub fn on_gossip_attestation(
     store: &mut Store,
     signed_attestation: &SignedAttestation,
+    is_aggregator: bool,
 ) -> Result<(), StoreError> {
     let validator_id = signed_attestation.validator_id;
     let attestation = Attestation {
@@ -570,10 +573,13 @@ pub fn on_gossip_attestation(
     }
     metrics::inc_pq_sig_attestation_signatures_valid();
 
-    // Store gossip signature unconditionally for later aggregation at interval 2.
-    // Subnet filtering is handled at the P2P subscription layer.
-    store.insert_gossip_signature(hashed, validator_id, signature);
-    metrics::update_gossip_signatures(store.gossip_signatures_count());
+    // Only aggregators persist the signature for later aggregation at
+    // interval 2. Non-aggregators drop the validated attestation — they
+    // still participate in the mesh so peers see the message propagate.
+    if is_aggregator {
+        store.insert_gossip_signature(hashed, validator_id, signature);
+        metrics::update_gossip_signatures(store.gossip_signatures_count());
+    }
 
     metrics::inc_attestations_valid(1);
 
