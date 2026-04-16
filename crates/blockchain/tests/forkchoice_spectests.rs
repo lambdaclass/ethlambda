@@ -81,7 +81,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time_ms, true, false);
+                    store::on_tick(&mut store, block_time_ms, true);
                     let result = store::on_block_without_verification(&mut store, signed_block);
 
                     match (result.is_ok(), step.valid) {
@@ -106,7 +106,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 "tick" => {
                     let timestamp_ms = step.time.expect("tick step missing time") * 1000;
                     // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp_ms, false, false);
+                    store::on_tick(&mut store, timestamp_ms, false);
                 }
                 "attestation" => {
                     let att_data = step
