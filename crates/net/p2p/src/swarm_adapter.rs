@@ -1,7 +1,6 @@
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
-    gossipsub::PublishError,
     request_response::{self, OutboundRequestId},
     swarm::SwarmEvent,
 };
@@ -14,8 +13,6 @@ pub enum SwarmCommand {
     Publish {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
-        /// When true, suppress NoPeersSubscribedToTopic errors (other errors still warn).
-        ignore_no_peers: bool,
     },
     Dial(Multiaddr),
     SendRequest {
@@ -40,25 +37,7 @@ impl SwarmHandle {
     pub fn publish(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Publish {
-                topic,
-                data,
-                ignore_no_peers: false,
-            })
-            .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
-    }
-
-    /// Publish, suppressing NoPeersSubscribedToTopic errors. Used when the sender
-    /// is also subscribed to the topic (e.g., aggregator publishing its own
-    /// attestation to a subnet it subscribes to) and no other peer subscribes.
-    pub fn publish_ignore_no_peers(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
-        let _ = self
-            .cmd_tx
-            .send(SwarmCommand::Publish {
-                topic,
-                data,
-                ignore_no_peers: true,
-            })
+            .send(SwarmCommand::Publish { topic, data })
             .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
     }
 
@@ -144,17 +123,13 @@ async fn swarm_loop(
 
 fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
     match cmd {
-        SwarmCommand::Publish {
-            topic,
-            data,
-            ignore_no_peers,
-        } => {
-            let result = swarm.behaviour_mut().gossipsub.publish(topic, data);
-            if let Err(err) = result
-                && !(ignore_no_peers && matches!(err, PublishError::NoPeersSubscribedToTopic))
-            {
-                warn!(%err, "Swarm adapter: publish failed");
-            }
+        SwarmCommand::Publish { topic, data } => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, data)
+                .inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"))
+                .ok();
         }
         SwarmCommand::Dial(addr) => {
             let _ = swarm

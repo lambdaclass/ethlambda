@@ -145,18 +145,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .cloned()
         .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
-    // Publish to the attestation subnet topic.
-    // Aggregators are subscribed to the subnet, so gossipsub uses mesh (not fanout).
-    // In small networks where no other node subscribes, this returns
-    // NoPeersSubscribedToTopic. Use best-effort to suppress the expected warning;
-    // the aggregator already self-delivered its attestation locally.
-    if server.is_aggregator {
-        server
-            .swarm_handle
-            .publish_ignore_no_peers(topic, compressed);
-    } else {
-        server.swarm_handle.publish(topic, compressed);
-    }
+    server.swarm_handle.publish(topic, compressed);
     info!(
         %slot,
         validator,
