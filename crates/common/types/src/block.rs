@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
@@ -127,7 +127,7 @@ pub struct BlockHeader {
 }
 
 /// A complete block including header and body.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Block {
     /// The slot in which the block was proposed.
     pub slot: u64,
@@ -177,14 +177,29 @@ impl Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
-#[derive(Debug, Default, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Default, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///
     /// Individual signatures live in the aggregated block signature list, so
     /// these entries contain only attestation data without per-attestation signatures.
+    #[serde(serialize_with = "serialize_attestations")]
     pub attestations: AggregatedAttestations,
 }
 
 /// List of aggregated attestations included in a block.
 pub type AggregatedAttestations = SszList<AggregatedAttestation, 4096>;
+
+fn serialize_attestations<S>(
+    attestations: &AggregatedAttestations,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(attestations.len()))?;
+    for attestation in attestations.iter() {
+        seq.serialize_element(attestation)?;
+    }
+    seq.end()
+}

@@ -1,5 +1,7 @@
+use libssz::SszEncode as _;
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitlist, SszVector};
+use serde::{Serialize, Serializer};
 
 use crate::{
     block::AggregatedSignatureProof,
@@ -19,7 +21,7 @@ pub struct Attestation {
 }
 
 /// Attestation content describing the validator's observed chain view.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AttestationData {
     /// The slot for which the attestation is made.
     pub slot: u64,
@@ -49,9 +51,10 @@ pub struct SignedAttestation {
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
 
 /// Aggregated attestation consisting of participation bits and message.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AggregatedAttestation {
     /// Bitfield indicating which validators participated in the aggregation.
+    #[serde(serialize_with = "serialize_aggregation_bits")]
     pub aggregation_bits: AggregationBits,
 
     /// Combined attestation data similar to the beacon chain format.
@@ -66,6 +69,16 @@ pub struct AggregatedAttestation {
 /// A general-purpose bitfield for tracking which validators have participated
 /// in some collective action (attestation, signature aggregation, etc.).
 pub type AggregationBits = SszBitlist<4096>;
+
+/// Serialize an `AggregationBits` bitlist as a `0x`-prefixed hex string of its
+/// SSZ encoding (matching the beacon API convention).
+fn serialize_aggregation_bits<S>(bits: &AggregationBits, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let encoded = format!("0x{}", hex::encode(bits.to_ssz()));
+    serializer.serialize_str(&encoded)
+}
 
 /// Returns the indices of set bits in an `AggregationBits` bitfield as validator IDs.
 pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + '_ {

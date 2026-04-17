@@ -2158,6 +2158,7 @@ dependencies = [
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-types",
+ "hex",
  "http-body-util",
  "jemalloc_pprof",
  "libssz",

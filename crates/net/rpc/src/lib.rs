@@ -8,6 +8,7 @@ use libssz::SszEncode;
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
+mod blocks;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
@@ -46,6 +47,11 @@ fn build_api_router(store: Store) -> Router {
         .route(
             "/lean/v0/fork_choice/ui",
             get(fork_choice::get_fork_choice_ui),
+        )
+        .route("/lean/v0/blocks/{block_id}", get(blocks::get_block))
+        .route(
+            "/lean/v0/blocks/{block_id}/header",
+            get(blocks::get_block_header),
         )
         .with_state(store)
 }
@@ -104,12 +110,14 @@ fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use ethlambda_storage::{StorageBackend, Table};
     use ethlambda_types::{
-        block::{BlockBody, BlockHeader},
+        block::{Block, BlockBody, BlockHeader},
         checkpoint::Checkpoint,
         primitives::{H256, HashTreeRoot as _},
         state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
+    use libssz::SszEncode;
 
     /// Create a minimal test state for testing.
     pub(crate) fn create_test_state() -> State {
@@ -138,6 +146,42 @@ pub(crate) mod test_utils {
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
         }
+    }
+
+    /// Build a block at the given slot with a trivial body.
+    pub(crate) fn make_block(slot: u64, parent_root: H256) -> Block {
+        Block {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        }
+    }
+
+    /// Insert a block's header (and body, if non-empty) into the backend.
+    ///
+    /// This bypasses `Store::insert_signed_block`, which requires XMSS
+    /// signatures that are expensive to produce in tests.
+    pub(crate) fn insert_block_raw(backend: &dyn StorageBackend, block: &Block) -> H256 {
+        let header = block.header();
+        let root = header.hash_tree_root();
+
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockHeaders, vec![(root.to_ssz(), header.to_ssz())])
+            .expect("put header");
+        if header.body_root != BlockBody::default().hash_tree_root() {
+            batch
+                .put_batch(
+                    Table::BlockBodies,
+                    vec![(root.to_ssz(), block.body.to_ssz())],
+                )
+                .expect("put body");
+        }
+        batch.commit().expect("commit");
+
+        root
     }
 }
 
@@ -224,5 +268,150 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), expected_ssz.as_slice());
+    }
+
+    mod blocks {
+        use super::*;
+        use ethlambda_types::{
+            primitives::{H256, HashTreeRoot as _},
+            state::JustifiedSlots,
+        };
+
+        use crate::test_utils::{insert_block_raw, make_block};
+
+        /// Build a store whose head state points back at `slot=1` via
+        /// `historical_block_hashes`, with a real block stored at that slot.
+        fn store_with_historical_block() -> (Store, H256) {
+            let backend = Arc::new(InMemoryBackend::new());
+
+            let target_block = make_block(1, H256::ZERO);
+            let target_root = insert_block_raw(backend.as_ref(), &target_block);
+
+            let mut anchor_state = create_test_state();
+            anchor_state.slot = 2;
+            anchor_state.latest_block_header.slot = 2;
+            anchor_state.latest_block_header.parent_root = target_root;
+            anchor_state.historical_block_hashes =
+                vec![H256::ZERO, target_root].try_into().unwrap();
+            anchor_state.justified_slots = JustifiedSlots::with_length(2).unwrap();
+
+            let store = Store::from_anchor_state(backend, anchor_state);
+            (store, target_root)
+        }
+
+        async fn send(app: axum::Router, uri: &str) -> axum::response::Response {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        fn anchor_root_of(state: &ethlambda_types::state::State) -> H256 {
+            let mut state = state.clone();
+            state.latest_block_header.state_root = H256::ZERO;
+            let state_root = state.hash_tree_root();
+            state.latest_block_header.state_root = state_root;
+            state.latest_block_header.hash_tree_root()
+        }
+
+        #[tokio::test]
+        async fn get_block_by_root_returns_json() {
+            let state = create_test_state();
+            let anchor_root = anchor_root_of(&state);
+            let backend = Arc::new(InMemoryBackend::new());
+            let store = Store::from_anchor_state(backend, state);
+            let app = build_api_router(store);
+
+            let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}")).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(json["slot"], 0);
+            assert_eq!(json["proposer_index"], 0);
+            assert!(json["parent_root"].is_string());
+            assert!(json["state_root"].is_string());
+            assert!(json["body"]["attestations"].is_array());
+        }
+
+        #[tokio::test]
+        async fn get_block_header_by_root_returns_json() {
+            let state = create_test_state();
+            let anchor_root = anchor_root_of(&state);
+            let backend = Arc::new(InMemoryBackend::new());
+            let store = Store::from_anchor_state(backend, state);
+            let app = build_api_router(store);
+
+            let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}/header")).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(json["slot"], 0);
+            assert_eq!(json["proposer_index"], 0);
+            assert!(json["body_root"].is_string());
+        }
+
+        #[tokio::test]
+        async fn get_block_by_slot_returns_json() {
+            let (store, _target_root) = store_with_historical_block();
+            let app = build_api_router(store);
+
+            let response = send(app, "/lean/v0/blocks/1").await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(json["slot"], 1);
+            assert!(json["body"]["attestations"].is_array());
+        }
+
+        #[tokio::test]
+        async fn get_block_invalid_id_returns_400() {
+            let state = create_test_state();
+            let backend = Arc::new(InMemoryBackend::new());
+            let store = Store::from_anchor_state(backend, state);
+            let app = build_api_router(store);
+
+            let response = send(app, "/lean/v0/blocks/not-a-valid-id").await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn get_block_missing_root_returns_404() {
+            let state = create_test_state();
+            let backend = Arc::new(InMemoryBackend::new());
+            let store = Store::from_anchor_state(backend, state);
+            let app = build_api_router(store);
+
+            let missing = format!("0x{}", "aa".repeat(32));
+            let response = send(app, &format!("/lean/v0/blocks/{missing}")).await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn get_block_missing_slot_returns_404() {
+            let (store, _) = store_with_historical_block();
+            let app = build_api_router(store);
+
+            let response = send(app, "/lean/v0/blocks/999").await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn get_block_empty_slot_returns_404() {
+            let (store, _) = store_with_historical_block();
+            let app = build_api_router(store);
+
+            // Slot 0 in the test setup is H256::ZERO (empty).
+            let response = send(app, "/lean/v0/blocks/0").await;
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 }

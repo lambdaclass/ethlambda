@@ -294,6 +294,8 @@ The RPC crate runs **two independent Axum servers** on separate ports, allowing 
 - `GET /lean/v0/checkpoints/justified` — justified checkpoint (JSON)
 - `GET /lean/v0/fork_choice` — fork choice tree (JSON)
 - `GET /lean/v0/fork_choice/ui` — interactive D3.js visualization
+- `GET /lean/v0/blocks/{block_id}` — block as JSON; `block_id` is a `0x`-prefixed 32-byte hex root or a decimal slot
+- `GET /lean/v0/blocks/{block_id}/header` — block header as JSON
 - Requires `Store` access
 
 ### Metrics Server (`:5054`)
