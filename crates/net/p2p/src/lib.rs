@@ -36,8 +36,8 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{
-        AGGREGATION_TOPIC_KIND, BLOCK_TOPIC_KIND, NETWORK_NAME, attestation_subnet_topic,
-        publish_aggregated_attestation, publish_attestation, publish_block,
+        aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
+        publish_attestation, publish_block,
     },
     req_resp::{
         BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
@@ -188,8 +188,7 @@ pub fn build_swarm(
         .expect("failed to bind gossipsub listening address");
 
     // Subscribe to block topic (all nodes)
-    let block_topic_str = format!("/leanconsensus/{NETWORK_NAME}/{BLOCK_TOPIC_KIND}/ssz_snappy");
-    let block_topic = libp2p::gossipsub::IdentTopic::new(block_topic_str);
+    let block_topic = block_topic();
     swarm
         .behaviour_mut()
         .gossipsub
@@ -197,9 +196,7 @@ pub fn build_swarm(
         .unwrap();
 
     // Subscribe to aggregation topic (all validators)
-    let aggregation_topic_str =
-        format!("/leanconsensus/{NETWORK_NAME}/{AGGREGATION_TOPIC_KIND}/ssz_snappy");
-    let aggregation_topic = libp2p::gossipsub::IdentTopic::new(aggregation_topic_str);
+    let aggregation_topic = aggregation_topic();
     swarm
         .behaviour_mut()
         .gossipsub

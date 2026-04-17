@@ -265,7 +265,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3)
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
-  - Topic: `/leanconsensus/{network}/{block|attestation}/ssz_snappy`
+  - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
+  - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
 - **Req/Resp**: Status, BlocksByRoot (snappy frame compression + varint length)
 
