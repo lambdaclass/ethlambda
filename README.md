@@ -132,4 +132,7 @@ Some features we are looking to implement in the near future, in order of priori
 - [Add support for pq-devnet-5](https://github.com/lambdaclass/ethlambda/issues/285)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
 - [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
-- [Formal verification of the STF](https://github.com/lambdaclass/ethlambda/issues/272)
+
+### Experimental features
+
+We have a proof-of-concept formalization of a part of the state transition function in Lean4 in PR [#269](https://github.com/lambdaclass/ethlambda/pull/269).
