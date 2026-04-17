@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
@@ -11,11 +11,13 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
 };
 
+use crate::aggregation::{
+    AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
+    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+};
 use crate::key_manager::ValidatorKeyPair;
-use crate::store::{AggregatedGroupOutput, AggregationSnapshot};
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
-use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
@@ -23,17 +25,7 @@ use tracing::{error, info, trace, warn};
 
 use crate::store::StoreError;
 
-/// Soft deadline for committee-signature aggregation measured from the
-/// interval-2 tick. After this much wall time elapses, the actor signals the
-/// worker to stop via its cancellation token. The 50 ms budget before the next
-/// interval (interval 3 at +800 ms) is reserved for publishing any late-arriving
-/// aggregates and for gossip propagation margin.
-const AGGREGATION_DEADLINE: Duration = Duration::from_millis(750);
-/// Upper bound we wait for a prior worker to exit if it is still running when
-/// the next session is about to start. Reached only in pathological cases
-/// (mismatched timers, stuck proofs); we warn before blocking.
-const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-
+pub mod aggregation;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -120,55 +112,6 @@ pub struct BlockChainServer {
     current_aggregation: Option<AggregationSession>,
 }
 
-/// Tracks an in-flight off-thread aggregation worker so the actor can cancel,
-/// join, and correlate incoming result messages with the right session.
-struct AggregationSession {
-    /// Slot at which this session was started; used as a fencing id so we can
-    /// drop late-arriving messages from a prior session.
-    session_id: u64,
-    /// Child of the actor cancellation token; fires either at the deadline or
-    /// when the actor itself is stopping.
-    cancel: CancellationToken,
-    /// Handle to the `spawn_blocking` worker. Held so `stopped()` / new-session
-    /// start can await completion.
-    worker: tokio::task::JoinHandle<()>,
-    /// Kept alive so the timer is implicitly cancelled when the field is
-    /// replaced or the actor stops (see `spawned_concurrency::tasks::time`).
-    _deadline_timer: spawned_concurrency::tasks::TimerHandle,
-}
-
-/// One successful aggregate streamed back from the worker.
-pub(crate) struct AggregateProduced {
-    session_id: u64,
-    output: AggregatedGroupOutput,
-}
-impl Message for AggregateProduced {
-    type Result = ();
-}
-
-/// Emitted by the worker after its loop exits (completion or cancellation).
-pub(crate) struct AggregationDone {
-    session_id: u64,
-    groups_considered: usize,
-    groups_aggregated: usize,
-    total_raw_sigs: usize,
-    total_children: usize,
-    total_elapsed: Duration,
-    cancelled: bool,
-}
-impl Message for AggregationDone {
-    type Result = ();
-}
-
-/// Self-message scheduled via `send_after` at interval-2 start. Cancels the
-/// session's token so the worker stops starting new aggregations.
-pub(crate) struct AggregationDeadline {
-    session_id: u64,
-}
-impl Message for AggregationDeadline {
-    type Result = ();
-}
-
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
@@ -247,7 +190,7 @@ impl BlockChainServer {
             }
         }
 
-        let Some(snapshot) = store::snapshot_aggregation_inputs(&self.store) else {
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store) else {
             // No gossip sigs and no pending payloads — nothing to aggregate this slot.
             return;
         };
@@ -706,7 +649,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
             return;
         }
 
-        store::apply_aggregated_group(&mut self.store, &msg.output);
+        aggregation::apply_aggregated_group(&mut self.store, &msg.output);
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
@@ -722,7 +665,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
 impl Handler<AggregationDone> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
-        store::finalize_aggregation_session(&self.store);
+        aggregation::finalize_aggregation_session(&self.store);
         metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
 
         let aggregation_elapsed = msg.total_elapsed;
@@ -748,56 +691,4 @@ impl Handler<AggregationDeadline> for BlockChainServer {
             session.cancel.cancel();
         }
     }
-}
-
-// -------------------------------------------------------------------------
-// Worker loop — runs on a `spawn_blocking` thread, no store access.
-// -------------------------------------------------------------------------
-
-fn run_aggregation_worker(
-    snapshot: AggregationSnapshot,
-    actor: ActorRef<BlockChainServer>,
-    cancel: CancellationToken,
-    session_id: u64,
-) {
-    let start = Instant::now();
-    let groups_considered = snapshot.groups_considered;
-    let mut groups_aggregated = 0usize;
-    let mut total_raw_sigs = 0usize;
-    let mut total_children = 0usize;
-
-    for job in snapshot.jobs {
-        if cancel.is_cancelled() {
-            break;
-        }
-
-        let job_raw_sigs = job.raw_ids.len();
-        let job_children = job.children.len();
-
-        let Some(output) = store::aggregate_job(job) else {
-            continue;
-        };
-
-        groups_aggregated += 1;
-        total_raw_sigs += job_raw_sigs;
-        total_children += job_children;
-
-        if actor
-            .send(AggregateProduced { session_id, output })
-            .is_err()
-        {
-            // Actor is gone; no point producing more.
-            break;
-        }
-    }
-
-    let _ = actor.send(AggregationDone {
-        session_id,
-        groups_considered,
-        groups_aggregated,
-        total_raw_sigs,
-        total_children,
-        total_elapsed: start.elapsed(),
-        cancelled: cancel.is_cancelled(),
-    });
 }
