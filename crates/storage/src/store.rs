@@ -918,6 +918,27 @@ impl Store {
         batch.commit().expect("commit");
     }
 
+    /// Get a block (header + body, no signatures) by root.
+    ///
+    /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
+    /// genesis block, which has no signature entry.
+    pub fn get_block(&self, root: &H256) -> Option<Block> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.to_ssz();
+
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+
+        let body = if header.body_root == *EMPTY_BODY_ROOT {
+            BlockBody::default()
+        } else {
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+        };
+
+        Some(Block::from_header_and_body(header, body))
+    }
+
     /// Get a signed block by combining header, body, and signatures.
     ///
     /// Returns None if any of the components are not found.
