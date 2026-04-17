@@ -35,7 +35,11 @@ pub struct AttestationData {
 }
 
 /// Validator attestation bundled with its signature.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+///
+/// `HashTreeRoot` is intentionally not derived: `XmssSignature` is a fixed-size
+/// byte vector for cross-client serialization but the spec Merkleizes it as a
+/// container, so roots would diverge. No code hashes `SignedAttestation`.
+#[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct SignedAttestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,

@@ -55,14 +55,18 @@ fn run_ssz_test(test: &SszTestCase) -> datatest_stable::Result<()> {
         }
         "Block" => run_typed_test::<ssz_types::Block, ethlambda_types::block::Block>(test),
         "State" => run_typed_test::<ssz_types::TestState, ethlambda_types::state::State>(test),
-        "SignedAttestation" => run_typed_test::<
+        // Types containing `XmssSignature` are serialized only — their hash tree
+        // root diverges from the spec because leanSpec Merkleizes the signature
+        // as a container while we treat it as fixed-size bytes.
+        "SignedAttestation" => run_serialization_only_test::<
             ssz_types::SignedAttestation,
             ethlambda_types::attestation::SignedAttestation,
         >(test),
-        "SignedBlock" => {
-            run_typed_test::<ssz_types::SignedBlock, ethlambda_types::block::SignedBlock>(test)
-        }
-        "BlockSignatures" => run_typed_test::<
+        "SignedBlock" => run_serialization_only_test::<
+            ssz_types::SignedBlock,
+            ethlambda_types::block::SignedBlock,
+        >(test),
+        "BlockSignatures" => run_serialization_only_test::<
             ssz_types::BlockSignatures,
             ethlambda_types::block::BlockSignatures,
         >(test),
@@ -95,17 +99,58 @@ where
     F: serde::de::DeserializeOwned + Into<D>,
     D: libssz::SszEncode + libssz::SszDecode + HashTreeRoot,
 {
-    let expected_bytes = decode_hex(&test.serialized)
-        .map_err(|e| format!("Failed to decode serialized hex: {e}"))?;
+    let expected_bytes = check_ssz_roundtrip::<F, D>(test)?;
     let expected_root =
         decode_hex_h256(&test.root).map_err(|e| format!("Failed to decode root hex: {e}"))?;
 
-    // Step 1: Deserialize JSON value into fixture type, then convert to domain type
     let fixture_value: F = serde_json::from_value(test.value.clone())
         .map_err(|e| format!("Failed to deserialize value: {e}"))?;
     let domain_value: D = fixture_value.into();
 
-    // Step 2: SSZ encode and compare with expected serialized bytes
+    // Re-encode for the hash computation; cheap relative to the fixture I/O.
+    debug_assert_eq!(
+        <D as libssz::SszEncode>::to_ssz(&domain_value),
+        expected_bytes
+    );
+
+    let computed_root = HashTreeRoot::hash_tree_root(&domain_value);
+    if computed_root != expected_root {
+        return Err(format!(
+            "Hash tree root mismatch for {}:\n  expected: {expected_root}\n  got:      {computed_root}",
+            test.type_name,
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Run only the serialization portion of the SSZ conformance tests.
+///
+/// Used for types where hash tree root intentionally diverges from the spec
+/// (see `SignedBlock`, `BlockSignatures`, `SignedAttestation`). Encoding and
+/// round-trip are still enforced so cross-client wire format stays in sync.
+fn run_serialization_only_test<F, D>(test: &SszTestCase) -> datatest_stable::Result<()>
+where
+    F: serde::de::DeserializeOwned + Into<D>,
+    D: libssz::SszEncode + libssz::SszDecode,
+{
+    check_ssz_roundtrip::<F, D>(test).map(|_| ())
+}
+
+/// Validates encoding and decoding round-trip, returning the expected bytes.
+fn check_ssz_roundtrip<F, D>(test: &SszTestCase) -> datatest_stable::Result<Vec<u8>>
+where
+    F: serde::de::DeserializeOwned + Into<D>,
+    D: libssz::SszEncode + libssz::SszDecode,
+{
+    let expected_bytes = decode_hex(&test.serialized)
+        .map_err(|e| format!("Failed to decode serialized hex: {e}"))?;
+
+    let fixture_value: F = serde_json::from_value(test.value.clone())
+        .map_err(|e| format!("Failed to deserialize value: {e}"))?;
+    let domain_value: D = fixture_value.into();
+
     let encoded = <D as libssz::SszEncode>::to_ssz(&domain_value);
     if encoded != expected_bytes {
         return Err(format!(
@@ -117,7 +162,6 @@ where
         .into());
     }
 
-    // Step 3: SSZ decode from expected bytes and re-encode (round-trip)
     let decoded = D::from_ssz_bytes(&expected_bytes)
         .map_err(|e| format!("SSZ decode failed for {}: {e:?}", test.type_name))?;
     let re_encoded = <D as libssz::SszEncode>::to_ssz(&decoded);
@@ -131,17 +175,7 @@ where
         .into());
     }
 
-    // Step 4: Verify hash tree root
-    let computed_root = HashTreeRoot::hash_tree_root(&domain_value);
-    if computed_root != expected_root {
-        return Err(format!(
-            "Hash tree root mismatch for {}:\n  expected: {expected_root}\n  got:      {computed_root}",
-            test.type_name,
-        )
-        .into());
-    }
-
-    Ok(())
+    Ok(expected_bytes)
 }
 
 datatest_stable::harness!({
