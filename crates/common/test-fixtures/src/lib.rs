@@ -2,10 +2,12 @@ use ethlambda_types::{
     attestation::{
         AggregatedAttestation as DomainAggregatedAttestation,
         AggregationBits as DomainAggregationBits, AttestationData as DomainAttestationData,
+        XmssSignature,
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     checkpoint::Checkpoint as DomainCheckpoint,
     primitives::H256,
+    signature::SIGNATURE_SIZE,
     state::{
         ChainConfig, JustificationValidators, JustifiedSlots, State, Validator as DomainValidator,
         ValidatorPubkeyBytes,
@@ -312,4 +314,18 @@ where
         .try_into()
         .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
     Ok(pubkey)
+}
+
+pub fn deser_xmss_hex<'de, D>(d: D) -> Result<XmssSignature, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    use serde::de::Error;
+
+    let value = String::deserialize(d)?;
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
+        .map_err(|_| D::Error::custom("XmssSignature value is not valid hex"))?;
+    XmssSignature::try_from(bytes)
+        .map_err(|_| D::Error::custom(format!("XmssSignature length != {SIGNATURE_SIZE}")))
 }
