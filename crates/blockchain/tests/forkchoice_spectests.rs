@@ -7,9 +7,9 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, XmssSignature},
+    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation, XmssSignature},
     block::{AggregatedSignatureProof, Block, BlockSignatures, SignedBlock},
-    primitives::{H256, HashTreeRoot as _},
+    primitives::{ByteList, H256, HashTreeRoot as _},
     signature::SIGNATURE_SIZE,
     state::State,
 };
@@ -28,7 +28,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         && SKIP_TESTS.contains(&stem)
     {
-        println!("Skipping {stem} (gossip attestation not serialized in fixture)");
+        println!("Skipping {stem} (see SKIP_TESTS comment)");
         return Ok(());
     }
     let tests = ForkChoiceTestVector::from_file(path)?;
@@ -74,25 +74,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true, false);
                     let result = store::on_block_without_verification(&mut store, signed_block);
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 "tick" => {
                     // Fixtures use either `time` (UNIX seconds) or `interval`
@@ -112,75 +94,44 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let att_data = step
                         .attestation
                         .expect("attestation step missing attestation data");
-                    let domain_data: ethlambda_types::attestation::AttestationData =
-                        att_data.data.into();
-                    let validator_id = att_data
-                        .validator_id
-                        .expect("attestation step missing validator_id");
+                    let signed_attestation = SignedAttestation {
+                        validator_id: att_data
+                            .validator_id
+                            .expect("attestation step missing validator_id"),
+                        data: att_data.data.into(),
+                        signature: att_data
+                            .signature
+                            .expect("attestation step missing signature"),
+                    };
+                    let is_aggregator = step.is_aggregator.unwrap_or(false);
 
-                    let result = store::on_gossip_attestation_without_verification(
+                    let result = store::on_gossip_attestation(
                         &mut store,
-                        validator_id,
-                        domain_data,
+                        &signed_attestation,
+                        is_aggregator,
                     );
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 "gossipAggregatedAttestation" => {
-                    // Aggregated attestation fixtures now carry proof data with a
-                    // participants bitfield, but the harness still uses the
-                    // single-validator bypass here. Tests whose checks rely on the
-                    // correct participants or pool routing are skipped via
-                    // `SKIP_TESTS`; the follow-up PR wires the real verifying
-                    // path through.
                     let att_data = step
                         .attestation
                         .expect("gossipAggregatedAttestation step missing attestation data");
-                    let domain_data: ethlambda_types::attestation::AttestationData =
-                        att_data.data.into();
-                    let validator_id = att_data.validator_id.unwrap_or(0);
+                    let proof_fixture = att_data
+                        .proof
+                        .expect("gossipAggregatedAttestation step missing proof");
+                    let proof_bytes: Vec<u8> = proof_fixture.proof_data.into();
+                    let proof_data = ByteList::try_from(proof_bytes)
+                        .expect("aggregated proof data fits in ByteListMiB");
+                    let aggregated = SignedAggregatedAttestation {
+                        data: att_data.data.into(),
+                        proof: AggregatedSignatureProof::new(
+                            proof_fixture.participants.into(),
+                            proof_data,
+                        ),
+                    };
 
-                    let result = store::on_gossip_attestation_without_verification(
-                        &mut store,
-                        validator_id,
-                        domain_data,
-                    );
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 other => {
                     return Err(format!("Unsupported step type '{other}'").into());
@@ -194,6 +145,20 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         }
     }
     Ok(())
+}
+
+fn assert_step_outcome<T, E: std::fmt::Debug>(
+    step_idx: usize,
+    expected_valid: bool,
+    result: Result<T, E>,
+) -> datatest_stable::Result<()> {
+    match (result, expected_valid) {
+        (Ok(_), false) => Err(format!("Step {step_idx} expected failure but got success").into()),
+        (Err(err), true) => {
+            Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
