@@ -325,8 +325,9 @@ pub fn on_gossip_attestation(
 /// Process a gossiped aggregated attestation from the aggregation subnet.
 ///
 /// Aggregated attestations arrive from committee aggregators and contain a proof
-/// covering multiple validators. We store one aggregated payload entry per
-/// participating validator so the fork choice extraction works uniformly.
+/// covering multiple validators. After signature verification, one entry is
+/// stored per unique attestation data (not per participating validator) in the
+/// pending pool; participant bits are carried in the proof itself.
 pub fn on_gossip_aggregated_attestation(
     store: &mut Store,
     aggregated: SignedAggregatedAttestation,
@@ -334,7 +335,6 @@ pub fn on_gossip_aggregated_attestation(
     validate_attestation_data(store, &aggregated.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
-    // Verify aggregated proof signature
     let target_state = store
         .get_state(&aggregated.data.target.root)
         .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
@@ -370,18 +370,22 @@ pub fn on_gossip_aggregated_attestation(
     }
     .map_err(StoreError::AggregateVerificationFailed)?;
 
-    // Store one proof per attestation data (not per validator)
-    store.insert_new_aggregated_payload(hashed, aggregated.proof.clone());
+    // Read stats before moving the proof into the store.
     let num_participants = aggregated.proof.participants.count_ones();
+    let target_slot = aggregated.data.target.slot;
+    let target_root = aggregated.data.target.root;
+    let source_slot = aggregated.data.source.slot;
+    let slot = aggregated.data.slot;
+
+    store.insert_new_aggregated_payload(hashed, aggregated.proof);
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
 
-    let slot = aggregated.data.slot;
     info!(
         slot,
         num_participants,
-        target_slot = aggregated.data.target.slot,
-        target_root = %ShortRoot(&aggregated.data.target.root.0),
-        source_slot = aggregated.data.source.slot,
+        target_slot,
+        target_root = %ShortRoot(&target_root.0),
+        source_slot,
         "Aggregated attestation processed"
     );
 
@@ -407,37 +411,6 @@ pub fn on_block_without_verification(
     signed_block: SignedBlock,
 ) -> Result<(), StoreError> {
     on_block_core(store, signed_block, false)
-}
-
-/// Process a gossip attestation without signature verification.
-///
-/// Validates the attestation data and inserts it directly into the known
-/// attestation payloads (bypassing the gossip → aggregate → promote pipeline).
-/// Use only in tests where signatures are absent (e.g., fork choice spec tests).
-pub fn on_gossip_attestation_without_verification(
-    store: &mut Store,
-    validator_id: u64,
-    data: AttestationData,
-) -> Result<(), StoreError> {
-    validate_attestation_data(store, &data)?;
-
-    // Validate the validator index exists in the target state
-    let target_state = store
-        .get_state(&data.target.root)
-        .ok_or(StoreError::MissingTargetState(data.target.root))?;
-    if validator_id >= target_state.validators.len() as u64 {
-        return Err(StoreError::InvalidValidatorIndex);
-    }
-
-    let bits = aggregation_bits_from_validator_indices(&[validator_id]);
-    let proof = AggregatedSignatureProof::empty(bits);
-    let hashed = HashedAttestationData::new(data);
-    store.insert_known_aggregated_payload(hashed, proof);
-
-    // Recalculate fork choice head after inserting the attestation
-    update_head(store, false);
-
-    Ok(())
 }
 
 /// Core block processing logic.

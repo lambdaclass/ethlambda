@@ -1,6 +1,7 @@
-use super::common::{self, Block, TestInfo, TestState};
+use super::common::{self, Block, TestInfo, TestState, deser_xmss_hex};
+use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::primitives::H256;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -59,6 +60,8 @@ pub struct ForkChoiceStep {
     pub interval: Option<u64>,
     #[serde(rename = "hasProposal")]
     pub has_proposal: Option<bool>,
+    #[serde(rename = "isAggregator")]
+    pub is_aggregator: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,8 +69,40 @@ pub struct AttestationStepData {
     #[serde(rename = "validatorId")]
     pub validator_id: Option<u64>,
     pub data: common::AttestationData,
-    #[allow(dead_code)]
-    pub signature: Option<String>,
+    #[serde(default, deserialize_with = "deser_opt_xmss_hex")]
+    pub signature: Option<XmssSignature>,
+    /// Present on `gossipAggregatedAttestation` steps.
+    pub proof: Option<ProofStepData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProofStepData {
+    pub participants: common::AggregationBits,
+    #[serde(rename = "proofData")]
+    pub proof_data: HexByteList,
+}
+
+/// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HexByteList {
+    data: String,
+}
+
+impl From<HexByteList> for Vec<u8> {
+    fn from(value: HexByteList) -> Self {
+        let stripped = value.data.strip_prefix("0x").unwrap_or(&value.data);
+        hex::decode(stripped).expect("invalid hex in proof data")
+    }
+}
+
+fn deser_opt_xmss_hex<'de, D>(d: D) -> Result<Option<XmssSignature>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrap(#[serde(deserialize_with = "deser_xmss_hex")] XmssSignature);
+
+    Ok(Option::<Wrap>::deserialize(d)?.map(|w| w.0))
 }
 
 #[derive(Debug, Clone, Deserialize)]
