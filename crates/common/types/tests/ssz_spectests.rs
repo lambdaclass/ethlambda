@@ -108,7 +108,7 @@ where
     let domain_value: D = fixture_value.into();
 
     // Re-encode for the hash computation; cheap relative to the fixture I/O.
-    debug_assert_eq!(
+    assert_eq!(
         <D as libssz::SszEncode>::to_ssz(&domain_value),
         expected_bytes
     );

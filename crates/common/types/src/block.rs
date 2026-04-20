@@ -13,10 +13,14 @@ use primitives::HashTreeRoot as _;
 
 /// Envelope carrying a block and its aggregated signatures.
 ///
+/// <div class="warning">
+///
 /// `HashTreeRoot` is intentionally not derived: `XmssSignature` is encoded as a
 /// fixed-size byte vector for cross-client serialization compatibility, but the
 /// spec treats it as a container for Merkleization. We never hash a
 /// `SignedBlock` directly — consumers always hash the inner `Block`.
+///
+/// </div>
 #[derive(Clone, SszEncode, SszDecode)]
 pub struct SignedBlock {
     /// The block being signed.
@@ -41,7 +45,11 @@ impl core::fmt::Debug for SignedBlock {
 
 /// Signature payload for the block.
 ///
+/// <div class="warning">
+///
 /// See the note on [`SignedBlock`] for why `HashTreeRoot` is omitted.
+///
+/// </div>
 #[derive(Clone, SszEncode, SszDecode)]
 pub struct BlockSignatures {
     /// Attestation signatures for the aggregated attestations in the block body.
