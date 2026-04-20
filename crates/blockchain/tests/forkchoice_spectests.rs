@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
@@ -21,17 +21,8 @@ const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
 mod common;
 mod types;
 
-// We don't check signatures in spec-tests, so invalid signature tests always pass.
-// The gossipAggregatedAttestation/attestation tests fail because the harness inserts
-// individual gossip attestations into known payloads (should be no-op) and aggregated
-// attestations with validator_id=0 into known (should use proof.participants into new).
-// TODO: fix these
-const SKIP_TESTS: &[&str] = &[
-    "test_gossip_attestation_with_invalid_signature",
-    "test_block_builder_fixed_point_advances_justification",
-    "test_equivocating_proposer_with_split_attestations",
-    "test_finalization_prunes_stale_aggregated_payloads",
-];
+/// List of skipped tests
+const SKIP_TESTS: &[&str] = &[];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
@@ -104,9 +95,18 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "tick" => {
-                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
-                    // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp_ms, false, false);
+                    // Fixtures use either `time` (UNIX seconds) or `interval`
+                    // (absolute interval count since genesis). Interval fixtures
+                    // encode `genesis_time_ms + interval * MILLISECONDS_PER_INTERVAL`.
+                    let timestamp_ms = match (step.time, step.interval) {
+                        (Some(time_s), _) => time_s * 1000,
+                        (None, Some(interval)) => {
+                            genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
+                        }
+                        (None, None) => panic!("tick step missing both time and interval"),
+                    };
+                    let has_proposal = step.has_proposal.unwrap_or(false);
+                    store::on_tick(&mut store, timestamp_ms, has_proposal, false);
                 }
                 "attestation" => {
                     let att_data = step
@@ -144,13 +144,12 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     }
                 }
                 "gossipAggregatedAttestation" => {
-                    // Aggregated attestation fixtures carry only attestation data
-                    // (no aggregated proof or participant list), so we use the same
-                    // non-verification path. This inserts directly into known payloads,
-                    // bypassing the new→known promotion pipeline that the production
-                    // `on_gossip_aggregated_attestation` uses.
-                    // TODO: route through a proper aggregated path once fixtures
-                    // include proof data and the test runner simulates promotion.
+                    // Aggregated attestation fixtures now carry proof data with a
+                    // participants bitfield, but the harness still uses the
+                    // single-validator bypass here. Tests whose checks rely on the
+                    // correct participants or pool routing are skipped via
+                    // `SKIP_TESTS`; the follow-up PR wires the real verifying
+                    // path through.
                     let att_data = step
                         .attestation
                         .expect("gossipAggregatedAttestation step missing attestation data");
@@ -201,7 +200,7 @@ fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
     let block: Block = block_data.to_block();
 
     // Build one empty proof per attestation, matching the aggregation_bits from
-    // each attestation in the block body. on_block_core zips attestations with
+    // each attestation in the block body. Block processing zips attestations with
     // signatures, so they must be the same length for attestations to reach
     // fork choice.
     let proofs: Vec<_> = block
@@ -226,9 +225,17 @@ fn validate_checks(
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
-    // Error on unsupported check fields
-    if checks.time.is_some() {
-        return Err(format!("Step {}: 'time' check not supported", step_idx).into());
+    // Validate time check: fixtures encode the expected store time in intervals
+    // since genesis (matching `Store::time()`).
+    if let Some(expected_time) = checks.time {
+        let actual_time = st.time();
+        if actual_time != expected_time {
+            return Err(format!(
+                "Step {}: time mismatch: expected {}, got {}",
+                step_idx, expected_time, actual_time
+            )
+            .into());
+        }
     }
     // Resolve headRootLabel to headRoot if only the label is provided
     let resolved_head_root = checks.head_root.or_else(|| {
