@@ -1,23 +1,3 @@
-//! Runtime-toggleable aggregator role.
-//!
-//! Tracks whether this node should act as a committee aggregator. Shared
-//! between the blockchain actor (reads on every tick and gossip attestation)
-//! and the admin API (writes when operators rotate duties). A thin wrapper
-//! around [`Arc<AtomicBool>`] so reads stay cheap and writes stay atomic.
-//!
-//! Mirrors leanSpec's `AggregatorController` (PR #636) with the Rust analogue
-//! of its asyncio lock: a single atomic cell. One flag is enough because
-//! ethlambda's P2P swarm only reads `is_aggregator` at construction time;
-//! runtime toggles do not (and cannot) resubscribe gossip subnets.
-//!
-//! # Invariants
-//!
-//! - The flag carries no dependent data; loads and stores use `Relaxed`.
-//! - Metric updates live in the blockchain actor so the gauge reflects what
-//!   the actor acted on rather than what was requested.
-//! - If a P2P runtime reader is ever added, it must consult this controller
-//!   instead of a stored bool. See `crates/net/p2p/src/lib.rs` `SwarmConfig`.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
