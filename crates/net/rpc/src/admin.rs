@@ -39,6 +39,11 @@ struct ToggleResponse {
 /// Returns 503 when the controller is not wired. Kept for spec parity with
 /// leanSpec, even though in ethlambda the controller is always wired when
 /// the API server is started via `main.rs`.
+///
+/// The `Option<Extension<_>>` wrapping makes the extractor infallible: a bare
+/// `Extension<T>` would cause axum to short-circuit with a 500 when the
+/// extension is missing, whereas `Option` yields `None` and lets us return
+/// a clean 503 with a useful message.
 pub async fn get_aggregator(controller: Option<Extension<AggregatorController>>) -> Response {
     match controller {
         Some(Extension(controller)) => json_response(StatusResponse {
@@ -50,8 +55,13 @@ pub async fn get_aggregator(controller: Option<Extension<AggregatorController>>)
 
 /// POST /lean/v0/admin/aggregator — toggles aggregator role at runtime.
 ///
-/// Body: `{"enabled": bool}`. Returns `{"is_aggregator": new, "previous": old}`.
+/// Body: `{"enabled": bool}`. Returns `{"is_aggregator": <new>, "previous": <old>}`.
 /// 400 on missing/invalid body, 503 when the controller is not wired.
+///
+/// The `Option<Extension<_>>` wrapping makes the extractor infallible: a bare
+/// `Extension<T>` would cause axum to short-circuit with a 500 when the
+/// extension is missing, whereas `Option` yields `None` and lets us return
+/// a clean 503 with a useful message.
 pub async fn post_aggregator(
     controller: Option<Extension<AggregatorController>>,
     body: Option<Json<Value>>,
@@ -70,8 +80,6 @@ pub async fn post_aggregator(
         return bad_request("Missing 'enabled' field in body");
     };
 
-    // Reject ints like 0/1: JSON does not distinguish them from booleans in
-    // loose parsers, but the spec's POST handler strictly requires a boolean.
     let Some(enabled) = enabled_value.as_bool() else {
         return bad_request("'enabled' must be a boolean");
     };
@@ -194,7 +202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_is_idempotent() {
+    async fn post_noop_when_value_matches_state() {
         let controller = AggregatorController::new(true);
         let _ = post(Some(controller.clone()), r#"{"enabled": true}"#).await;
         let resp = post(Some(controller.clone()), r#"{"enabled": true}"#).await;
