@@ -21,7 +21,7 @@ use tracing::{info, trace, warn};
 
 use crate::{
     INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    aggregation::aggregation_bits_from_validator_indices, metrics,
+    metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
