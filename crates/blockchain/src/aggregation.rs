@@ -21,7 +21,7 @@ use ethlambda_types::{
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::ActorRef;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::metrics;
 
@@ -410,16 +410,37 @@ pub(crate) fn run_aggregation_worker(
             break;
         }
 
-        let job_raw_sigs = job.raw_ids.len();
-        let job_children = job.children.len();
+        let slot = job.slot;
+        let raw_sigs = job.raw_ids.len();
+        let children = job.children.len();
 
+        let group_start = Instant::now();
         let Some(output) = aggregate_job(job) else {
+            let elapsed = group_start.elapsed();
+            warn!(
+                session_id,
+                slot,
+                raw_sigs,
+                children,
+                ?elapsed,
+                "Committee signature aggregation failed"
+            );
             continue;
         };
+        let elapsed = group_start.elapsed();
+        info!(
+            session_id,
+            slot,
+            raw_sigs,
+            children,
+            participants = output.participants.len(),
+            ?elapsed,
+            "Committee signature aggregated"
+        );
 
         groups_aggregated += 1;
-        total_raw_sigs += job_raw_sigs;
-        total_children += job_children;
+        total_raw_sigs += raw_sigs;
+        total_children += children;
 
         if actor
             .send(AggregateProduced { session_id, output })
