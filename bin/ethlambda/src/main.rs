@@ -176,6 +176,7 @@ async fn main() -> eyre::Result<()> {
     // are not re-evaluated at runtime. Toggling via the admin API affects
     // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
     // for the invariant.
+    // TODO: update ENR with the dynamic is_aggregator value
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
