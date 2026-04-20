@@ -21,23 +21,8 @@ const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
 mod common;
 mod types;
 
-// We don't check signatures in spec-tests, so invalid signature tests always pass.
-// The gossipAggregatedAttestation/attestation tests fail because the harness inserts
-// individual gossip attestations into known payloads (should be no-op) and aggregated
-// attestations with validator_id=0 into known (should use proof.participants into new).
-// The last three skips are fixtures whose attestation checks require the harness to
-// route `gossipAggregatedAttestation` steps through the real aggregated path (see the
-// follow-up PR). They're unblocked there.
-// TODO: fix these
-const SKIP_TESTS: &[&str] = &[
-    "test_gossip_attestation_with_invalid_signature",
-    "test_block_builder_fixed_point_advances_justification",
-    "test_equivocating_proposer_with_split_attestations",
-    "test_finalization_prunes_stale_aggregated_payloads",
-    "test_safe_target_uses_merged_pools_at_interval_3",
-    "test_tick_interval_0_skips_acceptance_when_not_proposer",
-    "test_tick_interval_progression_through_full_slot",
-];
+/// List of skipped tests
+const SKIP_TESTS: &[&str] = &[];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
