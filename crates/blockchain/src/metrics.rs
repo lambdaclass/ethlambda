@@ -226,6 +226,16 @@ static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogr
         .unwrap()
     });
 
+static LEAN_ATTESTATIONS_PRODUCTION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_attestations_production_time_seconds",
+            "Time taken to produce attestation",
+            vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+        )
+        .unwrap()
+    });
+
 static LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -381,6 +391,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_ATTESTATIONS_PRODUCTION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS);
@@ -497,6 +508,11 @@ pub fn inc_pq_sig_attestation_signatures_invalid() {
 /// Start timing individual attestation signing. Records duration when the guard is dropped.
 pub fn time_pq_sig_attestation_signing() -> TimingGuard {
     TimingGuard::new(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS)
+}
+
+/// Start timing attestation production. Records duration when the guard is dropped.
+pub fn time_attestations_production() -> TimingGuard {
+    TimingGuard::new(&LEAN_ATTESTATIONS_PRODUCTION_TIME_SECONDS)
 }
 
 /// Start timing individual attestation signature verification. Records duration when the guard is dropped.

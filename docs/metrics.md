@@ -64,10 +64,11 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 
 ## Validator Metrics
 
-| Name   | Type  | Usage | Sample collection event | Labels | Supported |
-|--------|-------|-------|-------------------------|--------|-----------|
-|`lean_validators_count`| Gauge | Number of validators managed by a node | On scrape |  | ✅(*) |
-|`lean_is_aggregator`| Gauge | Validator's `is_aggregator` status. True=1, False=0 | On node start | | ✅ |
+| Name   | Type  | Usage | Sample collection event | Labels | Buckets | Supported |
+|--------|-------|-------|-------------------------|--------|---------|-----------|
+|`lean_validators_count`| Gauge | Number of validators managed by a node | On scrape |  | | ✅(*) |
+|`lean_is_aggregator`| Gauge | Validator's `is_aggregator` status. True=1, False=0 | On node start | | | ✅ |
+|`lean_attestations_production_time_seconds`| Histogram | Time taken to produce attestation | On attestation production | | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 | ✅ |
 
 ## Network Metrics
 
