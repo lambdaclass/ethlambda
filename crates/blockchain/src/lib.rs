@@ -233,6 +233,8 @@ impl BlockChainServer {
     }
 
     fn produce_attestations(&mut self, slot: u64) {
+        let _timing = metrics::time_attestations_production();
+
         // Produce attestation data once for all validators
         let attestation_data = store::produce_attestation_data(&self.store, slot);
 
