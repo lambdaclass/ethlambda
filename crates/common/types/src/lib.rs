@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod attestation;
 pub mod block;
 pub mod checkpoint;
