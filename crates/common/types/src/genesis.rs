@@ -3,52 +3,12 @@ use serde::Deserialize;
 use crate::state::{Validator, ValidatorPubkeyBytes};
 
 /// A single validator entry in the genesis config with dual public keys.
-///
-/// Deserializes from either shape:
-///
-/// - A map with `attestation_pubkey` and `proposal_pubkey` (the canonical,
-///   production-style layout with independent signing keys per role).
-/// - A plain hex string (the lean-quickstart / single-key devnet layout),
-///   in which case the same pubkey is used for both roles. This matches how
-///   zeam and lantern already interpret that field.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "GenesisValidatorEntryRaw")]
 pub struct GenesisValidatorEntry {
+    #[serde(deserialize_with = "deser_pubkey_hex")]
     pub attestation_pubkey: ValidatorPubkeyBytes,
+    #[serde(deserialize_with = "deser_pubkey_hex")]
     pub proposal_pubkey: ValidatorPubkeyBytes,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum GenesisValidatorEntryRaw {
-    Flat(String),
-    Dual {
-        attestation_pubkey: String,
-        proposal_pubkey: String,
-    },
-}
-
-impl TryFrom<GenesisValidatorEntryRaw> for GenesisValidatorEntry {
-    type Error = String;
-
-    fn try_from(raw: GenesisValidatorEntryRaw) -> Result<Self, Self::Error> {
-        match raw {
-            GenesisValidatorEntryRaw::Flat(pubkey) => {
-                let bytes = parse_pubkey_hex(&pubkey)?;
-                Ok(Self {
-                    attestation_pubkey: bytes,
-                    proposal_pubkey: bytes,
-                })
-            }
-            GenesisValidatorEntryRaw::Dual {
-                attestation_pubkey,
-                proposal_pubkey,
-            } => Ok(Self {
-                attestation_pubkey: parse_pubkey_hex(&attestation_pubkey)?,
-                proposal_pubkey: parse_pubkey_hex(&proposal_pubkey)?,
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,12 +33,19 @@ impl GenesisConfig {
     }
 }
 
-fn parse_pubkey_hex(s: &str) -> Result<ValidatorPubkeyBytes, String> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).map_err(|_| format!("pubkey is not valid hex: {s}"))?;
-    bytes
-        .try_into()
-        .map_err(|v: Vec<u8>| format!("pubkey has length {} (expected 52)", v.len()))
+fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let s = String::deserialize(d)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes =
+        hex::decode(s).map_err(|_| D::Error::custom(format!("pubkey is not valid hex: {s}")))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        D::Error::custom(format!("pubkey has length {} (expected 52)", v.len()))
+    })
 }
 
 #[cfg(test)]
@@ -145,37 +112,6 @@ GENESIS_VALIDATORS:
         assert_eq!(
             config.genesis_validators[2].proposal_pubkey,
             hex::decode(PROP_PUBKEY_C).unwrap().as_slice()
-        );
-    }
-
-    #[test]
-    fn deserialize_genesis_config_flat_pubkeys() {
-        // lean-quickstart / single-key devnet layout: one pubkey per validator,
-        // used for both attestation and proposal roles.
-        let yaml = format!(
-            r#"GENESIS_TIME: 1770407233
-GENESIS_VALIDATORS:
-    - "{ATT_PUBKEY_A}"
-    - "0x{ATT_PUBKEY_B}"
-"#
-        );
-
-        let config: GenesisConfig =
-            serde_yaml_ng::from_str(&yaml).expect("Failed to deserialize flat-key genesis config");
-
-        assert_eq!(config.genesis_validators.len(), 2);
-        assert_eq!(
-            config.genesis_validators[0].attestation_pubkey,
-            config.genesis_validators[0].proposal_pubkey,
-            "flat pubkey must be shared across both roles"
-        );
-        assert_eq!(
-            config.genesis_validators[0].attestation_pubkey,
-            hex::decode(ATT_PUBKEY_A).unwrap().as_slice()
-        );
-        assert_eq!(
-            config.genesis_validators[1].attestation_pubkey,
-            hex::decode(ATT_PUBKEY_B).unwrap().as_slice()
         );
     }
 

@@ -290,18 +290,13 @@ where
 enum ValidatorKeyRole {
     Attestation,
     Proposal,
-    /// Single key used for both roles (single-key devnet layout where
-    /// `generate-genesis.sh` emits one `validator_N_sk.ssz` per validator with
-    /// no attester/proposer split).
-    Shared,
 }
 
-/// Classify a privkey file as attestation, proposal, or shared based on the
-/// filename.
+/// Classify a privkey file as attestation or proposal based on the filename.
 ///
 /// Matches zeam's (`pkgs/cli/src/node.zig:540`) and lantern's
-/// (`client_keys.c:606`) routing for the dual-key generator output, plus an
-/// extra Shared case for the single-key generator output.
+/// (`client_keys.c:606`) routing, which lets all three clients share the
+/// `lean-quickstart` generator output unchanged.
 fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
     let name = file
         .file_name()
@@ -312,7 +307,9 @@ fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
     match (is_attester, is_proposer) {
         (true, false) => Ok(ValidatorKeyRole::Attestation),
         (false, true) => Ok(ValidatorKeyRole::Proposal),
-        (false, false) => Ok(ValidatorKeyRole::Shared),
+        (false, false) => Err(format!(
+            "filename '{name}' must contain 'attester' or 'proposer'"
+        )),
         (true, true) => Err(format!(
             "filename '{name}' contains both 'attester' and 'proposer'; ambiguous"
         )),
@@ -350,38 +347,23 @@ fn read_validator_keys(
         }
     };
 
-    // Group entries per validator index, routing each to its role slot. A
-    // `Shared` entry populates both attester and proposer slots; it cannot be
-    // combined with role-specific entries for the same validator.
+    // Group entries per validator index, routing each to its role slot.
     let mut grouped: BTreeMap<u64, RoleSlots> = BTreeMap::new();
     for entry in validator_vec {
         let role = classify_role(&entry.privkey_file)?;
         let path = resolve_path(&entry.privkey_file);
-        let idx = entry.index;
-        let slots = grouped.entry(idx).or_default();
-        match role {
-            ValidatorKeyRole::Attestation => {
-                if slots.attestation.is_some() {
-                    return Err(format!("validator {idx}: duplicate Attestation entry"));
-                }
-                slots.attestation = Some(path);
-            }
-            ValidatorKeyRole::Proposal => {
-                if slots.proposal.is_some() {
-                    return Err(format!("validator {idx}: duplicate Proposal entry"));
-                }
-                slots.proposal = Some(path);
-            }
-            ValidatorKeyRole::Shared => {
-                if slots.attestation.is_some() || slots.proposal.is_some() {
-                    return Err(format!(
-                        "validator {idx}: cannot mix shared key with role-specific entries"
-                    ));
-                }
-                slots.attestation = Some(path.clone());
-                slots.proposal = Some(path);
-            }
+        let slots = grouped.entry(entry.index).or_default();
+        let target = match role {
+            ValidatorKeyRole::Attestation => &mut slots.attestation,
+            ValidatorKeyRole::Proposal => &mut slots.proposal,
+        };
+        if target.is_some() {
+            return Err(format!(
+                "validator {}: duplicate {role:?} entry",
+                entry.index
+            ));
         }
+        *target = Some(path);
     }
 
     let load_key = |path: &Path, purpose: &str| -> Result<ValidatorSecretKey, String> {
