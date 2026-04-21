@@ -6,6 +6,7 @@ use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
+    aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
@@ -50,9 +51,9 @@ impl BlockChain {
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
-        is_aggregator: bool,
+        aggregator: AggregatorController,
     ) -> BlockChain {
-        metrics::set_is_aggregator(is_aggregator);
+        metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
@@ -61,7 +62,7 @@ impl BlockChain {
             p2p: None,
             key_manager,
             pending_blocks: HashMap::new(),
-            is_aggregator,
+            aggregator,
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
         }
@@ -104,7 +105,11 @@ pub struct BlockChainServer {
     pending_block_parents: HashMap<H256, H256>,
 
     /// Whether this node acts as a committee aggregator.
-    is_aggregator: bool,
+    ///
+    /// Read fresh on every tick and gossip event so runtime toggles via the
+    /// admin API take effect without a restart. Seeded from the CLI
+    /// `--is-aggregator` flag at spawn.
+    aggregator: AggregatorController,
 
     /// In-flight committee-signature aggregation, if any. Present only while a
     /// worker started at the most recent interval 2 is still running or until
@@ -131,6 +136,13 @@ impl BlockChainServer {
         // Update current slot metric
         metrics::update_current_slot(slot);
 
+        // Snapshot the aggregator flag once per tick so all read sites within
+        // the tick see a consistent value even if the admin API toggles it
+        // mid-tick. Mirror it to the gauge from the actor side so
+        // `lean_is_aggregator` reflects the value the actor is acting on.
+        let is_aggregator = self.aggregator.is_enabled();
+        metrics::set_is_aggregator(is_aggregator);
+
         // At interval 0, check if we will propose (but don't build the block yet).
         // Tick forkchoice first to accept attestations, then build the block
         // using the freshly-accepted attestations.
@@ -145,7 +157,7 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        if interval == 2 && self.is_aggregator {
+        if interval == 2 && is_aggregator {
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -154,9 +166,11 @@ impl BlockChainServer {
             self.propose_block(slot, validator_id);
         }
 
-        // Produce attestations at interval 1 (all validators including proposer)
+        // Produce attestations at interval 1 (all validators including proposer).
+        // Reuse the same snapshot so self-delivery decisions match the rest
+        // of the tick.
         if interval == 1 {
-            self.produce_attestations(slot);
+            self.produce_attestations(slot, is_aggregator);
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
@@ -232,7 +246,7 @@ impl BlockChainServer {
             .find(|&vid| is_proposer(vid, slot, num_validators))
     }
 
-    fn produce_attestations(&mut self, slot: u64) {
+    fn produce_attestations(&mut self, slot: u64, is_aggregator: bool) {
         let _timing = metrics::time_attestations_production();
 
         // Produce attestation data once for all validators
@@ -262,7 +276,7 @@ impl BlockChainServer {
             // Gossipsub does not deliver messages back to the sender, so without
             // this the aggregator never sees its own validator's signature in
             // gossip_signatures and it is excluded from aggregated proofs.
-            if self.is_aggregator {
+            if is_aggregator {
                 let _ = store::on_gossip_attestation(&mut self.store, &signed_attestation, true)
                     .inspect_err(|err| {
                         warn!(%slot, %validator_id, %err, "Self-delivery of attestation failed")
@@ -536,7 +550,11 @@ impl BlockChainServer {
     }
 
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, self.is_aggregator)
+        // Read fresh here too: a gossip event can arrive between ticks, and
+        // if the admin API just toggled, the first gossip after the toggle
+        // should already use the new value.
+        let is_aggregator = self.aggregator.is_enabled();
+        let _ = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
     }
 
