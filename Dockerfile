@@ -28,11 +28,6 @@ ENV BUILD_PROFILE=$BUILD_PROFILE
 ARG FEATURES=""
 ENV FEATURES=$FEATURES
 
-# Build dependencies.
-# Rustflags are intentionally sourced from .cargo/config.toml instead of a
-# RUSTFLAGS env var: any set RUSTFLAGS (even an empty string) would override
-# target.<triple>.rustflags from the config, silently dropping target-cpu /
-# target-feature selection.
 RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
