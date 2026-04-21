@@ -8,3 +8,6 @@
 !crates/
 !LICENSE
 !.git/
+
+# cargo build configuration (target-cpu / target-feature rustflags)
+!.cargo/

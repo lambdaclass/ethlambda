@@ -15,19 +15,24 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 
+# Include .cargo/ so [target.*.rustflags] (e.g. -Ctarget-cpu=x86-64-v3) applies to
+# cargo-chef's dep build as well as the final cargo build. Without this the
+# cached deps are compiled with default flags and cargo reuses them.
+COPY .cargo/ .cargo/
+
 # Build profile, release by default
 ARG BUILD_PROFILE=release
 ENV BUILD_PROFILE=$BUILD_PROFILE
-
-# Extra Cargo flags
-ARG RUSTFLAGS=""
-ENV RUSTFLAGS="$RUSTFLAGS"
 
 # Extra Cargo features
 ARG FEATURES=""
 ENV FEATURES=$FEATURES
 
-# Build dependencies
+# Build dependencies.
+# Rustflags are intentionally sourced from .cargo/config.toml instead of a
+# RUSTFLAGS env var: any set RUSTFLAGS (even an empty string) would override
+# target.<triple>.rustflags from the config, silently dropping target-cpu /
+# target-feature selection.
 RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
