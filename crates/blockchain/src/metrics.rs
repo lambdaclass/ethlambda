@@ -266,6 +266,25 @@ static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS: std::sync::L
         .unwrap()
     });
 
+static LEAN_AGGREGATED_PROOF_SIZE_BYTES: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_aggregated_proof_size_bytes",
+            "Bytes size of an aggregated signature proof's proof_data field",
+            vec![
+                1024.0,
+                4096.0,
+                16384.0,
+                65536.0,
+                131_072.0,
+                262_144.0,
+                524_288.0,
+                1_048_576.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -396,6 +415,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
@@ -528,6 +548,11 @@ pub fn time_pq_sig_aggregated_signatures_building() -> TimingGuard {
 /// Start timing aggregated signature verification. Records duration when the guard is dropped.
 pub fn time_pq_sig_aggregated_signatures_verification() -> TimingGuard {
     TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS)
+}
+
+/// Observe the size of an aggregated signature proof's `proof_data` bytes.
+pub fn observe_aggregated_proof_size(bytes: usize) {
+    LEAN_AGGREGATED_PROOF_SIZE_BYTES.observe(bytes as f64);
 }
 
 /// Observe committee-signature aggregation duration. Measured in the

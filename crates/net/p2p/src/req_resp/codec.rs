@@ -12,7 +12,18 @@ use super::{
     },
 };
 
+use crate::metrics;
 use ethlambda_types::block::SignedBlock;
+
+/// Short label extracted from a libp2p protocol id, used as the `protocol`
+/// label on req/resp size metrics.
+fn protocol_label(protocol: &str) -> &'static str {
+    match protocol {
+        STATUS_PROTOCOL_V1 => "status",
+        BLOCKS_BY_ROOT_PROTOCOL_V1 => "blocks_by_root",
+        _ => "unknown",
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Codec;
@@ -30,7 +41,10 @@ impl libp2p::request_response::Codec for Codec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let payload = decode_payload(io).await?;
+        let decoded = decode_payload(io).await?;
+        let payload = decoded.uncompressed;
+        let label = protocol_label(protocol.as_ref());
+        metrics::observe_reqresp_request_size(label, payload.len(), decoded.compressed_size);
 
         match protocol.as_ref() {
             STATUS_PROTOCOL_V1 => {
@@ -60,9 +74,10 @@ impl libp2p::request_response::Codec for Codec {
     where
         T: AsyncRead + Unpin + Send,
     {
+        let label = protocol_label(protocol.as_ref());
         match protocol.as_ref() {
-            STATUS_PROTOCOL_V1 => decode_status_response(io).await,
-            BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io).await,
+            STATUS_PROTOCOL_V1 => decode_status_response(io, label).await,
+            BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io, label).await,
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -72,7 +87,7 @@ impl libp2p::request_response::Codec for Codec {
 
     async fn write_request<T>(
         &mut self,
-        _: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
@@ -86,18 +101,22 @@ impl libp2p::request_response::Codec for Codec {
             Request::BlocksByRoot(request) => request.to_ssz(),
         };
 
-        write_payload(io, &encoded).await
+        let compressed_size = write_payload(io, &encoded).await?;
+        let label = protocol_label(protocol.as_ref());
+        metrics::observe_reqresp_request_size(label, encoded.len(), compressed_size);
+        Ok(())
     }
 
     async fn write_response<T>(
         &mut self,
-        _: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         resp: Self::Response,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
+        let label = protocol_label(protocol.as_ref());
         match resp {
             Response::Success { payload } => {
                 match &payload {
@@ -105,7 +124,13 @@ impl libp2p::request_response::Codec for Codec {
                         // Send success code (0)
                         io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
                         let encoded = status.to_ssz();
-                        write_payload(io, &encoded).await
+                        let compressed_size = write_payload(io, &encoded).await?;
+                        metrics::observe_reqresp_response_chunk_size(
+                            label,
+                            encoded.len(),
+                            compressed_size,
+                        );
+                        Ok(())
                     }
                     ResponsePayload::BlocksByRoot(blocks) => {
                         // Write each block as a separate chunk.
@@ -123,7 +148,12 @@ impl libp2p::request_response::Codec for Codec {
                                 continue;
                             }
                             io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
-                            write_payload(io, &encoded).await?;
+                            let compressed_size = write_payload(io, &encoded).await?;
+                            metrics::observe_reqresp_response_chunk_size(
+                                label,
+                                encoded.len(),
+                                compressed_size,
+                            );
                         }
                         // Empty response if no blocks found (stream just ends)
                         Ok(())
@@ -137,7 +167,8 @@ impl libp2p::request_response::Codec for Codec {
                 // Error messages are SSZ-encoded as List[byte, 256]
                 let encoded = message.to_ssz();
 
-                write_payload(io, &encoded).await
+                write_payload(io, &encoded).await?;
+                Ok(())
             }
         }
     }
@@ -164,7 +195,7 @@ impl libp2p::request_response::Codec for Codec {
 /// - I/O error occurs while reading the response code or payload
 /// - Peer's error message cannot be SSZ-decoded (InvalidData)
 /// - Peer's Status payload cannot be SSZ-decoded (InvalidData)
-async fn decode_status_response<T>(io: &mut T) -> io::Result<Response>
+async fn decode_status_response<T>(io: &mut T, protocol_label: &str) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -173,7 +204,13 @@ where
         .await?;
 
     let code = ResponseCode::from(result_byte);
-    let payload = decode_payload(io).await?;
+    let decoded = decode_payload(io).await?;
+    let payload = decoded.uncompressed;
+    metrics::observe_reqresp_response_chunk_size(
+        protocol_label,
+        payload.len(),
+        decoded.compressed_size,
+    );
 
     if code != ResponseCode::SUCCESS {
         let message = ErrorMessage::from_ssz_bytes(&payload).map_err(|err| {
@@ -215,7 +252,7 @@ where
 ///
 /// Note: Error chunks from the peer (non-SUCCESS response codes) do not cause this
 /// function to return `Err` - they are logged and skipped.
-async fn decode_blocks_by_root_response<T>(io: &mut T) -> io::Result<Response>
+async fn decode_blocks_by_root_response<T>(io: &mut T, protocol_label: &str) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -232,7 +269,13 @@ where
         }
 
         let code = ResponseCode::from(result_byte);
-        let payload = decode_payload(io).await?;
+        let decoded = decode_payload(io).await?;
+        let payload = decoded.uncompressed;
+        metrics::observe_reqresp_response_chunk_size(
+            protocol_label,
+            payload.len(),
+            decoded.compressed_size,
+        );
 
         if code != ResponseCode::SUCCESS {
             let error_message = ErrorMessage::from_ssz_bytes(&payload)

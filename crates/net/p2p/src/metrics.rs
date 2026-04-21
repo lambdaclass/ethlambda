@@ -69,11 +69,16 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
 });
 
 // --- Gossip Message Size Histograms ---
+//
+// `compression` label values:
+// - `"raw"`: size of SSZ-encoded payload before snappy compression
+// - `"snappy"`: size of the on-wire snappy-compressed payload
 
-static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(
+static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "lean_gossip_block_size_bytes",
         "Bytes size of a gossip block message",
+        &["compression"],
         vec![
             10_000.0,
             50_000.0,
@@ -88,19 +93,21 @@ static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap()
 });
 
-static LEAN_GOSSIP_ATTESTATION_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(
+static LEAN_GOSSIP_ATTESTATION_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "lean_gossip_attestation_size_bytes",
         "Bytes size of a gossip attestation message",
+        &["compression"],
         vec![512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
     )
     .unwrap()
 });
 
-static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(
+static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "lean_gossip_aggregation_size_bytes",
         "Bytes size of a gossip aggregated attestation message",
+        &["compression"],
         vec![
             1024.0,
             4096.0,
@@ -115,19 +122,94 @@ static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|
     .unwrap()
 });
 
-/// Observe the size of a gossip block message.
-pub fn observe_gossip_block_size(bytes: usize) {
-    LEAN_GOSSIP_BLOCK_SIZE_BYTES.observe(bytes as f64);
+/// Observe the size of a gossip block message, recording both the raw SSZ
+/// size and the snappy-compressed on-wire size.
+pub fn observe_gossip_block_size(raw: usize, snappy: usize) {
+    LEAN_GOSSIP_BLOCK_SIZE_BYTES
+        .with_label_values(&["raw"])
+        .observe(raw as f64);
+    LEAN_GOSSIP_BLOCK_SIZE_BYTES
+        .with_label_values(&["snappy"])
+        .observe(snappy as f64);
 }
 
-/// Observe the size of a gossip attestation message.
-pub fn observe_gossip_attestation_size(bytes: usize) {
-    LEAN_GOSSIP_ATTESTATION_SIZE_BYTES.observe(bytes as f64);
+/// Observe the size of a gossip attestation message, recording both the raw
+/// SSZ size and the snappy-compressed on-wire size.
+pub fn observe_gossip_attestation_size(raw: usize, snappy: usize) {
+    LEAN_GOSSIP_ATTESTATION_SIZE_BYTES
+        .with_label_values(&["raw"])
+        .observe(raw as f64);
+    LEAN_GOSSIP_ATTESTATION_SIZE_BYTES
+        .with_label_values(&["snappy"])
+        .observe(snappy as f64);
 }
 
-/// Observe the size of a gossip aggregated attestation message.
-pub fn observe_gossip_aggregation_size(bytes: usize) {
-    LEAN_GOSSIP_AGGREGATION_SIZE_BYTES.observe(bytes as f64);
+/// Observe the size of a gossip aggregated attestation message, recording both
+/// the raw SSZ size and the snappy-compressed on-wire size.
+pub fn observe_gossip_aggregation_size(raw: usize, snappy: usize) {
+    LEAN_GOSSIP_AGGREGATION_SIZE_BYTES
+        .with_label_values(&["raw"])
+        .observe(raw as f64);
+    LEAN_GOSSIP_AGGREGATION_SIZE_BYTES
+        .with_label_values(&["snappy"])
+        .observe(snappy as f64);
+}
+
+// --- Req/Resp Message Size Histograms ---
+//
+// `protocol` label: `"status"` or `"blocks_by_root"`.
+// `compression` label: `"raw"` (SSZ) or `"snappy"` (on-wire, varint-prefixed
+// snappy frame bytes only — the response-code byte is not included).
+
+static LEAN_REQRESP_REQUEST_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_reqresp_request_size_bytes",
+        "Bytes size of a req/resp request",
+        &["protocol", "compression"],
+        vec![64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0]
+    )
+    .unwrap()
+});
+
+static LEAN_REQRESP_RESPONSE_CHUNK_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_reqresp_response_chunk_size_bytes",
+        "Bytes size of a single req/resp response chunk",
+        &["protocol", "compression"],
+        vec![
+            128.0,
+            1024.0,
+            10_000.0,
+            100_000.0,
+            500_000.0,
+            1_000_000.0,
+            5_000_000.0,
+            10_000_000.0
+        ]
+    )
+    .unwrap()
+});
+
+/// Observe the size of a req/resp request, recording both the raw SSZ size
+/// and the snappy-compressed on-wire size.
+pub fn observe_reqresp_request_size(protocol: &str, raw: usize, snappy: usize) {
+    LEAN_REQRESP_REQUEST_SIZE_BYTES
+        .with_label_values(&[protocol, "raw"])
+        .observe(raw as f64);
+    LEAN_REQRESP_REQUEST_SIZE_BYTES
+        .with_label_values(&[protocol, "snappy"])
+        .observe(snappy as f64);
+}
+
+/// Observe the size of a single req/resp response chunk, recording both the
+/// raw SSZ size and the snappy-compressed on-wire size.
+pub fn observe_reqresp_response_chunk_size(protocol: &str, raw: usize, snappy: usize) {
+    LEAN_REQRESP_RESPONSE_CHUNK_SIZE_BYTES
+        .with_label_values(&[protocol, "raw"])
+        .observe(raw as f64);
+    LEAN_REQRESP_RESPONSE_CHUNK_SIZE_BYTES
+        .with_label_values(&[protocol, "snappy"])
+        .observe(snappy as f64);
 }
 
 /// Set the attestation committee subnet gauge.
