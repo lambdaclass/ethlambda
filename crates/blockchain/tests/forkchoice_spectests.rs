@@ -72,7 +72,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time_ms, true, false);
+                    store::on_tick(&mut store, block_time_ms, true);
                     let result = store::on_block_without_verification(&mut store, signed_block);
                     assert_step_outcome(step_idx, step.valid, result)?;
                 }
@@ -88,7 +88,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         (None, None) => panic!("tick step missing both time and interval"),
                     };
                     let has_proposal = step.has_proposal.unwrap_or(false);
-                    store::on_tick(&mut store, timestamp_ms, has_proposal, false);
+                    store::on_tick(&mut store, timestamp_ms, has_proposal);
                 }
                 "attestation" => {
                     let att_data = step
