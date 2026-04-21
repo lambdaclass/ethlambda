@@ -82,9 +82,6 @@ pub(crate) struct AggregationSession {
     /// Handle to the `spawn_blocking` worker. Held so `stopped()` / new-session
     /// start can await completion.
     pub(crate) worker: tokio::task::JoinHandle<()>,
-    /// Kept alive so the timer is implicitly cancelled when the field is
-    /// replaced or the actor stops (see `spawned_concurrency::tasks::time`).
-    pub(crate) _deadline_timer: spawned_concurrency::tasks::TimerHandle,
 }
 
 /// One successful aggregate streamed back from the worker.

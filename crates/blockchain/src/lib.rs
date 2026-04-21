@@ -208,7 +208,7 @@ impl BlockChainServer {
             run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id);
         });
 
-        let deadline_timer = send_after(
+        let _deadline_timer = send_after(
             AGGREGATION_DEADLINE,
             ctx.clone(),
             AggregationDeadline { session_id },
@@ -218,7 +218,6 @@ impl BlockChainServer {
             session_id,
             cancel,
             worker,
-            _deadline_timer: deadline_timer,
         });
     }
 
