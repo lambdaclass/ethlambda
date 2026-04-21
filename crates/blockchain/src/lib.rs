@@ -12,15 +12,21 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
 };
 
+use crate::aggregation::{
+    AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
+    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+};
 use crate::key_manager::ValidatorKeyPair;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::store::StoreError;
 
+pub mod aggregation;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -58,6 +64,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             aggregator,
             pending_block_parents: HashMap::new(),
+            current_aggregation: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -103,10 +110,15 @@ pub struct BlockChainServer {
     /// admin API take effect without a restart. Seeded from the CLI
     /// `--is-aggregator` flag at spawn.
     aggregator: AggregatorController,
+
+    /// In-flight committee-signature aggregation, if any. Present only while a
+    /// worker started at the most recent interval 2 is still running or until
+    /// the next interval 2 takes over.
+    current_aggregation: Option<AggregationSession>,
 }
 
 impl BlockChainServer {
-    fn on_tick(&mut self, timestamp_ms: u64) {
+    async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -139,19 +151,14 @@ impl BlockChainServer {
             .flatten();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        let new_aggregates = store::on_tick(
+        store::on_tick(
             &mut self.store,
             timestamp_ms,
             proposer_validator_id.is_some(),
-            is_aggregator,
         );
 
-        if let Some(ref p2p) = self.p2p {
-            for aggregate in new_aggregates {
-                let _ = p2p
-                    .publish_aggregated_attestation(aggregate)
-                    .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
-            }
+        if interval == 2 && is_aggregator {
+            self.start_aggregation_session(slot, ctx).await;
         }
 
         // Now build and publish the block (after attestations have been accepted)
@@ -170,6 +177,62 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
+    }
+
+    /// Kick off a committee-signature aggregation session:
+    /// 1. If a prior session is still running (pathological), warn and join it.
+    /// 2. Snapshot the aggregation inputs from the store.
+    /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
+    /// 4. Schedule the `AggregationDeadline` self-message at +750 ms.
+    async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
+        if let Some(prior) = self.current_aggregation.take() {
+            prior.cancel.cancel();
+            if !prior.worker.is_finished() {
+                warn!(
+                    prior_session_id = prior.session_id,
+                    new_session_id = slot,
+                    "Prior aggregation worker still running at next session start; joining before proceeding"
+                );
+            }
+            match tokio::time::timeout(PRIOR_WORKER_JOIN_TIMEOUT, prior.worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(?err, "Prior aggregation worker task ended abnormally"),
+                Err(_) => warn!(
+                    timeout_secs = PRIOR_WORKER_JOIN_TIMEOUT.as_secs(),
+                    "Timed out joining prior aggregation worker"
+                ),
+            }
+        }
+
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store) else {
+            // No gossip sigs and no pending payloads — nothing to aggregate this slot.
+            return;
+        };
+
+        let session_id = slot;
+        // Independent token per session. Shutdown propagates via our
+        // #[stopped] hook which cancels any current session; the deadline
+        // timer cancels this specific session at +AGGREGATION_DEADLINE.
+        let cancel = CancellationToken::new();
+        let actor_ref = ctx.actor_ref();
+
+        let worker_cancel = cancel.clone();
+        let worker_actor = actor_ref.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id);
+        });
+
+        let _deadline_timer = send_after(
+            AGGREGATION_DEADLINE,
+            ctx.clone(),
+            AggregationDeadline { session_id },
+        );
+
+        self.current_aggregation = Some(AggregationSession {
+            session_id,
+            cancel,
+            worker,
+        });
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -515,7 +578,7 @@ impl BlockChainServer {
         let timestamp = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch");
-        self.on_tick(timestamp.as_millis() as u64);
+        self.on_tick(timestamp.as_millis() as u64, ctx).await;
         // Schedule the next tick at the next 800ms interval boundary
         let ms_since_epoch = timestamp.as_millis() as u64;
         let ms_to_next_interval =
@@ -525,6 +588,31 @@ impl BlockChainServer {
             ctx.clone(),
             block_chain_protocol::Tick,
         );
+    }
+
+    /// Actor lifecycle hook: wait for any in-flight aggregation worker to exit
+    /// before the actor is fully stopped. We cancel the session's token and
+    /// wait up to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current
+    /// `aggregate_job` call to finish (the proof itself cannot be interrupted).
+    #[stopped]
+    async fn on_stopped(&mut self, _ctx: &Context<Self>) {
+        let Some(session) = self.current_aggregation.take() else {
+            return;
+        };
+        session.cancel.cancel();
+        match tokio::time::timeout(PRIOR_WORKER_JOIN_TIMEOUT, session.worker).await {
+            Ok(Ok(())) => {
+                info!(
+                    session_id = session.session_id,
+                    "Aggregation worker joined on shutdown"
+                );
+            }
+            Ok(Err(err)) => warn!(?err, "Aggregation worker task ended abnormally on shutdown"),
+            Err(_) => warn!(
+                timeout_secs = PRIOR_WORKER_JOIN_TIMEOUT.as_secs(),
+                "Timed out joining aggregation worker on shutdown"
+            ),
+        }
     }
 }
 
@@ -556,5 +644,68 @@ impl Handler<NewAttestation> for BlockChainServer {
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         self.on_gossip_aggregated_attestation(msg.attestation);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Aggregation message handlers (worker → actor, actor → self for deadline)
+// -------------------------------------------------------------------------
+
+impl Handler<AggregateProduced> for BlockChainServer {
+    async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
+        // Drop results from a prior session (or from an unexpected late worker).
+        // Current session may be None if the actor already cleaned it up; accept
+        // the message only when ids match.
+        let current = self.current_aggregation.as_ref().map(|s| s.session_id);
+        if current != Some(msg.session_id) {
+            trace!(
+                incoming_session_id = msg.session_id,
+                current_session_id = ?current,
+                "Dropping stale aggregate produced for non-current session"
+            );
+            return;
+        }
+
+        aggregation::apply_aggregated_group(&mut self.store, &msg.output);
+
+        if let Some(ref p2p) = self.p2p {
+            let aggregate = SignedAggregatedAttestation {
+                data: msg.output.hashed.data().clone(),
+                proof: msg.output.proof,
+            };
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        }
+    }
+}
+
+impl Handler<AggregationDone> for BlockChainServer {
+    async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
+        aggregation::finalize_aggregation_session(&self.store);
+        metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
+
+        let aggregation_elapsed = msg.total_elapsed;
+        info!(
+            ?aggregation_elapsed,
+            session_id = msg.session_id,
+            groups_considered = msg.groups_considered,
+            groups_aggregated = msg.groups_aggregated,
+            total_raw_sigs = msg.total_raw_sigs,
+            total_children = msg.total_children,
+            cancelled = msg.cancelled,
+            aggregation_deadline_ms = AGGREGATION_DEADLINE.as_millis() as u64,
+            "Committee signatures aggregated"
+        );
+    }
+}
+
+impl Handler<AggregationDeadline> for BlockChainServer {
+    async fn handle(&mut self, msg: AggregationDeadline, _ctx: &Context<Self>) {
+        if let Some(session) = &self.current_aggregation
+            && session.session_id == msg.session_id
+        {
+            session.cancel.cancel();
+        }
     }
 }
