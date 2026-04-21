@@ -344,6 +344,13 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
+### Runtime Aggregator Toggle (Hot-Standby Model)
+- `POST /lean/v0/admin/aggregator` with `{"enabled": bool}` toggles the aggregator role at runtime without restart (ported from leanSpec PR #636)
+- `GET /lean/v0/admin/aggregator` returns `{"is_aggregator": bool}`
+- The CLI `--is-aggregator` flag **seeds** the initial value; runtime toggles are in-process only (not persisted across restarts)
+- Runtime toggles do NOT resubscribe gossip subnets — those are frozen at startup by `build_swarm`. Toggling ON at runtime only activates aggregation logic for subnets the node was already subscribed to
+- **Operational model**: standby aggregators should boot with `--is-aggregator=true` (so subscriptions are in place), then use the admin endpoint to rotate duties. A node booted with `--is-aggregator=false` and toggled ON later will have no extra subnets to aggregate
+
 ### Signature Verification
 - Fork choice tests use `on_block_without_verification()` to skip signature checks
 - Signature spec tests use `on_block()` which always verifies

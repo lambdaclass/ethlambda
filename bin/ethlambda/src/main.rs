@@ -23,6 +23,7 @@ use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2P
 use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
+    aggregator::AggregatorController,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
@@ -64,7 +65,15 @@ struct CliOptions {
     /// When set, skips genesis initialization and syncs from checkpoint.
     #[arg(long)]
     checkpoint_sync_url: Option<String>,
-    /// Whether this node acts as a committee aggregator
+    /// Whether this node acts as a committee aggregator.
+    ///
+    /// Seeds the initial value of the live aggregator flag shared by the
+    /// blockchain actor and the admin API. The flag can be toggled at
+    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
+    /// NOT persist across restarts and do NOT update gossip subnet
+    /// subscriptions, which are frozen at startup — standby aggregators
+    /// should boot with this flag enabled to establish subscriptions, then
+    /// use the admin endpoint to rotate duties (hot-standby model).
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
     /// Number of attestation committees (subnets) per slot
@@ -154,8 +163,19 @@ async fn main() -> eyre::Result<()> {
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, options.is_aggregator);
 
+    // Shared, runtime-mutable aggregator flag. Seeded from the CLI and
+    // threaded into both the blockchain actor (which reads on every tick)
+    // and the API server (which exposes GET/POST admin endpoints).
+    let aggregator = AggregatorController::new(options.is_aggregator);
+
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
+
+    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
+    // AggregatorController — subnet subscriptions are decided once here and
+    // are not re-evaluated at runtime. Toggling via the admin API affects
+    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
+    // for the invariant.
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
@@ -190,7 +210,7 @@ async fn main() -> eyre::Result<()> {
             .inspect_err(|err| error!(%err, "Metrics server failed"));
     });
     tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store)
+        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator)
             .await
             .inspect_err(|err| error!(%err, "API server failed"));
     });
