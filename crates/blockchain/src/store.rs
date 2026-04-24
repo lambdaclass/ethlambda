@@ -101,6 +101,16 @@ fn update_head(store: &mut Store, log_tree: bool) {
 }
 
 /// Update the safe target for attestation.
+///
+/// Safe target is an *availability* signal, not a durable-knowledge signal:
+/// only the "new" pool is considered. Migration from "new" to "known" runs at
+/// interval 4, strictly after this computation at interval 3. 3sf-mini chose
+/// that ordering deliberately so safe target sees only freshly received votes
+/// from the current slot and ignores what was carried over from earlier slots
+/// (block-included attestations, previously migrated gossip, self-attestations).
+/// Counting "known" would let a node keep advancing its safe target on stale
+/// evidence even when live participation has collapsed: exactly the failure
+/// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
     let head_state = store.get_state(&store.head()).expect("head state exists");
     let num_validators = head_state.validators.len() as u64;
@@ -108,10 +118,7 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools (known + new).
-    // At interval 3 the promotion (interval 4) hasn't run yet, so we must
-    // merge both pools to get a complete view for safe target computation.
-    let attestations = store.extract_latest_all_attestations();
+    let attestations = store.extract_latest_new_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
