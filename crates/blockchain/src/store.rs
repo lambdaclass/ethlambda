@@ -20,8 +20,8 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    metrics,
+    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
@@ -128,7 +128,7 @@ fn update_safe_target(store: &mut Store) {
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
-///     5. A vote cannot be for a future slot.
+///     5. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -175,13 +175,16 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         });
     }
 
-    // Time Check - Validate attestation is not too far in the future.
-    // We allow a small margin for clock disparity (1 slot), but no further.
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
-    if data.slot > current_slot + 1 {
+    // Time Check - Honest validators emit votes only after their slot has begun.
+    // Allow a small disparity margin for clock skew between peers.
+    //
+    // The bound is in intervals, not slots: a whole-slot margin would let an
+    // adversary pre-publish next-slot aggregates ahead of any honest validator.
+    let attestation_start_interval = data.slot * INTERVALS_PER_SLOT;
+    if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            current_slot,
+            store_time: store.time(),
         });
     }
 
@@ -795,11 +798,11 @@ pub enum StoreError {
     },
 
     #[error(
-        "Attestation slot {attestation_slot} is too far in future (current slot: {current_slot})"
+        "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
     )]
     AttestationTooFarInFuture {
         attestation_slot: u64,
-        current_slot: u64,
+        store_time: u64,
     },
 
     #[error(
