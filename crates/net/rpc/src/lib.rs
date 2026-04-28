@@ -20,23 +20,31 @@ pub async fn start_api_server(
     address: SocketAddr,
     store: Store,
     aggregator: AggregatorController,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store).layer(Extension(aggregator));
 
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, api_router).await?;
+    axum::serve(listener, api_router)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }
 
-pub async fn start_metrics_server(address: SocketAddr) -> Result<(), std::io::Error> {
+pub async fn start_metrics_server(
+    address: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
     let app = Router::new().merge(metrics_router).merge(debug_router);
 
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
     Ok(())
 }

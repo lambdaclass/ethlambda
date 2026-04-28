@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::Notify;
 
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -204,13 +205,23 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+    let shutdown_notify = Arc::new(Notify::new());
+    let metrics_shutdown = shutdown_notify.clone();
+    let api_shutdown = shutdown_notify.clone();
+
+    let metrics_handle = tokio::spawn(async move {
+        let shutdown_future = async move {
+            metrics_shutdown.notified().await;
+        };
+        let _ = ethlambda_rpc::start_metrics_server(metrics_socket, shutdown_future)
             .await
             .inspect_err(|err| error!(%err, "Metrics server failed"));
     });
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator)
+    let api_handle = tokio::spawn(async move {
+        let shutdown_future = async move {
+            api_shutdown.notified().await;
+        };
+        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator, shutdown_future)
             .await
             .inspect_err(|err| error!(%err, "API server failed"));
     });
@@ -218,7 +229,20 @@ async fn main() -> eyre::Result<()> {
     info!("Node initialized");
 
     tokio::signal::ctrl_c().await.ok();
-    println!("Shutting down...");
+    info!("Shutdown signal received, stopping actors and servers...");
+
+    let blockchain_ref = blockchain.actor_ref().clone();
+    let p2p_ref = p2p.actor_ref().clone();
+    blockchain_ref.context().stop();
+    p2p_ref.context().stop();
+    shutdown_notify.notify_waiters();
+
+    blockchain_ref.join().await;
+    p2p_ref.join().await;
+    let _ = api_handle.await;
+    let _ = metrics_handle.await;
+
+    info!("Shutdown complete");
 
     Ok(())
 }
