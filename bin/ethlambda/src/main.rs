@@ -47,7 +47,15 @@ const ASCII_ART: &str = r#"
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
     #[arg(long)]
-    custom_network_config_dir: PathBuf,
+    genesis: PathBuf,
+    #[arg(long)]
+    validators: PathBuf,
+    #[arg(long)]
+    bootnodes: PathBuf,
+    #[arg(long)]
+    validator_config: PathBuf,
+    #[arg(long)]
+    hash_sig_keys_dir: PathBuf,
     #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -121,15 +129,11 @@ async fn main() -> eyre::Result<()> {
 
     info!(node_key=?options.node_key, "got node key");
 
-    let config_path = options.custom_network_config_dir.join("config.yaml");
-    let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
-    let validators_path = options
-        .custom_network_config_dir
-        .join("annotated_validators.yaml");
-    let validator_config = options
-        .custom_network_config_dir
-        .join("validator-config.yaml");
-    let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
+    let config_path = options.genesis;
+    let bootnodes_path = options.bootnodes;
+    let validators_path = options.validators;
+    let validator_config = options.validator_config;
+    let validator_keys_dir = options.hash_sig_keys_dir;
 
     let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
     let genesis_config: GenesisConfig =
