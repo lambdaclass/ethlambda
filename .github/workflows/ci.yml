@@ -54,10 +54,11 @@ jobs:
 
       - name: Cache test fixtures
         id: cache-fixtures
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: leanSpec/fixtures
           key: leanspec-fixtures-${{ steps.lean-spec.outputs.commit }}
+          save-always: true
 
       # All fixture generation steps are skipped when the cache hits
       - name: Checkout leanSpec at pinned commit
@@ -93,10 +94,11 @@ jobs:
       - name: Cache production keys
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         id: cache-prod-keys
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: leanSpec/packages/testing/src/consensus_testing/test_keys/prod_scheme
           key: prod-keys-${{ steps.prod-keys-url.outputs.hash }}
+          save-always: true
 
       - name: Download production keys
         if: steps.cache-fixtures.outputs.cache-hit != 'true' && steps.cache-prod-keys.outputs.cache-hit != 'true'
