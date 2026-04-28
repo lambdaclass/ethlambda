@@ -180,7 +180,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     //
     // The bound is in intervals, not slots: a whole-slot margin would let an
     // adversary pre-publish next-slot aggregates ahead of any honest validator.
-    let attestation_start_interval = data.slot * INTERVALS_PER_SLOT;
+    let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
     if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
