@@ -32,6 +32,14 @@ pub struct StateTransitionTest {
     pub pre: TestState,
     pub blocks: Vec<Block>,
     pub post: Option<PostState>,
+    /// Exception class the spec test framework expects (e.g. "AssertionError").
+    ///
+    /// Some negative tests fail during pre-block construction in the spec
+    /// filler (e.g. `state.process_slots(spec.slot)` raising before a block
+    /// is built). The fixture then carries `blocks: []` and only this field
+    /// records the intended outcome.
+    #[serde(rename = "expectException")]
+    pub expect_exception: Option<String>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
     pub info: TestInfo,

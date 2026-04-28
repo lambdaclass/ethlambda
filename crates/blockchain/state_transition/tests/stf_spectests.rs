@@ -32,6 +32,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Build a block registry mapping "block_N" labels to hash tree roots.
         // Labels are 1-indexed: "block_1" is the first block in the array.
         let mut block_registry: HashMap<String, H256> = HashMap::new();
+        let blocks_empty = test.blocks.is_empty();
         for (i, block) in test.blocks.into_iter().enumerate() {
             let block: Block = block.into();
             let label = format!("block_{}", i + 1);
@@ -45,6 +46,12 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         match (result, test.post) {
             (Ok(_), Some(expected_post)) => {
                 compare_post_states(&post_state, &expected_post, &block_registry)?;
+            }
+            (Ok(_), None) if blocks_empty && test.expect_exception.is_some() => {
+                // Negative test where the spec filler raised during pre-block
+                // construction (so `blocks: []` in the fixture). The intended
+                // failure is recorded in `expectException`; ethlambda has no
+                // block to replay, so the spec framework's verdict stands.
             }
             (Ok(_), None) => {
                 return Err(
