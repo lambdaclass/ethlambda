@@ -221,9 +221,12 @@ fn validate_checks(
             .as_ref()
             .and_then(|label| block_registry.get(label).copied())
     });
-    if checks.safe_target.is_some() {
-        return Err(format!("Step {}: 'safeTarget' check not supported", step_idx).into());
-    }
+    let resolved_safe_target_root = checks.safe_target.or_else(|| {
+        checks
+            .safe_target_root_label
+            .as_ref()
+            .and_then(|label| block_registry.get(label).copied())
+    });
     // Validate attestationTargetSlot
     if let Some(expected_slot) = checks.attestation_target_slot {
         let target = store::get_attestation_target(st);
@@ -325,6 +328,30 @@ fn validate_checks(
             return Err(format!(
                 "Step {}: latestFinalizedRoot mismatch: expected {:?}, got {:?}",
                 step_idx, expected_root, finalized.root
+            )
+            .into());
+        }
+    }
+
+    // Validate safeTargetSlot
+    if let Some(expected_slot) = checks.safe_target_slot {
+        let actual_slot = st.safe_target_slot();
+        if actual_slot != expected_slot {
+            return Err(format!(
+                "Step {}: safeTargetSlot mismatch: expected {}, got {}",
+                step_idx, expected_slot, actual_slot
+            )
+            .into());
+        }
+    }
+
+    // Validate safeTarget root (resolved from label if root not provided)
+    if let Some(ref expected_root) = resolved_safe_target_root {
+        let actual_root = st.safe_target();
+        if actual_root != *expected_root {
+            return Err(format!(
+                "Step {}: safeTarget mismatch: expected {:?}, got {:?}",
+                step_idx, expected_root, actual_root
             )
             .into());
         }

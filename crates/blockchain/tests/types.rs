@@ -136,38 +136,51 @@ impl BlockStepData {
 // Check Types
 // ============================================================================
 
+/// Store-state expectations for a fork choice test step.
+///
+/// All fields are optional; only fields explicitly set by the fixture are validated.
+/// Root-typed fields have a `*RootLabel` companion that resolves a block label via the
+/// step's block registry, mirroring the leanSpec fixture schema.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StoreChecks {
-    // Validated fields
+    /// Expected store time in intervals since genesis.
+    pub time: Option<u64>,
+
     #[serde(rename = "headSlot")]
     pub head_slot: Option<u64>,
     #[serde(rename = "headRoot")]
     pub head_root: Option<H256>,
-    #[serde(rename = "attestationChecks")]
-    pub attestation_checks: Option<Vec<AttestationCheck>>,
-    #[serde(rename = "attestationTargetSlot")]
-    pub attestation_target_slot: Option<u64>,
-
-    /// Expected store time in intervals since genesis (validated when present).
-    pub time: Option<u64>,
-
-    // Unsupported fields (will error if present in test fixture)
     #[serde(rename = "headRootLabel")]
     pub head_root_label: Option<String>,
+
     #[serde(rename = "latestJustifiedSlot")]
     pub latest_justified_slot: Option<u64>,
     #[serde(rename = "latestJustifiedRoot")]
     pub latest_justified_root: Option<H256>,
     #[serde(rename = "latestJustifiedRootLabel")]
     pub latest_justified_root_label: Option<String>,
+
     #[serde(rename = "latestFinalizedSlot")]
     pub latest_finalized_slot: Option<u64>,
     #[serde(rename = "latestFinalizedRoot")]
     pub latest_finalized_root: Option<H256>,
     #[serde(rename = "latestFinalizedRootLabel")]
     pub latest_finalized_root_label: Option<String>,
+
+    /// Legacy single-field schema; expected safe target block root.
     #[serde(rename = "safeTarget")]
     pub safe_target: Option<H256>,
+    /// Expected slot of the safe target block (leanSpec #680 schema).
+    #[serde(rename = "safeTargetSlot")]
+    pub safe_target_slot: Option<u64>,
+    /// Expected safe target block root by label reference (leanSpec #680 schema).
+    #[serde(rename = "safeTargetRootLabel")]
+    pub safe_target_root_label: Option<String>,
+
+    #[serde(rename = "attestationTargetSlot")]
+    pub attestation_target_slot: Option<u64>,
+    #[serde(rename = "attestationChecks")]
+    pub attestation_checks: Option<Vec<AttestationCheck>>,
     #[serde(rename = "lexicographicHeadAmong")]
     pub lexicographic_head_among: Option<Vec<String>>,
 }
