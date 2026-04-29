@@ -2056,6 +2056,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "vergen-git2",
@@ -2165,6 +2166,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
 ]
