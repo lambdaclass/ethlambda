@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -29,7 +30,7 @@ use ethlambda_types::{
     state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
@@ -204,21 +205,51 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+    let shutdown_token = CancellationToken::new();
+    let metrics_shutdown = shutdown_token.clone();
+    let api_shutdown = shutdown_token.clone();
+
+    let metrics_handle = tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_metrics_server(metrics_socket, metrics_shutdown)
             .await
             .inspect_err(|err| error!(%err, "Metrics server failed"));
     });
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator)
+    let api_handle = tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator, api_shutdown)
             .await
             .inspect_err(|err| error!(%err, "API server failed"));
     });
 
     info!("Node initialized");
 
+    // 1st ctrl+c: start graceful shutdown
     tokio::signal::ctrl_c().await.ok();
-    println!("Shutting down...");
+
+    info!("Shutdown signal received, stopping actors and servers...");
+
+    tokio::spawn(async move {
+        // This can be turned into a loop
+        tokio::signal::ctrl_c().await.ok();
+        warn!("Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown");
+        tokio::signal::ctrl_c().await.ok();
+        warn!("Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown");
+        tokio::signal::ctrl_c().await.ok();
+        info!("Forced ungraceful shutdown...");
+        std::process::exit(1);
+    });
+
+    let blockchain_ref = blockchain.actor_ref().clone();
+    let p2p_ref = p2p.actor_ref().clone();
+    blockchain_ref.context().stop();
+    p2p_ref.context().stop();
+    shutdown_token.cancel();
+
+    blockchain_ref.join().await;
+    p2p_ref.join().await;
+    let _ = api_handle.await;
+    let _ = metrics_handle.await;
+
+    info!("Shutdown complete");
 
     Ok(())
 }
