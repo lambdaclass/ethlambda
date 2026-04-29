@@ -146,3 +146,120 @@ impl From<AttestationData> for HashedAttestationData {
         Self::new(data)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `AggregationBits` of `len` bits with the indices in `set` flipped on.
+    fn bits(len: usize, set: &[usize]) -> AggregationBits {
+        let mut b = AggregationBits::with_length(len).unwrap();
+        for &i in set {
+            b.set(i, true).unwrap();
+        }
+        b
+    }
+
+    #[test]
+    fn subset_empty_bitlists() {
+        let empty = AggregationBits::new();
+        assert!(bits_is_subset(&empty, &empty));
+    }
+
+    #[test]
+    fn subset_empty_a_is_subset_of_anything() {
+        let empty = AggregationBits::new();
+        let b = bits(8, &[0, 3, 7]);
+        assert!(bits_is_subset(&empty, &b));
+    }
+
+    #[test]
+    fn subset_zero_bits_a_is_subset_of_empty() {
+        // a has length but no set bits: byte iteration skips zero bytes, so it's a subset of empty.
+        let a = bits(8, &[]);
+        let empty = AggregationBits::new();
+        assert!(bits_is_subset(&a, &empty));
+    }
+
+    #[test]
+    fn subset_nonempty_a_is_not_subset_of_empty() {
+        let a = bits(8, &[2]);
+        let empty = AggregationBits::new();
+        assert!(!bits_is_subset(&a, &empty));
+    }
+
+    #[test]
+    fn subset_reflexive_equal_bitlists() {
+        let a = bits(16, &[0, 1, 5, 9, 15]);
+        let b = bits(16, &[0, 1, 5, 9, 15]);
+        assert!(bits_is_subset(&a, &b));
+        assert!(bits_is_subset(&b, &a));
+    }
+
+    #[test]
+    fn subset_strict_subset_returns_true() {
+        let a = bits(8, &[1, 4]);
+        let b = bits(8, &[1, 4, 6]);
+        assert!(bits_is_subset(&a, &b));
+        assert!(!bits_is_subset(&b, &a));
+    }
+
+    #[test]
+    fn subset_disjoint_bits_returns_false() {
+        let a = bits(8, &[0, 2]);
+        let b = bits(8, &[1, 3]);
+        assert!(!bits_is_subset(&a, &b));
+        assert!(!bits_is_subset(&b, &a));
+    }
+
+    #[test]
+    fn subset_partial_overlap_returns_false() {
+        // a shares bit 1 with b but also has bit 5 that b lacks.
+        let a = bits(8, &[1, 5]);
+        let b = bits(8, &[0, 1, 2]);
+        assert!(!bits_is_subset(&a, &b));
+    }
+
+    #[test]
+    fn subset_a_shorter_than_b_with_bits_in_b() {
+        // a has 8 bits, b has 16 bits. a's set bits are all present in b.
+        let a = bits(8, &[1, 4]);
+        let b = bits(16, &[1, 4, 11]);
+        assert!(bits_is_subset(&a, &b));
+    }
+
+    #[test]
+    fn subset_a_longer_than_b_with_zero_tail_is_subset() {
+        // a has 16 bits but only sets bit 2; b has 8 bits with the same bit set.
+        // a's tail byte is zero, so the loop skips it.
+        let a = bits(16, &[2]);
+        let b = bits(8, &[2]);
+        assert!(bits_is_subset(&a, &b));
+    }
+
+    #[test]
+    fn subset_a_longer_than_b_with_set_bit_past_b_returns_false() {
+        // a sets bit 9 (byte 1) but b only has 8 bits (1 byte). Missing bytes in b are
+        // treated as zero, so any bit in a's tail breaks the subset relation.
+        let a = bits(16, &[9]);
+        let b = bits(8, &[]);
+        assert!(!bits_is_subset(&a, &b));
+    }
+
+    #[test]
+    fn subset_multi_byte_bitlists() {
+        // Spans multiple bytes (24 bits = 3 bytes) to exercise the byte-by-byte loop.
+        let a = bits(24, &[0, 8, 16]);
+        let b = bits(24, &[0, 1, 8, 9, 16, 17]);
+        assert!(bits_is_subset(&a, &b));
+        assert!(!bits_is_subset(&b, &a));
+    }
+
+    #[test]
+    fn subset_violation_in_later_byte_returns_false() {
+        // a's first byte matches b, but bit 17 (in byte 2) is set in a only.
+        let a = bits(24, &[0, 1, 17]);
+        let b = bits(24, &[0, 1, 16]);
+        assert!(!bits_is_subset(&a, &b));
+    }
+}
