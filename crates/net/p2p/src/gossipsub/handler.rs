@@ -26,9 +26,11 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     else {
         unreachable!("we already matched on Message variant in handle_swarm_event");
     };
+    let peer_count = server.connected_peers.len();
     let topic_kind = message.topic.as_str().split("/").nth(3);
     match topic_kind {
         Some(BLOCK_TOPIC_KIND) => {
+            info!(kind = "block", peer_count, "P2P message received");
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
             else {
@@ -61,6 +63,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(AGGREGATION_TOPIC_KIND) => {
+            info!(kind = "aggregation", peer_count, "P2P message received");
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
             else {
@@ -91,6 +94,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
+            info!(kind = "attestation", peer_count, "P2P message received");
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
             else {
