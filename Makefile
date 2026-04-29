@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test
+.PHONY: help fmt lint docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -48,3 +48,12 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
 	@cd lean-quickstart \
 		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
+
+docs-deps: ## 📦 Install dependencies for generating the documentation
+	cargo install --version 0.4.51 mdbook
+
+docs: ## 📚 Generate the documentation site under ./book
+	mdbook build
+
+docs-serve: ## 📖 Serve the documentation locally with live reload
+	mdbook serve --open
