@@ -282,9 +282,8 @@
       const maxSlot = d3.max(allDescendants, d => d.data.slot);
       const slotRange = maxSlot - minSlot || 1;
 
-      // Stretch toward the viewport when the chain is short, but cap each slot
-      // at MAX_SLOT_HEIGHT so consecutive nodes never drift too far apart.
-      // Long chains use natural SLOT_HEIGHT spacing and scroll.
+      // Stretch toward the viewport for short chains (capped at MAX_SLOT_HEIGHT
+      // per slot); fall back to natural SLOT_HEIGHT for long chains (scrollable).
       const containerHeight = Math.max(container.clientHeight - MARGIN.top - MARGIN.bottom, 200);
       const naturalHeight = slotRange * SLOT_HEIGHT;
       const cappedStretch = slotRange * MAX_SLOT_HEIGHT;
@@ -335,8 +334,8 @@
       return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
     }
 
-    // Root of the currently-hovered node, so render() can refresh the tooltip
-    // contents on each poll without requiring the user to move the mouse.
+    // Tracked so render() can refresh the tooltip on each poll without
+    // requiring the user to move the mouse.
     let hoveredRoot = null;
 
     function tooltipHtml(d, total) {
@@ -450,10 +449,6 @@
         .attr("transform", d => `translate(${d.x},${d.y})`)
         .attr("opacity", 0);
 
-      // Inner disc rendered fully; the fill-mask above it paints the upper
-      // (1-ratio) portion in the page background color, so only the bottom
-      // ratio is visible. This avoids the clipPath-based approach, whose
-      // attribute interpolation isn't reliably re-rendered per frame.
       nodeEnter.append("circle")
         .attr("class", "node-inner")
         .attr("r", INNER_RADIUS)
@@ -494,8 +489,7 @@
         .attr("transform", d => `translate(${d.x},${d.y})`)
         .attr("opacity", 1);
 
-      // Sequential: fill animates over the full TRANSITION_DURATION, then
-      // a quick 100ms color flip after the fill is fully settled.
+      // Fill animates first, then color flips once the fill has settled.
       nodeMerged.select(".fill-mask")
         .transition()
         .duration(TRANSITION_DURATION)
