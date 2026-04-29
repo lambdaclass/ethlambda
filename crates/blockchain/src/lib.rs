@@ -46,6 +46,14 @@ pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER
 ///
 /// See: leanSpec commit 0c9528a (PR #536).
 pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// Future-slot tolerance for gossip attestations, expressed in intervals.
+///
+/// Bounds the clock skew the time check is willing to absorb when admitting a
+/// vote whose slot has not yet started locally. One interval is roughly 800 ms,
+/// the lean analogue of mainnet's `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+///
+/// See: leanSpec PR #682.
+pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
 impl BlockChain {
     pub fn spawn(
