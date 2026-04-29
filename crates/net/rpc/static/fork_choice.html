@@ -89,6 +89,12 @@
       cursor: pointer;
     }
 
+    .fill-mask {
+      fill: #1a1a2e;
+      stroke: none;
+      pointer-events: none;
+    }
+
     .node-label {
       fill: #ccc;
       font-size: 10px;
@@ -209,10 +215,6 @@
     function weightRatio(node, validatorCount) {
       if (!validatorCount) return 0;
       return Math.max(0, Math.min(1, node.weight / validatorCount));
-    }
-
-    function clipId(root) {
-      return `fill-clip-${root.replace(/^0x/, "")}`;
     }
 
     function isGenesisParent(parentRoot) {
@@ -337,16 +339,17 @@
     // contents on each poll without requiring the user to move the mouse.
     let hoveredRoot = null;
 
-    function tooltipHtml(d) {
+    function tooltipHtml(d, total) {
+      const pct = total ? parseFloat(((d.weight / total) * 100).toFixed(2)) : 0;
       return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
         `<span class="tt-label">slot:</span> ${d.slot}<br>` +
         `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        `<span class="tt-label">weight:</span> ${d.weight}`;
+        `<span class="tt-label">weight:</span> ${d.weight}/${total} (${pct}%)`;
     }
 
     function showTooltip(event, d) {
       hoveredRoot = d.root;
-      tooltip.innerHTML = tooltipHtml(d);
+      tooltip.innerHTML = tooltipHtml(d, currentData?.validator_count);
       tooltip.style.opacity = 1;
       tooltip.style.left = (event.clientX + 14) + "px";
       tooltip.style.top = (event.clientY - 14) + "px";
@@ -447,21 +450,21 @@
         .attr("transform", d => `translate(${d.x},${d.y})`)
         .attr("opacity", 0);
 
-      nodeEnter.append("clipPath")
-        .attr("class", "fill-clip")
-        .attr("id", d => clipId(d.root))
-        .append("rect")
-        .attr("class", "fill-rect")
-        .attr("x", -NODE_RADIUS)
-        .attr("width", NODE_RADIUS * 2)
-        .attr("y", d => NODE_RADIUS - d._ratio * NODE_RADIUS * 2)
-        .attr("height", d => d._ratio * NODE_RADIUS * 2);
-
+      // Inner disc rendered fully; the fill-mask above it paints the upper
+      // (1-ratio) portion in the page background color, so only the bottom
+      // ratio is visible. This avoids the clipPath-based approach, whose
+      // attribute interpolation isn't reliably re-rendered per frame.
       nodeEnter.append("circle")
         .attr("class", "node-inner")
         .attr("r", INNER_RADIUS)
-        .attr("fill", d => d._color)
-        .attr("clip-path", d => `url(#${clipId(d.root)})`);
+        .attr("fill", d => d._color);
+
+      nodeEnter.append("rect")
+        .attr("class", "fill-mask")
+        .attr("x", -INNER_RADIUS)
+        .attr("width", INNER_RADIUS * 2)
+        .attr("y", -INNER_RADIUS)
+        .attr("height", d => (1 - d._ratio) * INNER_RADIUS * 2);
 
       nodeEnter.append("circle")
         .attr("class", "node-outer")
@@ -491,21 +494,23 @@
         .attr("transform", d => `translate(${d.x},${d.y})`)
         .attr("opacity", 1);
 
-      nodeMerged.select(".fill-rect")
+      // Sequential: fill animates over the full TRANSITION_DURATION, then
+      // a quick 100ms color flip after the fill is fully settled.
+      nodeMerged.select(".fill-mask")
         .transition()
         .duration(TRANSITION_DURATION)
-        .attr("y", d => NODE_RADIUS - d._ratio * NODE_RADIUS * 2)
-        .attr("height", d => d._ratio * NODE_RADIUS * 2);
+        .attr("height", d => (1 - d._ratio) * INNER_RADIUS * 2);
 
-      // Color animates as a block transitions between roles (head → justified → finalized).
       nodeMerged.select(".node-inner")
         .transition()
-        .duration(TRANSITION_DURATION)
+        .delay(TRANSITION_DURATION)
+        .duration(100)
         .attr("fill", d => d._color);
 
       nodeMerged.select(".node-outer")
         .transition()
-        .duration(TRANSITION_DURATION)
+        .delay(TRANSITION_DURATION)
+        .duration(100)
         .attr("stroke", d => d._color);
 
       nodeMerged.select("text")
@@ -514,7 +519,7 @@
       // Keep the tooltip live while the user holds the mouse still over a node.
       if (hoveredRoot) {
         const hovered = layout.nodes.find(n => n.root === hoveredRoot);
-        if (hovered) tooltip.innerHTML = tooltipHtml(hovered);
+        if (hovered) tooltip.innerHTML = tooltipHtml(hovered, data.validator_count);
       }
 
       // Auto-scroll to head node
