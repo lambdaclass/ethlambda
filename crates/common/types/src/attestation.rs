@@ -86,12 +86,7 @@ pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + 
     })
 }
 
-/// Returns `true` iff every bit set in `a` is also set in `b` (i.e., participants(a) ⊆ participants(b)).
-///
-/// Operates byte-wise on the raw bitfield representation, avoiding the per-call
-/// `HashSet` allocation that index-iteration would require. Safe because SSZ
-/// decoding rejects bitlists with non-zero padding above the delimiter, so any
-/// bit not in `b` reliably reads as zero in `b.as_bytes()`.
+/// Returns `true` iff every bit set in `a` is also set in `b` (i.e., `a` is a subset of `b`).
 pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();

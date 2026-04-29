@@ -126,38 +126,26 @@ impl PayloadBuffer {
         }
     }
 
-    /// Insert a proof, maintaining the antichain invariant per data_root.
-    ///
-    /// Each data_root entry holds proofs whose participant sets are pairwise
-    /// incomparable under the subset relation. On push:
+    /// Insert a proof for an attestation, FIFO-evicting oldest data_roots
+    /// when total proofs reach capacity. Also ensures the buffer doesn't
+    /// include proofs which are a subset of other proofs for the same
+    /// attestation data:
     ///
     /// - If the incoming proof's participants are a subset (incl. equal) of
     ///   any existing proof, the incoming proof is redundant and skipped.
     /// - Otherwise, any existing proof whose participants are a strict subset
     ///   of the incoming proof's is removed before inserting.
-    ///
-    /// This subsumes exact-equality dedup and keeps buffers bounded when an
-    /// aggregator produces a proof that supersedes prior children.
-    ///
-    /// FIFO-evicts oldest data_roots when `total_proofs` exceeds capacity.
     fn push(&mut self, hashed: HashedAttestationData, proof: AggregatedSignatureProof) {
         let (data_root, att_data) = hashed.into_parts();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
-            // Subset checks operate byte-wise on AggregationBits to avoid per-call
-            // HashSet allocation on the aggregated-attestation ingest path.
-            //
-            // Antichain invariant on `entry.proofs`: surviving proofs are pairwise
-            // incomparable. Hence the early-return path below cannot have populated
-            // `to_remove`: if some `X ⊆ new ⊆ existing` had been marked, then
-            // `X ⊆ existing` would already violate the invariant.
             let mut to_remove: Vec<usize> = Vec::new();
             for (i, p) in entry.proofs.iter().enumerate() {
-                // Incoming is subsumed by an existing proof (incl. equal) — skip.
+                // Incoming is subsumed by an existing proof (incl. equal). Skip.
                 if bits_is_subset(&proof.participants, &p.participants) {
                     return;
                 }
-                // Existing is a strict subset of incoming — mark for removal.
+                // Existing is a strict subset of incoming. Mark for removal.
                 // (Non-strict equality was ruled out by the check above.)
                 if bits_is_subset(&p.participants, &proof.participants) {
                     to_remove.push(i);
