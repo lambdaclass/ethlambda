@@ -15,7 +15,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicU32, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -223,32 +222,21 @@ async fn main() -> eyre::Result<()> {
 
     info!("Node initialized");
 
-    let signal_count = Arc::new(AtomicU32::new(0));
-    let signal_count_clone = signal_count.clone();
+    // 1st ctrl+c: start graceful shutdown
+    tokio::signal::ctrl_c().await.ok();
 
-    // Handle multiple Ctrl+C signals:
-    // 1st Ctrl+C: graceful shutdown
-    // 2nd Ctrl+C: force exit immediately
+    info!("Shutdown signal received, stopping actors and servers...");
+
     tokio::spawn(async move {
-        loop {
-            tokio::signal::ctrl_c().await.ok();
-            let count = signal_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
-            if count == 1 {
-                info!("Shutdown signal received, stopping actors and servers...");
-            } else {
-                warn!("Force shutdown requested, exiting immediately");
-                std::process::exit(1);
-            }
-        }
+        // This can be turned into a loop
+        tokio::signal::ctrl_c().await.ok();
+        warn!("Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown");
+        tokio::signal::ctrl_c().await.ok();
+        warn!("Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown");
+        tokio::signal::ctrl_c().await.ok();
+        info!("Forced ungraceful shutdown...");
+        std::process::exit(1);
     });
-
-    // Wait for first signal
-    loop {
-        if signal_count.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
 
     let blockchain_ref = blockchain.actor_ref().clone();
     let p2p_ref = p2p.actor_ref().clone();

@@ -7,6 +7,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use ethlambda_types::primitives::H256;
 use libssz::SszEncode;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -20,7 +21,7 @@ pub async fn start_api_server(
     address: SocketAddr,
     store: Store,
     aggregator: AggregatorController,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store).layer(Extension(aggregator));
 
@@ -36,7 +37,7 @@ pub async fn start_api_server(
 
 pub async fn start_metrics_server(
     address: SocketAddr,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
