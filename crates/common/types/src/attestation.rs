@@ -86,6 +86,27 @@ pub fn validator_indices(bits: &AggregationBits) -> impl Iterator<Item = u64> + 
     })
 }
 
+/// Returns `true` iff every bit set in `a` is also set in `b` (i.e., participants(a) ⊆ participants(b)).
+///
+/// Operates byte-wise on the raw bitfield representation, avoiding the per-call
+/// `HashSet` allocation that index-iteration would require. Safe because SSZ
+/// decoding rejects bitlists with non-zero padding above the delimiter, so any
+/// bit not in `b` reliably reads as zero in `b.as_bytes()`.
+pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    for (i, &a_byte) in a_bytes.iter().enumerate() {
+        if a_byte == 0 {
+            continue;
+        }
+        let b_byte = b_bytes.get(i).copied().unwrap_or(0);
+        if a_byte & !b_byte != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAggregatedAttestation {

@@ -10,7 +10,7 @@ static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().h
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData},
+    attestation::{AttestationData, HashedAttestationData, bits_is_subset},
     block::{
         AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
     },
@@ -142,19 +142,24 @@ impl PayloadBuffer {
     /// FIFO-evicts oldest data_roots when `total_proofs` exceeds capacity.
     fn push(&mut self, hashed: HashedAttestationData, proof: AggregatedSignatureProof) {
         let (data_root, att_data) = hashed.into_parts();
-        let new_set: HashSet<u64> = proof.participant_indices().collect();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
+            // Subset checks operate byte-wise on AggregationBits to avoid per-call
+            // HashSet allocation on the aggregated-attestation ingest path.
+            //
+            // Antichain invariant on `entry.proofs`: surviving proofs are pairwise
+            // incomparable. Hence the early-return path below cannot have populated
+            // `to_remove`: if some `X ⊆ new ⊆ existing` had been marked, then
+            // `X ⊆ existing` would already violate the invariant.
             let mut to_remove: Vec<usize> = Vec::new();
             for (i, p) in entry.proofs.iter().enumerate() {
-                let existing_set: HashSet<u64> = p.participant_indices().collect();
                 // Incoming is subsumed by an existing proof (incl. equal) — skip.
-                if new_set.is_subset(&existing_set) {
+                if bits_is_subset(&proof.participants, &p.participants) {
                     return;
                 }
                 // Existing is a strict subset of incoming — mark for removal.
-                // (Non-strict equality was handled by the check above.)
-                if existing_set.is_subset(&new_set) {
+                // (Non-strict equality was ruled out by the check above.)
+                if bits_is_subset(&p.participants, &proof.participants) {
                     to_remove.push(i);
                 }
             }
@@ -1916,6 +1921,38 @@ mod tests {
             .collect();
         assert!(sets.contains(&vec![5, 6]));
         assert!(sets.contains(&vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn payload_buffer_push_empty_participants_subsumed_by_anything() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        // Empty-participant proof inserted first: anything that follows absorbs it.
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[]),
+        );
+        assert_eq!(buf.total_proofs, 1);
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(
+            buf.data[&data_root].proofs[0]
+                .participant_indices()
+                .collect::<Vec<u64>>(),
+            vec![1, 2]
+        );
+
+        // Empty-participant proof pushed against existing non-empty: incoming is subsumed, skipped.
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[]),
+        );
+        assert_eq!(buf.total_proofs, 1);
     }
 
     #[test]
