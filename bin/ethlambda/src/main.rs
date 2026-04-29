@@ -15,6 +15,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
+    sync::atomic::{AtomicU32, Ordering},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +31,7 @@ use ethlambda_types::{
     state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
@@ -222,8 +223,32 @@ async fn main() -> eyre::Result<()> {
 
     info!("Node initialized");
 
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received, stopping actors and servers...");
+    let signal_count = Arc::new(AtomicU32::new(0));
+    let signal_count_clone = signal_count.clone();
+
+    // Handle multiple Ctrl+C signals:
+    // 1st Ctrl+C: graceful shutdown
+    // 2nd Ctrl+C: force exit immediately
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            let count = signal_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            if count == 1 {
+                info!("Shutdown signal received, stopping actors and servers...");
+            } else {
+                warn!("Force shutdown requested, exiting immediately");
+                std::process::exit(1);
+            }
+        }
+    });
+
+    // Wait for first signal
+    loop {
+        if signal_count.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
 
     let blockchain_ref = blockchain.actor_ref().clone();
     let p2p_ref = p2p.actor_ref().clone();
