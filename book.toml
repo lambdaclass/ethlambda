@@ -13,3 +13,9 @@ git-repository-url = "https://github.com/lambdaclass/ethlambda"
 edit-url-template = "https://github.com/lambdaclass/ethlambda/edit/main/{path}"
 # Make sections collapsible, starting fully expanded
 fold = { enable = true, level = 1 }
+
+# Broken-link checker
+# https://github.com/marxin/mdbook-linkcheck2
+# Needs to be installed with `cargo install mdbook-linkcheck2`
+[output.linkcheck2]
+optional = true

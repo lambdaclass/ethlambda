@@ -50,7 +50,8 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
 
 docs-deps: ## 📦 Install dependencies for generating the documentation
-	cargo install --version 0.4.51 mdbook
+	cargo install --version 0.5.2 mdbook
+	cargo install --version 0.12.0 mdbook-linkcheck2
 
 docs: ## 📚 Generate the documentation site under ./book
 	mdbook build
