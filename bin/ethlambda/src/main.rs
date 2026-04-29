@@ -46,19 +46,19 @@ const ASCII_ART: &str = r#"
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
-    /// Path to the chain genesis config (config.yaml).
+    /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     genesis: PathBuf,
-    /// Path to the validator registry (annotated_validators.yaml).
+    /// Path to the validator registry (e.g., annotated_validators.yaml).
     #[arg(long)]
     validators: PathBuf,
-    /// Path to the bootnode list (nodes.yaml).
+    /// Path to the bootnode list (e.g., nodes.yaml).
     #[arg(long)]
     bootnodes: PathBuf,
     /// Path to validator-config.yaml (validator name registry for metrics labels).
     #[arg(long)]
     validator_config: PathBuf,
-    /// Directory containing per-validator XMSS keys (hash-sig-keys/).
+    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
     #[arg(long)]
     hash_sig_keys_dir: PathBuf,
     #[arg(long, default_value = "9000")]
