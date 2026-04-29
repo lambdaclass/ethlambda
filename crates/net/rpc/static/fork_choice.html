@@ -72,9 +72,27 @@
       stroke-width: 1.5;
     }
 
-    .node-circle {
+    .node-outer {
+      fill: none;
       stroke-width: 2;
       cursor: pointer;
+    }
+
+    .node-inner {
+      stroke: none;
+      pointer-events: none;
+    }
+
+    .node-hit {
+      fill: transparent;
+      stroke: none;
+      cursor: pointer;
+    }
+
+    .fill-mask {
+      fill: #1a1a2e;
+      stroke: none;
+      pointer-events: none;
     }
 
     .node-label {
@@ -149,10 +167,11 @@
 
   <script>
     const POLL_INTERVAL = 2000;
-    const MARGIN = { top: 40, right: 60, bottom: 40, left: 80 };
-    const SLOT_HEIGHT = 50;
-    const MIN_RADIUS = 8;
-    const MAX_RADIUS = 30;
+    const MARGIN = { top: 40, right: 60, bottom: 140, left: 80 };
+    const SLOT_HEIGHT = 120;
+    const MAX_SLOT_HEIGHT = 200;
+    const NODE_RADIUS = 16;
+    const INNER_RADIUS = NODE_RADIUS - 3;
     const TRANSITION_DURATION = 500;
 
     const COLORS = {
@@ -193,15 +212,9 @@
       return COLORS.default;
     }
 
-    function nodeStroke(node, data) {
-      const color = nodeColor(node, data);
-      return d3.color(color).darker(0.5).toString();
-    }
-
-    function nodeRadius(node, validatorCount) {
-      if (!validatorCount || validatorCount === 0) return MIN_RADIUS;
-      const ratio = node.weight / validatorCount;
-      return MIN_RADIUS + ratio * (MAX_RADIUS - MIN_RADIUS);
+    function weightRatio(node, validatorCount) {
+      if (!validatorCount) return 0;
+      return Math.max(0, Math.min(1, node.weight / validatorCount));
     }
 
     function isGenesisParent(parentRoot) {
@@ -269,7 +282,12 @@
       const maxSlot = d3.max(allDescendants, d => d.data.slot);
       const slotRange = maxSlot - minSlot || 1;
 
-      const totalHeight = Math.max(slotRange * SLOT_HEIGHT, 200);
+      // Stretch toward the viewport for short chains (capped at MAX_SLOT_HEIGHT
+      // per slot); fall back to natural SLOT_HEIGHT for long chains (scrollable).
+      const containerHeight = Math.max(container.clientHeight - MARGIN.top - MARGIN.bottom, 200);
+      const naturalHeight = slotRange * SLOT_HEIGHT;
+      const cappedStretch = slotRange * MAX_SLOT_HEIGHT;
+      const totalHeight = Math.max(naturalHeight, Math.min(containerHeight, cappedStretch));
 
       allDescendants.forEach(d => {
         d.y = MARGIN.top + ((d.data.slot - minSlot) / slotRange) * totalHeight;
@@ -291,8 +309,7 @@
         x: d.x,
         y: d.y,
         _color: nodeColor(d.data, data),
-        _stroke: nodeStroke(d.data, data),
-        _radius: nodeRadius(d.data, data.validator_count)
+        _ratio: weightRatio(d.data, data.validator_count)
       }));
 
       const links = [];
@@ -317,18 +334,28 @@
       return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
     }
 
-    function showTooltip(event, d) {
-      tooltip.innerHTML =
-        `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
+    // Tracked so render() can refresh the tooltip on each poll without
+    // requiring the user to move the mouse.
+    let hoveredRoot = null;
+
+    function tooltipHtml(d, total) {
+      const pct = total ? parseFloat(((d.weight / total) * 100).toFixed(2)) : 0;
+      return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
         `<span class="tt-label">slot:</span> ${d.slot}<br>` +
         `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        `<span class="tt-label">weight:</span> ${d.weight}`;
+        `<span class="tt-label">weight:</span> ${d.weight}${total != null ? `/${total} (${pct}%)` : ''}`;
+    }
+
+    function showTooltip(event, d) {
+      hoveredRoot = d.root;
+      tooltip.innerHTML = tooltipHtml(d, currentData?.validator_count);
       tooltip.style.opacity = 1;
       tooltip.style.left = (event.clientX + 14) + "px";
       tooltip.style.top = (event.clientY - 14) + "px";
     }
 
     function hideTooltip() {
+      hoveredRoot = null;
       tooltip.style.opacity = 0;
     }
 
@@ -391,15 +418,19 @@
       const linksEnter = links.enter()
         .append("line")
         .attr("class", "link")
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y + NODE_RADIUS)
+        .attr("x2", d => d.source.x)
+        .attr("y2", d => d.source.y + NODE_RADIUS)
         .attr("opacity", 0);
 
       links.merge(linksEnter)
         .transition()
         .duration(TRANSITION_DURATION)
         .attr("x1", d => d.source.x)
-        .attr("y1", d => d.source.y)
+        .attr("y1", d => d.source.y + NODE_RADIUS)
         .attr("x2", d => d.target.x)
-        .attr("y2", d => d.target.y)
+        .attr("y2", d => d.target.y - NODE_RADIUS)
         .attr("opacity", 1);
 
       // Nodes
@@ -419,14 +450,30 @@
         .attr("opacity", 0);
 
       nodeEnter.append("circle")
-        .attr("class", "node-circle")
-        .attr("r", d => d._radius)
-        .attr("fill", d => d._color)
-        .attr("stroke", d => d._stroke);
+        .attr("class", "node-inner")
+        .attr("r", INNER_RADIUS)
+        .attr("fill", d => d._color);
+
+      nodeEnter.append("rect")
+        .attr("class", "fill-mask")
+        .attr("x", -INNER_RADIUS)
+        .attr("width", INNER_RADIUS * 2)
+        .attr("y", -INNER_RADIUS)
+        .attr("height", d => (1 - d._ratio) * INNER_RADIUS * 2);
+
+      nodeEnter.append("circle")
+        .attr("class", "node-outer")
+        .attr("r", NODE_RADIUS)
+        .attr("stroke", d => d._color);
+
+      // Invisible hit target so hover works regardless of fill level.
+      nodeEnter.append("circle")
+        .attr("class", "node-hit")
+        .attr("r", NODE_RADIUS);
 
       nodeEnter.append("text")
         .attr("class", "node-label")
-        .attr("dy", d => d._radius + 14)
+        .attr("dy", NODE_RADIUS + 14)
         .text(d => truncateRoot(d.root));
 
       const nodeMerged = nodeEnter.merge(nodeGroups);
@@ -442,16 +489,32 @@
         .attr("transform", d => `translate(${d.x},${d.y})`)
         .attr("opacity", 1);
 
-      nodeMerged.select("circle")
+      // Fill animates first, then color flips once the fill has settled.
+      nodeMerged.select(".fill-mask")
         .transition()
         .duration(TRANSITION_DURATION)
-        .attr("r", d => d._radius)
-        .attr("fill", d => d._color)
-        .attr("stroke", d => d._stroke);
+        .attr("height", d => (1 - d._ratio) * INNER_RADIUS * 2);
+
+      nodeMerged.select(".node-inner")
+        .transition()
+        .delay(TRANSITION_DURATION)
+        .duration(100)
+        .attr("fill", d => d._color);
+
+      nodeMerged.select(".node-outer")
+        .transition()
+        .delay(TRANSITION_DURATION)
+        .duration(100)
+        .attr("stroke", d => d._color);
 
       nodeMerged.select("text")
-        .attr("dy", d => d._radius + 14)
         .text(d => truncateRoot(d.root));
+
+      // Keep the tooltip live while the user holds the mouse still over a node.
+      if (hoveredRoot) {
+        const hovered = layout.nodes.find(n => n.root === hoveredRoot);
+        if (hovered) tooltip.innerHTML = tooltipHtml(hovered, data.validator_count);
+      }
 
       // Auto-scroll to head node
       const headNode = layout.nodes.find(n => n.root === data.head);
