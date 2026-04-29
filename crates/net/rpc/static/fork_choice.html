@@ -343,7 +343,7 @@
       return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
         `<span class="tt-label">slot:</span> ${d.slot}<br>` +
         `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        `<span class="tt-label">weight:</span> ${d.weight}/${total} (${pct}%)`;
+        `<span class="tt-label">weight:</span> ${d.weight}${total != null ? `/${total} (${pct}%)` : ''}`;
     }
 
     function showTooltip(event, d) {
