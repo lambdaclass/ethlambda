@@ -74,6 +74,15 @@ pub(crate) struct Behaviour {
 }
 
 /// Configuration for building the libp2p swarm.
+///
+/// INVARIANT: `is_aggregator` is consumed once during [`build_swarm`] to decide
+/// subnet subscriptions and is NOT stored on [`P2PServer`]. Runtime toggles
+/// of the aggregator role via the admin API (see
+/// [`ethlambda_types::aggregator::AggregatorController`]) intentionally do
+/// not resubscribe gossip subnets — this is the leanSpec PR #636 scope
+/// limitation ("hot-standby model"). If a runtime reader is ever added on
+/// the P2P side, it must consult the shared `AggregatorController` instead
+/// of a bool captured here, or the runtime toggle will silently diverge.
 pub struct SwarmConfig {
     pub node_key: Vec<u8>,
     pub bootnodes: Vec<Bootnode>,

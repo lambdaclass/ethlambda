@@ -1019,29 +1019,6 @@ impl Store {
             .extract_latest_attestations()
     }
 
-    /// Extract per-validator latest attestations from both known and new payloads.
-    pub fn extract_latest_all_attestations(&self) -> HashMap<u64, AttestationData> {
-        let mut result = self
-            .known_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations();
-        for (vid, data) in self
-            .new_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations()
-        {
-            let should_update = result
-                .get(&vid)
-                .is_none_or(|existing| existing.slot < data.slot);
-            if should_update {
-                result.insert(vid, data);
-            }
-        }
-        result
-    }
-
     // ============ Known Aggregated Payloads ============
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.

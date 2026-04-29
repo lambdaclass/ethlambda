@@ -1,19 +1,27 @@
 use std::net::SocketAddr;
 
-use axum::{Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
+use axum::{
+    Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
+};
 use ethlambda_storage::Store;
+use ethlambda_types::aggregator::AggregatorController;
 use ethlambda_types::primitives::H256;
 use libssz::SszEncode;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
+mod admin;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 
-pub async fn start_api_server(address: SocketAddr, store: Store) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store);
+pub async fn start_api_server(
+    address: SocketAddr,
+    store: Store,
+    aggregator: AggregatorController,
+) -> Result<(), std::io::Error> {
+    let api_router = build_api_router(store).layer(Extension(aggregator));
 
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, api_router).await?;
@@ -34,6 +42,10 @@ pub async fn start_metrics_server(address: SocketAddr) -> Result<(), std::io::Er
 }
 
 /// Build the API router with the given store.
+///
+/// The aggregator controller is threaded in via `Extension` by the caller
+/// (see `start_api_server`) so existing store-backed handlers don't need to
+/// know about it and admin handlers extract it independently.
 fn build_api_router(store: Store) -> Router {
     Router::new()
         .route("/lean/v0/health", get(metrics::get_health))
@@ -46,6 +58,10 @@ fn build_api_router(store: Store) -> Router {
         .route(
             "/lean/v0/fork_choice/ui",
             get(fork_choice::get_fork_choice_ui),
+        )
+        .route(
+            "/lean/v0/admin/aggregator",
+            get(admin::get_aggregator).post(admin::post_aggregator),
         )
         .with_state(store)
 }

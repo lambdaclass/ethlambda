@@ -52,9 +52,9 @@ jobs:
         id: lean-spec
         run: echo "commit=$(sed -n 's/^LEAN_SPEC_COMMIT_HASH:= *//p' Makefile)" >> $GITHUB_OUTPUT
 
-      - name: Cache test fixtures
+      - name: Restore test fixtures cache
         id: cache-fixtures
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v5
         with:
           path: leanSpec/fixtures
           key: leanspec-fixtures-${{ steps.lean-spec.outputs.commit }}
@@ -90,10 +90,10 @@ jobs:
           HASH=$(echo -n "$URL" | sha256sum | awk '{print $1}')
           echo "hash=$HASH" >> $GITHUB_OUTPUT
 
-      - name: Cache production keys
+      - name: Restore production keys cache
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         id: cache-prod-keys
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v5
         with:
           path: leanSpec/packages/testing/src/consensus_testing/test_keys/prod_scheme
           key: prod-keys-${{ steps.prod-keys-url.outputs.hash }}
@@ -103,10 +103,33 @@ jobs:
         working-directory: leanSpec
         run: uv run python -m consensus_testing.keys --download --scheme prod
 
+      # Save production keys even if a later step fails, so a re-run does
+      # not have to re-download. See: https://github.com/actions/cache/tree/main/save#always-save-cache
+      #
+      # `cache-hit == 'false'` (rather than `!= 'true'`) only matches when
+      # the restore step actually ran and missed: when fixtures were already
+      # cached, the restore was skipped and `cache-hit` is empty, so save
+      # is skipped too.
+      - name: Save production keys cache
+        if: always() && steps.cache-prod-keys.outputs.cache-hit == 'false'
+        uses: actions/cache/save@v5
+        with:
+          path: leanSpec/packages/testing/src/consensus_testing/test_keys/prod_scheme
+          key: ${{ steps.cache-prod-keys.outputs.cache-primary-key }}
+
       - name: Generate test fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         working-directory: leanSpec
         run: uv run fill --fork=Devnet --scheme prod -o fixtures -n 2
+
+      # Save fixtures even if a later step fails, so a re-run does not
+      # have to regenerate them. See: https://github.com/actions/cache/tree/main/save#always-save-cache
+      - name: Save test fixtures cache
+        if: always() && steps.cache-fixtures.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: leanSpec/fixtures
+          key: ${{ steps.cache-fixtures.outputs.cache-primary-key }}
 
       # Ensure make sees fixtures as up-to-date (its timestamp must be
       # newer than leanSpec/, which intermediate steps may have modified).

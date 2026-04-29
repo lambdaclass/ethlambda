@@ -20,8 +20,8 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    metrics,
+    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
@@ -101,6 +101,16 @@ fn update_head(store: &mut Store, log_tree: bool) {
 }
 
 /// Update the safe target for attestation.
+///
+/// Safe target is an *availability* signal, not a durable-knowledge signal:
+/// only the "new" pool is considered. Migration from "new" to "known" runs at
+/// interval 4, strictly after this computation at interval 3. 3sf-mini chose
+/// that ordering deliberately so safe target sees only freshly received votes
+/// from the current slot and ignores what was carried over from earlier slots
+/// (block-included attestations, previously migrated gossip, self-attestations).
+/// Counting "known" would let a node keep advancing its safe target on stale
+/// evidence even when live participation has collapsed: exactly the failure
+/// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
     let head_state = store.get_state(&store.head()).expect("head state exists");
     let num_validators = head_state.validators.len() as u64;
@@ -108,10 +118,7 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools (known + new).
-    // At interval 3 the promotion (interval 4) hasn't run yet, so we must
-    // merge both pools to get a complete view for safe target computation.
-    let attestations = store.extract_latest_all_attestations();
+    let attestations = store.extract_latest_new_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -128,7 +135,7 @@ fn update_safe_target(store: &mut Store) {
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
-///     5. A vote cannot be for a future slot.
+///     5. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -175,13 +182,16 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         });
     }
 
-    // Time Check - Validate attestation is not too far in the future.
-    // We allow a small margin for clock disparity (1 slot), but no further.
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
-    if data.slot > current_slot + 1 {
+    // Time Check - Honest validators emit votes only after their slot has begun.
+    // Allow a small disparity margin for clock skew between peers.
+    //
+    // The bound is in intervals, not slots: a whole-slot margin would let an
+    // adversary pre-publish next-slot aggregates ahead of any honest validator.
+    let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
+    if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            current_slot,
+            store_time: store.time(),
         });
     }
 
@@ -626,26 +636,15 @@ pub fn get_attestation_target_with_checkpoints(
 
 /// Produce attestation data for the given slot.
 ///
-/// The attestation source comes from the head state's justified checkpoint,
-/// not the store-wide global max. This ensures voting aligns with the block
-/// builder's attestation filter (which also uses head state).
+/// The source comes from the store's global `latest_justified` checkpoint.
+/// When the store's justified has advanced past the head state (a minority
+/// fork justified a slot the head chain hasn't seen yet), the next block
+/// produced on the head chain is expected to close the gap via the
+/// fixed-point attestation loop in `build_block`.
 ///
-/// See: <https://github.com/leanEthereum/leanSpec/pull/506>
+/// See: <https://github.com/leanEthereum/leanSpec/pull/595>
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_root = store.head();
-    let head_state = store.get_state(&head_root).expect("head state exists");
-
-    // Derive source from head state's justified checkpoint.
-    // At genesis the checkpoint root is H256::ZERO; substitute the real
-    // genesis block root so attestation validation can look it up.
-    let source = if head_state.latest_block_header.slot == 0 {
-        Checkpoint {
-            root: head_root,
-            slot: head_state.latest_justified.slot,
-        }
-    } else {
-        head_state.latest_justified
-    };
 
     let head_checkpoint = Checkpoint {
         root: head_root,
@@ -655,15 +654,13 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
             .slot,
     };
 
-    // Calculate the target checkpoint for this attestation
     let target_checkpoint = get_attestation_target(store);
 
-    // Construct attestation data
     AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source,
+        source: store.latest_justified(),
     }
 }
 
@@ -728,6 +725,19 @@ pub fn produce_block_with_signatures(
             &aggregated_payloads,
         )?
     };
+
+    // Invariant (leanSpec #595): the produced block must not lag the store's
+    // justified checkpoint. Otherwise peers processing this block would never
+    // see justification advance, degrading liveness: the fixed-point loop in
+    // `build_block` is expected to incorporate pool attestations that close
+    // any divergence inherited from a minority fork.
+    let store_justified_slot = store.latest_justified().slot;
+    if post_checkpoints.justified.slot < store_justified_slot {
+        return Err(StoreError::JustifiedDivergenceNotClosed {
+            block_justified_slot: post_checkpoints.justified.slot,
+            store_justified_slot,
+        });
+    }
 
     metrics::observe_block_aggregated_payloads(signatures.len());
 
@@ -795,11 +805,11 @@ pub enum StoreError {
     },
 
     #[error(
-        "Attestation slot {attestation_slot} is too far in future (current slot: {current_slot})"
+        "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
     )]
     AttestationTooFarInFuture {
         attestation_slot: u64,
-        current_slot: u64,
+        store_time: u64,
     },
 
     #[error(
@@ -832,6 +842,16 @@ pub enum StoreError {
 
     #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
     TooManyAttestationData { count: usize, max: usize },
+
+    #[error(
+        "Produced block justified slot {block_justified_slot} \
+         is behind store justified slot {store_justified_slot}; \
+         fixed-point attestation loop did not converge"
+    )]
+    JustifiedDivergenceNotClosed {
+        block_justified_slot: u64,
+        store_justified_slot: u64,
+    },
 }
 
 /// Compute the bitwise union (OR) of two AggregationBits bitfields.
@@ -1482,73 +1502,6 @@ mod tests {
             signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
-        );
-    }
-
-    /// Attestation source must come from the head state's justified checkpoint,
-    /// not the store-wide global max.
-    ///
-    /// When a non-head fork block advances store.latest_justified past
-    /// head_state.latest_justified, using the store value causes every
-    /// attestation to be rejected by the block builder (which filters
-    /// by head state), producing blocks with 0 attestations.
-    ///
-    /// See: <https://github.com/leanEthereum/leanSpec/pull/506>
-    #[test]
-    fn produce_attestation_data_uses_head_state_justified() {
-        use ethlambda_storage::backend::InMemoryBackend;
-        use std::sync::Arc;
-
-        // Create a store at genesis with 3 validators.
-        let genesis_state = State::from_genesis(1000, vec![]);
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: AggregatedAttestations::default(),
-            },
-        };
-        let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
-
-        let head_root = store.head();
-
-        // The head state's justified checkpoint is what the block builder
-        // filters attestations against. At genesis the root is H256::ZERO,
-        // so we apply the same correction used in produce_attestation_data.
-        let head_state = store.get_state(&head_root).expect("head state exists");
-        let head_justified = Checkpoint {
-            root: head_root,
-            slot: head_state.latest_justified.slot,
-        };
-
-        // Simulate a non-head fork advancing the store's global justified
-        // past what the head chain has seen.
-        let higher_justified = Checkpoint {
-            root: H256([0x99; 32]),
-            slot: 42,
-        };
-        store.update_checkpoints(ForkCheckpoints::new(
-            head_root,
-            Some(higher_justified),
-            None,
-        ));
-
-        // Precondition: the global max is strictly ahead of the head state.
-        assert!(
-            store.latest_justified().slot > head_justified.slot,
-            "store justified should be ahead of head state justified"
-        );
-
-        // Produce attestation data. The source must come from the head state
-        // (slot 0), not from the global max (slot 42).
-        let attestation = produce_attestation_data(&store, 1);
-
-        assert_eq!(
-            attestation.source, head_justified,
-            "source must match head state's justified checkpoint, not store-wide max"
         );
     }
 
