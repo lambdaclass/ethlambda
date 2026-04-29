@@ -66,9 +66,17 @@ pub(crate) struct PendingRequest {
 
 // --- Swarm construction ---
 
-/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify, Gossipsub
+/// and Request-Response Behaviours.
+///
+/// `identify` is registered purely for interop: go-libp2p (gean) gates gossipsub
+/// GRAFT on the identify exchange completing, so a peer that doesn't respond to
+/// `/ipfs/id/1.0.0` is silently excluded from the mesh. Events from this
+/// behaviour are intentionally not handled: the registration alone is enough
+/// to satisfy probing peers. ream and zeam follow the same pattern.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
+    identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<Codec>,
 }
@@ -150,16 +158,23 @@ pub fn build_swarm(
         Default::default(),
     );
 
+    let secret_key =
+        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
+    let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
+
+    // Use the same `protocol_version` string as zeam
+    let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+        "/ipfs/0.1.0".to_owned(),
+        identity.public(),
+    ));
+
     let behavior = Behaviour {
+        identify,
         gossipsub,
         req_resp,
     };
 
     // TODO: set peer scoring params
-
-    let secret_key =
-        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
-    let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
