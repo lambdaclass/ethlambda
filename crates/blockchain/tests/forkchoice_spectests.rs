@@ -22,13 +22,6 @@ mod common;
 mod types;
 
 /// List of skipped tests.
-///
-/// `test_safe_target_uses_merged_pools_at_interval_3`: encodes the pre-leanSpec-#680
-/// merged-pool behavior. PR #316 changed `update_safe_target` to consume only the
-/// `new` attestation pool, so this fixture's expectation (`safeTargetSlot=2`) no
-/// longer matches: with an empty `new` pool at interval 3 the safe target now
-/// collapses to the latest justified root (slot 0). Skip until
-/// `LEAN_SPEC_COMMIT_HASH` is bumped to a revision that retires this fixture.
 const SKIP_TESTS: &[&str] = &[];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
