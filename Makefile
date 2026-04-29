@@ -24,8 +24,8 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-28: bump for leanSpec PR #682 (validate_attestation future-slot bound).
-LEAN_SPEC_COMMIT_HASH:=62eff6e7e6041a283877a546a07cb3b83f4f7d5b
+# 2026-04-29
+LEAN_SPEC_COMMIT_HASH:=495c29d49f2b12b7cc240c4028e15d4253a7d54e
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
