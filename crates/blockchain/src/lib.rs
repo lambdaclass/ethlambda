@@ -330,30 +330,31 @@ impl BlockChainServer {
 
         // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();
-        let proposer_signature = match self
-            .key_manager
-            .sign_block_root(validator_id, slot as u32, &block_root)
-        {
-            Ok(sig) => sig,
-            Err(KeyManagerError::KeyNotPreparedForSlot {
-                role,
-                slot: target_slot,
-                ..
-            }) => {
-                self.prepare_key_for_slot(validator_id, role, target_slot, ctx);
-                metrics::inc_block_building_failures();
-                return;
-            }
-            Err(KeyManagerError::KeyUnavailable(_)) => {
-                metrics::inc_block_building_failures();
-                return;
-            }
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to sign block root");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
+        let proposer_signature =
+            match self
+                .key_manager
+                .sign_block_root(validator_id, slot as u32, &block_root)
+            {
+                Ok(sig) => sig,
+                Err(KeyManagerError::KeyNotPreparedForSlot {
+                    role,
+                    slot: target_slot,
+                    ..
+                }) => {
+                    self.prepare_key_for_slot(validator_id, role, target_slot, ctx);
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+                Err(KeyManagerError::KeyUnavailable(_)) => {
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to sign block root");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            };
 
         // Assemble SignedBlock
         let signed_block = SignedBlock {
@@ -817,4 +818,3 @@ impl Handler<KeyPreparedForSlot> for BlockChainServer {
         }
     }
 }
-
