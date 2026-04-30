@@ -199,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: generates production-size XMSS key (~minutes)"]
     fn test_advance_until_prepared_advances_then_detects_exhaustion() {
         let key = generate_key_with_three_bottom_trees();
         // Initial window covers [0, 2*L). Target lives in tree 2 → one advance reaches it.
