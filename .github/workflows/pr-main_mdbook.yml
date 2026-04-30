@@ -76,7 +76,15 @@ jobs:
       - name: Check links
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --no-progress --exclude 'localhost' --exclude '127\.0\.0\.1' docs/
+          # eprint.iacr.org returns 403 to non-browser User-Agents (anti-bot
+          # protection on the IACR preprint server); the URLs themselves are
+          # valid in a real browser.
+          args: >-
+            --no-progress
+            --exclude 'localhost'
+            --exclude '127\.0\.0\.1'
+            --exclude 'eprint\.iacr\.org'
+            docs/
           fail: true
 
   deploy:
