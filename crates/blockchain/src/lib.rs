@@ -403,22 +403,13 @@ impl BlockChainServer {
             KeyRole::Attestation => &mut key_pair.attestation_key,
             KeyRole::Proposal => &mut key_pair.proposal_key,
         };
-        let Some(mut key) = field.take() else { return };
+        let Some(key) = field.take() else { return };
 
         info!(%validator_id, ?role, %target_slot, "Preparing XMSS key for slot in background");
         let actor_ref = ctx.actor_ref().clone();
 
         tokio::task::spawn_blocking(move || {
-            let result = loop {
-                if key.is_prepared_for(target_slot) {
-                    break Some(key);
-                }
-                let before = key.get_prepared_interval();
-                key.advance_preparation();
-                if key.get_prepared_interval() == before {
-                    break None;
-                }
-            };
+            let result = key.advance_until_prepared(target_slot);
             let _ = actor_ref.send(KeyPreparedForSlot {
                 validator_id,
                 role,
@@ -826,3 +817,4 @@ impl Handler<KeyPreparedForSlot> for BlockChainServer {
         }
     }
 }
+
