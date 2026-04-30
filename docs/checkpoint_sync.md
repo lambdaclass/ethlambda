@@ -6,14 +6,18 @@ Checkpoint sync allows a new consensus node to skip replaying the entire chain f
 
 ## Usage
 
-Checkpoint sync still requires a full network config directory (`--custom-network-config-dir`). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.
+Checkpoint sync still requires the network config files (genesis, validators, bootnodes, etc.). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.
 
 Pass the `--checkpoint-sync-url` flag when starting ethlambda:
 
 ```bash
 ethlambda \
   --checkpoint-sync-url <URL> \
-  --custom-network-config-dir ./network-config \
+  --genesis ./network-config/config.yaml \
+  --validators ./network-config/annotated_validators.yaml \
+  --bootnodes ./network-config/nodes.yaml \
+  --validator-config ./network-config/validator-config.yaml \
+  --hash-sig-keys-dir ./network-config/hash-sig-keys \
   --node-key ./node.key \
   --node-id ethlambda_0
 ```
