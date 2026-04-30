@@ -25,7 +25,7 @@ docker-build: ## 🐳 Build the Docker image
 	@echo
 
 # 2026-04-29
-LEAN_SPEC_COMMIT_HASH:=495c29d49f2b12b7cc240c4028e15d4253a7d54e
+LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
