@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test
+.PHONY: help fmt lint docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -24,8 +24,8 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-28: bump for leanSpec PR #682 (validate_attestation future-slot bound).
-LEAN_SPEC_COMMIT_HASH:=62eff6e7e6041a283877a546a07cb3b83f4f7d5b
+# 2026-04-29
+LEAN_SPEC_COMMIT_HASH:=495c29d49f2b12b7cc240c4028e15d4253a7d54e
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
@@ -48,3 +48,13 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
 	@cd lean-quickstart \
 		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
+
+docs-deps: ## 📦 Install dependencies for generating the documentation
+	cargo install --version 0.5.2 mdbook
+	cargo install --version 0.12.0 mdbook-linkcheck2
+
+docs: ## 📚 Generate the documentation site under ./book
+	mdbook build
+
+docs-serve: ## 📖 Serve the documentation locally with live reload
+	mdbook serve --open
