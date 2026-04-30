@@ -5,15 +5,28 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
-use tracing::info;
 
 use crate::metrics;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyRole {
+    Attestation,
+    Proposal,
+}
 
 /// Error types for KeyManager operations.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyManagerError {
     #[error("Validator key not found for validator_id: {0}")]
     ValidatorKeyNotFound(u64),
+    #[error("Key unavailable for validator {0}")]
+    KeyUnavailable(u64),
+    #[error("Key not prepared for slot {slot} (validator {validator_id}, {role:?})")]
+    KeyNotPreparedForSlot {
+        validator_id: u64,
+        role: KeyRole,
+        slot: u32,
+    },
     #[error("Signing error: {0}")]
     SigningError(String),
     #[error("Signature conversion error: {0}")]
@@ -26,8 +39,8 @@ pub enum KeyManagerError {
 /// allowing the validator to sign both an attestation and a block proposal
 /// within the same slot.
 pub struct ValidatorKeyPair {
-    pub attestation_key: ValidatorSecretKey,
-    pub proposal_key: ValidatorSecretKey,
+    pub attestation_key: Option<ValidatorSecretKey>,
+    pub proposal_key: Option<ValidatorSecretKey>,
 }
 
 /// Manages validator secret keys for signing attestations and block proposals.
@@ -35,7 +48,7 @@ pub struct ValidatorKeyPair {
 /// Each validator has two independent XMSS keys: one for attestation signing
 /// and one for block proposal signing.
 pub struct KeyManager {
-    keys: HashMap<u64, ValidatorKeyPair>,
+    pub(crate) keys: HashMap<u64, ValidatorKeyPair>,
 }
 
 impl KeyManager {
@@ -79,29 +92,22 @@ impl KeyManager {
             .keys
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
+        let key = key_pair
+            .attestation_key
+            .as_ref()
+            .ok_or(KeyManagerError::KeyUnavailable(validator_id))?;
 
-        // Advance XMSS key preparation window if the slot is outside the current window.
-        // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
-        // Multiple advances may be needed if the node was offline for an extended period.
-        if !key_pair.attestation_key.is_prepared_for(slot) {
-            info!(validator_id, slot, "Advancing XMSS key preparation window");
-            while !key_pair.attestation_key.is_prepared_for(slot) {
-                let before = key_pair.attestation_key.get_prepared_interval();
-                key_pair.attestation_key.advance_preparation();
-                if key_pair.attestation_key.get_prepared_interval() == before {
-                    return Err(KeyManagerError::SigningError(format!(
-                        "XMSS key exhausted for validator {validator_id}: \
-                         slot {slot} is beyond the key's activation interval"
-                    )));
-                }
-            }
+        if !key.is_prepared_for(slot) {
+            return Err(KeyManagerError::KeyNotPreparedForSlot {
+                validator_id,
+                role: KeyRole::Attestation,
+                slot,
+            });
         }
 
         let signature: ValidatorSignature = {
             let _timing = metrics::time_pq_sig_attestation_signing();
-            key_pair
-                .attestation_key
-                .sign(slot, message)
+            key.sign(slot, message)
                 .map_err(|e| KeyManagerError::SigningError(e.to_string()))
         }?;
         metrics::inc_pq_sig_attestation_signatures();
@@ -121,29 +127,20 @@ impl KeyManager {
             .keys
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
+        let key = key_pair
+            .proposal_key
+            .as_ref()
+            .ok_or(KeyManagerError::KeyUnavailable(validator_id))?;
 
-        // Advance XMSS key preparation window if the slot is outside the current window.
-        // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
-        // Multiple advances may be needed if the node was offline for an extended period.
-        if !key_pair.proposal_key.is_prepared_for(slot) {
-            info!(
+        if !key.is_prepared_for(slot) {
+            return Err(KeyManagerError::KeyNotPreparedForSlot {
                 validator_id,
-                slot, "Advancing XMSS proposal key preparation window"
-            );
-            while !key_pair.proposal_key.is_prepared_for(slot) {
-                let before = key_pair.proposal_key.get_prepared_interval();
-                key_pair.proposal_key.advance_preparation();
-                if key_pair.proposal_key.get_prepared_interval() == before {
-                    return Err(KeyManagerError::SigningError(format!(
-                        "XMSS proposal key exhausted for validator {validator_id}: \
-                         slot {slot} is beyond the key's activation interval"
-                    )));
-                }
-            }
+                role: KeyRole::Proposal,
+                slot,
+            });
         }
 
-        let signature: ValidatorSignature = key_pair
-            .proposal_key
+        let signature: ValidatorSignature = key
             .sign(slot, message)
             .map_err(|e| KeyManagerError::SigningError(e.to_string()))?;
 
@@ -187,6 +184,28 @@ mod tests {
         assert!(matches!(
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))
+        ));
+    }
+
+    #[test]
+    fn test_sign_returns_key_unavailable_when_field_is_none() {
+        let mut keys = HashMap::new();
+        keys.insert(
+            0,
+            ValidatorKeyPair {
+                attestation_key: None,
+                proposal_key: None,
+            },
+        );
+        let mut key_manager = KeyManager::new(keys);
+
+        assert!(matches!(
+            key_manager.sign_with_attestation_key(0, 0, &H256::default()),
+            Err(KeyManagerError::KeyUnavailable(0)),
+        ));
+        assert!(matches!(
+            key_manager.sign_with_proposal_key(0, 0, &H256::default()),
+            Err(KeyManagerError::KeyUnavailable(0)),
         ));
     }
 }
