@@ -191,18 +191,22 @@ impl PayloadBuffer {
     }
 
     /// Take all entries, leaving the buffer empty.
+    ///
+    /// Drains in insertion order (via `self.order`) so downstream consumers
+    /// like `promote_new_aggregated_payloads` re-insert into known_payloads
+    /// deterministically. HashMap iteration would be RandomState-seeded and
+    /// produce non-deterministic vote ordering for same-slot equivocation.
     fn drain(&mut self) -> Vec<(HashedAttestationData, AggregatedSignatureProof)> {
-        self.order.clear();
         self.total_proofs = 0;
-        self.data
-            .drain()
-            .flat_map(|(_, entry)| {
-                entry
-                    .proofs
-                    .into_iter()
-                    .map(move |proof| (HashedAttestationData::new(entry.data.clone()), proof))
-            })
-            .collect()
+        let mut result = Vec::with_capacity(self.data.values().map(|e| e.proofs.len()).sum());
+        while let Some(data_root) = self.order.pop_front() {
+            if let Some(entry) = self.data.remove(&data_root) {
+                for proof in entry.proofs {
+                    result.push((HashedAttestationData::new(entry.data.clone()), proof));
+                }
+            }
+        }
+        result
     }
 
     /// Return the number of distinct attestation messages in the buffer.
@@ -231,9 +235,19 @@ impl PayloadBuffer {
     }
 
     /// Extract per-validator latest attestations from proofs' participation bits.
+    ///
+    /// Iterates entries in insertion order (via `self.order`) so that, when two
+    /// aggregations carry the same `slot` but disagree on the target (an
+    /// equivocation by the shared validators), the first-observed aggregation
+    /// wins. The ethrex spec relies on Python dict insertion-order semantics
+    /// here; iterating `self.data.values()` would be RandomState-seeded and
+    /// fail the equivocation fork-choice tests non-deterministically.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
-        for entry in self.data.values() {
+        for data_root in &self.order {
+            let Some(entry) = self.data.get(data_root) else {
+                continue;
+            };
             for proof in &entry.proofs {
                 for vid in proof.participant_indices() {
                     let should_update = result
@@ -1993,6 +2007,94 @@ mod tests {
         assert!(!buf.data.contains_key(&root_a));
         assert!(buf.data.contains_key(&root_c));
         assert_eq!(buf.total_proofs, 2);
+    }
+
+    /// Build an attestation message at `slot` whose target points at `target_root`,
+    /// distinct from the default zero target so two such datas have different roots.
+    fn make_att_data_for_target(slot: u64, target_root: H256) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                root: target_root,
+                slot,
+            },
+            source: Checkpoint::default(),
+        }
+    }
+
+    /// When two aggregations share `slot` but disagree on the target
+    /// (same-slot equivocation), the *first inserted* aggregation must win for
+    /// the validators that participate in both. The fork-choice spec test
+    /// `test_same_slot_equivocating_attesters_count_once` depends on this.
+    /// HashMap iteration would make this RandomState-seeded and flaky.
+    #[test]
+    fn extract_latest_attestations_first_inserted_wins_on_slot_tie() {
+        let target_a = H256([0xaa; 32]);
+        let target_b = H256([0xbb; 32]);
+        let data_a = make_att_data_for_target(3, target_a);
+        let data_b = make_att_data_for_target(3, target_b);
+        assert_ne!(data_a.hash_tree_root(), data_b.hash_tree_root());
+
+        // Order 1: A then B → validators 0,1 (in both) must see A.
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(
+            HashedAttestationData::new(data_a.clone()),
+            make_proof_for_validators(&[0, 1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_b.clone()),
+            make_proof_for_validators(&[0, 1, 3, 4]),
+        );
+        let extracted = buf.extract_latest_attestations();
+        assert_eq!(extracted[&0].target.root, target_a);
+        assert_eq!(extracted[&1].target.root, target_a);
+        assert_eq!(extracted[&2].target.root, target_a);
+        assert_eq!(extracted[&3].target.root, target_b);
+        assert_eq!(extracted[&4].target.root, target_b);
+
+        // Order 2: B then A → validators 0,1 must now see B.
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(
+            HashedAttestationData::new(data_b),
+            make_proof_for_validators(&[0, 1, 3, 4]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_a),
+            make_proof_for_validators(&[0, 1, 2]),
+        );
+        let extracted = buf.extract_latest_attestations();
+        assert_eq!(extracted[&0].target.root, target_b);
+        assert_eq!(extracted[&1].target.root, target_b);
+        assert_eq!(extracted[&2].target.root, target_a);
+        assert_eq!(extracted[&3].target.root, target_b);
+        assert_eq!(extracted[&4].target.root, target_b);
+    }
+
+    /// `drain` must hand back entries in insertion order so that
+    /// `promote_new_aggregated_payloads` lands them in known_payloads in the
+    /// same order, preserving same-slot equivocation semantics through the
+    /// new → known migration.
+    #[test]
+    fn drain_preserves_insertion_order() {
+        let target_a = H256([0xaa; 32]);
+        let target_b = H256([0xbb; 32]);
+        let target_c = H256([0xcc; 32]);
+        let data_a = make_att_data_for_target(1, target_a);
+        let data_b = make_att_data_for_target(2, target_b);
+        let data_c = make_att_data_for_target(3, target_c);
+
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(HashedAttestationData::new(data_a), make_proof());
+        buf.push(HashedAttestationData::new(data_b), make_proof());
+        buf.push(HashedAttestationData::new(data_c), make_proof());
+
+        let drained = buf.drain();
+        let slots: Vec<u64> = drained.iter().map(|(h, _)| h.data().slot).collect();
+        assert_eq!(slots, vec![1, 2, 3]);
+        assert!(buf.data.is_empty());
+        assert!(buf.order.is_empty());
+        assert_eq!(buf.total_proofs, 0);
     }
 
     // ============ GossipSignatureBuffer Tests ============
