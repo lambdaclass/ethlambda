@@ -9,13 +9,11 @@ on:
     paths:
       - "docs/**"
       - "book.toml"
-      - "Makefile"
       - ".github/workflows/pr-main_mdbook.yml"
   pull_request:
     paths:
       - "docs/**"
       - "book.toml"
-      - "Makefile"
       - ".github/workflows/pr-main_mdbook.yml"
   workflow_dispatch:
 
