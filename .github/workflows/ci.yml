@@ -120,7 +120,7 @@ jobs:
       - name: Generate test fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         working-directory: leanSpec
-        run: uv run fill --fork=Devnet --scheme prod -o fixtures -n 2
+        run: uv run fill --fork=Devnet --scheme prod -o fixtures -n auto
 
       # Save fixtures even if a later step fails, so a re-run does not
       # have to regenerate them. See: https://github.com/actions/cache/tree/main/save#always-save-cache
