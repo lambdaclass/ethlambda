@@ -1,3 +1,5 @@
+# Modeled on ethrex's mdbook publish workflow:
+# https://github.com/lambdaclass/ethrex/blob/728dc7ded560c665ab1ff2cf7f3eeb197b5bc40f/.github/workflows/pr-main_mdbook.yml
 name: Publish ethlambda docs to GitHub Pages
 
 on:
@@ -7,23 +9,28 @@ on:
     paths:
       - "docs/**"
       - "book.toml"
+      - "Makefile"
       - ".github/workflows/pr-main_mdbook.yml"
   pull_request:
     paths:
       - "docs/**"
       - "book.toml"
+      - "Makefile"
       - ".github/workflows/pr-main_mdbook.yml"
   workflow_dispatch:
 
+# Default to least privilege; only the deploy job upgrades to write to push the
+# gh-pages branch.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{ github.workflow }}-build-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v6
 
@@ -79,8 +86,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     if: ${{ github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: write
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{ github.workflow }}-deploy-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Download docs artifact
         uses: actions/download-artifact@v4
