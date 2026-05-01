@@ -20,7 +20,7 @@ use std::{
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -141,7 +141,7 @@ async fn main() -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
-    populate_name_registry(&validator_config);
+    let node_names = load_node_names(&validator_config);
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
@@ -187,7 +187,7 @@ async fn main() -> eyre::Result<()> {
     })
     .expect("failed to build swarm");
 
-    let p2p = P2P::spawn(built, store.clone());
+    let p2p = P2P::spawn(built, store.clone(), node_names);
 
     // Wire actors together via protocol refs
     blockchain
@@ -223,7 +223,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn populate_name_registry(validator_config: impl AsRef<Path>) {
+fn load_node_names(validator_config: impl AsRef<Path>) -> HashMap<PeerId, String> {
     #[derive(Deserialize)]
     struct Validator {
         name: String,
@@ -244,8 +244,9 @@ fn populate_name_registry(validator_config: impl AsRef<Path>) {
         .map(|v| (v.name, v.privkey))
         .collect();
 
-    // Populates a dictionary used for labeling metrics with node names
-    ethlambda_p2p::metrics::populate_name_registry(names_and_privkeys);
+    let names = ethlambda_p2p::derive_peer_ids(names_and_privkeys);
+    info!(count = names.len(), "Loaded node-name registry");
+    names
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
