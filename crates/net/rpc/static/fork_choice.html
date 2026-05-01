@@ -56,6 +56,31 @@
     .value-finalized { color: #4caf50; }
     .value-validators { color: #e0e0e0; }
 
+    #legend {
+      display: flex;
+      gap: 12px;
+      margin-left: auto;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
     #chart-container {
       flex: 1;
       overflow: auto;
@@ -156,6 +181,12 @@
     <div class="item">
       <span class="label">Validators</span>
       <span class="value value-validators" id="validator-count">--</span>
+    </div>
+    <div id="legend" aria-label="Block color legend">
+      <div class="legend-item"><span class="legend-swatch" style="background: #4caf50;"></span>Finalized</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #2196f3;"></span>Justified</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ffeb3b;"></span>Safe target</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ff9800;"></span>Head</div>
     </div>
   </div>
 
