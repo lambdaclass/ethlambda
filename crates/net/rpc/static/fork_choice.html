@@ -347,13 +347,19 @@
 
     function tooltipHtml(d, data) {
       const isFinalized = d.slot <= data.finalized.slot;
-      const weightLine = isFinalized
-        ? `<span class="tt-label">status:</span> finalized`
-        : `<span class="tt-label">weight:</span> ${d.weight}`;
+      let lastLine;
+      if (isFinalized) {
+        lastLine = `<span class="tt-label">status:</span> finalized`;
+      } else {
+        const total = data.validator_count;
+        const pct = total ? parseFloat(((d.weight / total) * 100).toFixed(2)) : 0;
+        const suffix = total != null ? `/${total} (${pct}%)` : "";
+        lastLine = `<span class="tt-label">weight:</span> ${d.weight}${suffix}`;
+      }
       return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
         `<span class="tt-label">slot:</span> ${d.slot}<br>` +
         `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        weightLine;
+        lastLine;
     }
 
     function showTooltip(event, d, data) {
@@ -474,7 +480,7 @@
       nodeEnter.append("circle")
         .attr("class", "node-outer")
         .attr("r", NODE_RADIUS)
-        .attr("stroke", d => d._color);
+        .attr("stroke", d => d._stroke);
 
       // Invisible hit target so hover works regardless of fill level.
       nodeEnter.append("circle")
@@ -515,7 +521,7 @@
         .transition()
         .delay(TRANSITION_DURATION)
         .duration(100)
-        .attr("stroke", d => d._color);
+        .attr("stroke", d => d._stroke);
 
       nodeMerged.select("text")
         .text(d => truncateRoot(d.root));
