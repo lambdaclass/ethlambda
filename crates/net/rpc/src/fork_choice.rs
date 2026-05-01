@@ -30,26 +30,41 @@ pub struct ForkChoiceNode {
 pub async fn get_fork_choice(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let blocks = store.get_live_chain();
+    use axum::http::StatusCode;
+
+    macro_rules! try_store {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(%e, "Storage error in fork_choice handler");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        };
+    }
+
+    let blocks = try_store!(store.get_live_chain());
     let attestations = store.extract_latest_known_attestations();
 
-    let justified = store.latest_justified();
-    let finalized = store.latest_finalized();
+    let justified = try_store!(store.latest_justified());
+    let finalized = try_store!(store.latest_finalized());
     let start_slot = finalized.slot;
 
     let weights = ethlambda_fork_choice::compute_block_weights(start_slot, &blocks, &attestations);
 
-    let head = store.head();
-    let safe_target = store.safe_target();
+    let head = try_store!(store.head());
+    let safe_target = try_store!(store.safe_target());
 
-    let head_state = store.head_state();
-    let validator_count = head_state.validators.len() as u64;
+    let validator_count = try_store!(store.head_state()).validators.len() as u64;
 
     let nodes: Vec<ForkChoiceNode> = blocks
         .iter()
         .map(|(root, &(slot, parent_root))| {
             let proposer_index = store
                 .get_block_header(root)
+                .ok()
+                .flatten()
                 .map(|h| h.proposer_index)
                 .unwrap_or(0);
 
@@ -106,7 +121,7 @@ mod tests {
     async fn test_get_fork_choice_returns_json() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state).unwrap();
 
         let app = build_test_router(store);
 
@@ -143,7 +158,7 @@ mod tests {
     async fn test_get_fork_choice_ui_returns_html() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state).unwrap();
 
         let app = build_test_router(store);
 

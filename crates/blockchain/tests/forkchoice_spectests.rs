@@ -48,7 +48,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let anchor_block: Block = test.anchor_block.into();
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
+        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block).unwrap();
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
@@ -193,7 +193,7 @@ fn validate_checks(
     // Validate time check: fixtures encode the expected store time in intervals
     // since genesis (matching `Store::time()`).
     if let Some(expected_time) = checks.time {
-        let actual_time = st.time();
+        let actual_time = st.time().unwrap();
         if actual_time != expected_time {
             return Err(format!(
                 "Step {}: time mismatch: expected {}, got {}",
@@ -229,7 +229,7 @@ fn validate_checks(
     });
     // Validate attestationTargetSlot
     if let Some(expected_slot) = checks.attestation_target_slot {
-        let target = store::get_attestation_target(st);
+        let target = store::get_attestation_target(st).unwrap();
         if target.slot != expected_slot {
             return Err(format!(
                 "Step {}: attestationTargetSlot mismatch: expected {}, got {}",
@@ -239,7 +239,7 @@ fn validate_checks(
         }
 
         // Also validate the root matches a block at this slot
-        let blocks = st.get_live_chain();
+        let blocks = st.get_live_chain().unwrap();
         let block_found = blocks
             .iter()
             .any(|(root, (slot, _))| *slot == expected_slot && *root == target.root);
@@ -260,10 +260,11 @@ fn validate_checks(
 
     // Validate headSlot
     if let Some(expected_slot) = checks.head_slot {
-        let head_root = st.head();
+        let head_root = st.head().unwrap();
         let head_header = st
             .get_block_header(&head_root)
-            .ok_or_else(|| format!("Step {}: head block not found", step_idx))?;
+            .map_err(|e| format!("Step {step_idx}: DB error reading head block: {e}"))?
+            .ok_or_else(|| format!("Step {step_idx}: head block not found"))?;
         if head_header.slot != expected_slot {
             return Err(format!(
                 "Step {}: headSlot mismatch: expected {}, got {}",
@@ -275,7 +276,7 @@ fn validate_checks(
 
     // Validate headRoot (resolved from headRootLabel if headRoot not provided)
     if let Some(ref expected_root) = resolved_head_root {
-        let head_root = st.head();
+        let head_root = st.head().unwrap();
         if head_root != *expected_root {
             return Err(format!(
                 "Step {}: headRoot mismatch: expected {:?}, got {:?}",
@@ -287,7 +288,7 @@ fn validate_checks(
 
     // Validate latestJustifiedSlot
     if let Some(expected_slot) = checks.latest_justified_slot {
-        let justified = st.latest_justified();
+        let justified = st.latest_justified().unwrap();
         if justified.slot != expected_slot {
             return Err(format!(
                 "Step {}: latestJustifiedSlot mismatch: expected {}, got {}",
@@ -299,7 +300,7 @@ fn validate_checks(
 
     // Validate latestJustifiedRoot (resolved from label if root not provided)
     if let Some(ref expected_root) = resolved_justified_root {
-        let justified = st.latest_justified();
+        let justified = st.latest_justified().unwrap();
         if justified.root != *expected_root {
             return Err(format!(
                 "Step {}: latestJustifiedRoot mismatch: expected {:?}, got {:?}",
@@ -311,7 +312,7 @@ fn validate_checks(
 
     // Validate latestFinalizedSlot
     if let Some(expected_slot) = checks.latest_finalized_slot {
-        let finalized = st.latest_finalized();
+        let finalized = st.latest_finalized().unwrap();
         if finalized.slot != expected_slot {
             return Err(format!(
                 "Step {}: latestFinalizedSlot mismatch: expected {}, got {}",
@@ -323,7 +324,7 @@ fn validate_checks(
 
     // Validate latestFinalizedRoot (resolved from label if root not provided)
     if let Some(ref expected_root) = resolved_finalized_root {
-        let finalized = st.latest_finalized();
+        let finalized = st.latest_finalized().unwrap();
         if finalized.root != *expected_root {
             return Err(format!(
                 "Step {}: latestFinalizedRoot mismatch: expected {:?}, got {:?}",
@@ -461,7 +462,7 @@ fn validate_lexicographic_head_among(
         .into());
     }
 
-    let blocks = st.get_live_chain();
+    let blocks = st.get_live_chain().unwrap();
     let known_attestations: HashMap<u64, AttestationData> = st.extract_latest_known_attestations();
 
     // Resolve all fork labels to roots and compute their weights
@@ -537,7 +538,7 @@ fn validate_lexicographic_head_among(
         .expect("fork_data is not empty");
 
     // Verify the current head matches the lexicographically highest root
-    let actual_head_root = st.head();
+    let actual_head_root = st.head().unwrap();
     if actual_head_root != expected_head_root {
         let highest_label = fork_data
             .iter()

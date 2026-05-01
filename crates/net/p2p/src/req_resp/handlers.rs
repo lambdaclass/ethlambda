@@ -127,10 +127,11 @@ async fn handle_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        if let Some(signed_block) = server.store.get_signed_block(root) {
-            blocks.push(signed_block);
+        match server.store.get_signed_block(root) {
+            Ok(Some(signed_block)) => blocks.push(signed_block),
+            Ok(None) => {} // missing blocks are skipped per spec
+            Err(e) => warn!(%root, %e, "DB error fetching block by root"),
         }
-        // Missing blocks are silently skipped (per spec)
     }
 
     let found = blocks.len();
@@ -189,12 +190,14 @@ async fn handle_blocks_by_root_response(
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
+    let finalized = store.latest_finalized().unwrap_or_default();
+    let head_root = store.head().unwrap_or_default();
     let head_slot = store
         .get_block_header(&head_root)
-        .expect("head block exists")
-        .slot;
+        .ok()
+        .flatten()
+        .map(|h| h.slot)
+        .unwrap_or(0);
     Status {
         finalized,
         head: Checkpoint {

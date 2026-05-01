@@ -169,7 +169,8 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone())
+        .expect("failed to spawn blockchain actor");
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
     // AggregatorController — subnet subscriptions are decided once here and
@@ -458,7 +459,8 @@ async fn fetch_initial_state(
     let Some(checkpoint_url) = checkpoint_url else {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+        return Store::from_anchor_state(backend, genesis_state)
+            .map_err(checkpoint_sync::CheckpointSyncError::from);
     };
 
     // Checkpoint sync path
@@ -476,5 +478,6 @@ async fn fetch_initial_state(
     );
 
     // Store the anchor state and header, without body
-    Ok(Store::from_anchor_state(backend, state))
+    Store::from_anchor_state(backend, state)
+        .map_err(checkpoint_sync::CheckpointSyncError::from)
 }
