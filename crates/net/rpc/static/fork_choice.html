@@ -237,11 +237,6 @@
       return roles;
     }
 
-    function nodeColor(node, data) {
-      const [primary] = nodeRoles(node, data);
-      return primary ? COLORS[primary] : COLORS.default;
-    }
-
     function weightRatio(node, validatorCount) {
       if (!validatorCount) return 0;
       return Math.max(0, Math.min(1, node.weight / validatorCount));
@@ -340,7 +335,7 @@
           ...d.data,
           x: d.x,
           y: d.y,
-          _color: nodeColor(d.data, data),
+          _color: roles.length > 0 ? COLORS[roles[0]] : COLORS.default,
           _ratio: weightRatio(d.data, data.validator_count),
           // Colors of secondary roles, in priority order (after the primary).
           _haloColors: roles.slice(1).map(r => COLORS[r])
@@ -532,10 +527,12 @@
           .attr("stroke", d => d._haloColors[i] || "transparent");
       });
 
-      // Invisible hit target so hover works regardless of fill level.
+      // Invisible hit target so hover works regardless of fill level. Sized to
+      // cover the outermost halo so the cursor still triggers the tooltip when
+      // it sits between rings.
       nodeEnter.append("circle")
         .attr("class", "node-hit")
-        .attr("r", NODE_RADIUS);
+        .attr("r", NODE_RADIUS + MAX_HALO_OFFSET);
 
       nodeEnter.append("text")
         .attr("class", "node-label")
@@ -575,6 +572,9 @@
 
       HALO_OFFSETS.forEach((_, i) => {
         nodeMerged.select(`.halo-${i}`)
+          .transition()
+          .delay(TRANSITION_DURATION)
+          .duration(100)
           .attr("stroke", d => d._haloColors[i] || "transparent");
       });
 
