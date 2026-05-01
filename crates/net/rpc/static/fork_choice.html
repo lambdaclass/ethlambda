@@ -188,6 +188,7 @@
 
     let svg, gLinks, gNodes, gAxis;
     let currentData = null;
+    let hoveredRoot = null;
 
     function initSVG() {
       svg = d3.select("#chart-container")
@@ -212,8 +213,17 @@
       return COLORS.default;
     }
 
-    function weightRatio(node, validatorCount) {
-      if (!validatorCount) return 0;
+    function nodeStroke(node, data) {
+      const color = nodeColor(node, data);
+      return d3.color(color).darker(0.5).toString();
+    }
+
+    function nodeRatio(node, data) {
+      // Finalized blocks have full support by definition — fill completely
+      // rather than scaling by fork-choice weight (which is 0 at the root).
+      if (node.slot <= data.finalized.slot) return 1;
+      const validatorCount = data.validator_count;
+      if (!validatorCount || validatorCount === 0) return 0;
       return Math.max(0, Math.min(1, node.weight / validatorCount));
     }
 
@@ -309,7 +319,8 @@
         x: d.x,
         y: d.y,
         _color: nodeColor(d.data, data),
-        _ratio: weightRatio(d.data, data.validator_count)
+        _stroke: nodeStroke(d.data, data),
+        _ratio: nodeRatio(d.data, data)
       }));
 
       const links = [];
@@ -334,21 +345,20 @@
       return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
     }
 
-    // Tracked so render() can refresh the tooltip on each poll without
-    // requiring the user to move the mouse.
-    let hoveredRoot = null;
-
-    function tooltipHtml(d, total) {
-      const pct = total ? parseFloat(((d.weight / total) * 100).toFixed(2)) : 0;
+    function tooltipHtml(d, data) {
+      const isFinalized = d.slot <= data.finalized.slot;
+      const weightLine = isFinalized
+        ? `<span class="tt-label">status:</span> finalized`
+        : `<span class="tt-label">weight:</span> ${d.weight}`;
       return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
         `<span class="tt-label">slot:</span> ${d.slot}<br>` +
         `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        `<span class="tt-label">weight:</span> ${d.weight}${total != null ? `/${total} (${pct}%)` : ''}`;
+        weightLine;
     }
 
-    function showTooltip(event, d) {
+    function showTooltip(event, d, data) {
       hoveredRoot = d.root;
-      tooltip.innerHTML = tooltipHtml(d, currentData?.validator_count);
+      tooltip.innerHTML = tooltipHtml(d, data);
       tooltip.style.opacity = 1;
       tooltip.style.left = (event.clientX + 14) + "px";
       tooltip.style.top = (event.clientY - 14) + "px";
@@ -479,8 +489,8 @@
       const nodeMerged = nodeEnter.merge(nodeGroups);
 
       nodeMerged
-        .on("mouseover", function (event, d) { showTooltip(event, d); })
-        .on("mousemove", function (event, d) { showTooltip(event, d); })
+        .on("mouseover", function (event, d) { showTooltip(event, d, data); })
+        .on("mousemove", function (event, d) { showTooltip(event, d, data); })
         .on("mouseout", hideTooltip);
 
       nodeMerged
@@ -513,7 +523,7 @@
       // Keep the tooltip live while the user holds the mouse still over a node.
       if (hoveredRoot) {
         const hovered = layout.nodes.find(n => n.root === hoveredRoot);
-        if (hovered) tooltip.innerHTML = tooltipHtml(hovered, data.validator_count);
+        if (hovered) tooltip.innerHTML = tooltipHtml(hovered, data);
       }
 
       // Auto-scroll to head node
