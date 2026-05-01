@@ -518,3 +518,96 @@ async fn fetch_initial_state(
     // Store the anchor state and header, without body
     Ok(Store::from_anchor_state(backend, state))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
+    /// (devnet-4) where networks share a non-default committee count.
+    const VC_WITH_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: ansible
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+  attestation_committee_count: 2
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 9095
+    apiPort: 5055
+    subnet: 0
+    isAggregator: false
+    count: 1
+"#;
+
+    /// Local-devnet snippet without the optional field — committee count is
+    /// expected to fall back to the binary default.
+    const VC_WITHOUT_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: local
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 8087
+    apiPort: 5055
+    isAggregator: false
+    count: 1
+"#;
+
+    #[test]
+    fn parses_committee_count_when_present() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, Some(2));
+        assert_eq!(file.validators.len(), 1);
+        assert_eq!(file.validators[0].name, "ethlambda_0");
+    }
+
+    #[test]
+    fn defaults_to_none_when_field_absent() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, None);
+    }
+
+    #[test]
+    fn cli_overrides_file_value() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = Some(5);
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 5);
+    }
+
+    #[test]
+    fn falls_back_to_file_when_cli_absent() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 2);
+    }
+
+    #[test]
+    fn falls_back_to_default_when_neither_set() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 1);
+    }
+}
