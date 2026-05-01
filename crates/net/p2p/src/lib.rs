@@ -596,7 +596,9 @@ async fn handle_swarm_event(
 
 // --- Node identity helpers ---
 
-/// Drops entries whose secp256k1 private key fails to parse, with a `warn!` per drop.
+/// Derive each entry's `PeerId` from its secp256k1 private key.
+///
+/// Drops entries whose key fails to parse, with a `warn!` per drop.
 pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<PeerId, String> {
     names_and_privkeys
         .into_iter()
