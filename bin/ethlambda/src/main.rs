@@ -150,7 +150,10 @@ async fn main() -> eyre::Result<()> {
         .attestation_committee_count
         .or(validator_config_file.config.attestation_committee_count)
         .unwrap_or(1);
-    info!(attestation_committee_count, "Loaded attestation committee count");
+    info!(
+        attestation_committee_count,
+        "Loaded attestation committee count"
+    );
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
     let bootnodes = read_bootnodes(&bootnodes_path);
