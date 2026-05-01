@@ -76,9 +76,13 @@ struct CliOptions {
     /// use the admin endpoint to rotate duties (hot-standby model).
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
-    /// Number of attestation committees (subnets) per slot
-    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
-    attestation_committee_count: u64,
+    /// Number of attestation committees (subnets) per slot.
+    ///
+    /// If unset, falls back to `config.attestation_committee_count` from
+    /// `validator-config.yaml` in the network config dir, or `1` if that
+    /// field is also absent.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
@@ -102,9 +106,6 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
-    ethlambda_blockchain::metrics::set_attestation_committee_count(
-        options.attestation_committee_count,
-    );
 
     let api_socket = SocketAddr::new(options.http_address, options.api_port);
     let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
@@ -141,7 +142,31 @@ async fn main() -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
-    populate_name_registry(&validator_config);
+    let validator_config_file = read_validator_config_file(&validator_config);
+    populate_name_registry(&validator_config_file);
+
+    // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
+    let attestation_committee_count = options
+        .attestation_committee_count
+        .or(validator_config_file.config.attestation_committee_count)
+        .unwrap_or(1);
+    info!(
+        attestation_committee_count,
+        source = if options.attestation_committee_count.is_some() {
+            "cli"
+        } else if validator_config_file
+            .config
+            .attestation_committee_count
+            .is_some()
+        {
+            "validator-config.yaml"
+        } else {
+            "default"
+        },
+        "Resolved attestation committee count"
+    );
+    ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
+
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
@@ -181,7 +206,7 @@ async fn main() -> eyre::Result<()> {
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
-        attestation_committee_count: options.attestation_committee_count,
+        attestation_committee_count,
         is_aggregator: options.is_aggregator,
         aggregate_subnet_ids: options.aggregate_subnet_ids,
     })
@@ -223,25 +248,40 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn populate_name_registry(validator_config: impl AsRef<Path>) {
-    #[derive(Deserialize)]
-    struct Validator {
-        name: String,
-        privkey: H256,
-    }
-    #[derive(Deserialize)]
-    struct Config {
-        validators: Vec<Validator>,
-    }
-    let config_yaml =
-        std::fs::read_to_string(&validator_config).expect("Failed to read validator config file");
-    let config: Config =
-        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse validator config file");
+/// Subset of `validator-config.yaml` consumed by ethlambda.
+///
+/// The `config` block is a network-wide settings bag shared across clients;
+/// only fields ethlambda actually reads are deserialized. The `validators`
+/// list feeds the metrics name registry.
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigFile {
+    #[serde(default)]
+    config: ValidatorConfigBlock,
+    validators: Vec<ValidatorConfigEntry>,
+}
 
-    let names_and_privkeys = config
+#[derive(Debug, Default, Deserialize)]
+struct ValidatorConfigBlock {
+    #[serde(default)]
+    attestation_committee_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigEntry {
+    name: String,
+    privkey: H256,
+}
+
+fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
+    let yaml = std::fs::read_to_string(&path).expect("Failed to read validator config file");
+    serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
+}
+
+fn populate_name_registry(file: &ValidatorConfigFile) {
+    let names_and_privkeys = file
         .validators
-        .into_iter()
-        .map(|v| (v.name, v.privkey))
+        .iter()
+        .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
     // Populates a dictionary used for labeling metrics with node names
