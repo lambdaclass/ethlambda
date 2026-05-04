@@ -68,6 +68,15 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     .unwrap()
 });
 
+static LEAN_GOSSIP_MESH_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_gossip_mesh_peers",
+        "Number of peers in the gossipsub mesh",
+        &["client"]
+    )
+    .unwrap()
+});
+
 // --- Gossip Message Size Histograms ---
 
 static LEAN_GOSSIP_BLOCK_SIZE_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
@@ -167,4 +176,21 @@ pub fn notify_peer_disconnected(peer_id: &Option<PeerId>, direction: &str, reaso
 
     let name = resolve(peer_id);
     LEAN_CONNECTED_PEERS.with_label_values(&[name]).dec();
+}
+
+/// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
+///
+/// Called periodically by the swarm adapter. The gauge is reset before
+/// re-population so client labels for peers no longer in the mesh drop
+/// off rather than retaining stale counts.
+pub fn update_gossip_mesh_peers<'a>(peers: impl Iterator<Item = &'a PeerId>) {
+    let mut counts: HashMap<&'static str, i64> = HashMap::new();
+    for peer_id in peers {
+        let name = resolve(&Some(*peer_id));
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    LEAN_GOSSIP_MESH_PEERS.reset();
+    for (name, count) in counts {
+        LEAN_GOSSIP_MESH_PEERS.with_label_values(&[name]).set(count);
+    }
 }

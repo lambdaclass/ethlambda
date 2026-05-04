@@ -1,13 +1,21 @@
+use std::time::Duration;
+
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
     request_response::{self, OutboundRequestId},
     swarm::SwarmEvent,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{error, warn};
 
-use crate::{Behaviour, BehaviourEvent, req_resp::Request, req_resp::Response};
+use crate::{Behaviour, BehaviourEvent, metrics, req_resp::Request, req_resp::Response};
+
+/// Interval between gossipsub mesh peer metric refreshes.
+///
+/// Slightly slower than the gossipsub heartbeat (700ms) so the gauge
+/// reflects post-heartbeat mesh state with minimal polling overhead.
+const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub enum SwarmCommand {
     Publish {
@@ -106,6 +114,8 @@ async fn swarm_loop(
     event_tx: mpsc::UnboundedSender<SwarmEvent<BehaviourEvent>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
 ) {
+    let mut mesh_metric_tick = tokio::time::interval(MESH_METRIC_REFRESH_INTERVAL);
+    mesh_metric_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = swarm.next() => {
@@ -115,6 +125,11 @@ async fn swarm_loop(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 execute_command(&mut swarm, cmd);
+            }
+            _ = mesh_metric_tick.tick() => {
+                metrics::update_gossip_mesh_peers(
+                    swarm.behaviour().gossipsub.all_mesh_peers(),
+                );
             }
         }
     }
