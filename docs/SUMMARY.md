@@ -2,6 +2,10 @@
 
 [Introduction](./introduction.md)
 
+# Architecture
+
+- [Node Architecture](./architecture.md)
+
 # Consensus
 
 - [3SF-mini: Justification & Finalization](./3sf_mini.md)

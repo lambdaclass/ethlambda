@@ -9,7 +9,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 **Rust version:** 1.92.0 (edition 2024)
 **Test fixtures commit:** Check `LEAN_SPEC_COMMIT_HASH` in Makefile
 
-## Codebase Structure (10 crates)
+## Codebase Structure (1 bin + 11 crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -18,6 +18,8 @@ crates/
   blockchain/               # State machine actor (GenServer pattern)
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
+    ├─ src/aggregation.rs   # Two-phase signature aggregation worker
+    ├─ src/fork_choice_tree.rs # Fork choice tree (LMD GHOST tip selection)
     ├─ src/key_manager.rs   # Validator key management and signing
     ├─ src/metrics.rs       # Blockchain-level Prometheus metrics
     ├─ fork_choice/         # LMD GHOST implementation (3SF-mini)
@@ -26,15 +28,19 @@ crates/
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
     ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ test-fixtures/       # Shared spec-test fixture loaders
     └─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
   net/
-    ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot)
+    ├─ api/                 # Internal protocol traits between blockchain and p2p actors
+    ├─ p2p/                 # libp2p: identify + gossipsub + req-resp (Status, BlocksByRoot)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
     └─ rpc/                 # Axum HTTP: API server + metrics server (independent ports)
   storage/                  # RocksDB backend, in-memory for tests
-    └─ src/api/             # StorageBackend trait + Table enum
+    ├─ src/api/             # StorageBackend trait + Table enum
+    ├─ src/backend/         # RocksDB + in-memory implementations
+    └─ src/store.rs         # Higher-level Store wrapper over StorageBackend
 ```
 
 ## Key Architecture Patterns
@@ -264,6 +270,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3)
+- **Identify** (`/ipfs/id/1.0.0`): Registered for interop only — go-libp2p (gean) gates gossipsub GRAFT on identify completing, so peers that don't respond are silently excluded from the mesh
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -271,8 +278,8 @@ actual_slot = finalized_slot + 1 + relative_index
 - **Req/Resp**: Status, BlocksByRoot (snappy frame compression + varint length)
 
 ### Retry Strategy on Block Requests
-- Exponential backoff: 10ms, 40ms, 160ms, 640ms, 2560ms
-- Max 5 attempts, random peer selection on retry
+- Exponential backoff (×2): 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+- Max 10 attempts, random peer selection on retry (see `MAX_FETCH_RETRIES` in `crates/net/p2p/src/lib.rs`)
 
 ### Message IDs
 - 20-byte truncated SHA256 of: domain (valid/invalid snappy) + topic + data
@@ -364,7 +371,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (10)
+### Storage Tables (6)
 
 | Table | Key → Value | Purpose |
 |-------|-------------|---------|
@@ -372,12 +379,12 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
 | `BlockSignatures` | H256 → BlockSignatures | Signatures (absent for genesis) |
 | `States` | H256 → State | Beacon states by root |
-| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
-| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
-| `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
-| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
 | `Metadata` | string → various | Store state (head, config, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
+
+Attestation tracking (`new_attestations`, `known_attestations`) and the
+signature aggregation buffers (gossip signatures, aggregated proofs) live
+in-memory on the `Store` actor — they are not persisted across restarts.
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition

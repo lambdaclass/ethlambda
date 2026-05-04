@@ -4,8 +4,11 @@
 consensus client, written in Rust.
 
 This book collects the design notes and operator-facing references for ethlambda.
-It is split into two parts:
+It is split into three parts:
 
+- **Architecture** is a top-down tour of how a node is wired together:
+  [crate layout, actor model, tick loop, and storage](./architecture.md).
+  Start here to learn the codebase.
 - **Consensus** explains the algorithms ethlambda implements: the
   [3SF-mini](./3sf_mini.md) justification and finalization rules, and the
   [LMD-GHOST](./lmd_ghost.md) fork choice algorithm. Both documents are
