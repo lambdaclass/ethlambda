@@ -146,10 +146,16 @@ async fn main() -> eyre::Result<()> {
     populate_name_registry(&validator_config_file);
 
     // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
+    // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
+    // bound here so a YAML value of 0 cannot bypass it.
     let attestation_committee_count = options
         .attestation_committee_count
         .or(validator_config_file.config.attestation_committee_count)
         .unwrap_or(1);
+    eyre::ensure!(
+        attestation_committee_count >= 1,
+        "attestation_committee_count must be >= 1 (got {attestation_committee_count})"
+    );
     info!(
         attestation_committee_count,
         "Loaded attestation committee count"
