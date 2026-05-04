@@ -652,7 +652,7 @@
     container.addEventListener("pointerdown", markUserScrollIntent);
     container.addEventListener("touchstart", markUserScrollIntent, { passive: true });
     window.addEventListener("keydown", event => {
-      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
         markUserScrollIntent();
       }
     });
