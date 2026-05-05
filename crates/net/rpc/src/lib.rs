@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
@@ -17,6 +17,7 @@ mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 
+<<<<<<< Updated upstream
 pub async fn start_api_server(
     address: SocketAddr,
     store: Store,
@@ -50,6 +51,35 @@ pub async fn start_metrics_server(
             shutdown.cancelled().await;
         })
         .await?;
+=======
+pub struct RpcConfig {
+    pub http_address: IpAddr,
+    pub api_port: u16,
+    pub metrics_port: u16,
+}
+
+pub async fn start_rpc_server(config: RpcConfig, store: Store, aggregator: AggregatorController) -> Result<(), std::io::Error> {
+    let api_router = build_api_router(store).layer(Extension(aggregator));
+    let metrics_router = metrics::start_prometheus_metrics_api();
+    let debug_router = build_debug_router();
+
+    if config.api_port == config.metrics_port {
+        let app = Router::new().merge(api_router).merge(metrics_router).merge(debug_router);
+        let addr = SocketAddr::new(config.http_address, config.api_port);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
+    } else {
+        let api_addr = SocketAddr::new(config.http_address, config.api_port);
+        let metrics_addr = SocketAddr::new(config.http_address, config.metrics_port);
+        let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+        let metrics_app = Router::new().merge(metrics_router).merge(debug_router);
+        tokio::try_join!(
+            axum::serve(api_listener, api_router),
+            axum::serve(metrics_listener, metrics_app),
+        )?;
+    }
+>>>>>>> Stashed changes
 
     Ok(())
 }

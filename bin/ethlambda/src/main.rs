@@ -35,6 +35,7 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
 use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
+use ethlambda_rpc::{RpcConfig};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -107,10 +108,15 @@ async fn main() -> eyre::Result<()> {
         options.attestation_committee_count,
     );
 
-    let api_socket = SocketAddr::new(options.http_address, options.api_port);
-    let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
+    // let api_socket = SocketAddr::new(options.http_address, options.api_port);
+    // let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let rpc_config = RpcConfig {
+      http_address: options.http_address,
+      api_port: options.api_port,
+      metrics_port: options.metrics_port,
+  };
 
     println!("{ASCII_ART}");
 
@@ -205,6 +211,7 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
+<<<<<<< Updated upstream
     let shutdown_token = CancellationToken::new();
     let metrics_shutdown = shutdown_token.clone();
     let api_shutdown = shutdown_token.clone();
@@ -218,6 +225,23 @@ async fn main() -> eyre::Result<()> {
         let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator, api_shutdown)
             .await
             .inspect_err(|err| error!(%err, "API server failed"));
+=======
+    // tokio::spawn(async move {
+    //     let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+    //         .await
+    //         .inspect_err(|err| error!(%err, "Metrics server failed"));
+    // });
+    // tokio::spawn(async move {
+    //     let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator)
+    //         .await
+    //         .inspect_err(|err| error!(%err, "API server failed"));
+    // });
+
+    tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator)
+            .await
+            .inspect_err(|err| error!(%err, "rpc server failed"));
+>>>>>>> Stashed changes
     });
 
     info!("Node initialized");
