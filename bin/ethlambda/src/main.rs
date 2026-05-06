@@ -108,8 +108,6 @@ async fn main() -> eyre::Result<()> {
         options.attestation_committee_count,
     );
 
-    // let api_socket = SocketAddr::new(options.http_address, options.api_port);
-    // let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
     let rpc_config = RpcConfig {
