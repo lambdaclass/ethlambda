@@ -1,0 +1,746 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>3SF-mini: Justification &amp; Finalization - ethlambda</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-84a01bd5.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-031b865e.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/3sf_mini.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="3sf-mini-justification--finalization"><a class="header" href="#3sf-mini-justification--finalization">3SF-mini: Justification &amp; Finalization</a></h1>
+<p>ethlambda uses <strong>3SF-mini</strong> (Three-Stage Finality, minimal version) for justification
+and finalization. Unlike the Ethereum Beacon Chain’s epoch-based Casper FFG, 3SF-mini
+operates at the <strong>slot level</strong>: any slot can be justified, not just epoch boundaries.</p>
+<h2 id="quick-example-three-slots-to-finality"><a class="header" href="#quick-example-three-slots-to-finality">Quick Example: Three Slots to Finality</a></h2>
+<p>4 validators, slot N already finalized and justified.</p>
+<pre><code class="language-text">                             source  target
+                                │       │
+                                ▼       ▼
+    Slot N        ──[ N-2 ]──[ N-1 ]──[ N ]
+                       F        J       H
+
+                                     source    target
+                                        │         │
+                                        ▼         ▼
+    Slot N+1      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]
+                       F        F       J         H
+
+                                               source     target
+                                                  │          │
+                                                  ▼          ▼
+    Slot N+2      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]────[ N+2 ]
+                       F        F       F         J          H
+
+    H = head    J = justified    F = finalized
+</code></pre>
+<p>At each slot, validators vote for the newest block as their <strong>target</strong>, citing
+the latest justified checkpoint as their <strong>source</strong>:</p>
+<ul>
+<li><strong>Slot N+1:</strong> Votes <code>source=N, target=N+1</code>. Three of four vote
+(3×3=9 &gt;= 2×4=8), so <strong>N+1 is justified</strong>.</li>
+<li><strong>Slot N+2:</strong> Votes <code>source=N+1, target=N+2</code>. Three of four vote, so
+<strong>N+2 justified</strong>. N+1 and N+2 are consecutive justifiable slots and both
+are justified, so <strong>N+1 is finalized</strong>.</li>
+</ul>
+<p>In the ideal case, each block carries attestations that justify the parent slot
+and finalize the one before it. In practice, forks, missed slots, and delayed
+votes can break this cadence. The rest of this document explains the rules that
+make this work, and what happens when things go wrong.</p>
+<h2 id="concepts"><a class="header" href="#concepts">Concepts</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Term</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Justified</strong></td><td>A checkpoint backed by at least two-thirds of validator votes</td></tr>
+<tr><td><strong>Finalized</strong></td><td>A checkpoint that can never be reverted</td></tr>
+<tr><td><strong>Source</strong></td><td>The latest justified checkpoint (vote origin)</td></tr>
+<tr><td><strong>Target</strong></td><td>The checkpoint being voted for (vote destination)</td></tr>
+<tr><td><strong>Justifiable</strong></td><td>A slot that <em>could</em> become justified (per the 3SF-mini schedule)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="justification-via-supermajority"><a class="header" href="#justification-via-supermajority">Justification via Supermajority</a></h2>
+<p>A checkpoint becomes <strong>justified</strong> when at least two-thirds of validators attest to it as a target:</p>
+<pre><code class="language-text">                   JUSTIFICATION
+                   ─────────────
+
+    Validators:  V0  V1  V2  V3  V4  V5  V6  V7  V8
+                  │   │   │   │   │       │   │
+                  └───┴───┴───┴───┴───────┴───┘
+                              │
+                    7 out of 9 votes
+                  (3×7=21 &gt;= 2×9=18) ✓
+                              │
+                              ▼
+                     ┌──────────────┐
+                     │ Checkpoint C │
+                     │ JUSTIFIED ✓  │
+                     └──────────────┘
+</code></pre>
+<p>The threshold is computed as: <code>3 × vote_count &gt;= 2 × validator_count</code></p>
+<blockquote>
+<p><strong>In ethlambda:</strong> Justification and finalization are processed inside
+<code>process_attestations()</code> in <code>crates/blockchain/state_transition/src/lib.rs</code>,
+called from <code>process_block()</code>. The supermajority check is
+<code>3 * vote_count &gt;= 2 * validator_count</code>.</p>
+</blockquote>
+<p>Attestations must also pass validity checks before they count:</p>
+<ul>
+<li>Source checkpoint must already be justified</li>
+<li>Target must not already be justified</li>
+<li>Neither source nor target may have a zero-hash root</li>
+<li>Source slot &lt; Target slot (time flows forward)</li>
+<li>Both checkpoints must reference known blocks</li>
+<li>Target slot must be <strong>justifiable</strong> per the 3SF-mini schedule (see below)</li>
+</ul>
+<h2 id="the-justifiability-schedule"><a class="header" href="#the-justifiability-schedule">The Justifiability Schedule</a></h2>
+<p>Not every slot can be justified, only slots at specific distances from the last
+finalized slot. This is the novel part of 3SF-mini.</p>
+<p>A slot is <strong>justifiable</strong> if <code>delta = slot - finalized_slot</code> matches any rule:</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> The function <code>slot_is_justifiable_after(slot, finalized_slot)</code> in
+<code>crates/blockchain/state_transition/src/lib.rs</code> implements this check. It uses
+<code>isqrt()</code> for perfect square detection and the identity <code>4n(n+1) + 1 = (2n+1)²</code>
+for pronic number detection.</p>
+</blockquote>
+<pre><code class="language-text">    ┌───────────────────────────────────────────────────────┐
+    │             JUSTIFIABILITY RULES                      │
+    │                                                       │
+    │  Rule 1:  delta ≤ 5          (always justifiable)     │
+    │                                                       │
+    │  Rule 2:  delta = n²         (perfect squares)        │
+    │           1, 4, 9, 16, 25, 36, 49, 64, 81, 100, ...   │
+    │                                                       │
+    │  Rule 3:  delta = n(n+1)     (pronic numbers)         │
+    │           2, 6, 12, 20, 30, 42, 56, 72, 90, 110, ...  │
+    │                                                       │
+    └───────────────────────────────────────────────────────┘
+</code></pre>
+<p>Visualizing the first 40 slots after finalization (✓ = justifiable):</p>
+<pre><code class="language-text">    delta: 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19 20
+           ✓  ✓  ✓  ✓  ✓  ✓  ✓  ·  ·  ✓  ·  ·  ✓  ·  ·  ·  ✓  ·  ·  ·  ✓
+           ╰─ delta ≤ 5 ──╯  2×3      3²       3×4         4²          4×5
+
+    delta: 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+           ·  ·  ·  ·  ✓  ·  ·  ·  ·  ✓  ·  ·  ·  ·  ·  ✓  ·  ·  ·  ·
+                       5²             5×6               6²
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>delta</th><th>Rule</th><th>Formula</th><th>Gap since previous</th></tr>
+</thead>
+<tbody>
+<tr><td>0–5</td><td>1</td><td>≤ 5</td><td>-</td></tr>
+<tr><td>6</td><td>3</td><td>2×3</td><td>1</td></tr>
+<tr><td>9</td><td>2</td><td>3²</td><td>3</td></tr>
+<tr><td>12</td><td>3</td><td>3×4</td><td>3</td></tr>
+<tr><td>16</td><td>2</td><td>4²</td><td>4</td></tr>
+<tr><td>20</td><td>3</td><td>4×5</td><td>4</td></tr>
+<tr><td>25</td><td>2</td><td>5²</td><td>5</td></tr>
+<tr><td>30</td><td>3</td><td>5×6</td><td>5</td></tr>
+<tr><td>36</td><td>2</td><td>6²</td><td>6</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Key property:</strong> Gaps between justifiable slots grow, but never become infinite.
+As more time passes since finalization, the network gets progressively wider windows
+to accumulate votes. This creates a natural backpressure: if the network is struggling
+to reach a two-thirds majority (e.g., due to partitions or validator dropouts), the increasing
+gaps give more time for the supermajority to form.</p>
+<h2 id="finalization"><a class="header" href="#finalization">Finalization</a></h2>
+<p>A justified checkpoint becomes <strong>finalized</strong> when it is the source of a justification
+whose target is the <strong>next justifiable slot</strong>. In other words, there must be <strong>no
+justifiable slots between source and target</strong>: the two must be consecutive entries in
+the justifiability schedule.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> The <code>try_finalize()</code> function iterates over slots between
+source and target and calls <code>slot_is_justifiable_after</code> on each. If any slot
+is justifiable, finalization fails (source and target aren’t consecutive).
+The check uses <code>original_finalized_slot</code> (the finalized slot at the start of
+block processing), not the current one, since finalization can advance
+mid-processing.</p>
+</blockquote>
+<pre><code class="language-text">                    FINALIZATION CHECK
+                    ──────────────────
+
+    Example 1: Finalization FAILS
+
+    Finalized=10   Source=13 (justified)   Target=16 (justified)
+
+    [ 10 ] · · · [ 13 ]  14   15  [ 16 ]
+                          ▲    ▲
+                          │    └── delta=5 ≤ 5 → justifiable!
+                          └────── delta=4 ≤ 5 → justifiable!
+
+    Justifiable slots exist between S and T → NOT FINALIZED ✗
+    (13 and 16 are not consecutive justifiable slots)
+
+
+    Example 2: Finalization SUCCEEDS
+
+    Finalized=10   Source=16 (justified)   Target=19 (justified)
+
+    [ 10 ] · · · [ 16 ]  17   18  [ 19 ]
+                          ▲    ▲
+                          │    └── delta=8 → not justifiable ✓
+                          └────── delta=7 → not justifiable ✓
+
+    No justifiable slots between S and T → S is FINALIZED ✓
+    (16 and 19 are consecutive: delta=6=2×3, then delta=9=3²)
+</code></pre>
+<p>The reasoning: if a justifiable slot exists between source and target, validators
+could have directed their votes to that intermediate slot instead, potentially on a
+different fork. By requiring source and target to be consecutive justifiable slots,
+the protocol ensures that no alternative justification path can exist between them.</p>
+<h3 id="justifiable-slot-backoff"><a class="header" href="#justifiable-slot-backoff">Justifiable Slot Backoff</a></h3>
+<p>The justifiability schedule acts as a backoff mechanism to increase finalization rate
+during periods of asynchrony. By “diluting” the possible targets of a justification
+vote (via the <code>slot_is_justifiable_after</code> function), the protocol increases the window
+during which votes for a given slot can be included, improving the chances of achieving
+the required two-thirds majority.</p>
+<p>Since finalization requires two consecutively justifiable slots to both be justified,
+this backoff isn’t immediately reset after finalization occurs; it only lowers over
+time when synchrony is restored.</p>
+<p><strong>Example:</strong> Extended asynchrony with gradual recovery.</p>
+<pre><code>    F=0. Justifiable slots grow sparser as delta increases:
+
+    delta ≤ 5:     0   1   2   3   4   5                  (gap = 1)
+    delta 6–20:    6       9       12          16          20   (gap = 3–4)
+    delta 20–36:   20          25          30              36   (gap = 5–6)
+    ...
+    delta ~1000:   900     930     961     992      1024        (gap = 30–32)
+                   30²    30×31   31²    31×32      32²
+</code></pre>
+<p><strong>Phase 1: Long asynchrony, slow progress.</strong></p>
+<pre><code>    Validators vote, but with many justifiable targets, votes scatter
+    and no single slot reaches &gt;=2/3. As gaps widen, votes concentrate.
+
+    Near slot 1000, the 32-slot gap between 992 and 1024 means
+    no competing justifiable target exists for 32 slots after 992.
+    All votes funnel toward 1024 once it is built.
+</code></pre>
+<p><strong>Phase 2: Slot 992 finalized.</strong></p>
+<pre><code>    Slot 992 justified (source = earlier justified slot).
+    Slot 1024 justified (source = 992).
+
+    slot:  0  ...  992              1024
+           F        J    ·······     J
+                    ▲                ▲
+                 source ──────────▶ target
+
+    Slots 993–1023: any justifiable from F=0?
+      Perfect squares? 31²=961 (before), 32²=1024 (boundary). None.
+      Pronic? 31×32=992 (boundary), 32×33=1056 (after). None.
+    No justifiable slots between them → slot 992 FINALIZED ✓
+</code></pre>
+<p><strong>Phase 3: Partial reset. Backoff shrinks but doesn’t vanish.</strong></p>
+<pre><code>    New F=992. Justifiable slots shift:
+
+    slot: 992 993 994 995 996 997 998 ··· 1001 ··· 1004 ··· 1008 ··· 1022 ··· 1028
+           F   ✓   ✓   ✓   ✓   ✓   ✓      ✓       ✓       ✓       ✓       ✓
+              ╰── delta ≤ 5 ──╯  2×3     3²      3×4     4²      5×6     6²
+
+    Dense slots 993–998 are already in the past!
+    Near the current slot (~1024), justifiable slots are ~6 apart:
+
+    ...  1022     1028     1034     1041  ...
+         δ=30     δ=36     δ=42     δ=49
+         5×6      6²       6×7      7²
+         └──6──┘  └──6──┘  └──7──┘
+
+    Gaps shrank from 32 → 6, but didn't reset to 1.
+</code></pre>
+<p><strong>Phase 4: Further finalization closes the gap.</strong></p>
+<pre><code>    Justify 1022 and 1028, finalize 1022. New F=1022.
+
+    From F=1022, at slot ~1028 (delta = 6):
+
+    slot:  1022  1023  1024  1025  1026  1027  1028
+            F     ✓     ✓     ✓     ✓     ✓     ✓
+                  ╰────── delta ≤ 5 ──────╯    2×3
+
+    Gaps are back to 1. Fast finalization resumes.
+
+    Summary of gradual recovery:
+
+    ┌───────────────────┬──────┬───────┬───────┬──────────────┐
+    │ Finalization step │  F   │ Head  │ Delta │ Nearby gaps  │
+    ├───────────────────┼──────┼───────┼───────┼──────────────┤
+    │ Before any        │    0 │ ~1000 │ ~1000 │ 31–32        │
+    │ After 1st (992)   │  992 │ ~1024 │   ~32 │ 6–7          │
+    │ After 2nd (1022)  │ 1022 │ ~1028 │    ~6 │ 1            │
+    └───────────────────┴──────┴───────┴───────┴──────────────┘
+
+    Each finalization step reduces the delta between the finalized
+    slot and the chain head, progressively tightening the gaps.
+</code></pre>
+<p>When finalization advances, the following cleanup occurs:</p>
+<ul>
+<li><code>justified_slots</code> window shifts forward (old slots pruned)</li>
+<li><code>LiveChain</code> entries for finalized slots are pruned</li>
+<li>Gossip signatures and aggregation proofs for finalized blocks are cleaned up</li>
+<li>Future fork choice runs start from the finalized slot’s successor</li>
+</ul>
+<blockquote>
+<p><strong>In ethlambda:</strong> The <code>justified_slots</code> bitlist uses relative indexing (index 0 =
+<code>finalized_slot + 1</code>). When finalization advances, <code>shift_window()</code> in
+<code>crates/blockchain/state_transition/src/justified_slots_ops.rs</code> drops the
+now-finalized prefix. The attestation target is also walked back to the nearest
+justifiable slot via <code>slot_is_justifiable_after</code> in <code>crates/blockchain/src/store.rs</code>.</p>
+</blockquote>
+<h2 id="end-to-end-from-head-selection-to-finalization"><a class="header" href="#end-to-end-from-head-selection-to-finalization">End-to-End: From Head Selection to Finalization</a></h2>
+<p>This section connects <a href="lmd_ghost.html">LMD-GHOST fork choice</a> with 3SF-mini.
+The <a href="#quick-example-three-slots-to-finality">quick example above</a> showed the happy
+path; here we focus on what happens when things go wrong.</p>
+<h3 id="recap-attestation-anatomy"><a class="header" href="#recap-attestation-anatomy">Recap: Attestation Anatomy</a></h3>
+<p>Each attestation carries three checkpoints, each determined by a different mechanism:</p>
+<pre><code class="language-text">    ┌────────────────────────────────────────────────────────────────┐
+    │                       ATTESTATION                              │
+    │                                                                │
+    │  head    Newest block the validator sees                       │
+    │          ← LMD-GHOST with min_score = 0                        │
+    │                                                                │
+    │  target  Block the validator wants justified next              │
+    │          ← Derived from safe target, walked back to nearest    │
+    │            justifiable slot (feeds into 3SF-mini)              │
+    │                                                                │
+    │  source  Latest justified checkpoint                           │
+    │          ← Read from store state                               │
+    └────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>The <strong>safe target</strong> is computed by running LMD-GHOST with a two-thirds vote threshold.
+Only blocks backed by a supermajority qualify, so the safe target is always at or
+behind the head. The attestation <strong>target</strong> is derived by walking back from the head
+toward the safe target (max 3 steps), then to the nearest justifiable slot. See
+<a href="lmd_ghost.html#safe-target-selection">Safe Target Selection</a> for details.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> <code>get_attestation_target()</code> in <code>crates/blockchain/src/store.rs</code>
+implements this walk-back. <code>JUSTIFICATION_LOOKBACK_SLOTS = 3</code> provides a liveness
+guarantee: even if the safe target is stuck, the target eventually advances once
+the head moves far enough ahead.</p>
+</blockquote>
+<h3 id="lagging-safe-target-fork-with-delayed-convergence"><a class="header" href="#lagging-safe-target-fork-with-delayed-convergence">Lagging Safe Target (Fork with Delayed Convergence)</a></h3>
+<p>When validators disagree about the head, the safe target lags behind: no single
+branch has two-thirds support. This delays justification until the fork resolves.</p>
+<pre><code class="language-text">    Setup: 9 validators, finalized=100, justified=101
+    Safe target threshold: &gt;=6 votes (2/3 of 9)
+</code></pre>
+<p><strong>Slots 102–103: Fork splits votes. No progress.</strong></p>
+<pre><code class="language-text">                         ┌──[ B102a ]──[ B103a ]     V0–V4 (5)
+    [ F=100 ]──[ J=101 ]─┤
+                         └──[ B102b ]──[ B103b ]     V5–V8 (4)
+</code></pre>
+<p>Neither branch clears two-thirds → safe target stuck at B101. Walk-back from head
+always lands on source (B101). <strong>No attestation can advance justification.</strong></p>
+<p><strong>Slot 104: V7 and V8 switch sides. Fork resolves.</strong></p>
+<p>V7 and V8 receive B102a (delayed by the partition) and switch to the a-branch.</p>
+<pre><code class="language-text">                         ┌──[ B102a ]──[ B103a ]──[ B104a ]     V0–V4, V7, V8 (7)
+    [ F=100 ]──[ J=101 ]─┤
+                         └──[ B102b ]──[ B103b ]──[ B104b ]     V5–V6  (2)
+</code></pre>
+<p>B102a subtree now has 7 votes &gt;= 6 → <strong>safe target = B102a</strong>. Walk-back from B104a
+lands on B102a (2 steps). Slot 102 is justifiable (delta=2 ≤ 5).</p>
+<pre><code class="language-text">    source=101 ──▶ target=102    7/9 votes → 3×7=21 &gt;= 2×9=18 → JUSTIFIED ✓
+    Finalization: no slots between 101 and 102 → 101 FINALIZED ✓
+</code></pre>
+<p>After slot 104: <strong>finalized=101, justified=102.</strong></p>
+<p><strong>Slots 105–106: Full convergence and recovery.</strong></p>
+<p>All 9 validators on the a-branch. Slot 105: target=B104a → <strong>B104a JUSTIFIED</strong>.
+But finalization fails: slot 103 (between source=102 and target=104) is justifiable
+but was never justified (lost in the fork).</p>
+<p>Slot 106: target=B105a → <strong>B105a JUSTIFIED</strong>. No justifiable slots between 104 and
+105 → <strong>104 FINALIZED</strong>. Finalization jumped from 101 to 104, skipping 102 and 103.</p>
+<pre><code class="language-text">    FORK WITH DELAYED CONVERGENCE
+    ═════════════════════════════
+
+    Slot:     100   101   102   103   104   105   106
+    Status:    F     J     ·     ·     ·     ·     ·
+                                fork ──────┤
+                                          resolves
+    Head:      ·    B101  B102a B103a B104a B105a B106a
+    Safe:      ·    B100  B101  B101  B102a B104a B105a
+                          stuck ─────┘  ▲
+                                        │
+                           V7+V8 switch, safe target unsticks
+
+    Justified:  ·    101   ─     ─    102   104   105
+    Finalized:  ·     ·    ─     ─    101   ─     104
+                                                   ▲
+                              finalization jumps ──┘
+                               (102,103 skipped; 103 was never justified)
+</code></pre>
+<h2 id="comparison-with-casper-ffg"><a class="header" href="#comparison-with-casper-ffg">Comparison with Casper FFG</a></h2>
+<p>Both 3SF-mini and Casper FFG are finality gadgets built on the same foundation:
+supermajority links between checkpoints. They differ fundamentally in their unit of
+time and what that implies for validator participation. For a thorough treatment of
+Casper FFG as used in Ethereum, see the
+<a href="https://eth2book.info/capella/part2/consensus/casper_ffg/">eth2book chapter on Casper FFG</a>.</p>
+<h3 id="slots-vs-epochs-the-core-architectural-split"><a class="header" href="#slots-vs-epochs-the-core-architectural-split">Slots vs Epochs: The Core Architectural Split</a></h3>
+<p><strong>3SF-mini: Every Validator, Every Slot</strong></p>
+<p>In 3SF-mini, <strong>all validators vote in every slot</strong>. A checkpoint can be justified at
+any slot (subject to the justifiability schedule), and finalization can happen as soon
+as two consecutive justifiable slots are both justified.</p>
+<pre><code class="language-text">    3SF-mini  (4-second slots, 4 validators)
+
+    Slot 100        Slot 101        Slot 102        Slot 103
+    ┌───────┐       ┌───────┐       ┌───────┐       ┌───────┐
+    │V0 V1  │       │V0 V1  │       │V0 V1  │       │V0 V1  │
+    │V2 V3  │       │V2 V3  │       │V2 V3  │       │V2 V3  │
+    └───┬───┘       └───┬───┘       └───┬───┘       └───┬───┘
+        │               │               │               │
+     4 votes         4 votes         4 votes         4 votes
+     per slot        per slot        per slot        per slot
+
+    Every validator participates in every slot.
+    &gt;=2/3 threshold checked per-slot → can justify any slot.
+</code></pre>
+<p>This is simple and fast, but it means every validator must produce and verify a vote
+every slot. The total message load scales as <code>validators × slots</code>.</p>
+<p><strong>Casper FFG: Validators Split Across an Epoch</strong></p>
+<p>Ethereum’s beacon chain has ~1,000,000 active validators. Having all of them vote every
+12-second slot would be unmanageable. Instead, Casper FFG groups 32 slots into an
+<strong>epoch</strong>, and splits the validator set across the slots within it:</p>
+<pre><code class="language-text">    Casper FFG  (12-second slots, 32 per epoch, ~900k validators)
+
+    Epoch N
+    ┌─────────────────────────────────────────────────────────────┐
+    │ Slot 0     Slot 1     Slot 2    ...    Slot 30    Slot 31   │
+    │ ┌──────┐   ┌──────┐   ┌──────┐        ┌──────┐   ┌──────┐   │
+    │ │~28125│   │~28125│   │~28125│  ...   │~28125│   │~28125│   │
+    │ │valids│   │valids│   │valids│        │valids│   │valids│   │
+    │ └──┬───┘   └──┬───┘   └──┬───┘        └──┬───┘   └──┬───┘   │
+    │    │           │           │               │           │    │
+    └────┼───────────┼───────────┼───────────────┼───────────┼────┘
+         └───────────┴───────────┴───┬───────────┴───────────┘
+                                     │
+                            All ~900k votes
+                          collected over 32 slots
+                                     │
+                                     ▼
+                              Epoch checkpoint
+                              (first slot of epoch)
+
+    Each validator attests exactly ONCE per epoch.
+    The full &gt;=2/3 tally is only meaningful at epoch boundaries.
+</code></pre>
+<p>Each validator is shuffled into a <strong>committee</strong> assigned to one specific slot. Within
+that slot, the committee may be further split (up to 64 sub-committees) for parallel
+aggregation. The result: each validator only attests once per epoch, and the network
+processes ~28,000 attestations per slot instead of ~900,000.</p>
+<p><strong>The trade-off:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>3SF-mini</strong></th><th><strong>Casper FFG</strong></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Who votes when</strong></td><td>All validators, every slot</td><td>Each validator once per epoch (in its assigned slot)</td></tr>
+<tr><td><strong>Messages per slot</strong></td><td><code>N</code> (all validators)</td><td><code>N / 32</code> (one committee)</td></tr>
+<tr><td><strong>Supermajority known after</strong></td><td>1 slot (all votes in)</td><td>1 epoch (need all 32 committees)</td></tr>
+<tr><td><strong>Fastest finalization</strong></td><td>2 slots = <strong>8 seconds</strong></td><td>2 epochs = <strong>~12.8 minutes</strong></td></tr>
+<tr><td><strong>Practical validator limit</strong></td><td>Hundreds–thousands</td><td>Millions</td></tr>
+</tbody>
+</table>
+</div>
+<p>Epochs exist because of a scalability constraint, not a protocol-theory preference. If
+you could process a million votes per slot, Casper FFG wouldn’t need epochs at all. 3SF-mini
+sidesteps this by targeting a smaller validator set, which lets it operate at slot granularity.</p>
+<h3 id="finalization-logic"><a class="header" href="#finalization-logic">Finalization Logic</a></h3>
+<p>Both require a chain of justified checkpoints, but the rules differ in what they check.</p>
+<p><strong>Casper FFG</strong> uses <strong>k-finality</strong>. The original rule (k=1) requires a direct supermajority
+link from a checkpoint to its immediate successor: justify epoch N+1 with source=N, and N
+is finalized. Ethereum generalizes this to <strong>k=2</strong>, which handles the case where the network
+falls slightly behind:</p>
+<pre><code class="language-text">    Casper FFG — 1-finality (ideal case):
+
+    Epoch N       Epoch N+1
+    ┌─────┐       ┌─────┐
+    │ CP  │══════▶│ CP  │       Supermajority link N → N+1
+    │ J ✓ │       │     │
+    └─────┘       └─────┘
+
+    Processing this link:
+      1. Epoch N+1 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (direct successor justified)
+
+
+    Casper FFG — 2-finality (one epoch behind):
+
+    Epoch N       Epoch N+1     Epoch N+2
+    ┌─────┐       ┌─────┐       ┌─────┐
+    │ CP  │       │ CP  │       │ CP  │
+    │ J ✓ │       │ J ✓ │       │     │
+    └─────┘       └─────┘       └─────┘
+       │                           │
+       └══════ supermajority ══════┘
+               link N → N+2
+
+    The direct link N→N+1 didn't form in time.
+    Instead, a link forms from N→N+2. Processing this link:
+      1. Epoch N+2 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (all intermediates are justified)
+</code></pre>
+<p>The 2-finality rule is a recovery mechanism: even if the network missed the ideal one-epoch
+finalization window, it gets a second chance. Ethereum tracks the justification status of the
+last 4 epoch boundaries to detect both cases. In practice, most finalization happens via
+1-finality during normal operation; 2-finality kicks in during brief network hiccups.</p>
+<p><strong>3SF-mini</strong> takes a different approach entirely:</p>
+<pre><code class="language-text">    Slot S        Slot T
+    ┌─────┐       ┌─────┐
+    │ CP  │──────▶│ CP  │       No justifiable slots exist
+    │ J ✓ │       │ J ✓ │       between S and T
+    └─────┘       └─────┘
+    ∴ Slot S is FINALIZED
+
+    Rule: Finalized when NO intermediate checkpoints could exist
+</code></pre>
+<p>Instead of checking that intermediate checkpoints <em>are justified</em>, 3SF-mini checks that no
+intermediate checkpoints <em>could exist at all</em>. This is a stronger guarantee: validators’
+votes between source and target could only have gone to the target, since there’s nowhere else
+to direct them. This structural property is also why 3SF-mini doesn’t need Casper’s
+surround-vote slashing condition.</p>
+<p>Casper’s k-finality is essentially a tolerance parameter: “how many epochs behind can we be
+and still finalize?” Ethereum chose k=2, meaning it tolerates one missed epoch. 3SF-mini
+doesn’t need this concept because the justifiability schedule itself adapts. Instead of
+tolerating missed windows, it makes the windows wider when the network is struggling.</p>
+<h3 id="adaptive-backoff-unique-to-3sf-mini"><a class="header" href="#adaptive-backoff-unique-to-3sf-mini">Adaptive Backoff (unique to 3SF-mini)</a></h3>
+<p>Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini’s
+justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
+(via the perfect square and pronic number rules), creating natural vote concentration when the
+network is struggling to reach a two-thirds majority. Casper FFG has no equivalent; its epoch spacing is the
+same whether the network is healthy or partitioned. See
+<a href="#justifiable-slot-backoff">Justifiable Slot Backoff</a> for a detailed walkthrough.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="lmd_ghost.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="lmd_ghost.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

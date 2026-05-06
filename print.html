@@ -1,0 +1,1767 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ethlambda</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-84a01bd5.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-031b865e.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p><strong>ethlambda</strong> is a minimalist, fast and modular implementation of the Lean Ethereum
+consensus client, written in Rust.</p>
+<p>This book collects the design notes and operator-facing references for ethlambda.
+It is split into two parts:</p>
+<ul>
+<li><strong>Consensus</strong> explains the algorithms ethlambda implements: the
+<a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization rules, and the
+<a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. Both documents are
+implementation-agnostic; ethlambda-specific behaviour is called out in
+blockquotes.</li>
+<li><strong>Operations</strong> documents observable surfaces of a running node:
+<a href="#metrics">Prometheus metrics</a>, <a href="#checkpoint-sync">checkpoint sync</a>,
+and the <a href="#fork-choice-visualization">fork choice visualization</a> served
+by the API.</li>
+</ul>
+<p>For build and contribution instructions, see the
+<a href="https://github.com/lambdaclass/ethlambda/blob/main/README.md"><code>README</code></a> and
+<a href="https://github.com/lambdaclass/ethlambda/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>
+in the repository.</p>
+<h2 id="visual-references"><a class="header" href="#visual-references">Visual references</a></h2>
+<p>Two standalone HTML infographics ship alongside this book and are copied verbatim
+into the rendered output:</p>
+<ul>
+<li><a href="infographics/3sf-mini-infographic.html">3SF-mini infographic</a></li>
+<li><a href="infographics/ethlambda_architecture.html">ethlambda architecture infographic</a></li>
+</ul>
+<h2 id="related-projects"><a class="header" href="#related-projects">Related projects</a></h2>
+<p>ethlambda is one of several Lean Ethereum consensus clients under active development.
+For comparison and cross-client testing:</p>
+<ul>
+<li><a href="https://github.com/blockblaz/zeam">zeam</a> (Zig)</li>
+<li><a href="https://github.com/ReamLabs/ream">ream</a> (Rust)</li>
+<li><a href="https://github.com/qdrvm/qlean-mini">qlean</a> (C++)</li>
+<li><a href="https://github.com/grandinetech/lean/tree/main/lean_client">grandine</a> (Rust)</li>
+<li><a href="https://github.com/devlongs/gean">gean</a> (Go)</li>
+<li><a href="https://github.com/Pier-Two/lantern">Lantern</a> (C)</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="3sf-mini-justification--finalization"><a class="header" href="#3sf-mini-justification--finalization">3SF-mini: Justification &amp; Finalization</a></h1>
+<p>ethlambda uses <strong>3SF-mini</strong> (Three-Stage Finality, minimal version) for justification
+and finalization. Unlike the Ethereum Beacon Chain’s epoch-based Casper FFG, 3SF-mini
+operates at the <strong>slot level</strong>: any slot can be justified, not just epoch boundaries.</p>
+<h2 id="quick-example-three-slots-to-finality"><a class="header" href="#quick-example-three-slots-to-finality">Quick Example: Three Slots to Finality</a></h2>
+<p>4 validators, slot N already finalized and justified.</p>
+<pre><code class="language-text">                             source  target
+                                │       │
+                                ▼       ▼
+    Slot N        ──[ N-2 ]──[ N-1 ]──[ N ]
+                       F        J       H
+
+                                     source    target
+                                        │         │
+                                        ▼         ▼
+    Slot N+1      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]
+                       F        F       J         H
+
+                                               source     target
+                                                  │          │
+                                                  ▼          ▼
+    Slot N+2      ──[ N-2 ]──[ N-1 ]──[ N ]────[ N+1 ]────[ N+2 ]
+                       F        F       F         J          H
+
+    H = head    J = justified    F = finalized
+</code></pre>
+<p>At each slot, validators vote for the newest block as their <strong>target</strong>, citing
+the latest justified checkpoint as their <strong>source</strong>:</p>
+<ul>
+<li><strong>Slot N+1:</strong> Votes <code>source=N, target=N+1</code>. Three of four vote
+(3×3=9 &gt;= 2×4=8), so <strong>N+1 is justified</strong>.</li>
+<li><strong>Slot N+2:</strong> Votes <code>source=N+1, target=N+2</code>. Three of four vote, so
+<strong>N+2 justified</strong>. N+1 and N+2 are consecutive justifiable slots and both
+are justified, so <strong>N+1 is finalized</strong>.</li>
+</ul>
+<p>In the ideal case, each block carries attestations that justify the parent slot
+and finalize the one before it. In practice, forks, missed slots, and delayed
+votes can break this cadence. The rest of this document explains the rules that
+make this work, and what happens when things go wrong.</p>
+<h2 id="concepts"><a class="header" href="#concepts">Concepts</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Term</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Justified</strong></td><td>A checkpoint backed by at least two-thirds of validator votes</td></tr>
+<tr><td><strong>Finalized</strong></td><td>A checkpoint that can never be reverted</td></tr>
+<tr><td><strong>Source</strong></td><td>The latest justified checkpoint (vote origin)</td></tr>
+<tr><td><strong>Target</strong></td><td>The checkpoint being voted for (vote destination)</td></tr>
+<tr><td><strong>Justifiable</strong></td><td>A slot that <em>could</em> become justified (per the 3SF-mini schedule)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="justification-via-supermajority"><a class="header" href="#justification-via-supermajority">Justification via Supermajority</a></h2>
+<p>A checkpoint becomes <strong>justified</strong> when at least two-thirds of validators attest to it as a target:</p>
+<pre><code class="language-text">                   JUSTIFICATION
+                   ─────────────
+
+    Validators:  V0  V1  V2  V3  V4  V5  V6  V7  V8
+                  │   │   │   │   │       │   │
+                  └───┴───┴───┴───┴───────┴───┘
+                              │
+                    7 out of 9 votes
+                  (3×7=21 &gt;= 2×9=18) ✓
+                              │
+                              ▼
+                     ┌──────────────┐
+                     │ Checkpoint C │
+                     │ JUSTIFIED ✓  │
+                     └──────────────┘
+</code></pre>
+<p>The threshold is computed as: <code>3 × vote_count &gt;= 2 × validator_count</code></p>
+<blockquote>
+<p><strong>In ethlambda:</strong> Justification and finalization are processed inside
+<code>process_attestations()</code> in <code>crates/blockchain/state_transition/src/lib.rs</code>,
+called from <code>process_block()</code>. The supermajority check is
+<code>3 * vote_count &gt;= 2 * validator_count</code>.</p>
+</blockquote>
+<p>Attestations must also pass validity checks before they count:</p>
+<ul>
+<li>Source checkpoint must already be justified</li>
+<li>Target must not already be justified</li>
+<li>Neither source nor target may have a zero-hash root</li>
+<li>Source slot &lt; Target slot (time flows forward)</li>
+<li>Both checkpoints must reference known blocks</li>
+<li>Target slot must be <strong>justifiable</strong> per the 3SF-mini schedule (see below)</li>
+</ul>
+<h2 id="the-justifiability-schedule"><a class="header" href="#the-justifiability-schedule">The Justifiability Schedule</a></h2>
+<p>Not every slot can be justified, only slots at specific distances from the last
+finalized slot. This is the novel part of 3SF-mini.</p>
+<p>A slot is <strong>justifiable</strong> if <code>delta = slot - finalized_slot</code> matches any rule:</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> The function <code>slot_is_justifiable_after(slot, finalized_slot)</code> in
+<code>crates/blockchain/state_transition/src/lib.rs</code> implements this check. It uses
+<code>isqrt()</code> for perfect square detection and the identity <code>4n(n+1) + 1 = (2n+1)²</code>
+for pronic number detection.</p>
+</blockquote>
+<pre><code class="language-text">    ┌───────────────────────────────────────────────────────┐
+    │             JUSTIFIABILITY RULES                      │
+    │                                                       │
+    │  Rule 1:  delta ≤ 5          (always justifiable)     │
+    │                                                       │
+    │  Rule 2:  delta = n²         (perfect squares)        │
+    │           1, 4, 9, 16, 25, 36, 49, 64, 81, 100, ...   │
+    │                                                       │
+    │  Rule 3:  delta = n(n+1)     (pronic numbers)         │
+    │           2, 6, 12, 20, 30, 42, 56, 72, 90, 110, ...  │
+    │                                                       │
+    └───────────────────────────────────────────────────────┘
+</code></pre>
+<p>Visualizing the first 40 slots after finalization (✓ = justifiable):</p>
+<pre><code class="language-text">    delta: 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19 20
+           ✓  ✓  ✓  ✓  ✓  ✓  ✓  ·  ·  ✓  ·  ·  ✓  ·  ·  ·  ✓  ·  ·  ·  ✓
+           ╰─ delta ≤ 5 ──╯  2×3      3²       3×4         4²          4×5
+
+    delta: 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+           ·  ·  ·  ·  ✓  ·  ·  ·  ·  ✓  ·  ·  ·  ·  ·  ✓  ·  ·  ·  ·
+                       5²             5×6               6²
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>delta</th><th>Rule</th><th>Formula</th><th>Gap since previous</th></tr>
+</thead>
+<tbody>
+<tr><td>0–5</td><td>1</td><td>≤ 5</td><td>-</td></tr>
+<tr><td>6</td><td>3</td><td>2×3</td><td>1</td></tr>
+<tr><td>9</td><td>2</td><td>3²</td><td>3</td></tr>
+<tr><td>12</td><td>3</td><td>3×4</td><td>3</td></tr>
+<tr><td>16</td><td>2</td><td>4²</td><td>4</td></tr>
+<tr><td>20</td><td>3</td><td>4×5</td><td>4</td></tr>
+<tr><td>25</td><td>2</td><td>5²</td><td>5</td></tr>
+<tr><td>30</td><td>3</td><td>5×6</td><td>5</td></tr>
+<tr><td>36</td><td>2</td><td>6²</td><td>6</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Key property:</strong> Gaps between justifiable slots grow, but never become infinite.
+As more time passes since finalization, the network gets progressively wider windows
+to accumulate votes. This creates a natural backpressure: if the network is struggling
+to reach a two-thirds majority (e.g., due to partitions or validator dropouts), the increasing
+gaps give more time for the supermajority to form.</p>
+<h2 id="finalization"><a class="header" href="#finalization">Finalization</a></h2>
+<p>A justified checkpoint becomes <strong>finalized</strong> when it is the source of a justification
+whose target is the <strong>next justifiable slot</strong>. In other words, there must be <strong>no
+justifiable slots between source and target</strong>: the two must be consecutive entries in
+the justifiability schedule.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> The <code>try_finalize()</code> function iterates over slots between
+source and target and calls <code>slot_is_justifiable_after</code> on each. If any slot
+is justifiable, finalization fails (source and target aren’t consecutive).
+The check uses <code>original_finalized_slot</code> (the finalized slot at the start of
+block processing), not the current one, since finalization can advance
+mid-processing.</p>
+</blockquote>
+<pre><code class="language-text">                    FINALIZATION CHECK
+                    ──────────────────
+
+    Example 1: Finalization FAILS
+
+    Finalized=10   Source=13 (justified)   Target=16 (justified)
+
+    [ 10 ] · · · [ 13 ]  14   15  [ 16 ]
+                          ▲    ▲
+                          │    └── delta=5 ≤ 5 → justifiable!
+                          └────── delta=4 ≤ 5 → justifiable!
+
+    Justifiable slots exist between S and T → NOT FINALIZED ✗
+    (13 and 16 are not consecutive justifiable slots)
+
+
+    Example 2: Finalization SUCCEEDS
+
+    Finalized=10   Source=16 (justified)   Target=19 (justified)
+
+    [ 10 ] · · · [ 16 ]  17   18  [ 19 ]
+                          ▲    ▲
+                          │    └── delta=8 → not justifiable ✓
+                          └────── delta=7 → not justifiable ✓
+
+    No justifiable slots between S and T → S is FINALIZED ✓
+    (16 and 19 are consecutive: delta=6=2×3, then delta=9=3²)
+</code></pre>
+<p>The reasoning: if a justifiable slot exists between source and target, validators
+could have directed their votes to that intermediate slot instead, potentially on a
+different fork. By requiring source and target to be consecutive justifiable slots,
+the protocol ensures that no alternative justification path can exist between them.</p>
+<h3 id="justifiable-slot-backoff"><a class="header" href="#justifiable-slot-backoff">Justifiable Slot Backoff</a></h3>
+<p>The justifiability schedule acts as a backoff mechanism to increase finalization rate
+during periods of asynchrony. By “diluting” the possible targets of a justification
+vote (via the <code>slot_is_justifiable_after</code> function), the protocol increases the window
+during which votes for a given slot can be included, improving the chances of achieving
+the required two-thirds majority.</p>
+<p>Since finalization requires two consecutively justifiable slots to both be justified,
+this backoff isn’t immediately reset after finalization occurs; it only lowers over
+time when synchrony is restored.</p>
+<p><strong>Example:</strong> Extended asynchrony with gradual recovery.</p>
+<pre><code>    F=0. Justifiable slots grow sparser as delta increases:
+
+    delta ≤ 5:     0   1   2   3   4   5                  (gap = 1)
+    delta 6–20:    6       9       12          16          20   (gap = 3–4)
+    delta 20–36:   20          25          30              36   (gap = 5–6)
+    ...
+    delta ~1000:   900     930     961     992      1024        (gap = 30–32)
+                   30²    30×31   31²    31×32      32²
+</code></pre>
+<p><strong>Phase 1: Long asynchrony, slow progress.</strong></p>
+<pre><code>    Validators vote, but with many justifiable targets, votes scatter
+    and no single slot reaches &gt;=2/3. As gaps widen, votes concentrate.
+
+    Near slot 1000, the 32-slot gap between 992 and 1024 means
+    no competing justifiable target exists for 32 slots after 992.
+    All votes funnel toward 1024 once it is built.
+</code></pre>
+<p><strong>Phase 2: Slot 992 finalized.</strong></p>
+<pre><code>    Slot 992 justified (source = earlier justified slot).
+    Slot 1024 justified (source = 992).
+
+    slot:  0  ...  992              1024
+           F        J    ·······     J
+                    ▲                ▲
+                 source ──────────▶ target
+
+    Slots 993–1023: any justifiable from F=0?
+      Perfect squares? 31²=961 (before), 32²=1024 (boundary). None.
+      Pronic? 31×32=992 (boundary), 32×33=1056 (after). None.
+    No justifiable slots between them → slot 992 FINALIZED ✓
+</code></pre>
+<p><strong>Phase 3: Partial reset. Backoff shrinks but doesn’t vanish.</strong></p>
+<pre><code>    New F=992. Justifiable slots shift:
+
+    slot: 992 993 994 995 996 997 998 ··· 1001 ··· 1004 ··· 1008 ··· 1022 ··· 1028
+           F   ✓   ✓   ✓   ✓   ✓   ✓      ✓       ✓       ✓       ✓       ✓
+              ╰── delta ≤ 5 ──╯  2×3     3²      3×4     4²      5×6     6²
+
+    Dense slots 993–998 are already in the past!
+    Near the current slot (~1024), justifiable slots are ~6 apart:
+
+    ...  1022     1028     1034     1041  ...
+         δ=30     δ=36     δ=42     δ=49
+         5×6      6²       6×7      7²
+         └──6──┘  └──6──┘  └──7──┘
+
+    Gaps shrank from 32 → 6, but didn't reset to 1.
+</code></pre>
+<p><strong>Phase 4: Further finalization closes the gap.</strong></p>
+<pre><code>    Justify 1022 and 1028, finalize 1022. New F=1022.
+
+    From F=1022, at slot ~1028 (delta = 6):
+
+    slot:  1022  1023  1024  1025  1026  1027  1028
+            F     ✓     ✓     ✓     ✓     ✓     ✓
+                  ╰────── delta ≤ 5 ──────╯    2×3
+
+    Gaps are back to 1. Fast finalization resumes.
+
+    Summary of gradual recovery:
+
+    ┌───────────────────┬──────┬───────┬───────┬──────────────┐
+    │ Finalization step │  F   │ Head  │ Delta │ Nearby gaps  │
+    ├───────────────────┼──────┼───────┼───────┼──────────────┤
+    │ Before any        │    0 │ ~1000 │ ~1000 │ 31–32        │
+    │ After 1st (992)   │  992 │ ~1024 │   ~32 │ 6–7          │
+    │ After 2nd (1022)  │ 1022 │ ~1028 │    ~6 │ 1            │
+    └───────────────────┴──────┴───────┴───────┴──────────────┘
+
+    Each finalization step reduces the delta between the finalized
+    slot and the chain head, progressively tightening the gaps.
+</code></pre>
+<p>When finalization advances, the following cleanup occurs:</p>
+<ul>
+<li><code>justified_slots</code> window shifts forward (old slots pruned)</li>
+<li><code>LiveChain</code> entries for finalized slots are pruned</li>
+<li>Gossip signatures and aggregation proofs for finalized blocks are cleaned up</li>
+<li>Future fork choice runs start from the finalized slot’s successor</li>
+</ul>
+<blockquote>
+<p><strong>In ethlambda:</strong> The <code>justified_slots</code> bitlist uses relative indexing (index 0 =
+<code>finalized_slot + 1</code>). When finalization advances, <code>shift_window()</code> in
+<code>crates/blockchain/state_transition/src/justified_slots_ops.rs</code> drops the
+now-finalized prefix. The attestation target is also walked back to the nearest
+justifiable slot via <code>slot_is_justifiable_after</code> in <code>crates/blockchain/src/store.rs</code>.</p>
+</blockquote>
+<h2 id="end-to-end-from-head-selection-to-finalization"><a class="header" href="#end-to-end-from-head-selection-to-finalization">End-to-End: From Head Selection to Finalization</a></h2>
+<p>This section connects <a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST fork choice</a> with 3SF-mini.
+The <a href="#quick-example-three-slots-to-finality">quick example above</a> showed the happy
+path; here we focus on what happens when things go wrong.</p>
+<h3 id="recap-attestation-anatomy"><a class="header" href="#recap-attestation-anatomy">Recap: Attestation Anatomy</a></h3>
+<p>Each attestation carries three checkpoints, each determined by a different mechanism:</p>
+<pre><code class="language-text">    ┌────────────────────────────────────────────────────────────────┐
+    │                       ATTESTATION                              │
+    │                                                                │
+    │  head    Newest block the validator sees                       │
+    │          ← LMD-GHOST with min_score = 0                        │
+    │                                                                │
+    │  target  Block the validator wants justified next              │
+    │          ← Derived from safe target, walked back to nearest    │
+    │            justifiable slot (feeds into 3SF-mini)              │
+    │                                                                │
+    │  source  Latest justified checkpoint                           │
+    │          ← Read from store state                               │
+    └────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>The <strong>safe target</strong> is computed by running LMD-GHOST with a two-thirds vote threshold.
+Only blocks backed by a supermajority qualify, so the safe target is always at or
+behind the head. The attestation <strong>target</strong> is derived by walking back from the head
+toward the safe target (max 3 steps), then to the nearest justifiable slot. See
+<a href="#safe-target-selection">Safe Target Selection</a> for details.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> <code>get_attestation_target()</code> in <code>crates/blockchain/src/store.rs</code>
+implements this walk-back. <code>JUSTIFICATION_LOOKBACK_SLOTS = 3</code> provides a liveness
+guarantee: even if the safe target is stuck, the target eventually advances once
+the head moves far enough ahead.</p>
+</blockquote>
+<h3 id="lagging-safe-target-fork-with-delayed-convergence"><a class="header" href="#lagging-safe-target-fork-with-delayed-convergence">Lagging Safe Target (Fork with Delayed Convergence)</a></h3>
+<p>When validators disagree about the head, the safe target lags behind: no single
+branch has two-thirds support. This delays justification until the fork resolves.</p>
+<pre><code class="language-text">    Setup: 9 validators, finalized=100, justified=101
+    Safe target threshold: &gt;=6 votes (2/3 of 9)
+</code></pre>
+<p><strong>Slots 102–103: Fork splits votes. No progress.</strong></p>
+<pre><code class="language-text">                         ┌──[ B102a ]──[ B103a ]     V0–V4 (5)
+    [ F=100 ]──[ J=101 ]─┤
+                         └──[ B102b ]──[ B103b ]     V5–V8 (4)
+</code></pre>
+<p>Neither branch clears two-thirds → safe target stuck at B101. Walk-back from head
+always lands on source (B101). <strong>No attestation can advance justification.</strong></p>
+<p><strong>Slot 104: V7 and V8 switch sides. Fork resolves.</strong></p>
+<p>V7 and V8 receive B102a (delayed by the partition) and switch to the a-branch.</p>
+<pre><code class="language-text">                         ┌──[ B102a ]──[ B103a ]──[ B104a ]     V0–V4, V7, V8 (7)
+    [ F=100 ]──[ J=101 ]─┤
+                         └──[ B102b ]──[ B103b ]──[ B104b ]     V5–V6  (2)
+</code></pre>
+<p>B102a subtree now has 7 votes &gt;= 6 → <strong>safe target = B102a</strong>. Walk-back from B104a
+lands on B102a (2 steps). Slot 102 is justifiable (delta=2 ≤ 5).</p>
+<pre><code class="language-text">    source=101 ──▶ target=102    7/9 votes → 3×7=21 &gt;= 2×9=18 → JUSTIFIED ✓
+    Finalization: no slots between 101 and 102 → 101 FINALIZED ✓
+</code></pre>
+<p>After slot 104: <strong>finalized=101, justified=102.</strong></p>
+<p><strong>Slots 105–106: Full convergence and recovery.</strong></p>
+<p>All 9 validators on the a-branch. Slot 105: target=B104a → <strong>B104a JUSTIFIED</strong>.
+But finalization fails: slot 103 (between source=102 and target=104) is justifiable
+but was never justified (lost in the fork).</p>
+<p>Slot 106: target=B105a → <strong>B105a JUSTIFIED</strong>. No justifiable slots between 104 and
+105 → <strong>104 FINALIZED</strong>. Finalization jumped from 101 to 104, skipping 102 and 103.</p>
+<pre><code class="language-text">    FORK WITH DELAYED CONVERGENCE
+    ═════════════════════════════
+
+    Slot:     100   101   102   103   104   105   106
+    Status:    F     J     ·     ·     ·     ·     ·
+                                fork ──────┤
+                                          resolves
+    Head:      ·    B101  B102a B103a B104a B105a B106a
+    Safe:      ·    B100  B101  B101  B102a B104a B105a
+                          stuck ─────┘  ▲
+                                        │
+                           V7+V8 switch, safe target unsticks
+
+    Justified:  ·    101   ─     ─    102   104   105
+    Finalized:  ·     ·    ─     ─    101   ─     104
+                                                   ▲
+                              finalization jumps ──┘
+                               (102,103 skipped; 103 was never justified)
+</code></pre>
+<h2 id="comparison-with-casper-ffg"><a class="header" href="#comparison-with-casper-ffg">Comparison with Casper FFG</a></h2>
+<p>Both 3SF-mini and Casper FFG are finality gadgets built on the same foundation:
+supermajority links between checkpoints. They differ fundamentally in their unit of
+time and what that implies for validator participation. For a thorough treatment of
+Casper FFG as used in Ethereum, see the
+<a href="https://eth2book.info/capella/part2/consensus/casper_ffg/">eth2book chapter on Casper FFG</a>.</p>
+<h3 id="slots-vs-epochs-the-core-architectural-split"><a class="header" href="#slots-vs-epochs-the-core-architectural-split">Slots vs Epochs: The Core Architectural Split</a></h3>
+<p><strong>3SF-mini: Every Validator, Every Slot</strong></p>
+<p>In 3SF-mini, <strong>all validators vote in every slot</strong>. A checkpoint can be justified at
+any slot (subject to the justifiability schedule), and finalization can happen as soon
+as two consecutive justifiable slots are both justified.</p>
+<pre><code class="language-text">    3SF-mini  (4-second slots, 4 validators)
+
+    Slot 100        Slot 101        Slot 102        Slot 103
+    ┌───────┐       ┌───────┐       ┌───────┐       ┌───────┐
+    │V0 V1  │       │V0 V1  │       │V0 V1  │       │V0 V1  │
+    │V2 V3  │       │V2 V3  │       │V2 V3  │       │V2 V3  │
+    └───┬───┘       └───┬───┘       └───┬───┘       └───┬───┘
+        │               │               │               │
+     4 votes         4 votes         4 votes         4 votes
+     per slot        per slot        per slot        per slot
+
+    Every validator participates in every slot.
+    &gt;=2/3 threshold checked per-slot → can justify any slot.
+</code></pre>
+<p>This is simple and fast, but it means every validator must produce and verify a vote
+every slot. The total message load scales as <code>validators × slots</code>.</p>
+<p><strong>Casper FFG: Validators Split Across an Epoch</strong></p>
+<p>Ethereum’s beacon chain has ~1,000,000 active validators. Having all of them vote every
+12-second slot would be unmanageable. Instead, Casper FFG groups 32 slots into an
+<strong>epoch</strong>, and splits the validator set across the slots within it:</p>
+<pre><code class="language-text">    Casper FFG  (12-second slots, 32 per epoch, ~900k validators)
+
+    Epoch N
+    ┌─────────────────────────────────────────────────────────────┐
+    │ Slot 0     Slot 1     Slot 2    ...    Slot 30    Slot 31   │
+    │ ┌──────┐   ┌──────┐   ┌──────┐        ┌──────┐   ┌──────┐   │
+    │ │~28125│   │~28125│   │~28125│  ...   │~28125│   │~28125│   │
+    │ │valids│   │valids│   │valids│        │valids│   │valids│   │
+    │ └──┬───┘   └──┬───┘   └──┬───┘        └──┬───┘   └──┬───┘   │
+    │    │           │           │               │           │    │
+    └────┼───────────┼───────────┼───────────────┼───────────┼────┘
+         └───────────┴───────────┴───┬───────────┴───────────┘
+                                     │
+                            All ~900k votes
+                          collected over 32 slots
+                                     │
+                                     ▼
+                              Epoch checkpoint
+                              (first slot of epoch)
+
+    Each validator attests exactly ONCE per epoch.
+    The full &gt;=2/3 tally is only meaningful at epoch boundaries.
+</code></pre>
+<p>Each validator is shuffled into a <strong>committee</strong> assigned to one specific slot. Within
+that slot, the committee may be further split (up to 64 sub-committees) for parallel
+aggregation. The result: each validator only attests once per epoch, and the network
+processes ~28,000 attestations per slot instead of ~900,000.</p>
+<p><strong>The trade-off:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>3SF-mini</strong></th><th><strong>Casper FFG</strong></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Who votes when</strong></td><td>All validators, every slot</td><td>Each validator once per epoch (in its assigned slot)</td></tr>
+<tr><td><strong>Messages per slot</strong></td><td><code>N</code> (all validators)</td><td><code>N / 32</code> (one committee)</td></tr>
+<tr><td><strong>Supermajority known after</strong></td><td>1 slot (all votes in)</td><td>1 epoch (need all 32 committees)</td></tr>
+<tr><td><strong>Fastest finalization</strong></td><td>2 slots = <strong>8 seconds</strong></td><td>2 epochs = <strong>~12.8 minutes</strong></td></tr>
+<tr><td><strong>Practical validator limit</strong></td><td>Hundreds–thousands</td><td>Millions</td></tr>
+</tbody>
+</table>
+</div>
+<p>Epochs exist because of a scalability constraint, not a protocol-theory preference. If
+you could process a million votes per slot, Casper FFG wouldn’t need epochs at all. 3SF-mini
+sidesteps this by targeting a smaller validator set, which lets it operate at slot granularity.</p>
+<h3 id="finalization-logic"><a class="header" href="#finalization-logic">Finalization Logic</a></h3>
+<p>Both require a chain of justified checkpoints, but the rules differ in what they check.</p>
+<p><strong>Casper FFG</strong> uses <strong>k-finality</strong>. The original rule (k=1) requires a direct supermajority
+link from a checkpoint to its immediate successor: justify epoch N+1 with source=N, and N
+is finalized. Ethereum generalizes this to <strong>k=2</strong>, which handles the case where the network
+falls slightly behind:</p>
+<pre><code class="language-text">    Casper FFG — 1-finality (ideal case):
+
+    Epoch N       Epoch N+1
+    ┌─────┐       ┌─────┐
+    │ CP  │══════▶│ CP  │       Supermajority link N → N+1
+    │ J ✓ │       │     │
+    └─────┘       └─────┘
+
+    Processing this link:
+      1. Epoch N+1 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (direct successor justified)
+
+
+    Casper FFG — 2-finality (one epoch behind):
+
+    Epoch N       Epoch N+1     Epoch N+2
+    ┌─────┐       ┌─────┐       ┌─────┐
+    │ CP  │       │ CP  │       │ CP  │
+    │ J ✓ │       │ J ✓ │       │     │
+    └─────┘       └─────┘       └─────┘
+       │                           │
+       └══════ supermajority ══════┘
+               link N → N+2
+
+    The direct link N→N+1 didn't form in time.
+    Instead, a link forms from N→N+2. Processing this link:
+      1. Epoch N+2 becomes JUSTIFIED (target of a supermajority link)
+      2. Epoch N becomes FINALIZED (all intermediates are justified)
+</code></pre>
+<p>The 2-finality rule is a recovery mechanism: even if the network missed the ideal one-epoch
+finalization window, it gets a second chance. Ethereum tracks the justification status of the
+last 4 epoch boundaries to detect both cases. In practice, most finalization happens via
+1-finality during normal operation; 2-finality kicks in during brief network hiccups.</p>
+<p><strong>3SF-mini</strong> takes a different approach entirely:</p>
+<pre><code class="language-text">    Slot S        Slot T
+    ┌─────┐       ┌─────┐
+    │ CP  │──────▶│ CP  │       No justifiable slots exist
+    │ J ✓ │       │ J ✓ │       between S and T
+    └─────┘       └─────┘
+    ∴ Slot S is FINALIZED
+
+    Rule: Finalized when NO intermediate checkpoints could exist
+</code></pre>
+<p>Instead of checking that intermediate checkpoints <em>are justified</em>, 3SF-mini checks that no
+intermediate checkpoints <em>could exist at all</em>. This is a stronger guarantee: validators’
+votes between source and target could only have gone to the target, since there’s nowhere else
+to direct them. This structural property is also why 3SF-mini doesn’t need Casper’s
+surround-vote slashing condition.</p>
+<p>Casper’s k-finality is essentially a tolerance parameter: “how many epochs behind can we be
+and still finalize?” Ethereum chose k=2, meaning it tolerates one missed epoch. 3SF-mini
+doesn’t need this concept because the justifiability schedule itself adapts. Instead of
+tolerating missed windows, it makes the windows wider when the network is struggling.</p>
+<h3 id="adaptive-backoff-unique-to-3sf-mini"><a class="header" href="#adaptive-backoff-unique-to-3sf-mini">Adaptive Backoff (unique to 3SF-mini)</a></h3>
+<p>Casper FFG has a fixed checkpoint every epoch, regardless of network conditions. 3SF-mini’s
+justifiability schedule adapts: gaps between justifiable slots grow under prolonged asynchrony
+(via the perfect square and pronic number rules), creating natural vote concentration when the
+network is struggling to reach a two-thirds majority. Casper FFG has no equivalent; its epoch spacing is the
+same whether the network is healthy or partitioned. See
+<a href="#justifiable-slot-backoff">Justifiable Slot Backoff</a> for a detailed walkthrough.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="-lmd-ghost-fork-choice-algorithm"><a class="header" href="#-lmd-ghost-fork-choice-algorithm">👻 LMD-GHOST fork choice algorithm</a></h1>
+<p>A deep dive into how the <strong>LMD-GHOST</strong> (Latest Message Driven, Greedy Heaviest Observed SubTree)
+fork choice algorithm works. LMD-GHOST is the fork choice rule used by Ethereum’s consensus layer
+and its derivatives. Each validator’s <strong>latest attestation</strong> is their single active vote, and the
+algorithm follows the heaviest branch at every fork.</p>
+<p>This document is implementation-agnostic, with ethlambda-specific details called out in
+blockquotes marked <strong>“In ethlambda”</strong>.</p>
+<blockquote>
+<p>Much of the conceptual framing in this document is inspired by Ben Edgington’s
+<a href="https://eth2book.info/">Eth2 Book</a>, particularly the
+<a href="https://eth2book.info/latest/part2/consensus/lmd_ghost/">LMD GHOST chapter</a>.
+Highly recommended reading for anyone interested in Ethereum consensus.</p>
+</blockquote>
+<hr>
+<h2 id="background--history"><a class="header" href="#background--history">Background &amp; History</a></h2>
+<p>The GHOST protocol was introduced by <strong>Sompolinsky and Zohar</strong> in a
+<a href="https://eprint.iacr.org/2013/881.pdf">2013 paper</a>. Its core idea: instead of choosing the heaviest chain,
+we choose the <strong>heaviest subtree</strong>, counting orphaned blocks as evidence of support for
+their ancestors.</p>
+<p>The “LMD” in LMD-GHOST stands for <strong>Latest Message Driven</strong>: only each validator’s
+<strong>most recent</strong> attestation counts, preventing vote amplification. LMD-GHOST is the
+fork choice rule used by the Ethereum Beacon Chain and Lean Ethereum.</p>
+<hr>
+<h2 id="why-fork-choice"><a class="header" href="#why-fork-choice">Why Fork Choice?</a></h2>
+<p>In a distributed system where validators propose blocks concurrently, the blockchain can
+fork: two valid blocks may appear at the same slot, creating competing chains. The
+<strong>fork choice rule</strong> answers a critical question:</p>
+<blockquote>
+<p><em>Which chain tip should I follow?</em></p>
+</blockquote>
+<pre><code class="language-text">                   ┌──────────┐
+             ┌────▶│ Block C  │  ← Chain tip 1
+             │     │ slot 5   │
+┌──────────┐ │     └──────────┘
+│ Block A  │─┤
+│ slot 3   │ │     ┌──────────┐
+└──────────┘ └────▶│ Block D  │  ← Chain tip 2
+                   │ slot 5   │
+                   └──────────┘
+
+                    Which tip should validators follow?
+</code></pre>
+<p>Every node in the network must be able to independently arrive at the same answer using
+only its local view of blocks and attestations. The fork choice rule is what makes this
+possible. It is a deterministic function from a node’s observed state to a single chain tip.</p>
+<hr>
+<h2 id="from-heaviest-chain-to-heaviest-subtree"><a class="header" href="#from-heaviest-chain-to-heaviest-subtree">From Heaviest Chain to Heaviest Subtree</a></h2>
+<p>The simplest fork choice rule is <strong>heaviest chain</strong>: follow the chain tip with the most
+accumulated weight. This works when fork rates are low, but breaks down when honest
+validators fork within a common branch:</p>
+<pre><code class="language-text">              HEAVIEST CHAIN vs HEAVIEST SUBTREE
+              ──────────────────────────────────
+
+    An attacker with 40% of stake forks at A.
+    The honest majority (60%) builds on B but forks into C and D:
+
+                    ┌───B──┬──C     V0, V1, V2 vote for C (30%)
+              A ────┤      └──D     V3, V4, V5 vote for D (30%)
+                    │
+                    └───X──Y──Z     V6, V7, V8, V9 vote for Z (40%)
+
+    Heaviest chain:
+      Z has 40% of votes, C and D each have 30%.
+      Attacker wins! ✗
+
+    Heaviest subtree (LMD-GHOST):
+      At A: B subtree has 60% (C + D), X subtree has 40%.
+      Pick B. Then at B: C has 30%, D has 30% (tiebreaker).
+      Honest majority wins. ✓
+</code></pre>
+<p>LMD-GHOST is strictly better when honest validators fork within a common subtree.
+Instead of requiring all honest validators to agree on a single chain tip (which is
+impossible under network delay), it aggregates their support at each level of the tree.</p>
+<h3 id="how-subtree-weight-works-the-ghost-part"><a class="header" href="#how-subtree-weight-works-the-ghost-part">How Subtree Weight Works (the “GHOST” Part)</a></h3>
+<p>The key insight behind the “Heaviest Observed SubTree” part of LMD-GHOST:
+<strong>a vote for a block is implicitly a vote for all its ancestors.</strong></p>
+<p>When a validator attests to block F as their head, they are also expressing support
+for every block on the path from the root to F:</p>
+<pre><code class="language-text">    Validator attests: head = F
+
+    A ── B ── C ── D ── E ── F
+    ▲    ▲    ▲    ▲    ▲    ▲
+    │    │    │    │    │    │
+    └────┴────┴────┴────┴────┘
+    All ancestors implicitly supported
+</code></pre>
+<p>This is why LMD-GHOST counts the <strong>subtree</strong> weight: a block’s weight includes every
+attestation for any of its descendants, because those attestations implicitly endorse
+the ancestor too. The algorithm exploits this by walking backward from each attested
+head and incrementing every block along the path.</p>
+<hr>
+<h2 id="lmd-why-only-the-latest-message"><a class="header" href="#lmd-why-only-the-latest-message">LMD: Why Only the Latest Message?</a></h2>
+<p>The “LMD” in LMD-GHOST stands for <strong>Latest Message Driven</strong>. Each validator’s <strong>most
+recent</strong> attestation is their only vote. All previous attestations are discarded.</p>
+<pre><code class="language-text">    Validator 7's attestation history:
+
+    Slot 10: attests to head = B     ← discarded
+    Slot 11: attests to head = C     ← discarded
+    Slot 12: attests to head = E     ← THIS is the active vote
+
+    Only the slot 12 attestation counts for fork choice.
+</code></pre>
+<p>Why only the latest? Two reasons:</p>
+<ol>
+<li>
+<p><strong>Prevents double-voting.</strong> If all messages counted, a validator could cast many
+attestations and amplify their influence. With LMD, each validator gets exactly one
+active vote regardless of how many attestations they’ve broadcast.</p>
+</li>
+<li>
+<p><strong>Reflects current knowledge.</strong> A validator’s latest attestation reflects their most
+recent view of the chain. Older attestations may reference blocks that are no longer
+on the best chain. Keeping only the latest ensures fork choice uses the most up-to-date
+information.</p>
+</li>
+</ol>
+<p>The fork choice store maintains a mapping of <code>validator_index → latest attestation</code>.
+When a new attestation arrives from a validator, it <strong>replaces</strong> their previous entry:</p>
+<pre><code class="language-text">    Fork choice store (latest messages):
+
+    ┌──────────────┬──────────────────────────────┐
+    │ Validator    │ Latest Attestation           │
+    ├──────────────┼──────────────────────────────┤
+    │ 0            │ head=E, target=C, source=A   │
+    │ 1            │ head=D, target=C, source=A   │
+    │ 2            │ head=E, target=C, source=A   │
+    │ 3            │ head=F, target=D, source=A   │
+    │ ...          │ ...                          │
+    └──────────────┴──────────────────────────────┘
+
+    One row per validator. New attestation → overwrite row.
+</code></pre>
+<hr>
+<h2 id="lmd-ghost-step-by-step"><a class="header" href="#lmd-ghost-step-by-step">LMD-GHOST Step by Step</a></h2>
+<p>The algorithm takes a set of inputs and produces a single block root: the head of
+the chain.</p>
+<h3 id="inputs"><a class="header" href="#inputs">Inputs</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Input</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Start root</td><td>The justified checkpoint (root of the subtree to search)</td></tr>
+<tr><td>Block tree</td><td>The set of known blocks: root → (slot, parent)</td></tr>
+<tr><td>Attestations</td><td>Latest message per validator: validator_index → attestation</td></tr>
+<tr><td>Min score</td><td>Minimum weight for a branch to be considered (0 = follow any branch; higher = conservative)</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>In ethlambda:</strong> The function is <code>compute_lmd_ghost_head()</code> in
+<code>crates/blockchain/fork_choice/src/lib.rs</code>. The block tree comes from
+the <code>LiveChain</code> storage index, and <code>min_score</code> is 0 for head selection
+or ⌈2V/3⌉ for safe target computation.</p>
+</blockquote>
+<h3 id="the-algorithm"><a class="header" href="#the-algorithm">The Algorithm</a></h3>
+<p>First, <strong>accumulate weights.</strong> Each attestation “paints” the path from its head back
+to the start root. In the simplest form (equal-weight validators), this adds +1 to
+every block on the path. In systems with balance-weighted voting, the validator’s
+effective balance is added instead.</p>
+<pre><code class="language-text">    Validator 0 attests to head = F
+
+      J ─ A ─ B ─ C ─ D ─ E ─ F       (J = justified root)
+          +1  +1  +1  +1  +1  +1       J is at start_slot, not counted
+
+    Validator 1 attests to head = D
+
+      J ─ A ─ B ─ C ─ D
+          +1  +1  +1  +1
+
+    Accumulated weights:
+
+      Block:    J    A    B    C    D    E    F
+      Weight:   ─    2    2    2    2    1    1
+                │
+                └ start_root (not weighted, used as the descent origin)
+</code></pre>
+<blockquote>
+<p><strong>In ethlambda:</strong> All validators have equal weight (+1 per vote). The Ethereum
+Beacon Chain instead weights votes by effective balance (up to 2048 ETH).</p>
+</blockquote>
+<p>Then, <strong>greedily descend.</strong> Starting from the start root, at each node pick the child
+with the most weight. Repeat until reaching a leaf:</p>
+<pre><code class="language-text">    J ──┬── B (5)   ← pick B (higher weight)
+        └── G (2)
+
+    B ──┬── C (3)   ← pick C (higher weight)
+        └── H (2)
+
+    C ──── D (3)    ← only child, continue
+
+    D ── (no children) → HEAD = D!
+</code></pre>
+<p>Children below <code>min_score</code> are ignored during the descent. With <code>min_score = 0</code>
+(normal head selection) all children are visible. With a higher threshold, only
+branches with strong support are followed. This is used for
+<a href="#safe-target-selection">safe target selection</a>.</p>
+<h3 id="the-tiebreaker"><a class="header" href="#the-tiebreaker">The Tiebreaker</a></h3>
+<p>When two children have exactly equal weight, a deterministic tiebreaker is needed.
+Without one, different nodes could pick different heads from the same data, breaking
+consensus. The tiebreaker is <strong>lexicographically higher block root hash</strong>, i.e.,
+higher hash value wins.</p>
+<pre><code class="language-text">    Equal weight scenario:
+
+        Parent
+        │
+    ┌───┴───┐
+    B (3)   C (3)         ← Equal weight!
+    root:   root:
+    0x3a..  0x7f..        ← 0x7f &gt; 0x3a, so pick C
+</code></pre>
+<p>The choice of “higher hash wins” is a convention. Any deterministic rule would work;
+what matters is that all nodes apply the same one.</p>
+<hr>
+<h2 id="worked-example-head-selection"><a class="header" href="#worked-example-head-selection">Worked Example: Head Selection</a></h2>
+<p>Consider a network with <strong>5 validators</strong> (indices 0–4) and the following block tree
+rooted at the justified checkpoint <code>J</code> at slot 10:</p>
+<pre><code class="language-text">                          BLOCK TREE
+                          ──────────
+
+Slot 10     ┌──────┐
+(justified) │  J   │ ← Justified checkpoint (start_root)
+            └──┬───┘
+               │
+Slot 11     ┌──┴───┐
+            │  A   │
+            └──┬───┘
+            ┌──┴────────┐
+            │           │
+Slot 12  ┌──┴───┐    ┌──┴───┐
+         │  B   │    │  C   │
+         └──┬───┘    └──┬───┘
+            │           │
+Slot 13  ┌──┴───┐    ┌──┴───┐
+         │  D   │    │  E   │
+         └──────┘    └──────┘
+</code></pre>
+<p><strong>Latest attestations (one per validator):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Validator</th><th>Attested Head</th><th>Path back from head to J</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>D</td><td>D → B → A → (J)</td></tr>
+<tr><td>1</td><td>D</td><td>D → B → A → (J)</td></tr>
+<tr><td>2</td><td>E</td><td>E → C → A → (J)</td></tr>
+<tr><td>3</td><td>E</td><td>E → C → A → (J)</td></tr>
+<tr><td>4</td><td>E</td><td>E → C → A → (J)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Accumulate weights</strong> by walking backward from each attested head, adding +1 per
+block (stopping at J’s slot):</p>
+<pre><code class="language-text">    V0 (head=D):  D+1  B+1  A+1
+    V1 (head=D):  D+1  B+1  A+1
+    V2 (head=E):  E+1  C+1  A+1
+    V3 (head=E):  E+1  C+1  A+1
+    V4 (head=E):  E+1  C+1  A+1
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Block</th><th>Weight</th><th>Explanation</th></tr>
+</thead>
+<tbody>
+<tr><td>A</td><td>5</td><td>On path of all 5 validators</td></tr>
+<tr><td>B</td><td>2</td><td>On path of V0, V1</td></tr>
+<tr><td>C</td><td>3</td><td>On path of V2, V3, V4</td></tr>
+<tr><td>D</td><td>2</td><td>Head of V0, V1</td></tr>
+<tr><td>E</td><td>3</td><td>Head of V2, V3, V4</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Greedily descend</strong> from J, always picking the heaviest child:</p>
+<pre><code class="language-text">    Start at J
+      └─▶ A (only child, weight 5)
+           ├── B (weight 2)
+           └── C (weight 3)  ← Pick C (3 &gt; 2)
+                └─▶ E (only child, weight 3)
+                     └─▶ No children → HEAD = E ✓
+</code></pre>
+<p><strong>Result:</strong> The canonical head is <strong>Block E</strong>. Even though both branches have the same
+depth, the C→E branch has 3 votes vs B→D’s 2 votes.</p>
+<pre><code class="language-text">                          RESOLVED HEAD
+                          ─────────────
+
+Slot 10     ┌──────┐
+            │  J   │
+            └──┬───┘
+               │
+Slot 11     ┌──┴───┐
+            │  A   │ ✓ canonical
+            └──┬───┘
+            ┌──┴────────┐
+            │           │
+Slot 12  ┌──┴───┐    ┌──┴───┐
+         │  B   │    │  C   │ ✓ canonical (weight 3 &gt; 2)
+         └──┬───┘    └──┬───┘
+            │           │
+Slot 13  ┌──┴───┐    ┌──┴───┐
+         │  D   │    │  E   │ ★ HEAD
+         └──────┘    └──────┘
+</code></pre>
+<h3 id="what-if-a-vote-changes"><a class="header" href="#what-if-a-vote-changes">What If a Vote Changes?</a></h3>
+<p>Suppose validator 1 now sees block E and switches their attestation from D to E:</p>
+<pre><code class="language-text">    Before:  V0=D, V1=D, V2=E, V3=E, V4=E   → Head = E (3 vs 2)
+    After:   V0=D, V1=E, V2=E, V3=E, V4=E   → Head = E (4 vs 1)
+
+    The head didn't change, but the margin increased from 1 to 3.
+    If instead V2 and V3 had switched to D:
+
+    After:   V0=D, V1=D, V2=D, V3=D, V4=E   → Head = D (4 vs 1)
+
+    The head reorgs from E to D.
+</code></pre>
+<hr>
+<h2 id="fork-choice-vs-finality"><a class="header" href="#fork-choice-vs-finality">Fork Choice vs Finality</a></h2>
+<p>An important conceptual distinction: <strong>LMD-GHOST provides fork choice, not finality.</strong></p>
+<p>LMD-GHOST gives the network a way to agree on the current head of the chain at any
+moment, but the head can change. A block selected by fork choice today could be
+reorged away tomorrow if attestations shift. LMD-GHOST alone provides no guarantee
+that any block is permanent.</p>
+<p><strong>Finality</strong>, the guarantee that a block can never be reverted, comes from a separate
+mechanism called a <strong>finality gadget</strong>. LMD-GHOST is designed to compose with any
+finality gadget (e.g., Casper FFG in the Ethereum Beacon Chain, or <a href="#3sf-mini-justification--finalization">3SF-mini</a> in Lean Ethereum).</p>
+<pre><code class="language-text">    ┌────────────────────────────────────────────────────┐
+    │                 CONSENSUS = TWO LAYERS             │
+    │                                                    │
+    │  ┌─────────────┐        ┌──────────────────────┐   │
+    │  │  LMD-GHOST  │        │  Finality Gadget     │   │
+    │  │             │        │                      │   │
+    │  │ "Which tip  │        │ "Which blocks are    │   │
+    │  │  is best    │        │  permanent and can   │   │
+    │  │  right now?"│        │  never be reverted?" │   │
+    │  │             │        │                      │   │
+    │  │ Dynamic,    │        │ Monotonic, only      │   │
+    │  │ can reorg   │        │ moves forward        │   │
+    │  └──────┬──────┘        └──────────┬───────────┘   │
+    │         │                          │               │
+    │         └──────────┬───────────────┘               │
+    │                    ▼                               │
+    │         ┌──────────────────┐                       │
+    │         │  Full Consensus  │                       │
+    │         └──────────────────┘                       │
+    └────────────────────────────────────────────────────┘
+</code></pre>
+<blockquote>
+<p><strong>In ethlambda:</strong> The finality gadget is <a href="#3sf-mini-justification--finalization">3SF-mini</a>, which operates at
+the slot level rather than epoch boundaries.</p>
+</blockquote>
+<p>The two layers interact: LMD-GHOST runs its greedy descent <strong>starting from the latest
+justified checkpoint</strong> (not genesis). This means finality constrains fork choice: once
+a checkpoint is finalized, no fork choice run will ever consider blocks before it.</p>
+<pre><code class="language-text">    ┌─────────┐         ┌─────────┐         ┌──── ...
+    │FINALIZED│────────▶│JUSTIFIED│────────▶│  fork choice
+    │ slot 50 │         │ slot 55 │         │  runs here
+    └─────────┘         └─────────┘         └──── ...
+         │                   │
+         │                   └── start_root for LMD-GHOST
+         │
+         └── everything before this is permanent
+</code></pre>
+<p>This has a major practical benefit: <strong>finality allows aggressive pruning of the block
+tree.</strong> Without finality, fork choice would need to consider every block since genesis,
+and the tree would grow without bound. With finality, all blocks at or before the finalized
+checkpoint can be discarded from the fork choice’s working set.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> The <code>LiveChain</code> index (the in-memory block tree used by fork choice)
+is pruned every time finalization advances, keeping it bounded to only the non-finalized
+portion of the chain.</p>
+</blockquote>
+<hr>
+<h2 id="attestation-pipeline"><a class="header" href="#attestation-pipeline">Attestation Pipeline</a></h2>
+<p>In a naive implementation, every attestation would influence fork choice the instant it
+arrives. This creates problems: validators with faster network connections see different
+heads than slower ones, and the proposer’s view of the chain could shift mid-block-construction.</p>
+<p>Lean Ethereum solves this with a <strong>staged promotion pipeline</strong>: attestations are
+collected into a pending set and only promoted to the active fork choice set at
+designated moments. This ensures all validators operate on a consistent view.</p>
+<pre><code class="language-text">                       ATTESTATION LIFECYCLE
+                       ─────────────────────
+
+  ┌──────────────┐       ┌──────────────────┐       ┌──────────────────┐
+  │   Network    │       │    Pending       │       │    Active        │
+  │  (gossip)    │──────▶│  Attestations    │──────▶│  Attestations    │
+  │              │       │                  │       │                  │
+  └──────────────┘       └──────────────────┘       └──────────────────┘
+                                 │                          │
+                          NOT used for               Used for fork choice
+                          fork choice                weight calculations
+                                 │                          │
+                          Promoted at ─────────────▶ designated intervals
+                          fixed points
+</code></pre>
+<blockquote>
+<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, stored
+in <code>LatestNewAttestations</code> and <code>LatestKnownAttestations</code> tables respectively.
+Promotion happens at tick intervals 0 (if proposing) and 3 (end of slot).</p>
+</blockquote>
+<h3 id="why-staged-promotion"><a class="header" href="#why-staged-promotion">Why Staged Promotion?</a></h3>
+<p>The staged design serves two purposes:</p>
+<ol>
+<li>
+<p><strong>Consistency:</strong> All validators promote attestations at the same moments,
+reducing divergence in head selection. Without batching, validators with faster
+network connections would see different heads than slower ones.</p>
+</li>
+<li>
+<p><strong>Proposer fairness:</strong> The proposer computes the block against a known, fixed set
+of attestations. If new attestations could influence fork choice mid-computation,
+different validators might disagree on the head.</p>
+</li>
+</ol>
+<h3 id="on-chain-vs-off-chain-attestations"><a class="header" href="#on-chain-vs-off-chain-attestations">On-Chain vs Off-Chain Attestations</a></h3>
+<p>Attestations arrive from two sources, and how they enter the pipeline matters:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Source</th><th>Enters As</th><th>Reason</th></tr>
+</thead>
+<tbody>
+<tr><td>Network gossip</td><td><strong>Pending</strong></td><td>Must wait for promotion window</td></tr>
+<tr><td>Block body (on-chain)</td><td><strong>Active</strong></td><td>Already consensus-validated</td></tr>
+<tr><td>Proposer’s own attestation</td><td><strong>Pending</strong></td><td>Prevents proposer weight advantage</td></tr>
+</tbody>
+</table>
+</div>
+<p>The proposer’s own attestation enters as pending (not active) deliberately. If it
+were immediately active, the proposer would gain an unfair weight advantage for
+their own block, a circular dependency where proposing a block gives you an extra
+vote toward making that block canonical.</p>
+<hr>
+<h2 id="safe-target-selection"><a class="header" href="#safe-target-selection">Safe Target Selection</a></h2>
+<p>The <strong>safe target</strong> is a conservative head computed with a high weight threshold.
+It constrains the <code>target</code> field in attestations, which feeds into
+<a href="#3sf-mini-justification--finalization">3SF-mini</a> for justification and finalization decisions. Validators
+still vote for the newest head they see (regular LMD-GHOST with <code>min_score = 0</code>)
+in the <code>head</code> field. The safe target only affects which blocks can progress
+toward finality. It is computed by running the same LMD-GHOST algorithm but with
+a non-zero <code>min_score</code> in the filtering phase.</p>
+<pre><code class="language-text">                    SAFE TARGET vs HEAD
+                    ────────────────────
+
+    Regular head (min_score = 0):
+    Follow heaviest branch, even with a slim margin
+
+             ┌── B (3 votes) ← HEAD (3 &gt; 2)
+    J ── A ──┤
+             └── C (2 votes)
+
+
+    Safe target (min_score = ⌈2V/3⌉):
+    Only follow branches with supermajority support
+
+    V = 5 validators, threshold = ⌈10/3⌉ = 4
+
+             ┌── B (3 votes) ← Below threshold (3 &lt; 4), pruned
+    J ── A ──┤
+             └── C (2 votes) ← Below threshold (2 &lt; 4), pruned
+
+    Safe target = A (no children pass threshold)
+</code></pre>
+<p>This means the safe target <strong>lags behind</strong> the head. It only advances when a branch
+accumulates overwhelming support, making it resistant to temporary fluctuations:</p>
+<pre><code class="language-text">    Timeline of safe target vs head:
+
+    Slot:    10    11    12    13    14    15    16
+    Head:    J     A     B     D     D     E     F
+    Safe:    J     J     J     A     A     A     D
+                                                  │
+                        Safe target is always ────┘
+                        at or behind the head
+</code></pre>
+<p>The safe target prevents <a href="#3sf-mini-justification--finalization">3SF-mini</a> from finalizing unstable branches:
+without it, a slim-majority fork could reach justification and finalization before
+the network converges. By requiring supermajority support for the target, only
+branches with strong consensus can progress toward finality, even though
+validators’ head votes freely follow the newest chain tip.</p>
+<hr>
+<h2 id="reorgs"><a class="header" href="#reorgs">Reorgs</a></h2>
+<p>A <strong>reorg</strong> (reorganization) occurs when the fork choice head switches from one branch
+to another. This happens when a competing branch accumulates more attestation weight
+than the current head’s branch.</p>
+<pre><code class="language-text">                    REORG SCENARIO
+                    ──────────────
+
+    Before (head = D):
+
+              ┌── B ── D   ★ HEAD (weight 4)
+    J ── A ──┤
+              └── C ── E      (weight 3)
+
+
+    New attestations arrive, 3 validators switch to E:
+
+              ┌── B ── D      (weight 2)
+    J ── A ──┤
+              └── C ── E   ★ HEAD (weight 5)    ← REORG!
+
+
+    The canonical chain changed from  J─A─B─D  to  J─A─C─E
+    Blocks B and D are no longer canonical (but remain in the block tree).
+</code></pre>
+<p>Reorgs are normal during transient network conditions but should be rare in stable
+operation. They cannot cross a finalization boundary: once a block is finalized, it is
+permanently part of the canonical chain.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> Reorgs are detected by checking whether the old and new heads
+share a common prefix, and tracked via Prometheus metrics
+(<code>lean_fork_choice_reorgs_total</code>).</p>
+</blockquote>
+<hr>
+<h2 id="lmd-ghost-variants"><a class="header" href="#lmd-ghost-variants">LMD-GHOST Variants</a></h2>
+<p>LMD-GHOST is one of several variants that have been proposed and studied. Understanding
+the design space helps explain why LMD was chosen.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variant</th><th>Full Name</th><th>What Counts</th><th>Trade-off</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>IMD</strong></td><td>Immediate Message Driven</td><td>All attestations ever</td><td>Maximizes data but creates unbounded storage and is vulnerable to long-range rewriting</td></tr>
+<tr><td><strong>LMD</strong></td><td>Latest Message Driven</td><td>Only each validator’s most recent attestation</td><td>Good balance: one vote per validator, reflects current view, bounded storage</td></tr>
+<tr><td><strong>FMD</strong></td><td>Fresh Message Driven</td><td>Only attestations from current/previous epoch</td><td>Prevents very old attestations from influencing fork choice, but validators who go offline lose influence immediately</td></tr>
+<tr><td><strong>RLMD</strong></td><td>Recent Latest Message Driven</td><td>Latest attestation, but only if within N epochs</td><td>Parameterized compromise between LMD and FMD; tunable staleness threshold</td></tr>
+</tbody>
+</table>
+</div>
+<p>The Ethereum consensus mini-spec originally used IMD-GHOST but switched to LMD in
+November 2018 due to superior stability properties.</p>
+<pre><code class="language-text">    IMD: All attestations count         LMD: Only latest counts
+
+    V0: slot 5 → head B                V0: slot 5 → head B  (overwritten)
+    V0: slot 8 → head C                V0: slot 8 → head C  ← active
+    V0: slot 11 → head E               V0: slot 11 → head E ← active
+
+    V0 contributes 3 votes!            V0 contributes 1 vote.
+    Validators who attest more          Equal influence regardless
+    often have outsized influence.      of attestation frequency.
+</code></pre>
+<hr>
+<h2 id="ethlambda-implementation-reference"><a class="header" href="#ethlambda-implementation-reference">ethlambda Implementation Reference</a></h2>
+<p>This section covers ethlambda-specific details: scheduling, Beacon Chain differences,
+source code locations, and performance.</p>
+<h3 id="tick-based-scheduling"><a class="header" href="#tick-based-scheduling">Tick-Based Scheduling</a></h3>
+<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>4 intervals</strong> (1 second
+each). Fork choice operations are scheduled at specific intervals:</p>
+<pre><code class="language-text">                          ONE SLOT (4 seconds)
+    ┌──────────────┬──────────────┬──────────────┬──────────────┐
+    │  Interval 0  │  Interval 1  │  Interval 2  │  Interval 3  │
+    │   (t+0s)     │   (t+1s)     │   (t+2s)     │   (t+3s)     │
+    ├──────────────┼──────────────┼──────────────┼──────────────┤
+    │              │              │              │              │
+    │ IF PROPOSER: │ NON-PROPOSER:│ update_safe  │ accept_new   │
+    │  accept new  │  produce     │ _target()    │ _attestations│
+    │  attestations│  attestation │              │ ()           │
+    │  + propose   │              │ (2/3 vote    │              │
+    │  block       │              │  threshold)  │ update_head()│
+    │              │              │              │              │
+    │ update_head()│              │              │              │
+    │              │              │              │              │
+    └──────────────┴──────────────┴──────────────┴──────────────┘
+
+    ◄─────────────── Slot N ──────────────────────────────────────►
+</code></pre>
+<p><strong>Detailed sequence:</strong></p>
+<pre><code class="language-text">    Interval 0 ─ Slot boundary
+    │
+    ├── Am I the proposer for this slot?
+    │   ├── YES: promote new → known attestations
+    │   │        run fork choice → update_head()
+    │   │        build block using known attestations
+    │   │        publish block to network
+    │   └── NO:  (wait for block from proposer)
+    │
+    Interval 1 ─ Attestation production
+    │
+    ├── Non-proposers:
+    │   └── Create attestation with:
+    │       • head   = current fork choice head (newest head)
+    │       • target = derived from safe_target (for 3SF-mini)
+    │       • source = latest_justified checkpoint
+    │       Publish attestation to gossipsub
+    │
+    Interval 2 ─ Safe target update
+    │
+    ├── Recalculate safe_target using 2/3 supermajority threshold
+    │   └── Only blocks with ≥ ⌈2V/3⌉ attestation weight qualify
+    │       (V = total validators)
+    │
+    Interval 3 ─ End of slot
+    │
+    ├── Promote new → known attestations
+    └── Run fork choice → update_head()
+</code></pre>
+<h3 id="differences-from-the-ethereum-beacon-chain"><a class="header" href="#differences-from-the-ethereum-beacon-chain">Differences from the Ethereum Beacon Chain</a></h3>
+<p>ethlambda is a lean consensus client with several simplifications compared to the
+Ethereum Beacon Chain:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspect</th><th>ethlambda</th><th>Ethereum Beacon Chain</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Vote weight</strong></td><td>Equal: 1 vote per validator</td><td>Proportional to effective balance (up to 32 ETH)</td></tr>
+<tr><td><strong>Proposer boost</strong></td><td>None</td><td>Yes: newly proposed blocks get temporary bonus weight</td></tr>
+<tr><td><strong>Equivocation handling</strong></td><td>Not in fork choice</td><td>Equivocating validators’ weight excluded</td></tr>
+<tr><td><strong>Attestation frequency</strong></td><td>Every slot</td><td>Once per epoch</td></tr>
+<tr><td><strong>Committee structure</strong></td><td>All validators attest each slot</td><td>Validators split into per-slot committees</td></tr>
+<tr><td><strong>Slot duration</strong></td><td>4 seconds</td><td>12 seconds</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>No proposer boost.</strong> The Beacon Chain adds a “proposer boost”, a temporary weight bonus
+given to newly proposed blocks to prevent balancing attacks. ethlambda does not implement
+this. Instead, proposer fairness is handled through the two-stage attestation pipeline
+(the proposer’s own attestation enters as “new”, not “known”).</p>
+<p><strong>No balance weighting.</strong> In the Beacon Chain, a validator with 32 ETH of effective balance
+has more fork choice weight than one with 16 ETH. In ethlambda, every validator has exactly
+equal weight (1 vote = 1 unit of weight), simplifying the algorithm and analysis.</p>
+<p><strong>No equivocation discounting.</strong> The Beacon Chain’s fork choice detects validators who
+equivocate (attest to conflicting blocks in the same slot) and excludes their weight. This
+addresses the “nothing at stake” problem where validators can costlessly vote for multiple
+forks. ethlambda does not implement this in its fork choice.</p>
+<h3 id="key-files"><a class="header" href="#key-files">Key Files</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Component</th></tr>
+</thead>
+<tbody>
+<tr><td><code>crates/blockchain/fork_choice/src/lib.rs</code></td><td>Core LMD-GHOST algorithm (<code>compute_lmd_ghost_head</code>)</td></tr>
+<tr><td><code>crates/blockchain/src/store.rs</code></td><td>Store: head update, safe target, attestation promotion</td></tr>
+<tr><td><code>crates/blockchain/src/lib.rs</code></td><td>BlockChain actor: tick scheduling, interval dispatch</td></tr>
+<tr><td><code>crates/common/types/src/attestation.rs</code></td><td><code>AttestationData</code> type (head, target, source, slot)</td></tr>
+<tr><td><code>crates/common/types/src/state.rs</code></td><td><code>Checkpoint</code> (root + slot), <code>State</code></td></tr>
+<tr><td><code>crates/storage/src/api/</code></td><td><code>LiveChain</code> table, <code>StorageBackend</code> trait</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="data-flow-summary"><a class="header" href="#data-flow-summary">Data Flow Summary</a></h3>
+<pre><code class="language-text">     ┌───────────┐         ┌──────────────┐             ┌───────────────┐
+     │ Gossipsub │────────▶│ New          │──(promote)─▶│ Known         │
+     │ (network) │         │ Attestations │             │ Attestations  │
+     └───────────┘         └──────────────┘             └───────┬───────┘
+                                                                │
+     ┌───────────┐                                              │
+     │ LiveChain │──── { root → (slot, parent) } ───────────────┤
+     │  (index)  │                                              │
+     └───────────┘                                              │
+                                                                ▼
+                                                  ┌─────────────────┐
+     ┌───────────┐                                │ compute_lmd_    │
+     │ Justified │──── start_root ───────────────▶│ ghost_head()    │
+     │Checkpoint │                                │                 │
+     └───────────┘                                └────────┬────────┘
+                                                           │
+                                                    ┌──────┴──────┐
+                                                    │             │
+                                                    ▼             ▼
+                                              ┌──────────┐ ┌───────────┐
+                                              │   HEAD   │ │   SAFE    │
+                                              │ (min=0)  │ │  TARGET   │
+                                              └──────────┘ │ (min=2V/3)│
+                                                           └───────────┘
+</code></pre>
+<h3 id="performance-characteristics"><a class="header" href="#performance-characteristics">Performance Characteristics</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Time Complexity</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td>Weight accumulation</td><td>O(A × D)</td><td>A = attestations, D = max chain depth from justified root</td></tr>
+<tr><td>Greedy descent</td><td>O(D × B)</td><td>D = depth, B = max branching factor</td></tr>
+<tr><td>Attestation promotion</td><td>O(V)</td><td>V = total validators</td></tr>
+<tr><td>LiveChain lookup</td><td>O(B)</td><td>B = non-finalized blocks</td></tr>
+</tbody>
+</table>
+</div>
+<p>In practice with a small validator set and bounded non-finalized chain length,
+all operations complete in sub-millisecond time. The <code>// TODO: add proto-array implementation</code> comment in the source indicates a future optimization path:
+proto-array is an O(1) amortized fork choice algorithm used by most Beacon Chain
+clients.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="metrics"><a class="header" href="#metrics">Metrics</a></h1>
+<p>We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at <code>http://&lt;http_address&gt;:&lt;metrics_port&gt;/metrics</code> (default: <code>http://127.0.0.1:5054/metrics</code>).</p>
+<p>A ready-to-use Grafana + Prometheus monitoring stack with pre-configured <a href="https://github.com/leanEthereum/leanMetrics">leanMetrics</a> dashboards is available in <a href="https://github.com/blockblaz/lean-quickstart">lean-quickstart</a>.</p>
+<p>The exposed metrics follow <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">the leanMetrics specification</a>, with some metrics not yet implemented. We have a full list of implemented metrics below, with a checkbox indicating whether each metric is currently supported or not.</p>
+<h2 id="node-info-metrics"><a class="header" href="#node-info-metrics">Node Info Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_node_info</code></td><td>Gauge</td><td>Node information (always 1)</td><td>On node start</td><td>name, version</td><td>✅</td></tr>
+<tr><td><code>lean_node_start_time_seconds</code></td><td>Gauge</td><td>Start timestamp</td><td>On node start</td><td></td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="pq-signature-metrics"><a class="header" href="#pq-signature-metrics">PQ Signature Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_pq_sig_attestation_signatures_total</code></td><td>Counter</td><td>Total number of individual attestation signatures</td><td>On each attestation signing</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_attestation_signatures_valid_total</code></td><td>Counter</td><td>Total number of valid individual attestation signatures</td><td>On each attestation signature verification</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_attestation_signatures_invalid_total</code></td><td>Counter</td><td>Total number of invalid individual attestation signatures</td><td>On each attestation signature verification</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_attestation_signing_time_seconds</code></td><td>Histogram</td><td>Time taken to sign an attestation</td><td>On each attestation signing</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_attestation_verification_time_seconds</code></td><td>Histogram</td><td>Time taken to verify an attestation signature</td><td>On each attestation signature verification</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_aggregated_signatures_total</code></td><td>Counter</td><td>Total number of aggregated signatures</td><td>On aggregated signature production</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_aggregated_signatures_valid_total</code></td><td>Counter</td><td>Total number of valid aggregated signatures</td><td>On aggregated signature verification</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_aggregated_signatures_invalid_total</code></td><td>Counter</td><td>Total number of invalid aggregated signatures</td><td>On aggregated signature verification</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_attestations_in_aggregated_signatures_total</code></td><td>Counter</td><td>Total number of attestations included into aggregated signatures</td><td>On aggregated signature production</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_aggregated_signatures_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build an aggregated attestation signature</td><td>On aggregated signature production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4</td><td>✅</td></tr>
+<tr><td><code>lean_pq_sig_aggregated_signatures_verification_time_seconds</code></td><td>Histogram</td><td>Time taken to verify an aggregated attestation signature</td><td>On aggregated signature verification</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="fork-choice-metrics"><a class="header" href="#fork-choice-metrics">Fork-Choice Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_head_slot</code></td><td>Gauge</td><td>Latest slot of the lean chain</td><td>On get fork choice head</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_current_slot</code></td><td>Gauge</td><td>Current slot of the lean chain</td><td>On scrape</td><td></td><td></td><td>✅(*)</td></tr>
+<tr><td><code>lean_safe_target_slot</code></td><td>Gauge</td><td>Safe target slot</td><td>On safe target update</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_fork_choice_block_processing_time_seconds</code></td><td>Histogram</td><td>Time taken to process block</td><td>On fork choice process block</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1, 1.25, 1.5, 2, 4</td><td>✅</td></tr>
+<tr><td><code>lean_attestations_valid_total</code></td><td>Counter</td><td>Total number of valid attestations</td><td>On validate attestation</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_attestations_invalid_total</code></td><td>Counter</td><td>Total number of invalid attestations</td><td>On validate attestation</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_attestation_validation_time_seconds</code></td><td>Histogram</td><td>Time taken to validate attestation</td><td>On validate attestation</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+<tr><td><code>lean_fork_choice_reorgs_total</code></td><td>Counter</td><td>Total number of fork choice reorgs</td><td>On fork choice reorg</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_fork_choice_reorg_depth</code></td><td>Histogram</td><td>Depth of fork choice reorgs (in blocks)</td><td>On fork choice reorg</td><td></td><td>1, 2, 3, 5, 7, 10, 20, 30, 50, 100</td><td>✅</td></tr>
+<tr><td><code>lean_gossip_signatures</code></td><td>Gauge</td><td>Number of gossip signatures in fork-choice store</td><td>On gossip signatures update</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_latest_new_aggregated_payloads</code></td><td>Gauge</td><td>Number of new aggregated payload items</td><td>On <code>latest_new_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_latest_known_aggregated_payloads</code></td><td>Gauge</td><td>Number of known aggregated payload items</td><td>On <code>latest_known_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_committee_signatures_aggregation_time_seconds</code></td><td>Histogram</td><td>Time taken to aggregate committee signatures</td><td>On committee signatures aggregation</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="state-transition-metrics"><a class="header" href="#state-transition-metrics">State Transition Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_latest_justified_slot</code></td><td>Gauge</td><td>Latest justified slot</td><td>On state transition</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_latest_finalized_slot</code></td><td>Gauge</td><td>Latest finalized slot</td><td>On state transition</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_finalizations_total</code></td><td>Counter</td><td>Total number of finalization attempts</td><td>On finalization attempt</td><td>result=success,error</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_time_seconds</code></td><td>Histogram</td><td>Time to process state transition</td><td>On state transition</td><td></td><td>0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4</td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_slots_processed_total</code></td><td>Counter</td><td>Total number of processed slots</td><td>On state transition process slots</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_slots_processing_time_seconds</code></td><td>Histogram</td><td>Time taken to process slots</td><td>On state transition process slots</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_block_processing_time_seconds</code></td><td>Histogram</td><td>Time taken to process block</td><td>On state transition process block</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_attestations_processed_total</code></td><td>Counter</td><td>Total number of processed attestations</td><td>On state transition process attestations</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_state_transition_attestations_processing_time_seconds</code></td><td>Histogram</td><td>Time taken to process attestations</td><td>On state transition process attestations</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="validator-metrics"><a class="header" href="#validator-metrics">Validator Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_validators_count</code></td><td>Gauge</td><td>Number of validators managed by a node</td><td>On scrape</td><td></td><td></td><td>✅(*)</td></tr>
+<tr><td><code>lean_is_aggregator</code></td><td>Gauge</td><td>Validator’s <code>is_aggregator</code> status. True=1, False=0</td><td>On node start</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_attestations_production_time_seconds</code></td><td>Histogram</td><td>Time taken to produce attestation</td><td>On attestation production</td><td></td><td>0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="network-metrics"><a class="header" href="#network-metrics">Network Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_attestation_committee_count</code></td><td>Gauge</td><td>Number of attestation committees</td><td>On node start</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_attestation_committee_subnet</code></td><td>Gauge</td><td>Node’s attestation committee subnet</td><td>On node start</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_connected_peers</code></td><td>Gauge</td><td>Number of connected peers</td><td>On scrape</td><td>client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam</td><td>✅(*)</td></tr>
+<tr><td><code>lean_peer_connection_events_total</code></td><td>Counter</td><td>Total number of peer connection events</td><td>On peer connection</td><td>direction=inbound,outbound<br>result=success,timeout,error</td><td>✅</td></tr>
+<tr><td><code>lean_peer_disconnection_events_total</code></td><td>Counter</td><td>Total number of peer disconnection events</td><td>On peer disconnection</td><td>direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<p>✅(*) <strong>Partial support</strong>: These metrics are implemented but not collected “on scrape” as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.</p>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<h3 id="docker-desktop-on-macos"><a class="header" href="#docker-desktop-on-macos">Docker Desktop on MacOS</a></h3>
+<p>lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.
+To work around this, enable the <a href="https://docs.docker.com/enterprise/security/hardened-desktop/settings-management/settings-reference/#enable-host-networking">“Enable host networking” option</a> in Docker Desktop settings under Resources &gt; Network.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="checkpoint-sync"><a class="header" href="#checkpoint-sync">Checkpoint Sync</a></h1>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<p>Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.</p>
+<h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
+<p>Checkpoint sync still requires a full network config directory (<code>--custom-network-config-dir</code>). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.</p>
+<p>Pass the <code>--checkpoint-sync-url</code> flag when starting ethlambda:</p>
+<pre><code class="language-bash">ethlambda \
+  --checkpoint-sync-url &lt;URL&gt; \
+  --custom-network-config-dir ./network-config \
+  --node-key ./node.key \
+  --node-id ethlambda_0
+</code></pre>
+<p>Where <code>&lt;URL&gt;</code> is the address of a checkpoint source (see <a href="#checkpoint-sources">Checkpoint Sources</a> below).</p>
+<p>When <code>--checkpoint-sync-url</code> is omitted, the node initializes from genesis.</p>
+<h2 id="checkpoint-sources"><a class="header" href="#checkpoint-sources">Checkpoint Sources</a></h2>
+<h3 id="direct-peer"><a class="header" href="#direct-peer">Direct peer</a></h3>
+<p>Any running node that serves the finalized state as SSZ can be used as a checkpoint source, not just ethlambda. For ethlambda nodes, the endpoint is <code>/lean/v0/states/finalized</code>.</p>
+<p>This is the simplest option, with no additional infrastructure needed. The trade-off is that you trust a single peer to provide a correct finalized state.</p>
+<h3 id="leanpoint"><a class="header" href="#leanpoint">Leanpoint</a></h3>
+<p><a href="https://github.com/blockblaz/leanpoint">Leanpoint</a> is a dedicated checkpoint sync provider. It polls multiple nodes and only serves state when 50%+ agree on finality, adding a layer of consensus validation.</p>
+<p>This is the recommended option for production deployments since it reduces trust in any single peer.</p>
+<h2 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h2>
+<ol>
+<li>
+<p><strong>Fetch and verify</strong>: The node sends an HTTP GET to the provided URL requesting the SSZ-encoded finalized state. Once downloaded, the state is decoded and verified against the local genesis config (see <a href="#verification-checks">Verification Checks</a> below).</p>
+<p>Timeouts:</p>
+<ul>
+<li><strong>Connect</strong>: 15 seconds (fail fast if peer is unreachable)</li>
+<li><strong>Read</strong>: 15 seconds of inactivity that resets on each successful read, so large states can download as long as data keeps flowing</li>
+</ul>
+</li>
+<li>
+<p><strong>Initialize</strong>: The node stores the block header and the full state from the checkpoint. No block body is stored since it isn’t available from the checkpoint. The node does not need the anchor block body to participate from this point forward.</p>
+</li>
+</ol>
+<h3 id="failure-and-success"><a class="header" href="#failure-and-success">Failure and success</a></h3>
+<p>If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.</p>
+<p>After successful initialization, the node starts normally: it connects to the P2P network and begins participating from the checkpoint slot.</p>
+<p>If the data directory (<code>./data</code>) already contains state from a previous run, checkpoint sync writes the new anchor state on top without clearing existing data. For a clean checkpoint sync, remove the data directory first.</p>
+<h2 id="verification-checks"><a class="header" href="#verification-checks">Verification Checks</a></h2>
+<p>All checks are performed before the state is accepted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Check</th><th>What it catches</th></tr>
+</thead>
+<tbody>
+<tr><td>Slot &gt; 0</td><td>Checkpoint state cannot be genesis (slot 0)</td></tr>
+<tr><td>Validators non-empty</td><td>State must contain validators</td></tr>
+<tr><td>Genesis time matches</td><td>Wrong network or misconfigured peer</td></tr>
+<tr><td>Validator count matches</td><td>Validator set size differs from genesis config</td></tr>
+<tr><td>Sequential validator indices</td><td>Indices must be 0, 1, 2, … in order</td></tr>
+<tr><td>Validator pubkeys match</td><td>Validator identity differs from genesis config</td></tr>
+<tr><td>Finalized slot &lt;= state slot</td><td>Finalized checkpoint cannot be in the future</td></tr>
+<tr><td>Justified slot &gt;= finalized slot</td><td>Justified must be at or after finalized</td></tr>
+<tr><td>Same-slot checkpoints have matching roots</td><td>If justified and finalized are at the same slot, they must agree on the root</td></tr>
+<tr><td>Block header slot &lt;= state slot</td><td>Block header cannot be ahead of the state</td></tr>
+<tr><td>Block header root matches finalized</td><td>If header is at finalized slot, its root must match the finalized root</td></tr>
+<tr><td>Block header root matches justified</td><td>If header is at justified slot, its root must match the justified root</td></tr>
+</tbody>
+</table>
+</div>
+<p>HTTP errors and SSZ decoding failures are caught before verification runs.</p>
+<h2 id="security-considerations"><a class="header" href="#security-considerations">Security Considerations</a></h2>
+<h3 id="trust-model"><a class="header" href="#trust-model">Trust model</a></h3>
+<p>Checkpoint sync operates under a <a href="https://blog.ethereum.org/2014/11/25/proof-stake-learned-love-weak-subjectivity"><strong>weak subjectivity</strong></a> assumption. In proof of work, any node can objectively determine the canonical chain by verifying the most cumulative work. Proof of stake doesn’t have this property: validators can costlessly sign multiple forks, so a node that wasn’t online to observe the chain in real time cannot distinguish the real chain from a fabricated one using protocol rules alone.</p>
+<p>Weak subjectivity resolves this: a new node obtains a recent trusted state through a social channel (a peer, a checkpoint provider, a block explorer) and starts from there. Nodes that are always online are unaffected because they continuously track the chain and don’t need external trust.</p>
+<p>What you <strong>are</strong> trusting:</p>
+<ul>
+<li>The checkpoint source is honest about which state is finalized</li>
+<li>The state hasn’t been crafted to put you on a fork that diverged within the weak subjectivity period</li>
+</ul>
+<p>What verification <strong>does</strong> protect against:</p>
+<ul>
+<li>Wrong network (genesis time mismatch)</li>
+<li>Wrong validator set (pubkey or count mismatch)</li>
+<li>Structurally invalid states (impossible slot orderings, inconsistent checkpoints)</li>
+<li>Corrupted data (SSZ decode failures)</li>
+</ul>
+<p>What verification <strong>does not</strong> protect against:</p>
+<ul>
+<li>A checkpoint source that serves a structurally valid state on a minority fork. It will pass all checks but put you on the wrong chain. This is why the choice of checkpoint source matters.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="fork-choice-visualization"><a class="header" href="#fork-choice-visualization">Fork Choice Visualization</a></h1>
+<p>A browser-based real-time visualization of the LMD GHOST fork choice tree, served from the existing RPC server with no additional dependencies.</p>
+<h2 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Endpoint</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET /lean/v0/fork_choice/ui</code></td><td>Interactive D3.js visualization page</td></tr>
+<tr><td><code>GET /lean/v0/fork_choice</code></td><td>JSON snapshot of the fork choice tree</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both endpoints are served on the API port (<code>--api-port</code>, default <code>5052</code>).</p>
+<h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
+<h3 id="local-devnet"><a class="header" href="#local-devnet">Local devnet</a></h3>
+<pre><code class="language-bash">make run-devnet
+</code></pre>
+<p>The local devnet runs 3 ethlambda nodes with metrics ports 8085, 8086, and 8087. Open any of them:</p>
+<ul>
+<li>http://localhost:8085/lean/v0/fork_choice/ui</li>
+<li>http://localhost:8086/lean/v0/fork_choice/ui</li>
+<li>http://localhost:8087/lean/v0/fork_choice/ui</li>
+</ul>
+<h3 id="standalone-node"><a class="header" href="#standalone-node">Standalone node</a></h3>
+<pre><code class="language-bash">cargo run --release -- \
+  --custom-network-config-dir ./config \
+  --node-key ./keys/node.key \
+  --node-id 0 \
+  --api-port 5052
+</code></pre>
+<p>Then open http://localhost:5052/lean/v0/fork_choice/ui.</p>
+<h2 id="visualization-guide"><a class="header" href="#visualization-guide">Visualization Guide</a></h2>
+<h3 id="color-coding"><a class="header" href="#color-coding">Color coding</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Color</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>Green</td><td>Finalized block</td></tr>
+<tr><td>Blue</td><td>Justified block</td></tr>
+<tr><td>Yellow</td><td>Safe target block</td></tr>
+<tr><td>Orange</td><td>Current head</td></tr>
+<tr><td>Gray</td><td>Default (no special status)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="layout"><a class="header" href="#layout">Layout</a></h3>
+<ul>
+<li><strong>Y axis</strong>: slot number (time flows downward)</li>
+<li><strong>X axis</strong>: fork spreading — branches appear when competing chains exist</li>
+<li><strong>Circle size</strong>: scaled by <code>weight / validator_count</code> — larger circles have more attestation support</li>
+</ul>
+<h3 id="interactive-features"><a class="header" href="#interactive-features">Interactive features</a></h3>
+<ul>
+<li><strong>Tooltips</strong>: hover any block to see root hash, slot, proposer index, and weight</li>
+<li><strong>Auto-polling</strong>: the page fetches fresh data every 2 seconds</li>
+<li><strong>Auto-scroll</strong>: the view follows the head as the chain progresses</li>
+</ul>
+<h3 id="what-to-look-for"><a class="header" href="#what-to-look-for">What to look for</a></h3>
+<ul>
+<li><strong>Single vertical chain</strong>: healthy consensus, no forks</li>
+<li><strong>Horizontal branching</strong>: competing chains — check attestation weights to see which branch validators prefer</li>
+<li><strong>Color transitions</strong>: blocks turning green as finalization advances</li>
+<li><strong>Stalled finalization</strong>: if justified/finalized slots stop advancing, check validator attestation activity</li>
+</ul>
+<h2 id="json-api"><a class="header" href="#json-api">JSON API</a></h2>
+<pre><code class="language-bash">curl -s http://localhost:5052/lean/v0/fork_choice | jq .
+</code></pre>
+<p>Response schema:</p>
+<pre><code class="language-json">{
+  "nodes": [
+    {
+      "root": "0x...",
+      "slot": 42,
+      "parent_root": "0x...",
+      "proposer_index": 3,
+      "weight": 5
+    }
+  ],
+  "head": "0x...",
+  "justified": { "root": "0x...", "slot": 10 },
+  "finalized": { "root": "0x...", "slot": 5 },
+  "safe_target": "0x...",
+  "validator_count": 8
+}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nodes</code></td><td>All blocks in the live chain (from finalized slot onward)</td></tr>
+<tr><td><code>nodes[].weight</code></td><td>Number of latest-message attestations whose target is this block or a descendant</td></tr>
+<tr><td><code>head</code></td><td>Current fork choice head root</td></tr>
+<tr><td><code>justified</code></td><td>Latest justified checkpoint</td></tr>
+<tr><td><code>finalized</code></td><td>Latest finalized checkpoint</td></tr>
+<tr><td><code>safe_target</code></td><td>Block root selected with a 2/3 validator threshold</td></tr>
+<tr><td><code>validator_count</code></td><td>Total validators in the head state</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
