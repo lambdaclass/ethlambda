@@ -51,6 +51,28 @@
       gap: 2px;
     }
 
+    #follow-head-toggle {
+      margin-left: auto;
+      padding: 7px 12px;
+      border: 1px solid #ff9800;
+      border-radius: 4px;
+      background: transparent;
+      color: #ff9800;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    #follow-head-toggle:hover {
+      background: rgba(255, 152, 0, 0.12);
+    }
+
+    #follow-head-toggle[aria-pressed="false"] {
+      border-color: #666;
+      color: #aaa;
+    }
+
     .value-head { color: #ff9800; }
     .value-justified { color: #2196f3; }
     .value-finalized { color: #4caf50; }
@@ -163,6 +185,7 @@
       <span class="label">Validators</span>
       <span class="value value-validators" id="validator-count">--</span>
     </div>
+    <button id="follow-head-toggle" type="button" aria-pressed="true">Following Head</button>
   </div>
 
   <div id="chart-container">
@@ -206,9 +229,15 @@
     const container = document.getElementById("chart-container");
     const tooltip = document.getElementById("tooltip");
     const emptyMsg = document.getElementById("empty-message");
+    const followHeadToggle = document.getElementById("follow-head-toggle");
 
     let svg, gLinks, gNodes, gAxis;
     let currentData = null;
+    let followHead = true;
+    let currentHeadScrollTarget = null;
+    let lastScrollTop = 0;
+    let programmaticScrollTimeout = null;
+    let isProgrammaticScroll = false;
 
     function initSVG() {
       svg = d3.select("#chart-container")
@@ -410,6 +439,50 @@
       tooltip.style.opacity = 0;
     }
 
+    function updateFollowHeadToggle() {
+      followHeadToggle.setAttribute("aria-pressed", String(followHead));
+      followHeadToggle.textContent = followHead ? "Following Head" : "Follow Head";
+    }
+
+    function markProgrammaticScroll() {
+      isProgrammaticScroll = true;
+      if (programmaticScrollTimeout) clearTimeout(programmaticScrollTimeout);
+      programmaticScrollTimeout = setTimeout(() => {
+        isProgrammaticScroll = false;
+      }, TRANSITION_DURATION + 150);
+    }
+
+    function scrollToHead(behavior = "smooth") {
+      if (currentHeadScrollTarget == null) return;
+      markProgrammaticScroll();
+      container.scrollTo({
+        top: currentHeadScrollTarget,
+        behavior
+      });
+    }
+
+    function isAtHead() {
+      return currentHeadScrollTarget != null &&
+        Math.abs(container.scrollTop - currentHeadScrollTarget) <= NODE_RADIUS * 3;
+    }
+
+    function setFollowHead(enabled, shouldScroll = false) {
+      followHead = enabled;
+      updateFollowHeadToggle();
+
+      if (followHead && shouldScroll) {
+        scrollToHead();
+      }
+    }
+
+    function markUserScrollIntent() {
+      isProgrammaticScroll = false;
+      if (programmaticScrollTimeout) {
+        clearTimeout(programmaticScrollTimeout);
+        programmaticScrollTimeout = null;
+      }
+    }
+
     function render(data) {
       if (!data || !data.nodes || data.nodes.length === 0) {
         emptyMsg.style.display = "block";
@@ -587,16 +660,22 @@
         if (hovered) tooltip.innerHTML = tooltipHtml(hovered, data);
       }
 
-      // Auto-scroll to head node
+      // Auto-scroll to head node if head tracking is enabled.
       const headNode = layout.nodes.find(n => n.root === data.head);
       if (headNode) {
         const containerRect = container.getBoundingClientRect();
         const headY = headNode.y;
-        const scrollTarget = headY - containerRect.height / 2;
-        container.scrollTo({
-          top: Math.max(0, scrollTarget),
-          behavior: "smooth"
-        });
+        const maxScrollTop = Math.max(0, layout.height - containerRect.height);
+        currentHeadScrollTarget = Math.min(
+          maxScrollTop,
+          Math.max(0, headY - containerRect.height / 2)
+        );
+
+        if (followHead) {
+          scrollToHead();
+        }
+      } else {
+        currentHeadScrollTarget = null;
       }
     }
 
@@ -618,8 +697,36 @@
     }
 
     initSVG();
+    updateFollowHeadToggle();
     fetchAndRender();
     setInterval(fetchAndRender, POLL_INTERVAL);
+
+    followHeadToggle.addEventListener("click", () => {
+      setFollowHead(!followHead, true);
+    });
+
+    container.addEventListener("scroll", () => {
+      const scrollingUp = container.scrollTop < lastScrollTop - 2;
+
+      if (!isProgrammaticScroll) {
+        if (followHead && scrollingUp && !isAtHead()) {
+          setFollowHead(false);
+        } else if (!followHead && isAtHead()) {
+          setFollowHead(true);
+        }
+      }
+
+      lastScrollTop = container.scrollTop;
+    });
+
+    container.addEventListener("wheel", markUserScrollIntent, { passive: true });
+    container.addEventListener("pointerdown", markUserScrollIntent, { passive: true });
+    container.addEventListener("touchstart", markUserScrollIntent, { passive: true });
+    window.addEventListener("keydown", event => {
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+        markUserScrollIntent();
+      }
+    });
 
     window.addEventListener("resize", () => {
       if (currentData) render(currentData);
