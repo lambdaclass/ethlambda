@@ -1,5 +1,3 @@
-# Pull Request Template
-
 ## 🗒️ Description / Motivation
 - What does this PR change?
 - Why is this change needed?
@@ -20,3 +18,9 @@
 ## Related Issues / PRs
 - Closes #
 - Related to #
+
+## ✅ Verification Checklist
+
+- [ ] Ran `make fmt` — clean
+- [ ] Ran `make lint` (clippy with `-D warnings`) — clean
+- [ ] Ran `cargo test --workspace --release` — all passing

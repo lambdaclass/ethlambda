@@ -50,6 +50,15 @@ static LEAN_CONNECTED_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+static LEAN_GOSSIP_MESH_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_gossip_mesh_peers",
+        "Number of peers in the gossipsub mesh",
+        &["client"]
+    )
+    .unwrap()
+});
+
 static LEAN_PEER_CONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_peer_connection_events_total",
@@ -167,4 +176,30 @@ pub fn notify_peer_disconnected(peer_id: &Option<PeerId>, direction: &str, reaso
 
     let name = resolve(peer_id);
     LEAN_CONNECTED_PEERS.with_label_values(&[name]).dec();
+}
+
+/// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
+pub fn update_gossip_mesh_peers<'a>(peers: impl Iterator<Item = &'a PeerId>) {
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    {
+        let registry = NODE_NAME_REGISTRY.read().unwrap();
+        for peer_id in peers {
+            let name = registry.get(peer_id).copied().unwrap_or("unknown");
+            *counts.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    // Seed previously-published labels with 0 so departed clients fall to
+    // zero in the single set() pass below.
+    for family in LEAN_GOSSIP_MESH_PEERS.collect() {
+        for metric in family.get_metric() {
+            for label in metric.get_label() {
+                counts.entry(label.value().to_string()).or_insert(0);
+            }
+        }
+    }
+    for (name, count) in counts {
+        LEAN_GOSSIP_MESH_PEERS
+            .with_label_values(&[&name])
+            .set(count);
+    }
 }

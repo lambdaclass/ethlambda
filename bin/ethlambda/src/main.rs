@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -29,10 +30,11 @@ use ethlambda_types::{
     state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
+use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
 
 const ASCII_ART: &str = r#"
@@ -76,9 +78,13 @@ struct CliOptions {
     /// use the admin endpoint to rotate duties (hot-standby model).
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
-    /// Number of attestation committees (subnets) per slot
-    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
-    attestation_committee_count: u64,
+    /// Number of attestation committees (subnets) per slot.
+    ///
+    /// If unset, falls back to `config.attestation_committee_count` from
+    /// `validator-config.yaml` in the network config dir, or `1` if that
+    /// field is also absent.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
@@ -102,14 +108,14 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
-    ethlambda_blockchain::metrics::set_attestation_committee_count(
-        options.attestation_committee_count,
-    );
 
-    let api_socket = SocketAddr::new(options.http_address, options.api_port);
-    let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let rpc_config = RpcConfig {
+        http_address: options.http_address,
+        api_port: options.api_port,
+        metrics_port: options.metrics_port,
+    };
 
     println!("{ASCII_ART}");
 
@@ -141,7 +147,26 @@ async fn main() -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
-    populate_name_registry(&validator_config);
+    let validator_config_file = read_validator_config_file(&validator_config);
+    populate_name_registry(&validator_config_file);
+
+    // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
+    // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
+    // bound here so a YAML value of 0 cannot bypass it.
+    let attestation_committee_count = options
+        .attestation_committee_count
+        .or(validator_config_file.config.attestation_committee_count)
+        .unwrap_or(1);
+    eyre::ensure!(
+        attestation_committee_count >= 1,
+        "attestation_committee_count must be >= 1 (got {attestation_committee_count})"
+    );
+    info!(
+        attestation_committee_count,
+        "Loaded attestation committee count"
+    );
+    ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
+
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
@@ -181,7 +206,7 @@ async fn main() -> eyre::Result<()> {
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
-        attestation_committee_count: options.attestation_committee_count,
+        attestation_committee_count,
         is_aggregator: options.is_aggregator,
         aggregate_subnet_ids: options.aggregate_subnet_ids,
     })
@@ -204,44 +229,86 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+    let shutdown_token = CancellationToken::new();
+    let rpc_shutdown = shutdown_token.clone();
+
+    let rpc_handle = tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
             .await
-            .inspect_err(|err| error!(%err, "Metrics server failed"));
-    });
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator)
-            .await
-            .inspect_err(|err| error!(%err, "API server failed"));
+            .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
 
+    // 1st ctrl+c: start graceful shutdown
     tokio::signal::ctrl_c().await.ok();
-    println!("Shutting down...");
+
+    info!("Shutdown signal received, stopping actors and servers...");
+
+    tokio::spawn(async move {
+        // This can be turned into a loop
+        tokio::signal::ctrl_c().await.ok();
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
+        );
+        tokio::signal::ctrl_c().await.ok();
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
+        );
+        tokio::signal::ctrl_c().await.ok();
+        info!("Forced ungraceful shutdown...");
+        std::process::exit(1);
+    });
+
+    let blockchain_ref = blockchain.actor_ref().clone();
+    let p2p_ref = p2p.actor_ref().clone();
+    blockchain_ref.context().stop();
+    p2p_ref.context().stop();
+    shutdown_token.cancel();
+
+    blockchain_ref.join().await;
+    p2p_ref.join().await;
+    let _ = rpc_handle.await;
+
+    info!("Shutdown complete");
 
     Ok(())
 }
 
-fn populate_name_registry(validator_config: impl AsRef<Path>) {
-    #[derive(Deserialize)]
-    struct Validator {
-        name: String,
-        privkey: H256,
-    }
-    #[derive(Deserialize)]
-    struct Config {
-        validators: Vec<Validator>,
-    }
-    let config_yaml =
-        std::fs::read_to_string(&validator_config).expect("Failed to read validator config file");
-    let config: Config =
-        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse validator config file");
+/// Subset of `validator-config.yaml` consumed by ethlambda.
+///
+/// The `config` block is a network-wide settings bag shared across clients;
+/// only fields ethlambda actually reads are deserialized. The `validators`
+/// list feeds the metrics name registry.
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigFile {
+    #[serde(default)]
+    config: ValidatorConfigBlock,
+    validators: Vec<ValidatorConfigEntry>,
+}
 
-    let names_and_privkeys = config
+#[derive(Debug, Default, Deserialize)]
+struct ValidatorConfigBlock {
+    #[serde(default)]
+    attestation_committee_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigEntry {
+    name: String,
+    privkey: H256,
+}
+
+fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
+    let yaml = std::fs::read_to_string(&path).expect("Failed to read validator config file");
+    serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
+}
+
+fn populate_name_registry(file: &ValidatorConfigFile) {
+    let names_and_privkeys = file
         .validators
-        .into_iter()
-        .map(|v| (v.name, v.privkey))
+        .iter()
+        .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
     // Populates a dictionary used for labeling metrics with node names
@@ -477,4 +544,97 @@ async fn fetch_initial_state(
 
     // Store the anchor state and header, without body
     Ok(Store::from_anchor_state(backend, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
+    /// (devnet-4) where networks share a non-default committee count.
+    const VC_WITH_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: ansible
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+  attestation_committee_count: 2
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 9095
+    apiPort: 5055
+    subnet: 0
+    isAggregator: false
+    count: 1
+"#;
+
+    /// Local-devnet snippet without the optional field — committee count is
+    /// expected to fall back to the binary default.
+    const VC_WITHOUT_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: local
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 8087
+    apiPort: 5055
+    isAggregator: false
+    count: 1
+"#;
+
+    #[test]
+    fn parses_committee_count_when_present() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, Some(2));
+        assert_eq!(file.validators.len(), 1);
+        assert_eq!(file.validators[0].name, "ethlambda_0");
+    }
+
+    #[test]
+    fn defaults_to_none_when_field_absent() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, None);
+    }
+
+    #[test]
+    fn cli_overrides_file_value() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = Some(5);
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 5);
+    }
+
+    #[test]
+    fn falls_back_to_file_when_cli_absent() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 2);
+    }
+
+    #[test]
+    fn falls_back_to_default_when_neither_set() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 1);
+    }
 }
