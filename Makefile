@@ -25,14 +25,14 @@ docker-build: ## 🐳 Build the Docker image
 	@echo
 
 # 2026-04-29
-LEAN_SPEC_COMMIT_HASH:=495c29d49f2b12b7cc240c4028e15d4253a7d54e
+LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures
+	cd leanSpec && uv run fill --fork devnet -n auto --scheme=prod -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
@@ -50,8 +50,8 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
 
 docs-deps: ## 📦 Install dependencies for generating the documentation
-	cargo install --version 0.5.2 mdbook
-	cargo install --version 0.12.0 mdbook-linkcheck2
+	cargo install --version 0.5.2 --locked mdbook
+	cargo install --version 0.12.0 --locked mdbook-linkcheck2
 
 docs: ## 📚 Generate the documentation site under ./book
 	mdbook build
