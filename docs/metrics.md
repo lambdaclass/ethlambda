@@ -29,7 +29,6 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_pq_sig_attestations_in_aggregated_signatures_total` | Counter | Total number of attestations included into aggregated signatures | On aggregated signature production | | | ✅ |
 | `lean_pq_sig_aggregated_signatures_building_time_seconds` | Histogram | Time taken to build an aggregated attestation signature | On aggregated signature production | | 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 | ✅ |
 | `lean_pq_sig_aggregated_signatures_verification_time_seconds` | Histogram | Time taken to verify an aggregated attestation signature | On aggregated signature verification | | 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4 | ✅ |
-| `lean_aggregated_proof_size_bytes` | Histogram | Bytes size of an aggregated signature proof's `proof_data` field | On aggregated signature production | | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 | ✅ |
 
 ## Fork-Choice Metrics
 
@@ -80,11 +79,26 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |`lean_connected_peers`| Gauge | Number of connected peers | On scrape | client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam | ✅(*) |
 |`lean_peer_connection_events_total`| Counter | Total number of peer connection events | On peer connection | direction=inbound,outbound<br>result=success,timeout,error | ✅ |
 |`lean_peer_disconnection_events_total`| Counter | Total number of peer disconnection events | On peer disconnection | direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error | ✅ |
-|`lean_gossip_block_size_bytes`| Histogram | Bytes size of a gossip block message (raw SSZ or snappy on-wire) | On gossip block send/receive | compression=raw,snappy | ✅ |
-|`lean_gossip_attestation_size_bytes`| Histogram | Bytes size of a gossip attestation message (raw SSZ or snappy on-wire) | On gossip attestation send/receive | compression=raw,snappy | ✅ |
-|`lean_gossip_aggregation_size_bytes`| Histogram | Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire) | On gossip aggregation send/receive | compression=raw,snappy | ✅ |
-|`lean_reqresp_request_size_bytes`| Histogram | Bytes size of a req/resp request (raw SSZ or snappy on-wire) | On req/resp request send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | ✅ |
-|`lean_reqresp_response_chunk_size_bytes`| Histogram | Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire) | On req/resp response chunk send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | ✅ |
+
+## Custom Metrics (non-leanMetrics)
+
+The metrics below are not part of the [leanMetrics specification](https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md). They are ethlambda-specific observability around on-wire message sizes and post-quantum aggregated proof sizes.
+
+### PQ Signature Sizes
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_aggregated_proof_size_bytes` | Histogram | Bytes size of an aggregated signature proof's `proof_data` field | On aggregated signature production | | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 |
+
+### Network Sizes
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_gossip_block_size_bytes` | Histogram | Bytes size of a gossip block message (raw SSZ or snappy on-wire) | On gossip block send/receive | compression=raw,snappy | 10000, 50000, 100000, 250000, 500000, 1000000, 2000000, 5000000 |
+| `lean_gossip_attestation_size_bytes` | Histogram | Bytes size of a gossip attestation message (raw SSZ or snappy on-wire) | On gossip attestation send/receive | compression=raw,snappy | 512, 1024, 2048, 4096, 8192, 16384 |
+| `lean_gossip_aggregation_size_bytes` | Histogram | Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire) | On gossip aggregation send/receive | compression=raw,snappy | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 |
+| `lean_reqresp_request_size_bytes` | Histogram | Bytes size of a req/resp request (raw SSZ or snappy on-wire) | On req/resp request send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 64, 128, 256, 512, 1024, 4096, 16384, 65536 |
+| `lean_reqresp_response_chunk_size_bytes` | Histogram | Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire) | On req/resp response chunk send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000 |
 
 ---
 

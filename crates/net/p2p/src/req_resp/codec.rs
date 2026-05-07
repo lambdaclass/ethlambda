@@ -167,7 +167,8 @@ impl libp2p::request_response::Codec for Codec {
                 // Error messages are SSZ-encoded as List[byte, 256]
                 let encoded = message.to_ssz();
 
-                write_payload(io, &encoded).await?;
+                let compressed_size = write_payload(io, &encoded).await?;
+                metrics::observe_reqresp_response_chunk_size(label, encoded.len(), compressed_size);
                 Ok(())
             }
         }

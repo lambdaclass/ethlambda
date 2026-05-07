@@ -10,6 +10,16 @@ pub const MAX_COMPRESSED_PAYLOAD_SIZE: usize = 32 + MAX_PAYLOAD_SIZE + MAX_PAYLO
 
 /// Decoded payload together with the size of its on-wire snappy-compressed
 /// bytes (excluding the varint length prefix).
+///
+/// `compressed_size` is accurate for single-chunk streams (Status request /
+/// response, BlocksByRoot request). For multi-chunk streams (BlocksByRoot
+/// response) the value is over-reported on the first chunk because
+/// `decode_payload` slurps the whole stream via `read_to_end` before parsing
+/// the first varint, so `compressed_size` measures everything left after that
+/// varint rather than just this chunk's snappy frame. The metric is still
+/// useful for single-chunk traffic and as an order-of-magnitude signal on
+/// multi-chunk responses; precise per-chunk accounting would require refactoring
+/// `decode_payload` to read one varint + one snappy frame at a time.
 pub struct DecodedPayload {
     pub uncompressed: Vec<u8>,
     pub compressed_size: usize,
