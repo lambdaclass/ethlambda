@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -283,7 +284,11 @@ pub struct P2P {
 impl P2P {
     /// Build swarm, start I/O adapter, spawn actor, and wire the swarm event stream.
     pub fn spawn(built: BuiltSwarm, store: Store, node_names: HashMap<PeerId, String>) -> P2P {
-        let (swarm_stream, swarm_handle) = swarm_adapter::start_swarm_adapter(built.swarm);
+        // Shared with the swarm adapter so its mesh metric tick can label
+        // peers by node name without needing a global registry.
+        let node_names = Arc::new(node_names);
+        let (swarm_stream, swarm_handle) =
+            swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
         let server = P2PServer {
             swarm_handle,
@@ -333,7 +338,7 @@ pub struct P2PServer {
     pub(crate) pending_requests: HashMap<H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, H256>,
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
-    node_names: HashMap<PeerId, String>,
+    node_names: Arc<HashMap<PeerId, String>>,
 }
 
 impl P2PServer {

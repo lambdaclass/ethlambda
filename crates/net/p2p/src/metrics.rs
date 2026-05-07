@@ -1,13 +1,24 @@
 //! Prometheus metrics for the P2P network layer.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use ethlambda_metrics::*;
+use libp2p::PeerId;
 
 static LEAN_CONNECTED_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "lean_connected_peers",
         "Number of connected peers",
+        &["client"]
+    )
+    .unwrap()
+});
+
+static LEAN_GOSSIP_MESH_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_gossip_mesh_peers",
+        "Number of peers in the gossipsub mesh",
         &["client"]
     )
     .unwrap()
@@ -128,4 +139,37 @@ pub fn notify_peer_disconnected(node_name: &str, direction: &str, reason: &str) 
         .inc();
 
     LEAN_CONNECTED_PEERS.with_label_values(&[node_name]).dec();
+}
+
+/// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
+///
+/// `node_names` is the per-`P2PServer` registry of known peers (owned by the
+/// actor, not a global). Peers absent from the map are bucketed under
+/// `"unknown"`.
+pub fn update_gossip_mesh_peers<'a>(
+    peers: impl Iterator<Item = &'a PeerId>,
+    node_names: &HashMap<PeerId, String>,
+) {
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for peer_id in peers {
+        let name = node_names
+            .get(peer_id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        *counts.entry(name.to_string()).or_default() += 1;
+    }
+    // Seed previously-published labels with 0 so departed clients fall to
+    // zero in the single set() pass below.
+    for family in LEAN_GOSSIP_MESH_PEERS.collect() {
+        for metric in family.get_metric() {
+            for label in metric.get_label() {
+                counts.entry(label.value().to_string()).or_insert(0);
+            }
+        }
+    }
+    for (name, count) in counts {
+        LEAN_GOSSIP_MESH_PEERS
+            .with_label_values(&[&name])
+            .set(count);
+    }
 }

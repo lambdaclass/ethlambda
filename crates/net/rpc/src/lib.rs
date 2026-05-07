@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
@@ -7,6 +7,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use ethlambda_types::primitives::H256;
 use libssz::SszEncode;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -16,27 +17,51 @@ mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 
-pub async fn start_api_server(
-    address: SocketAddr,
-    store: Store,
-    aggregator: AggregatorController,
-) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store).layer(Extension(aggregator));
-
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, api_router).await?;
-
-    Ok(())
+#[derive(Debug, Clone)]
+pub struct RpcConfig {
+    pub http_address: IpAddr,
+    pub api_port: u16,
+    pub metrics_port: u16,
 }
 
-pub async fn start_metrics_server(address: SocketAddr) -> Result<(), std::io::Error> {
+pub async fn start_rpc_server(
+    config: RpcConfig,
+    store: Store,
+    aggregator: AggregatorController,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let api_router = build_api_router(store).layer(Extension(aggregator));
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
-    let app = Router::new().merge(metrics_router).merge(debug_router);
-
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    if config.api_port == config.metrics_port {
+        let app = Router::new()
+            .merge(api_router)
+            .merge(metrics_router)
+            .merge(debug_router);
+        let addr = SocketAddr::new(config.http_address, config.api_port);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            })
+            .await?;
+    } else {
+        let api_addr = SocketAddr::new(config.http_address, config.api_port);
+        let metrics_addr = SocketAddr::new(config.http_address, config.metrics_port);
+        let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+        let metrics_app = Router::new().merge(metrics_router).merge(debug_router);
+        let metrics_shutdown = shutdown.clone();
+        tokio::try_join!(
+            axum::serve(api_listener, api_router).with_graceful_shutdown(async move {
+                shutdown.cancelled().await;
+            }),
+            axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(async move {
+                metrics_shutdown.cancelled().await;
+            }),
+        )?;
+    }
 
     Ok(())
 }
@@ -44,7 +69,7 @@ pub async fn start_metrics_server(address: SocketAddr) -> Result<(), std::io::Er
 /// Build the API router with the given store.
 ///
 /// The aggregator controller is threaded in via `Extension` by the caller
-/// (see `start_api_server`) so existing store-backed handlers don't need to
+/// (see `start_rpc_server`) so existing store-backed handlers don't need to
 /// know about it and admin handlers extract it independently.
 fn build_api_router(store: Store) -> Router {
     Router::new()
