@@ -8,8 +8,8 @@ use std::{
 use ethlambda_metrics::*;
 use ethlambda_types::primitives::H256;
 use libp2p::{
+    identity::{secp256k1, Keypair},
     PeerId,
-    identity::{Keypair, secp256k1},
 };
 
 static NODE_NAME_REGISTRY: LazyLock<RwLock<HashMap<PeerId, &'static str>>> =
@@ -50,6 +50,15 @@ static LEAN_CONNECTED_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+static LEAN_GOSSIP_MESH_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_gossip_mesh_peers",
+        "Number of peers in the gossipsub mesh",
+        &["client"]
+    )
+    .unwrap()
+});
+
 static LEAN_PEER_CONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "lean_peer_connection_events_total",
@@ -64,15 +73,6 @@ static LEAN_PEER_DISCONNECTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock:
         "lean_peer_disconnection_events_total",
         "Total number of peer disconnection events",
         &["direction", "reason"]
-    )
-    .unwrap()
-});
-
-static LEAN_GOSSIP_MESH_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
-        "lean_gossip_mesh_peers",
-        "Number of peers in the gossipsub mesh",
-        &["client"]
     )
     .unwrap()
 });
@@ -179,17 +179,27 @@ pub fn notify_peer_disconnected(peer_id: &Option<PeerId>, direction: &str, reaso
 }
 
 /// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
-///
-/// Called periodically by the swarm adapter. The gauge is reset before
-/// re-population so client labels for peers no longer in the mesh drop
-/// off rather than retaining stale counts.
 pub fn update_gossip_mesh_peers<'a>(peers: impl Iterator<Item = &'a PeerId>) {
     let mut counts: HashMap<&'static str, i64> = HashMap::new();
-    for peer_id in peers {
-        let name = resolve(&Some(*peer_id));
-        *counts.entry(name).or_insert(0) += 1;
+    {
+        let registry = NODE_NAME_REGISTRY.read().unwrap();
+        for peer_id in peers {
+            let name = registry.get(peer_id).copied().unwrap_or("unknown");
+            *counts.entry(name).or_default() += 1;
+        }
     }
-    LEAN_GOSSIP_MESH_PEERS.reset();
+    // Zero out client labels that were published before but aren't in the
+    // current mesh, by enumerating the gauge's existing children.
+    for family in LEAN_GOSSIP_MESH_PEERS.collect() {
+        for metric in family.get_metric() {
+            for label in metric.get_label() {
+                let value = label.value();
+                if !counts.contains_key(value) {
+                    LEAN_GOSSIP_MESH_PEERS.with_label_values(&[value]).set(0);
+                }
+            }
+        }
+    }
     for (name, count) in counts {
         LEAN_GOSSIP_MESH_PEERS.with_label_values(&[name]).set(count);
     }
