@@ -28,31 +28,48 @@ pub async fn handle_req_resp_message(
         request_response::Event::Message { peer, message, .. } => match message {
             request_response::Message::Request {
                 request, channel, ..
-            } => match request {
-                Request::Status(status) => {
-                    handle_status_request(server, status, channel, peer).await;
+            } => {
+                let peer_count = server.connected_peers.len();
+                match request {
+                    Request::Status(status) => {
+                        info!(kind = "status_request", peer_count, "P2P message received");
+                        handle_status_request(server, status, channel, peer).await;
+                    }
+                    Request::BlocksByRoot(request) => {
+                        info!(
+                            kind = "blocks_by_root_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_blocks_by_root_request(server, request, channel, peer).await;
+                    }
                 }
-                Request::BlocksByRoot(request) => {
-                    handle_blocks_by_root_request(server, request, channel, peer).await;
-                }
-            },
+            }
             request_response::Message::Response {
                 request_id,
                 response,
-            } => match response {
-                Response::Success { payload } => match payload {
-                    ResponsePayload::Status(status) => {
-                        handle_status_response(status, peer).await;
+            } => {
+                let peer_count = server.connected_peers.len();
+                match response {
+                    Response::Success { payload } => match payload {
+                        ResponsePayload::Status(status) => {
+                            info!(kind = "status_response", peer_count, "P2P message received");
+                            handle_status_response(status, peer).await;
+                        }
+                        ResponsePayload::BlocksByRoot(blocks) => {
+                            info!(
+                                kind = "blocks_by_root_response",
+                                peer_count, "P2P message received"
+                            );
+                            handle_blocks_by_root_response(server, blocks, peer, request_id, ctx)
+                                .await;
+                        }
+                    },
+                    Response::Error { code, message } => {
+                        let error_str = String::from_utf8_lossy(&message);
+                        warn!(%peer, ?code, %error_str, "Received error response");
                     }
-                    ResponsePayload::BlocksByRoot(blocks) => {
-                        handle_blocks_by_root_response(server, blocks, peer, request_id, ctx).await;
-                    }
-                },
-                Response::Error { code, message } => {
-                    let error_str = String::from_utf8_lossy(&message);
-                    warn!(%peer, ?code, %error_str, "Received error response");
                 }
-            },
+            }
         },
         request_response::Event::OutboundFailure {
             peer,

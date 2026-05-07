@@ -20,8 +20,8 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    metrics,
+    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
@@ -101,6 +101,16 @@ fn update_head(store: &mut Store, log_tree: bool) {
 }
 
 /// Update the safe target for attestation.
+///
+/// Safe target is an *availability* signal, not a durable-knowledge signal:
+/// only the "new" pool is considered. Migration from "new" to "known" runs at
+/// interval 4, strictly after this computation at interval 3. 3sf-mini chose
+/// that ordering deliberately so safe target sees only freshly received votes
+/// from the current slot and ignores what was carried over from earlier slots
+/// (block-included attestations, previously migrated gossip, self-attestations).
+/// Counting "known" would let a node keep advancing its safe target on stale
+/// evidence even when live participation has collapsed: exactly the failure
+/// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
     let head_state = store.get_state(&store.head()).expect("head state exists");
     let num_validators = head_state.validators.len() as u64;
@@ -108,10 +118,7 @@ fn update_safe_target(store: &mut Store) {
     let min_target_score = (num_validators * 2).div_ceil(3);
 
     let blocks = store.get_live_chain();
-    // Merge both attestation pools (known + new).
-    // At interval 3 the promotion (interval 4) hasn't run yet, so we must
-    // merge both pools to get a complete view for safe target computation.
-    let attestations = store.extract_latest_all_attestations();
+    let attestations = store.extract_latest_new_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -128,7 +135,7 @@ fn update_safe_target(store: &mut Store) {
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
-///     5. A vote cannot be for a future slot.
+///     5. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -175,13 +182,16 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         });
     }
 
-    // Time Check - Validate attestation is not too far in the future.
-    // We allow a small margin for clock disparity (1 slot), but no further.
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
-    if data.slot > current_slot + 1 {
+    // Time Check - Honest validators emit votes only after their slot has begun.
+    // Allow a small disparity margin for clock skew between peers.
+    //
+    // The bound is in intervals, not slots: a whole-slot margin would let an
+    // adversary pre-publish next-slot aggregates ahead of any honest validator.
+    let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
+    if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            current_slot,
+            store_time: store.time(),
         });
     }
 
@@ -795,11 +805,11 @@ pub enum StoreError {
     },
 
     #[error(
-        "Attestation slot {attestation_slot} is too far in future (current slot: {current_slot})"
+        "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
     )]
     AttestationTooFarInFuture {
         attestation_slot: u64,
-        current_slot: u64,
+        store_time: u64,
     },
 
     #[error(

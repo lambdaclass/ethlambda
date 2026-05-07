@@ -46,6 +46,14 @@ pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER
 ///
 /// See: leanSpec commit 0c9528a (PR #536).
 pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// Future-slot tolerance for gossip attestations, expressed in intervals.
+///
+/// Bounds the clock skew the time check is willing to absorb when admitting a
+/// vote whose slot has not yet started locally. One interval is roughly 800 ms,
+/// the lean analogue of mainnet's `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+///
+/// See: leanSpec PR #682.
+pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
 impl BlockChain {
     pub fn spawn(
@@ -408,6 +416,27 @@ impl BlockChainServer {
         // Discard any pending children: since we won't process this block,
         // children referencing it as parent would remain stuck indefinitely.
         if slot <= self.store.latest_finalized().slot {
+            self.discard_pending_subtree(block_root);
+            return;
+        }
+
+        // Reject blocks whose slot has not started locally, mirroring the
+        // attestation time check in `validate_attestation_data`. The disparity
+        // bound is in intervals, not slots: a whole-slot margin would let an
+        // adversary pre-publish next-slot blocks ahead of any honest proposer.
+        // Catching this early also avoids persisting bogus future blocks to
+        // RocksDB and triggering BlocksByRoot fan-out for fabricated parents.
+        let block_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
+        let store_time = self.store.time();
+        if block_start_interval > store_time + GOSSIP_DISPARITY_INTERVALS {
+            warn!(
+                %slot,
+                store_time,
+                proposer,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                "Rejecting block: slot is too far in future"
+            );
             self.discard_pending_subtree(block_root);
             return;
         }

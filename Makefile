@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test
+.PHONY: help fmt lint docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -24,15 +24,15 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-20
-LEAN_SPEC_COMMIT_HASH:=bc17f7ae8d16caec276f4d304e04fd3c65e6de3c
+# 2026-04-29
+LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet --scheme=prod -o fixtures
+	cd leanSpec && uv run fill --fork devnet -n auto --scheme=prod -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
@@ -48,3 +48,13 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
 	@cd lean-quickstart \
 		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
+
+docs-deps: ## 📦 Install dependencies for generating the documentation
+	cargo install --version 0.5.2 --locked mdbook
+	cargo install --version 0.12.0 --locked mdbook-linkcheck2
+
+docs: ## 📚 Generate the documentation site under ./book
+	mdbook build
+
+docs-serve: ## 📖 Serve the documentation locally with live reload
+	mdbook serve --open
