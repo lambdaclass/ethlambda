@@ -8,8 +8,8 @@ use std::{
 use ethlambda_metrics::*;
 use ethlambda_types::primitives::H256;
 use libp2p::{
-    identity::{secp256k1, Keypair},
     PeerId,
+    identity::{Keypair, secp256k1},
 };
 
 static NODE_NAME_REGISTRY: LazyLock<RwLock<HashMap<PeerId, &'static str>>> =
