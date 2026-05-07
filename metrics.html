@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-84a01bd5.js";
+            window.path_to_searchindex_js = "searchindex-c631f979.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-031b865e.js"></script>
@@ -284,6 +284,34 @@
 <tr><td><code>lean_connected_peers</code></td><td>Gauge</td><td>Number of connected peers</td><td>On scrape</td><td>client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam</td><td>✅(*)</td></tr>
 <tr><td><code>lean_peer_connection_events_total</code></td><td>Counter</td><td>Total number of peer connection events</td><td>On peer connection</td><td>direction=inbound,outbound<br>result=success,timeout,error</td><td>✅</td></tr>
 <tr><td><code>lean_peer_disconnection_events_total</code></td><td>Counter</td><td>Total number of peer disconnection events</td><td>On peer disconnection</td><td>direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="custom-metrics-non-leanmetrics"><a class="header" href="#custom-metrics-non-leanmetrics">Custom Metrics (non-leanMetrics)</a></h2>
+<p>The metrics below are not part of the <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">leanMetrics specification</a>. They are ethlambda-specific observability around on-wire message sizes and post-quantum aggregated proof sizes.</p>
+<h3 id="pq-signature-sizes"><a class="header" href="#pq-signature-sizes">PQ Signature Sizes</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_aggregated_proof_size_bytes</code></td><td>Histogram</td><td>Bytes size of an aggregated signature proof’s <code>proof_data</code> field</td><td>On aggregated signature production</td><td></td><td>1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="network-sizes"><a class="header" href="#network-sizes">Network Sizes</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_gossip_block_size_bytes</code></td><td>Histogram</td><td>Bytes size of a gossip block message (raw SSZ or snappy on-wire)</td><td>On gossip block send/receive</td><td>compression=raw,snappy</td><td>10000, 50000, 100000, 250000, 500000, 1000000, 2000000, 5000000</td></tr>
+<tr><td><code>lean_gossip_attestation_size_bytes</code></td><td>Histogram</td><td>Bytes size of a gossip attestation message (raw SSZ or snappy on-wire)</td><td>On gossip attestation send/receive</td><td>compression=raw,snappy</td><td>512, 1024, 2048, 4096, 8192, 16384</td></tr>
+<tr><td><code>lean_gossip_aggregation_size_bytes</code></td><td>Histogram</td><td>Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire)</td><td>On gossip aggregation send/receive</td><td>compression=raw,snappy</td><td>1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576</td></tr>
+<tr><td><code>lean_reqresp_request_size_bytes</code></td><td>Histogram</td><td>Bytes size of a req/resp request (raw SSZ or snappy on-wire)</td><td>On req/resp request send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>64, 128, 256, 512, 1024, 4096, 16384, 65536</td></tr>
+<tr><td><code>lean_reqresp_response_chunk_size_bytes</code></td><td>Histogram</td><td>Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire)</td><td>On req/resp response chunk send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000</td></tr>
 </tbody>
 </table>
 </div>
