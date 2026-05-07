@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
+use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
 
 const ASCII_ART: &str = r#"
@@ -108,10 +109,13 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 
-    let api_socket = SocketAddr::new(options.http_address, options.api_port);
-    let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let rpc_config = RpcConfig {
+        http_address: options.http_address,
+        api_port: options.api_port,
+        metrics_port: options.metrics_port,
+    };
 
     println!("{ASCII_ART}");
 
@@ -226,18 +230,12 @@ async fn main() -> eyre::Result<()> {
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
     let shutdown_token = CancellationToken::new();
-    let metrics_shutdown = shutdown_token.clone();
-    let api_shutdown = shutdown_token.clone();
+    let rpc_shutdown = shutdown_token.clone();
 
-    let metrics_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_metrics_server(metrics_socket, metrics_shutdown)
+    let rpc_handle = tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
             .await
-            .inspect_err(|err| error!(%err, "Metrics server failed"));
-    });
-    let api_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store, aggregator, api_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "API server failed"));
+            .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
@@ -270,8 +268,7 @@ async fn main() -> eyre::Result<()> {
 
     blockchain_ref.join().await;
     p2p_ref.join().await;
-    let _ = api_handle.await;
-    let _ = metrics_handle.await;
+    let _ = rpc_handle.await;
 
     info!("Shutdown complete");
 
