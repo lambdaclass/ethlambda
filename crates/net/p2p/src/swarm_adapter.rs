@@ -12,10 +12,7 @@ use tracing::{error, warn};
 use crate::{Behaviour, BehaviourEvent, metrics, req_resp::Request, req_resp::Response};
 
 /// Interval between gossipsub mesh peer metric refreshes.
-///
-/// Slightly slower than the gossipsub heartbeat (700ms) so the gauge
-/// reflects post-heartbeat mesh state with minimal polling overhead.
-const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub enum SwarmCommand {
     Publish {
