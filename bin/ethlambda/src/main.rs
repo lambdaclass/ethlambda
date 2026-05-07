@@ -311,9 +311,7 @@ fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
         .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
-    let names = ethlambda_p2p::derive_peer_ids(names_and_privkeys);
-    info!(count = names.len(), "Loaded node-name registry");
-    names
+    ethlambda_p2p::derive_peer_ids(names_and_privkeys)
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
