@@ -21,6 +21,6 @@
 
 ## ✅ Verification Checklist
 
-- [ ] `make fmt` — clean
-- [ ] `make lint` (clippy with `-D warnings`) — clean
-- [ ] `cargo test --workspace --release` — all passing
+- [ ] Ran `make fmt` — clean
+- [ ] Ran `make lint` (clippy with `-D warnings`) — clean
+- [ ] Ran `cargo test --workspace --release` — all passing
