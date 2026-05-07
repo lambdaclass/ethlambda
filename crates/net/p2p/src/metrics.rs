@@ -142,10 +142,6 @@ pub fn notify_peer_disconnected(node_name: &str, direction: &str, reason: &str) 
 }
 
 /// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
-///
-/// `node_names` is the per-`P2PServer` registry of known peers (owned by the
-/// actor, not a global). Peers absent from the map are bucketed under
-/// `"unknown"`.
 pub fn update_gossip_mesh_peers<'a>(
     peers: impl Iterator<Item = &'a PeerId>,
     node_names: &HashMap<PeerId, String>,
