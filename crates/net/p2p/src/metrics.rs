@@ -180,27 +180,24 @@ pub fn notify_peer_disconnected(peer_id: &Option<PeerId>, direction: &str, reaso
 
 /// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
 pub fn update_gossip_mesh_peers<'a>(peers: impl Iterator<Item = &'a PeerId>) {
-    let mut counts: HashMap<&'static str, i64> = HashMap::new();
+    let mut counts: HashMap<String, i64> = HashMap::new();
     {
         let registry = NODE_NAME_REGISTRY.read().unwrap();
         for peer_id in peers {
             let name = registry.get(peer_id).copied().unwrap_or("unknown");
-            *counts.entry(name).or_default() += 1;
+            *counts.entry(name.to_string()).or_default() += 1;
         }
     }
-    // Zero out client labels that were published before but aren't in the
-    // current mesh, by enumerating the gauge's existing children.
+    // Seed previously-published labels with 0 so departed clients fall to
+    // zero in the single set() pass below.
     for family in LEAN_GOSSIP_MESH_PEERS.collect() {
         for metric in family.get_metric() {
             for label in metric.get_label() {
-                let value = label.value();
-                if !counts.contains_key(value) {
-                    LEAN_GOSSIP_MESH_PEERS.with_label_values(&[value]).set(0);
-                }
+                counts.entry(label.value().to_string()).or_insert(0);
             }
         }
     }
     for (name, count) in counts {
-        LEAN_GOSSIP_MESH_PEERS.with_label_values(&[name]).set(count);
+        LEAN_GOSSIP_MESH_PEERS.with_label_values(&[&name]).set(count);
     }
 }
