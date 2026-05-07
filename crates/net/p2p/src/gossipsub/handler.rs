@@ -31,12 +31,13 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     match topic_kind {
         Some(BLOCK_TOPIC_KIND) => {
             info!(kind = "block", peer_count, "P2P message received");
+            let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
             else {
                 return;
             };
-            metrics::observe_gossip_block_size(uncompressed_data.len());
+            metrics::observe_gossip_block_size(uncompressed_data.len(), compressed_len);
 
             let Ok(signed_block) = SignedBlock::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped block"))
@@ -64,12 +65,13 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
         }
         Some(AGGREGATION_TOPIC_KIND) => {
             info!(kind = "aggregation", peer_count, "P2P message received");
+            let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
             else {
                 return;
             };
-            metrics::observe_gossip_aggregation_size(uncompressed_data.len());
+            metrics::observe_gossip_aggregation_size(uncompressed_data.len(), compressed_len);
 
             let Ok(aggregation) = SignedAggregatedAttestation::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped aggregation"))
@@ -95,12 +97,13 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             info!(kind = "attestation", peer_count, "P2P message received");
+            let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
             else {
                 return;
             };
-            metrics::observe_gossip_attestation_size(uncompressed_data.len());
+            metrics::observe_gossip_attestation_size(uncompressed_data.len(), compressed_len);
 
             let Ok(signed_attestation) = SignedAttestation::from_ssz_bytes(&uncompressed_data)
                 .inspect_err(|err| error!(?err, "Failed to decode gossipped attestation"))
@@ -142,6 +145,8 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
 
+    metrics::observe_gossip_attestation_size(ssz_bytes.len(), compressed.len());
+
     // Look up subscribed topic or construct on-the-fly for gossipsub fanout
     let topic = server
         .attestation_topics
@@ -175,6 +180,8 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
 
+    metrics::observe_gossip_block_size(ssz_bytes.len(), compressed.len());
+
     // Publish to gossipsub
     server
         .swarm_handle
@@ -200,6 +207,8 @@ pub async fn publish_aggregated_attestation(
 
     // Compress with raw snappy
     let compressed = compress_message(&ssz_bytes);
+
+    metrics::observe_gossip_aggregation_size(ssz_bytes.len(), compressed.len());
 
     // Publish to the aggregation topic
     server
