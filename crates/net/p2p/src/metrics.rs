@@ -198,6 +198,8 @@ pub fn update_gossip_mesh_peers<'a>(peers: impl Iterator<Item = &'a PeerId>) {
         }
     }
     for (name, count) in counts {
-        LEAN_GOSSIP_MESH_PEERS.with_label_values(&[&name]).set(count);
+        LEAN_GOSSIP_MESH_PEERS
+            .with_label_values(&[&name])
+            .set(count);
     }
 }
