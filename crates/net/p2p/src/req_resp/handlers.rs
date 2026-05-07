@@ -171,7 +171,7 @@ async fn handle_blocks_by_range_request(
         "Received BlocksByRange request"
     );
 
-    if request.step == 0 || request.count > MAX_REQUEST_BLOCKS {
+    if request.step == 0 || request.count == 0 || request.count > MAX_REQUEST_BLOCKS {
         let response = Response::error(
             ResponseCode::INVALID_REQUEST,
             error_message("invalid BlocksByRange request"),
