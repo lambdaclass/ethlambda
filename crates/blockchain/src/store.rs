@@ -42,19 +42,20 @@ fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    let _ = update_head(store, log_tree)
+        .inspect_err(|e| warn!(%e, "Failed to update head"));
 }
 
 /// Update the head based on the fork choice rule.
 ///
 /// When `log_tree` is true, also computes block weights and logs an ASCII
 /// fork choice tree to the terminal.
-fn update_head(store: &mut Store, log_tree: bool) {
-    let blocks = store.get_live_chain();
+fn update_head(store: &mut Store, log_tree: bool) -> Result<(), StoreError>{
+    let blocks = store.get_live_chain()?;
     let attestations = store.extract_latest_known_attestations();
-    let old_head = store.head();
+    let old_head = store.head()?;
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        store.latest_justified()?.root,
         &blocks,
         &attestations,
         0,
@@ -64,19 +65,23 @@ fn update_head(store: &mut Store, log_tree: bool) {
         metrics::observe_fork_choice_reorg_depth(depth);
         info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
-    store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+    store.update_checkpoints(ForkCheckpoints::head_only(new_head))?;
 
     if old_head != new_head {
         let old_slot = store
             .get_block_header(&old_head)
+            .ok()
+            .flatten()
             .map(|h| h.slot)
             .unwrap_or(0);
         let new_slot = store
             .get_block_header(&new_head)
+            .ok()
+            .flatten()
             .map(|h| h.slot)
             .unwrap_or(0);
-        let justified_slot = store.latest_justified().slot;
-        let finalized_slot = store.latest_finalized().slot;
+        let justified_slot = store.latest_justified()?.slot;
+        let finalized_slot = store.latest_finalized()?.slot;
         info!(
             head_slot = new_slot,
             head_root = %ShortRoot(&new_head.0),
@@ -93,11 +98,12 @@ fn update_head(store: &mut Store, log_tree: bool) {
             &blocks,
             &weights,
             new_head,
-            store.latest_justified(),
-            store.latest_finalized(),
+            store.latest_justified()?,
+            store.latest_finalized()?,
         );
         info!("\n{tree}");
     }
+    Ok(())
 }
 
 /// Update the safe target for attestation.
@@ -111,21 +117,23 @@ fn update_head(store: &mut Store, log_tree: bool) {
 /// Counting "known" would let a node keep advancing its safe target on stale
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
-fn update_safe_target(store: &mut Store) {
-    let head_state = store.get_state(&store.head()).expect("head state exists");
+fn update_safe_target(store: &mut Store) -> Result<(), StoreError> {
+    let head_state = store.get_state(&store.head()?)?
+        .ok_or_else(|| StoreError::Storage("head state not found".into()))?;
     let num_validators = head_state.validators.len() as u64;
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
-    let blocks = store.get_live_chain();
+    let blocks = store.get_live_chain()?;
     let attestations = store.extract_latest_new_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        store.latest_justified()?.root,
         &blocks,
         &attestations,
         min_target_score,
     );
-    store.set_safe_target(safe_target);
+    store.set_safe_target(safe_target)?;
+    Ok(())
 }
 
 /// Validate incoming attestation before processing.
@@ -141,14 +149,14 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 
     // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
     let source_header = store
-        .get_block_header(&data.source.root)
+        .get_block_header(&data.source.root)?
         .ok_or(StoreError::UnknownSourceBlock(data.source.root))?;
     let target_header = store
-        .get_block_header(&data.target.root)
+        .get_block_header(&data.target.root)?
         .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
 
     let head_header = store
-        .get_block_header(&data.head.root)
+        .get_block_header(&data.head.root)?
         .ok_or(StoreError::UnknownHeadBlock(data.head.root))?;
 
     // Topology Check - Source must be older than Target, and Head must be at least as recent.
@@ -188,10 +196,10 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     // The bound is in intervals, not slots: a whole-slot margin would let an
     // adversary pre-publish next-slot aggregates ahead of any honest validator.
     let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
-    if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
+    if attestation_start_interval > store.time()? + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            store_time: store.time(),
+            store_time: store.time().unwrap_or_default(),
         });
     }
 
@@ -206,26 +214,31 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let genesis_time_ms = store.config().genesis_time * 1000;
+    let Ok(config) = store.config() else { return };
+    let genesis_time_ms = config.genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
     // If we're more than a slot behind, fast-forward to a slot before.
     // Operations are idempotent, so this should be fine.
-    if time.saturating_sub(store.time()) > INTERVALS_PER_SLOT {
-        store.set_time(time - INTERVALS_PER_SLOT);
+    let current_time = store.time().unwrap_or(0);
+    if time.saturating_sub(current_time) > INTERVALS_PER_SLOT {
+        let _ = store.set_time(time - INTERVALS_PER_SLOT);
     }
 
-    while store.time() < time {
-        store.set_time(store.time() + 1);
+    loop {
+        let Ok(t) = store.time() else { return };
+        if t >= time { break; }
+        if store.set_time(t + 1).is_err() { return; }
 
-        let slot = store.time() / INTERVALS_PER_SLOT;
-        let interval = store.time() % INTERVALS_PER_SLOT;
+        let new_time = t + 1;
+        let slot = new_time / INTERVALS_PER_SLOT;
+        let interval = new_time % INTERVALS_PER_SLOT;
 
         trace!(%slot, %interval, "processing tick");
 
         // has_proposal is only signaled for the final tick (matching Python spec behavior)
-        let is_final_tick = store.time() == time;
+        let is_final_tick = new_time == time;
         let should_signal_proposal = has_proposal && is_final_tick;
 
         // NOTE: here we assume on_tick never skips intervals.
@@ -248,7 +261,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             }
             3 => {
                 // Update safe target for validators
-                update_safe_target(store);
+                let _ = update_safe_target(store)
+                    .inspect_err(|e| warn!(%e, "Failed to update safe target"));
             }
             4 => {
                 // End of slot - accept accumulated attestations and log tree
@@ -283,7 +297,7 @@ pub fn on_gossip_attestation(
 
     let target = attestation.data.target;
     let target_state = store
-        .get_state(&target.root)
+        .get_state(&target.root)?
         .ok_or(StoreError::MissingTargetState(target.root))?;
     if validator_id >= target_state.validators.len() as u64 {
         return Err(StoreError::InvalidValidatorIndex);
@@ -346,7 +360,7 @@ pub fn on_gossip_aggregated_attestation(
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
     let target_state = store
-        .get_state(&aggregated.data.target.root)
+        .get_state(&aggregated.data.target.root)?
         .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
     let validators = &target_state.validators;
     let num_validators = validators.len() as u64;
@@ -440,7 +454,7 @@ fn on_block_core(
     let slot = block.slot;
 
     // Skip duplicate blocks (idempotent operation)
-    if store.has_state(&block_root) {
+    if store.has_state(&block_root)? {
         return Ok(());
     }
 
@@ -449,7 +463,7 @@ fn on_block_core(
     // This check ensures the state has been computed for the parent block.
     let parent_state =
         store
-            .get_state(&block.parent_root)
+            .get_state(&block.parent_root)?
             .ok_or(StoreError::MissingParentState {
                 parent_root: block.parent_root,
                 slot,
@@ -494,18 +508,18 @@ fn on_block_core(
     post_state.latest_block_header.state_root = state_root;
 
     // Update justified/finalized checkpoints if they have higher slots
-    let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
+    let justified = (post_state.latest_justified.slot > store.latest_justified()?.slot)
         .then_some(post_state.latest_justified);
-    let finalized = (post_state.latest_finalized.slot > store.latest_finalized().slot)
+    let finalized = (post_state.latest_finalized.slot > store.latest_finalized()?.slot)
         .then_some(post_state.latest_finalized);
 
     if justified.is_some() || finalized.is_some() {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
+        store.update_checkpoints(ForkCheckpoints::new(store.head()?, justified, finalized))?;
     }
 
     // Store signed block and state
-    store.insert_signed_block(block_root, signed_block.clone());
-    store.insert_state(block_root, post_state);
+    store.insert_signed_block(block_root, signed_block.clone())?;
+    store.insert_state(block_root, post_state)?;
 
     // Process block body attestations and their signatures
     let aggregated_attestations = &block.body.attestations;
@@ -526,7 +540,7 @@ fn on_block_core(
     store.insert_known_aggregated_payloads_batch(known_entries);
 
     // Update forkchoice head based on new block and attestations
-    update_head(store, false);
+    update_head(store, false)?;
 
     let block_total = block_start.elapsed();
     info!(
@@ -544,11 +558,11 @@ fn on_block_core(
 /// Calculate target checkpoint for validator attestations.
 ///
 /// NOTE: this assumes that we have all the blocks from the head back to the latest finalized.
-pub fn get_attestation_target(store: &Store) -> Checkpoint {
+pub fn get_attestation_target(store: &Store) -> Result<Checkpoint, StoreError> {
     get_attestation_target_with_checkpoints(
         store,
-        store.latest_justified(),
-        store.latest_finalized(),
+        store.latest_justified()?,
+        store.latest_finalized()?,
     )
 }
 
@@ -566,16 +580,16 @@ pub fn get_attestation_target_with_checkpoints(
     store: &Store,
     justified: Checkpoint,
     finalized: Checkpoint,
-) -> Checkpoint {
+) -> Result<Checkpoint, StoreError> {
     // Start from current head
-    let mut target_block_root = store.head();
+    let mut target_block_root = store.head()?;
     let mut target_header = store
-        .get_block_header(&target_block_root)
-        .expect("head block exists");
+        .get_block_header(&target_block_root)?
+        .ok_or_else(|| StoreError::Storage("head block header not found".into()))?;
 
     let safe_target_block_slot = store
-        .get_block_header(&store.safe_target())
-        .expect("safe target exists")
+        .get_block_header(&store.safe_target()?)?
+        .ok_or_else(|| StoreError::Storage("safe target block header not found".into()))?
         .slot;
 
     // Walk back toward safe target (up to `JUSTIFICATION_LOOKBACK_SLOTS` steps)
@@ -586,8 +600,8 @@ pub fn get_attestation_target_with_checkpoints(
         if target_header.slot > safe_target_block_slot {
             target_block_root = target_header.parent_root;
             target_header = store
-                .get_block_header(&target_block_root)
-                .expect("parent block exists");
+                .get_block_header(&target_block_root)?
+                .ok_or_else(|| StoreError::Storage("parent block header not found".into()))?;
         } else {
             break;
         }
@@ -604,8 +618,8 @@ pub fn get_attestation_target_with_checkpoints(
     {
         target_block_root = target_header.parent_root;
         target_header = store
-            .get_block_header(&target_block_root)
-            .expect("parent block exists");
+            .get_block_header(&target_block_root)?
+            .ok_or_else(|| StoreError::Storage("parent block header not found".into()))?;
     }
     // Guard: clamp target to justified (not in the spec).
     //
@@ -625,13 +639,13 @@ pub fn get_attestation_target_with_checkpoints(
             justified_slot = justified.slot,
             "Attestation target walked behind justified source, clamping to justified"
         );
-        return justified;
+        return Ok(justified);
     }
 
-    Checkpoint {
+    Ok(Checkpoint {
         root: target_block_root,
         slot: target_header.slot,
-    }
+    })
 }
 
 /// Produce attestation data for the given slot.
@@ -643,34 +657,36 @@ pub fn get_attestation_target_with_checkpoints(
 /// fixed-point attestation loop in `build_block`.
 ///
 /// See: <https://github.com/leanEthereum/leanSpec/pull/595>
-pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
-    let head_root = store.head();
+pub fn produce_attestation_data(store: &Store, slot: u64) -> Result<AttestationData, StoreError> {
+    let head_root = store.head()?;
+
+    let head_slot = store
+        .get_block_header(&head_root)?
+        .ok_or_else(|| StoreError::Storage("head block header not found".into()))?
+        .slot;
 
     let head_checkpoint = Checkpoint {
         root: head_root,
-        slot: store
-            .get_block_header(&head_root)
-            .expect("head block exists")
-            .slot,
+        slot: head_slot,
     };
 
-    let target_checkpoint = get_attestation_target(store);
+    let target_checkpoint = get_attestation_target(store)?;
 
-    AttestationData {
+    Ok(AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
-    }
+        source: store.latest_justified()?,
+    })
 }
 
 /// Get the head for block proposal at the given slot.
 ///
 /// Ensures store is up-to-date and processes any pending attestations
 /// before returning the canonical head.
-fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
+fn get_proposal_head(store: &mut Store, slot: u64) -> Result<H256, StoreError> {
     // Calculate time corresponding to this slot
-    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+    let slot_time_ms = store.config()?.genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
@@ -678,7 +694,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Process any pending attestations before proposal
     accept_new_attestations(store, false);
 
-    store.head()
+    store.head().map_err(StoreError::from)
 }
 
 /// Produce a block and per-aggregated-attestation signature payloads for the target slot.
@@ -691,9 +707,9 @@ pub fn produce_block_with_signatures(
     validator_index: u64,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
-    let head_root = get_proposal_head(store, slot);
+    let head_root = get_proposal_head(store, slot)?;
     let head_state = store
-        .get_state(&head_root)
+        .get_state(&head_root)?
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
@@ -712,7 +728,7 @@ pub fn produce_block_with_signatures(
     // Get known aggregated payloads: data_root -> (AttestationData, Vec<proof>)
     let aggregated_payloads = store.known_aggregated_payloads();
 
-    let known_block_roots = store.get_block_roots();
+    let known_block_roots = store.get_block_roots()?;
 
     let (block, signatures, post_checkpoints) = {
         let _timing = metrics::time_block_building_payload_aggregation();
@@ -731,7 +747,7 @@ pub fn produce_block_with_signatures(
     // see justification advance, degrading liveness: the fixed-point loop in
     // `build_block` is expected to incorporate pool attestations that close
     // any divergence inherited from a minority fork.
-    let store_justified_slot = store.latest_justified().slot;
+    let store_justified_slot = store.latest_justified()?.slot;
     if post_checkpoints.justified.slot < store_justified_slot {
         return Err(StoreError::JustifiedDivergenceNotClosed {
             block_justified_slot: post_checkpoints.justified.slot,
@@ -852,6 +868,15 @@ pub enum StoreError {
         block_justified_slot: u64,
         store_justified_slot: u64,
     },
+
+    #[error("Storage error: {0}")]
+    Storage(#[source] ethlambda_storage::Error),
+}
+
+impl From<ethlambda_storage::Error> for StoreError {
+    fn from(e: ethlambda_storage::Error) -> Self {
+        Self::Storage(e)
+    }
 }
 
 /// Compute the bitwise union (OR) of two AggregationBits bitfields.
@@ -1278,8 +1303,8 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
         return None;
     }
 
-    let old_head_header = store.get_block_header(&old_head)?;
-    let new_head_header = store.get_block_header(&new_head)?;
+    let old_head_header = store.get_block_header(&old_head).ok().flatten()?;
+    let new_head_header = store.get_block_header(&new_head).ok().flatten()?;
 
     let old_slot = old_head_header.slot;
     let new_slot = new_head_header.slot;
@@ -1295,7 +1320,7 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     // Bounded to avoid unbounded walks in pathological cases.
     const MAX_REORG_DEPTH: u64 = 128;
     let mut depth: u64 = 0;
-    while let Some(current_header) = store.get_block_header(&current_root) {
+    while let Some(current_header) = store.get_block_header(&current_root).ok().flatten() {
         if current_header.slot <= target_slot {
             // We've reached the target slot - check if we're at the target block
             return (current_root != target_root).then_some(depth);
@@ -1612,9 +1637,9 @@ mod tests {
             },
         };
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block).unwrap();
 
-        let head_root = store.head();
+        let head_root = store.head().unwrap();
         let att_data = AttestationData {
             slot: 0,
             head: Checkpoint {

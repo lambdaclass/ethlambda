@@ -1,7 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{
-    Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
+    Extension, Json, Router, http::HeaderValue, http::StatusCode, http::header,
+    response::IntoResponse, routing::get,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
@@ -104,25 +105,31 @@ fn build_debug_router() -> Router {
 async fn get_latest_finalized_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
-    let mut state = store
-        .get_state(&finalized.root)
-        .expect("finalized state exists");
-
-    // Zero state_root to match the canonical post-state representation.
-    // The spec's state_transition sets state_root to zero during process_block_header,
-    // and only fills it in lazily at the next slot's process_slots.
-    // Serving the canonical form ensures checkpoint sync interoperability.
-    state.latest_block_header.state_root = H256::ZERO;
-
-    ssz_response(state.to_ssz())
+    let finalized = match store.latest_finalized() {
+        Ok(cp) => cp,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match store.get_state(&finalized.root) {
+        Ok(Some(mut state)) => {
+            // Zero state_root to match the canonical post-state representation.
+            // The spec's state_transition sets state_root to zero during process_block_header,
+            // and only fills it in lazily at the next slot's process_slots.
+            // Serving the canonical form ensures checkpoint sync interoperability.
+            state.latest_block_header.state_root = H256::ZERO;
+            ssz_response(state.to_ssz())
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn get_latest_justified_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let checkpoint = store.latest_justified();
-    json_response(checkpoint)
+    match store.latest_justified() {
+        Ok(checkpoint) => json_response(checkpoint),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 fn json_response<T: serde::Serialize>(value: T) -> axum::response::Response {
@@ -201,7 +208,7 @@ mod tests {
     async fn test_get_latest_justified_checkpoint() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state).unwrap();
 
         let app = build_api_router(store.clone());
 
@@ -221,7 +228,7 @@ mod tests {
         let checkpoint: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // The justified checkpoint should match the store's latest justified
-        let expected = store.latest_justified();
+        let expected = store.latest_justified().unwrap();
         assert_eq!(
             checkpoint,
             json!({
@@ -237,11 +244,11 @@ mod tests {
         use libssz::SszEncode;
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state).unwrap();
 
         // Build expected SSZ with zeroed state_root (canonical post-state form)
-        let finalized = store.latest_finalized();
-        let mut expected_state = store.get_state(&finalized.root).unwrap();
+        let finalized = store.latest_finalized().unwrap();
+        let mut expected_state = store.get_state(&finalized.root).unwrap().unwrap();
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 

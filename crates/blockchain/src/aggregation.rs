@@ -127,7 +127,7 @@ pub fn snapshot_aggregation_inputs(store: &Store) -> Option<AggregationSnapshot>
         return None;
     }
 
-    let head_state = store.head_state();
+    let head_state = store.head_state().ok()?;
     let validators = &head_state.validators;
 
     let gossip_roots: HashSet<H256> = gossip_groups

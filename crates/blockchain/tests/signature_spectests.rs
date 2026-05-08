@@ -44,7 +44,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Initialize the store with the anchor state and block
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
-        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
+        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block).unwrap();
 
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlock = test.signed_block.into();
