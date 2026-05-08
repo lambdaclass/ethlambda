@@ -250,7 +250,7 @@ fn canonical_blocks_by_range(
             break;
         }
 
-        if header.slot <= end_slot && (header.slot - start_slot) % step == 0 {
+        if header.slot <= end_slot && (header.slot - start_slot).is_multiple_of(step) {
             roots_by_slot.insert(header.slot, current_root);
         }
 
