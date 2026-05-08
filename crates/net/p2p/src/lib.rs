@@ -59,6 +59,7 @@ const MAX_FETCH_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
+pub const LONG_RANGE_SYNC_THRESHOLD: u64 = 2;
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,

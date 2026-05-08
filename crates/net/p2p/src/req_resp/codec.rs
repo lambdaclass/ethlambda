@@ -21,6 +21,7 @@ fn protocol_label(protocol: &str) -> &'static str {
     match protocol {
         STATUS_PROTOCOL_V1 => "status",
         BLOCKS_BY_ROOT_PROTOCOL_V1 => "blocks_by_root",
+        BLOCKS_BY_RANGE_PROTOCOL_V1 => "blocks_by_range",
         _ => "unknown",
     }
 }
@@ -82,11 +83,9 @@ impl libp2p::request_response::Codec for Codec {
     {
         let label = protocol_label(protocol.as_ref());
         match protocol.as_ref() {
-            STATUS_PROTOCOL_V1 => decode_status_response(io).await,
-            BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io).await,
-            BLOCKS_BY_RANGE_PROTOCOL_V1 => decode_blocks_by_range_response(io).await,
             STATUS_PROTOCOL_V1 => decode_status_response(io, label).await,
             BLOCKS_BY_ROOT_PROTOCOL_V1 => decode_blocks_by_root_response(io, label).await,
+            BLOCKS_BY_RANGE_PROTOCOL_V1 => decode_blocks_by_range_response(io, label).await,
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -268,18 +267,22 @@ async fn decode_blocks_by_root_response<T>(io: &mut T, protocol_label: &str) -> 
 where
     T: AsyncRead + Unpin + Send,
 {
-    decode_blocks_response(io, ResponsePayload::BlocksByRoot).await
+    decode_blocks_response(io, protocol_label, ResponsePayload::BlocksByRoot).await
 }
 
-async fn decode_blocks_by_range_response<T>(io: &mut T) -> io::Result<Response>
+async fn decode_blocks_by_range_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+) -> io::Result<Response>
 where
     T: AsyncRead + Unpin + Send,
 {
-    decode_blocks_response(io, ResponsePayload::BlocksByRange).await
+    decode_blocks_response(io, protocol_label, ResponsePayload::BlocksByRange).await
 }
 
 async fn decode_blocks_response<T>(
     io: &mut T,
+    protocol_label: &str,
     payload: fn(Vec<SignedBlock>) -> ResponsePayload,
 ) -> io::Result<Response>
 where

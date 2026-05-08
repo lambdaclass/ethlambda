@@ -11,14 +11,15 @@ use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
+use super::messages::{ResponseCode, error_message};
 use super::{
-    BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest, BlocksByRootRequest, MAX_REQUEST_BLOCKS,
-    Request, Response, ResponsePayload, Status, messages::error_message,
+    BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
+    BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
 };
+use crate::LONG_RANGE_SYNC_THRESHOLD;
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, P2PServer, PendingRequest,
-    p2p_protocol,
-    req_resp::{RequestedBlockRoots, messages::ResponseCode},
+    p2p_protocol, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -62,7 +63,7 @@ pub async fn handle_req_resp_message(
                     Response::Success { payload } => match payload {
                         ResponsePayload::Status(status) => {
                             info!(kind = "status_response", peer_count, "P2P message received");
-                            handle_status_response(status, peer).await;
+                            handle_status_response(server, status, peer).await;
                         }
                         ResponsePayload::BlocksByRoot(blocks) => {
                             info!(
@@ -79,6 +80,7 @@ pub async fn handle_req_resp_message(
                                 count = blocks.len(),
                                 "P2P message received"
                             );
+                            handle_blocks_by_range_response(server, blocks, peer).await;
                         }
                     },
                     Response::Error { code, message } => {
@@ -129,8 +131,24 @@ async fn handle_status_request(
     server.swarm_handle.send_response(channel, response);
 }
 
-async fn handle_status_response(status: Status, peer: PeerId) {
+async fn handle_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     info!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
+
+    let our_head_slot = server.store.head_slot();
+    if status.head.slot <= our_head_slot {
+        return;
+    }
+    let gap = status.head.slot - our_head_slot;
+
+    if gap > LONG_RANGE_SYNC_THRESHOLD {
+        // Long-range sync: request blocks by range to efficiently fill large gap.
+        let start_slot = our_head_slot.saturating_add(1);
+        info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
+        request_blocks_by_range_from_peer(server, peer, start_slot, gap).await;
+    } else {
+        // Short-range sync: fetch individual blocks by root, relying on gossip to fill any small gaps.
+        info!(%peer, gap, "Short gap, relying on gossip / FetchBlock for missing slots");
+    }
 }
 
 async fn handle_blocks_by_root_request(
@@ -295,6 +313,35 @@ async fn handle_blocks_by_root_response(
     }
 }
 
+async fn handle_blocks_by_range_response(
+    server: &mut P2PServer,
+    blocks: Vec<SignedBlock>,
+    peer: PeerId,
+) {
+    info!(%peer, count = blocks.len(), "Received BlocksByRange response");
+
+    if blocks.is_empty() {
+        warn!(%peer, "Received empty BlocksByRange response");
+        return;
+    }
+
+    if let Some(ref blockchain) = server.blockchain {
+        for block in blocks {
+            let block_root = block.message.hash_tree_root();
+            let slot = block.message.slot;
+            let _ = blockchain.new_block(block).inspect_err(|err| {
+                error!(
+                    %peer,
+                    %slot,
+                    block_root = %ethlambda_types::ShortRoot(&block_root.0),
+                    %err,
+                    "Failed to forward range-fetched block to blockchain"
+                )
+            });
+        }
+    }
+}
+
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
     let finalized = store.latest_finalized();
@@ -389,6 +436,60 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
 
     // Map request_id to root for failure handling
     server.request_id_map.insert(request_id, root);
+
+    true
+}
+
+async fn request_blocks_by_range_from_peer(
+    server: &mut P2PServer,
+    peer: PeerId,
+    start_slot: u64,
+    count: u64,
+) -> bool {
+    if count == 0 {
+        return true;
+    }
+
+    let mut remaining = count;
+    let mut next_slot = start_slot;
+
+    while remaining > 0 {
+        let batch_count = remaining.min(MAX_REQUEST_BLOCKS);
+        let request = BlocksByRangeRequest {
+            start_slot: next_slot,
+            count: batch_count,
+            step: 1,
+        };
+
+        info!(
+            %peer,
+            start_slot = next_slot,
+            count = batch_count,
+            "Sending BlocksByRange request"
+        );
+
+        if server
+            .swarm_handle
+            .send_request(
+                peer,
+                Request::BlocksByRange(request),
+                libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
+            )
+            .await
+            .is_none()
+        {
+            warn!(
+                %peer,
+                start_slot = next_slot,
+                count = batch_count,
+                "Failed to send BlocksByRange request (swarm adapter closed)"
+            );
+            return false;
+        }
+
+        remaining -= batch_count;
+        next_slot = next_slot.saturating_add(batch_count);
+    }
 
     true
 }
