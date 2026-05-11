@@ -58,11 +58,6 @@ use tracing::debug;
 pub const TEST_DRIVER_ENV: &str = "HIVE_LEAN_TEST_DRIVER";
 
 /// Whether the supplied env-var value should activate the driver.
-///
-/// Pure helper so [`test_driver_enabled`] stays a thin wrapper over
-/// `std::env::var` and the parsing rules are unit-testable without mutating
-/// process-global env state (which would be `unsafe` and racy under cargo's
-/// parallel test runner).
 fn parse_truthy_env_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
