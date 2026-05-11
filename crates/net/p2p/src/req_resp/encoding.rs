@@ -8,8 +8,25 @@ pub const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 // https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md#max_message_size
 pub const MAX_COMPRESSED_PAYLOAD_SIZE: usize = 32 + MAX_PAYLOAD_SIZE + MAX_PAYLOAD_SIZE / 6 + 1024; // ~12 MB
 
+/// Decoded payload together with the size of its on-wire snappy-compressed
+/// bytes (excluding the varint length prefix).
+///
+/// `compressed_size` is accurate for single-chunk streams (Status request /
+/// response, BlocksByRoot request). For multi-chunk streams (BlocksByRoot
+/// response) the value is over-reported on the first chunk because
+/// `decode_payload` slurps the whole stream via `read_to_end` before parsing
+/// the first varint, so `compressed_size` measures everything left after that
+/// varint rather than just this chunk's snappy frame. The metric is still
+/// useful for single-chunk traffic and as an order-of-magnitude signal on
+/// multi-chunk responses; precise per-chunk accounting would require refactoring
+/// `decode_payload` to read one varint + one snappy frame at a time.
+pub struct DecodedPayload {
+    pub uncompressed: Vec<u8>,
+    pub compressed_size: usize,
+}
+
 /// Decode a varint-prefixed, snappy-compressed SSZ payload from an async reader.
-pub async fn decode_payload<T>(io: &mut T) -> io::Result<Vec<u8>>
+pub async fn decode_payload<T>(io: &mut T) -> io::Result<DecodedPayload>
 where
     T: AsyncRead + Unpin + Send,
 {
@@ -26,6 +43,7 @@ where
         ));
     }
     let (size, rest) = decode_varint(&buf)?;
+    let compressed_size = rest.len();
 
     if size as usize > MAX_PAYLOAD_SIZE {
         return Err(io::Error::new(
@@ -44,10 +62,15 @@ where
         ));
     }
 
-    Ok(uncompressed)
+    Ok(DecodedPayload {
+        uncompressed,
+        compressed_size,
+    })
 }
 
-pub async fn write_payload<T>(io: &mut T, encoded: &[u8]) -> io::Result<()>
+/// Write a varint-prefixed, snappy-compressed SSZ payload. Returns the size
+/// of the snappy-compressed bytes (excluding the varint length prefix).
+pub async fn write_payload<T>(io: &mut T, encoded: &[u8]) -> io::Result<usize>
 where
     T: AsyncWrite + Unpin,
 {
@@ -70,7 +93,7 @@ where
     io.write_all(varint_buf).await?;
     io.write_all(&buf).await?;
 
-    Ok(())
+    Ok(buf.len())
 }
 
 /// Encodes a u32 as a varint into the provided buffer, returning a slice of the buffer

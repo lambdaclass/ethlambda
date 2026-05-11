@@ -18,4 +18,10 @@ fold = { enable = true, level = 1 }
 # https://github.com/marxin/mdbook-linkcheck2
 # Needs to be installed with `cargo install mdbook-linkcheck2`
 [output.linkcheck2]
+# Skip silently if the binary isn't installed, so contributors can build the
+# site without installing the link checker.
 optional = true
+# Fail the build on broken links (default is "warn"), so CI catches them.
+# Only internal/relative links are checked because follow-web-links defaults
+# to false.
+warning-policy = "error"
