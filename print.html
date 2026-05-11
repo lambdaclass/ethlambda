@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c631f979.js";
+            window.path_to_searchindex_js = "searchindex-6b17334d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-031b865e.js"></script>
@@ -1464,6 +1464,7 @@ clients.</p>
 <tr><td><code>lean_attestation_validation_time_seconds</code></td><td>Histogram</td><td>Time taken to validate attestation</td><td>On validate attestation</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 1</td><td>✅</td></tr>
 <tr><td><code>lean_fork_choice_reorgs_total</code></td><td>Counter</td><td>Total number of fork choice reorgs</td><td>On fork choice reorg</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_fork_choice_reorg_depth</code></td><td>Histogram</td><td>Depth of fork choice reorgs (in blocks)</td><td>On fork choice reorg</td><td></td><td>1, 2, 3, 5, 7, 10, 20, 30, 50, 100</td><td>✅</td></tr>
+<tr><td><code>lean_tick_interval_duration_seconds</code></td><td>Histogram</td><td>Elapsed time between clock ticks in seconds</td><td>At the start of each tick interval</td><td></td><td>0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6</td><td>✅</td></tr>
 <tr><td><code>lean_gossip_signatures</code></td><td>Gauge</td><td>Number of gossip signatures in fork-choice store</td><td>On gossip signatures update</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_latest_new_aggregated_payloads</code></td><td>Gauge</td><td>Number of new aggregated payload items</td><td>On <code>latest_new_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_latest_known_aggregated_payloads</code></td><td>Gauge</td><td>Number of known aggregated payload items</td><td>On <code>latest_known_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
