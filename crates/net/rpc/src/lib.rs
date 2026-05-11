@@ -124,7 +124,7 @@ async fn get_latest_finalized_state(
 
 async fn get_latest_finalized_block(
     axum::extract::State(store): axum::extract::State<Store>,
-) -> axum::response::Response {
+) -> impl IntoResponse {
     let finalized = store.latest_finalized();
     // Returns 404 for genesis since it doesn't have a valid signature
     match store.get_signed_block(&finalized.root) {
