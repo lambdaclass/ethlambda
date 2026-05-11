@@ -1,7 +1,10 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{
-    Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
+    Extension, Json, Router,
+    http::{HeaderValue, StatusCode, header},
+    response::IntoResponse,
+    routing::get,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
@@ -121,13 +124,13 @@ async fn get_latest_finalized_state(
 
 async fn get_latest_finalized_block(
     axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let finalized = store.latest_finalized();
-    let block = store
-        .get_signed_block(&finalized.root)
-        .expect("finalized block exists");
-
-    ssz_response(block.to_ssz())
+    // Returns 404 for genesis since it doesn't have a valid signature
+    match store.get_signed_block(&finalized.root) {
+        Some(block) => ssz_response(block.to_ssz()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn get_latest_justified_state(
@@ -197,10 +200,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
+    use axum::{body::Body, http::Request};
     use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use serde_json::json;
@@ -344,5 +344,29 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), expected_ssz.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_finalized_block_returns_404_when_absent() {
+        // Genesis-anchored store: init_store writes header + state but no
+        // BlockSignatures entry, so get_signed_block(genesis_root) returns None
+        // and the endpoint must report 404 rather than panic.
+        let state = create_test_state();
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend, state);
+
+        let app = build_api_router(store);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks/finalized")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
