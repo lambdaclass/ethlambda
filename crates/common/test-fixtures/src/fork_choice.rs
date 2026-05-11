@@ -1,4 +1,12 @@
-use super::common::{self, Block, TestInfo, TestState, deser_xmss_hex};
+//! Fork-choice test fixture types.
+//!
+//! Used both by the offline spec-test runner and the Hive `/lean/v0/test_driver/fork_choice/*`
+//! endpoints, which receive the same JSON shapes from the lean spec-assets simulator.
+
+use crate::{
+    AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
+    deser_xmss_hex,
+};
 use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Deserializer};
@@ -48,6 +56,11 @@ pub struct ForkChoiceTest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForkChoiceStep {
+    /// Whether this step is expected to be accepted by the store.
+    ///
+    /// Defaults to `true` because the simulator omits the field when it expects
+    /// success (`checks`-only steps don't carry a `valid` flag at all).
+    #[serde(default = "default_true")]
     pub valid: bool,
     pub checks: Option<StoreChecks>,
     #[serde(rename = "stepType")]
@@ -64,11 +77,15 @@ pub struct ForkChoiceStep {
     pub is_aggregator: Option<bool>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationStepData {
     #[serde(rename = "validatorId")]
     pub validator_id: Option<u64>,
-    pub data: common::AttestationData,
+    pub data: AttestationData,
     #[serde(default, deserialize_with = "deser_opt_xmss_hex")]
     pub signature: Option<XmssSignature>,
     /// Present on `gossipAggregatedAttestation` steps.
@@ -77,7 +94,7 @@ pub struct AttestationStepData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStepData {
-    pub participants: common::AggregationBits,
+    pub participants: AggregationBits,
     #[serde(rename = "proofData")]
     pub proof_data: HexByteList,
 }
@@ -114,21 +131,20 @@ pub struct BlockStepData {
     pub parent_root: H256,
     #[serde(rename = "stateRoot")]
     pub state_root: H256,
-    pub body: common::BlockBody,
+    pub body: BlockBody,
     #[serde(rename = "blockRootLabel")]
     pub block_root_label: Option<String>,
 }
 
 impl BlockStepData {
     pub fn to_block(&self) -> ethlambda_types::block::Block {
-        Block {
+        ethlambda_types::block::Block {
             slot: self.slot,
             proposer_index: self.proposer_index,
             parent_root: self.parent_root,
             state_root: self.state_root,
-            body: self.body.clone(),
+            body: self.body.clone().into(),
         }
-        .into()
     }
 }
 
@@ -160,12 +176,20 @@ pub struct StoreChecks {
     #[serde(rename = "latestJustifiedRootLabel")]
     pub latest_justified_root_label: Option<String>,
 
+    /// camelCase alias used by Hive's spec-assets fixtures (`justifiedCheckpoint`).
+    #[serde(rename = "justifiedCheckpoint")]
+    pub justified_checkpoint: Option<Checkpoint>,
+
     #[serde(rename = "latestFinalizedSlot")]
     pub latest_finalized_slot: Option<u64>,
     #[serde(rename = "latestFinalizedRoot")]
     pub latest_finalized_root: Option<H256>,
     #[serde(rename = "latestFinalizedRootLabel")]
     pub latest_finalized_root_label: Option<String>,
+
+    /// camelCase alias used by Hive's spec-assets fixtures (`finalizedCheckpoint`).
+    #[serde(rename = "finalizedCheckpoint")]
+    pub finalized_checkpoint: Option<Checkpoint>,
 
     /// Legacy single-field schema; expected safe target block root.
     #[serde(rename = "safeTarget")]

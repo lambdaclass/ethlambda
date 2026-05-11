@@ -2156,10 +2156,14 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-blockchain",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
+ "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-test-fixtures",
  "ethlambda-types",
+ "hex",
  "http-body-util",
  "jemalloc_pprof",
  "libssz",
@@ -2208,6 +2212,7 @@ dependencies = [
  "hex",
  "libssz-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

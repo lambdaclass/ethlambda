@@ -14,12 +14,9 @@ use ethlambda_types::{
     state::State,
 };
 
-use crate::types::{ForkChoiceTestVector, StoreChecks};
+use ethlambda_test_fixtures::fork_choice::{AttestationCheck, ForkChoiceTestVector, StoreChecks};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
-
-mod common;
-mod types;
 
 /// List of skipped tests.
 const SKIP_TESTS: &[&str] = &[];
@@ -161,7 +158,9 @@ fn assert_step_outcome<T, E: std::fmt::Debug>(
     }
 }
 
-fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
+fn build_signed_block(
+    block_data: ethlambda_test_fixtures::fork_choice::BlockStepData,
+) -> SignedBlock {
     let block: Block = block_data.to_block();
 
     // Build one empty proof per attestation, matching the aggregation_bits from
@@ -374,7 +373,7 @@ fn validate_checks(
 
 fn validate_attestation_check(
     st: &Store,
-    check: &types::AttestationCheck,
+    check: &AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
     let validator_id = check.validator;

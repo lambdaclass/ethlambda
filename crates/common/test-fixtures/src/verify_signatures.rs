@@ -1,4 +1,10 @@
-use super::common::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
+//! Signature-verification test fixture types.
+//!
+//! Used both by the offline spec-test runner and the Hive
+//! `/lean/v0/test_driver/verify_signatures/run` endpoint, which receives the
+//! same JSON shapes from the lean spec-assets simulator.
+
+use crate::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
     AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
