@@ -257,29 +257,8 @@ async fn run_state_transition(
 ) -> Json<StateTransitionResponse> {
     let mut state: State = request.pre.into();
     let blocks: Vec<Block> = request.blocks.into_iter().map(Into::into).collect();
-    let blocks_empty = blocks.is_empty();
 
-    let result = (|| -> Result<(), String> {
-        for block in &blocks {
-            ethlambda_state_transition::state_transition(&mut state, block)
-                .map_err(|err| err.to_string())?;
-        }
-
-        // Match Ream's behavior: fixtures may carry `expectException` with an
-        // empty `blocks` list to exercise pre-state-only invariants. The STF
-        // entry point only runs when there's a block, so force a deterministic
-        // failure here to keep the simulator's `expectException` assertion
-        // consistent.
-        if blocks_empty && request.expect_exception.is_some() {
-            let target_slot = state.slot;
-            ethlambda_state_transition::process_slots(&mut state, target_slot)
-                .map_err(|err| err.to_string())?;
-        }
-
-        Ok(())
-    })();
-
-    let response = match result {
+    let response = match apply_state_transition(&mut state, &blocks, request.expect_exception) {
         Ok(()) => StateTransitionResponse {
             succeeded: true,
             error: None,
@@ -292,6 +271,32 @@ async fn run_state_transition(
         },
     };
     Json(response)
+}
+
+/// Run the STF for each block in `blocks` and return the first error (if any).
+///
+/// When `blocks` is empty and `expect_exception` is set the spec fixture wants
+/// failure but the STF entry point never runs, so call `process_slots(slot)`
+/// against the current slot. That call returns `Err(StateSlotIsNewer)` because
+/// the STF rejects `target_slot <= current_slot`, giving the simulator a
+/// deterministic non-2xx outcome that matches the fixture's `expectException`.
+fn apply_state_transition(
+    state: &mut State,
+    blocks: &[Block],
+    expect_exception: Option<String>,
+) -> Result<(), String> {
+    for block in blocks {
+        ethlambda_state_transition::state_transition(state, block)
+            .map_err(|err| err.to_string())?;
+    }
+
+    if blocks.is_empty() && expect_exception.is_some() {
+        let target_slot = state.slot;
+        ethlambda_state_transition::process_slots(state, target_slot)
+            .map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
 }
 
 /// `POST /lean/v0/test_driver/verify_signatures/run`
