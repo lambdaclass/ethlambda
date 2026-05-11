@@ -4,26 +4,18 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    aggregation::{aggregate_type_2, proposer_type_one},
-    store,
-};
+use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
-    block::{Block, ByteListMiB, SignedBlock, TypeOneMultiSignature},
+    block::{Block, TypeOneMultiSignature},
     primitives::{ByteList, H256, HashTreeRoot as _},
     state::State,
 };
-use libssz::SszEncode as _;
 
-use crate::types::{ForkChoiceTestVector, StoreChecks};
+use ethlambda_test_fixtures::fork_choice::{AttestationCheck, ForkChoiceTestVector, StoreChecks};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
-
-mod common;
-mod types;
 
 /// List of skipped tests.
 const SKIP_TESTS: &[&str] = &[];
@@ -70,7 +62,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         block_registry.insert(label.clone(), root);
                     }
 
-                    let signed_block = build_signed_block(block_data);
+                    let signed_block = block_data.to_blank_signed_block();
 
                     let block_time_ms =
                         genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
@@ -163,54 +155,6 @@ fn assert_step_outcome<T, E: std::fmt::Debug>(
             Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
         }
         _ => Ok(()),
-    }
-}
-
-fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
-    let block: Block = block_data.to_block();
-
-    // Build one empty Type-1 per attestation plus a stub proposer Type-1,
-    // then fold the lot into the merged Type-2 proof carried on the block.
-    // Fork choice spec tests run via `on_block_without_verification`, so the
-    // proof bytes are never crypto-checked — but the structural ingestion in
-    // `process_new_block` still decodes the blob and asserts the info list
-    // has `attestations.len() + 1` entries.
-    //
-    // Oversized-block tests (more than MAX_ATTESTATIONS_DATA attestations)
-    // overflow `TypeOneInfos`'s SSZ-list cap; fall back to an empty proof
-    // because `process_new_block` rejects with `TooManyAttestationData` before
-    // the proof is decoded, so its contents don't matter.
-    let block_root = block.hash_tree_root();
-    let attestation_count = block.body.attestations.len();
-    let proof = if attestation_count > ethlambda_blockchain::MAX_ATTESTATIONS_DATA {
-        ByteListMiB::default()
-    } else {
-        let attestation_proofs: Vec<TypeOneMultiSignature> = block
-            .body
-            .attestations
-            .iter()
-            .map(|att| {
-                TypeOneMultiSignature::empty(
-                    att.aggregation_bits.clone(),
-                    att.data.hash_tree_root(),
-                    att.data.slot,
-                )
-            })
-            .collect();
-        let mut all = attestation_proofs;
-        all.push(proposer_type_one(
-            block.proposer_index,
-            ByteListMiB::default(),
-            block_root,
-            block.slot,
-        ));
-        let merged = aggregate_type_2(all);
-        ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
-    };
-
-    SignedBlock {
-        message: block,
-        proof,
     }
 }
 
@@ -404,7 +348,7 @@ fn validate_checks(
 
 fn validate_attestation_check(
     st: &Store,
-    check: &types::AttestationCheck,
+    check: &AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
     let validator_id = check.validator;

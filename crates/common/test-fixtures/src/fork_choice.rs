@@ -1,9 +1,29 @@
-use super::common::{self, Block, TestInfo, TestState, deser_xmss_hex};
+//! Fork-choice test fixture types.
+//!
+//! Used both by the offline spec-test runner and the Hive `/lean/v0/test_driver/fork_choice/*`
+//! endpoints, which receive the same JSON shapes from the lean spec-assets simulator.
+
+use crate::{
+    AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
+    deser_xmss_hex,
+};
 use ethlambda_types::attestation::XmssSignature;
-use ethlambda_types::primitives::H256;
+use ethlambda_types::block::{
+    ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
+};
+use ethlambda_types::primitives::{H256, HashTreeRoot as _};
+use libssz::SszEncode as _;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Per-block cap from `ethlambda_blockchain::MAX_ATTESTATIONS_DATA`, mirrored
+/// here so the test-fixtures crate stays free of a blockchain-layer dep. Used
+/// by [`BlockStepData::to_blank_signed_block`] to fall back to an empty proof
+/// for oversized-block test cases (the merged Type-2 metadata list caps at
+/// `MAX_ATTESTATIONS_DATA + 1`, which is exactly the proposer + every block
+/// attestation; oversized blocks are rejected upstream of proof decoding).
+const MAX_ATTESTATIONS_DATA: usize = 16;
 
 // ============================================================================
 // Root Structures
@@ -48,6 +68,11 @@ pub struct ForkChoiceTest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForkChoiceStep {
+    /// Whether this step is expected to be accepted by the store.
+    ///
+    /// Defaults to `true` because the simulator omits the field when it expects
+    /// success (`checks`-only steps don't carry a `valid` flag at all).
+    #[serde(default = "default_true")]
     pub valid: bool,
     pub checks: Option<StoreChecks>,
     #[serde(rename = "stepType")]
@@ -64,11 +89,15 @@ pub struct ForkChoiceStep {
     pub is_aggregator: Option<bool>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationStepData {
     #[serde(rename = "validatorId")]
     pub validator_id: Option<u64>,
-    pub data: common::AttestationData,
+    pub data: AttestationData,
     #[serde(default, deserialize_with = "deser_opt_xmss_hex")]
     pub signature: Option<XmssSignature>,
     /// Present on `gossipAggregatedAttestation` steps.
@@ -77,7 +106,7 @@ pub struct AttestationStepData {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStepData {
-    pub participants: common::AggregationBits,
+    pub participants: AggregationBits,
     #[serde(rename = "proofData")]
     pub proof_data: HexByteList,
 }
@@ -114,21 +143,69 @@ pub struct BlockStepData {
     pub parent_root: H256,
     #[serde(rename = "stateRoot")]
     pub state_root: H256,
-    pub body: common::BlockBody,
+    pub body: BlockBody,
     #[serde(rename = "blockRootLabel")]
     pub block_root_label: Option<String>,
 }
 
 impl BlockStepData {
     pub fn to_block(&self) -> ethlambda_types::block::Block {
-        Block {
+        ethlambda_types::block::Block {
             slot: self.slot,
             proposer_index: self.proposer_index,
             parent_root: self.parent_root,
             state_root: self.state_root,
-            body: self.body.clone(),
+            body: self.body.clone().into(),
         }
-        .into()
+    }
+
+    /// Build a `SignedBlock` whose merged Type-2 proof is structurally correct
+    /// (one Type-1 info entry per block-body attestation plus a trailing
+    /// proposer entry) but carries empty proof bytes — the crypto layer is
+    /// never invoked by callers of this helper.
+    ///
+    /// Used by callers that import the block via `on_block_without_verification`
+    /// (fork-choice spec-test runner and Hive test-driver), where
+    /// `process_new_block` still decodes the merged proof and asserts the info
+    /// list aligns with `attestations.len() + 1` before dispatching.
+    ///
+    /// Oversized-block tests (more than `MAX_ATTESTATIONS_DATA` attestations)
+    /// overflow `TypeOneInfos`'s SSZ-list cap, so we fall back to an empty
+    /// proof blob — `process_new_block` rejects with `TooManyAttestationData`
+    /// before the proof is ever decoded, so its contents don't matter for
+    /// those scenarios.
+    pub fn to_blank_signed_block(&self) -> SignedBlock {
+        let block = self.to_block();
+        let block_root = block.hash_tree_root();
+        let proof = if block.body.attestations.len() > MAX_ATTESTATIONS_DATA {
+            ByteListMiB::default()
+        } else {
+            let attestation_proofs: Vec<TypeOneMultiSignature> = block
+                .body
+                .attestations
+                .iter()
+                .map(|att| {
+                    TypeOneMultiSignature::empty(
+                        att.aggregation_bits.clone(),
+                        att.data.hash_tree_root(),
+                        att.data.slot,
+                    )
+                })
+                .collect();
+            let mut all = attestation_proofs;
+            all.push(TypeOneMultiSignature::for_proposer(
+                block.proposer_index,
+                ByteListMiB::default(),
+                block_root,
+                block.slot,
+            ));
+            let merged = TypeTwoMultiSignature::from_type_1s(all);
+            ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
+        };
+        SignedBlock {
+            message: block,
+            proof,
+        }
     }
 }
 
@@ -160,12 +237,20 @@ pub struct StoreChecks {
     #[serde(rename = "latestJustifiedRootLabel")]
     pub latest_justified_root_label: Option<String>,
 
+    /// camelCase alias used by Hive's spec-assets fixtures (`justifiedCheckpoint`).
+    #[serde(rename = "justifiedCheckpoint")]
+    pub justified_checkpoint: Option<Checkpoint>,
+
     #[serde(rename = "latestFinalizedSlot")]
     pub latest_finalized_slot: Option<u64>,
     #[serde(rename = "latestFinalizedRoot")]
     pub latest_finalized_root: Option<H256>,
     #[serde(rename = "latestFinalizedRootLabel")]
     pub latest_finalized_root_label: Option<String>,
+
+    /// camelCase alias used by Hive's spec-assets fixtures (`finalizedCheckpoint`).
+    #[serde(rename = "finalizedCheckpoint")]
+    pub finalized_checkpoint: Option<Checkpoint>,
 
     /// Legacy single-field schema; expected safe target block root.
     #[serde(rename = "safeTarget")]

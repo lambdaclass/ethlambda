@@ -143,9 +143,48 @@ impl TypeOneMultiSignature {
         Self::new(participants, message, slot, SszList::new())
     }
 
+    /// Wrap a proposer's XMSS signature over a block root as a singleton Type-1.
+    ///
+    /// Used by block production and test fixtures to fold the proposer's
+    /// signature into the block-level Type-2 merged proof.
+    pub fn for_proposer(
+        proposer_index: u64,
+        proposer_signature: ByteListMiB,
+        block_root: H256,
+        slot: u64,
+    ) -> Self {
+        let mut participants = AggregationBits::with_length(proposer_index as usize + 1)
+            .expect("validator index fits");
+        participants
+            .set(proposer_index as usize, true)
+            .expect("index within capacity");
+        Self::new(participants, block_root, slot, proposer_signature)
+    }
+
     /// Returns the validator indices that are set in the participants bitfield.
     pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
         validator_indices(&self.info.participants)
+    }
+}
+
+impl TypeTwoMultiSignature {
+    /// Merge a list of Type-1 single-message proofs into a single Type-2
+    /// multi-message proof. Mirrors upstream leanSpec's `aggregate_type_2`
+    /// stub: the metadata list (`TypeOneInfos`) is faithfully preserved so a
+    /// verifier can re-derive the per-message binding inputs, but the merged
+    /// `proof` bytes are left empty until the `lean_multisig_py` bindings ship
+    /// real cryptographic merging. Block-level signature verification stays
+    /// structural-only in the meantime, and per-attestation crypto verification
+    /// continues to run at gossip ingestion.
+    pub fn from_type_1s(type_1s: Vec<TypeOneMultiSignature>) -> Self {
+        let infos: Vec<TypeOneInfo> = type_1s.into_iter().map(|t1| t1.info).collect();
+        let info = TypeOneInfos::try_from(infos)
+            .expect("type-1 infos within MAX_ATTESTATIONS_DATA + 1 limit");
+        Self {
+            info,
+            bytecode_claim: BytecodeClaim::ZERO,
+            proof: ByteListMiB::default(),
+        }
     }
 }
 

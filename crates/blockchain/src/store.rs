@@ -481,7 +481,7 @@ fn on_block_core(
     let sig_verification_start = std::time::Instant::now();
     if verify {
         // Validate cryptographic signatures
-        verify_signatures(&parent_state, &signed_block)?;
+        verify_block_signatures(&parent_state, &signed_block)?;
     }
     let sig_verification = sig_verification_start.elapsed();
 
@@ -1191,14 +1191,23 @@ fn build_block(
 
 /// Structural verification of a signed block's merged Type-2 proof.
 ///
-/// Phase 3 mirrors the upstream `verify_type_2` stub: we decode the merged
-/// proof blob and check that its `info` list is structurally aligned with the
-/// block body (one entry per attestation plus one trailing entry for the
-/// proposer). Cryptographic verification of each Type-1 happens at gossip
-/// ingestion (`on_gossip_aggregated_attestation`), not here — block-level
-/// crypto verification will return once `lean_multisig` exposes a real
+/// Phase 3 of the Type-1 / Type-2 aggregation migration replaces the per-
+/// attestation `verify_aggregated_signature` plus standalone proposer-signature
+/// check with a structural alignment check on the merged Type-2 blob: the
+/// `info` list must hold one entry per block-body attestation plus one
+/// trailing entry for the proposer. Cryptographic verification of each Type-1
+/// still happens at gossip ingestion (`on_gossip_aggregated_attestation`); the
+/// block-level crypto path returns once `lean_multisig` exposes a real
 /// merged-proof verification primitive.
-fn verify_signatures(state: &State, signed_block: &SignedBlock) -> Result<(), StoreError> {
+///
+/// Exposed publicly so RPC handlers (notably the Hive test-driver
+/// `verify_signatures/run` endpoint) can run the exact same verification path
+/// the import pipeline uses; the production import path also calls this from
+/// [`on_block_core`].
+pub fn verify_block_signatures(
+    state: &State,
+    signed_block: &SignedBlock,
+) -> Result<(), StoreError> {
     let total_start = std::time::Instant::now();
 
     let block = &signed_block.message;
@@ -1315,10 +1324,11 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregation::{aggregate_type_2, proposer_type_one};
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature},
+        block::{
+            BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
+        },
         checkpoint::Checkpoint,
         state::State,
     };
@@ -1334,13 +1344,13 @@ mod tests {
         attestation_proofs: Vec<TypeOneMultiSignature>,
     ) -> ByteListMiB {
         let mut all = attestation_proofs;
-        all.push(proposer_type_one(
+        all.push(TypeOneMultiSignature::for_proposer(
             proposer_index,
             ByteListMiB::default(),
             block_root,
             slot,
         ));
-        let merged = aggregate_type_2(all);
+        let merged = TypeTwoMultiSignature::from_type_1s(all);
         ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
     }
 
@@ -1401,7 +1411,7 @@ mod tests {
             proof,
         };
 
-        let result = verify_signatures(&state, &signed_block);
+        let result = verify_block_signatures(&state, &signed_block);
         assert!(
             matches!(result, Err(StoreError::ParticipantsMismatch)),
             "Expected ParticipantsMismatch, got: {result:?}"

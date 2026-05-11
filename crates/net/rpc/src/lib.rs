@@ -19,12 +19,35 @@ mod admin;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
+pub mod test_driver;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
     pub http_address: IpAddr,
     pub api_port: u16,
     pub metrics_port: u16,
+}
+
+/// Start the RPC server in Hive test-driver mode.
+///
+/// Exposes only the `/lean/v0/test_driver/...` endpoints plus a `/lean/v0/health`
+/// stub. The driver swaps its own `Store` on every `fork_choice/init`, so we
+/// don't share state with the regular consensus path (which isn't running in
+/// driver mode anyway — see `bin/ethlambda/src/main.rs`).
+pub async fn start_test_driver_rpc_server(
+    config: RpcConfig,
+    driver: test_driver::DriverState,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let app = test_driver::build_router(driver);
+    let addr = SocketAddr::new(config.http_address, config.api_port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await?;
+    Ok(())
 }
 
 pub async fn start_rpc_server(

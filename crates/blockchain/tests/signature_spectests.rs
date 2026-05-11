@@ -9,9 +9,7 @@ use ethlambda_types::{
     state::State,
 };
 
-mod common;
-mod signature_types;
-use signature_types::VerifySignaturesTestVector;
+use ethlambda_test_fixtures::verify_signatures::VerifySignaturesTestVector;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 

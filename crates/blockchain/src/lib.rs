@@ -8,15 +8,14 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteListMiB, SignedBlock},
+    block::{ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature},
     primitives::{H256, HashTreeRoot as _},
 };
 use libssz::SszEncode as _;
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, aggregate_type_2, proposer_type_one,
-    run_aggregation_worker,
+    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use spawned_concurrency::actor;
@@ -334,10 +333,15 @@ impl BlockChainServer {
         // proposer Type-1 into the block's single merged Type-2 proof.
         let proposer_proof_bytes = ByteListMiB::try_from(proposer_signature.to_vec())
             .expect("XMSS signature fits in ByteListMiB");
-        let proposer_t1 = proposer_type_one(validator_id, proposer_proof_bytes, block_root, slot);
+        let proposer_t1 = TypeOneMultiSignature::for_proposer(
+            validator_id,
+            proposer_proof_bytes,
+            block_root,
+            slot,
+        );
         let mut all_proofs = type_one_proofs;
         all_proofs.push(proposer_t1);
-        let merged = aggregate_type_2(all_proofs);
+        let merged = TypeTwoMultiSignature::from_type_1s(all_proofs);
         let proof_bytes = ByteListMiB::try_from(merged.to_ssz())
             .expect("merged Type-2 proof fits in ByteListMiB");
         let signed_block = SignedBlock {

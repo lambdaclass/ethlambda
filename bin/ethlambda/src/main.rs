@@ -109,8 +109,6 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key);
-    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
     let rpc_config = RpcConfig {
         http_address: options.http_address,
         api_port: options.api_port,
@@ -120,6 +118,22 @@ async fn main() -> eyre::Result<()> {
     println!("{ASCII_ART}");
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+
+    // Hive lean spec-asset suites boot the client with
+    // HIVE_LEAN_TEST_DRIVER=1 so it skips the consensus/p2p stack and
+    // exposes only the `/lean/v0/test_driver/...` endpoints driven by the
+    // simulator. Detected here before any config / key / genesis loading
+    // so the driver run doesn't touch --node-key, --custom-network-config-dir,
+    // or any other consensus prerequisite the hive shim doesn't bother to
+    // provision.
+    if ethlambda_rpc::test_driver::test_driver_enabled() {
+        info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
+        return run_test_driver(rpc_config).await;
+    }
+
+    let node_p2p_key = read_hex_file_bytes(&options.node_key);
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+
     #[cfg(not(target_env = "msvc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(target_env = "msvc")]
@@ -270,6 +284,40 @@ async fn main() -> eyre::Result<()> {
     p2p_ref.join().await;
     let _ = rpc_handle.await;
 
+    info!("Shutdown complete");
+
+    Ok(())
+}
+
+/// Boot the binary in Hive test-driver mode.
+///
+/// Skips every consensus/p2p subsystem and just exposes the
+/// `/lean/v0/test_driver/...` HTTP endpoints over the configured API port.
+/// The driver-mode store is seeded with an empty in-memory state and is
+/// replaced on every `fork_choice/init` request from the simulator.
+async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
+    use tokio::sync::RwLock;
+
+    let driver: ethlambda_rpc::test_driver::DriverState =
+        Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
+
+    let shutdown_token = CancellationToken::new();
+    let rpc_shutdown = shutdown_token.clone();
+
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(err) =
+            ethlambda_rpc::start_test_driver_rpc_server(rpc_config, driver, rpc_shutdown).await
+        {
+            error!(%err, "Test-driver RPC server failed");
+        }
+    });
+
+    info!("Test-driver RPC ready");
+
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown signal received, stopping test-driver RPC...");
+    shutdown_token.cancel();
+    let _ = rpc_handle.await;
     info!("Shutdown complete");
 
     Ok(())

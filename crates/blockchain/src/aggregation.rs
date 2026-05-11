@@ -13,10 +13,7 @@ use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
-    block::{
-        ByteListMiB, BytecodeClaim, TypeOneInfo, TypeOneInfos, TypeOneMultiSignature,
-        TypeTwoMultiSignature,
-    },
+    block::{ByteListMiB, BytecodeClaim, TypeOneInfo, TypeOneMultiSignature},
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
@@ -398,47 +395,11 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
     aggregation_bits
 }
 
-/// Merge a list of Type-1 single-message proofs into a single Type-2
-/// multi-message proof. The resulting Type-2 binds every input message.
-///
-/// This mirrors upstream leanSpec's `aggregate_type_2` stub: the metadata list
-/// (`TypeOneInfos`) is faithfully preserved so a verifier can re-derive the
-/// per-message binding inputs, but the merged `proof` bytes are left empty for
-/// now. Real cryptographic merging will arrive together with the
-/// `lean_multisig_py` bindings; block-level signature verification stays
-/// structural-only in the meantime, and per-attestation crypto verification
-/// continues to run at gossip ingestion (see `on_gossip_aggregated_attestation`).
-pub fn aggregate_type_2(type_1s: Vec<TypeOneMultiSignature>) -> TypeTwoMultiSignature {
-    let infos: Vec<TypeOneInfo> = type_1s.into_iter().map(|t1| t1.info).collect();
-    let info =
-        TypeOneInfos::try_from(infos).expect("type-1 infos within MAX_ATTESTATIONS_DATA + 1 limit");
-    TypeTwoMultiSignature {
-        info,
-        bytecode_claim: BytecodeClaim::ZERO,
-        proof: ByteListMiB::default(),
-    }
-}
-
-/// Build the singleton Type-1 envelope for a proposer's XMSS signature over a
-/// block root. Used to fold the proposer's signature into the block-level
-/// Type-2 merged proof at assembly time.
-pub fn proposer_type_one(
-    proposer_index: u64,
-    proposer_signature: ByteListMiB,
-    block_root: H256,
-    slot: u64,
-) -> TypeOneMultiSignature {
-    let participants = aggregation_bits_from_validator_indices(&[proposer_index]);
-    TypeOneMultiSignature {
-        info: TypeOneInfo {
-            message: block_root,
-            slot,
-            participants,
-            bytecode_claim: BytecodeClaim::ZERO,
-        },
-        proof: proposer_signature,
-    }
-}
+// Type-1 / Type-2 envelope builders moved to
+// [`ethlambda_types::block::TypeOneMultiSignature::for_proposer`] and
+// [`ethlambda_types::block::TypeTwoMultiSignature::from_type_1s`] so the
+// `ethlambda-test-fixtures` crate can share them without depending on the
+// blockchain layer.
 
 /// Worker loop — runs on a `spawn_blocking` thread, no store access.
 ///
