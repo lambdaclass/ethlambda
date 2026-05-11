@@ -290,10 +290,12 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     participants.dedup();
 
     let aggregation_bits = aggregation_bits_from_validator_indices(&participants);
+    let proof = AggregatedSignatureProof::new(aggregation_bits, proof_data);
+    metrics::observe_aggregated_proof_size(proof.proof_data.len());
 
     Some(AggregatedGroupOutput {
         hashed: job.hashed,
-        proof: AggregatedSignatureProof::new(aggregation_bits, proof_data),
+        proof,
         participants,
         keys_to_delete: job.keys_to_delete,
     })

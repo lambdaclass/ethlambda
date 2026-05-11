@@ -420,6 +420,27 @@ impl BlockChainServer {
             return;
         }
 
+        // Reject blocks whose slot has not started locally, mirroring the
+        // attestation time check in `validate_attestation_data`. The disparity
+        // bound is in intervals, not slots: a whole-slot margin would let an
+        // adversary pre-publish next-slot blocks ahead of any honest proposer.
+        // Catching this early also avoids persisting bogus future blocks to
+        // RocksDB and triggering BlocksByRoot fan-out for fabricated parents.
+        let block_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
+        let store_time = self.store.time();
+        if block_start_interval > store_time + GOSSIP_DISPARITY_INTERVALS {
+            warn!(
+                %slot,
+                store_time,
+                proposer,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                "Rejecting block: slot is too far in future"
+            );
+            self.discard_pending_subtree(block_root);
+            return;
+        }
+
         // Check if parent state exists before attempting to process
         if !self.store.has_state(&parent_root) {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
