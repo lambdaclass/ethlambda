@@ -133,7 +133,7 @@ impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         // Observe tick interval duration before any processing
         if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant);
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
         }
         self.last_tick_instant = Some(Instant::now());
 
