@@ -75,6 +75,7 @@ fn build_api_router(store: Store) -> Router {
     Router::new()
         .route("/lean/v0/health", get(metrics::get_health))
         .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
+        .route("/lean/v0/blocks/finalized", get(get_latest_finalized_block))
         .route(
             "/lean/v0/checkpoints/justified",
             get(get_latest_justified_state),
@@ -116,6 +117,17 @@ async fn get_latest_finalized_state(
     state.latest_block_header.state_root = H256::ZERO;
 
     ssz_response(state.to_ssz())
+}
+
+async fn get_latest_finalized_block(
+    axum::extract::State(store): axum::extract::State<Store>,
+) -> impl IntoResponse {
+    let finalized = store.latest_finalized();
+    let block = store
+        .get_signed_block(&finalized.root)
+        .expect("finalized block exists");
+
+    ssz_response(block.to_ssz())
 }
 
 async fn get_latest_justified_state(
@@ -189,7 +201,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
@@ -251,6 +263,73 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/lean/v0/states/finalized")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_ssz.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_finalized_block() {
+        use ethlambda_types::{
+            attestation::XmssSignature,
+            block::{Block, BlockBody, BlockSignatures, SignedBlock},
+            checkpoint::Checkpoint,
+            primitives::{H256, HashTreeRoot as _},
+            signature::SIGNATURE_SIZE,
+        };
+        use libssz::SszEncode;
+
+        let state = create_test_state();
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, state);
+
+        // Build a non-genesis signed block with empty body and zero proposer signature.
+        let block = Block {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: store.latest_finalized().root,
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let block_root = block.header().hash_tree_root();
+        let signed_block = SignedBlock {
+            message: block,
+            signature: BlockSignatures {
+                attestation_signatures: Default::default(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        };
+
+        // Persist the signed block and mark it as the latest finalized checkpoint.
+        store.insert_signed_block(block_root, signed_block.clone());
+        store.update_checkpoints(ForkCheckpoints::new(
+            block_root,
+            None,
+            Some(Checkpoint {
+                root: block_root,
+                slot: 1,
+            }),
+        ));
+
+        let expected_ssz = signed_block.to_ssz();
+
+        let app = build_api_router(store);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks/finalized")
                     .body(Body::empty())
                     .unwrap(),
             )
