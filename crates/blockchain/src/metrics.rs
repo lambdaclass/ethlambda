@@ -615,8 +615,8 @@ pub fn observe_fork_choice_reorg_depth(depth: u64) {
 }
 
 /// Observe the duration between consecutive tick intervals in seconds.
-pub fn observe_tick_interval_duration(prev_instant: Instant) {
-    LEAN_TICK_INTERVAL_DURATION_SECONDS.observe(prev_instant.elapsed().as_secs_f64());
+pub fn observe_tick_interval_duration(duration: Duration) {
+    LEAN_TICK_INTERVAL_DURATION_SECONDS.observe(duration.as_secs_f64());
 }
 
 /// Observe the number of aggregated payloads in a built block.
