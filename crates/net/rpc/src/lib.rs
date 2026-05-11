@@ -1,7 +1,10 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{
-    Extension, Json, Router, http::HeaderValue, http::header, response::IntoResponse, routing::get,
+    Extension, Json, Router,
+    http::{HeaderValue, StatusCode, header},
+    response::IntoResponse,
+    routing::get,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
@@ -16,12 +19,35 @@ mod admin;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
+pub mod test_driver;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
     pub http_address: IpAddr,
     pub api_port: u16,
     pub metrics_port: u16,
+}
+
+/// Start the RPC server in Hive test-driver mode.
+///
+/// Exposes only the `/lean/v0/test_driver/...` endpoints plus a `/lean/v0/health`
+/// stub. The driver swaps its own `Store` on every `fork_choice/init`, so we
+/// don't share state with the regular consensus path (which isn't running in
+/// driver mode anyway — see `bin/ethlambda/src/main.rs`).
+pub async fn start_test_driver_rpc_server(
+    config: RpcConfig,
+    driver: test_driver::DriverState,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let app = test_driver::build_router(driver);
+    let addr = SocketAddr::new(config.http_address, config.api_port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await?;
+    Ok(())
 }
 
 pub async fn start_rpc_server(
@@ -75,6 +101,7 @@ fn build_api_router(store: Store) -> Router {
     Router::new()
         .route("/lean/v0/health", get(metrics::get_health))
         .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
+        .route("/lean/v0/blocks/finalized", get(get_latest_finalized_block))
         .route(
             "/lean/v0/checkpoints/justified",
             get(get_latest_justified_state),
@@ -116,6 +143,17 @@ async fn get_latest_finalized_state(
     state.latest_block_header.state_root = H256::ZERO;
 
     ssz_response(state.to_ssz())
+}
+
+async fn get_latest_finalized_block(
+    axum::extract::State(store): axum::extract::State<Store>,
+) -> impl IntoResponse {
+    let finalized = store.latest_finalized();
+    // Returns 404 for genesis since it doesn't have a valid signature
+    match store.get_signed_block(&finalized.root) {
+        Some(block) => ssz_response(block.to_ssz()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn get_latest_justified_state(
@@ -185,11 +223,8 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
-    use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use axum::{body::Body, http::Request};
+    use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
@@ -265,5 +300,96 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), expected_ssz.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_finalized_block() {
+        use ethlambda_types::{
+            attestation::XmssSignature,
+            block::{Block, BlockBody, BlockSignatures, SignedBlock},
+            checkpoint::Checkpoint,
+            primitives::{H256, HashTreeRoot as _},
+            signature::SIGNATURE_SIZE,
+        };
+        use libssz::SszEncode;
+
+        let state = create_test_state();
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, state);
+
+        // Build a non-genesis signed block with empty body and zero proposer signature.
+        let block = Block {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: store.latest_finalized().root,
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let block_root = block.header().hash_tree_root();
+        let signed_block = SignedBlock {
+            message: block,
+            signature: BlockSignatures {
+                attestation_signatures: Default::default(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        };
+
+        // Persist the signed block and mark it as the latest finalized checkpoint.
+        store.insert_signed_block(block_root, signed_block.clone());
+        store.update_checkpoints(ForkCheckpoints::new(
+            block_root,
+            None,
+            Some(Checkpoint {
+                root: block_root,
+                slot: 1,
+            }),
+        ));
+
+        let expected_ssz = signed_block.to_ssz();
+
+        let app = build_api_router(store);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks/finalized")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_ssz.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_finalized_block_returns_404_when_absent() {
+        // Genesis-anchored store: init_store writes header + state but no
+        // BlockSignatures entry, so get_signed_block(genesis_root) returns None
+        // and the endpoint must report 404 rather than panic.
+        let state = create_test_state();
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend, state);
+
+        let app = build_api_router(store);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks/finalized")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
