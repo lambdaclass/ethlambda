@@ -2,7 +2,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitlist, SszVector};
 
 use crate::{
-    block::AggregatedSignatureProof,
+    block::TypeOneMultiSignature,
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::SIGNATURE_SIZE,
@@ -103,10 +103,14 @@ pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
 }
 
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
+///
+/// The `proof` carries a Type-1 single-message multi-signer aggregate: the
+/// signed message is the attestation data root, participants live in
+/// `proof.info.participants`, and the raw aggregate bytes are in `proof.proof`.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,
-    pub proof: AggregatedSignatureProof,
+    pub proof: TypeOneMultiSignature,
 }
 
 /// Attestation data paired with its precomputed tree hash root.

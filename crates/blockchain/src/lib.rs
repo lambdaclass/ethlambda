@@ -308,7 +308,7 @@ impl BlockChainServer {
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures, _post_checkpoints)) =
+        let Ok((block, type_one_proofs, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
@@ -327,7 +327,13 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock
+        // Assemble SignedBlock. The internal pipeline emits Type-1 proofs but
+        // `BlockSignatures` still carries the legacy `AggregatedSignatureProof`
+        // shape during Phase 2; project each Type-1 down at this boundary.
+        // Phase 3 will remove the conversion when SignedBlock switches to a
+        // single Type-2 merged proof.
+        let attestation_signatures: Vec<_> =
+            type_one_proofs.iter().map(|t1| t1.to_legacy()).collect();
         let signed_block = SignedBlock {
             message: block,
             signature: BlockSignatures {

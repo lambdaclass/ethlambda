@@ -13,9 +13,10 @@ use ethlambda_types::{
     },
     block::{
         AggregatedSignatureProof as DomainAggregatedSignatureProof, AttestationSignatures,
-        BlockSignatures as DomainBlockSignatures, ByteListMiB, SignedBlock as DomainSignedBlock,
+        BlockSignatures as DomainBlockSignatures, ByteListMiB, BytecodeClaim,
+        SignedBlock as DomainSignedBlock, TypeOneMultiSignature,
     },
-    primitives::H256,
+    primitives::{H256, HashTreeRoot as _},
 };
 use libssz_types::SszVector;
 use serde::Deserialize;
@@ -207,9 +208,13 @@ pub struct SignedAggregatedAttestation {
 
 impl From<SignedAggregatedAttestation> for DomainSignedAggregatedAttestation {
     fn from(value: SignedAggregatedAttestation) -> Self {
+        let data: ethlambda_types::attestation::AttestationData = value.data.into();
+        let message = data.hash_tree_root();
+        let slot = data.slot;
+        let legacy: DomainAggregatedSignatureProof = value.proof.into();
         Self {
-            data: value.data.into(),
-            proof: value.proof.into(),
+            data,
+            proof: TypeOneMultiSignature::from_legacy(legacy, message, slot, BytecodeClaim::ZERO),
         }
     }
 }

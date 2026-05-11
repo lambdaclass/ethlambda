@@ -11,7 +11,10 @@ use ethlambda_types::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
         HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
-    block::{AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody, SignedBlock},
+    block::{
+        AggregatedAttestations, Block, BlockBody, BytecodeClaim, SignedBlock, TypeOneInfo,
+        TypeOneMultiSignature,
+    },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -372,7 +375,7 @@ pub fn on_gossip_aggregated_attestation(
     {
         let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
         ethlambda_crypto::verify_aggregated_signature(
-            &aggregated.proof.proof_data,
+            &aggregated.proof.proof,
             pubkeys,
             &data_root,
             slot,
@@ -381,7 +384,7 @@ pub fn on_gossip_aggregated_attestation(
     .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Read stats before moving the proof into the store.
-    let num_participants = aggregated.proof.participants.count_ones();
+    let num_participants = aggregated.proof.info.participants.count_ones();
     let target_slot = aggregated.data.target.slot;
     let target_root = aggregated.data.target.root;
     let source_slot = aggregated.data.source.slot;
@@ -511,13 +514,24 @@ fn on_block_core(
     let aggregated_attestations = &block.body.attestations;
     let attestation_signatures = &signed_block.signature.attestation_signatures;
 
-    // Store one proof per attestation data in known aggregated payloads.
-    let mut known_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
+    // Store one proof per attestation data in known aggregated payloads. The
+    // block body still carries `AggregatedSignatureProof` (legacy shape during
+    // the phased migration); lift each into a `TypeOneMultiSignature` here so
+    // the payload buffer stays uniformly Type-1. `bytecode_claim` is a
+    // placeholder until the lean_multisig binding exposes the trusted value.
+    let mut known_entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> = Vec::new();
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
     {
-        known_entries.push((HashedAttestationData::new(att.data.clone()), proof.clone()));
+        let hashed = HashedAttestationData::new(att.data.clone());
+        let type_one = TypeOneMultiSignature::from_legacy(
+            proof.clone(),
+            hashed.root(),
+            att.data.slot,
+            BytecodeClaim::ZERO,
+        );
+        known_entries.push((hashed, type_one));
         // Count each participating validator as a valid attestation
         let count = validator_indices(&att.aggregation_bits).count() as u64;
         metrics::inc_attestations_valid(count);
@@ -689,7 +703,7 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
-) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
+) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
     let head_state = store
@@ -876,9 +890,9 @@ fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> Aggregati
 /// - Multiple entries: merged into one using recursive proof aggregation
 ///   (leanSpec PR #510).
 fn compact_attestations(
-    entries: Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
+    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
     head_state: &State,
-) -> Result<Vec<(AggregatedAttestation, AggregatedSignatureProof)>, StoreError> {
+) -> Result<Vec<(AggregatedAttestation, TypeOneMultiSignature)>, StoreError> {
     if entries.len() <= 1 {
         return Ok(entries);
     }
@@ -904,7 +918,7 @@ fn compact_attestations(
     }
 
     // Wrap in Option so we can .take() items by index without cloning
-    let mut items: Vec<Option<(AggregatedAttestation, AggregatedSignatureProof)>> =
+    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
         entries.into_iter().map(Some).collect();
 
     let mut compacted = Vec::with_capacity(order.len());
@@ -918,7 +932,7 @@ fn compact_attestations(
         }
 
         // Collect all entries for this AttestationData
-        let group_items: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = indices
+        let group_items: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = indices
             .iter()
             .map(|&idx| items[idx].take().expect("index used once"))
             .collect();
@@ -945,7 +959,7 @@ fn compact_attestations(
                             .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok((pubkeys, proof.proof_data.clone()))
+                Ok((pubkeys, proof.proof.clone()))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
 
@@ -953,7 +967,15 @@ fn compact_attestations(
         let merged_proof_data = aggregate_proofs(children, &data_root, slot)
             .map_err(StoreError::SignatureAggregationFailed)?;
 
-        let merged_proof = AggregatedSignatureProof::new(merged_bits.clone(), merged_proof_data);
+        let merged_proof = TypeOneMultiSignature {
+            info: TypeOneInfo {
+                message: data_root,
+                slot: data.slot,
+                participants: merged_bits.clone(),
+                bytecode_claim: BytecodeClaim::ZERO,
+            },
+            proof: merged_proof_data,
+        };
         let merged_att = AggregatedAttestation {
             aggregation_bits: merged_bits,
             data,
@@ -978,8 +1000,8 @@ fn compact_attestations(
 /// Each selected proof is appended to `selected` paired with its
 /// corresponding AggregatedAttestation.
 fn extend_proofs_greedily(
-    proofs: &[AggregatedSignatureProof],
-    selected: &mut Vec<(AggregatedAttestation, AggregatedSignatureProof)>,
+    proofs: &[TypeOneMultiSignature],
+    selected: &mut Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
     att_data: &AttestationData,
 ) {
     if proofs.is_empty() {
@@ -1018,7 +1040,7 @@ fn extend_proofs_greedily(
             .collect();
 
         let att = AggregatedAttestation {
-            aggregation_bits: proof.participants.clone(),
+            aggregation_bits: proof.info.participants.clone(),
             data: att_data.clone(),
         };
 
@@ -1045,9 +1067,9 @@ fn build_block(
     proposer_index: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)>,
-) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
-    let mut selected: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = Vec::new();
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+    let mut selected: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = Vec::new();
 
     if !aggregated_payloads.is_empty() {
         // Genesis edge case: when building on genesis (slot 0),
@@ -1320,7 +1342,7 @@ mod tests {
         attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
         block::{
             AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
-            SignedBlock,
+            SignedBlock, TypeOneMultiSignature,
         },
         checkpoint::Checkpoint,
         signature::SIGNATURE_SIZE,
@@ -1428,10 +1450,8 @@ mod tests {
 
         // Simulate a stall: populate the payload pool with many distinct entries.
         // Each has a unique target (different slot) and a large proof payload.
-        let mut aggregated_payloads: HashMap<
-            H256,
-            (AttestationData, Vec<AggregatedSignatureProof>),
-        > = HashMap::new();
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+            HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
             let target_slot = (i + 1) as u64;
@@ -1458,7 +1478,12 @@ mod tests {
 
             let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
             let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
-            let proof = AggregatedSignatureProof::new(bits, proof_data);
+            let proof = TypeOneMultiSignature::from_legacy(
+                AggregatedSignatureProof::new(bits, proof_data),
+                data_root,
+                att_data.slot,
+                BytecodeClaim::ZERO,
+            );
 
             aggregated_payloads.insert(data_root, (att_data, vec![proof]));
         }
@@ -1482,8 +1507,11 @@ mod tests {
             "MAX_ATTESTATIONS_DATA should cap attestations: got {attestation_count}"
         );
 
-        // Construct the full signed block as it would be sent over gossip
-        let attestation_sigs: Vec<AggregatedSignatureProof> = signatures;
+        // Construct the full signed block as it would be sent over gossip.
+        // Phase 2 boundary: project the Type-1 proofs back to the legacy shape
+        // expected by `BlockSignatures`. Removed in Phase 3.
+        let attestation_sigs: Vec<AggregatedSignatureProof> =
+            signatures.iter().map(|t1| t1.to_legacy()).collect();
         let signed_block = SignedBlock {
             message: block,
             signature: BlockSignatures {
@@ -1523,6 +1551,13 @@ mod tests {
         bits
     }
 
+    /// Test helper: empty Type-1 proof carrying the given participants and slot
+    /// metadata. The message and bytecode_claim are zeroed — only the participant
+    /// bitfield matters for the pipeline tests below.
+    fn make_type_one_proof(bits: AggregationBits, slot: u64) -> TypeOneMultiSignature {
+        TypeOneMultiSignature::empty(bits, H256::ZERO, slot)
+    }
+
     #[test]
     fn compact_attestations_no_duplicates() {
         let data_a = make_att_data(1);
@@ -1536,14 +1571,14 @@ mod tests {
                     aggregation_bits: bits_a.clone(),
                     data: data_a.clone(),
                 },
-                AggregatedSignatureProof::empty(bits_a),
+                make_type_one_proof(bits_a, data_a.slot),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_b.clone(),
                     data: data_b.clone(),
                 },
-                AggregatedSignatureProof::empty(bits_b),
+                make_type_one_proof(bits_b, data_b.slot),
             ),
         ];
 
@@ -1570,21 +1605,21 @@ mod tests {
                     aggregation_bits: bits_0.clone(),
                     data: data_a.clone(),
                 },
-                AggregatedSignatureProof::empty(bits_0),
+                make_type_one_proof(bits_0, data_a.slot),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_1.clone(),
                     data: data_b.clone(),
                 },
-                AggregatedSignatureProof::empty(bits_1),
+                make_type_one_proof(bits_1, data_b.slot),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_2.clone(),
                     data: data_c.clone(),
                 },
-                AggregatedSignatureProof::empty(bits_2),
+                make_type_one_proof(bits_2, data_c.slot),
             ),
         ];
 
@@ -1695,9 +1730,9 @@ mod tests {
         //   A = {0, 1, 2, 3}  (4 validators — largest, picked first)
         //   B = {2, 3, 4}     (overlaps A on {2,3} but adds validator 4)
         //   C = {1, 2}        (subset of A — adds nothing, must be skipped)
-        let proof_a = AggregatedSignatureProof::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = AggregatedSignatureProof::empty(make_bits(&[2, 3, 4]));
-        let proof_c = AggregatedSignatureProof::empty(make_bits(&[1, 2]));
+        let proof_a = make_type_one_proof(make_bits(&[0, 1, 2, 3]), data.slot);
+        let proof_b = make_type_one_proof(make_bits(&[2, 3, 4]), data.slot);
+        let proof_c = make_type_one_proof(make_bits(&[1, 2]), data.slot);
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b, proof_c], &mut selected, &data);
@@ -1716,7 +1751,7 @@ mod tests {
 
         // Attestation bits mirror the proof's participants for each entry.
         for (att, proof) in &selected {
-            assert_eq!(att.aggregation_bits, proof.participants);
+            assert_eq!(att.aggregation_bits, proof.info.participants);
             assert_eq!(att.data, data);
         }
     }
@@ -1730,8 +1765,8 @@ mod tests {
         // B's participants are a subset of A's. After picking A, B offers zero
         // new coverage and must not be selected (its inclusion would also
         // violate the disjoint invariant).
-        let proof_a = AggregatedSignatureProof::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = AggregatedSignatureProof::empty(make_bits(&[1, 2]));
+        let proof_a = make_type_one_proof(make_bits(&[0, 1, 2, 3]), data.slot);
+        let proof_b = make_type_one_proof(make_bits(&[1, 2]), data.slot);
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data);

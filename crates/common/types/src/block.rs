@@ -162,6 +162,59 @@ pub struct TypeTwoMultiSignature {
     pub proof: ByteListMiB,
 }
 
+impl TypeOneMultiSignature {
+    /// Build an empty Type-1 proof with the given participants and message
+    /// metadata. `proof` bytes are left empty — useful as a placeholder when
+    /// actual aggregation is not yet performed (forkchoice tests, etc.).
+    pub fn empty(participants: AggregationBits, message: H256, slot: u64) -> Self {
+        Self {
+            info: TypeOneInfo {
+                message,
+                slot,
+                participants,
+                bytecode_claim: BytecodeClaim::ZERO,
+            },
+            proof: SszList::new(),
+        }
+    }
+
+    /// Returns the validator indices that are set in the participants bitfield.
+    pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
+        validator_indices(&self.info.participants)
+    }
+
+    /// Phase-2 boundary helper: lift a legacy `AggregatedSignatureProof` into a
+    /// Type-1 by attaching the per-message metadata that the new envelope
+    /// requires. Use only at module boundaries that still carry the old shape
+    /// (block body ingestion, test fixtures). The `bytecode_claim` is a
+    /// placeholder until the lean_multisig binding exposes the trusted
+    /// evaluation.
+    pub fn from_legacy(
+        proof: AggregatedSignatureProof,
+        message: H256,
+        slot: u64,
+        bytecode_claim: BytecodeClaim,
+    ) -> Self {
+        Self {
+            info: TypeOneInfo {
+                message,
+                slot,
+                participants: proof.participants,
+                bytecode_claim,
+            },
+            proof: proof.proof_data,
+        }
+    }
+
+    /// Phase-2 boundary helper: project a Type-1 down to the legacy
+    /// `AggregatedSignatureProof` shape used inside `BlockSignatures`. Lossy —
+    /// drops `info.message`, `info.slot`, and `info.bytecode_claim`. Removed
+    /// in Phase 3 when `BlockSignatures` is replaced end-to-end.
+    pub fn to_legacy(&self) -> AggregatedSignatureProof {
+        AggregatedSignatureProof::new(self.info.participants.clone(), self.proof.clone())
+    }
+}
+
 impl AggregatedSignatureProof {
     /// Create a new aggregated signature proof.
     pub fn new(participants: AggregationBits, proof_data: ByteListMiB) -> Self {
