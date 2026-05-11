@@ -8,13 +8,15 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{BlockSignatures, SignedBlock},
+    block::{ByteListMiB, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
 };
+use libssz::SszEncode as _;
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, aggregate_type_2, proposer_type_one,
+    run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use spawned_concurrency::actor;
@@ -327,21 +329,20 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock. The internal pipeline emits Type-1 proofs but
-        // `BlockSignatures` still carries the legacy `AggregatedSignatureProof`
-        // shape during Phase 2; project each Type-1 down at this boundary.
-        // Phase 3 will remove the conversion when SignedBlock switches to a
-        // single Type-2 merged proof.
-        let attestation_signatures: Vec<_> =
-            type_one_proofs.iter().map(|t1| t1.to_legacy()).collect();
+        // Assemble SignedBlock: wrap the proposer's XMSS signature as a
+        // singleton Type-1 and fold every attestation Type-1 plus the
+        // proposer Type-1 into the block's single merged Type-2 proof.
+        let proposer_proof_bytes = ByteListMiB::try_from(proposer_signature.to_vec())
+            .expect("XMSS signature fits in ByteListMiB");
+        let proposer_t1 = proposer_type_one(validator_id, proposer_proof_bytes, block_root, slot);
+        let mut all_proofs = type_one_proofs;
+        all_proofs.push(proposer_t1);
+        let merged = aggregate_type_2(all_proofs);
+        let proof_bytes = ByteListMiB::try_from(merged.to_ssz())
+            .expect("merged Type-2 proof fits in ByteListMiB");
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures: attestation_signatures
-                    .try_into()
-                    .expect("attestation signatures within limit"),
-            },
+            proof: proof_bytes,
         };
 
         // Process the block locally before publishing

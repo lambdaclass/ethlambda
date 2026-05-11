@@ -1,8 +1,9 @@
 use super::common::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
+use ethlambda_blockchain::aggregation::{aggregate_type_2, proposer_type_one};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
-use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
-};
+use ethlambda_types::block::{ByteListMiB, SignedBlock, TypeOneMultiSignature};
+use ethlambda_types::primitives::HashTreeRoot as _;
+use libssz::SszEncode as _;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,28 +57,42 @@ pub struct TestSignedBlock {
 
 impl From<TestSignedBlock> for SignedBlock {
     fn from(value: TestSignedBlock) -> Self {
-        let block = value.block.into();
-        let proposer_signature = value.signature.proposer_signature;
+        let block: ethlambda_types::block::Block = value.block.into();
+        let block_root = block.hash_tree_root();
+        let proposer_signature_bytes = value.signature.proposer_signature.to_vec();
+        let proposer_proof = ByteListMiB::try_from(proposer_signature_bytes)
+            .expect("XMSS signature fits in ByteListMiB");
 
-        let attestation_signatures: AttestationSignatures = value
+        // The legacy fixture lists one `attestationSignatures` entry per
+        // block-body attestation; pair them up to derive per-Type-1 message
+        // and slot metadata, then fold every Type-1 plus the proposer Type-1
+        // into the merged Type-2 blob.
+        let attestation_t1s: Vec<TypeOneMultiSignature> = value
             .signature
             .attestation_signatures
             .data
             .into_iter()
-            .map(|att_sig| {
+            .zip(block.body.attestations.iter())
+            .map(|(att_sig, att)| {
                 let participants: EthAggregationBits = att_sig.participants.into();
-                AggregatedSignatureProof::empty(participants)
+                TypeOneMultiSignature::empty(participants, att.data.hash_tree_root(), att.data.slot)
             })
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("too many attestation signatures");
+            .collect();
+
+        let mut all = attestation_t1s;
+        all.push(proposer_type_one(
+            block.proposer_index,
+            proposer_proof,
+            block_root,
+            block.slot,
+        ));
+        let merged = aggregate_type_2(all);
+        let proof =
+            ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB");
 
         SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures,
-                proposer_signature,
-            },
+            proof,
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
     attestation::{AttestationData, HashedAttestationData, bits_is_subset},
-    block::{Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock, TypeOneMultiSignature},
+    block::{Block, BlockBody, BlockHeader, ByteListMiB, SignedBlock, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -950,16 +950,16 @@ impl Store {
         batch.commit().expect("commit");
     }
 
-    /// Get a signed block by combining header, body, and signatures.
+    /// Get a signed block by combining header, body, and the merged proof.
     ///
     /// Returns None if any of the components are not found.
-    /// Note: Genesis block has no entry in BlockSignatures table.
+    /// Note: Genesis block has no entry in the `BlockSignatures` table.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
+        let proof_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
 
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
@@ -972,11 +972,11 @@ impl Store {
         };
 
         let block = Block::from_header_and_body(header, body);
-        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+        let proof = ByteListMiB::from_ssz_bytes(&proof_bytes).expect("valid block proof");
 
         Some(SignedBlock {
             message: block,
-            signature,
+            proof,
         })
     }
 
@@ -1208,7 +1208,7 @@ impl Store {
     }
 }
 
-/// Write block header, body, and signatures onto an existing batch.
+/// Write block header, body, and the merged proof blob onto an existing batch.
 ///
 /// Returns the deserialized [`Block`] so callers can access fields like
 /// `slot` and `parent_root` without re-deserializing.
@@ -1219,7 +1219,7 @@ fn write_signed_block(
 ) -> Block {
     let SignedBlock {
         message: block,
-        signature,
+        proof,
     } = signed_block;
 
     let header = block.header();
@@ -1238,10 +1238,12 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    let sig_entries = vec![(root_bytes, signature.to_ssz())];
+    // Store the merged Type-2 proof blob. Table name kept for the column-family
+    // migration cost; renaming to `BlockProof` is a follow-up.
+    let proof_entries = vec![(root_bytes, proof.to_ssz())];
     batch
-        .put_batch(Table::BlockSignatures, sig_entries)
-        .expect("put block signatures");
+        .put_batch(Table::BlockSignatures, proof_entries)
+        .expect("put block proof");
 
     block
 }

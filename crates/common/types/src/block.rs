@@ -4,21 +4,27 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 
 use crate::{
-    attestation::{AggregatedAttestation, AggregationBits, XmssSignature, validator_indices},
+    attestation::{AggregatedAttestation, AggregationBits, validator_indices},
     primitives::{self, ByteList, H256},
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
 use primitives::HashTreeRoot as _;
 
-/// Envelope carrying a block and its aggregated signatures.
+/// Envelope carrying a block and a single merged proof binding every signature
+/// it depends on.
+///
+/// The `proof` blob is the SSZ-encoded form of a [`TypeTwoMultiSignature`] that
+/// covers, in order, every per-attestation Type-1 proof plus a singleton Type-1
+/// proof carrying the proposer's signature over the block root. Decode with
+/// `TypeTwoMultiSignature::from_ssz_bytes(&signed_block.proof)`.
 ///
 /// <div class="warning">
 ///
-/// `HashTreeRoot` is intentionally not derived: `XmssSignature` is encoded as a
-/// fixed-size byte vector for cross-client serialization compatibility, but the
-/// spec treats it as a container for Merkleization. We never hash a
-/// `SignedBlock` directly — consumers always hash the inner `Block`.
+/// `HashTreeRoot` is intentionally not derived: consumers never hash a
+/// `SignedBlock` directly — they always hash the inner `Block`. Keeping the
+/// envelope structurally minimal also means the on-chain root is independent
+/// of how the merged proof is serialised.
 ///
 /// </div>
 #[derive(Clone, SszEncode, SszDecode)]
@@ -26,70 +32,18 @@ pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
 
-    /// Aggregated signature payload for the block.
-    ///
-    /// Contains per-attestation aggregated proofs and the proposer's signature
-    /// over the block root using the proposal key.
-    pub signature: BlockSignatures,
+    /// SSZ-encoded merged proof for every signature this block depends on.
+    pub proof: ByteListMiB,
 }
 
-// Manual Debug impl because leanSig signatures don't implement Debug.
+// Manual Debug impl because the merged proof bytes are large and opaque.
 impl core::fmt::Debug for SignedBlock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SignedBlock")
             .field("message", &self.message)
-            .field("signature", &"...")
+            .field("proof", &format_args!("<{} bytes>", self.proof.len()))
             .finish()
     }
-}
-
-/// Signature payload for the block.
-///
-/// <div class="warning">
-///
-/// See the note on [`SignedBlock`] for why `HashTreeRoot` is omitted.
-///
-/// </div>
-#[derive(Clone, SszEncode, SszDecode)]
-pub struct BlockSignatures {
-    /// Attestation signatures for the aggregated attestations in the block body.
-    ///
-    /// Each entry corresponds to an aggregated attestation from the block body and
-    /// contains the leanVM aggregated signature proof bytes for the participating validators.
-    ///
-    /// TODO:
-    /// - Eventually this field will be replaced by a single SNARK aggregating *all* signatures.
-    pub attestation_signatures: AttestationSignatures,
-
-    /// Proposer's signature over the block root using the proposal key.
-    pub proposer_signature: XmssSignature,
-}
-
-/// List of per-attestation aggregated signature proofs.
-///
-/// Each entry corresponds to an aggregated attestation from the block body.
-///
-/// It contains:
-///     - the participants bitfield,
-///     - proof bytes from leanVM signature aggregation.
-pub type AttestationSignatures = SszList<AggregatedSignatureProof, 4096>;
-
-/// Cryptographic proof that a set of validators signed a message.
-///
-/// This container encapsulates the output of the leanVM signature aggregation,
-/// combining the participant set with the proof bytes. This design ensures
-/// the proof is self-describing: it carries information about which validators
-/// it covers.
-///
-/// The proof can verify that all participants signed the same message in the
-/// same epoch, using a single verification operation instead of checking
-/// each signature individually.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
-pub struct AggregatedSignatureProof {
-    /// Bitfield indicating which validators' signatures are included.
-    pub participants: AggregationBits,
-    /// The raw aggregated proof bytes from leanVM.
-    pub proof_data: ByteListMiB,
 }
 
 pub type ByteListMiB = ByteList<1_048_576>;
@@ -163,10 +117,14 @@ pub struct TypeTwoMultiSignature {
 }
 
 impl TypeOneMultiSignature {
-    /// Build an empty Type-1 proof with the given participants and message
-    /// metadata. `proof` bytes are left empty — useful as a placeholder when
-    /// actual aggregation is not yet performed (forkchoice tests, etc.).
-    pub fn empty(participants: AggregationBits, message: H256, slot: u64) -> Self {
+    /// Build a Type-1 proof with the given participants, message, slot and
+    /// raw proof bytes.
+    pub fn new(
+        participants: AggregationBits,
+        message: H256,
+        slot: u64,
+        proof_data: ByteListMiB,
+    ) -> Self {
         Self {
             info: TypeOneInfo {
                 message,
@@ -174,69 +132,20 @@ impl TypeOneMultiSignature {
                 participants,
                 bytecode_claim: BytecodeClaim::ZERO,
             },
-            proof: SszList::new(),
+            proof: proof_data,
         }
+    }
+
+    /// Build an empty Type-1 proof with the given participants and message
+    /// metadata. `proof` bytes are left empty — useful as a placeholder when
+    /// actual aggregation is not yet performed (forkchoice tests, etc.).
+    pub fn empty(participants: AggregationBits, message: H256, slot: u64) -> Self {
+        Self::new(participants, message, slot, SszList::new())
     }
 
     /// Returns the validator indices that are set in the participants bitfield.
     pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
         validator_indices(&self.info.participants)
-    }
-
-    /// Phase-2 boundary helper: lift a legacy `AggregatedSignatureProof` into a
-    /// Type-1 by attaching the per-message metadata that the new envelope
-    /// requires. Use only at module boundaries that still carry the old shape
-    /// (block body ingestion, test fixtures). The `bytecode_claim` is a
-    /// placeholder until the lean_multisig binding exposes the trusted
-    /// evaluation.
-    pub fn from_legacy(
-        proof: AggregatedSignatureProof,
-        message: H256,
-        slot: u64,
-        bytecode_claim: BytecodeClaim,
-    ) -> Self {
-        Self {
-            info: TypeOneInfo {
-                message,
-                slot,
-                participants: proof.participants,
-                bytecode_claim,
-            },
-            proof: proof.proof_data,
-        }
-    }
-
-    /// Phase-2 boundary helper: project a Type-1 down to the legacy
-    /// `AggregatedSignatureProof` shape used inside `BlockSignatures`. Lossy —
-    /// drops `info.message`, `info.slot`, and `info.bytecode_claim`. Removed
-    /// in Phase 3 when `BlockSignatures` is replaced end-to-end.
-    pub fn to_legacy(&self) -> AggregatedSignatureProof {
-        AggregatedSignatureProof::new(self.info.participants.clone(), self.proof.clone())
-    }
-}
-
-impl AggregatedSignatureProof {
-    /// Create a new aggregated signature proof.
-    pub fn new(participants: AggregationBits, proof_data: ByteListMiB) -> Self {
-        Self {
-            participants,
-            proof_data,
-        }
-    }
-
-    /// Create an empty proof with the given participants bitfield.
-    ///
-    /// Used as a placeholder when actual aggregation is not yet implemented.
-    pub fn empty(participants: AggregationBits) -> Self {
-        Self {
-            participants,
-            proof_data: SszList::new(),
-        }
-    }
-
-    /// Returns the validator indices that are set in the participants bitfield.
-    pub fn participant_indices(&self) -> impl Iterator<Item = u64> + '_ {
-        validator_indices(&self.participants)
     }
 }
 

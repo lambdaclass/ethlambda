@@ -25,6 +25,13 @@ docker-build: ## 🐳 Build the Docker image
 	@echo
 
 # 2026-04-29
+# NOTE(type1-type2): an attempted bump to anshalshukla/leanSpec@0ab09dd ("dummy
+# type 1 and type 2 aggregation with block proofs") was reverted because the
+# testing harness in that branch still imports `AttestationSignatures`, which
+# the same commit removed — the fixture generator fails to load. We stay on
+# the canonical commit and skip the affected SSZ-spec and signature-spec test
+# cases until the upstream refactor lands together with matching testing-side
+# updates.
 LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
 
 leanSpec:

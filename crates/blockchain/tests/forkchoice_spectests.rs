@@ -4,18 +4,19 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    aggregation::{aggregate_type_2, proposer_type_one},
+    store,
+};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation, XmssSignature},
-    block::{
-        AggregatedSignatureProof, Block, BlockSignatures, BytecodeClaim, SignedBlock,
-        TypeOneMultiSignature,
-    },
+    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
+    block::{Block, ByteListMiB, SignedBlock, TypeOneMultiSignature},
     primitives::{ByteList, H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
     state::State,
 };
+use libssz::SszEncode as _;
 
 use crate::types::{ForkChoiceTestVector, StoreChecks};
 
@@ -126,14 +127,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let proof_data = ByteList::try_from(proof_bytes)
                         .expect("aggregated proof data fits in ByteListMiB");
                     let data: AttestationData = att_data.data.into();
-                    let proof = TypeOneMultiSignature::from_legacy(
-                        AggregatedSignatureProof::new(
-                            proof_fixture.participants.into(),
-                            proof_data,
-                        ),
+                    let proof = TypeOneMultiSignature::new(
+                        proof_fixture.participants.into(),
                         data.hash_tree_root(),
                         data.slot,
-                        BytecodeClaim::ZERO,
+                        proof_data,
                     );
                     let aggregated = SignedAggregatedAttestation { data, proof };
 
@@ -171,23 +169,48 @@ fn assert_step_outcome<T, E: std::fmt::Debug>(
 fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
     let block: Block = block_data.to_block();
 
-    // Build one empty proof per attestation, matching the aggregation_bits from
-    // each attestation in the block body. Block processing zips attestations with
-    // signatures, so they must be the same length for attestations to reach
-    // fork choice.
-    let proofs: Vec<_> = block
-        .body
-        .attestations
-        .iter()
-        .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-        .collect();
+    // Build one empty Type-1 per attestation plus a stub proposer Type-1,
+    // then fold the lot into the merged Type-2 proof carried on the block.
+    // Fork choice spec tests run via `on_block_without_verification`, so the
+    // proof bytes are never crypto-checked — but the structural ingestion in
+    // `process_new_block` still decodes the blob and asserts the info list
+    // has `attestations.len() + 1` entries.
+    //
+    // Oversized-block tests (more than MAX_ATTESTATIONS_DATA attestations)
+    // overflow `TypeOneInfos`'s SSZ-list cap; fall back to an empty proof
+    // because `process_new_block` rejects with `TooManyAttestationData` before
+    // the proof is decoded, so its contents don't matter.
+    let block_root = block.hash_tree_root();
+    let attestation_count = block.body.attestations.len();
+    let proof = if attestation_count > ethlambda_blockchain::MAX_ATTESTATIONS_DATA {
+        ByteListMiB::default()
+    } else {
+        let attestation_proofs: Vec<TypeOneMultiSignature> = block
+            .body
+            .attestations
+            .iter()
+            .map(|att| {
+                TypeOneMultiSignature::empty(
+                    att.aggregation_bits.clone(),
+                    att.data.hash_tree_root(),
+                    att.data.slot,
+                )
+            })
+            .collect();
+        let mut all = attestation_proofs;
+        all.push(proposer_type_one(
+            block.proposer_index,
+            ByteListMiB::default(),
+            block_root,
+            block.slot,
+        ));
+        let merged = aggregate_type_2(all);
+        ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
+    };
 
     SignedBlock {
         message: block,
-        signature: BlockSignatures {
-            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            attestation_signatures: proofs.try_into().expect("attestation proofs within limit"),
-        },
+        proof,
     }
 }
 

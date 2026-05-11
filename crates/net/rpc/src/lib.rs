@@ -282,11 +282,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
-            attestation::XmssSignature,
-            block::{Block, BlockBody, BlockSignatures, SignedBlock},
+            block::{Block, BlockBody, ByteListMiB, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
-            signature::SIGNATURE_SIZE,
         };
         use libssz::SszEncode;
 
@@ -294,7 +292,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(backend, state);
 
-        // Build a non-genesis signed block with empty body and zero proposer signature.
+        // Build a non-genesis signed block with empty body and empty proof blob.
         let block = Block {
             slot: 1,
             proposer_index: 0,
@@ -305,10 +303,7 @@ mod tests {
         let block_root = block.header().hash_tree_root();
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures: Default::default(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            },
+            proof: ByteListMiB::default(),
         };
 
         // Persist the signed block and mark it as the latest finalized checkpoint.

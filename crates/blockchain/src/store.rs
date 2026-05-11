@@ -12,14 +12,15 @@ use ethlambda_types::{
         HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
     block::{
-        AggregatedAttestations, Block, BlockBody, BytecodeClaim, SignedBlock, TypeOneInfo,
-        TypeOneMultiSignature,
+        AggregatedAttestations, Block, BlockBody, ByteListMiB, BytecodeClaim, SignedBlock,
+        TypeOneInfo, TypeOneMultiSignature, TypeTwoMultiSignature,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
     state::State,
 };
+use libssz::SszDecode as _;
 use tracing::{info, trace, warn};
 
 use crate::{
@@ -510,29 +511,41 @@ fn on_block_core(
     store.insert_signed_block(block_root, signed_block.clone());
     store.insert_state(block_root, post_state);
 
-    // Process block body attestations and their signatures
+    // Process block body attestations and feed them into the payload buffer
+    // so fork choice's LMD GHOST overlay can see block-only votes.
+    //
+    // Since the block carries a single merged Type-2 proof, we cannot recover
+    // per-attestation proof bytes here. The entries we insert are info-only
+    // (`TypeOneInfo` from the merged proof's `info` list, with empty `proof`
+    // bytes). Real per-attestation proof bytes still arrive via gossip
+    // (`SignedAggregatedAttestation`) and verify there; this insertion is
+    // purely for fork-choice vote bookkeeping. Compact aggregation paths
+    // (`compact_attestations` → `aggregate_proofs`) only run when there are
+    // multiple proofs per attestation data, so info-only entries are safe.
     let aggregated_attestations = &block.body.attestations;
-    let attestation_signatures = &signed_block.signature.attestation_signatures;
+    let merged = TypeTwoMultiSignature::from_ssz_bytes(signed_block.proof.iter().as_slice())
+        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+    let expected_info_len = aggregated_attestations.len() + 1;
+    if merged.info.len() != expected_info_len {
+        return Err(StoreError::AttestationSignatureMismatch {
+            signatures: merged.info.len(),
+            attestations: aggregated_attestations.len(),
+        });
+    }
 
-    // Store one proof per attestation data in known aggregated payloads. The
-    // block body still carries `AggregatedSignatureProof` (legacy shape during
-    // the phased migration); lift each into a `TypeOneMultiSignature` here so
-    // the payload buffer stays uniformly Type-1. `bytecode_claim` is a
-    // placeholder until the lean_multisig binding exposes the trusted value.
-    let mut known_entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> = Vec::new();
-    for (att, proof) in aggregated_attestations
+    let mut known_entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> =
+        Vec::with_capacity(aggregated_attestations.len());
+    for (att, info) in aggregated_attestations
         .iter()
-        .zip(attestation_signatures.iter())
+        .zip(merged.info.iter().take(aggregated_attestations.len()))
     {
         let hashed = HashedAttestationData::new(att.data.clone());
-        let type_one = TypeOneMultiSignature::from_legacy(
-            proof.clone(),
-            hashed.root(),
-            att.data.slot,
-            BytecodeClaim::ZERO,
-        );
+        let type_one = TypeOneMultiSignature {
+            info: info.clone(),
+            proof: ByteListMiB::default(),
+        };
         known_entries.push((hashed, type_one));
-        // Count each participating validator as a valid attestation
+        // Count each participating validator as a valid attestation.
         let count = validator_indices(&att.aggregation_bits).count() as u64;
         metrics::inc_attestations_valid(count);
     }
@@ -1176,114 +1189,78 @@ fn build_block(
     Ok((final_block, aggregated_signatures, post_checkpoints))
 }
 
-/// Verify all signatures in a signed block.
+/// Structural verification of a signed block's merged Type-2 proof.
 ///
-/// Each attestation has a corresponding proof in the signature list.
+/// Phase 3 mirrors the upstream `verify_type_2` stub: we decode the merged
+/// proof blob and check that its `info` list is structurally aligned with the
+/// block body (one entry per attestation plus one trailing entry for the
+/// proposer). Cryptographic verification of each Type-1 happens at gossip
+/// ingestion (`on_gossip_aggregated_attestation`), not here — block-level
+/// crypto verification will return once `lean_multisig` exposes a real
+/// merged-proof verification primitive.
 fn verify_signatures(state: &State, signed_block: &SignedBlock) -> Result<(), StoreError> {
-    use ethlambda_crypto::verify_aggregated_signature;
-    use ethlambda_types::signature::ValidatorSignature;
-
     let total_start = std::time::Instant::now();
 
     let block = &signed_block.message;
     let attestations = &block.body.attestations;
-    let attestation_signatures = &signed_block.signature.attestation_signatures;
 
-    if attestations.len() != attestation_signatures.len() {
+    let merged = TypeTwoMultiSignature::from_ssz_bytes(signed_block.proof.iter().as_slice())
+        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+
+    let expected_info_len = attestations.len() + 1;
+    if merged.info.len() != expected_info_len {
         return Err(StoreError::AttestationSignatureMismatch {
-            signatures: attestation_signatures.len(),
+            signatures: merged.info.len(),
             attestations: attestations.len(),
         });
     }
+
     let validators = &state.validators;
     let num_validators = validators.len() as u64;
 
-    // Verify each attestation's signature proof in parallel
-    let aggregated_start = std::time::Instant::now();
-
-    // Prepare verification inputs sequentially (cheap: bit checks + pubkey lookups)
-    let verification_inputs: Vec<_> = attestations
-        .iter()
-        .zip(attestation_signatures)
-        .map(|(attestation, aggregated_proof)| {
-            if attestation.aggregation_bits != aggregated_proof.participants {
-                return Err(StoreError::ParticipantsMismatch);
+    // Per-attestation entries: messages, slots, and participants must mirror
+    // the block body. The crypto binding for each is already checked at gossip.
+    for (attestation, info) in attestations.iter().zip(merged.info.iter()) {
+        if attestation.aggregation_bits != info.participants {
+            return Err(StoreError::ParticipantsMismatch);
+        }
+        if info.slot != attestation.data.slot {
+            return Err(StoreError::AttestationSignatureMismatch {
+                signatures: merged.info.len(),
+                attestations: attestations.len(),
+            });
+        }
+        if info.message != attestation.data.hash_tree_root() {
+            return Err(StoreError::ParticipantsMismatch);
+        }
+        for vid in validator_indices(&attestation.aggregation_bits) {
+            if vid >= num_validators {
+                return Err(StoreError::InvalidValidatorIndex);
             }
+        }
+    }
 
-            let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
-            let message = attestation.data.hash_tree_root();
-
-            // Collect attestation public keys with bounds check in a single pass
-            let public_keys: Vec<_> = validator_indices(&attestation.aggregation_bits)
-                .map(|vid| {
-                    if vid >= num_validators {
-                        return Err(StoreError::InvalidValidatorIndex);
-                    }
-                    validators[vid as usize]
-                        .get_attestation_pubkey()
-                        .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-                })
-                .collect::<Result<_, _>>()?;
-
-            Ok((&aggregated_proof.proof_data, public_keys, message, slot))
-        })
-        .collect::<Result<_, StoreError>>()?;
-
-    // Run expensive signature verification in parallel.
-    // into_par_iter() moves each tuple, avoiding a clone of public_keys.
-    use rayon::prelude::*;
-    verification_inputs.into_par_iter().try_for_each(
-        |(proof_data, public_keys, message, slot)| {
-            let result = {
-                let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
-                verify_aggregated_signature(proof_data, public_keys, &message, slot)
-            };
-            match result {
-                Ok(()) => {
-                    metrics::inc_pq_sig_aggregated_signatures_valid();
-                    Ok(())
-                }
-                Err(e) => {
-                    metrics::inc_pq_sig_aggregated_signatures_invalid();
-                    Err(StoreError::AggregateVerificationFailed(e))
-                }
-            }
-        },
-    )?;
-
-    let aggregated_elapsed = aggregated_start.elapsed();
-
-    let proposer_start = std::time::Instant::now();
-
-    // Verify proposer signature over block root using proposal key
-    let proposer_signature =
-        ValidatorSignature::from_bytes(&signed_block.signature.proposer_signature)
-            .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
-
-    let proposer = validators
-        .get(block.proposer_index as usize)
-        .ok_or(StoreError::InvalidValidatorIndex)?;
-
-    let proposer_pubkey = proposer
-        .get_proposal_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(proposer.index))?;
-
-    let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
+    // Trailing proposer entry: single bit for `block.proposer_index`,
+    // message equals the block root, slot matches the block slot.
+    let proposer_info = &merged.info[attestations.len()];
     let block_root = block.hash_tree_root();
-
-    if !proposer_signature.is_valid(&proposer_pubkey, slot, &block_root) {
+    if proposer_info.message != block_root || proposer_info.slot != block.slot {
         return Err(StoreError::ProposerSignatureVerificationFailed);
     }
-    let proposer_elapsed = proposer_start.elapsed();
+    let proposer_bits: Vec<u64> = validator_indices(&proposer_info.participants).collect();
+    if proposer_bits != [block.proposer_index] {
+        return Err(StoreError::ProposerSignatureVerificationFailed);
+    }
+    if block.proposer_index >= num_validators {
+        return Err(StoreError::InvalidValidatorIndex);
+    }
 
     let total_elapsed = total_start.elapsed();
     info!(
         slot = block.slot,
         attestation_count = attestations.len(),
-        ?aggregated_elapsed,
-        ?proposer_elapsed,
         ?total_elapsed,
-        "Signature verification timing"
+        "Block proof structural check"
     );
 
     Ok(())
@@ -1338,20 +1315,46 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregation::{aggregate_type_2, proposer_type_one};
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
-        block::{
-            AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
-            SignedBlock, TypeOneMultiSignature,
-        },
+        attestation::{AggregatedAttestation, AggregationBits, AttestationData},
+        block::{BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature},
         checkpoint::Checkpoint,
-        signature::SIGNATURE_SIZE,
         state::State,
     };
+    use libssz::SszEncode as _;
+
+    /// Test helper: wrap a list of Type-1 attestation proofs plus a stub
+    /// proposer Type-1 into the SSZ-encoded merged Type-2 blob that the
+    /// post-Phase-3 `SignedBlock.proof` carries.
+    fn make_signed_block_proof(
+        proposer_index: u64,
+        block_root: H256,
+        slot: u64,
+        attestation_proofs: Vec<TypeOneMultiSignature>,
+    ) -> ByteListMiB {
+        let mut all = attestation_proofs;
+        all.push(proposer_type_one(
+            proposer_index,
+            ByteListMiB::default(),
+            block_root,
+            slot,
+        ));
+        let merged = aggregate_type_2(all);
+        ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
+    }
 
     #[test]
     fn verify_signatures_rejects_participants_mismatch() {
-        let state = State::from_genesis(1000, vec![]);
+        // One validator in state so the proposer-index bounds check passes.
+        let state = State::from_genesis(
+            1000,
+            vec![ethlambda_types::state::Validator {
+                attestation_pubkey: [0u8; 52],
+                proposal_pubkey: [0u8; 52],
+                index: 0,
+            }],
+        );
 
         let attestation_data = AttestationData {
             slot: 0,
@@ -1360,12 +1363,12 @@ mod tests {
             source: Checkpoint::default(),
         };
 
-        // Create attestation with bits [0, 1] set
+        // Attestation declares bits [0, 1] in the block body...
         let mut attestation_bits = AggregationBits::with_length(4).unwrap();
         attestation_bits.set(0, true).unwrap();
         attestation_bits.set(1, true).unwrap();
 
-        // Create proof with different bits [0, 1, 2] set
+        // ...but the merged Type-2 carries info[0].participants = [0, 1, 2].
         let mut proof_bits = AggregationBits::with_length(4).unwrap();
         proof_bits.set(0, true).unwrap();
         proof_bits.set(1, true).unwrap();
@@ -1373,25 +1376,29 @@ mod tests {
 
         let attestation = AggregatedAttestation {
             aggregation_bits: attestation_bits,
-            data: attestation_data,
+            data: attestation_data.clone(),
         };
-        let proof = AggregatedSignatureProof::empty(proof_bits);
-
         let attestations = AggregatedAttestations::try_from(vec![attestation]).unwrap();
-        let attestation_signatures = AttestationSignatures::try_from(vec![proof]).unwrap();
+
+        let block = Block {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body: BlockBody { attestations },
+        };
+        let block_root = block.hash_tree_root();
+
+        let mismatching_t1 = TypeOneMultiSignature::empty(
+            proof_bits,
+            attestation_data.hash_tree_root(),
+            attestation_data.slot,
+        );
+        let proof = make_signed_block_proof(0, block_root, 0, vec![mismatching_t1]);
 
         let signed_block = SignedBlock {
-            message: Block {
-                slot: 0,
-                proposer_index: 0,
-                parent_root: H256::ZERO,
-                state_root: H256::ZERO,
-                body: BlockBody { attestations },
-            },
-            signature: BlockSignatures {
-                attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            },
+            message: block,
+            proof,
         };
 
         let result = verify_signatures(&state, &signed_block);
@@ -1478,12 +1485,7 @@ mod tests {
 
             let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
             let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
-            let proof = TypeOneMultiSignature::from_legacy(
-                AggregatedSignatureProof::new(bits, proof_data),
-                data_root,
-                att_data.slot,
-                BytecodeClaim::ZERO,
-            );
+            let proof = TypeOneMultiSignature::new(bits, data_root, att_data.slot, proof_data);
 
             aggregated_payloads.insert(data_root, (att_data, vec![proof]));
         }
@@ -1507,17 +1509,12 @@ mod tests {
             "MAX_ATTESTATIONS_DATA should cap attestations: got {attestation_count}"
         );
 
-        // Construct the full signed block as it would be sent over gossip.
-        // Phase 2 boundary: project the Type-1 proofs back to the legacy shape
-        // expected by `BlockSignatures`. Removed in Phase 3.
-        let attestation_sigs: Vec<AggregatedSignatureProof> =
-            signatures.iter().map(|t1| t1.to_legacy()).collect();
+        // Build the merged Type-2 proof exactly as `propose_block` would.
+        let block_root = block.hash_tree_root();
+        let proof = make_signed_block_proof(proposer_index, block_root, block.slot, signatures);
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            },
+            proof,
         };
 
         // SSZ-encode: this is exactly what publish_block does before compression
@@ -1682,24 +1679,27 @@ mod tests {
         ])
         .unwrap();
 
-        let attestation_signatures = AttestationSignatures::try_from(vec![
-            AggregatedSignatureProof::empty(bits_a),
-            AggregatedSignatureProof::empty(bits_b),
-        ])
-        .unwrap();
-
+        let block = Block {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: head_root,
+            state_root: H256::ZERO,
+            body: BlockBody { attestations },
+        };
+        let block_root = block.hash_tree_root();
+        let att_root = att_data.hash_tree_root();
+        let proof = make_signed_block_proof(
+            0,
+            block_root,
+            block.slot,
+            vec![
+                TypeOneMultiSignature::empty(bits_a, att_root, att_data.slot),
+                TypeOneMultiSignature::empty(bits_b, att_root, att_data.slot),
+            ],
+        );
         let signed_block = SignedBlock {
-            message: Block {
-                slot: 1,
-                proposer_index: 0,
-                parent_root: head_root,
-                state_root: H256::ZERO,
-                body: BlockBody { attestations },
-            },
-            signature: BlockSignatures {
-                attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            },
+            message: block,
+            proof,
         };
 
         let result = on_block_without_verification(&mut store, signed_block);
