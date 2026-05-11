@@ -339,10 +339,19 @@ async fn run_verify_signatures(
 // Helpers
 // ============================================================================
 
-/// Replicate the invariant `Store::get_forkchoice_store` asserts (without the
-/// panic): anchor_block and state.latest_block_header must agree on every
-/// field once `state_root` is zeroed, AND the original `state_root` must be
-/// either zero or the computed tree-hash root of the state.
+/// Replicate the invariants `Store::get_forkchoice_store` asserts (without
+/// the panic):
+///
+/// 1. `anchor_block` and `state.latest_block_header` must agree on every field
+///    once `state_root` is zeroed.
+/// 2. The state's own `latest_block_header.state_root` must be either zero
+///    (raw / pre-fill form) or match the tree-hash root of the state computed
+///    with that field zeroed.
+/// 3. `anchor_block.state_root` must equal the tree-hash root of the state
+///    (with the header's `state_root` zeroed). This is the invariant the
+///    `test_store_from_anchor_rejects_mismatched_state_root` spec fixture
+///    targets: a block whose `state_root` disagrees with the supplied
+///    anchor state is structurally inconsistent and must be refused at init.
 fn anchor_pair_is_consistent(state: &State, block: &Block) -> bool {
     let mut state_header = state.latest_block_header.clone();
     let mut block_header = block.header();
@@ -352,14 +361,16 @@ fn anchor_pair_is_consistent(state: &State, block: &Block) -> bool {
         return false;
     }
 
-    let original = state.latest_block_header.state_root;
-    if original == H256::ZERO {
-        return true;
-    }
     let mut zeroed = state.clone();
     zeroed.latest_block_header.state_root = H256::ZERO;
     let computed = zeroed.hash_tree_root();
-    original == computed
+
+    let header_state_root = state.latest_block_header.state_root;
+    if header_state_root != H256::ZERO && header_state_root != computed {
+        return false;
+    }
+
+    block.state_root == computed
 }
 
 /// Dispatch a fork-choice step against the held Store.

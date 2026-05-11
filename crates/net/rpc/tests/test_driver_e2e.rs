@@ -13,13 +13,21 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ethlambda_rpc::test_driver::{DriverState, build_router, empty_driver_store};
-use ethlambda_types::{block::BlockBody, primitives::HashTreeRoot};
+use ethlambda_types::{block::BlockBody, primitives::HashTreeRoot, state::State};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 const ZERO_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Compute the state_root the genesis `anchorBlock` must carry for an init
+/// request to pass the consistency check: the tree-hash root of the empty
+/// genesis state with `latest_block_header.state_root` zeroed.
+fn genesis_state_root_hex(genesis_time: u64) -> String {
+    let state = State::from_genesis(genesis_time, vec![]);
+    format!("{}", state.hash_tree_root())
+}
 
 /// Build a genesis-shaped `anchorState` JSON object that the test driver's
 /// `init_fork_choice` handler will accept.
@@ -46,12 +54,15 @@ fn genesis_anchor_state_json(genesis_time: u64) -> Value {
 }
 
 /// Build the matching genesis `anchorBlock` JSON (slot 0, empty body).
-fn genesis_anchor_block_json() -> Value {
+///
+/// `stateRoot` must equal `genesis_state_root_hex(genesis_time)` for the
+/// driver's anchor consistency check to pass.
+fn genesis_anchor_block_json(genesis_time: u64) -> Value {
     json!({
         "slot": 0,
         "proposerIndex": 0,
         "parentRoot": ZERO_ROOT,
-        "stateRoot": ZERO_ROOT,
+        "stateRoot": genesis_state_root_hex(genesis_time),
         "body": {"attestations": {"data": []}},
     })
 }
@@ -91,7 +102,7 @@ async fn init_with_genesis_anchor_returns_204_and_resets_store() {
 
     let body = json!({
         "anchorState": genesis_anchor_state_json(1234),
-        "anchorBlock": genesis_anchor_block_json(),
+        "anchorBlock": genesis_anchor_block_json(1234),
     });
 
     let (status, _) = post(&router, "/lean/v0/test_driver/fork_choice/init", &body).await;
@@ -109,8 +120,29 @@ async fn init_with_mismatched_anchor_returns_400() {
 
     // Genesis state but the anchor block claims a different slot — the
     // header comparison must reject this pair.
-    let mut anchor_block = genesis_anchor_block_json();
+    let mut anchor_block = genesis_anchor_block_json(0);
     anchor_block["slot"] = json!(42);
+
+    let body = json!({
+        "anchorState": genesis_anchor_state_json(0),
+        "anchorBlock": anchor_block,
+    });
+
+    let (status, _) = post(&router, "/lean/v0/test_driver/fork_choice/init", &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn init_with_garbage_block_state_root_returns_400() {
+    // Regression for the `test_store_from_anchor_rejects_mismatched_state_root`
+    // spec fixture: the anchor block's `stateRoot` field is the only thing
+    // wrong, and the driver must catch it instead of accepting the pair.
+    let driver = fresh_driver();
+    let router = build_router(driver);
+
+    let mut anchor_block = genesis_anchor_block_json(0);
+    anchor_block["stateRoot"] =
+        json!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
     let body = json!({
         "anchorState": genesis_anchor_state_json(0),
@@ -128,7 +160,7 @@ async fn step_tick_advances_store_time_and_returns_snapshot() {
 
     let init = json!({
         "anchorState": genesis_anchor_state_json(0),
-        "anchorBlock": genesis_anchor_block_json(),
+        "anchorBlock": genesis_anchor_block_json(0),
     });
     let (status, _) = post(&router, "/lean/v0/test_driver/fork_choice/init", &init).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -155,7 +187,7 @@ async fn checks_step_is_noop_but_returns_current_snapshot() {
 
     let init = json!({
         "anchorState": genesis_anchor_state_json(0),
-        "anchorBlock": genesis_anchor_block_json(),
+        "anchorBlock": genesis_anchor_block_json(0),
     });
     let (_, _) = post(&router, "/lean/v0/test_driver/fork_choice/init", &init).await;
 
