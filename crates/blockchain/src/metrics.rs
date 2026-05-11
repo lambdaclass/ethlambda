@@ -1,6 +1,6 @@
 //! Prometheus metrics for the blockchain module.
 
-use std::time::Instant;
+use std::time::Duration;
 
 use ethlambda_metrics::*;
 
