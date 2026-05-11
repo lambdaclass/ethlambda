@@ -7,10 +7,11 @@
 use crate::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
+    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, ByteListMiB, SignedBlock,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 /// Root struct for verify signatures test vectors
@@ -60,6 +61,11 @@ pub struct TestSignedBlock {
     pub signature: TestSignatureBundle,
 }
 
+/// Lossy fixture-to-SignedBlock conversion: per-attestation proof bytes from
+/// the fixture are dropped, leaving empty payloads. Adequate for callers that
+/// don't reach the leanVM aggregate verifier (e.g. signature spec tests whose
+/// fixtures all set `expectException`). For real signature verification use
+/// [`TestSignedBlock::try_into_signed_block_with_proofs`].
 impl From<TestSignedBlock> for SignedBlock {
     fn from(value: TestSignedBlock) -> Self {
         let block = value.block.into();
@@ -85,6 +91,83 @@ impl From<TestSignedBlock> for SignedBlock {
                 proposer_signature,
             },
         }
+    }
+}
+
+/// Error returned by [`TestSignedBlock::try_into_signed_block_with_proofs`].
+#[derive(Debug)]
+pub enum SignedBlockConvertError {
+    InvalidProofHex { index: usize, reason: String },
+    ProofTooLarge { index: usize, len: usize },
+    TooManyAttestationSignatures,
+}
+
+impl fmt::Display for SignedBlockConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProofHex { index, reason } => {
+                write!(
+                    f,
+                    "attestation_signatures[{index}].proofData: invalid hex: {reason}"
+                )
+            }
+            Self::ProofTooLarge { index, len } => {
+                write!(
+                    f,
+                    "attestation_signatures[{index}].proofData: {len} bytes exceeds ByteListMiB limit"
+                )
+            }
+            Self::TooManyAttestationSignatures => {
+                f.write_str("attestation_signatures list exceeds AttestationSignatures limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SignedBlockConvertError {}
+
+impl TestSignedBlock {
+    /// Materialize a `SignedBlock` that preserves the fixture-supplied
+    /// per-attestation proof bytes verbatim. Required for verifying signatures
+    /// against the leanVM aggregate path; the lossy [`From`] impl above drops
+    /// these bytes.
+    pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
+        let block = self.block.into();
+        let proposer_signature = self.signature.proposer_signature;
+
+        let proofs: Vec<AggregatedSignatureProof> = self
+            .signature
+            .attestation_signatures
+            .data
+            .into_iter()
+            .enumerate()
+            .map(|(index, att_sig)| {
+                let participants: EthAggregationBits = att_sig.participants.into();
+                let raw = &att_sig.proof_data.data;
+                let stripped = raw.strip_prefix("0x").unwrap_or(raw);
+                let bytes = hex::decode(stripped).map_err(|err| {
+                    SignedBlockConvertError::InvalidProofHex {
+                        index,
+                        reason: err.to_string(),
+                    }
+                })?;
+                let len = bytes.len();
+                let proof_data = ByteListMiB::try_from(bytes)
+                    .map_err(|_| SignedBlockConvertError::ProofTooLarge { index, len })?;
+                Ok(AggregatedSignatureProof::new(participants, proof_data))
+            })
+            .collect::<Result<_, SignedBlockConvertError>>()?;
+
+        let attestation_signatures: AttestationSignatures = AttestationSignatures::try_from(proofs)
+            .map_err(|_| SignedBlockConvertError::TooManyAttestationSignatures)?;
+
+        Ok(SignedBlock {
+            message: block,
+            signature: BlockSignatures {
+                attestation_signatures,
+                proposer_signature,
+            },
+        })
     }
 }
 

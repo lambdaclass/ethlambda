@@ -1,8 +1,8 @@
 //! End-to-end tests for the Hive lean test-driver router.
 //!
 //! These tests exercise the four `/lean/v0/test_driver/...` endpoints exactly
-//! as the hive simulator does — same JSON bodies, same HTTP method, same
-//! response shape — using `tower::ServiceExt::oneshot` so no real socket is
+//! as the hive simulator does: same JSON bodies, same HTTP method, same
+//! response shape, using `tower::ServiceExt::oneshot` so no real socket is
 //! involved. They're the closest thing to running the suite under hive
 //! without spinning up docker.
 
@@ -118,7 +118,7 @@ async fn init_with_mismatched_anchor_returns_400() {
     let driver = fresh_driver();
     let router = build_router(driver);
 
-    // Genesis state but the anchor block claims a different slot — the
+    // Genesis state but the anchor block claims a different slot: the
     // header comparison must reject this pair.
     let mut anchor_block = genesis_anchor_block_json(0);
     anchor_block["slot"] = json!(42);
@@ -247,7 +247,7 @@ async fn verify_signatures_with_empty_validator_set_fails_cleanly() {
 
     // Build a signed block referencing the genesis state but with an invalid
     // proposer (no validators in the set). The driver should return
-    // succeeded:false with a descriptive error — matching the simulator's
+    // succeeded:false with a descriptive error, matching the simulator's
     // expectException path.
     let signed_block = json!({
         "message": {

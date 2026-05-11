@@ -127,7 +127,7 @@ async fn main() -> eyre::Result<()> {
     // or any other consensus prerequisite the hive shim doesn't bother to
     // provision.
     if ethlambda_rpc::test_driver::test_driver_enabled() {
-        info!("HIVE_LEAN_TEST_DRIVER detected — booting in test-driver mode");
+        info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
         return run_test_driver(rpc_config).await;
     }
 

@@ -35,23 +35,16 @@ use ethlambda_blockchain::{
 };
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_test_fixtures::{
-    Block as FixtureBlock, TestState,
-    fork_choice::{BlockStepData, ForkChoiceStep},
-    state_transition::StateTransitionRunRequest,
-    verify_signatures::TestSignedBlock,
+    Block as FixtureBlock, TestState, fork_choice::ForkChoiceStep,
+    state_transition::StateTransitionRunRequest, verify_signatures::TestSignedBlock,
 };
 use ethlambda_types::{
     attestation::{
         AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
-        XmssSignature,
     },
-    block::{
-        AggregatedSignatureProof, AttestationSignatures, Block, BlockSignatures, ByteListMiB,
-        SignedBlock,
-    },
+    block::{AggregatedSignatureProof, Block, ByteListMiB},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
     state::State,
 };
 use serde::{Deserialize, Serialize};
@@ -64,15 +57,24 @@ use tracing::debug;
 /// of `"1"`, `"true"`, or `"yes"` (case-insensitive) enables the driver.
 pub const TEST_DRIVER_ENV: &str = "HIVE_LEAN_TEST_DRIVER";
 
+/// Whether the supplied env-var value should activate the driver.
+///
+/// Pure helper so [`test_driver_enabled`] stays a thin wrapper over
+/// `std::env::var` and the parsing rules are unit-testable without mutating
+/// process-global env state (which would be `unsafe` and racy under cargo's
+/// parallel test runner).
+fn parse_truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 /// Returns true when the binary should boot into test-driver mode.
 pub fn test_driver_enabled() -> bool {
-    match std::env::var(TEST_DRIVER_ENV) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes"
-        ),
-        Err(_) => false,
-    }
+    std::env::var(TEST_DRIVER_ENV)
+        .map(|value| parse_truthy_env_value(&value))
+        .unwrap_or(false)
 }
 
 /// Shared, runtime-replaceable Store backing every test-driver handler.
@@ -137,29 +139,15 @@ struct VerifySignaturesRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DriverCheckpoint {
-    slot: u64,
-    root: H256,
-}
-
-impl From<Checkpoint> for DriverCheckpoint {
-    fn from(value: Checkpoint) -> Self {
-        Self {
-            slot: value.slot,
-            root: value.root,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct DriverSnapshot {
     head_slot: u64,
     head_root: H256,
     /// Store time in 800 ms intervals since genesis (matches [`Store::time`]).
     time: u64,
-    justified_checkpoint: DriverCheckpoint,
-    finalized_checkpoint: DriverCheckpoint,
+    /// `Checkpoint` already serializes as `{root, slot}`, which is the shape
+    /// hive's `DriverCheckpoint` expects; no wrapper type needed.
+    justified_checkpoint: Checkpoint,
+    finalized_checkpoint: Checkpoint,
     safe_target: H256,
 }
 
@@ -217,7 +205,7 @@ async fn init_fork_choice(
 
     // Mirror Store::get_forkchoice_store's invariants explicitly so we can
     // surface a clean 400 instead of panicking the handler task.
-    if !anchor_pair_is_consistent(&state, &block) {
+    if !anchor_pair_is_consistent(&mut state, &block) {
         return (
             StatusCode::BAD_REQUEST,
             "anchor block does not match anchor state",
@@ -242,10 +230,12 @@ async fn step_fork_choice(
     AxumState(driver): AxumState<DriverState>,
     Json(step): Json<ForkChoiceStep>,
 ) -> Json<StepResponse> {
-    let outcome = {
-        let mut guard = driver.write().await;
-        apply_step(&mut guard, step)
-    };
+    // Hold the write guard across both the step and the snapshot read so the
+    // returned snapshot reflects this step (and no interleaved request can
+    // mutate the store in between, even though the hive simulator drives
+    // steps serially per fixture).
+    let mut guard = driver.write().await;
+    let outcome = apply_step(&mut guard, step);
     let (accepted, error) = match outcome {
         Ok(()) => (true, None),
         Err(err) => {
@@ -253,10 +243,8 @@ async fn step_fork_choice(
             (false, Some(err))
         }
     };
-    let snapshot = {
-        let guard = driver.read().await;
-        snapshot_store(&guard)
-    };
+    let snapshot = snapshot_store(&guard);
+    drop(guard);
     Json(StepResponse {
         accepted,
         error,
@@ -320,7 +308,15 @@ async fn run_verify_signatures(
     Json(request): Json<VerifySignaturesRequest>,
 ) -> Json<VerifySignaturesResponse> {
     let state: State = request.anchor_state.into();
-    let signed_block = signed_block_from_fixture(request.signed_block);
+    let signed_block = match request.signed_block.try_into_signed_block_with_proofs() {
+        Ok(block) => block,
+        Err(err) => {
+            return Json(VerifySignaturesResponse {
+                succeeded: false,
+                error: Some(format!("malformed signedBlock fixture: {err}")),
+            });
+        }
+    };
 
     let response = match verify_block_signatures(&state, &signed_block) {
         Ok(()) => VerifySignaturesResponse {
@@ -352,7 +348,12 @@ async fn run_verify_signatures(
 ///    `test_store_from_anchor_rejects_mismatched_state_root` spec fixture
 ///    targets: a block whose `state_root` disagrees with the supplied
 ///    anchor state is structurally inconsistent and must be refused at init.
-fn anchor_pair_is_consistent(state: &State, block: &Block) -> bool {
+///
+/// Takes `&mut State` so we can zero the header field in-place around the
+/// hash computation rather than cloning the whole state (validator set +
+/// historical roots can be hundreds of KB). The original `state_root` is
+/// restored before the function returns.
+fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
     let mut state_header = state.latest_block_header.clone();
     let mut block_header = block.header();
     state_header.state_root = H256::ZERO;
@@ -361,12 +362,12 @@ fn anchor_pair_is_consistent(state: &State, block: &Block) -> bool {
         return false;
     }
 
-    let mut zeroed = state.clone();
-    zeroed.latest_block_header.state_root = H256::ZERO;
-    let computed = zeroed.hash_tree_root();
+    let saved = state.latest_block_header.state_root;
+    state.latest_block_header.state_root = H256::ZERO;
+    let computed = state.hash_tree_root();
+    state.latest_block_header.state_root = saved;
 
-    let header_state_root = state.latest_block_header.state_root;
-    if header_state_root != H256::ZERO && header_state_root != computed {
+    if saved != H256::ZERO && saved != computed {
         return false;
     }
 
@@ -392,7 +393,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             let block_data = step
                 .block
                 .ok_or_else(|| "block step missing block data".to_string())?;
-            let signed_block = blank_signed_block(block_data);
+            let signed_block = block_data.to_blank_signed_block();
             // Match the spec-test runner: advance time to the block's slot
             // before importing so the future-slot guard doesn't reject it.
             let block_time_ms = store.config().genesis_time * 1000
@@ -433,72 +434,10 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             };
             store::on_gossip_aggregated_attestation(store, aggregated).map_err(|e| e.to_string())
         }
-        // `checks`-only steps are no-ops here — the simulator validates them
+        // `checks`-only steps are no-ops here: the simulator validates them
         // against the snapshot returned alongside this response.
         "checks" => Ok(()),
         other => Err(format!("unknown step type: {other}")),
-    }
-}
-
-/// Build a SignedBlock for fork-choice import without real signatures.
-///
-/// Matches the offline spec-test runner's `build_signed_block`: one empty
-/// proof per attestation (the participant bits get checked against the
-/// attestation's `aggregation_bits` during import) and a zeroed proposer
-/// signature. Fork-choice steps use `on_block_without_verification`, so
-/// these placeholders never reach the crypto layer.
-fn blank_signed_block(block_data: BlockStepData) -> SignedBlock {
-    let block: Block = block_data.to_block();
-    let proofs: Vec<AggregatedSignatureProof> = block
-        .body
-        .attestations
-        .iter()
-        .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-        .collect();
-
-    SignedBlock {
-        message: block,
-        signature: BlockSignatures {
-            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE])
-                .expect("zero-filled signature has the correct length"),
-            attestation_signatures: AttestationSignatures::try_from(proofs)
-                .expect("attestation proofs within limit"),
-        },
-    }
-}
-
-/// Materialize a SignedBlock that preserves the fixture-supplied per-validator
-/// proof bytes, so `verify_block_signatures` actually exercises the leanVM
-/// aggregate path (vs. the `From<TestSignedBlock>` shortcut that drops it).
-fn signed_block_from_fixture(value: TestSignedBlock) -> SignedBlock {
-    let block: Block = value.block.into();
-    let proposer_signature = value.signature.proposer_signature;
-    let proofs: Vec<AggregatedSignatureProof> = value
-        .signature
-        .attestation_signatures
-        .data
-        .into_iter()
-        .map(|att_sig| {
-            let participants: EthAggregationBits = att_sig.participants.into();
-            let stripped = att_sig
-                .proof_data
-                .data
-                .strip_prefix("0x")
-                .unwrap_or(&att_sig.proof_data.data);
-            let proof_bytes = hex::decode(stripped).unwrap_or_default();
-            let proof_data =
-                ByteListMiB::try_from(proof_bytes).unwrap_or_else(|_| ByteListMiB::default());
-            AggregatedSignatureProof::new(participants, proof_data)
-        })
-        .collect();
-
-    SignedBlock {
-        message: block,
-        signature: BlockSignatures {
-            attestation_signatures: AttestationSignatures::try_from(proofs)
-                .expect("attestation proofs within limit"),
-            proposer_signature,
-        },
     }
 }
 
@@ -515,18 +454,12 @@ fn post_summary(state: &State) -> StateTransitionPost {
 
 /// Snapshot the store fields exposed by the fork-choice `step` response.
 fn snapshot_store(store: &Store) -> DriverSnapshot {
-    let head_root = store.head();
-    let head_slot = store
-        .get_block_header(&head_root)
-        .map(|header| header.slot)
-        .unwrap_or(0);
-
     DriverSnapshot {
-        head_slot,
-        head_root,
+        head_slot: store.head_slot(),
+        head_root: store.head(),
         time: store.time(),
-        justified_checkpoint: store.latest_justified().into(),
-        finalized_checkpoint: store.latest_finalized().into(),
+        justified_checkpoint: store.latest_justified(),
+        finalized_checkpoint: store.latest_finalized(),
         safe_target: store.safe_target(),
     }
 }
@@ -536,20 +469,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn driver_recognizes_truthy_env_values() {
-        for value in ["1", "true", "TRUE", " Yes "] {
-            // SAFETY: tests run single-threaded for shared env vars in this
-            // file; the std::env contract here is just to flip the toggle.
-            unsafe { std::env::set_var(TEST_DRIVER_ENV, value) };
-            assert!(test_driver_enabled(), "{value:?} should enable the driver");
+    fn parse_truthy_env_value_accepts_canonical_truthy_strings() {
+        for value in ["1", "true", "TRUE", " Yes ", "yes\n"] {
+            assert!(parse_truthy_env_value(value), "{value:?} should be truthy");
         }
-        unsafe { std::env::set_var(TEST_DRIVER_ENV, "0") };
-        assert!(!test_driver_enabled(), "0 should disable the driver");
-        unsafe { std::env::remove_var(TEST_DRIVER_ENV) };
-        assert!(
-            !test_driver_enabled(),
-            "unset env should disable the driver"
-        );
+        for value in ["0", "false", "no", "", "  ", "1.0"] {
+            assert!(!parse_truthy_env_value(value), "{value:?} should be falsy");
+        }
     }
 
     #[test]

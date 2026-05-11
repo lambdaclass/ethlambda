@@ -8,7 +8,11 @@ use crate::{
     deser_xmss_hex,
 };
 use ethlambda_types::attestation::XmssSignature;
+use ethlambda_types::block::{
+    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
+};
 use ethlambda_types::primitives::H256;
+use ethlambda_types::signature::SIGNATURE_SIZE;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -144,6 +148,34 @@ impl BlockStepData {
             parent_root: self.parent_root,
             state_root: self.state_root,
             body: self.body.clone().into(),
+        }
+    }
+
+    /// Build a SignedBlock with placeholder signatures: one empty aggregated
+    /// proof per attestation (participant bits copied from the block body) and
+    /// a zeroed proposer signature.
+    ///
+    /// Used by callers that import the block via `on_block_without_verification`
+    /// (fork-choice spec-test runner and Hive test-driver), where the crypto
+    /// layer is never invoked but the SignedBlock shape must still satisfy the
+    /// length checks `on_block_core` performs before dispatching.
+    pub fn to_blank_signed_block(&self) -> SignedBlock {
+        let block = self.to_block();
+        let proofs: Vec<AggregatedSignatureProof> = block
+            .body
+            .attestations
+            .iter()
+            .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
+            .collect();
+
+        SignedBlock {
+            message: block,
+            signature: BlockSignatures {
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE])
+                    .expect("zero-filled signature has the correct length"),
+                attestation_signatures: AttestationSignatures::try_from(proofs)
+                    .expect("attestation proofs within limit"),
+            },
         }
     }
 }
