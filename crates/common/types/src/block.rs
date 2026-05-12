@@ -84,12 +84,19 @@ pub struct TypeOneInfo {
     pub bytecode_claim: BytecodeClaim,
 }
 
+/// Maximum number of distinct `AttestationData` entries permitted in a single
+/// block. Canonical home for the cap shared across `ethlambda-blockchain`,
+/// `ethlambda-test-fixtures`, and the wire types in this crate.
+///
+/// See: leanSpec commit 0c9528a (PR #536).
+pub const MAX_ATTESTATIONS_DATA: usize = 16;
+
 /// SSZ-list of Type-1 info entries packed inside a Type-2 proof.
 ///
 /// Holds at most `MAX_ATTESTATIONS_DATA` distinct attestation entries plus one
 /// for the proposer's own signature. Mirrors upstream
-/// `TypeOneInfos.LIMIT = MAX_ATTESTATIONS_DATA + 1` (= 16 + 1).
-pub type TypeOneInfos = SszList<TypeOneInfo, 17>;
+/// `TypeOneInfos.LIMIT = MAX_ATTESTATIONS_DATA + 1`.
+pub type TypeOneInfos = SszList<TypeOneInfo, { MAX_ATTESTATIONS_DATA + 1 }>;
 
 /// A Type-1 single-message proof aggregating signatures from many validators.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]

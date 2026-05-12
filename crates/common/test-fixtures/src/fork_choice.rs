@@ -9,21 +9,13 @@ use crate::{
 };
 use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::block::{
-    ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
+    ByteListMiB, MAX_ATTESTATIONS_DATA, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
 };
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use libssz::SszEncode as _;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
-
-/// Per-block cap from `ethlambda_blockchain::MAX_ATTESTATIONS_DATA`, mirrored
-/// here so the test-fixtures crate stays free of a blockchain-layer dep. Used
-/// by [`BlockStepData::to_blank_signed_block`] to fall back to an empty proof
-/// for oversized-block test cases (the merged Type-2 metadata list caps at
-/// `MAX_ATTESTATIONS_DATA + 1`, which is exactly the proposer + every block
-/// attestation; oversized blocks are rejected upstream of proof decoding).
-const MAX_ATTESTATIONS_DATA: usize = 16;
 
 // ============================================================================
 // Root Structures
