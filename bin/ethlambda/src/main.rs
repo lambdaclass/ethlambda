@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -175,7 +175,7 @@ async fn main() -> eyre::Result<()> {
     );
 
     let validator_config_file = read_validator_config_file(&validator_config);
-    populate_name_registry(&validator_config_file);
+    let node_names = load_node_names(&validator_config_file);
 
     // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
     // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
@@ -239,7 +239,7 @@ async fn main() -> eyre::Result<()> {
     })
     .expect("failed to build swarm");
 
-    let p2p = P2P::spawn(built, store.clone());
+    let p2p = P2P::spawn(built, store.clone(), node_names);
 
     // Wire actors together via protocol refs
     blockchain
@@ -340,7 +340,7 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 ///
 /// The `config` block is a network-wide settings bag shared across clients;
 /// only fields ethlambda actually reads are deserialized. The `validators`
-/// list feeds the metrics name registry.
+/// list feeds the node-name registry passed to `P2P::spawn`.
 #[derive(Debug, Deserialize)]
 struct ValidatorConfigFile {
     #[serde(default)]
@@ -365,15 +365,14 @@ fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
     serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
 }
 
-fn populate_name_registry(file: &ValidatorConfigFile) {
+fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
     let names_and_privkeys = file
         .validators
         .iter()
         .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
-    // Populates a dictionary used for labeling metrics with node names
-    ethlambda_p2p::metrics::populate_name_registry(names_and_privkeys);
+    ethlambda_p2p::derive_peer_ids(names_and_privkeys)
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
