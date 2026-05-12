@@ -48,8 +48,21 @@ const ASCII_ART: &str = r#"
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
+    /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
-    custom_network_config_dir: PathBuf,
+    genesis: PathBuf,
+    /// Path to the validator registry (e.g., annotated_validators.yaml).
+    #[arg(long)]
+    validators: PathBuf,
+    /// Path to the bootnode list (e.g., nodes.yaml).
+    #[arg(long)]
+    bootnodes: PathBuf,
+    /// Path to validator-config.yaml (validator name registry for metrics labels).
+    #[arg(long)]
+    validator_config: PathBuf,
+    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
+    #[arg(long)]
+    hash_sig_keys_dir: PathBuf,
     #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -109,8 +122,6 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key);
-    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
     let rpc_config = RpcConfig {
         http_address: options.http_address,
         api_port: options.api_port,
@@ -120,6 +131,22 @@ async fn main() -> eyre::Result<()> {
     println!("{ASCII_ART}");
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+
+    // Hive lean spec-asset suites boot the client with
+    // HIVE_LEAN_TEST_DRIVER=1 so it skips the consensus/p2p stack and
+    // exposes only the `/lean/v0/test_driver/...` endpoints driven by the
+    // simulator. Detected here before any config / key / genesis loading
+    // so the driver run doesn't touch --node-key, --custom-network-config-dir,
+    // or any other consensus prerequisite the hive shim doesn't bother to
+    // provision.
+    if ethlambda_rpc::test_driver::test_driver_enabled() {
+        info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
+        return run_test_driver(rpc_config).await;
+    }
+
+    let node_p2p_key = read_hex_file_bytes(&options.node_key);
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+
     #[cfg(not(target_env = "msvc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(target_env = "msvc")]
@@ -127,15 +154,11 @@ async fn main() -> eyre::Result<()> {
 
     info!(node_key=?options.node_key, "got node key");
 
-    let config_path = options.custom_network_config_dir.join("config.yaml");
-    let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
-    let validators_path = options
-        .custom_network_config_dir
-        .join("annotated_validators.yaml");
-    let validator_config = options
-        .custom_network_config_dir
-        .join("validator-config.yaml");
-    let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
+    let config_path = options.genesis;
+    let bootnodes_path = options.bootnodes;
+    let validators_path = options.validators;
+    let validator_config = options.validator_config;
+    let validator_keys_dir = options.hash_sig_keys_dir;
 
     let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
     let genesis_config: GenesisConfig =
@@ -270,6 +293,40 @@ async fn main() -> eyre::Result<()> {
     p2p_ref.join().await;
     let _ = rpc_handle.await;
 
+    info!("Shutdown complete");
+
+    Ok(())
+}
+
+/// Boot the binary in Hive test-driver mode.
+///
+/// Skips every consensus/p2p subsystem and just exposes the
+/// `/lean/v0/test_driver/...` HTTP endpoints over the configured API port.
+/// The driver-mode store is seeded with an empty in-memory state and is
+/// replaced on every `fork_choice/init` request from the simulator.
+async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
+    use tokio::sync::RwLock;
+
+    let driver: ethlambda_rpc::test_driver::DriverState =
+        Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
+
+    let shutdown_token = CancellationToken::new();
+    let rpc_shutdown = shutdown_token.clone();
+
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(err) =
+            ethlambda_rpc::start_test_driver_rpc_server(rpc_config, driver, rpc_shutdown).await
+        {
+            error!(%err, "Test-driver RPC server failed");
+        }
+    });
+
+    info!("Test-driver RPC ready");
+
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown signal received, stopping test-driver RPC...");
+    shutdown_token.cancel();
+    let _ = rpc_handle.await;
     info!("Shutdown complete");
 
     Ok(())
