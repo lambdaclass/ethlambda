@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -48,8 +48,21 @@ const ASCII_ART: &str = r#"
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
+    /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
-    custom_network_config_dir: PathBuf,
+    genesis: PathBuf,
+    /// Path to the validator registry (e.g., annotated_validators.yaml).
+    #[arg(long)]
+    validators: PathBuf,
+    /// Path to the bootnode list (e.g., nodes.yaml).
+    #[arg(long)]
+    bootnodes: PathBuf,
+    /// Path to validator-config.yaml (validator name registry for metrics labels).
+    #[arg(long)]
+    validator_config: PathBuf,
+    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
+    #[arg(long)]
+    hash_sig_keys_dir: PathBuf,
     #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -141,15 +154,11 @@ async fn main() -> eyre::Result<()> {
 
     info!(node_key=?options.node_key, "got node key");
 
-    let config_path = options.custom_network_config_dir.join("config.yaml");
-    let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
-    let validators_path = options
-        .custom_network_config_dir
-        .join("annotated_validators.yaml");
-    let validator_config = options
-        .custom_network_config_dir
-        .join("validator-config.yaml");
-    let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
+    let config_path = options.genesis;
+    let bootnodes_path = options.bootnodes;
+    let validators_path = options.validators;
+    let validator_config = options.validator_config;
+    let validator_keys_dir = options.hash_sig_keys_dir;
 
     let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
     let genesis_config: GenesisConfig =
@@ -162,7 +171,7 @@ async fn main() -> eyre::Result<()> {
     );
 
     let validator_config_file = read_validator_config_file(&validator_config);
-    populate_name_registry(&validator_config_file);
+    let node_names = load_node_names(&validator_config_file);
 
     // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
     // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
@@ -226,7 +235,7 @@ async fn main() -> eyre::Result<()> {
     })
     .expect("failed to build swarm");
 
-    let p2p = P2P::spawn(built, store.clone());
+    let p2p = P2P::spawn(built, store.clone(), node_names);
 
     // Wire actors together via protocol refs
     blockchain
@@ -327,7 +336,7 @@ async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
 ///
 /// The `config` block is a network-wide settings bag shared across clients;
 /// only fields ethlambda actually reads are deserialized. The `validators`
-/// list feeds the metrics name registry.
+/// list feeds the node-name registry passed to `P2P::spawn`.
 #[derive(Debug, Deserialize)]
 struct ValidatorConfigFile {
     #[serde(default)]
@@ -352,15 +361,14 @@ fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
     serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
 }
 
-fn populate_name_registry(file: &ValidatorConfigFile) {
+fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
     let names_and_privkeys = file
         .validators
         .iter()
         .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
-    // Populates a dictionary used for labeling metrics with node names
-    ethlambda_p2p::metrics::populate_name_registry(names_and_privkeys);
+    ethlambda_p2p::derive_peer_ids(names_and_privkeys)
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
