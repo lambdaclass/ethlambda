@@ -395,12 +395,6 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
     aggregation_bits
 }
 
-// Type-1 / Type-2 envelope builders moved to
-// [`ethlambda_types::block::TypeOneMultiSignature::for_proposer`] and
-// [`ethlambda_types::block::TypeTwoMultiSignature::from_type_1s`] so the
-// `ethlambda-test-fixtures` crate can share them without depending on the
-// blockchain layer.
-
 /// Worker loop — runs on a `spawn_blocking` thread, no store access.
 ///
 /// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and streams
