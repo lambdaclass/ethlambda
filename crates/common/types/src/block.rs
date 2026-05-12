@@ -51,12 +51,6 @@ pub type ByteListMiB = ByteList<1_048_576>;
 // ============================================================================
 // Type-1 / Type-2 multi-signature model
 // ============================================================================
-//
-// New typed multi-signature surface introduced by leanSpec commit
-// `anshalshukla/leanSpec@0ab09dd` ("dummy type 1 and type 2 aggregation with
-// block proofs"). Defined alongside the legacy `AggregatedSignatureProof` /
-// `BlockSignatures` types during the phased migration; consumers will switch
-// over in later phases (gossip layer first, then block wire).
 
 /// Trusted `Evaluation<EF>` field carried inside Type-1 / Type-2 proofs.
 ///
