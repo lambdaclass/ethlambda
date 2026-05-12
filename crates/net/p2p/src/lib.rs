@@ -40,8 +40,9 @@ use crate::{
         publish_attestation, publish_block,
     },
     req_resp::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
-        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
+        BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
+        MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1, build_status,
+        fetch_block_from_peer,
     },
     swarm_adapter::SwarmHandle,
 };
@@ -152,6 +153,10 @@ pub fn build_swarm(
             ),
             (
                 StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
+            (
+                StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
                 request_response::ProtocolSupport::Full,
             ),
         ],
