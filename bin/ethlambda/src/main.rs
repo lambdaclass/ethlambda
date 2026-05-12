@@ -596,9 +596,36 @@ async fn fetch_initial_state(
     // Checkpoint sync path
     info!(%checkpoint_url, "Starting checkpoint sync");
 
-    let (state, signed_block) =
-        checkpoint_sync::fetch_finalized_anchor(checkpoint_url, genesis.genesis_time, &validators)
-            .await?;
+    // The state and block are fetched in parallel; if the peer advances
+    // finalization between the two requests the pair won't match. Retry a
+    // small number of times so this transient race doesn't fail node startup.
+    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
+    const ANCHOR_FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let mut attempt = 1;
+    let (state, signed_block) = loop {
+        match checkpoint_sync::fetch_finalized_anchor(
+            checkpoint_url,
+            genesis.genesis_time,
+            &validators,
+        )
+        .await
+        {
+            Ok(pair) => break pair,
+            Err(checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
+                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
+            {
+                warn!(
+                    attempt,
+                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
+                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
+                );
+                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
 
     info!(
         slot = state.slot,

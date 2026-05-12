@@ -102,9 +102,11 @@ async fn fetch_ssz<T: SszDecode>(client: &Client, url: &str) -> Result<T, Checkp
 /// strip a trailing legacy path if present and also trim any trailing slash.
 // TODO: remove this and use the full URL
 fn normalize_base_url(url: &str) -> &str {
-    url.strip_suffix(FINALIZED_STATE_PATH)
-        .unwrap_or(url)
-        .trim_end_matches('/')
+    // Trim trailing slashes FIRST so that the legacy-suffix strip succeeds on
+    // inputs like `…/lean/v0/states/finalized/`; otherwise we'd leave the
+    // state path embedded in the "base URL" and double-prefix every request.
+    let trimmed = url.trim_end_matches('/');
+    trimmed.strip_suffix(FINALIZED_STATE_PATH).unwrap_or(trimmed)
 }
 
 /// Fetch the finalized state from a checkpoint peer and verify it
@@ -509,5 +511,15 @@ mod tests {
     #[test]
     fn normalize_strips_trailing_slash() {
         assert_eq!(normalize_base_url("http://peer:5052/"), "http://peer:5052");
+    }
+
+    #[test]
+    fn normalize_strips_legacy_state_path_with_trailing_slash() {
+        // Regression: a trailing slash on the legacy path used to defeat
+        // strip_suffix, leaving the path embedded in the "base URL".
+        assert_eq!(
+            normalize_base_url("http://peer:5052/lean/v0/states/finalized/"),
+            "http://peer:5052"
+        );
     }
 }
