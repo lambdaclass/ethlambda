@@ -17,7 +17,7 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
-    state::{ChainConfig, State},
+    state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
 use tracing::info;
@@ -472,22 +472,15 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// Panics if the block's header doesn't match the state's `latest_block_header`
-    /// (comparing all fields except `state_root`, which is computed internally).
+    /// Panics if [`anchor_pair_is_consistent`] would reject the pair.
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
-        anchor_state: State,
+        mut anchor_state: State,
         anchor_block: Block,
     ) -> Self {
-        // Compare headers with state_root zeroed (init_store handles state_root separately)
-        let mut state_header = anchor_state.latest_block_header.clone();
-        let mut block_header = anchor_block.header();
-        state_header.state_root = H256::ZERO;
-        block_header.state_root = H256::ZERO;
-
-        assert_eq!(
-            state_header, block_header,
-            "block header doesn't match state's latest_block_header"
+        assert!(
+            anchor_pair_is_consistent(&mut anchor_state, &anchor_block),
+            "anchor block does not match anchor state"
         );
 
         Self::init_store(backend, anchor_state, Some(anchor_block.body))

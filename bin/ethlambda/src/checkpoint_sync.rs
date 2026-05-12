@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use ethlambda_types::block::SignedBlock;
-use ethlambda_types::primitives::{H256, HashTreeRoot as _};
-use ethlambda_types::state::{State, Validator};
+use ethlambda_types::primitives::HashTreeRoot as _;
+use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
 
@@ -56,13 +56,8 @@ pub enum CheckpointSyncError {
     BlockHeaderFinalizedRootMismatch,
     #[error("block header at justified slot must match justified root")]
     BlockHeaderJustifiedRootMismatch,
-    #[error(
-        "anchor block does not match anchor state: block.state_root={block_state_root}, computed state root={computed_state_root}"
-    )]
-    AnchorPairingMismatch {
-        block_state_root: H256,
-        computed_state_root: H256,
-    },
+    #[error("anchor block does not match anchor state")]
+    AnchorPairingMismatch,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
@@ -155,7 +150,7 @@ pub async fn fetch_finalized_anchor(
     let client = build_client()?;
 
     // Issue both fetches concurrently; either failure cancels the pair.
-    let (state, signed_block) = tokio::try_join!(
+    let (mut state, signed_block) = tokio::try_join!(
         fetch_finalized_state(
             &client,
             base_url,
@@ -165,34 +160,14 @@ pub async fn fetch_finalized_anchor(
         fetch_finalized_block(&client, base_url),
     )?;
 
-    verify_anchor_pairing(&state, &signed_block)?;
-
-    Ok((state, signed_block))
-}
-
-/// Verify that the signed block's `state_root` matches the canonical hash
-/// of the state served by `/lean/v0/states/finalized`.
-///
-/// The state served by that endpoint has `latest_block_header.state_root`
-/// zeroed so that the resulting `hash_tree_root` is stable across the
-/// chicken-and-egg between header and state root. We must match the same
-/// canonical form when hashing locally.
-fn verify_anchor_pairing(
-    state: &State,
-    signed_block: &SignedBlock,
-) -> Result<(), CheckpointSyncError> {
-    let mut canonical = state.clone();
-    canonical.latest_block_header.state_root = H256::ZERO;
-    let computed_state_root = canonical.hash_tree_root();
-
-    if signed_block.message.state_root != computed_state_root {
-        return Err(CheckpointSyncError::AnchorPairingMismatch {
-            block_state_root: signed_block.message.state_root,
-            computed_state_root,
-        });
+    // Strictly mirrors the invariants `Store::get_forkchoice_store` asserts —
+    // header equality, state self-consistency, and `block.state_root` equal
+    // to the canonical tree-hash root of the state.
+    if !anchor_pair_is_consistent(&mut state, &signed_block.message) {
+        return Err(CheckpointSyncError::AnchorPairingMismatch);
     }
 
-    Ok(())
+    Ok((state, signed_block))
 }
 
 /// Verify checkpoint state is structurally valid.
@@ -541,85 +516,5 @@ mod tests {
     #[test]
     fn normalize_strips_trailing_slash() {
         assert_eq!(normalize_base_url("http://peer:5052/"), "http://peer:5052");
-    }
-
-    // --- verify_anchor_pairing ---
-
-    /// Build a SignedBlock whose header matches `state.latest_block_header`
-    /// (with the canonical zero state_root) and whose state_root is
-    /// `state_root_field`.
-    fn build_signed_block_for(state: &State, state_root_field: H256) -> SignedBlock {
-        use ethlambda_types::attestation::XmssSignature;
-        use ethlambda_types::block::{Block, BlockBody, BlockSignatures, SignedBlock};
-        use ethlambda_types::signature::SIGNATURE_SIZE;
-
-        let header = &state.latest_block_header;
-        let block = Block {
-            slot: header.slot,
-            proposer_index: header.proposer_index,
-            parent_root: header.parent_root,
-            state_root: state_root_field,
-            body: BlockBody::default(),
-        };
-        SignedBlock {
-            message: block,
-            signature: BlockSignatures {
-                attestation_signatures: Default::default(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            },
-        }
-    }
-
-    /// Compute the canonical state root the way `/lean/v0/states/finalized`
-    /// serves it: with `latest_block_header.state_root` zeroed.
-    fn canonical_state_root(state: &State) -> H256 {
-        let mut clone = state.clone();
-        clone.latest_block_header.state_root = H256::ZERO;
-        clone.hash_tree_root()
-    }
-
-    #[test]
-    fn pairing_accepts_matching_state_root() {
-        let validators = vec![create_test_validator()];
-        let mut state = create_test_state(100, validators, 1000);
-        // Match the body_root in the header to BlockBody::default(), so the
-        // signed block we build below shares the same header shape.
-        use ethlambda_types::block::BlockBody;
-        state.latest_block_header.body_root = BlockBody::default().hash_tree_root();
-        let expected = canonical_state_root(&state);
-        let signed_block = build_signed_block_for(&state, expected);
-
-        assert!(verify_anchor_pairing(&state, &signed_block).is_ok());
-    }
-
-    #[test]
-    fn pairing_rejects_mismatched_state_root() {
-        let validators = vec![create_test_validator()];
-        let state = create_test_state(100, validators, 1000);
-        // Use a bogus state_root in the block.
-        let signed_block = build_signed_block_for(&state, H256::from([0xaau8; 32]));
-
-        let err = verify_anchor_pairing(&state, &signed_block).unwrap_err();
-        assert!(matches!(
-            err,
-            CheckpointSyncError::AnchorPairingMismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn pairing_independent_of_state_root_field_in_header() {
-        // The pairing check zeroes latest_block_header.state_root before
-        // hashing, so the same block must pair regardless of whatever value
-        // was already stored there.
-        let validators = vec![create_test_validator()];
-        let mut state = create_test_state(100, validators, 1000);
-        use ethlambda_types::block::BlockBody;
-        state.latest_block_header.body_root = BlockBody::default().hash_tree_root();
-        let canonical = canonical_state_root(&state);
-        let signed_block = build_signed_block_for(&state, canonical);
-
-        // Inject a non-zero state_root into the header: must still verify.
-        state.latest_block_header.state_root = H256::from([0xffu8; 32]);
-        assert!(verify_anchor_pairing(&state, &signed_block).is_ok());
     }
 }
