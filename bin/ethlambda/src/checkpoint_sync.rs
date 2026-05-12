@@ -106,7 +106,9 @@ fn normalize_base_url(url: &str) -> &str {
     // inputs like `…/lean/v0/states/finalized/`; otherwise we'd leave the
     // state path embedded in the "base URL" and double-prefix every request.
     let trimmed = url.trim_end_matches('/');
-    trimmed.strip_suffix(FINALIZED_STATE_PATH).unwrap_or(trimmed)
+    trimmed
+        .strip_suffix(FINALIZED_STATE_PATH)
+        .unwrap_or(trimmed)
 }
 
 /// Fetch the finalized state from a checkpoint peer and verify it
