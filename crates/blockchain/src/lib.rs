@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
@@ -73,6 +73,7 @@ impl BlockChain {
             aggregator,
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
+            last_tick_instant: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -123,10 +124,19 @@ pub struct BlockChainServer {
     /// worker started at the most recent interval 2 is still running or until
     /// the next interval 2 takes over.
     current_aggregation: Option<AggregationSession>,
+
+    /// Last tick instant for measuring interval duration.
+    last_tick_instant: Option<Instant>,
 }
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
+        // Observe tick interval duration before any processing
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
+
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds

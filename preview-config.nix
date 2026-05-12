@@ -90,7 +90,11 @@ let
         WorkingDirectory = "${dataDir}/${name}";
         ExecStart = builtins.concatStringsSep " " ([
           binaryPath
-          "--custom-network-config-dir" genesisDir
+          "--genesis" "${genesisDir}/config.yaml"
+          "--validators" "${genesisDir}/annotated_validators.yaml"
+          "--bootnodes" "${genesisDir}/nodes.yaml"
+          "--validator-config" "${genesisDir}/validator-config.yaml"
+          "--hash-sig-keys-dir" "${genesisDir}/hash-sig-keys"
           "--gossipsub-port" (toString gossipPort)
           "--node-id" name
           "--node-key" "${genesisDir}/${name}.key"

@@ -1,5 +1,7 @@
 //! Prometheus metrics for the blockchain module.
 
+use std::time::Duration;
+
 use ethlambda_metrics::*;
 
 // --- Gauges ---
@@ -305,6 +307,18 @@ static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_tick_interval_duration_seconds",
+            "Elapsed time between clock ticks in seconds",
+            vec![
+                0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6
+            ]
+        )
+        .unwrap()
+    });
+
 // --- Block Production ---
 
 static LEAN_BLOCK_AGGREGATED_PAYLOADS: std::sync::LazyLock<Histogram> =
@@ -417,6 +431,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
+    std::sync::LazyLock::force(&LEAN_TICK_INTERVAL_DURATION_SECONDS);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS);
@@ -597,6 +612,11 @@ pub fn set_attestation_committee_count(count: u64) {
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
+}
+
+/// Observe the duration between consecutive tick intervals in seconds.
+pub fn observe_tick_interval_duration(duration: Duration) {
+    LEAN_TICK_INTERVAL_DURATION_SECONDS.observe(duration.as_secs_f64());
 }
 
 /// Observe the number of aggregated payloads in a built block.
