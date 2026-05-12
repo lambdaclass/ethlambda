@@ -1620,7 +1620,8 @@ mod tests {
             },
         };
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block)
+            .expect("anchor state and block must match");
 
         let head_root = store.head();
         let att_data = AttestationData {

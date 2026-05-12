@@ -20,7 +20,22 @@ use ethlambda_types::{
     state::{ChainConfig, State},
 };
 use libssz::{SszDecode, SszEncode};
+use thiserror::Error;
 use tracing::info;
+
+/// Errors returned by [`Store::get_forkchoice_store`].
+#[derive(Debug, Error)]
+pub enum GetForkchoiceStoreError {
+    #[error(
+        "anchor block header doesn't match state's latest_block_header \
+         (compared with state_root zeroed): state header = {state_header:?}, \
+         block header = {block_header:?}"
+    )]
+    HeaderMismatch {
+        state_header: Box<BlockHeader>,
+        block_header: Box<BlockHeader>,
+    },
+}
 
 /// Checkpoints to update in the forkchoice store.
 ///
@@ -470,27 +485,34 @@ impl Store {
     /// The block must match the state's `latest_block_header`.
     /// Named to mirror the spec's `get_forkchoice_store` function.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the block's header doesn't match the state's `latest_block_header`
-    /// (comparing all fields except `state_root`, which is computed internally).
+    /// Returns [`GetForkchoiceStoreError::HeaderMismatch`] if the block's header
+    /// doesn't match the state's `latest_block_header` (comparing all fields
+    /// except `state_root`, which is computed internally).
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
         anchor_state: State,
         anchor_block: Block,
-    ) -> Self {
+    ) -> Result<Self, GetForkchoiceStoreError> {
         // Compare headers with state_root zeroed (init_store handles state_root separately)
         let mut state_header = anchor_state.latest_block_header.clone();
         let mut block_header = anchor_block.header();
         state_header.state_root = H256::ZERO;
         block_header.state_root = H256::ZERO;
 
-        assert_eq!(
-            state_header, block_header,
-            "block header doesn't match state's latest_block_header"
-        );
+        if state_header != block_header {
+            return Err(GetForkchoiceStoreError::HeaderMismatch {
+                state_header: Box::new(state_header),
+                block_header: Box::new(block_header),
+            });
+        }
 
-        Self::init_store(backend, anchor_state, Some(anchor_block.body))
+        Ok(Self::init_store(
+            backend,
+            anchor_state,
+            Some(anchor_block.body),
+        ))
     }
 
     /// Internal helper to initialize the store with anchor data.

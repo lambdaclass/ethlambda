@@ -2200,6 +2200,7 @@ dependencies = [
  "rand 0.10.0",
  "rocksdb",
  "tempfile",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
