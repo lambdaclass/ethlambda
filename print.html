@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6b17334d.js";
+            window.path_to_searchindex_js = "searchindex-6c7e556e.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-031b865e.js"></script>
@@ -1558,11 +1558,15 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
 <p>Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.</p>
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
-<p>Checkpoint sync still requires a full network config directory (<code>--custom-network-config-dir</code>). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.</p>
+<p>Checkpoint sync still requires the network config files (genesis, validators, bootnodes, etc.). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.</p>
 <p>Pass the <code>--checkpoint-sync-url</code> flag when starting ethlambda:</p>
 <pre><code class="language-bash">ethlambda \
   --checkpoint-sync-url &lt;URL&gt; \
-  --custom-network-config-dir ./network-config \
+  --genesis ./network-config/config.yaml \
+  --validators ./network-config/annotated_validators.yaml \
+  --bootnodes ./network-config/nodes.yaml \
+  --validator-config ./network-config/validator-config.yaml \
+  --hash-sig-keys-dir ./network-config/hash-sig-keys \
   --node-key ./node.key \
   --node-id ethlambda_0
 </code></pre>
@@ -1665,7 +1669,11 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 </ul>
 <h3 id="standalone-node"><a class="header" href="#standalone-node">Standalone node</a></h3>
 <pre><code class="language-bash">cargo run --release -- \
-  --custom-network-config-dir ./config \
+  --genesis ./config/config.yaml \
+  --validators ./config/annotated_validators.yaml \
+  --bootnodes ./config/nodes.yaml \
+  --validator-config ./config/validator-config.yaml \
+  --hash-sig-keys-dir ./config/hash-sig-keys \
   --node-key ./keys/node.key \
   --node-id 0 \
   --api-port 5052
