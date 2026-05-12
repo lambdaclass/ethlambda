@@ -100,6 +100,7 @@ async fn fetch_ssz<T: SszDecode>(client: &Client, url: &str) -> Result<T, Checkp
 /// The new contract is a base URL (`http://peer:5052`) so we can derive both
 /// the state and block endpoints. To avoid breaking existing devnet scripts,
 /// strip a trailing legacy path if present and also trim any trailing slash.
+// TODO: remove this and use the full URL
 fn normalize_base_url(url: &str) -> &str {
     url.strip_suffix(FINALIZED_STATE_PATH)
         .unwrap_or(url)
@@ -108,7 +109,7 @@ fn normalize_base_url(url: &str) -> &str {
 
 /// Fetch the finalized state from a checkpoint peer and verify it
 /// against the local genesis configuration.
-pub async fn fetch_finalized_state(
+async fn fetch_finalized_state(
     client: &Client,
     base_url: &str,
     expected_genesis_time: u64,
@@ -121,10 +122,7 @@ pub async fn fetch_finalized_state(
 }
 
 /// Fetch the finalized signed block from a checkpoint peer.
-///
-/// Unlike the state, the block is not validated standalone here — pairing
-/// against the finalized state is enforced by [`fetch_finalized_anchor`].
-pub async fn fetch_finalized_block(
+async fn fetch_finalized_block(
     client: &Client,
     base_url: &str,
 ) -> Result<SignedBlock, CheckpointSyncError> {
@@ -133,11 +131,6 @@ pub async fn fetch_finalized_block(
 }
 
 /// Fetch the finalized state and signed block in parallel and verify they pair.
-///
-/// Pairing is the spec assertion that `signed_block.message.state_root` equals
-/// `hash_tree_root(state)` after the state has been canonicalized (i.e. with
-/// `latest_block_header.state_root` zeroed, mirroring what the peer serves on
-/// `/lean/v0/states/finalized`).
 ///
 /// If the peer advances finalization between the two requests the pairing will
 /// not hold; the caller is expected to retry.
