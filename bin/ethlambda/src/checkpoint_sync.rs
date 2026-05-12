@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use ethlambda_types::primitives::HashTreeRoot as _;
+use ethlambda_types::block::SignedBlock;
+use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::state::{State, Validator};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
@@ -12,6 +13,12 @@ const CHECKPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for reading data during body download.
 /// This is an inactivity timeout - it resets on each successful read.
 const CHECKPOINT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Path of the finalized-state endpoint (relative to the peer's API base URL).
+const FINALIZED_STATE_PATH: &str = "/lean/v0/states/finalized";
+
+/// Path of the finalized-block endpoint (relative to the peer's API base URL).
+const FINALIZED_BLOCK_PATH: &str = "/lean/v0/blocks/finalized";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
@@ -49,9 +56,16 @@ pub enum CheckpointSyncError {
     BlockHeaderFinalizedRootMismatch,
     #[error("block header at justified slot must match justified root")]
     BlockHeaderJustifiedRootMismatch,
+    #[error(
+        "anchor block does not match anchor state: block.state_root={block_state_root}, computed state root={computed_state_root}"
+    )]
+    AnchorPairingMismatch {
+        block_state_root: H256,
+        computed_state_root: H256,
+    },
 }
 
-/// Fetch finalized state from checkpoint sync URL.
+/// Build the HTTP client used for checkpoint sync fetches.
 ///
 /// Uses two-phase timeout strategy:
 /// - Connect timeout (15s): Fails quickly if peer is unreachable
@@ -63,31 +77,122 @@ pub enum CheckpointSyncError {
 /// failing fast if the connection stalls. A plain total timeout would
 /// disconnect even for valid downloads if the state is simply too large to
 /// transfer within the time limit.
-pub async fn fetch_checkpoint_state(
-    url: &str,
-    expected_genesis_time: u64,
-    expected_validators: &[Validator],
-) -> Result<State, CheckpointSyncError> {
-    // Use .read_timeout() to detect stalled downloads (inactivity timer).
-    // This allows large states to complete as long as data keeps flowing.
-    let client = Client::builder()
+fn build_client() -> Result<Client, CheckpointSyncError> {
+    Ok(Client::builder()
         .connect_timeout(CHECKPOINT_CONNECT_TIMEOUT)
         .read_timeout(CHECKPOINT_READ_TIMEOUT)
-        .build()?;
+        .build()?)
+}
 
-    let response = client
+/// Fetch and SSZ-decode an `application/octet-stream` body from `url`.
+async fn fetch_ssz<T: SszDecode>(client: &Client, url: &str) -> Result<T, CheckpointSyncError> {
+    let bytes = client
         .get(url)
         .header("Accept", "application/octet-stream")
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_status()?
+        .bytes()
+        .await?;
 
-    let bytes = response.bytes().await?;
-    let state = State::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)?;
+    T::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)
+}
 
+/// Normalize a checkpoint-sync URL to a base URL.
+///
+/// Operators historically pass the full state URL (e.g.
+/// `http://peer:5052/lean/v0/states/finalized`) via `--checkpoint-sync-url`.
+/// The new contract is a base URL (`http://peer:5052`) so we can derive both
+/// the state and block endpoints. To avoid breaking existing devnet scripts,
+/// strip a trailing legacy path if present and also trim any trailing slash.
+fn normalize_base_url(url: &str) -> &str {
+    url.strip_suffix(FINALIZED_STATE_PATH)
+        .unwrap_or(url)
+        .trim_end_matches('/')
+}
+
+/// Fetch the finalized state from a checkpoint peer and verify it
+/// against the local genesis configuration.
+pub async fn fetch_finalized_state(
+    client: &Client,
+    base_url: &str,
+    expected_genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<State, CheckpointSyncError> {
+    let url = format!("{base_url}{FINALIZED_STATE_PATH}");
+    let state: State = fetch_ssz(client, &url).await?;
     verify_checkpoint_state(&state, expected_genesis_time, expected_validators)?;
-
     Ok(state)
+}
+
+/// Fetch the finalized signed block from a checkpoint peer.
+///
+/// Unlike the state, the block is not validated standalone here — pairing
+/// against the finalized state is enforced by [`fetch_finalized_anchor`].
+pub async fn fetch_finalized_block(
+    client: &Client,
+    base_url: &str,
+) -> Result<SignedBlock, CheckpointSyncError> {
+    let url = format!("{base_url}{FINALIZED_BLOCK_PATH}");
+    fetch_ssz(client, &url).await
+}
+
+/// Fetch the finalized state and signed block in parallel and verify they pair.
+///
+/// Pairing is the spec assertion that `signed_block.message.state_root` equals
+/// `hash_tree_root(state)` after the state has been canonicalized (i.e. with
+/// `latest_block_header.state_root` zeroed, mirroring what the peer serves on
+/// `/lean/v0/states/finalized`).
+///
+/// If the peer advances finalization between the two requests the pairing will
+/// not hold; the caller is expected to retry.
+pub async fn fetch_finalized_anchor(
+    url: &str,
+    expected_genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let base_url = normalize_base_url(url);
+    let client = build_client()?;
+
+    // Issue both fetches concurrently; either failure cancels the pair.
+    let (state, signed_block) = tokio::try_join!(
+        fetch_finalized_state(
+            &client,
+            base_url,
+            expected_genesis_time,
+            expected_validators
+        ),
+        fetch_finalized_block(&client, base_url),
+    )?;
+
+    verify_anchor_pairing(&state, &signed_block)?;
+
+    Ok((state, signed_block))
+}
+
+/// Verify that the signed block's `state_root` matches the canonical hash
+/// of the state served by `/lean/v0/states/finalized`.
+///
+/// The state served by that endpoint has `latest_block_header.state_root`
+/// zeroed so that the resulting `hash_tree_root` is stable across the
+/// chicken-and-egg between header and state root. We must match the same
+/// canonical form when hashing locally.
+fn verify_anchor_pairing(
+    state: &State,
+    signed_block: &SignedBlock,
+) -> Result<(), CheckpointSyncError> {
+    let mut canonical = state.clone();
+    canonical.latest_block_header.state_root = H256::ZERO;
+    let computed_state_root = canonical.hash_tree_root();
+
+    if signed_block.message.state_root != computed_state_root {
+        return Err(CheckpointSyncError::AnchorPairingMismatch {
+            block_state_root: signed_block.message.state_root,
+            computed_state_root,
+        });
+    }
+
+    Ok(())
 }
 
 /// Verify checkpoint state is structurally valid.
@@ -416,5 +521,105 @@ mod tests {
         state.latest_justified.slot = 90;
         state.latest_justified.root = H256::from([99u8; 32]); // Wrong root
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+    }
+
+    // --- normalize_base_url ---
+
+    #[test]
+    fn normalize_strips_legacy_state_path() {
+        assert_eq!(
+            normalize_base_url("http://peer:5052/lean/v0/states/finalized"),
+            "http://peer:5052"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_base_url() {
+        assert_eq!(normalize_base_url("http://peer:5052"), "http://peer:5052");
+    }
+
+    #[test]
+    fn normalize_strips_trailing_slash() {
+        assert_eq!(normalize_base_url("http://peer:5052/"), "http://peer:5052");
+    }
+
+    // --- verify_anchor_pairing ---
+
+    /// Build a SignedBlock whose header matches `state.latest_block_header`
+    /// (with the canonical zero state_root) and whose state_root is
+    /// `state_root_field`.
+    fn build_signed_block_for(state: &State, state_root_field: H256) -> SignedBlock {
+        use ethlambda_types::attestation::XmssSignature;
+        use ethlambda_types::block::{Block, BlockBody, BlockSignatures, SignedBlock};
+        use ethlambda_types::signature::SIGNATURE_SIZE;
+
+        let header = &state.latest_block_header;
+        let block = Block {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root,
+            state_root: state_root_field,
+            body: BlockBody::default(),
+        };
+        SignedBlock {
+            message: block,
+            signature: BlockSignatures {
+                attestation_signatures: Default::default(),
+                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+            },
+        }
+    }
+
+    /// Compute the canonical state root the way `/lean/v0/states/finalized`
+    /// serves it: with `latest_block_header.state_root` zeroed.
+    fn canonical_state_root(state: &State) -> H256 {
+        let mut clone = state.clone();
+        clone.latest_block_header.state_root = H256::ZERO;
+        clone.hash_tree_root()
+    }
+
+    #[test]
+    fn pairing_accepts_matching_state_root() {
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators, 1000);
+        // Match the body_root in the header to BlockBody::default(), so the
+        // signed block we build below shares the same header shape.
+        use ethlambda_types::block::BlockBody;
+        state.latest_block_header.body_root = BlockBody::default().hash_tree_root();
+        let expected = canonical_state_root(&state);
+        let signed_block = build_signed_block_for(&state, expected);
+
+        assert!(verify_anchor_pairing(&state, &signed_block).is_ok());
+    }
+
+    #[test]
+    fn pairing_rejects_mismatched_state_root() {
+        let validators = vec![create_test_validator()];
+        let state = create_test_state(100, validators, 1000);
+        // Use a bogus state_root in the block.
+        let signed_block = build_signed_block_for(&state, H256::from([0xaau8; 32]));
+
+        let err = verify_anchor_pairing(&state, &signed_block).unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointSyncError::AnchorPairingMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn pairing_independent_of_state_root_field_in_header() {
+        // The pairing check zeroes latest_block_header.state_root before
+        // hashing, so the same block must pair regardless of whatever value
+        // was already stored there.
+        let validators = vec![create_test_validator()];
+        let mut state = create_test_state(100, validators, 1000);
+        use ethlambda_types::block::BlockBody;
+        state.latest_block_header.body_root = BlockBody::default().hash_tree_root();
+        let canonical = canonical_state_root(&state);
+        let signed_block = build_signed_block_for(&state, canonical);
+
+        // Inject a non-zero state_root into the header: must still verify.
+        state.latest_block_header.state_root = H256::from([0xffu8; 32]);
+        assert!(verify_anchor_pairing(&state, &signed_block).is_ok());
     }
 }

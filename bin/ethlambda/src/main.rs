@@ -22,7 +22,7 @@ use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
-use ethlambda_types::primitives::H256;
+use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,
@@ -76,8 +76,12 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
-    /// URL to download checkpoint state from (e.g., http://peer:5052/lean/v0/states/finalized)
-    /// When set, skips genesis initialization and syncs from checkpoint.
+    /// Base URL of a checkpoint-sync peer's API server (e.g., http://peer:5052).
+    /// When set, skips genesis initialization and fetches the finalized state
+    /// and block from the peer's `/lean/v0/states/finalized` and
+    /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
+    /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
+    /// path is stripped.
     #[arg(long)]
     checkpoint_sync_url: Option<String>,
     /// Whether this node acts as a committee aggregator.
@@ -558,14 +562,19 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
 /// Fetch the initial state for the node.
 ///
 /// If `checkpoint_url` is provided, performs checkpoint sync by downloading
-/// and verifying the finalized state from a remote peer. Otherwise, creates
-/// a genesis state from the local genesis configuration.
+/// and verifying the finalized state AND signed block in parallel from a
+/// remote peer. Otherwise, creates a genesis state from the local genesis
+/// configuration.
+///
+/// Fetching the matching signed block lets the local store serve a valid
+/// anchor via the `BlocksByRoot` req-resp protocol; without it, peers
+/// requesting the anchor would receive a synthetic block whose hash differs
+/// from `latest_finalized.root` and would score-penalize us.
 ///
 /// # Arguments
 ///
-/// * `checkpoint_url` - Optional URL to fetch checkpoint state from
+/// * `checkpoint_url` - Optional base URL to a peer's API server
 /// * `genesis` - Genesis configuration (for genesis_time verification and genesis state creation)
-/// * `validators` - Validator set (moved for genesis state creation)
 /// * `backend` - Storage backend for Store creation
 ///
 /// # Returns
@@ -588,19 +597,26 @@ async fn fetch_initial_state(
     // Checkpoint sync path
     info!(%checkpoint_url, "Starting checkpoint sync");
 
-    let state =
-        checkpoint_sync::fetch_checkpoint_state(checkpoint_url, genesis.genesis_time, &validators)
+    let (state, signed_block) =
+        checkpoint_sync::fetch_finalized_anchor(checkpoint_url, genesis.genesis_time, &validators)
             .await?;
 
     info!(
         slot = state.slot,
         validators = state.validators.len(),
         finalized_slot = state.latest_finalized.slot,
+        anchor_block_slot = signed_block.message.slot,
         "Checkpoint sync complete"
     );
 
-    // Store the anchor state and header, without body
-    Ok(Store::from_anchor_state(backend, state))
+    // Initialize the store from state + anchor block body, then persist the
+    // signatures so we can serve the anchor on BlocksByRoot. `insert_signed_block`
+    // overlaps with what `get_forkchoice_store` already wrote, but it's
+    // idempotent and the only path that also stores `BlockSignatures`.
+    let anchor_root = signed_block.message.header().hash_tree_root();
+    let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone());
+    store.insert_signed_block(anchor_root, signed_block);
+    Ok(store)
 }
 
 #[cfg(test)]
