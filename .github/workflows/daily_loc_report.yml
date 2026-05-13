@@ -1,0 +1,104 @@
+name: Daily Lines of Code Report
+
+on:
+  schedule:
+    # Every day at UTC midnight (Slack daily, Telegram on Monday only)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to post (test channel/chat or prod)"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - prod
+      post_telegram:
+        description: "Also post to Telegram on this manual run"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  loc:
+    name: Count ethlambda LoC and publish report
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install tokei
+        run: cargo install tokei --locked --version 12.1.2
+
+      - name: Restore previous LoC report
+        id: cache-loc-report
+        uses: actions/cache/restore@v5
+        with:
+          path: loc_report.json
+          key: loc-report-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            loc-report-${{ github.ref_name }}-
+
+      - name: Stash previous report as .old for delta computation
+        if: steps.cache-loc-report.outputs.cache-hit != ''
+        run: mv loc_report.json loc_report.json.old
+
+      - name: Generate LoC report
+        run: bash .github/scripts/generate_loc_report.sh
+
+      - name: Save new LoC report to cache
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: loc_report.json
+          key: loc-report-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Post results to workflow summary
+        run: cat loc_report_github.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: >-
+            ${{ (github.event_name == 'schedule' || inputs.target == 'prod')
+                && secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK
+                || secrets.ETHLAMBDA_TEST_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_slack.sh "$SLACK_WEBHOOK" loc_report_slack.json
+
+      - name: Post to Telegram (weekly, or manual opt-in)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ETHLAMBDA_CHAT_ID: >-
+            ${{ (github.event_name == 'schedule' || inputs.target == 'prod')
+                && secrets.TELEGRAM_ETHLAMBDA_CHAT_ID
+                || secrets.TELEGRAM_ETHLAMBDA_TEST_CHAT_ID }}
+        run: |
+          # Scheduled runs only post to Telegram on Monday (UTC).
+          # Manual runs require post_telegram=true to opt in.
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            day_of_week=$(date -u +%u)  # 1=Monday .. 7=Sunday
+            if [[ "$day_of_week" != "1" ]]; then
+              echo "Skipping Telegram post (scheduled run, only sent on Monday)"
+              exit 0
+            fi
+          elif [[ "${{ inputs.post_telegram }}" != "true" ]]; then
+            echo "Skipping Telegram post (manual run, post_telegram not enabled)"
+            exit 0
+          fi
+          bash .github/scripts/publish_telegram.sh loc_report_telegram.txt
