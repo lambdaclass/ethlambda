@@ -1578,6 +1578,134 @@ mod tests {
         );
     }
 
+    /// Regression test for leanSpec PR #716: build_block must absorb
+    /// gap-closing attestations whose source is justified on the head
+    /// chain but older than `latest_justified` (e.g., a sibling fork
+    /// advanced the store's justified past what the canonical head has
+    /// proven). Without the relaxed `is_slot_justified(source.slot)`
+    /// filter, the exact-equality check would drop the attestation and
+    /// justification would never converge on this chain.
+    #[test]
+    fn build_block_absorbs_older_but_justified_source() {
+        use ethlambda_state_transition::justified_slots_ops;
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const SUPERMAJORITY: usize = 34; // ceil(2 * 50 / 3)
+        const HEAD_SLOT: u64 = 5;
+        const JUSTIFIED_SLOT: u64 = 1;
+        const GAP_TARGET_SLOT: u64 = 2;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 0, JUSTIFIED_SLOT);
+        justified_slots_ops::set_justified(&mut justified_slots, 0, JUSTIFIED_SLOT);
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint {
+                root: hashes[JUSTIFIED_SLOT as usize],
+                slot: JUSTIFIED_SLOT,
+            },
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // source = genesis (slot 0): older than head.latest_justified at
+        // slot 1. Pre-PR exact-equality filter would drop this; post-PR
+        // it's absorbed and the candidate justifies GAP_TARGET_SLOT.
+        let att_data = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[GAP_TARGET_SLOT as usize],
+                slot: GAP_TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let data_root = att_data.hash_tree_root();
+
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        for i in 0..SUPERMAJORITY {
+            bits.set(i, true).unwrap();
+        }
+        let proof = AggregatedSignatureProof::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(data_root, (att_data.clone(), vec![proof]));
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let (block, _signatures, post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        let targets: Vec<_> = block
+            .body
+            .attestations
+            .iter()
+            .map(|att| att.data.target)
+            .collect();
+        assert!(
+            targets.contains(&att_data.target),
+            "produced block missing gap-closing attestation: {targets:?}"
+        );
+
+        assert_eq!(post_checkpoints.justified.slot, GAP_TARGET_SLOT);
+        assert_eq!(
+            post_checkpoints.justified.root,
+            hashes[GAP_TARGET_SLOT as usize]
+        );
+    }
+
     fn make_att_data(slot: u64) -> AttestationData {
         AttestationData {
             slot,
