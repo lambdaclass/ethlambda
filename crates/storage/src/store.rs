@@ -7,16 +7,30 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
+/// Build a placeholder `BlockSignatures` for blocks that were never signed.
+///
+/// Genesis-style anchor blocks have no proposer signature and no per-attestation
+/// proofs (no attestations exist). `get_signed_block` returns this so peers can
+/// still receive the block in BlocksByRoot responses.
+fn empty_block_signatures() -> BlockSignatures {
+    BlockSignatures {
+        attestation_signatures: AttestationSignatures::default(),
+        proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE])
+            .expect("zero-filled signature fits"),
+    }
+}
+
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData, bits_is_subset},
+    attestation::{AttestationData, HashedAttestationData, XmssSignature, bits_is_subset},
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
+        AggregatedSignatureProof, AttestationSignatures, Block, BlockBody, BlockHeader,
+        BlockSignatures, SignedBlock,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
+    signature::{SIGNATURE_SIZE, ValidatorSignature},
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
@@ -990,15 +1004,17 @@ impl Store {
 
     /// Get a signed block by combining header, body, and signatures.
     ///
-    /// Returns None if any of the components are not found.
-    /// Note: Genesis block has no entry in BlockSignatures table.
+    /// Returns None if the header or body (for non-empty bodies) is missing.
+    ///
+    /// Signatures are absent for genesis-style anchor blocks (no proposer ever
+    /// signed them). To keep BlocksByRoot symmetric with the fork-choice view
+    /// for peers, synthesize empty `BlockSignatures` when the header exists
+    /// but no signature row was written.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
-
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
@@ -1009,8 +1025,14 @@ impl Store {
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
+        let signature = match view.get(Table::BlockSignatures, &key).expect("get") {
+            Some(sig_bytes) => {
+                BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures")
+            }
+            None => empty_block_signatures(),
+        };
+
         let block = Block::from_header_and_body(header, body);
-        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
         Some(SignedBlock {
             message: block,
