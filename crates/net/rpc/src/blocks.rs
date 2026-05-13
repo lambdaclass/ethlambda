@@ -60,17 +60,26 @@ fn resolve_block_id(store: &Store, block_id: &str) -> Result<H256, BlockIdError>
 }
 
 fn parse_root(hex_body: &str) -> Result<H256, BlockIdError> {
-    let bytes = hex::decode(hex_body).map_err(|_| BlockIdError::Invalid)?;
-    if bytes.len() != 32 {
+    // Length-check before decoding so attacker-controlled paths can't force
+    // a proportional allocation just to be rejected.
+    if hex_body.len() != 64 {
         return Err(BlockIdError::Invalid);
     }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
+    let arr: [u8; 32] = hex::decode(hex_body)
+        .map_err(|_| BlockIdError::Invalid)?
+        .try_into()
+        .map_err(|_| BlockIdError::Invalid)?;
     Ok(H256(arr))
 }
 
 fn resolve_slot(store: &Store, slot: u64) -> Result<H256, BlockIdError> {
     let head_state = store.head_state();
+    // The head block isn't pushed into historical_block_hashes (that table only
+    // contains parent roots for slots up to head_slot - 1), so resolve it from
+    // the store's head pointer.
+    if slot == head_state.latest_block_header.slot {
+        return Ok(store.head());
+    }
     let root = head_state
         .historical_block_hashes
         .get(slot as usize)

@@ -445,6 +445,23 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn get_block_by_head_slot_returns_json() {
+            // The head block is not in historical_block_hashes; the resolver
+            // must special-case slot == head and return the store's head root.
+            let (store, _target_root) = store_with_historical_block();
+            let head_slot = store.head_state().latest_block_header.slot;
+            let app = build_api_router(store);
+
+            let response = send(app, &format!("/lean/v0/blocks/{head_slot}")).await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(json["slot"], head_slot);
+        }
+
+        #[tokio::test]
         async fn get_block_invalid_id_returns_400() {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
