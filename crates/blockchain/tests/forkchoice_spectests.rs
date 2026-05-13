@@ -4,40 +4,27 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, XmssSignature},
-    block::{AggregatedSignatureProof, Block, BlockSignatures, SignedBlock},
-    primitives::{H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
+    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
+    block::{AggregatedSignatureProof, Block},
+    primitives::{ByteList, H256, HashTreeRoot as _},
     state::State,
 };
 
-use crate::types::{ForkChoiceTestVector, StoreChecks};
+use ethlambda_test_fixtures::fork_choice::{AttestationCheck, ForkChoiceTestVector, StoreChecks};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
 
-mod common;
-mod types;
-
-// We don't check signatures in spec-tests, so invalid signature tests always pass.
-// The gossipAggregatedAttestation/attestation tests fail because the harness inserts
-// individual gossip attestations into known payloads (should be no-op) and aggregated
-// attestations with validator_id=0 into known (should use proof.participants into new).
-// TODO: fix these
-const SKIP_TESTS: &[&str] = &[
-    "test_gossip_attestation_with_invalid_signature",
-    "test_block_builder_fixed_point_advances_justification",
-    "test_equivocating_proposer_with_split_attestations",
-    "test_finalization_prunes_stale_aggregated_payloads",
-];
+/// List of skipped tests.
+const SKIP_TESTS: &[&str] = &[];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         && SKIP_TESTS.contains(&stem)
     {
-        println!("Skipping {stem} (gossip attestation not serialized in fixture)");
+        println!("Skipping {stem} (see SKIP_TESTS comment)");
         return Ok(());
     }
     let tests = ForkChoiceTestVector::from_file(path)?;
@@ -75,113 +62,72 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         block_registry.insert(label.clone(), root);
                     }
 
-                    let signed_block = build_signed_block(block_data);
+                    let signed_block = block_data.to_blank_signed_block();
 
                     let block_time_ms =
                         genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
 
                     // NOTE: the has_proposal argument is set to true, following the spec
-                    store::on_tick(&mut store, block_time_ms, true, false);
+                    store::on_tick(&mut store, block_time_ms, true);
                     let result = store::on_block_without_verification(&mut store, signed_block);
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 "tick" => {
-                    let timestamp_ms = step.time.expect("tick step missing time") * 1000;
-                    // NOTE: the has_proposal argument is set to false, following the spec
-                    store::on_tick(&mut store, timestamp_ms, false, false);
+                    // Fixtures use either `time` (UNIX seconds) or `interval`
+                    // (absolute interval count since genesis). Interval fixtures
+                    // encode `genesis_time_ms + interval * MILLISECONDS_PER_INTERVAL`.
+                    let timestamp_ms = match (step.time, step.interval) {
+                        (Some(time_s), _) => time_s * 1000,
+                        (None, Some(interval)) => {
+                            genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
+                        }
+                        (None, None) => panic!("tick step missing both time and interval"),
+                    };
+                    let has_proposal = step.has_proposal.unwrap_or(false);
+                    store::on_tick(&mut store, timestamp_ms, has_proposal);
                 }
                 "attestation" => {
                     let att_data = step
                         .attestation
                         .expect("attestation step missing attestation data");
-                    let domain_data: ethlambda_types::attestation::AttestationData =
-                        att_data.data.into();
-                    let validator_id = att_data
-                        .validator_id
-                        .expect("attestation step missing validator_id");
+                    let signed_attestation = SignedAttestation {
+                        validator_id: att_data
+                            .validator_id
+                            .expect("attestation step missing validator_id"),
+                        data: att_data.data.into(),
+                        signature: att_data
+                            .signature
+                            .expect("attestation step missing signature"),
+                    };
+                    let is_aggregator = step.is_aggregator.unwrap_or(false);
 
-                    let result = store::on_gossip_attestation_without_verification(
+                    let result = store::on_gossip_attestation(
                         &mut store,
-                        validator_id,
-                        domain_data,
+                        &signed_attestation,
+                        is_aggregator,
                     );
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 "gossipAggregatedAttestation" => {
-                    // Aggregated attestation fixtures carry only attestation data
-                    // (no aggregated proof or participant list), so we use the same
-                    // non-verification path. This inserts directly into known payloads,
-                    // bypassing the new→known promotion pipeline that the production
-                    // `on_gossip_aggregated_attestation` uses.
-                    // TODO: route through a proper aggregated path once fixtures
-                    // include proof data and the test runner simulates promotion.
                     let att_data = step
                         .attestation
                         .expect("gossipAggregatedAttestation step missing attestation data");
-                    let domain_data: ethlambda_types::attestation::AttestationData =
-                        att_data.data.into();
-                    let validator_id = att_data.validator_id.unwrap_or(0);
+                    let proof_fixture = att_data
+                        .proof
+                        .expect("gossipAggregatedAttestation step missing proof");
+                    let proof_bytes: Vec<u8> = proof_fixture.proof_data.into();
+                    let proof_data = ByteList::try_from(proof_bytes)
+                        .expect("aggregated proof data fits in ByteListMiB");
+                    let aggregated = SignedAggregatedAttestation {
+                        data: att_data.data.into(),
+                        proof: AggregatedSignatureProof::new(
+                            proof_fixture.participants.into(),
+                            proof_data,
+                        ),
+                    };
 
-                    let result = store::on_gossip_attestation_without_verification(
-                        &mut store,
-                        validator_id,
-                        domain_data,
-                    );
-
-                    match (result.is_ok(), step.valid) {
-                        (true, false) => {
-                            return Err(format!(
-                                "Step {} expected failure but got success",
-                                step_idx
-                            )
-                            .into());
-                        }
-                        (false, true) => {
-                            return Err(format!(
-                                "Step {} expected success but got failure: {:?}",
-                                step_idx,
-                                result.err()
-                            )
-                            .into());
-                        }
-                        _ => {}
-                    }
+                    let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
+                    assert_step_outcome(step_idx, step.valid, result)?;
                 }
                 other => {
                     return Err(format!("Unsupported step type '{other}'").into());
@@ -197,26 +143,17 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
-    let block: Block = block_data.to_block();
-
-    // Build one empty proof per attestation, matching the aggregation_bits from
-    // each attestation in the block body. on_block_core zips attestations with
-    // signatures, so they must be the same length for attestations to reach
-    // fork choice.
-    let proofs: Vec<_> = block
-        .body
-        .attestations
-        .iter()
-        .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-        .collect();
-
-    SignedBlock {
-        message: block,
-        signature: BlockSignatures {
-            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            attestation_signatures: proofs.try_into().expect("attestation proofs within limit"),
-        },
+fn assert_step_outcome<T, E: std::fmt::Debug>(
+    step_idx: usize,
+    expected_valid: bool,
+    result: Result<T, E>,
+) -> datatest_stable::Result<()> {
+    match (result, expected_valid) {
+        (Ok(_), false) => Err(format!("Step {step_idx} expected failure but got success").into()),
+        (Err(err), true) => {
+            Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -226,9 +163,17 @@ fn validate_checks(
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
-    // Error on unsupported check fields
-    if checks.time.is_some() {
-        return Err(format!("Step {}: 'time' check not supported", step_idx).into());
+    // Validate time check: fixtures encode the expected store time in intervals
+    // since genesis (matching `Store::time()`).
+    if let Some(expected_time) = checks.time {
+        let actual_time = st.time();
+        if actual_time != expected_time {
+            return Err(format!(
+                "Step {}: time mismatch: expected {}, got {}",
+                step_idx, expected_time, actual_time
+            )
+            .into());
+        }
     }
     // Resolve headRootLabel to headRoot if only the label is provided
     let resolved_head_root = checks.head_root.or_else(|| {
@@ -249,9 +194,12 @@ fn validate_checks(
             .as_ref()
             .and_then(|label| block_registry.get(label).copied())
     });
-    if checks.safe_target.is_some() {
-        return Err(format!("Step {}: 'safeTarget' check not supported", step_idx).into());
-    }
+    let resolved_safe_target_root = checks.safe_target.or_else(|| {
+        checks
+            .safe_target_root_label
+            .as_ref()
+            .and_then(|label| block_registry.get(label).copied())
+    });
     // Validate attestationTargetSlot
     if let Some(expected_slot) = checks.attestation_target_slot {
         let target = store::get_attestation_target(st);
@@ -358,6 +306,30 @@ fn validate_checks(
         }
     }
 
+    // Validate safeTargetSlot
+    if let Some(expected_slot) = checks.safe_target_slot {
+        let actual_slot = st.safe_target_slot();
+        if actual_slot != expected_slot {
+            return Err(format!(
+                "Step {}: safeTargetSlot mismatch: expected {}, got {}",
+                step_idx, expected_slot, actual_slot
+            )
+            .into());
+        }
+    }
+
+    // Validate safeTarget root (resolved from label if root not provided)
+    if let Some(ref expected_root) = resolved_safe_target_root {
+        let actual_root = st.safe_target();
+        if actual_root != *expected_root {
+            return Err(format!(
+                "Step {}: safeTarget mismatch: expected {:?}, got {:?}",
+                step_idx, expected_root, actual_root
+            )
+            .into());
+        }
+    }
+
     // Validate attestationChecks
     if let Some(ref att_checks) = checks.attestation_checks {
         for att_check in att_checks {
@@ -375,7 +347,7 @@ fn validate_checks(
 
 fn validate_attestation_check(
     st: &Store,
-    check: &types::AttestationCheck,
+    check: &AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
     let validator_id = check.validator;

@@ -312,7 +312,7 @@ When finalization advances, the following cleanup occurs:
 
 ## End-to-End: From Head Selection to Finalization
 
-This section connects [LMD-GHOST fork choice](ghost-fork-choice.md) with 3SF-mini.
+This section connects [LMD-GHOST fork choice](lmd_ghost.md) with 3SF-mini.
 The [quick example above](#quick-example-three-slots-to-finality) showed the happy
 path; here we focus on what happens when things go wrong.
 
@@ -340,7 +340,7 @@ The **safe target** is computed by running LMD-GHOST with a two-thirds vote thre
 Only blocks backed by a supermajority qualify, so the safe target is always at or
 behind the head. The attestation **target** is derived by walking back from the head
 toward the safe target (max 3 steps), then to the nearest justifiable slot. See
-[Safe Target Selection](ghost-fork-choice.md#safe-target-selection) for details.
+[Safe Target Selection](lmd_ghost.md#safe-target-selection) for details.
 
 > **In ethlambda:** `get_attestation_target()` in `crates/blockchain/src/store.rs`
 > implements this walk-back. `JUSTIFICATION_LOOKBACK_SLOTS = 3` provides a liveness

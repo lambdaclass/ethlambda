@@ -10,7 +10,7 @@ static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().h
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData},
+    attestation::{AttestationData, HashedAttestationData, bits_is_subset},
     block::{
         AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
     },
@@ -126,18 +126,38 @@ impl PayloadBuffer {
         }
     }
 
-    /// Insert proofs for an attestation, FIFO-evicting oldest data_roots when total proofs reach capacity.
+    /// Insert a proof for an attestation, FIFO-evicting oldest data_roots
+    /// when total proofs reach capacity. Also ensures the buffer doesn't
+    /// include proofs which are a subset of other proofs for the same
+    /// attestation data:
+    ///
+    /// - If the incoming proof's participants are a subset (incl. equal) of
+    ///   any existing proof, the incoming proof is redundant and skipped.
+    /// - Otherwise, any existing proof whose participants are a strict subset
+    ///   of the incoming proof's is removed before inserting.
     fn push(&mut self, hashed: HashedAttestationData, proof: AggregatedSignatureProof) {
         let (data_root, att_data) = hashed.into_parts();
+
         if let Some(entry) = self.data.get_mut(&data_root) {
-            // Skip duplicate proofs (same participants)
-            if entry
-                .proofs
-                .iter()
-                .any(|p| p.participants == proof.participants)
-            {
-                return;
+            let mut to_remove: Vec<usize> = Vec::new();
+            for (i, p) in entry.proofs.iter().enumerate() {
+                // Incoming is subsumed by an existing proof (incl. equal). Skip.
+                if bits_is_subset(&proof.participants, &p.participants) {
+                    return;
+                }
+                // Existing is a strict subset of incoming. Mark for removal.
+                // (Non-strict equality was ruled out by the check above.)
+                if bits_is_subset(&p.participants, &proof.participants) {
+                    to_remove.push(i);
+                }
             }
+
+            // Remove subsumed proofs (reverse order so earlier indices stay valid).
+            for i in to_remove.into_iter().rev() {
+                entry.proofs.swap_remove(i);
+                self.total_proofs -= 1;
+            }
+
             entry.proofs.push(proof);
             self.total_proofs += 1;
         } else {
@@ -171,18 +191,22 @@ impl PayloadBuffer {
     }
 
     /// Take all entries, leaving the buffer empty.
+    ///
+    /// Drains in insertion order (via `self.order`) so downstream consumers
+    /// like `promote_new_aggregated_payloads` re-insert into known_payloads
+    /// deterministically. HashMap iteration would be RandomState-seeded and
+    /// produce non-deterministic vote ordering for same-slot equivocation.
     fn drain(&mut self) -> Vec<(HashedAttestationData, AggregatedSignatureProof)> {
-        self.order.clear();
         self.total_proofs = 0;
-        self.data
-            .drain()
-            .flat_map(|(_, entry)| {
-                entry
-                    .proofs
-                    .into_iter()
-                    .map(move |proof| (HashedAttestationData::new(entry.data.clone()), proof))
-            })
-            .collect()
+        let mut result = Vec::with_capacity(self.data.values().map(|e| e.proofs.len()).sum());
+        while let Some(data_root) = self.order.pop_front() {
+            if let Some(entry) = self.data.remove(&data_root) {
+                for proof in entry.proofs {
+                    result.push((HashedAttestationData::new(entry.data.clone()), proof));
+                }
+            }
+        }
+        result
     }
 
     /// Return the number of distinct attestation messages in the buffer.
@@ -211,9 +235,19 @@ impl PayloadBuffer {
     }
 
     /// Extract per-validator latest attestations from proofs' participation bits.
+    ///
+    /// Iterates entries in insertion order (via `self.order`) so that, when two
+    /// aggregations carry the same `slot` but disagree on the target (an
+    /// equivocation by the shared validators), the first-observed aggregation
+    /// wins. The ethrex spec relies on Python dict insertion-order semantics
+    /// here; iterating `self.data.values()` would be RandomState-seeded and
+    /// fail the equivocation fork-choice tests non-deterministically.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
         let mut result: HashMap<u64, AttestationData> = HashMap::new();
-        for entry in self.data.values() {
+        for data_root in &self.order {
+            let Some(entry) = self.data.get(data_root) else {
+                continue;
+            };
             for proof in &entry.proofs {
                 for vid in proof.participant_indices() {
                     let should_update = result
@@ -1013,29 +1047,6 @@ impl Store {
             .extract_latest_attestations()
     }
 
-    /// Extract per-validator latest attestations from both known and new payloads.
-    pub fn extract_latest_all_attestations(&self) -> HashMap<u64, AttestationData> {
-        let mut result = self
-            .known_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations();
-        for (vid, data) in self
-            .new_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations()
-        {
-            let should_update = result
-                .get(&vid)
-                .is_none_or(|existing| existing.slot < data.slot);
-            if should_update {
-                result.insert(vid, data);
-            }
-        }
-        result
-    }
-
     // ============ Known Aggregated Payloads ============
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.
@@ -1649,6 +1660,17 @@ mod tests {
         AggregatedSignatureProof::empty(bits)
     }
 
+    /// Create a proof with bits set for every validator in `vids`.
+    fn make_proof_for_validators(vids: &[u64]) -> AggregatedSignatureProof {
+        use ethlambda_types::attestation::AggregationBits;
+        let max = vids.iter().copied().max().unwrap_or(0) as usize;
+        let mut bits = AggregationBits::with_length(max + 1).unwrap();
+        for &v in vids {
+            bits.set(v as usize, true).unwrap();
+        }
+        AggregatedSignatureProof::empty(bits)
+    }
+
     fn make_att_data(slot: u64) -> AttestationData {
         AttestationData {
             slot,
@@ -1770,6 +1792,330 @@ mod tests {
 
         assert_eq!(cloned.new_payloads.lock().unwrap().len(), 0);
         assert_eq!(cloned.known_payloads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn payload_buffer_push_superset_removes_strict_subset() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[1, 2, 3]),
+        );
+
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.data[&data_root].proofs.len(), 1);
+        let kept: HashSet<u64> = buf.data[&data_root].proofs[0]
+            .participant_indices()
+            .collect();
+        assert_eq!(kept, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn payload_buffer_push_subset_is_skipped() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2, 3]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[1, 2]),
+        );
+
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.data[&data_root].proofs.len(), 1);
+        let kept: HashSet<u64> = buf.data[&data_root].proofs[0]
+            .participant_indices()
+            .collect();
+        assert_eq!(kept, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn payload_buffer_push_equal_participants_is_skipped() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[1, 2]),
+        );
+
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.data[&data_root].proofs.len(), 1);
+    }
+
+    #[test]
+    fn payload_buffer_push_incomparable_proofs_coexist() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[3, 4]),
+        );
+
+        assert_eq!(buf.total_proofs, 2);
+        assert_eq!(buf.data[&data_root].proofs.len(), 2);
+    }
+
+    #[test]
+    fn payload_buffer_push_superset_absorbs_multiple_subsets() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        // Three pairwise-incomparable singletons: all retained.
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1]),
+        );
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[3]),
+        );
+        assert_eq!(buf.total_proofs, 3);
+
+        // Superset push absorbs all three at once.
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[1, 2, 3]),
+        );
+
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.data[&data_root].proofs.len(), 1);
+        // `order` still contains the single entry.
+        assert_eq!(buf.order.len(), 1);
+        assert_eq!(buf.order.front().copied(), Some(data_root));
+    }
+
+    #[test]
+    fn payload_buffer_push_mixed_kept_and_removed() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[5, 6]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[1, 2, 3]),
+        );
+
+        assert_eq!(buf.total_proofs, 2);
+
+        let sets: HashSet<Vec<u64>> = buf.data[&data_root]
+            .proofs
+            .iter()
+            .map(|p| {
+                let mut v: Vec<u64> = p.participant_indices().collect();
+                v.sort_unstable();
+                v
+            })
+            .collect();
+        assert!(sets.contains(&vec![5, 6]));
+        assert!(sets.contains(&vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn payload_buffer_push_empty_participants_subsumed_by_anything() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        // Empty-participant proof inserted first: anything that follows absorbs it.
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[]),
+        );
+        assert_eq!(buf.total_proofs, 1);
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[1, 2]),
+        );
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(
+            buf.data[&data_root].proofs[0]
+                .participant_indices()
+                .collect::<Vec<u64>>(),
+            vec![1, 2]
+        );
+
+        // Empty-participant proof pushed against existing non-empty: incoming is subsumed, skipped.
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[]),
+        );
+        assert_eq!(buf.total_proofs, 1);
+    }
+
+    #[test]
+    fn payload_buffer_push_cross_data_root_independence() {
+        let mut buf = PayloadBuffer::new(10);
+        let data_a = make_att_data(1);
+        let data_b = make_att_data(2);
+        let root_a = data_a.hash_tree_root();
+        let root_b = data_b.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data_a),
+            make_proof_for_validators(&[1, 2, 3]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_b),
+            make_proof_for_validators(&[1, 2]),
+        );
+
+        // Different data_roots → no cross-entry subsumption.
+        assert_eq!(buf.total_proofs, 2);
+        assert_eq!(buf.data[&root_a].proofs.len(), 1);
+        assert_eq!(buf.data[&root_b].proofs.len(), 1);
+    }
+
+    #[test]
+    fn payload_buffer_push_fifo_eviction_uses_total_proofs() {
+        let mut buf = PayloadBuffer::new(2);
+        let data_a = make_att_data(1);
+        let data_b = make_att_data(2);
+        let data_c = make_att_data(3);
+        let root_a = data_a.hash_tree_root();
+        let root_c = data_c.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data_a),
+            make_proof_for_validators(&[1]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_b),
+            make_proof_for_validators(&[2, 3]),
+        );
+        // total_proofs == 3, over capacity → evict oldest (root_a).
+        // Pushing a third distinct data_root triggers eviction via capacity.
+        buf.push(
+            HashedAttestationData::new(data_c),
+            make_proof_for_validators(&[4]),
+        );
+
+        assert!(!buf.data.contains_key(&root_a));
+        assert!(buf.data.contains_key(&root_c));
+        assert_eq!(buf.total_proofs, 2);
+    }
+
+    /// Build an attestation message at `slot` whose target points at `target_root`,
+    /// distinct from the default zero target so two such datas have different roots.
+    fn make_att_data_for_target(slot: u64, target_root: H256) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                root: target_root,
+                slot,
+            },
+            source: Checkpoint::default(),
+        }
+    }
+
+    /// When two aggregations share `slot` but disagree on the target
+    /// (same-slot equivocation), the *first inserted* aggregation must win for
+    /// the validators that participate in both. The fork-choice spec test
+    /// `test_same_slot_equivocating_attesters_count_once` depends on this.
+    /// HashMap iteration would make this RandomState-seeded and flaky.
+    #[test]
+    fn extract_latest_attestations_first_inserted_wins_on_slot_tie() {
+        let target_a = H256([0xaa; 32]);
+        let target_b = H256([0xbb; 32]);
+        let data_a = make_att_data_for_target(3, target_a);
+        let data_b = make_att_data_for_target(3, target_b);
+        assert_ne!(data_a.hash_tree_root(), data_b.hash_tree_root());
+
+        // Order 1: A then B → validators 0,1 (in both) must see A.
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(
+            HashedAttestationData::new(data_a.clone()),
+            make_proof_for_validators(&[0, 1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_b.clone()),
+            make_proof_for_validators(&[0, 1, 3, 4]),
+        );
+        let extracted = buf.extract_latest_attestations();
+        assert_eq!(extracted[&0].target.root, target_a);
+        assert_eq!(extracted[&1].target.root, target_a);
+        assert_eq!(extracted[&2].target.root, target_a);
+        assert_eq!(extracted[&3].target.root, target_b);
+        assert_eq!(extracted[&4].target.root, target_b);
+
+        // Order 2: B then A → validators 0,1 must now see B.
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(
+            HashedAttestationData::new(data_b),
+            make_proof_for_validators(&[0, 1, 3, 4]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_a),
+            make_proof_for_validators(&[0, 1, 2]),
+        );
+        let extracted = buf.extract_latest_attestations();
+        assert_eq!(extracted[&0].target.root, target_b);
+        assert_eq!(extracted[&1].target.root, target_b);
+        assert_eq!(extracted[&2].target.root, target_a);
+        assert_eq!(extracted[&3].target.root, target_b);
+        assert_eq!(extracted[&4].target.root, target_b);
+    }
+
+    /// `drain` must hand back entries in insertion order so that
+    /// `promote_new_aggregated_payloads` lands them in known_payloads in the
+    /// same order, preserving same-slot equivocation semantics through the
+    /// new → known migration.
+    #[test]
+    fn drain_preserves_insertion_order() {
+        let target_a = H256([0xaa; 32]);
+        let target_b = H256([0xbb; 32]);
+        let target_c = H256([0xcc; 32]);
+        let data_a = make_att_data_for_target(1, target_a);
+        let data_b = make_att_data_for_target(2, target_b);
+        let data_c = make_att_data_for_target(3, target_c);
+
+        let mut buf = PayloadBuffer::new(10);
+        buf.push(HashedAttestationData::new(data_a), make_proof());
+        buf.push(HashedAttestationData::new(data_b), make_proof());
+        buf.push(HashedAttestationData::new(data_c), make_proof());
+
+        let drained = buf.drain();
+        let slots: Vec<u64> = drained.iter().map(|(h, _)| h.data().slot).collect();
+        assert_eq!(slots, vec![1, 2, 3]);
+        assert!(buf.data.is_empty());
+        assert!(buf.order.is_empty());
+        assert_eq!(buf.total_proofs, 0);
     }
 
     // ============ GossipSignatureBuffer Tests ============

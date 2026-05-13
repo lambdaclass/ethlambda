@@ -17,6 +17,7 @@ libssz.workspace = true
 libssz-types.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
 
 tracing.workspace = true
 tracing-subscriber = "0.3"

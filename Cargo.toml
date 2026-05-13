@@ -49,6 +49,7 @@ hex = "0.4"
 spawned-concurrency = "0.5.0"
 spawned-rt = "0.5.0"
 tokio = "1.0"
+tokio-util = "0.7"
 
 prometheus = "0.14"
 

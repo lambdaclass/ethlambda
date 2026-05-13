@@ -9,9 +9,7 @@ use ethlambda_types::{
     state::State,
 };
 
-mod common;
-mod signature_types;
-use signature_types::VerifySignaturesTestVector;
+use ethlambda_test_fixtures::verify_signatures::VerifySignaturesTestVector;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 
@@ -51,7 +49,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Advance time to the block's slot
         let block_time_ms = genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-        store::on_tick(&mut st, block_time_ms, true, false);
+        store::on_tick(&mut st, block_time_ms, true);
 
         // Process the block (this includes signature verification)
         let result = store::on_block(&mut st, signed_block);

@@ -16,22 +16,25 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::H256;
 use ethlambda_types::{
+    aggregator::AggregatorController,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
+use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
 
 const ASCII_ART: &str = r#"
@@ -45,8 +48,21 @@ const ASCII_ART: &str = r#"
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 struct CliOptions {
+    /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
-    custom_network_config_dir: PathBuf,
+    genesis: PathBuf,
+    /// Path to the validator registry (e.g., annotated_validators.yaml).
+    #[arg(long)]
+    validators: PathBuf,
+    /// Path to the bootnode list (e.g., nodes.yaml).
+    #[arg(long)]
+    bootnodes: PathBuf,
+    /// Path to validator-config.yaml (validator name registry for metrics labels).
+    #[arg(long)]
+    validator_config: PathBuf,
+    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
+    #[arg(long)]
+    hash_sig_keys_dir: PathBuf,
     #[arg(long, default_value = "9000")]
     gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -64,12 +80,24 @@ struct CliOptions {
     /// When set, skips genesis initialization and syncs from checkpoint.
     #[arg(long)]
     checkpoint_sync_url: Option<String>,
-    /// Whether this node acts as a committee aggregator
+    /// Whether this node acts as a committee aggregator.
+    ///
+    /// Seeds the initial value of the live aggregator flag shared by the
+    /// blockchain actor and the admin API. The flag can be toggled at
+    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
+    /// NOT persist across restarts and do NOT update gossip subnet
+    /// subscriptions, which are frozen at startup — standby aggregators
+    /// should boot with this flag enabled to establish subscriptions, then
+    /// use the admin endpoint to rotate duties (hot-standby model).
     #[arg(long, default_value = "false")]
     is_aggregator: bool,
-    /// Number of attestation committees (subnets) per slot
-    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
-    attestation_committee_count: u64,
+    /// Number of attestation committees (subnets) per slot.
+    ///
+    /// If unset, falls back to `config.attestation_committee_count` from
+    /// `validator-config.yaml` in the network config dir, or `1` if that
+    /// field is also absent.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
@@ -93,18 +121,32 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
-    ethlambda_blockchain::metrics::set_attestation_committee_count(
-        options.attestation_committee_count,
-    );
 
-    let api_socket = SocketAddr::new(options.http_address, options.api_port);
-    let metrics_socket = SocketAddr::new(options.http_address, options.metrics_port);
-    let node_p2p_key = read_hex_file_bytes(&options.node_key);
-    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let rpc_config = RpcConfig {
+        http_address: options.http_address,
+        api_port: options.api_port,
+        metrics_port: options.metrics_port,
+    };
 
     println!("{ASCII_ART}");
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+
+    // Hive lean spec-asset suites boot the client with
+    // HIVE_LEAN_TEST_DRIVER=1 so it skips the consensus/p2p stack and
+    // exposes only the `/lean/v0/test_driver/...` endpoints driven by the
+    // simulator. Detected here before any config / key / genesis loading
+    // so the driver run doesn't touch --node-key, --custom-network-config-dir,
+    // or any other consensus prerequisite the hive shim doesn't bother to
+    // provision.
+    if ethlambda_rpc::test_driver::test_driver_enabled() {
+        info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
+        return run_test_driver(rpc_config).await;
+    }
+
+    let node_p2p_key = read_hex_file_bytes(&options.node_key);
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+
     #[cfg(not(target_env = "msvc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(target_env = "msvc")]
@@ -112,15 +154,11 @@ async fn main() -> eyre::Result<()> {
 
     info!(node_key=?options.node_key, "got node key");
 
-    let config_path = options.custom_network_config_dir.join("config.yaml");
-    let bootnodes_path = options.custom_network_config_dir.join("nodes.yaml");
-    let validators_path = options
-        .custom_network_config_dir
-        .join("annotated_validators.yaml");
-    let validator_config = options
-        .custom_network_config_dir
-        .join("validator-config.yaml");
-    let validator_keys_dir = options.custom_network_config_dir.join("hash-sig-keys");
+    let config_path = options.genesis;
+    let bootnodes_path = options.bootnodes;
+    let validators_path = options.validators;
+    let validator_config = options.validator_config;
+    let validator_keys_dir = options.hash_sig_keys_dir;
 
     let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
     let genesis_config: GenesisConfig =
@@ -132,7 +170,26 @@ async fn main() -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
-    populate_name_registry(&validator_config);
+    let validator_config_file = read_validator_config_file(&validator_config);
+    let node_names = load_node_names(&validator_config_file);
+
+    // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
+    // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
+    // bound here so a YAML value of 0 cannot bypass it.
+    let attestation_committee_count = options
+        .attestation_committee_count
+        .or(validator_config_file.config.attestation_committee_count)
+        .unwrap_or(1);
+    eyre::ensure!(
+        attestation_committee_count >= 1,
+        "attestation_committee_count must be >= 1 (got {attestation_committee_count})"
+    );
+    info!(
+        attestation_committee_count,
+        "Loaded attestation committee count"
+    );
+    ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
+
     let bootnodes = read_bootnodes(&bootnodes_path);
 
     let validator_keys =
@@ -154,20 +211,31 @@ async fn main() -> eyre::Result<()> {
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, options.is_aggregator);
 
+    // Shared, runtime-mutable aggregator flag. Seeded from the CLI and
+    // threaded into both the blockchain actor (which reads on every tick)
+    // and the API server (which exposes GET/POST admin endpoints).
+    let aggregator = AggregatorController::new(options.is_aggregator);
+
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
+
+    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
+    // AggregatorController — subnet subscriptions are decided once here and
+    // are not re-evaluated at runtime. Toggling via the admin API affects
+    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
+    // for the invariant.
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
-        attestation_committee_count: options.attestation_committee_count,
+        attestation_committee_count,
         is_aggregator: options.is_aggregator,
         aggregate_subnet_ids: options.aggregate_subnet_ids,
     })
     .expect("failed to build swarm");
 
-    let p2p = P2P::spawn(built, store.clone());
+    let p2p = P2P::spawn(built, store.clone(), node_names);
 
     // Wire actors together via protocol refs
     blockchain
@@ -184,48 +252,123 @@ async fn main() -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_metrics_server(metrics_socket)
+    let shutdown_token = CancellationToken::new();
+    let rpc_shutdown = shutdown_token.clone();
+
+    let rpc_handle = tokio::spawn(async move {
+        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
             .await
-            .inspect_err(|err| error!(%err, "Metrics server failed"));
-    });
-    tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_api_server(api_socket, store)
-            .await
-            .inspect_err(|err| error!(%err, "API server failed"));
+            .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
 
+    // 1st ctrl+c: start graceful shutdown
     tokio::signal::ctrl_c().await.ok();
-    println!("Shutting down...");
+
+    info!("Shutdown signal received, stopping actors and servers...");
+
+    tokio::spawn(async move {
+        // This can be turned into a loop
+        tokio::signal::ctrl_c().await.ok();
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 2 more times to force ungraceful shutdown"
+        );
+        tokio::signal::ctrl_c().await.ok();
+        warn!(
+            "Graceful shutdown in progress. Press ctrl+C 1 more times to force ungraceful shutdown"
+        );
+        tokio::signal::ctrl_c().await.ok();
+        info!("Forced ungraceful shutdown...");
+        std::process::exit(1);
+    });
+
+    let blockchain_ref = blockchain.actor_ref().clone();
+    let p2p_ref = p2p.actor_ref().clone();
+    blockchain_ref.context().stop();
+    p2p_ref.context().stop();
+    shutdown_token.cancel();
+
+    blockchain_ref.join().await;
+    p2p_ref.join().await;
+    let _ = rpc_handle.await;
+
+    info!("Shutdown complete");
 
     Ok(())
 }
 
-fn populate_name_registry(validator_config: impl AsRef<Path>) {
-    #[derive(Deserialize)]
-    struct Validator {
-        name: String,
-        privkey: H256,
-    }
-    #[derive(Deserialize)]
-    struct Config {
-        validators: Vec<Validator>,
-    }
-    let config_yaml =
-        std::fs::read_to_string(&validator_config).expect("Failed to read validator config file");
-    let config: Config =
-        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse validator config file");
+/// Boot the binary in Hive test-driver mode.
+///
+/// Skips every consensus/p2p subsystem and just exposes the
+/// `/lean/v0/test_driver/...` HTTP endpoints over the configured API port.
+/// The driver-mode store is seeded with an empty in-memory state and is
+/// replaced on every `fork_choice/init` request from the simulator.
+async fn run_test_driver(rpc_config: RpcConfig) -> eyre::Result<()> {
+    use tokio::sync::RwLock;
 
-    let names_and_privkeys = config
+    let driver: ethlambda_rpc::test_driver::DriverState =
+        Arc::new(RwLock::new(ethlambda_rpc::test_driver::empty_driver_store()));
+
+    let shutdown_token = CancellationToken::new();
+    let rpc_shutdown = shutdown_token.clone();
+
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(err) =
+            ethlambda_rpc::start_test_driver_rpc_server(rpc_config, driver, rpc_shutdown).await
+        {
+            error!(%err, "Test-driver RPC server failed");
+        }
+    });
+
+    info!("Test-driver RPC ready");
+
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown signal received, stopping test-driver RPC...");
+    shutdown_token.cancel();
+    let _ = rpc_handle.await;
+    info!("Shutdown complete");
+
+    Ok(())
+}
+
+/// Subset of `validator-config.yaml` consumed by ethlambda.
+///
+/// The `config` block is a network-wide settings bag shared across clients;
+/// only fields ethlambda actually reads are deserialized. The `validators`
+/// list feeds the node-name registry passed to `P2P::spawn`.
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigFile {
+    #[serde(default)]
+    config: ValidatorConfigBlock,
+    validators: Vec<ValidatorConfigEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ValidatorConfigBlock {
+    #[serde(default)]
+    attestation_committee_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidatorConfigEntry {
+    name: String,
+    privkey: H256,
+}
+
+fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
+    let yaml = std::fs::read_to_string(&path).expect("Failed to read validator config file");
+    serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
+}
+
+fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
+    let names_and_privkeys = file
         .validators
-        .into_iter()
-        .map(|v| (v.name, v.privkey))
+        .iter()
+        .map(|v| (v.name.clone(), v.privkey))
         .collect();
 
-    // Populates a dictionary used for labeling metrics with node names
-    ethlambda_p2p::metrics::populate_name_registry(names_and_privkeys);
+    ethlambda_p2p::derive_peer_ids(names_and_privkeys)
 }
 
 fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
@@ -457,4 +600,97 @@ async fn fetch_initial_state(
 
     // Store the anchor state and header, without body
     Ok(Store::from_anchor_state(backend, state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
+    /// (devnet-4) where networks share a non-default committee count.
+    const VC_WITH_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: ansible
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+  attestation_committee_count: 2
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 9095
+    apiPort: 5055
+    subnet: 0
+    isAggregator: false
+    count: 1
+"#;
+
+    /// Local-devnet snippet without the optional field — committee count is
+    /// expected to fall back to the binary default.
+    const VC_WITHOUT_COMMITTEE_COUNT: &str = r#"
+shuffle: roundrobin
+deployment_mode: local
+config:
+  activeEpoch: 18
+  keyType: "hash-sig"
+validators:
+  - name: "ethlambda_0"
+    privkey: "299550529a79bc2dce003747c52fb0639465c893e00b0440ac66144d625e066a"
+    enrFields:
+      ip: "127.0.0.1"
+      quic: 9001
+    metricsPort: 8087
+    apiPort: 5055
+    isAggregator: false
+    count: 1
+"#;
+
+    #[test]
+    fn parses_committee_count_when_present() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, Some(2));
+        assert_eq!(file.validators.len(), 1);
+        assert_eq!(file.validators[0].name, "ethlambda_0");
+    }
+
+    #[test]
+    fn defaults_to_none_when_field_absent() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        assert_eq!(file.config.attestation_committee_count, None);
+    }
+
+    #[test]
+    fn cli_overrides_file_value() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = Some(5);
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 5);
+    }
+
+    #[test]
+    fn falls_back_to_file_when_cli_absent() {
+        let file: ValidatorConfigFile = serde_yaml_ng::from_str(VC_WITH_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 2);
+    }
+
+    #[test]
+    fn falls_back_to_default_when_neither_set() {
+        let file: ValidatorConfigFile =
+            serde_yaml_ng::from_str(VC_WITHOUT_COMMITTEE_COUNT).unwrap();
+        let cli_override: Option<u64> = None;
+        let resolved = cli_override
+            .or(file.config.attestation_committee_count)
+            .unwrap_or(1);
+        assert_eq!(resolved, 1);
+    }
 }

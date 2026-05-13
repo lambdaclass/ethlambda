@@ -17,9 +17,9 @@ use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol,
+    Multiaddr, StreamProtocol,
     gossipsub::{MessageAuthenticity, ValidationMode},
-    identity::{PublicKey, secp256k1},
+    identity::{Keypair, PublicKey, secp256k1},
     multiaddr::Protocol,
     request_response::{self, OutboundRequestId},
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -40,8 +40,9 @@ use crate::{
         publish_attestation, publish_block,
     },
     req_resp::{
-        BLOCKS_BY_ROOT_PROTOCOL_V1, Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request,
-        STATUS_PROTOCOL_V1, build_status, fetch_block_from_peer,
+        BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
+        MAX_COMPRESSED_PAYLOAD_SIZE, Request, STATUS_PROTOCOL_V1, build_status,
+        fetch_block_from_peer,
     },
     swarm_adapter::SwarmHandle,
 };
@@ -51,7 +52,7 @@ pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
 
-pub use metrics::populate_name_registry;
+pub use libp2p::PeerId;
 
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
 const MAX_FETCH_RETRIES: u32 = 10;
@@ -66,14 +67,31 @@ pub(crate) struct PendingRequest {
 
 // --- Swarm construction ---
 
-/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining Gossipsub and Request-Response Behaviours
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify, Gossipsub
+/// and Request-Response Behaviours.
+///
+/// `identify` is registered purely for interop: go-libp2p (gean) gates gossipsub
+/// GRAFT on the identify exchange completing, so a peer that doesn't respond to
+/// `/ipfs/id/1.0.0` is silently excluded from the mesh. Events from this
+/// behaviour are intentionally not handled: the registration alone is enough
+/// to satisfy probing peers. ream and zeam follow the same pattern.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
+    identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<Codec>,
 }
 
 /// Configuration for building the libp2p swarm.
+///
+/// INVARIANT: `is_aggregator` is consumed once during [`build_swarm`] to decide
+/// subnet subscriptions and is NOT stored on [`P2PServer`]. Runtime toggles
+/// of the aggregator role via the admin API (see
+/// [`ethlambda_types::aggregator::AggregatorController`]) intentionally do
+/// not resubscribe gossip subnets — this is the leanSpec PR #636 scope
+/// limitation ("hot-standby model"). If a runtime reader is ever added on
+/// the P2P side, it must consult the shared `AggregatorController` instead
+/// of a bool captured here, or the runtime toggle will silently diverge.
 pub struct SwarmConfig {
     pub node_key: Vec<u8>,
     pub bootnodes: Vec<Bootnode>,
@@ -92,7 +110,6 @@ pub struct BuiltSwarm {
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
-    pub(crate) is_aggregator: bool,
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -138,20 +155,31 @@ pub fn build_swarm(
                 StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
                 request_response::ProtocolSupport::Full,
             ),
+            (
+                StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
+                request_response::ProtocolSupport::Full,
+            ),
         ],
         Default::default(),
     );
 
+    let secret_key =
+        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
+    let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
+
+    // Use the same `protocol_version` string as zeam
+    let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+        "/ipfs/0.1.0".to_owned(),
+        identity.public(),
+    ));
+
     let behavior = Behaviour {
+        identify,
         gossipsub,
         req_resp,
     };
 
     // TODO: set peer scoring params
-
-    let secret_key =
-        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
-    let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
@@ -247,7 +275,6 @@ pub fn build_swarm(
         block_topic,
         aggregation_topic,
         bootnode_addrs,
-        is_aggregator: config.is_aggregator,
     })
 }
 
@@ -260,8 +287,9 @@ pub struct P2P {
 
 impl P2P {
     /// Build swarm, start I/O adapter, spawn actor, and wire the swarm event stream.
-    pub fn spawn(built: BuiltSwarm, store: Store) -> P2P {
-        let (swarm_stream, swarm_handle) = swarm_adapter::start_swarm_adapter(built.swarm);
+    pub fn spawn(built: BuiltSwarm, store: Store, node_names: HashMap<PeerId, String>) -> P2P {
+        let (swarm_stream, swarm_handle) =
+            swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
         let server = P2PServer {
             swarm_handle,
@@ -271,11 +299,11 @@ impl P2P {
             attestation_committee_count: built.attestation_committee_count,
             block_topic: built.block_topic,
             aggregation_topic: built.aggregation_topic,
-            is_aggregator: built.is_aggregator,
             connected_peers: HashSet::new(),
             pending_requests: HashMap::new(),
             request_id_map: HashMap::new(),
             bootnode_addrs: built.bootnode_addrs,
+            node_names,
         };
         let handle = server.start();
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
@@ -306,12 +334,21 @@ pub struct P2PServer {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) is_aggregator: bool,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_requests: HashMap<H256, PendingRequest>,
     pub(crate) request_id_map: HashMap<OutboundRequestId, H256>,
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    node_names: HashMap<PeerId, String>,
+}
+
+impl P2PServer {
+    fn resolve_node_name(&self, peer_id: Option<&PeerId>) -> &str {
+        peer_id
+            .and_then(|p| self.node_names.get(p))
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
 }
 
 // Protocol trait for internal messages only (retry scheduling).
@@ -439,7 +476,11 @@ async fn handle_swarm_event(
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
                 let peer_count = server.connected_peers.len();
-                metrics::notify_peer_connected(&Some(peer_id), direction, "success");
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(Some(&peer_id)),
+                    direction,
+                    "success",
+                );
                 // Send status request on first connection to this peer
                 let our_status = build_status(&server.store);
                 let our_finalized_slot = our_status.finalized.slot;
@@ -492,7 +533,11 @@ async fn handle_swarm_event(
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
                 let peer_count = server.connected_peers.len();
-                metrics::notify_peer_disconnected(&Some(peer_id), direction, reason);
+                metrics::notify_peer_disconnected(
+                    server.resolve_node_name(Some(&peer_id)),
+                    direction,
+                    reason,
+                );
 
                 info!(
                     %peer_id,
@@ -521,7 +566,11 @@ async fn handle_swarm_event(
             } else {
                 "error"
             };
-            metrics::notify_peer_connected(&peer_id, "outbound", result);
+            metrics::notify_peer_connected(
+                server.resolve_node_name(peer_id.as_ref()),
+                "outbound",
+                result,
+            );
             warn!(?peer_id, %error, "Outgoing connection error");
 
             // Schedule redial if this was a bootnode
@@ -538,13 +587,40 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-            metrics::notify_peer_connected(&peer_id, "inbound", "error");
+            metrics::notify_peer_connected(
+                server.resolve_node_name(peer_id.as_ref()),
+                "inbound",
+                "error",
+            );
             warn!(%error, "Incoming connection error");
         }
         _ => {
             trace!(?event, "Ignored swarm event");
         }
     }
+}
+
+// --- Node identity helpers ---
+
+/// Derive each entry's `PeerId` from its secp256k1 private key.
+///
+/// Drops entries whose key fails to parse, with a `warn!` per drop.
+pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<PeerId, String> {
+    names_and_privkeys
+        .into_iter()
+        .filter_map(|(name, mut privkey)| {
+            match secp256k1::SecretKey::try_from_bytes(&mut privkey.0) {
+                Ok(privkey) => {
+                    let pubkey = Keypair::from(secp256k1::Keypair::from(privkey)).public();
+                    Some((PeerId::from_public_key(&pubkey), name))
+                }
+                Err(err) => {
+                    warn!(%name, %err, "Skipping node-name registry entry: invalid secp256k1 privkey");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 // --- Bootnode parsing ---

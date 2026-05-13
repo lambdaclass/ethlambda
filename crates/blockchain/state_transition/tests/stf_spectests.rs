@@ -26,6 +26,14 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         }
         println!("Running test: {}", name);
 
+        // Fixtures with no blocks come from spec filler runs that raised
+        // before any block was constructed (e.g. negative tests where
+        // `state.process_slots(spec.slot)` aborts pre-build). With nothing
+        // for ethlambda to replay, the spec framework's verdict stands.
+        if test.blocks.is_empty() {
+            continue;
+        }
+
         let mut pre_state: State = test.pre.into();
         let mut result = Ok(());
 

@@ -1,21 +1,24 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
     futures::StreamExt,
-    gossipsub::PublishError,
     request_response::{self, OutboundRequestId},
     swarm::SwarmEvent,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{error, warn};
 
-use crate::{Behaviour, BehaviourEvent, req_resp::Request, req_resp::Response};
+use crate::{Behaviour, BehaviourEvent, metrics, req_resp::Request, req_resp::Response};
+
+/// Interval between gossipsub mesh peer metric refreshes.
+const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub enum SwarmCommand {
     Publish {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
-        /// When true, suppress NoPeersSubscribedToTopic errors (other errors still warn).
-        ignore_no_peers: bool,
     },
     Dial(Multiaddr),
     SendRequest {
@@ -40,25 +43,7 @@ impl SwarmHandle {
     pub fn publish(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Publish {
-                topic,
-                data,
-                ignore_no_peers: false,
-            })
-            .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
-    }
-
-    /// Publish, suppressing NoPeersSubscribedToTopic errors. Used when the sender
-    /// is also subscribed to the topic (e.g., aggregator publishing its own
-    /// attestation to a subnet it subscribes to) and no other peer subscribes.
-    pub fn publish_ignore_no_peers(&self, topic: libp2p::gossipsub::IdentTopic, data: Vec<u8>) {
-        let _ = self
-            .cmd_tx
-            .send(SwarmCommand::Publish {
-                topic,
-                data,
-                ignore_no_peers: true,
-            })
+            .send(SwarmCommand::Publish { topic, data })
             .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
     }
 
@@ -108,6 +93,7 @@ impl SwarmHandle {
 
 pub fn start_swarm_adapter(
     swarm: libp2p::Swarm<Behaviour>,
+    node_names: HashMap<PeerId, String>,
 ) -> (
     impl futures::Stream<Item = SwarmEvent<BehaviourEvent>>,
     SwarmHandle,
@@ -115,7 +101,7 @@ pub fn start_swarm_adapter(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(swarm_loop(swarm, event_tx, cmd_rx));
+    tokio::spawn(swarm_loop(swarm, event_tx, cmd_rx, node_names));
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(event_rx);
     let handle = SwarmHandle { cmd_tx };
@@ -126,7 +112,10 @@ async fn swarm_loop(
     mut swarm: libp2p::Swarm<Behaviour>,
     event_tx: mpsc::UnboundedSender<SwarmEvent<BehaviourEvent>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    node_names: HashMap<PeerId, String>,
 ) {
+    let mut mesh_metric_tick = tokio::time::interval(MESH_METRIC_REFRESH_INTERVAL);
+    mesh_metric_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             event = swarm.next() => {
@@ -137,6 +126,12 @@ async fn swarm_loop(
                 let Some(cmd) = cmd else { break };
                 execute_command(&mut swarm, cmd);
             }
+            _ = mesh_metric_tick.tick() => {
+                metrics::update_gossip_mesh_peers(
+                    swarm.behaviour().gossipsub.all_mesh_peers(),
+                    &node_names,
+                );
+            }
         }
     }
     error!("Swarm adapter loop exited — P2P networking is no longer functional");
@@ -144,17 +139,13 @@ async fn swarm_loop(
 
 fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
     match cmd {
-        SwarmCommand::Publish {
-            topic,
-            data,
-            ignore_no_peers,
-        } => {
-            let result = swarm.behaviour_mut().gossipsub.publish(topic, data);
-            if let Err(err) = result
-                && !(ignore_no_peers && matches!(err, PublishError::NoPeersSubscribedToTopic))
-            {
-                warn!(%err, "Swarm adapter: publish failed");
-            }
+        SwarmCommand::Publish { topic, data } => {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, data)
+                .inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"))
+                .ok();
         }
         SwarmCommand::Dial(addr) => {
             let _ = swarm
