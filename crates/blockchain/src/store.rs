@@ -1803,17 +1803,11 @@ mod tests {
         use std::sync::Arc;
 
         let genesis_state = State::from_genesis(1000, vec![]);
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: AggregatedAttestations::default(),
-            },
-        };
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+        // Use `from_anchor_state` here rather than `get_forkchoice_store`:
+        // the latter now enforces `block.state_root == hash_tree_root(state)`,
+        // which a synthetic genesis block with zero state_root cannot satisfy.
+        let mut store = Store::from_anchor_state(backend, genesis_state);
 
         let head_root = store.head();
         let att_data = AttestationData {
