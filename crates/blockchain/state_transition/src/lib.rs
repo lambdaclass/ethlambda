@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ethlambda_types::{
     ShortRoot,
+    attestation::AttestationData,
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -9,7 +10,7 @@ use ethlambda_types::{
 };
 use tracing::{info, warn};
 
-mod justified_slots_ops;
+pub mod justified_slots_ops;
 pub mod metrics;
 
 #[derive(Debug, thiserror::Error)]
@@ -479,6 +480,27 @@ fn checkpoint_exists(state: &State, checkpoint: Checkpoint) -> bool {
         .get(checkpoint.slot as usize)
         .map(|root| root == &checkpoint.root)
         .unwrap_or(false)
+}
+
+/// Whether both source and target checkpoints in `data` match the chain at
+/// their slots.
+///
+/// Callers pass a chain view as it would appear after `process_block_header`
+/// on the consuming block: covering `[0, block.slot - 1]` with `parent_root`
+/// at the parent slot and `H256::ZERO` for empty slots between parent and the
+/// candidate.
+pub fn attestation_data_matches_chain(
+    historical_block_hashes: &[H256],
+    data: &AttestationData,
+) -> bool {
+    let source_slot = data.source.slot as usize;
+    let target_slot = data.target.slot as usize;
+    if source_slot >= historical_block_hashes.len() || target_slot >= historical_block_hashes.len()
+    {
+        return false;
+    }
+    historical_block_hashes[source_slot] == data.source.root
+        && historical_block_hashes[target_slot] == data.target.root
 }
 
 /// Checks if the slot is a valid candidate for justification after a given finalized slot.
