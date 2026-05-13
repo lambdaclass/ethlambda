@@ -1060,7 +1060,7 @@ fn build_block(
         // ZERO_HASH for empty slots in between. Lets us validate source/target
         // roots without waiting for the STF to drop mismatches.
         let parent_slot = head_state.latest_block_header.slot;
-        let num_empty_slots = (slot - parent_slot - 1) as usize;
+        let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
         let mut extended_historical_block_hashes: Vec<H256> =
             head_state.historical_block_hashes.iter().copied().collect();
         extended_historical_block_hashes.push(parent_root);
@@ -1086,11 +1086,11 @@ fn build_block(
                 if !known_block_roots.contains(&att_data.head.root) {
                     continue;
                 }
-                // Relaxed source check (leanSpec #716): accept any source whose
-                // slot is at or before the head chain's latest justified slot,
-                // not just an exact-match checkpoint. Lets us absorb gap-closing
-                // attestations from sibling forks that justified earlier slots.
-                if att_data.source.slot > current_justified.slot {
+                if !justified_slots_ops::is_slot_justified(
+                    &current_justified_slots,
+                    current_finalized_slot,
+                    att_data.source.slot,
+                ) {
                     continue;
                 }
 
