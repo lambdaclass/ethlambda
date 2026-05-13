@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_ethrex_client::{EngineClient, ForkChoiceState};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -60,6 +61,7 @@ impl BlockChain {
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        execution_client: Option<EngineClient>,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -74,6 +76,7 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
+            execution_client,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -127,6 +130,17 @@ pub struct BlockChainServer {
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
+
+    /// Optional Engine API client to the execution layer (e.g. ethrex).
+    ///
+    /// Present only when ethlambda was started with `--execution-endpoint`
+    /// and `--execution-jwt-secret`. When set, the actor fires
+    /// `engine_forkchoiceUpdatedV3` at the start of each slot to keep the EL
+    /// informed of our head/justified/finalized. The schema is currently
+    /// scaffolding only — Lean blocks do not yet carry execution payloads,
+    /// so the EL responds `SYNCING` against zeros until a real payload
+    /// pipeline is wired (see docs/plans/engine-api-integration.md).
+    execution_client: Option<EngineClient>,
 }
 
 impl BlockChainServer {
@@ -195,6 +209,43 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
+
+        // Notify the execution layer once per slot (interval 0). Fire and
+        // forget: the EL is informational here, never on the consensus
+        // critical path. Until Lean blocks carry execution payloads, we map
+        // beacon roots straight onto EL block hashes — the EL will reply
+        // `SYNCING` because it doesn't know those hashes, which is the
+        // expected scaffold behavior.
+        if interval == 0 && self.execution_client.is_some() {
+            self.notify_execution_layer();
+        }
+    }
+
+    /// Send the current head/safe/finalized triplet to the execution layer
+    /// via `engine_forkchoiceUpdatedV3`. Errors are logged but never
+    /// propagated — the consensus loop must continue regardless of EL state.
+    fn notify_execution_layer(&self) {
+        let Some(client) = self.execution_client.as_ref() else {
+            return;
+        };
+        let head = self.store.head();
+        let safe = self.store.safe_target();
+        let finalized = self.store.latest_finalized().root;
+        let state = ForkChoiceState {
+            head_block_hash: head,
+            safe_block_hash: safe,
+            finalized_block_hash: finalized,
+        };
+        let client = client.clone();
+        tokio::spawn(async move {
+            match client.forkchoice_updated_v3(state, None).await {
+                Ok(resp) => trace!(
+                    status = ?resp.payload_status.status,
+                    "engine_forkchoiceUpdatedV3 ok"
+                ),
+                Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
+            }
+        });
     }
 
     /// Kick off a committee-signature aggregation session:

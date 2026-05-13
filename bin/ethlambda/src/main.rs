@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
+use ethlambda_ethrex_client::{ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, JwtSecret};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
 
@@ -105,6 +106,17 @@ struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
+    /// URL of the ethrex (or other EL) Engine API auth endpoint, e.g. `http://127.0.0.1:8551`.
+    ///
+    /// When unset, Engine API integration is disabled and ethlambda runs as
+    /// a consensus-only node. When set, `--execution-jwt-secret` is required.
+    #[arg(long, requires = "execution_jwt_secret")]
+    execution_endpoint: Option<String>,
+    /// Path to a file containing the 32-byte JWT secret shared with the EL,
+    /// as a single line of hex (optionally `0x`-prefixed). Same format used
+    /// by Lighthouse/Teku/Prysm/ethrex.
+    #[arg(long, requires = "execution_endpoint")]
+    execution_jwt_secret: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -217,7 +229,18 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
+    let execution_client = build_execution_client(
+        options.execution_endpoint.as_deref(),
+        options.execution_jwt_secret.as_deref(),
+    )
+    .await;
+
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        validator_keys,
+        aggregator.clone(),
+        execution_client,
+    );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
     // AggregatorController — subnet subscriptions are decided once here and
@@ -536,6 +559,57 @@ fn read_validator_keys(
     );
 
     Ok(validator_keys)
+}
+
+/// Build the optional Engine API client and run the capability handshake.
+///
+/// Returns `None` when integration is disabled (neither flag provided).
+/// Returns `None` and logs an error when construction or the handshake
+/// fails — consensus must keep running regardless of EL state.
+async fn build_execution_client(
+    endpoint: Option<&str>,
+    jwt_path: Option<&Path>,
+) -> Option<EngineClient> {
+    // CLI requires both-or-neither; defensive recheck for clarity.
+    let (endpoint, jwt_path) = match (endpoint, jwt_path) {
+        (Some(e), Some(p)) => (e, p),
+        (None, None) => return None,
+        _ => {
+            error!("Both --execution-endpoint and --execution-jwt-secret are required together");
+            return None;
+        }
+    };
+
+    let secret = match JwtSecret::from_file(jwt_path) {
+        Ok(s) => s,
+        Err(err) => {
+            error!(path = %jwt_path.display(), %err, "Failed to load JWT secret");
+            return None;
+        }
+    };
+
+    let client = match EngineClient::new(endpoint, secret) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(%err, "Failed to construct EngineClient");
+            return None;
+        }
+    };
+
+    info!(endpoint, "Engine API integration enabled");
+
+    match client
+        .exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES)
+        .await
+    {
+        Ok(caps) => info!(count = caps.len(), "EL capability handshake succeeded"),
+        Err(err) => warn!(
+            %err,
+            "EL capability handshake failed (will keep retrying on each tick)"
+        ),
+    }
+
+    Some(client)
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
