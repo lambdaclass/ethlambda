@@ -499,8 +499,12 @@ pub fn attestation_data_matches_chain(
     {
         return false;
     }
-    historical_block_hashes[source_slot] == data.source.root
-        && historical_block_hashes[target_slot] == data.target.root
+    let source_root = historical_block_hashes[source_slot];
+    let target_root = historical_block_hashes[target_slot];
+    if source_root == H256::ZERO || target_root == H256::ZERO {
+        return false;
+    }
+    source_root == data.source.root && target_root == data.target.root
 }
 
 /// Checks if the slot is a valid candidate for justification after a given finalized slot.
