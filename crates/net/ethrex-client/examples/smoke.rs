@@ -27,8 +27,12 @@ const SLOT_DURATION: Duration = Duration::from_secs(4);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let url = args.next().expect("usage: smoke <url> <jwt-path> [--loop <slots>]");
-    let jwt_path = args.next().expect("usage: smoke <url> <jwt-path> [--loop <slots>]");
+    let url = args
+        .next()
+        .expect("usage: smoke <url> <jwt-path> [--loop <slots>]");
+    let jwt_path = args
+        .next()
+        .expect("usage: smoke <url> <jwt-path> [--loop <slots>]");
     let slot_count: Option<u32> = match (args.next(), args.next()) {
         (Some(ref flag), Some(n)) if flag == "--loop" => Some(n.parse()?),
         (None, None) => None,
@@ -42,17 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = EngineClient::new(url, secret)?;
 
     println!("--- engine_exchangeCapabilities");
-    let caps = client.exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES).await?;
-    println!("EL advertises {} capabilities (showing first 6):", caps.len());
+    let caps = client
+        .exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES)
+        .await?;
+    println!(
+        "EL advertises {} capabilities (showing first 6):",
+        caps.len()
+    );
     for c in caps.iter().take(6) {
         println!("  {c}");
     }
 
     let Some(slots) = slot_count else {
         println!("\n--- engine_forkchoiceUpdatedV3 (one-shot, zeros)");
-        let resp = client
-            .forkchoice_updated_v3(zero_state(), None)
-            .await?;
+        let resp = client.forkchoice_updated_v3(zero_state(), None).await?;
         println!("status    = {:?}", resp.payload_status.status);
         println!("payloadId = {:?}", resp.payload_id);
         return Ok(());

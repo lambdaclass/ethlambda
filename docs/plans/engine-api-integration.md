@@ -22,7 +22,7 @@ payload validation, and payload building.
 - No JWT / JSON-RPC client crate.
 - Slot duration: 4s, tick intervals 0-4 per slot.
 
-**ethrex** (`/Users/pablodeymonnaz/Lambda/ethrex`):
+**ethrex** ([lambdaclass/ethrex](https://github.com/lambdaclass/ethrex)):
 - Full mainline Engine API on an auth RPC port: V1-V5 of `engine_newPayload`,
   V1-V4 of `engine_forkchoiceUpdated`, V1-V5 of `engine_getPayload`, plus
   `engine_exchangeCapabilities` and `engine_getClientVersionV1`.
@@ -165,8 +165,8 @@ Out of scope for this plan unless C is selected up front.
 
 ## References
 
-- ethrex Engine API: `/Users/pablodeymonnaz/Lambda/ethrex/crates/networking/rpc/engine/`
-- ethrex auth client (template): `/Users/pablodeymonnaz/Lambda/ethrex/crates/networking/rpc/clients/auth/mod.rs`
-- ethrex JWT auth: `/Users/pablodeymonnaz/Lambda/ethrex/crates/networking/rpc/authentication.rs`
+- ethrex Engine API: <https://github.com/lambdaclass/ethrex/tree/main/crates/networking/rpc/engine>
+- ethrex auth client (template): <https://github.com/lambdaclass/ethrex/blob/main/crates/networking/rpc/clients/auth/mod.rs>
+- ethrex JWT auth: <https://github.com/lambdaclass/ethrex/blob/main/crates/networking/rpc/authentication.rs>
 - Engine API spec: <https://github.com/ethereum/execution-apis/tree/main/src/engine>
 - Capability list (mainline): `engine_*V1..V5` — see `engine/mod.rs:CAPABILITIES`

@@ -212,29 +212,31 @@ impl BlockChainServer {
 
         // Notify the execution layer once per slot (interval 0). Fire and
         // forget: the EL is informational here, never on the consensus
-        // critical path. Until Lean blocks carry execution payloads, we map
-        // beacon roots straight onto EL block hashes — the EL will reply
-        // `SYNCING` because it doesn't know those hashes, which is the
-        // expected scaffold behavior.
+        // critical path. Until Lean blocks carry execution payloads, we
+        // send all-zero hashes — beacon roots are not EL block hashes, and
+        // passing them confuses the EL into attempting to sync to garbage.
+        // Zero is the spec-friendly "unknown head" sentinel; the EL reliably
+        // replies `SYNCING`, which is the expected scaffold response.
         if interval == 0 && self.execution_client.is_some() {
             self.notify_execution_layer();
         }
     }
 
-    /// Send the current head/safe/finalized triplet to the execution layer
-    /// via `engine_forkchoiceUpdatedV3`. Errors are logged but never
-    /// propagated — the consensus loop must continue regardless of EL state.
+    /// Send a zero-valued forkchoice update to the execution layer via
+    /// `engine_forkchoiceUpdatedV3`. Errors are logged but never propagated —
+    /// the consensus loop must continue regardless of EL state.
+    ///
+    /// Once Lean blocks carry an `executionPayload`, swap `H256::ZERO` for
+    /// the corresponding EL block hashes derived from the latest known
+    /// head / safe / finalized blocks.
     fn notify_execution_layer(&self) {
         let Some(client) = self.execution_client.as_ref() else {
             return;
         };
-        let head = self.store.head();
-        let safe = self.store.safe_target();
-        let finalized = self.store.latest_finalized().root;
         let state = ForkChoiceState {
-            head_block_hash: head,
-            safe_block_hash: safe,
-            finalized_block_hash: finalized,
+            head_block_hash: H256::ZERO,
+            safe_block_hash: H256::ZERO,
+            finalized_block_hash: H256::ZERO,
         };
         let client = client.clone();
         tokio::spawn(async move {

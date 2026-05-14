@@ -83,6 +83,7 @@ impl EngineClient {
             .body(body_str)
             .send()
             .await?
+            .error_for_status()?
             .text()
             .await?;
         trace!(method, response = %raw, "engine RPC response");

@@ -609,7 +609,7 @@ async fn build_execution_client(
         Ok(caps) => info!(count = caps.len(), "EL capability handshake succeeded"),
         Err(err) => warn!(
             %err,
-            "EL capability handshake failed (will keep retrying on each tick)"
+            "EL capability handshake failed; per-slot FCU calls will still be attempted"
         ),
     }
 

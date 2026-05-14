@@ -32,6 +32,7 @@ pub struct PayloadAttributesV3 {
     #[serde(with = "hex_u64")]
     pub timestamp: u64,
     pub prev_randao: H256,
+    #[serde(with = "hex_address")]
     pub suggested_fee_recipient: [u8; 20],
     pub withdrawals: Vec<Withdrawal>,
     pub parent_beacon_block_root: H256,
@@ -45,6 +46,7 @@ pub struct Withdrawal {
     pub index: u64,
     #[serde(with = "hex_u64")]
     pub validator_index: u64,
+    #[serde(with = "hex_address")]
     pub address: [u8; 20],
     #[serde(with = "hex_u64")]
     pub amount: u64,
@@ -52,10 +54,9 @@ pub struct Withdrawal {
 
 /// Opaque identifier returned by FCU when payload building was requested.
 ///
-/// 8-byte big-endian-encoded ID; we treat it as a 16-char hex string on
-/// the wire (`0x` + 16 hex digits).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+/// 8 bytes on the wire as a hex `DATA` string (`0x` + 16 hex digits), per
+/// the execution-apis spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadId(pub [u8; 8]);
 
 impl PayloadId {
@@ -64,9 +65,35 @@ impl PayloadId {
     }
 }
 
+impl Serialize for PayloadId {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for PayloadId {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        let stripped = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(stripped).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 8 {
+            return Err(serde::de::Error::custom(format!(
+                "PayloadId expected 8 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&bytes);
+        Ok(Self(out))
+    }
+}
+
 /// EL's verdict on a payload or forkchoice update.
+///
+/// `SCREAMING_SNAKE_CASE` matches the canonical spec values
+/// (`VALID`, `INVALID`, `SYNCING`, `ACCEPTED`, `INVALID_BLOCK_HASH`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PayloadStatusKind {
     Valid,
     Invalid,
@@ -99,6 +126,7 @@ pub struct ForkChoiceUpdatedResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionPayloadV3 {
     pub parent_hash: H256,
+    #[serde(with = "hex_address")]
     pub fee_recipient: [u8; 20],
     pub state_root: H256,
     pub receipts_root: H256,
@@ -194,10 +222,40 @@ mod hex_u256 {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(de)?;
         let stripped = s.strip_prefix("0x").unwrap_or(&s);
-        // Left-pad to 64 hex chars (32 bytes).
+        // Left-pad to 64 hex chars (32 bytes); reject overflow.
+        if stripped.len() > 64 {
+            return Err(serde::de::Error::custom(format!(
+                "u256 hex too long: {} chars (max 64)",
+                stripped.len()
+            )));
+        }
         let padded = format!("{stripped:0>64}");
         let bytes = hex::decode(&padded).map_err(serde::de::Error::custom)?;
         let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+}
+
+/// 20-byte Ethereum address as a `0x`-prefixed hex `DATA` string.
+mod hex_address {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 20], ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&format!("0x{}", hex::encode(v)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 20], D::Error> {
+        let s = String::deserialize(de)?;
+        let stripped = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(stripped).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 20 {
+            return Err(serde::de::Error::custom(format!(
+                "address expected 20 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut out = [0u8; 20];
         out.copy_from_slice(&bytes);
         Ok(out)
     }
@@ -252,5 +310,74 @@ mod tests {
         assert_eq!(s, r#"{"n":"0xdeadbeef"}"#);
         let back: Wrap = serde_json::from_str(&s).unwrap();
         assert_eq!(back.n, 0xdead_beef);
+    }
+
+    #[test]
+    fn payload_status_invalid_block_hash_uses_screaming_snake() {
+        let json = r#"{"status":"INVALID_BLOCK_HASH","latestValidHash":null,"validationError":"bad hash"}"#;
+        let parsed: PayloadStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.status, PayloadStatusKind::InvalidBlockHash);
+        let back = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            back.contains(r#""status":"INVALID_BLOCK_HASH""#),
+            "got: {back}"
+        );
+    }
+
+    #[test]
+    fn payload_id_is_hex_string_on_wire() {
+        let id = PayloadId([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#""0x0123456789abcdef""#);
+        let back: PayloadId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn payload_id_rejects_wrong_length() {
+        // 6 bytes instead of 8.
+        let err = serde_json::from_str::<PayloadId>(r#""0x010203040506""#).unwrap_err();
+        assert!(err.to_string().contains("expected 8 bytes"));
+    }
+
+    #[test]
+    fn address_serializes_as_hex_data_string() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            #[serde(with = "hex_address")]
+            addr: [u8; 20],
+        }
+        let w = Wrap { addr: [0xab; 20] };
+        let json = serde_json::to_string(&w).unwrap();
+        let expected = format!(r#"{{"addr":"0x{}"}}"#, "ab".repeat(20));
+        assert_eq!(json, expected);
+        let back: Wrap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.addr, w.addr);
+    }
+
+    #[test]
+    fn address_rejects_wrong_length() {
+        #[derive(Debug, Deserialize)]
+        struct Wrap {
+            #[serde(with = "hex_address")]
+            #[allow(dead_code)]
+            addr: [u8; 20],
+        }
+        let err = serde_json::from_str::<Wrap>(r#"{"addr":"0xabcd"}"#).unwrap_err();
+        assert!(err.to_string().contains("expected 20 bytes"));
+    }
+
+    #[test]
+    fn hex_u256_rejects_overflow_instead_of_panicking() {
+        #[derive(Debug, Deserialize)]
+        struct Wrap {
+            #[serde(with = "hex_u256")]
+            #[allow(dead_code)]
+            n: [u8; 32],
+        }
+        // 65 hex chars = 33 bytes > 32; must error, not panic.
+        let too_long = format!(r#"{{"n":"0x{}"}}"#, "a".repeat(65));
+        let err = serde_json::from_str::<Wrap>(&too_long).unwrap_err();
+        assert!(err.to_string().contains("too long"));
     }
 }
