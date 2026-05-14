@@ -424,7 +424,20 @@ impl BlockChainServer {
 
         let mut all_proofs = type_one_proofs;
         all_proofs.push(proposer_t1);
-        let infos: Vec<TypeOneInfo> = all_proofs.into_iter().map(|t1| t1.info).collect();
+        // Strip the per-component Type-1 proof bytes when packing the Type-2
+        // envelope. leanSpec PR #717 stores them inside `info[i].proof` to
+        // enable cheap split-without-SNARK, but with realistic
+        // lean-multisig devnet5 Type-1 sizes (~225 KiB) bundling N+1 copies
+        // overflows the 1 MiB `ByteListMiB` cap on the outer envelope.
+        // The merged proof bytes alone still verify the full binding;
+        // `split_type_2_by_message` is the SNARK-backed recovery path.
+        let infos: Vec<TypeOneInfo> = all_proofs
+            .into_iter()
+            .map(|t1| TypeOneInfo {
+                participants: t1.info.participants,
+                proof: ByteListMiB::default(),
+            })
+            .collect();
         let Ok(merged_infos) = TypeOneInfos::try_from(infos) else {
             error!(%slot, %validator_id, "Too many Type-1 infos for Type-2 envelope");
             metrics::inc_block_building_failures();
@@ -434,8 +447,12 @@ impl BlockChainServer {
             info: merged_infos,
             proof: merged_proof_bytes,
         };
-        let proof_bytes = ByteListMiB::try_from(merged_envelope.to_ssz())
-            .expect("merged Type-2 envelope fits in ByteListMiB");
+        let Ok(proof_bytes) = ByteListMiB::try_from(merged_envelope.to_ssz()).inspect_err(
+            |err| error!(%slot, %validator_id, ?err, "Merged Type-2 envelope exceeds ByteListMiB"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
         let signed_block = SignedBlock {
             message: block,
             proof: proof_bytes,

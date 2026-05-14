@@ -12,7 +12,7 @@ use ethlambda_types::{
         HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
     block::{
-        AggregatedAttestations, Block, BlockBody, SignedBlock, TypeOneMultiSignature,
+        AggregatedAttestations, Block, BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature,
         TypeTwoMultiSignature,
     },
     checkpoint::Checkpoint,
@@ -514,10 +514,12 @@ fn on_block_core(
     // Process block body attestations and feed them into the payload buffer
     // so fork choice's LMD GHOST overlay can see block-only votes.
     //
-    // The merged Type-2 envelope carries per-component Type-1 proof bytes
-    // inside `info[i].proof` (leanSpec PR #717), so we can recover real
-    // standalone Type-1s for each attestation without running a fresh SNARK
-    // and feed them into the payload buffer for downstream re-aggregation.
+    // The merged Type-2 envelope carries info-only (participants) entries
+    // for each component to keep the on-wire envelope under the 1 MiB cap.
+    // Standalone Type-1 proof bytes are not recoverable from a block;
+    // downstream re-aggregation has to come from the gossip channel or be
+    // SNARK-split with `split_type_2_by_message`. Entries we insert here
+    // are info-only, used only for fork-choice vote bookkeeping.
     let aggregated_attestations = &block.body.attestations;
     let merged = TypeTwoMultiSignature::from_ssz_bytes(signed_block.proof.iter().as_slice())
         .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
@@ -538,7 +540,7 @@ fn on_block_core(
         let hashed = HashedAttestationData::new(att.data.clone());
         let type_one = TypeOneMultiSignature {
             info: info.clone(),
-            proof: info.proof.clone(),
+            proof: ByteListMiB::default(),
         };
         known_entries.push((hashed, type_one));
         // Count each participating validator as a valid attestation.
