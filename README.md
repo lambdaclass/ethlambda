@@ -60,7 +60,7 @@ We welcome contributions! Please read our [CONTRIBUTING.md](./CONTRIBUTING.md) f
 - **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
 - **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
 - **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
-- **Ecosystem coordination**: the [open PQ Interop calls](https://github.com/ethereum/pm/issues/2055) cover cross-client Lean Ethereum work.
+- **Ecosystem coordination**: the [PQ Interop calls](https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle) on `ethereum/pm` cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.
 
 ## Philosophy
 
