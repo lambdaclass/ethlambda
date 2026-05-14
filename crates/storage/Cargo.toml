@@ -14,6 +14,7 @@ ethlambda-types.workspace = true
 
 tracing.workspace = true
 rocksdb.workspace = true
+thiserror.workspace = true
 
 libssz.workspace = true
 libssz-derive.workspace = true
