@@ -62,6 +62,7 @@ impl BlockChain {
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        crypto_merge_t1_into_t2: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -76,6 +77,7 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
+            crypto_merge_t1_into_t2,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -129,6 +131,16 @@ pub struct BlockChainServer {
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
+
+    /// When `true`, `propose_block` produces a real Type-2 SNARK by wrapping
+    /// the proposer signature as a singleton Type-1 and calling
+    /// `merge_type_1s_into_type_2`. Each call currently takes several seconds
+    /// on the actor thread and blocks the message loop, so the default is
+    /// `false`: a metadata-only Type-2 envelope ships and the verifier falls
+    /// back to its structural-only path (per-attestation crypto still runs at
+    /// gossip ingestion). Flip to `true` once the SNARK work is moved off
+    /// the actor thread.
+    crypto_merge_t1_into_t2: bool,
 }
 
 impl BlockChainServer {
@@ -339,10 +351,21 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
-        // singleton Type-1 SNARK, then merge it with every attestation Type-1
-        // into the block's single Type-2 proof (real lean-multisig devnet5
-        // cryptography, replacing the structural-only stub used before).
+        // Assemble SignedBlock. We have two paths:
+        //
+        // * `crypto_merge_t1_into_t2`: wrap the proposer's raw XMSS into a
+        //   singleton Type-1 SNARK and merge it with every attestation Type-1
+        //   into a real cryptographic Type-2. Correct but expensive — each
+        //   proof currently takes seconds on the actor thread, starving
+        //   interval-1 attestation production and blocking finality.
+        // * Stub path: produce a metadata-only Type-2 envelope (per-component
+        //   `participants` + empty proof bytes). Block-level verify falls back
+        //   to the structural check; per-attestation crypto verification still
+        //   runs at gossip ingestion.
+        //
+        // Until the SNARK work is moved off the actor thread, the stub path is
+        // the default so the rest of the protocol (attestations, fork choice,
+        // justification, finality) can make progress.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         let Some(proposer_validator) = validators.get(validator_id as usize) else {
@@ -350,87 +373,96 @@ impl BlockChainServer {
             metrics::inc_block_building_failures();
             return;
         };
-        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
+
+        let proposer_proof_bytes = if self.crypto_merge_t1_into_t2 {
+            let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+                |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
+            ) else {
+                metrics::inc_block_building_failures();
+                return;
+            };
+            let Ok(proposer_validator_signature) =
+                ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
+                    error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
+                })
+            else {
+                metrics::inc_block_building_failures();
+                return;
+            };
+            let Ok(proposer_t1_bytes) = ethlambda_crypto::aggregate_signatures(
+                vec![proposer_pubkey.clone()],
+                vec![proposer_validator_signature],
+                &block_root,
+                slot as u32,
+            )
+            .inspect_err(|err| {
+                error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1")
+            }) else {
+                metrics::inc_block_building_failures();
+                return;
+            };
+            proposer_t1_bytes
+        } else {
+            ByteListMiB::default()
         };
 
-        let Ok(proposer_validator_signature) =
-            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
-                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
-            })
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let Ok(proposer_t1_bytes) = ethlambda_crypto::aggregate_signatures(
-            vec![proposer_pubkey.clone()],
-            vec![proposer_validator_signature],
-            &block_root,
-            slot as u32,
-        )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let proposer_t1 = TypeOneMultiSignature::for_proposer(validator_id, proposer_t1_bytes);
+        let proposer_t1 =
+            TypeOneMultiSignature::for_proposer(validator_id, proposer_proof_bytes.clone());
 
-        // Resolve pubkeys per Type-1 component for merge_many_type_1. Attestation
-        // components use each participant's attestation_pubkey; the trailing
-        // proposer component uses the single proposal_pubkey.
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)> =
-            Vec::with_capacity(type_one_proofs.len() + 1);
-        let mut resolve_failed = false;
-        for t1 in &type_one_proofs {
-            let mut pubkeys = Vec::new();
-            for vid in t1.participant_indices() {
-                let Some(validator) = validators.get(vid as usize) else {
-                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
-                    resolve_failed = true;
-                    break;
-                };
-                match validator.get_attestation_pubkey() {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(err) => {
-                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+        let merged_proof_bytes = if self.crypto_merge_t1_into_t2 {
+            let proposer_pubkey = match proposer_validator.get_proposal_pubkey() {
+                Ok(pk) => pk,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            };
+            let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)> =
+                Vec::with_capacity(type_one_proofs.len() + 1);
+            let mut resolve_failed = false;
+            for t1 in &type_one_proofs {
+                let mut pubkeys = Vec::new();
+                for vid in t1.participant_indices() {
+                    let Some(validator) = validators.get(vid as usize) else {
+                        error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
                         resolve_failed = true;
                         break;
+                    };
+                    match validator.get_attestation_pubkey() {
+                        Ok(pk) => pubkeys.push(pk),
+                        Err(err) => {
+                            error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+                            resolve_failed = true;
+                            break;
+                        }
                     }
                 }
+                if resolve_failed {
+                    break;
+                }
+                merge_inputs.push((pubkeys, t1.proof.clone()));
             }
             if resolve_failed {
-                break;
+                metrics::inc_block_building_failures();
+                return;
             }
-            merge_inputs.push((pubkeys, t1.proof.clone()));
-        }
-        if resolve_failed {
-            metrics::inc_block_building_failures();
-            return;
-        }
-        merge_inputs.push((vec![proposer_pubkey], proposer_t1.proof.clone()));
+            merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        let Ok(merged_proof_bytes) = ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs)
-            .inspect_err(
-                |err| error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2"),
-            )
-        else {
-            metrics::inc_block_building_failures();
-            return;
+            match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            }
+        } else {
+            ByteListMiB::default()
         };
 
         let mut all_proofs = type_one_proofs;
         all_proofs.push(proposer_t1);
-        // Strip the per-component Type-1 proof bytes when packing the Type-2
-        // envelope. leanSpec PR #717 stores them inside `info[i].proof` to
-        // enable cheap split-without-SNARK, but with realistic
-        // lean-multisig devnet5 Type-1 sizes (~225 KiB) bundling N+1 copies
-        // overflows the 1 MiB `ByteListMiB` cap on the outer envelope.
-        // The merged proof bytes alone still verify the full binding;
-        // `split_type_2_by_message` is the SNARK-backed recovery path.
         let infos: Vec<TypeOneInfo> = all_proofs
             .into_iter()
             .map(|t1| TypeOneInfo {

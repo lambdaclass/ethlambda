@@ -1242,6 +1242,21 @@ pub fn verify_block_signatures(
 
     let structural_elapsed = total_start.elapsed();
 
+    // Skip crypto when the merged proof carries no SNARK bytes (the stub path
+    // used while the actor-thread SNARK work is being moved off-thread —
+    // per-attestation crypto still runs at gossip ingestion).
+    if merged.proof.is_empty() {
+        let total_elapsed = total_start.elapsed();
+        info!(
+            slot = block.slot,
+            attestation_count = attestations.len(),
+            ?structural_elapsed,
+            ?total_elapsed,
+            "Block Type-2 proof structural-only (empty SNARK bytes)"
+        );
+        return Ok(());
+    }
+
     // Resolve pubkeys per Type-2 component for verify_type_2 and rederive the
     // expected (message, slot) bindings from the block body. Attestation
     // components use each participant's attestation_pubkey; the trailing
