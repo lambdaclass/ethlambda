@@ -426,6 +426,8 @@
       return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
     }
 
+    // Tracked so render() can refresh the tooltip on each poll without
+    // requiring the user to move the mouse.
     let hoveredRoot = null;
 
     function tooltipHtml(d, data) {
