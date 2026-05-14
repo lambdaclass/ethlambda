@@ -47,6 +47,9 @@ pub enum AggregationError {
     #[error("child proof deserialization failed at index {0}")]
     ChildDeserializationFailed(usize),
 
+    #[error("outer proof deserialization failed")]
+    DeserializationFailed,
+
     #[error("need at least 2 children for recursive aggregation, got {0}")]
     InsufficientChildren(usize),
 
@@ -386,7 +389,7 @@ pub fn split_type_2_by_message(
 
     let type_2 =
         LMType2::decompress_without_pubkeys(proof_data.iter().as_slice(), pubkeys_per_info)
-            .ok_or(AggregationError::ChildDeserializationFailed(0))?;
+            .ok_or(AggregationError::DeserializationFailed)?;
 
     let matches: Vec<usize> = type_2
         .info

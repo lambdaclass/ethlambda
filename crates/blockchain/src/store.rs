@@ -793,6 +793,9 @@ pub enum StoreError {
     #[error("Proposer signature verification failed")]
     ProposerSignatureVerificationFailed,
 
+    #[error("Block slot {0} exceeds u32 range")]
+    SlotOutOfRange(u64),
+
     #[error("State transition failed: {0}")]
     StateTransitionFailed(#[from] ethlambda_state_transition::Error),
 
@@ -1243,8 +1246,24 @@ pub fn verify_block_signatures(
     let structural_elapsed = total_start.elapsed();
 
     // Skip crypto when the merged proof carries no SNARK bytes (the stub path
-    // used while the actor-thread SNARK work is being moved off-thread —
-    // per-attestation crypto still runs at gossip ingestion).
+    // used while the actor-thread SNARK work is being moved off-thread).
+    //
+    // SECURITY CAVEAT: in this branch the proposer's XMSS signature over the
+    // block root is NOT cryptographically verified — only the participants
+    // bitfield is checked against `block.proposer_index`. A peer that knows
+    // the elected proposer for a slot could submit a block claiming that
+    // proposer's authorship without holding the key. Two upstream mitigations
+    // still apply:
+    //   * `ethlambda_state_transition::process_block_header` rejects any block
+    //     whose `proposer_index` doesn't match the slot's elected proposer, so
+    //     impersonation of a *different* validator still fails the state
+    //     transition.
+    //   * Per-attestation Type-1 signatures continue to verify cryptographically
+    //     at gossip ingestion (`on_gossip_aggregated_attestation`), so the
+    //     attestation body of the block is still bound to real signers.
+    // The stub path is a devnet-only convenience pending the SNARK off-thread
+    // refactor; production / interop deployments should run with
+    // `--crypto-merge-t1-into-t2`.
     if merged.proof.is_empty() {
         let total_elapsed = total_start.elapsed();
         info!(
@@ -1252,7 +1271,7 @@ pub fn verify_block_signatures(
             attestation_count = attestations.len(),
             ?structural_elapsed,
             ?total_elapsed,
-            "Block Type-2 proof structural-only (empty SNARK bytes)"
+            "Block Type-2 proof structural-only (empty SNARK bytes — proposer sig not crypto-verified)"
         );
         return Ok(());
     }
@@ -1278,7 +1297,7 @@ pub fn verify_block_signatures(
         }
         pubkeys_per_component.push(pubkeys);
         let slot_u32 = u32::try_from(attestation.data.slot)
-            .map_err(|_| StoreError::ProposerSignatureVerificationFailed)?;
+            .map_err(|_| StoreError::SlotOutOfRange(attestation.data.slot))?;
         expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
     }
 
@@ -1290,7 +1309,7 @@ pub fn verify_block_signatures(
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     pubkeys_per_component.push(vec![proposer_pubkey]);
     let block_slot_u32 =
-        u32::try_from(block.slot).map_err(|_| StoreError::ProposerSignatureVerificationFailed)?;
+        u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
     expected_bindings.push((block_root, block_slot_u32));
 
     let crypto_start = std::time::Instant::now();

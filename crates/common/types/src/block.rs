@@ -118,6 +118,15 @@ pub struct TypeTwoMultiSignature {
 impl TypeOneMultiSignature {
     /// Build a Type-1 proof carrying the given participant bitfield and the
     /// aggregated proof bytes.
+    ///
+    /// `info.proof` and the outer `proof` carry the same bytes. This mirrors
+    /// leanSpec PR #717's shape (`aggregate_type_1` returns
+    /// `TypeOneMultiSignature(info=TypeOneInfo(participants, proof=wire),
+    /// proof=wire)`) so that a Type-1 embedded inside a Type-2's `info[i]`
+    /// reads the same as a standalone Type-1. The cost is one extra heap copy
+    /// of ~225 KiB per Type-1 — acceptable in the gossip pipeline; if it
+    /// shows up in profiling, swap the inner `ByteListMiB` for an
+    /// `Arc<ByteListMiB>` once SSZ derive supports it.
     pub fn new(participants: AggregationBits, proof_data: ByteListMiB) -> Self {
         Self {
             info: TypeOneInfo {

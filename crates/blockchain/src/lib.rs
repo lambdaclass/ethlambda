@@ -374,13 +374,23 @@ impl BlockChainServer {
             return;
         };
 
-        let proposer_proof_bytes = if self.crypto_merge_t1_into_t2 {
-            let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
-                |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-            ) else {
-                metrics::inc_block_building_failures();
-                return;
-            };
+        // Decode the proposer's proposal pubkey once and reuse it both for the
+        // singleton Type-1 wrap and for the Type-2 merge inputs. Only needed on
+        // the crypto path; the stub path doesn't reference it.
+        let proposer_pubkey_opt = if self.crypto_merge_t1_into_t2 {
+            match proposer_validator.get_proposal_pubkey() {
+                Ok(pk) => Some(pk),
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let proposer_proof_bytes = if let Some(ref proposer_pubkey) = proposer_pubkey_opt {
             let Ok(proposer_validator_signature) =
                 ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
                     error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
@@ -409,15 +419,7 @@ impl BlockChainServer {
         let proposer_t1 =
             TypeOneMultiSignature::for_proposer(validator_id, proposer_proof_bytes.clone());
 
-        let merged_proof_bytes = if self.crypto_merge_t1_into_t2 {
-            let proposer_pubkey = match proposer_validator.get_proposal_pubkey() {
-                Ok(pk) => pk,
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey");
-                    metrics::inc_block_building_failures();
-                    return;
-                }
-            };
+        let merged_proof_bytes = if let Some(proposer_pubkey) = proposer_pubkey_opt {
             let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)> =
                 Vec::with_capacity(type_one_proofs.len() + 1);
             let mut resolve_failed = false;
