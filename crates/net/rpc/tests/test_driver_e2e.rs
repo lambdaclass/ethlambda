@@ -68,7 +68,7 @@ fn genesis_anchor_block_json(genesis_time: u64) -> Value {
 }
 
 fn fresh_driver() -> DriverState {
-    Arc::new(RwLock::new(empty_driver_store()))
+    Arc::new(RwLock::new(empty_driver_store().unwrap()))
 }
 
 async fn post(router: &axum::Router, path: &str, body: &Value) -> (StatusCode, Value) {
@@ -110,7 +110,7 @@ async fn init_with_genesis_anchor_returns_204_and_resets_store() {
 
     // The driver's store should now reflect the supplied genesis time.
     let guard = driver.read().await;
-    assert_eq!(guard.config().genesis_time, 1234);
+    assert_eq!(guard.config().unwrap().genesis_time, 1234);
 }
 
 #[tokio::test]

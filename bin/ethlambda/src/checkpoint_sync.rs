@@ -19,6 +19,8 @@ pub enum CheckpointSyncError {
     Http(#[from] reqwest::Error),
     #[error("SSZ deserialization failed: {0:?}")]
     SszDecode(DecodeError),
+    #[error("Storage error: {0}")]
+    Storage(#[from] ethlambda_storage::Error),
     #[error("checkpoint state slot cannot be 0")]
     SlotIsZero,
     #[error("checkpoint state has no validators")]

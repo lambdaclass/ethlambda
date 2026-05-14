@@ -19,21 +19,20 @@
 //!
 //! Activated by setting `HIVE_LEAN_TEST_DRIVER=1` in the container env; see
 //! [`test_driver_enabled`] and the boot path in `bin/ethlambda/src/main.rs`.
-
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
     extract::State as AxumState,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{get, post},
 };
 use ethlambda_blockchain::{
     MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     store::{self, verify_block_signatures},
 };
-use ethlambda_storage::{Store, backend::InMemoryBackend};
+use ethlambda_storage::{Error, Store, backend::InMemoryBackend};
 use ethlambda_test_fixtures::{
     Block as FixtureBlock, TestState, fork_choice::ForkChoiceStep,
     state_transition::StateTransitionRunRequest, verify_signatures::TestSignedBlock,
@@ -81,7 +80,7 @@ pub type DriverState = Arc<RwLock<Store>>;
 /// Build an empty in-memory Store with no validators.
 ///
 /// Used as the placeholder seed before the first `fork_choice/init` call.
-pub fn empty_driver_store() -> Store {
+pub fn empty_driver_store() -> Result<Store, Error> {
     let backend = Arc::new(InMemoryBackend::new());
     Store::from_anchor_state(backend, State::from_genesis(0, vec![]))
 }
@@ -191,15 +190,13 @@ struct VerifySignaturesResponse {
 async fn init_fork_choice(
     AxumState(driver): AxumState<DriverState>,
     Json(request): Json<InitForkChoiceRequest>,
-) -> Response {
+) -> impl IntoResponse {
     let mut state: State = request.anchor_state.into();
     if let Some(genesis_time) = request.genesis_time {
         state.config.genesis_time = genesis_time;
     }
     let block: Block = request.anchor_block.into();
 
-    // Mirror Store::get_forkchoice_store's invariants explicitly so we can
-    // surface a clean 400 instead of panicking the handler task.
     if !anchor_pair_is_consistent(&mut state, &block) {
         return (
             StatusCode::BAD_REQUEST,
@@ -209,7 +206,10 @@ async fn init_fork_choice(
     }
 
     let backend = Arc::new(InMemoryBackend::new());
-    let new_store = Store::from_anchor_state(backend, state);
+    let new_store = match Store::from_anchor_state(backend, state) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
 
     *driver.write().await = new_store;
 
@@ -224,11 +224,7 @@ async fn init_fork_choice(
 async fn step_fork_choice(
     AxumState(driver): AxumState<DriverState>,
     Json(step): Json<ForkChoiceStep>,
-) -> Json<StepResponse> {
-    // Hold the write guard across both the step and the snapshot read so the
-    // returned snapshot reflects this step (and no interleaved request can
-    // mutate the store in between, even though the hive simulator drives
-    // steps serially per fixture).
+) -> impl IntoResponse {
     let mut guard = driver.write().await;
     let outcome = apply_step(&mut guard, step);
     let (accepted, error) = match outcome {
@@ -238,13 +234,17 @@ async fn step_fork_choice(
             (false, Some(err))
         }
     };
-    let snapshot = snapshot_store(&guard);
+    let snapshot = match snapshot_store(&guard) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     drop(guard);
     Json(StepResponse {
         accepted,
         error,
         snapshot,
     })
+    .into_response()
 }
 
 /// `POST /lean/v0/test_driver/state_transition/run`
@@ -378,7 +378,7 @@ fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
 fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
     match step.step_type.as_str() {
         "tick" => {
-            let genesis_time = store.config().genesis_time;
+            let genesis_time = store.config().map_err(|e| e.to_string())?.genesis_time;
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
@@ -396,7 +396,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             let signed_block = block_data.to_blank_signed_block();
             // Match the spec-test runner: advance time to the block's slot
             // before importing so the future-slot guard doesn't reject it.
-            let block_time_ms = store.config().genesis_time * 1000
+            let block_time_ms = store.config().map_err(|e| e.to_string())?.genesis_time * 1000
                 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
             store::on_tick(store, block_time_ms, true);
             store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
@@ -453,15 +453,15 @@ fn post_summary(state: &State) -> StateTransitionPost {
 }
 
 /// Snapshot the store fields exposed by the fork-choice `step` response.
-fn snapshot_store(store: &Store) -> DriverSnapshot {
-    DriverSnapshot {
-        head_slot: store.head_slot(),
-        head_root: store.head(),
-        time: store.time(),
-        justified_checkpoint: store.latest_justified(),
-        finalized_checkpoint: store.latest_finalized(),
-        safe_target: store.safe_target(),
-    }
+fn snapshot_store(store: &Store) -> Result<DriverSnapshot, Error> {
+    Ok(DriverSnapshot {
+        head_slot: store.head_slot()?,
+        head_root: store.head()?,
+        time: store.time()?,
+        justified_checkpoint: store.latest_justified()?,
+        finalized_checkpoint: store.latest_finalized()?,
+        safe_target: store.safe_target()?,
+    })
 }
 
 #[cfg(test)]
@@ -480,12 +480,12 @@ mod tests {
 
     #[test]
     fn empty_driver_store_is_usable_as_seed() {
-        let store = empty_driver_store();
+        let store = empty_driver_store().unwrap();
         // Head, time, checkpoints all read without panicking; that's the
         // contract `init_fork_choice` relies on before the first reset.
         let _ = store.head();
-        assert_eq!(store.time(), 0);
-        assert_eq!(store.latest_justified().slot, 0);
-        assert_eq!(store.latest_finalized().slot, 0);
+        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.latest_justified().unwrap().slot, 0);
+        assert_eq!(store.latest_finalized().unwrap().slot, 0);
     }
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
-use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageWriteBatch, Table, Error};
 
 use ethlambda_types::{
     attestation::{AttestationData, HashedAttestationData, bits_is_subset},
@@ -461,7 +461,7 @@ impl Store {
     ///
     /// Uses the state's `latest_block_header` as the anchor block header.
     /// No block body is stored since it's not available.
-    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
+    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Result<Self, Error> {
         Self::init_store(backend, anchor_state, None)
     }
 
@@ -478,7 +478,7 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         anchor_state: State,
         anchor_block: Block,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // Compare headers with state_root zeroed (init_store handles state_root separately)
         let mut state_header = anchor_state.latest_block_header.clone();
         let mut block_header = anchor_block.header();
@@ -500,7 +500,7 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_body: Option<BlockBody>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // Save original state_root for validation
         let original_state_root = anchor_state.latest_block_header.state_root;
 
@@ -528,7 +528,7 @@ impl Store {
 
         // Insert initial data
         {
-            let mut batch = backend.begin_write().expect("write batch");
+            let mut batch = backend.begin_write()?;
 
             // Metadata
             let metadata_entries = vec![
@@ -539,74 +539,60 @@ impl Store {
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
             ];
-            batch
-                .put_batch(Table::Metadata, metadata_entries)
-                .expect("put metadata");
+            batch.put_batch(Table::Metadata, metadata_entries)?;
 
             // Block header
             let header_entries = vec![(
                 anchor_block_root.to_ssz(),
                 anchor_state.latest_block_header.to_ssz(),
             )];
-            batch
-                .put_batch(Table::BlockHeaders, header_entries)
-                .expect("put block header");
+            batch.put_batch(Table::BlockHeaders, header_entries)?;
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
                 let body_entries = vec![(anchor_block_root.to_ssz(), body.to_ssz())];
-                batch
-                    .put_batch(Table::BlockBodies, body_entries)
-                    .expect("put block body");
+                batch.put_batch(Table::BlockBodies, body_entries)?;
             }
 
             // State
             let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
-            batch
-                .put_batch(Table::States, state_entries)
-                .expect("put state");
+            batch.put_batch(Table::States, state_entries)?;
 
             // Live chain index
             let index_entries = vec![(
                 encode_live_chain_key(anchor_state.latest_block_header.slot, &anchor_block_root),
                 anchor_state.latest_block_header.parent_root.to_ssz(),
             )];
-            batch
-                .put_batch(Table::LiveChain, index_entries)
-                .expect("put live chain index");
+            batch.put_batch(Table::LiveChain, index_entries)?;
 
-            batch.commit().expect("commit");
+            batch.commit()?;
         }
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self {
+        Ok(Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-        }
+        })
     }
 
     // ============ Metadata Helpers ============
 
-    fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
-        let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::Metadata, key)
-            .expect("get")
-            .expect("metadata key exists");
-        T::from_ssz_bytes(&bytes).expect("valid encoding")
+    fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
+        let view = self.backend.begin_read()?;
+        let bytes = view.get(Table::Metadata, key)?.ok_or("Metadata key not found")?;
+        T::from_ssz_bytes(&bytes).map_err(|e| e.into())
     }
 
-    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
-        let mut batch = self.backend.begin_write().expect("write batch");
+    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error>{
+        let mut batch = self.backend.begin_write()?;
         batch
-            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
-            .expect("put metadata");
-        batch.commit().expect("commit");
+            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])?;
+        batch.commit()
     }
 
     // ============ Time ============
@@ -616,50 +602,50 @@ impl Store {
     /// Each increment represents one 800ms interval. Derive slot/interval as:
     ///   slot     = time() / INTERVALS_PER_SLOT
     ///   interval = time() % INTERVALS_PER_SLOT
-    pub fn time(&self) -> u64 {
+    pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
     }
 
     /// Sets the current store time.
-    pub fn set_time(&mut self, time: u64) {
-        self.set_metadata(KEY_TIME, &time);
+    pub fn set_time(&mut self, time: u64) -> Result<(), Error> {
+        self.set_metadata(KEY_TIME, &time)
     }
 
     // ============ Config ============
 
     /// Returns the chain configuration.
-    pub fn config(&self) -> ChainConfig {
+    pub fn config(&self) -> Result<ChainConfig, Error> {
         self.get_metadata(KEY_CONFIG)
     }
 
     // ============ Head ============
 
     /// Returns the current head block root.
-    pub fn head(&self) -> H256 {
+    pub fn head(&self) -> Result<H256, Error> {
         self.get_metadata(KEY_HEAD)
     }
 
     // ============ Safe Target ============
 
     /// Returns the safe target block root for attestations.
-    pub fn safe_target(&self) -> H256 {
+    pub fn safe_target(&self) -> Result<H256,Error> {
         self.get_metadata(KEY_SAFE_TARGET)
     }
 
     /// Sets the safe target block root.
-    pub fn set_safe_target(&mut self, safe_target: H256) {
-        self.set_metadata(KEY_SAFE_TARGET, &safe_target);
+    pub fn set_safe_target(&mut self, safe_target: H256) -> Result<(), Error> {
+        self.set_metadata(KEY_SAFE_TARGET, &safe_target)
     }
 
     // ============ Checkpoints ============
 
     /// Returns the latest justified checkpoint.
-    pub fn latest_justified(&self) -> Checkpoint {
+    pub fn latest_justified(&self) -> Result<Checkpoint, Error> {
         self.get_metadata(KEY_LATEST_JUSTIFIED)
     }
 
     /// Returns the latest finalized checkpoint.
-    pub fn latest_finalized(&self) -> Checkpoint {
+    pub fn latest_finalized(&self) -> Result<Checkpoint, Error> {
         self.get_metadata(KEY_LATEST_FINALIZED)
     }
 
@@ -672,9 +658,9 @@ impl Store {
     /// - Finalized is updated if provided.
     ///
     /// When finalization advances, prunes the LiveChain index.
-    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) -> Result<(), Error> {
         // Read old finalized slot before updating metadata
-        let old_finalized_slot = self.latest_finalized().slot;
+        let old_finalized_slot = self.latest_finalized()?.slot;
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
@@ -686,18 +672,18 @@ impl Store {
             entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()));
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch.put_batch(Table::Metadata, entries).expect("put");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::Metadata, entries)?;
+        batch.commit()?;
 
         // Lightweight pruning that should happen immediately on finalization advance:
         // live chain index, signatures, and attestation data. These are cheap and
         // affect fork choice correctness (live chain) or attestation processing.
         // Heavy state/block pruning is deferred to prune_old_data().
-        if let Some(finalized) = checkpoints.finalized
+        Ok(if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self.prune_live_chain(finalized.slot);
+            let pruned_chain = self.prune_live_chain(finalized.slot)?;
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
 
             if pruned_chain > 0 || pruned_sigs > 0 {
@@ -706,7 +692,7 @@ impl Store {
                     pruned_chain, pruned_sigs, "Pruned finalized data"
                 );
             }
-        }
+        })
     }
 
     /// Prune old states and blocks to keep storage bounded.
@@ -715,13 +701,13 @@ impl Store {
     /// pruning until after a batch of blocks has been fully processed. Running
     /// this mid-cascade would delete states that pending children still need,
     /// causing infinite re-processing loops when fallback pruning is active.
-    pub fn prune_old_data(&mut self) {
-        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
-        let pruned_states = self.prune_old_states(&protected_roots);
-        let pruned_blocks = self.prune_old_blocks(&protected_roots);
-        if pruned_states > 0 || pruned_blocks > 0 {
+    pub fn prune_old_data(&mut self) -> Result<(), Error> {
+        let protected_roots = [self.latest_finalized()?.root, self.latest_justified()?.root];
+        let pruned_states = self.prune_old_states(&protected_roots)?;
+        let pruned_blocks = self.prune_old_blocks(&protected_roots)?;
+        Ok(if pruned_states > 0 || pruned_blocks > 0 {
             info!(pruned_states, pruned_blocks, "Pruned old states and blocks");
-        }
+        })
     }
 
     // ============ Blocks ============
@@ -730,15 +716,14 @@ impl Store {
     ///
     /// Iterates only the LiveChain table, avoiding Block deserialization.
     /// Returns only non-finalized blocks, automatically pruned on finalization.
-    pub fn get_live_chain(&self) -> HashMap<H256, (u64, H256)> {
-        let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, v)| {
+    pub fn get_live_chain(&self) -> Result<HashMap<H256, (u64, H256)>, Error> {
+        let view = self.backend.begin_read()?;
+        view.prefix_iterator(Table::LiveChain, &[])?
+            .map(|res| -> Result<(H256, (u64, H256)), Error> {
+                let (k, v) = res?;
                 let (slot, root) = decode_live_chain_key(&k);
-                let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
-                (root, (slot, parent_root))
+                let parent_root = H256::from_ssz_bytes(&v).map_err(|e| -> Error { Box::new(e) })?;
+                Ok((root, (slot, parent_root)))
             })
             .collect()
     }
@@ -746,14 +731,13 @@ impl Store {
     /// Get all known block roots as HashSet.
     ///
     /// Useful for checking block existence without deserializing.
-    pub fn get_block_roots(&self) -> HashSet<H256> {
-        let view = self.backend.begin_read().expect("read view");
-        view.prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(k, _)| {
+    pub fn get_block_roots(&self) -> Result<HashSet<H256>, Error> {
+        let view = self.backend.begin_read()?;
+        view.prefix_iterator(Table::LiveChain, &[])?
+            .map(|res| -> Result<H256, Error> {
+                let (k, _) = res?;
                 let (_, root) = decode_live_chain_key(&k);
-                root
+                Ok(root)
             })
             .collect()
     }
@@ -764,14 +748,13 @@ impl Store {
     /// LiveChain index is pruned.
     ///
     /// Returns the number of entries pruned.
-    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> usize {
-        let view = self.backend.begin_read().expect("read view");
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> Result<usize, Error> {
+        let view = self.backend.begin_read()?;
 
         // Collect keys to delete - stop once we hit finalized_slot
         // Keys are sorted by slot (big-endian encoding) so we can stop early
         let keys_to_delete: Vec<_> = view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
+            .prefix_iterator(Table::LiveChain, &[])?
             .filter_map(|res| res.ok())
             .take_while(|(k, _)| {
                 let (slot, _) = decode_live_chain_key(k);
@@ -783,15 +766,13 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count == 0 {
-            return 0;
+            return Ok(0);
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::LiveChain, keys_to_delete)
-            .expect("delete non-finalized chain entries");
-        batch.commit().expect("commit");
-        count
+        let mut batch = self.backend.begin_write()?;
+        batch.delete_batch(Table::LiveChain, keys_to_delete)?;
+        batch.commit()?;
+        Ok(count)
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
@@ -808,23 +789,22 @@ impl Store {
     /// states whose roots appear in `protected_roots` (finalized, justified).
     ///
     /// Returns the number of states pruned.
-    pub fn prune_old_states(&mut self, protected_roots: &[H256]) -> usize {
-        let view = self.backend.begin_read().expect("read view");
+    pub fn prune_old_states(&mut self, protected_roots: &[H256]) -> Result<usize, Error> {
+        let view = self.backend.begin_read()?;
 
         // Collect (root_bytes, slot) from BlockHeaders to determine state age.
+        // Intentionally skip corrupt entries with filter_map + ok().
         let mut entries: Vec<(Vec<u8>, u64)> = view
-            .prefix_iterator(Table::BlockHeaders, &[])
-            .expect("iterator")
+            .prefix_iterator(Table::BlockHeaders, &[])?
             .filter_map(|res| res.ok())
-            .map(|(key, value)| {
-                let header = BlockHeader::from_ssz_bytes(&value).expect("valid header");
-                (key.to_vec(), header.slot)
+            .filter_map(|(key, value)| {
+                BlockHeader::from_ssz_bytes(&value).ok().map(|h| (key.to_vec(), h.slot))
             })
             .collect();
         drop(view);
 
         if entries.len() <= STATES_TO_KEEP {
-            return 0;
+            return Ok(0);
         }
 
         // Sort by slot descending (newest first)
@@ -842,13 +822,11 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count > 0 {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::States, keys_to_delete)
-                .expect("delete old states");
-            batch.commit().expect("commit");
+            let mut batch = self.backend.begin_write()?;
+            batch.delete_batch(Table::States, keys_to_delete)?;
+            batch.commit()?;
         }
-        count
+        Ok(count)
     }
 
     /// Prune old blocks beyond the retention window.
@@ -858,22 +836,21 @@ impl Store {
     /// Deletes from `BlockHeaders`, `BlockBodies`, and `BlockSignatures`.
     ///
     /// Returns the number of blocks pruned.
-    pub fn prune_old_blocks(&mut self, protected_roots: &[H256]) -> usize {
-        let view = self.backend.begin_read().expect("read view");
+    pub fn prune_old_blocks(&mut self, protected_roots: &[H256]) -> Result<usize, Error> {
+        let view = self.backend.begin_read()?;
 
+        // Intentionally skip corrupt entries with filter_map + ok().
         let mut entries: Vec<(Vec<u8>, u64)> = view
-            .prefix_iterator(Table::BlockHeaders, &[])
-            .expect("iterator")
+            .prefix_iterator(Table::BlockHeaders, &[])?
             .filter_map(|res| res.ok())
-            .map(|(key, value)| {
-                let header = BlockHeader::from_ssz_bytes(&value).expect("valid header");
-                (key.to_vec(), header.slot)
+            .filter_map(|(key, value)| {
+                BlockHeader::from_ssz_bytes(&value).ok().map(|h| (key.to_vec(), h.slot))
             })
             .collect();
         drop(view);
 
         if entries.len() <= BLOCKS_TO_KEEP {
-            return 0;
+            return Ok(0);
         }
 
         // Sort by slot descending (newest first)
@@ -890,27 +867,21 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count > 0 {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::BlockHeaders, keys_to_delete.clone())
-                .expect("delete old block headers");
-            batch
-                .delete_batch(Table::BlockBodies, keys_to_delete.clone())
-                .expect("delete old block bodies");
-            batch
-                .delete_batch(Table::BlockSignatures, keys_to_delete)
-                .expect("delete old block signatures");
-            batch.commit().expect("commit");
+            let mut batch = self.backend.begin_write()?;
+            batch.delete_batch(Table::BlockHeaders, keys_to_delete.clone())?;
+            batch.delete_batch(Table::BlockBodies, keys_to_delete.clone())?;
+            batch.delete_batch(Table::BlockSignatures, keys_to_delete)?;
+            batch.commit()?;
         }
-        count
+        Ok(count)
     }
 
     /// Get the block header by root.
-    pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
+    pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
+        let view = self.backend.begin_read()?;
+        view.get(Table::BlockHeaders, &root.to_ssz())?
+            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).map_err(|e| -> Error { Box::new(e) }))
+            .transpose()
     }
 
     // ============ Signed Blocks ============
@@ -924,10 +895,10 @@ impl Store {
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
-    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        write_signed_block(batch.as_mut(), &root, signed_block);
-        batch.commit().expect("commit");
+    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) -> Result<(), Error> {
+        let mut batch = self.backend.begin_write()?;
+        write_signed_block(batch.as_mut(), &root, signed_block)?;
+        batch.commit()
     }
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -937,75 +908,81 @@ impl Store {
     /// only storing signatures for non-genesis blocks.
     ///
     /// Takes ownership to avoid cloning large signature data.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let block = write_signed_block(batch.as_mut(), &root, signed_block);
+    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) -> Result<(), Error> {
+        let mut batch = self.backend.begin_write()?;
+        let block = write_signed_block(batch.as_mut(), &root, signed_block)?;
 
         let index_entries = vec![(
             encode_live_chain_key(block.slot, &root),
             block.parent_root.to_ssz(),
         )];
-        batch
-            .put_batch(Table::LiveChain, index_entries)
-            .expect("put non-finalized chain index");
+        batch.put_batch(Table::LiveChain, index_entries)?;
 
-        batch.commit().expect("commit");
+        batch.commit()
     }
 
     /// Get a signed block by combining header, body, and signatures.
     ///
     /// Returns None if any of the components are not found.
     /// Note: Genesis block has no entry in BlockSignatures table.
-    pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
-        let view = self.backend.begin_read().expect("read view");
+    pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
+        let view = self.backend.begin_read()?;
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key)? else {
+            return Ok(None);
+        };
+        let Some(sig_bytes) = view.get(Table::BlockSignatures, &key)? else {
+            return Ok(None);
+        };
 
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+        let header = BlockHeader::from_ssz_bytes(&header_bytes)
+            .map_err(|e| -> Error { Box::new(e) })?;
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
-            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
+                return Ok(None);
+            };
+            BlockBody::from_ssz_bytes(&body_bytes)
+                .map_err(|e| -> Error { Box::new(e) })?
         };
 
         let block = Block::from_header_and_body(header, body);
-        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
+        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes)
+            .map_err(|e| -> Error { Box::new(e) })?;
 
-        Some(SignedBlock {
+        Ok(Some(SignedBlock {
             message: block,
             signature,
-        })
+        }))
     }
 
     // ============ States ============
 
     /// Returns the state for the given block root.
-    pub fn get_state(&self, root: &H256) -> Option<State> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+    pub fn get_state(&self, root: &H256) -> Result<Option<State>, Error> {
+        let view = self.backend.begin_read()?;
+        view.get(Table::States, &root.to_ssz())?
+            .map(|bytes| State::from_ssz_bytes(&bytes).map_err(|e| -> Error { Box::new(e) }))
+            .transpose()
     }
 
     /// Returns whether a state exists for the given block root.
-    pub fn has_state(&self, root: &H256) -> bool {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::States, &root.to_ssz())
-            .expect("get")
-            .is_some()
+    pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
+        let view = self.backend.begin_read()?;
+        Ok(view.get(Table::States, &root.to_ssz())?
+            .is_some())
     }
 
     /// Stores a state indexed by block root.
-    pub fn insert_state(&mut self, root: H256, state: State) {
-        let mut batch = self.backend.begin_write().expect("write batch");
+    pub fn insert_state(&mut self, root: H256, state: State) -> Result<(), Error> {
+        let mut batch = self.backend.begin_write()?;
         let entries = vec![(root.to_ssz(), state.to_ssz())];
-        batch.put_batch(Table::States, entries).expect("put state");
-        batch.commit().expect("commit");
+        batch.put_batch(Table::States, entries)?;
+        batch.commit()
     }
 
     // ============ Attestation Extraction ============
@@ -1190,23 +1167,23 @@ impl Store {
     // ============ Derived Accessors ============
 
     /// Returns the slot of the current head block.
-    pub fn head_slot(&self) -> u64 {
-        self.get_block_header(&self.head())
-            .expect("head block exists")
-            .slot
+    pub fn head_slot(&self) -> Result<u64, Error> {
+        Ok(self.get_block_header(&self.head()?)?
+            .ok_or_else(|| -> Error { "head block header not found".into() })?
+            .slot)
     }
 
     /// Returns the slot of the current safe target block.
-    pub fn safe_target_slot(&self) -> u64 {
-        self.get_block_header(&self.safe_target())
-            .expect("safe target exists")
-            .slot
+    pub fn safe_target_slot(&self) -> Result<u64, Error> {
+        Ok(self.get_block_header(&self.safe_target()?)?
+            .ok_or_else(|| -> Error { "safe target block header not found".into() })?
+            .slot)
     }
 
     /// Returns a clone of the head state.
-    pub fn head_state(&self) -> State {
-        self.get_state(&self.head())
-            .expect("head state is always available")
+    pub fn head_state(&self) -> Result<State, Error> {
+        self.get_state(&self.head()?)?
+            .ok_or_else(|| "head state not found".into())
     }
 }
 
@@ -1218,7 +1195,7 @@ fn write_signed_block(
     batch: &mut dyn StorageWriteBatch,
     root: &H256,
     signed_block: SignedBlock,
-) -> Block {
+) -> Result<Block, Error> {
     let SignedBlock {
         message: block,
         signature,
@@ -1228,24 +1205,18 @@ fn write_signed_block(
     let root_bytes = root.to_ssz();
 
     let header_entries = vec![(root_bytes.clone(), header.to_ssz())];
-    batch
-        .put_batch(Table::BlockHeaders, header_entries)
-        .expect("put block header");
+    batch.put_batch(Table::BlockHeaders, header_entries)?;
 
     // Skip storing empty bodies - they can be reconstructed from the header's body_root
     if header.body_root != *EMPTY_BODY_ROOT {
         let body_entries = vec![(root_bytes.clone(), block.body.to_ssz())];
-        batch
-            .put_batch(Table::BlockBodies, body_entries)
-            .expect("put block body");
+        batch.put_batch(Table::BlockBodies, body_entries)?;
     }
 
     let sig_entries = vec![(root_bytes, signature.to_ssz())];
-    batch
-        .put_batch(Table::BlockSignatures, sig_entries)
-        .expect("put block signatures");
+    batch.put_batch(Table::BlockSignatures, sig_entries)?;
 
-    block
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -1352,7 +1323,7 @@ mod tests {
             BLOCKS_TO_KEEP
         );
 
-        let pruned = store.prune_old_blocks(&[]);
+        let pruned = store.prune_old_blocks(&[]).unwrap();
         assert_eq!(pruned, 0);
         assert_eq!(
             count_entries(backend.as_ref(), Table::BlockHeaders),
@@ -1371,7 +1342,7 @@ mod tests {
         }
         assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), total);
 
-        let pruned = store.prune_old_blocks(&[]);
+        let pruned = store.prune_old_blocks(&[]).unwrap();
         assert_eq!(pruned, 10);
         assert_eq!(
             count_entries(backend.as_ref(), Table::BlockHeaders),
@@ -1409,7 +1380,7 @@ mod tests {
         // Protect the two oldest blocks (slots 0 and 1)
         let finalized_root = root(0);
         let justified_root = root(1);
-        let pruned = store.prune_old_blocks(&[finalized_root, justified_root]);
+        let pruned = store.prune_old_blocks(&[finalized_root, justified_root]).unwrap();
 
         // 10 would be pruned, but 2 are protected
         assert_eq!(pruned, 8);
@@ -1452,7 +1423,7 @@ mod tests {
             STATES_TO_KEEP
         );
 
-        let pruned = store.prune_old_states(&[]);
+        let pruned = store.prune_old_states(&[]).unwrap();
         assert_eq!(pruned, 0);
     }
 
@@ -1468,7 +1439,7 @@ mod tests {
         }
         assert_eq!(count_entries(backend.as_ref(), Table::States), total);
 
-        let pruned = store.prune_old_states(&[]);
+        let pruned = store.prune_old_states(&[]).unwrap();
         assert_eq!(pruned, 5);
         assert_eq!(
             count_entries(backend.as_ref(), Table::States),
@@ -1498,7 +1469,7 @@ mod tests {
 
         let finalized_root = root(0);
         let justified_root = root(2);
-        let pruned = store.prune_old_states(&[finalized_root, justified_root]);
+        let pruned = store.prune_old_states(&[finalized_root, justified_root]).unwrap();
 
         // 5 would be pruned, but 2 are protected
         assert_eq!(pruned, 3);
@@ -1559,13 +1530,13 @@ mod tests {
         // Use the last inserted root as head. Calling update_checkpoints with
         // head_only triggers the fallback path (finalization doesn't advance).
         let head_root = root(total_states as u64 - 1);
-        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
+        store.update_checkpoints(ForkCheckpoints::head_only(head_root)).unwrap();
 
         // update_checkpoints no longer prunes states/blocks inline — the caller
         // must invoke prune_old_data() separately (after a block cascade completes).
         assert_eq!(count_entries(backend.as_ref(), Table::States), total_states);
 
-        store.prune_old_data();
+        store.prune_old_data().unwrap();
 
         // 3005 headers total. Top 3000 by slot are kept in the retention window,
         // leaving 5 candidates. 2 are protected (finalized + justified),
@@ -1610,8 +1581,8 @@ mod tests {
 
         // Use the last inserted root as head
         let head_root = root(STATES_TO_KEEP as u64 - 1);
-        store.update_checkpoints(ForkCheckpoints::head_only(head_root));
-        store.prune_old_data();
+        store.update_checkpoints(ForkCheckpoints::head_only(head_root)).unwrap();
+        store.prune_old_data().unwrap();
 
         // Nothing should be pruned (within retention window)
         assert_eq!(

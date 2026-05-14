@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ethlambda_storage::Error;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -133,10 +134,11 @@ async fn handle_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        if let Some(signed_block) = server.store.get_signed_block(root) {
-            blocks.push(signed_block);
+        match server.store.get_signed_block(root) {
+            Ok(Some(signed_block)) => blocks.push(signed_block),
+            Ok(None) => {} // missing blocks are skipped per spec
+            Err(e) => warn!(%root, %e, "DB error fetching block by root"),
         }
-        // Missing blocks are silently skipped (per spec)
     }
 
     let found = blocks.len();
@@ -169,12 +171,23 @@ async fn handle_blocks_by_range_request(
         return;
     }
 
-    let blocks = canonical_blocks_by_range(
+    let blocks = match canonical_blocks_by_range(
         &server.store,
         request.start_slot,
         request.count,
         request.step,
-    );
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%peer, %e, "storage error during BlocksByRange request");
+            let response = Response::error(
+                ResponseCode::SERVER_ERROR,
+                error_message("internal storage error"),
+            );
+            server.swarm_handle.send_response(channel, response);
+            return;
+        }
+    };
 
     info!(
         %peer,
@@ -194,9 +207,9 @@ fn canonical_blocks_by_range(
     start_slot: u64,
     count: u64,
     step: u64,
-) -> Vec<SignedBlock> {
+) -> Result<Vec<SignedBlock>, Error> {
     if count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let Some(end_slot) = count
@@ -204,14 +217,14 @@ fn canonical_blocks_by_range(
         .and_then(|value| value.checked_mul(step))
         .and_then(|last_offset| start_slot.checked_add(last_offset))
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut roots_by_slot = HashMap::new();
-    let mut current_root = store.head();
+    let mut current_root = store.head()?;
 
     while !current_root.is_zero() {
-        let Some(header) = store.get_block_header(&current_root) else {
+        let Ok(Some(header)) = store.get_block_header(&current_root) else {
             break;
         };
 
@@ -226,13 +239,14 @@ fn canonical_blocks_by_range(
         current_root = header.parent_root;
     }
 
-    (0..count)
+    let blocks = (0..count)
         .filter_map(|index| {
             let slot = start_slot.checked_add(index.checked_mul(step)?)?;
             let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root)
+            store.get_signed_block(root).ok().flatten()
         })
-        .collect()
+        .collect();
+    Ok(blocks)
 }
 
 async fn handle_blocks_by_root_response(
@@ -284,12 +298,14 @@ async fn handle_blocks_by_root_response(
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
+    let finalized = store.latest_finalized().unwrap_or_default();
+    let head_root = store.head().unwrap_or_default();
     let head_slot = store
         .get_block_header(&head_root)
-        .expect("head block exists")
-        .slot;
+        .ok()
+        .flatten()
+        .map(|h| h.slot)
+        .unwrap_or(0);
     Status {
         finalized,
         head: Checkpoint {
@@ -441,26 +457,30 @@ mod tests {
     #[test]
     fn blocks_by_range_returns_canonical_blocks_in_requested_order() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![])).unwrap();
 
-        let block_1 = signed_block(1, store.head());
+        let block_1 = signed_block(1, store.head().unwrap());
         let root_1 = block_1.message.hash_tree_root();
-        store.insert_signed_block(root_1, block_1);
+        store.insert_signed_block(root_1, block_1).unwrap();
 
         let block_2 = signed_block(2, root_1);
         let root_2 = block_2.message.hash_tree_root();
-        store.insert_signed_block(root_2, block_2);
+        store.insert_signed_block(root_2, block_2).unwrap();
 
         let side_block_3 = signed_block(3, root_1);
         let side_root_3 = side_block_3.message.hash_tree_root();
-        store.insert_signed_block(side_root_3, side_block_3);
+        store
+            .insert_signed_block(side_root_3, side_block_3)
+            .unwrap();
 
         let block_4 = signed_block(4, root_2);
         let root_4 = block_4.message.hash_tree_root();
-        store.insert_signed_block(root_4, block_4);
-        store.update_checkpoints(ForkCheckpoints::head_only(root_4));
+        store.insert_signed_block(root_4, block_4).unwrap();
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_4))
+            .unwrap();
 
-        let blocks = canonical_blocks_by_range(&store, 1, 4, 1);
+        let blocks = canonical_blocks_by_range(&store, 1, 4, 1).unwrap();
         let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();
         let roots: Vec<_> = blocks
             .iter()
