@@ -23,6 +23,7 @@ ethlambda-types.workspace = true
 libssz.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
 tracing.workspace = true
 jemalloc_pprof.workspace = true
 
