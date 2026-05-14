@@ -269,7 +269,6 @@
     let lastScrollTop = 0;
     let programmaticScrollTimeout = null;
     let isProgrammaticScroll = false;
-    let hoveredRoot = null;
 
     function initSVG() {
       svg = d3.select("#chart-container")
@@ -298,18 +297,8 @@
       return roles;
     }
 
-    function nodeStroke(node, data) {
-      const roles = nodeRoles(node, data);
-      const color = roles.length > 0 ? COLORS[roles[0]] : COLORS.default;
-      return d3.color(color).darker(0.5).toString();
-    }
-
-    function nodeRatio(node, data) {
-      // Finalized blocks have full support by definition — fill completely
-      // rather than scaling by fork-choice weight (which is 0 at the root).
-      if (node.slot <= data.finalized.slot) return 1;
-      const validatorCount = data.validator_count;
-      if (!validatorCount || validatorCount === 0) return 0;
+    function weightRatio(node, validatorCount) {
+      if (!validatorCount) return 0;
       return Math.max(0, Math.min(1, node.weight / validatorCount));
     }
 
@@ -402,13 +391,14 @@
 
       const flatNodes = allDescendants.map(d => {
         const roles = nodeRoles(d.data, data);
+        // Finalized blocks are filled by default, otherwise scale by fork-choice weight.
+        const isFinalized = roles.includes("finalized");
         return {
           ...d.data,
           x: d.x,
           y: d.y,
           _color: roles.length > 0 ? COLORS[roles[0]] : COLORS.default,
-          _stroke: nodeStroke(d.data, data),
-          _ratio: nodeRatio(d.data, data),
+          _ratio: isFinalized ? 1 : weightRatio(d.data, data.validator_count),
           // Colors of secondary roles, in priority order (after the primary).
           _haloColors: roles.slice(1).map(r => COLORS[r])
         };
@@ -436,21 +426,35 @@
       return { nodes: flatNodes, links, width: svgWidth, height: svgHeight, slots };
     }
 
+    let hoveredRoot = null;
+
     function tooltipHtml(d, data) {
-      const isFinalized = d.slot <= data.finalized.slot;
-      let lastLine;
-      if (isFinalized) {
-        lastLine = `<span class="tt-label">status:</span> finalized`;
-      } else {
+      const roles = nodeRoles(d, data);
+      const lines = [
+        `<span class="tt-label">root:</span> ${truncateRoot(d.root)}`,
+        `<span class="tt-label">slot:</span> ${d.slot}`,
+        `<span class="tt-label">proposer:</span> ${d.proposer_index}`,
+      ];
+
+      if (roles.length > 0) {
+        const roleSpans = roles
+          .map(r => `<span style="color: ${COLORS[r]}">${ROLE_LABELS[r]}</span>`)
+          .join(", ");
+        lines.push(`<span class="tt-label">status:</span> ${roleSpans}`);
+      }
+
+      // Skip the weight line for purely-finalized blocks: their fork-choice
+      // weight is 0 by design and reading "weight: 0" alongside "finalized" is
+      // misleading. Any non-finalized role still gets a meaningful number.
+      const isPureFinalized = roles.length === 1 && roles[0] === "finalized";
+      if (!isPureFinalized) {
         const total = data.validator_count;
         const pct = total ? parseFloat(((d.weight / total) * 100).toFixed(2)) : 0;
         const suffix = total != null ? `/${total} (${pct}%)` : "";
-        lastLine = `<span class="tt-label">weight:</span> ${d.weight}${suffix}`;
+        lines.push(`<span class="tt-label">weight:</span> ${d.weight}${suffix}`);
       }
-      return `<span class="tt-label">root:</span> ${truncateRoot(d.root)}<br>` +
-        `<span class="tt-label">slot:</span> ${d.slot}<br>` +
-        `<span class="tt-label">proposer:</span> ${d.proposer_index}<br>` +
-        lastLine;
+
+      return lines.join("<br>");
     }
 
     function showTooltip(event, d, data) {
@@ -615,7 +619,7 @@
       nodeEnter.append("circle")
         .attr("class", "node-outer")
         .attr("r", NODE_RADIUS)
-        .attr("stroke", d => d._stroke);
+        .attr("stroke", d => d._color);
 
       // Halo rings, one per secondary role. Always rendered with a transparent
       // stroke when no role applies so transitions can animate stroke color
@@ -668,7 +672,7 @@
         .transition()
         .delay(TRANSITION_DURATION)
         .duration(100)
-        .attr("stroke", d => d._stroke);
+        .attr("stroke", d => d._color);
 
       HALO_OFFSETS.forEach((_, i) => {
         nodeMerged.select(`.halo-${i}`)
