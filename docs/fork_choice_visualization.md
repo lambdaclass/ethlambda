@@ -29,7 +29,11 @@ The local devnet runs 3 ethlambda nodes with metrics ports 8085, 8086, and 8087.
 
 ```bash
 cargo run --release -- \
-  --custom-network-config-dir ./config \
+  --genesis ./config/config.yaml \
+  --validators ./config/annotated_validators.yaml \
+  --bootnodes ./config/nodes.yaml \
+  --validator-config ./config/validator-config.yaml \
+  --hash-sig-keys-dir ./config/hash-sig-keys \
   --node-key ./keys/node.key \
   --node-id 0 \
   --api-port 5052

@@ -44,8 +44,8 @@ use ethlambda_types::{
     },
     block::{AggregatedSignatureProof, Block, ByteListMiB},
     checkpoint::Checkpoint,
-    primitives::{H256, HashTreeRoot as _},
-    state::State,
+    primitives::H256,
+    state::{State, anchor_pair_is_consistent},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -334,45 +334,6 @@ async fn run_verify_signatures(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Replicate the invariants `Store::get_forkchoice_store` asserts (without
-/// the panic):
-///
-/// 1. `anchor_block` and `state.latest_block_header` must agree on every field
-///    once `state_root` is zeroed.
-/// 2. The state's own `latest_block_header.state_root` must be either zero
-///    (raw / pre-fill form) or match the tree-hash root of the state computed
-///    with that field zeroed.
-/// 3. `anchor_block.state_root` must equal the tree-hash root of the state
-///    (with the header's `state_root` zeroed). This is the invariant the
-///    `test_store_from_anchor_rejects_mismatched_state_root` spec fixture
-///    targets: a block whose `state_root` disagrees with the supplied
-///    anchor state is structurally inconsistent and must be refused at init.
-///
-/// Takes `&mut State` so we can zero the header field in-place around the
-/// hash computation rather than cloning the whole state (validator set +
-/// historical roots can be hundreds of KB). The original `state_root` is
-/// restored before the function returns.
-fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
-    let mut state_header = state.latest_block_header.clone();
-    let mut block_header = block.header();
-    state_header.state_root = H256::ZERO;
-    block_header.state_root = H256::ZERO;
-    if state_header != block_header {
-        return false;
-    }
-
-    let saved = state.latest_block_header.state_root;
-    state.latest_block_header.state_root = H256::ZERO;
-    let computed = state.hash_tree_root();
-    state.latest_block_header.state_root = saved;
-
-    if saved != H256::ZERO && saved != computed {
-        return false;
-    }
-
-    block.state_root == computed
-}
 
 /// Dispatch a fork-choice step against the held Store.
 fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {

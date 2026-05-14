@@ -2163,6 +2163,7 @@ dependencies = [
  "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
+ "hex",
  "http-body-util",
  "jemalloc_pprof",
  "libssz",

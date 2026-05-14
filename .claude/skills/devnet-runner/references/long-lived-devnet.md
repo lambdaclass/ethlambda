@@ -53,7 +53,11 @@ done
 docker run -d --restart unless-stopped --name ethlambda_0 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_0:/data \
   $IMAGE \
-  --custom-network-config-dir /config \
+  --genesis /config/config.yaml \
+  --validators /config/annotated_validators.yaml \
+  --bootnodes /config/nodes.yaml \
+  --validator-config /config/validator-config.yaml \
+  --hash-sig-keys-dir /config/hash-sig-keys \
   --gossipsub-port 9001 --node-id ethlambda_0 \
   --node-key /config/ethlambda_0.key \
   --http-address 0.0.0.0 --api-port 5052 --metrics-port 8081
@@ -61,7 +65,11 @@ docker run -d --restart unless-stopped --name ethlambda_0 --network host \
 docker run -d --restart unless-stopped --name ethlambda_1 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_1:/data \
   $IMAGE \
-  --custom-network-config-dir /config \
+  --genesis /config/config.yaml \
+  --validators /config/annotated_validators.yaml \
+  --bootnodes /config/nodes.yaml \
+  --validator-config /config/validator-config.yaml \
+  --hash-sig-keys-dir /config/hash-sig-keys \
   --gossipsub-port 9002 --node-id ethlambda_1 \
   --node-key /config/ethlambda_1.key \
   --http-address 0.0.0.0 --api-port 5053 --metrics-port 8082
@@ -69,7 +77,11 @@ docker run -d --restart unless-stopped --name ethlambda_1 --network host \
 docker run -d --restart unless-stopped --name ethlambda_2 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_2:/data \
   $IMAGE \
-  --custom-network-config-dir /config \
+  --genesis /config/config.yaml \
+  --validators /config/annotated_validators.yaml \
+  --bootnodes /config/nodes.yaml \
+  --validator-config /config/validator-config.yaml \
+  --hash-sig-keys-dir /config/hash-sig-keys \
   --gossipsub-port 9003 --node-id ethlambda_2 \
   --node-key /config/ethlambda_2.key \
   --http-address 0.0.0.0 --api-port 5054 --metrics-port 8083
@@ -77,7 +89,11 @@ docker run -d --restart unless-stopped --name ethlambda_2 --network host \
 docker run -d --restart unless-stopped --name ethlambda_3 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_3:/data \
   $IMAGE \
-  --custom-network-config-dir /config \
+  --genesis /config/config.yaml \
+  --validators /config/annotated_validators.yaml \
+  --bootnodes /config/nodes.yaml \
+  --validator-config /config/validator-config.yaml \
+  --hash-sig-keys-dir /config/hash-sig-keys \
   --gossipsub-port 9004 --node-id ethlambda_3 \
   --node-key /config/ethlambda_3.key \
   --is-aggregator \
@@ -141,7 +157,11 @@ sleep 60
 docker run -d --restart unless-stopped --name ethlambda_0 --network host \
   -v $GENESIS:/config -v $DATA/ethlambda_0:/data \
   $NEW_IMAGE \
-  --custom-network-config-dir /config \
+  --genesis /config/config.yaml \
+  --validators /config/annotated_validators.yaml \
+  --bootnodes /config/nodes.yaml \
+  --validator-config /config/validator-config.yaml \
+  --hash-sig-keys-dir /config/hash-sig-keys \
   --gossipsub-port 9001 --node-id ethlambda_0 \
   --node-key /config/ethlambda_0.key \
   --http-address 0.0.0.0 --api-port 5052 --metrics-port 8081 \

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{
@@ -92,6 +93,7 @@ impl SwarmHandle {
 
 pub fn start_swarm_adapter(
     swarm: libp2p::Swarm<Behaviour>,
+    node_names: HashMap<PeerId, String>,
 ) -> (
     impl futures::Stream<Item = SwarmEvent<BehaviourEvent>>,
     SwarmHandle,
@@ -99,7 +101,7 @@ pub fn start_swarm_adapter(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(swarm_loop(swarm, event_tx, cmd_rx));
+    tokio::spawn(swarm_loop(swarm, event_tx, cmd_rx, node_names));
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(event_rx);
     let handle = SwarmHandle { cmd_tx };
@@ -110,6 +112,7 @@ async fn swarm_loop(
     mut swarm: libp2p::Swarm<Behaviour>,
     event_tx: mpsc::UnboundedSender<SwarmEvent<BehaviourEvent>>,
     mut cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+    node_names: HashMap<PeerId, String>,
 ) {
     let mut mesh_metric_tick = tokio::time::interval(MESH_METRIC_REFRESH_INTERVAL);
     mesh_metric_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -126,6 +129,7 @@ async fn swarm_loop(
             _ = mesh_metric_tick.tick() => {
                 metrics::update_gossip_mesh_peers(
                     swarm.behaviour().gossipsub.all_mesh_peers(),
+                    &node_names,
                 );
             }
         }
