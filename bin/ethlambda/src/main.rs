@@ -640,9 +640,16 @@ async fn fetch_initial_state(
     // overlaps with what `get_forkchoice_store` already wrote, but it's
     // idempotent and the only path that also stores `BlockSignatures`.
     let anchor_root = signed_block.message.header().hash_tree_root();
-    let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone());
-    store.insert_signed_block(anchor_root, signed_block);
-    Ok(store)
+    match Store::get_forkchoice_store(backend, state, signed_block.message.clone()) {
+        Ok(mut store) => {
+            store.insert_signed_block(anchor_root, signed_block);
+            return Ok(store);
+        }
+        Err(err) => {
+            error!(%err, "Failed to initialize store from anchor state and block");
+            return Err(checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch);
+        }
+    };
 }
 
 #[cfg(test)]
