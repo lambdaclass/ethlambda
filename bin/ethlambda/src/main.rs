@@ -22,7 +22,7 @@ use clap::Parser;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
-use ethlambda_types::primitives::{H256, HashTreeRoot as _};
+use ethlambda_types::primitives::H256;
 use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,

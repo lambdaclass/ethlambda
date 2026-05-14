@@ -136,4 +136,5 @@ pub struct BlocksByRootRequest {
 pub struct BlocksByRangeRequest {
     pub start_slot: u64,
     pub count: u64,
+    pub step: u64,
 }
