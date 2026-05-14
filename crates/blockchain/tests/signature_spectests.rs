@@ -9,9 +9,7 @@ use ethlambda_types::{
     state::State,
 };
 
-mod common;
-mod signature_types;
-use signature_types::VerifySignaturesTestVector;
+use ethlambda_test_fixtures::verify_signatures::VerifySignaturesTestVector;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 
@@ -44,7 +42,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Initialize the store with the anchor state and block
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
-        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
+        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block)
+            .expect("anchor state and block must match");
 
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlock = test.signed_block.into();

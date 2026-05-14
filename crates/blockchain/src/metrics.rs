@@ -1,5 +1,7 @@
 //! Prometheus metrics for the blockchain module.
 
+use std::time::Duration;
+
 use ethlambda_metrics::*;
 
 // --- Gauges ---
@@ -266,6 +268,25 @@ static LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS: std::sync::L
         .unwrap()
     });
 
+static LEAN_AGGREGATED_PROOF_SIZE_BYTES: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_aggregated_proof_size_bytes",
+            "Bytes size of an aggregated signature proof's proof_data field",
+            vec![
+                1024.0,
+                4096.0,
+                16384.0,
+                65536.0,
+                131_072.0,
+                262_144.0,
+                524_288.0,
+                1_048_576.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -282,6 +303,18 @@ static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
             "lean_fork_choice_reorg_depth",
             "Depth of fork choice reorgs (in blocks)",
             vec![1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0, 50.0, 100.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_tick_interval_duration_seconds",
+            "Elapsed time between clock ticks in seconds",
+            vec![
+                0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6
+            ]
         )
         .unwrap()
     });
@@ -396,7 +429,9 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_BUILDING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
+    std::sync::LazyLock::force(&LEAN_TICK_INTERVAL_DURATION_SECONDS);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
     std::sync::LazyLock::force(&LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS);
@@ -530,6 +565,11 @@ pub fn time_pq_sig_aggregated_signatures_verification() -> TimingGuard {
     TimingGuard::new(&LEAN_PQ_SIG_AGGREGATED_SIGNATURES_VERIFICATION_TIME_SECONDS)
 }
 
+/// Observe the size of an aggregated signature proof's `proof_data` bytes.
+pub fn observe_aggregated_proof_size(bytes: usize) {
+    LEAN_AGGREGATED_PROOF_SIZE_BYTES.observe(bytes as f64);
+}
+
 /// Observe committee-signature aggregation duration. Measured in the
 /// off-thread worker and reported back via an `AggregationDone` message, so a
 /// drop-guard that crosses the thread boundary is not appropriate here.
@@ -572,6 +612,11 @@ pub fn set_attestation_committee_count(count: u64) {
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
+}
+
+/// Observe the duration between consecutive tick intervals in seconds.
+pub fn observe_tick_interval_duration(duration: Duration) {
+    LEAN_TICK_INTERVAL_DURATION_SECONDS.observe(duration.as_secs_f64());
 }
 
 /// Observe the number of aggregated payloads in a built block.

@@ -3,7 +3,7 @@ use libssz_types::{SszBitlist, SszList};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    block::{BlockBody, BlockHeader},
+    block::{Block, BlockBody, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{self, H256},
     signature::{SignatureParseError, ValidatorPublicKey},
@@ -128,4 +128,44 @@ impl State {
 #[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ChainConfig {
     pub genesis_time: u64,
+}
+
+/// Validate that an `(anchor_state, anchor_block)` pair is structurally consistent.
+///
+/// Used by every code path that bootstraps a fork-choice store (Store
+/// constructor, checkpoint-sync client, hive test driver) to enforce the same
+/// invariants without duplicating the check:
+///
+/// 1. `anchor_block.header()` and `state.latest_block_header` must agree on
+///    every field once `state_root` is zeroed.
+/// 2. `state.latest_block_header.state_root` must be either zero (raw /
+///    pre-fill form) or match the tree-hash root of the state computed with
+///    that field zeroed.
+/// 3. `anchor_block.state_root` must equal that same canonical tree-hash root.
+///    A block whose `state_root` disagrees with the supplied anchor state is
+///    structurally inconsistent and must be refused at init.
+///
+/// Takes `&mut State` to zero `latest_block_header.state_root` in place around
+/// the hash computation rather than cloning the whole state (validator set +
+/// historical roots can be hundreds of KB). The original `state_root` is
+/// restored before the function returns.
+pub fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
+    let mut state_header = state.latest_block_header.clone();
+    let mut block_header = block.header();
+    state_header.state_root = H256::ZERO;
+    block_header.state_root = H256::ZERO;
+    if state_header != block_header {
+        return false;
+    }
+
+    let saved = state.latest_block_header.state_root;
+    state.latest_block_header.state_root = H256::ZERO;
+    let computed = state.hash_tree_root();
+    state.latest_block_header.state_root = saved;
+
+    if saved != H256::ZERO && saved != computed {
+        return false;
+    }
+
+    block.state_root == computed
 }

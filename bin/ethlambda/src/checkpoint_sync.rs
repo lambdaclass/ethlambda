@@ -1,7 +1,8 @@
 use std::time::Duration;
 
+use ethlambda_types::block::SignedBlock;
 use ethlambda_types::primitives::HashTreeRoot as _;
-use ethlambda_types::state::{State, Validator};
+use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
 
@@ -12,6 +13,12 @@ const CHECKPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for reading data during body download.
 /// This is an inactivity timeout - it resets on each successful read.
 const CHECKPOINT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Path of the finalized-state endpoint (relative to the peer's API base URL).
+const FINALIZED_STATE_PATH: &str = "/lean/v0/states/finalized";
+
+/// Path of the finalized-block endpoint (relative to the peer's API base URL).
+const FINALIZED_BLOCK_PATH: &str = "/lean/v0/blocks/finalized";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
@@ -49,9 +56,11 @@ pub enum CheckpointSyncError {
     BlockHeaderFinalizedRootMismatch,
     #[error("block header at justified slot must match justified root")]
     BlockHeaderJustifiedRootMismatch,
+    #[error("anchor block does not match anchor state")]
+    AnchorPairingMismatch,
 }
 
-/// Fetch finalized state from checkpoint sync URL.
+/// Build the HTTP client used for checkpoint sync fetches.
 ///
 /// Uses two-phase timeout strategy:
 /// - Connect timeout (15s): Fails quickly if peer is unreachable
@@ -63,31 +72,99 @@ pub enum CheckpointSyncError {
 /// failing fast if the connection stalls. A plain total timeout would
 /// disconnect even for valid downloads if the state is simply too large to
 /// transfer within the time limit.
-pub async fn fetch_checkpoint_state(
-    url: &str,
-    expected_genesis_time: u64,
-    expected_validators: &[Validator],
-) -> Result<State, CheckpointSyncError> {
-    // Use .read_timeout() to detect stalled downloads (inactivity timer).
-    // This allows large states to complete as long as data keeps flowing.
-    let client = Client::builder()
+fn build_client() -> Result<Client, CheckpointSyncError> {
+    Ok(Client::builder()
         .connect_timeout(CHECKPOINT_CONNECT_TIMEOUT)
         .read_timeout(CHECKPOINT_READ_TIMEOUT)
-        .build()?;
+        .build()?)
+}
 
-    let response = client
+/// Fetch and SSZ-decode an `application/octet-stream` body from `url`.
+async fn fetch_ssz<T: SszDecode>(client: &Client, url: &str) -> Result<T, CheckpointSyncError> {
+    let bytes = client
         .get(url)
         .header("Accept", "application/octet-stream")
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_status()?
+        .bytes()
+        .await?;
 
-    let bytes = response.bytes().await?;
-    let state = State::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)?;
+    T::from_ssz_bytes(&bytes).map_err(CheckpointSyncError::SszDecode)
+}
 
+/// Normalize a checkpoint-sync URL to a base URL.
+///
+/// Operators historically pass the full state URL (e.g.
+/// `http://peer:5052/lean/v0/states/finalized`) via `--checkpoint-sync-url`.
+/// The new contract is a base URL (`http://peer:5052`) so we can derive both
+/// the state and block endpoints. To avoid breaking existing devnet scripts,
+/// strip a trailing legacy path if present and also trim any trailing slash.
+// TODO: remove this and use the full URL
+fn normalize_base_url(url: &str) -> &str {
+    // Trim trailing slashes FIRST so that the legacy-suffix strip succeeds on
+    // inputs like `…/lean/v0/states/finalized/`; otherwise we'd leave the
+    // state path embedded in the "base URL" and double-prefix every request.
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .strip_suffix(FINALIZED_STATE_PATH)
+        .unwrap_or(trimmed)
+}
+
+/// Fetch the finalized state from a checkpoint peer and verify it
+/// against the local genesis configuration.
+async fn fetch_finalized_state(
+    client: &Client,
+    base_url: &str,
+    expected_genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<State, CheckpointSyncError> {
+    let url = format!("{base_url}{FINALIZED_STATE_PATH}");
+    let state: State = fetch_ssz(client, &url).await?;
     verify_checkpoint_state(&state, expected_genesis_time, expected_validators)?;
-
     Ok(state)
+}
+
+/// Fetch the finalized signed block from a checkpoint peer.
+async fn fetch_finalized_block(
+    client: &Client,
+    base_url: &str,
+) -> Result<SignedBlock, CheckpointSyncError> {
+    let url = format!("{base_url}{FINALIZED_BLOCK_PATH}");
+    fetch_ssz(client, &url).await
+}
+
+/// Fetch the finalized state and signed block in parallel and verify they pair.
+///
+/// If the peer advances finalization between the two requests the pairing will
+/// not hold; the caller is expected to retry.
+pub async fn fetch_finalized_anchor(
+    url: &str,
+    expected_genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let base_url = normalize_base_url(url);
+    let client = build_client()?;
+
+    // Issue both fetches concurrently; either failure cancels the pair.
+    let (mut state, signed_block) = tokio::try_join!(
+        fetch_finalized_state(
+            &client,
+            base_url,
+            expected_genesis_time,
+            expected_validators
+        ),
+        fetch_finalized_block(&client, base_url),
+    )?;
+
+    // Strictly mirrors the invariants `Store::get_forkchoice_store` asserts —
+    // header equality, state self-consistency, and `block.state_root` equal
+    // to the canonical tree-hash root of the state.
+    if !anchor_pair_is_consistent(&mut state, &signed_block.message) {
+        return Err(CheckpointSyncError::AnchorPairingMismatch);
+    }
+
+    Ok((state, signed_block))
 }
 
 /// Verify checkpoint state is structurally valid.
@@ -416,5 +493,35 @@ mod tests {
         state.latest_justified.slot = 90;
         state.latest_justified.root = H256::from([99u8; 32]); // Wrong root
         assert!(verify_checkpoint_state(&state, 1000, &validators).is_err());
+    }
+
+    // --- normalize_base_url ---
+
+    #[test]
+    fn normalize_strips_legacy_state_path() {
+        assert_eq!(
+            normalize_base_url("http://peer:5052/lean/v0/states/finalized"),
+            "http://peer:5052"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_base_url() {
+        assert_eq!(normalize_base_url("http://peer:5052"), "http://peer:5052");
+    }
+
+    #[test]
+    fn normalize_strips_trailing_slash() {
+        assert_eq!(normalize_base_url("http://peer:5052/"), "http://peer:5052");
+    }
+
+    #[test]
+    fn normalize_strips_legacy_state_path_with_trailing_slash() {
+        // Regression: a trailing slash on the legacy path used to defeat
+        // strip_suffix, leaving the path embedded in the "base URL".
+        assert_eq!(
+            normalize_base_url("http://peer:5052/lean/v0/states/finalized/"),
+            "http://peer:5052"
+        );
     }
 }

@@ -7,19 +7,15 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation, XmssSignature},
-    block::{AggregatedSignatureProof, Block, BlockSignatures, SignedBlock},
+    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
+    block::{AggregatedSignatureProof, Block},
     primitives::{ByteList, H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
-    state::State,
+    state::{State, anchor_pair_is_consistent},
 };
 
-use crate::types::{ForkChoiceTestVector, StoreChecks};
+use ethlambda_test_fixtures::fork_choice::{AttestationCheck, ForkChoiceTestVector, StoreChecks};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
-
-mod common;
-mod types;
 
 /// List of skipped tests.
 const SKIP_TESTS: &[&str] = &[];
@@ -43,12 +39,39 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         }
         println!("Running test: {}", name);
 
-        // Initialize store from anchor state/block
-        let anchor_state: State = test.anchor_state.into();
+        // Initialize store from anchor state/block.
+        //
+        // Fixtures whose `steps` is empty are "anchor rejection" cases (e.g.
+        // `test_store_from_anchor_rejects_mismatched_state_root`): they assert
+        // that init refuses an inconsistent (state, block) pair. We detect that
+        // up front with the non-panicking helper instead of letting
+        // `get_forkchoice_store`'s assert! panic out of the test harness.
+        let mut anchor_state: State = test.anchor_state.into();
         let anchor_block: Block = test.anchor_block.into();
         let genesis_time = anchor_state.config.genesis_time;
+
+        let pair_ok = anchor_pair_is_consistent(&mut anchor_state, &anchor_block);
+        if test.steps.is_empty() {
+            if pair_ok {
+                return Err(format!(
+                    "Fixture '{name}' has no steps (expects anchor rejection) \
+                     but the (state, block) pair is consistent"
+                )
+                .into());
+            }
+            continue;
+        }
+        if !pair_ok {
+            return Err(format!(
+                "Fixture '{name}' has steps (expects anchor acceptance) \
+                 but the (state, block) pair is inconsistent"
+            )
+            .into());
+        }
+
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block);
+        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block)
+            .expect("anchor state and block must match");
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
@@ -66,7 +89,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         block_registry.insert(label.clone(), root);
                     }
 
-                    let signed_block = build_signed_block(block_data);
+                    let signed_block = block_data.to_blank_signed_block();
 
                     let block_time_ms =
                         genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
@@ -158,29 +181,6 @@ fn assert_step_outcome<T, E: std::fmt::Debug>(
             Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
         }
         _ => Ok(()),
-    }
-}
-
-fn build_signed_block(block_data: types::BlockStepData) -> SignedBlock {
-    let block: Block = block_data.to_block();
-
-    // Build one empty proof per attestation, matching the aggregation_bits from
-    // each attestation in the block body. Block processing zips attestations with
-    // signatures, so they must be the same length for attestations to reach
-    // fork choice.
-    let proofs: Vec<_> = block
-        .body
-        .attestations
-        .iter()
-        .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-        .collect();
-
-    SignedBlock {
-        message: block,
-        signature: BlockSignatures {
-            proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
-            attestation_signatures: proofs.try_into().expect("attestation proofs within limit"),
-        },
     }
 }
 
@@ -374,7 +374,7 @@ fn validate_checks(
 
 fn validate_attestation_check(
     st: &Store,
-    check: &types::AttestationCheck,
+    check: &AttestationCheck,
     step_idx: usize,
 ) -> datatest_stable::Result<()> {
     let validator_id = check.validator;
