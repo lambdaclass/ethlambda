@@ -477,7 +477,7 @@ fn on_block_core(
     let sig_verification_start = std::time::Instant::now();
     if verify {
         // Validate cryptographic signatures
-        verify_signatures(&parent_state, &signed_block)?;
+        verify_block_signatures(&parent_state, &signed_block)?;
     }
     let sig_verification = sig_verification_start.elapsed();
 
@@ -1157,7 +1157,15 @@ fn build_block(
 /// Verify all signatures in a signed block.
 ///
 /// Each attestation has a corresponding proof in the signature list.
-fn verify_signatures(state: &State, signed_block: &SignedBlock) -> Result<(), StoreError> {
+///
+/// Exposed publicly so RPC handlers (notably the Hive test-driver
+/// `verify_signatures/run` endpoint) can run the exact same verification path
+/// the import pipeline uses; the production import path also calls this from
+/// [`on_block_core`].
+pub fn verify_block_signatures(
+    state: &State,
+    signed_block: &SignedBlock,
+) -> Result<(), StoreError> {
     use ethlambda_crypto::verify_aggregated_signature;
     use ethlambda_types::signature::ValidatorSignature;
 
@@ -1372,7 +1380,7 @@ mod tests {
             },
         };
 
-        let result = verify_signatures(&state, &signed_block);
+        let result = verify_block_signatures(&state, &signed_block);
         assert!(
             matches!(result, Err(StoreError::ParticipantsMismatch)),
             "Expected ParticipantsMismatch, got: {result:?}"
@@ -1602,17 +1610,11 @@ mod tests {
         use std::sync::Arc;
 
         let genesis_state = State::from_genesis(1000, vec![]);
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: AggregatedAttestations::default(),
-            },
-        };
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+        // Use `from_anchor_state` here rather than `get_forkchoice_store`:
+        // the latter now enforces `block.state_root == hash_tree_root(state)`,
+        // which a synthetic genesis block with zero state_root cannot satisfy.
+        let mut store = Store::from_anchor_state(backend, genesis_state);
 
         let head_root = store.head();
         let att_data = AttestationData {

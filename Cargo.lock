@@ -2056,6 +2056,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "vergen-git2",
@@ -2155,16 +2156,21 @@ name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ethlambda-blockchain",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
+ "ethlambda-state-transition",
  "ethlambda-storage",
+ "ethlambda-test-fixtures",
  "ethlambda-types",
+ "hex",
  "http-body-util",
  "jemalloc_pprof",
  "libssz",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
 ]
@@ -2206,6 +2212,7 @@ dependencies = [
  "hex",
  "libssz-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

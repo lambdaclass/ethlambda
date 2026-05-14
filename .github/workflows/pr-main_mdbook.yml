@@ -1,0 +1,112 @@
+# Modeled on ethrex's mdbook publish workflow:
+# https://github.com/lambdaclass/ethrex/blob/728dc7ded560c665ab1ff2cf7f3eeb197b5bc40f/.github/workflows/pr-main_mdbook.yml
+name: Publish ethlambda docs to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - ".github/workflows/pr-main_mdbook.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - ".github/workflows/pr-main_mdbook.yml"
+  workflow_dispatch:
+
+# Default to least privilege; only the deploy job upgrades to write to push the
+# gh-pages branch.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-build-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.5.2"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo install
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+
+      # mdbook-linkcheck2 runs as part of `mdbook build` and fails the build
+      # on broken internal links (see book.toml `warning-policy = "error"`).
+      - name: Install mdbook-linkcheck2
+        run: cargo install --version 0.12.0 --locked mdbook-linkcheck2
+
+      - name: Build documentation
+        run: make docs
+
+      - name: Upload docs artifact
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs
+          path: book/html
+          retention-days: 1
+
+  # Internal links are validated by mdbook-linkcheck2 inside the build step.
+  # This job validates external URLs, which linkcheck2 skips by default
+  # (follow-web-links = false) to keep local builds fast and offline-friendly.
+  link-check:
+    name: Link Check
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # eprint.iacr.org returns 403 to non-browser User-Agents (anti-bot
+          # protection on the IACR preprint server); the URLs themselves are
+          # valid in a real browser.
+          args: >-
+            --no-progress
+            --exclude 'localhost'
+            --exclude '127\.0\.0\.1'
+            --exclude 'eprint\.iacr\.org'
+            docs/
+          fail: true
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: write
+    concurrency:
+      group: ${{ github.workflow }}-deploy-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Download docs artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: docs
+          path: book/html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: book/html
+          destination_dir: .
