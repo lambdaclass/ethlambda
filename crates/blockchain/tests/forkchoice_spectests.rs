@@ -119,12 +119,8 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let proof_data = ByteList::try_from(proof_bytes)
                         .expect("aggregated proof data fits in ByteListMiB");
                     let data: AttestationData = att_data.data.into();
-                    let proof = TypeOneMultiSignature::new(
-                        proof_fixture.participants.into(),
-                        data.hash_tree_root(),
-                        data.slot,
-                        proof_data,
-                    );
+                    let proof =
+                        TypeOneMultiSignature::new(proof_fixture.participants.into(), proof_data);
                     let aggregated = SignedAggregatedAttestation { data, proof };
 
                     let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);

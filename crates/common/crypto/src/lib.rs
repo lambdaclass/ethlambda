@@ -56,8 +56,11 @@ pub enum AggregationError {
         pubkey_sets: usize,
     },
 
-    #[error("split index {index} out of bounds for type-2 with {components} components")]
-    SplitIndexOutOfBounds { index: usize, components: usize },
+    #[error("split-by-message target not found in type-2 components")]
+    UnknownMessage,
+
+    #[error("split-by-message target matched multiple components")]
+    MultipleMessages,
 
     #[error("prover failure: {0}")]
     ProverFailure(String),
@@ -362,22 +365,19 @@ pub fn verify_type_2_signature(
 }
 
 /// Split (disaggregate) a Type-2 merged proof into a single Type-1 proof for
-/// the component at `index`. Generates a fresh SNARK; expensive.
+/// the component bound to `message`. Generates a fresh SNARK; expensive.
 ///
-/// Returns the `compress_without_pubkeys()` form of the resulting Type-1.
-pub fn split_type_2_signature(
+/// Mirrors leanSpec PR #717 `TypeTwoMultiSignature.split_by_msg`: the caller
+/// supplies the expected message (an attestation data root or the block
+/// root) and the wrapper locates the unique matching component inside the
+/// decompressed proof. Returns the `compress_without_pubkeys()` form of the
+/// resulting Type-1.
+pub fn split_type_2_by_message(
     proof_data: &ByteListMiB,
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
-    index: usize,
+    message: &H256,
 ) -> Result<ByteListMiB, AggregationError> {
     ensure_prover_ready();
-
-    if index >= pubkeys_per_component.len() {
-        return Err(AggregationError::SplitIndexOutOfBounds {
-            index,
-            components: pubkeys_per_component.len(),
-        });
-    }
 
     let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
         .into_iter()
@@ -387,6 +387,18 @@ pub fn split_type_2_signature(
     let type_2 =
         LMType2::decompress_without_pubkeys(proof_data.iter().as_slice(), pubkeys_per_info)
             .ok_or(AggregationError::ChildDeserializationFailed(0))?;
+
+    let matches: Vec<usize> = type_2
+        .info
+        .iter()
+        .enumerate()
+        .filter_map(|(i, info)| (info.without_pubkeys.message == message.0).then_some(i))
+        .collect();
+    let index = match matches.as_slice() {
+        [i] => *i,
+        [] => return Err(AggregationError::UnknownMessage),
+        _ => return Err(AggregationError::MultipleMessages),
+    };
 
     let component = split_type_2(type_2, index, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
@@ -574,9 +586,12 @@ mod tests {
         )
         .expect("verify type-2");
 
-        let split =
-            split_type_2_signature(&merged, vec![vec![pk_a.clone()], vec![pk_b.clone()]], 0)
-                .expect("split");
+        let split = split_type_2_by_message(
+            &merged,
+            vec![vec![pk_a.clone()], vec![pk_b.clone()]],
+            &msg_a,
+        )
+        .expect("split");
 
         verify_aggregated_signature(&split, vec![pk_a.clone()], &msg_a, slot_a)
             .expect("verify split");

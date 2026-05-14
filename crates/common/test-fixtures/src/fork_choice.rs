@@ -11,7 +11,7 @@ use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::block::{
     ByteListMiB, MAX_ATTESTATIONS_DATA, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
 };
-use ethlambda_types::primitives::{H256, HashTreeRoot as _};
+use ethlambda_types::primitives::H256;
 use libssz::SszEncode as _;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
@@ -168,7 +168,6 @@ impl BlockStepData {
     /// those scenarios.
     pub fn to_blank_signed_block(&self) -> SignedBlock {
         let block = self.to_block();
-        let block_root = block.hash_tree_root();
         let proof = if block.body.attestations.len() > MAX_ATTESTATIONS_DATA {
             ByteListMiB::default()
         } else {
@@ -176,20 +175,12 @@ impl BlockStepData {
                 .body
                 .attestations
                 .iter()
-                .map(|att| {
-                    TypeOneMultiSignature::empty(
-                        att.aggregation_bits.clone(),
-                        att.data.hash_tree_root(),
-                        att.data.slot,
-                    )
-                })
+                .map(|att| TypeOneMultiSignature::empty(att.aggregation_bits.clone()))
                 .collect();
             let mut all = attestation_proofs;
             all.push(TypeOneMultiSignature::for_proposer(
                 block.proposer_index,
                 ByteListMiB::default(),
-                block_root,
-                block.slot,
             ));
             let merged = TypeTwoMultiSignature::from_type_1s(all);
             ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")

@@ -13,7 +13,7 @@ use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
-    block::{ByteListMiB, BytecodeClaim, TypeOneInfo, TypeOneMultiSignature},
+    block::{ByteListMiB, TypeOneMultiSignature},
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
@@ -290,15 +290,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     participants.dedup();
 
     let aggregation_bits = aggregation_bits_from_validator_indices(&participants);
-    let proof = TypeOneMultiSignature {
-        info: TypeOneInfo {
-            message: data_root,
-            slot: job.slot,
-            participants: aggregation_bits,
-            bytecode_claim: BytecodeClaim::ZERO,
-        },
-        proof: proof_data,
-    };
+    let proof = TypeOneMultiSignature::new(aggregation_bits, proof_data);
     metrics::observe_aggregated_proof_size(proof.proof.len());
 
     Some(AggregatedGroupOutput {

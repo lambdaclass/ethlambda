@@ -9,7 +9,6 @@ use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSi
 use ethlambda_types::block::{
     ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
 };
-use ethlambda_types::primitives::HashTreeRoot as _;
 use libssz::SszEncode as _;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -73,7 +72,6 @@ pub struct TestSignedBlock {
 impl From<TestSignedBlock> for SignedBlock {
     fn from(value: TestSignedBlock) -> Self {
         let block: ethlambda_types::block::Block = value.block.into();
-        let block_root = block.hash_tree_root();
         let proposer_proof = ByteListMiB::try_from(value.signature.proposer_signature.to_vec())
             .expect("XMSS signature fits in ByteListMiB");
 
@@ -82,10 +80,9 @@ impl From<TestSignedBlock> for SignedBlock {
             .attestation_signatures
             .data
             .into_iter()
-            .zip(block.body.attestations.iter())
-            .map(|(att_sig, att)| {
+            .map(|att_sig| {
                 let participants: EthAggregationBits = att_sig.participants.into();
-                TypeOneMultiSignature::empty(participants, att.data.hash_tree_root(), att.data.slot)
+                TypeOneMultiSignature::empty(participants)
             })
             .collect();
 
@@ -93,8 +90,6 @@ impl From<TestSignedBlock> for SignedBlock {
         all.push(TypeOneMultiSignature::for_proposer(
             block.proposer_index,
             proposer_proof,
-            block_root,
-            block.slot,
         ));
         let merged = TypeTwoMultiSignature::from_type_1s(all);
         let proof = ByteListMiB::try_from(merged.to_ssz())
@@ -148,7 +143,6 @@ impl TestSignedBlock {
     /// them through `verify_block_signatures`).
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let block: ethlambda_types::block::Block = self.block.into();
-        let block_root = block.hash_tree_root();
         let proposer_proof = ByteListMiB::try_from(self.signature.proposer_signature.to_vec())
             .expect("XMSS signature fits in ByteListMiB");
 
@@ -157,9 +151,8 @@ impl TestSignedBlock {
             .attestation_signatures
             .data
             .into_iter()
-            .zip(block.body.attestations.iter())
             .enumerate()
-            .map(|(index, (att_sig, att))| {
+            .map(|(index, att_sig)| {
                 let participants: EthAggregationBits = att_sig.participants.into();
                 let raw = &att_sig.proof_data.data;
                 let stripped = raw.strip_prefix("0x").unwrap_or(raw);
@@ -172,12 +165,7 @@ impl TestSignedBlock {
                 let len = bytes.len();
                 let proof_data = ByteListMiB::try_from(bytes)
                     .map_err(|_| SignedBlockConvertError::ProofTooLarge { index, len })?;
-                Ok(TypeOneMultiSignature::new(
-                    participants,
-                    att.data.hash_tree_root(),
-                    att.data.slot,
-                    proof_data,
-                ))
+                Ok(TypeOneMultiSignature::new(participants, proof_data))
             })
             .collect::<Result<_, SignedBlockConvertError>>()?;
 
@@ -189,8 +177,6 @@ impl TestSignedBlock {
         all.push(TypeOneMultiSignature::for_proposer(
             block.proposer_index,
             proposer_proof,
-            block_root,
-            block.slot,
         ));
         let merged = TypeTwoMultiSignature::from_type_1s(all);
         let proof = ByteListMiB::try_from(merged.to_ssz())

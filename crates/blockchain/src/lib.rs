@@ -9,7 +9,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{
-        ByteListMiB, BytecodeClaim, SignedBlock, TypeOneInfo, TypeOneInfos, TypeOneMultiSignature,
+        ByteListMiB, SignedBlock, TypeOneInfo, TypeOneInfos, TypeOneMultiSignature,
         TypeTwoMultiSignature,
     },
     primitives::{H256, HashTreeRoot as _},
@@ -377,8 +377,7 @@ impl BlockChainServer {
             metrics::inc_block_building_failures();
             return;
         };
-        let proposer_t1 =
-            TypeOneMultiSignature::for_proposer(validator_id, proposer_t1_bytes, block_root, slot);
+        let proposer_t1 = TypeOneMultiSignature::for_proposer(validator_id, proposer_t1_bytes);
 
         // Resolve pubkeys per Type-1 component for merge_many_type_1. Attestation
         // components use each participant's attestation_pubkey; the trailing
@@ -433,7 +432,6 @@ impl BlockChainServer {
         };
         let merged_envelope = TypeTwoMultiSignature {
             info: merged_infos,
-            bytecode_claim: BytecodeClaim::ZERO,
             proof: merged_proof_bytes,
         };
         let proof_bytes = ByteListMiB::try_from(merged_envelope.to_ssz())

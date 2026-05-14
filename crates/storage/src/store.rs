@@ -1628,7 +1628,7 @@ mod tests {
 
     fn make_proof() -> TypeOneMultiSignature {
         use ethlambda_types::attestation::AggregationBits;
-        TypeOneMultiSignature::empty(AggregationBits::new(), H256::ZERO, 0)
+        TypeOneMultiSignature::empty(AggregationBits::new())
     }
 
     /// Create a proof with a specific validator bit set (distinct participants).
@@ -1636,7 +1636,7 @@ mod tests {
         use ethlambda_types::attestation::AggregationBits;
         let mut bits = AggregationBits::with_length(vid + 1).unwrap();
         bits.set(vid, true).unwrap();
-        TypeOneMultiSignature::empty(bits, H256::ZERO, 0)
+        TypeOneMultiSignature::empty(bits)
     }
 
     /// Create a proof with bits set for every validator in `vids`.
@@ -1647,7 +1647,7 @@ mod tests {
         for &v in vids {
             bits.set(v as usize, true).unwrap();
         }
-        TypeOneMultiSignature::empty(bits, H256::ZERO, 0)
+        TypeOneMultiSignature::empty(bits)
     }
 
     fn make_att_data(slot: u64) -> AttestationData {

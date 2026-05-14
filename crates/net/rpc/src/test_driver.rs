@@ -430,12 +430,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
             let data: ethlambda_types::attestation::AttestationData = att.data.into();
             let aggregated = SignedAggregatedAttestation {
-                proof: TypeOneMultiSignature::new(
-                    participants,
-                    data.hash_tree_root(),
-                    data.slot,
-                    proof_data,
-                ),
+                proof: TypeOneMultiSignature::new(participants, proof_data),
                 data,
             };
             store::on_gossip_aggregated_attestation(store, aggregated).map_err(|e| e.to_string())

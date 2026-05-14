@@ -51,31 +51,26 @@ pub type ByteListMiB = ByteList<1_048_576>;
 // ============================================================================
 // Type-1 / Type-2 multi-signature model
 // ============================================================================
+//
+// Wire format mirrors leanSpec PR #717: the proof envelope carries only what
+// the verifier cannot rederive from the block body. `message` / `slot` /
+// `bytecode_claim` are intentionally absent — the verifier reconstructs each
+// component's binding from the block-body attestation it sits next to (plus
+// the block root + slot for the proposer entry).
 
-/// Trusted `Evaluation<EF>` field carried inside Type-1 / Type-2 proofs.
+/// Per-component metadata for a Type-1 multi-signer proof.
 ///
-/// Upstream models this as a `Bytes32` placeholder until `lean_multisig_py`
-/// bindings land with the concrete SSZ serialisation. Mirrored here as `H256`.
-pub type BytecodeClaim = H256;
-
-/// Per-message metadata for a Type-1 (single-message) multi-signer proof.
-///
-/// Carries everything a verifier needs to recompute the proof's binding inputs
-/// without re-deriving from block content. Participants stay in bitfield form
-/// for wire compactness; pubkeys are resolved at the binding boundary from the
-/// validator registry.
+/// Holds the participant bitfield and the per-component proof bytes in
+/// compact no-pubkeys form. Inside a Type-2 envelope, `proof` is the standalone
+/// Type-1 wire for this single component, enabling cheap disaggregation
+/// without running a fresh SNARK.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct TypeOneInfo {
-    /// The 32-byte message that was signed
-    /// (e.g. `hash_tree_root` of attestation data, or a block root).
-    pub message: H256,
-    /// The slot in which the signatures were created.
-    pub slot: u64,
     /// Bitfield indicating which validators contributed signatures.
     pub participants: AggregationBits,
-    /// Trusted evaluation tied to the proof. Recomputed by the verifier when
-    /// received externally.
-    pub bytecode_claim: BytecodeClaim,
+    /// Standalone Type-1 proof bytes (`compress_without_pubkeys`) for this
+    /// component. Used by split-by-msg and by re-broadcast paths.
+    pub proof: ByteListMiB,
 }
 
 /// Maximum number of distinct `AttestationData` entries permitted in a single
@@ -93,73 +88,66 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 pub type TypeOneInfos = SszList<TypeOneInfo, { MAX_ATTESTATIONS_DATA + 1 }>;
 
 /// A Type-1 single-message proof aggregating signatures from many validators.
+///
+/// The outer `proof` field is the canonical aggregated proof bytes; `info.proof`
+/// holds the same bytes (kept aligned so a Type-1 embedded inside a Type-2's
+/// info list reads identically standalone). `message` and `slot` live on the
+/// caller-side block body, not on this envelope.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct TypeOneMultiSignature {
-    /// Message, slot, participants, and trusted bytecode claim.
+    /// Per-component participant bitfield plus the standalone proof bytes.
     pub info: TypeOneInfo,
-    /// Raw aggregated proof bytes (`ExecutionProof` on the Rust side).
+    /// Aggregated proof bytes in compact no-pubkeys representation.
     pub proof: ByteListMiB,
 }
 
 /// A Type-2 merged proof covering many distinct messages.
 ///
-/// On the wire a `SignedBlock` will carry the SSZ-serialised form of this
-/// container as its single proof blob (introduced in a later phase). The
-/// block-level info list enumerates every `(message, slot, participants)`
-/// tuple the proof binds to.
+/// `signed_block.proof` carries the SSZ-encoded form of this container. The
+/// `info` list enumerates per-component (participants, standalone Type-1
+/// proof bytes); messages and slots are reconstructed at verify time from the
+/// block body.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct TypeTwoMultiSignature {
-    /// Per-message metadata, one entry per merged Type-1 proof.
+    /// Per-component metadata, one entry per merged Type-1 proof.
     pub info: TypeOneInfos,
-    /// Aggregation-level trusted evaluation. Recomputed on receive.
-    pub bytecode_claim: BytecodeClaim,
-    /// Raw merged proof bytes (`ExecutionProof` on the Rust side).
+    /// Merged proof bytes in compact no-pubkeys representation.
     pub proof: ByteListMiB,
 }
 
 impl TypeOneMultiSignature {
-    /// Build a Type-1 proof with the given participants, message, slot and
-    /// raw proof bytes.
-    pub fn new(
-        participants: AggregationBits,
-        message: H256,
-        slot: u64,
-        proof_data: ByteListMiB,
-    ) -> Self {
+    /// Build a Type-1 proof carrying the given participant bitfield and the
+    /// aggregated proof bytes.
+    pub fn new(participants: AggregationBits, proof_data: ByteListMiB) -> Self {
         Self {
             info: TypeOneInfo {
-                message,
-                slot,
                 participants,
-                bytecode_claim: BytecodeClaim::ZERO,
+                proof: proof_data.clone(),
             },
             proof: proof_data,
         }
     }
 
-    /// Build an empty Type-1 proof with the given participants and message
-    /// metadata. `proof` bytes are left empty — useful as a placeholder when
-    /// actual aggregation is not yet performed (forkchoice tests, etc.).
-    pub fn empty(participants: AggregationBits, message: H256, slot: u64) -> Self {
-        Self::new(participants, message, slot, SszList::new())
+    /// Build a Type-1 proof carrying the given participants and EMPTY proof
+    /// bytes. Useful as a placeholder in fork-choice payload caches where only
+    /// the participant set is needed; cannot drive a real Type-2 merge or
+    /// pass cryptographic verification.
+    pub fn empty(participants: AggregationBits) -> Self {
+        Self::new(participants, SszList::new())
     }
 
-    /// Wrap a proposer's XMSS signature over a block root as a singleton Type-1.
+    /// Wrap a proposer's Type-1 proof bytes with the singleton participant set.
     ///
-    /// Used by block production and test fixtures to fold the proposer's
-    /// signature into the block-level Type-2 merged proof.
-    pub fn for_proposer(
-        proposer_index: u64,
-        proposer_signature: ByteListMiB,
-        block_root: H256,
-        slot: u64,
-    ) -> Self {
+    /// The bytes must be a real aggregated Type-1 over the proposer's XMSS
+    /// signature (e.g. from `ethlambda_crypto::aggregate_signatures`), not
+    /// raw XMSS bytes — `verify_type_2` rejects raw-XMSS placeholders.
+    pub fn for_proposer(proposer_index: u64, proposer_proof_bytes: ByteListMiB) -> Self {
         let mut participants = AggregationBits::with_length(proposer_index as usize + 1)
             .expect("validator index fits");
         participants
             .set(proposer_index as usize, true)
             .expect("index within capacity");
-        Self::new(participants, block_root, slot, proposer_signature)
+        Self::new(participants, proposer_proof_bytes)
     }
 
     /// Returns the validator indices that are set in the participants bitfield.
@@ -169,10 +157,10 @@ impl TypeOneMultiSignature {
 }
 
 impl TypeTwoMultiSignature {
-    /// Build a metadata-preserving Type-2 envelope with EMPTY merged proof
-    /// bytes. Useful for tests that exercise the structural-only fast-fail leg
-    /// of `verify_block_signatures` (participants mismatch, missing entries…)
-    /// without paying the lean-multisig SNARK cost.
+    /// Build a Type-2 envelope from a list of Type-1 components with EMPTY
+    /// merged proof bytes. Useful for tests that exercise the structural
+    /// fast-fail leg of `verify_block_signatures` (participants mismatch,
+    /// missing entries, …) without paying the lean-multisig SNARK cost.
     ///
     /// Production block production uses
     /// [`ethlambda_crypto::merge_type_1s_into_type_2`] to produce a real
@@ -184,7 +172,6 @@ impl TypeTwoMultiSignature {
             .expect("type-1 infos within MAX_ATTESTATIONS_DATA + 1 limit");
         Self {
             info,
-            bytecode_claim: BytecodeClaim::ZERO,
             proof: ByteListMiB::default(),
         }
     }
@@ -290,10 +277,8 @@ mod tests {
 
     fn sample_type_one_info() -> TypeOneInfo {
         TypeOneInfo {
-            message: H256([7u8; 32]),
-            slot: 42,
             participants: sample_bits(8, &[0, 3, 7]),
-            bytecode_claim: H256([1u8; 32]),
+            proof: ByteListMiB::try_from((0..32u8).collect::<Vec<u8>>()).unwrap(),
         }
     }
 
@@ -302,13 +287,11 @@ mod tests {
         let info = sample_type_one_info();
         let bytes = info.to_ssz();
         let decoded = TypeOneInfo::from_ssz_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.message, info.message);
-        assert_eq!(decoded.slot, info.slot);
-        assert_eq!(decoded.bytecode_claim, info.bytecode_claim);
         assert_eq!(
             decoded.participants.as_bytes(),
             info.participants.as_bytes()
         );
+        assert_eq!(decoded.proof.to_vec(), info.proof.to_vec());
     }
 
     #[test]
@@ -321,44 +304,41 @@ mod tests {
         let bytes = sig.to_ssz();
         let decoded = TypeOneMultiSignature::from_ssz_bytes(&bytes).expect("decode");
         assert_eq!(decoded.proof.to_vec(), proof_bytes);
-        assert_eq!(decoded.info.slot, sig.info.slot);
+        assert_eq!(
+            decoded.info.participants.as_bytes(),
+            sig.info.participants.as_bytes()
+        );
     }
 
     #[test]
     fn type_two_multi_signature_ssz_round_trip() {
         let infos: Vec<TypeOneInfo> = (0..3)
             .map(|i| TypeOneInfo {
-                message: H256([i as u8; 32]),
-                slot: 100 + i as u64,
                 participants: sample_bits(8, &[i, i + 1]),
-                bytecode_claim: H256([0xAA; 32]),
+                proof: ByteListMiB::try_from(vec![i as u8; 16]).unwrap(),
             })
             .collect();
         let merged_bytes: Vec<u8> = (0..128).map(|i| (i % 256) as u8).collect();
         let sig = TypeTwoMultiSignature {
             info: TypeOneInfos::try_from(infos.clone()).unwrap(),
-            bytecode_claim: H256([0xBB; 32]),
             proof: ByteListMiB::try_from(merged_bytes.clone()).unwrap(),
         };
         let bytes = sig.to_ssz();
         let decoded = TypeTwoMultiSignature::from_ssz_bytes(&bytes).expect("decode");
         assert_eq!(decoded.info.len(), 3);
         assert_eq!(decoded.proof.to_vec(), merged_bytes);
-        assert_eq!(decoded.bytecode_claim, sig.bytecode_claim);
         for (got, want) in decoded.info.iter().zip(infos.iter()) {
-            assert_eq!(got.slot, want.slot);
-            assert_eq!(got.message, want.message);
+            assert_eq!(got.participants.as_bytes(), want.participants.as_bytes());
+            assert_eq!(got.proof.to_vec(), want.proof.to_vec());
         }
     }
 
     #[test]
     fn type_one_infos_respects_limit() {
         let too_many: Vec<TypeOneInfo> = (0..18)
-            .map(|i| TypeOneInfo {
-                message: H256([i as u8; 32]),
-                slot: i as u64,
+            .map(|_| TypeOneInfo {
                 participants: sample_bits(1, &[0]),
-                bytecode_claim: H256([0u8; 32]),
+                proof: ByteListMiB::default(),
             })
             .collect();
         assert!(TypeOneInfos::try_from(too_many).is_err());
