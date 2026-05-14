@@ -1356,13 +1356,14 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
+        attestation::{
+            AggregatedAttestation, AggregationBits, AttestationData, blank_xmss_signature,
+        },
         block::{
             AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
             SignedBlock,
         },
         checkpoint::Checkpoint,
-        signature::SIGNATURE_SIZE,
         state::State,
     };
 
@@ -1407,7 +1408,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 
@@ -1561,7 +1562,7 @@ mod tests {
             message: block,
             signature: BlockSignatures {
                 attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 
@@ -1858,7 +1859,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 

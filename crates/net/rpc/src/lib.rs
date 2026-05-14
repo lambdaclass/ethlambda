@@ -494,11 +494,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
-            attestation::XmssSignature,
+            attestation::blank_xmss_signature,
             block::{Block, BlockBody, BlockSignatures, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
-            signature::SIGNATURE_SIZE,
         };
         use libssz::SszEncode;
 
@@ -519,7 +518,7 @@ mod tests {
             message: block,
             signature: BlockSignatures {
                 attestation_signatures: Default::default(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 
@@ -559,10 +558,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_latest_finalized_block_returns_404_when_absent() {
-        // Genesis-anchored store: init_store writes header + state but no
-        // BlockSignatures entry, so get_signed_block(genesis_root) returns None
-        // and the endpoint must report 404 rather than panic.
+    async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_signature() {
+        // Genesis-anchored store: `init_store` writes the header + state but no
+        // `BlockSignatures` row. `get_signed_block` synthesizes an empty
+        // `BlockSignatures` so peers can still receive the genesis block on
+        // BlocksByRoot; the HTTP endpoint stays consistent and returns 200
+        // rather than 404.
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
@@ -579,6 +580,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

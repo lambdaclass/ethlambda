@@ -15,22 +15,21 @@ static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().h
 fn empty_block_signatures() -> BlockSignatures {
     BlockSignatures {
         attestation_signatures: AttestationSignatures::default(),
-        proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE])
-            .expect("zero-filled signature fits"),
+        proposer_signature: blank_xmss_signature(),
     }
 }
 
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData, XmssSignature, bits_is_subset},
+    attestation::{AttestationData, HashedAttestationData, bits_is_subset, blank_xmss_signature},
     block::{
         AggregatedSignatureProof, AttestationSignatures, Block, BlockBody, BlockHeader,
         BlockSignatures, SignedBlock,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::{SIGNATURE_SIZE, ValidatorSignature},
+    signature::ValidatorSignature,
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
