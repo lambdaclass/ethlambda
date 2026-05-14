@@ -367,7 +367,7 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
 
     // Ensure the vote refers to blocks that actually exist on our chain;
     // also rejects zero-hash source or target inline.
-    if !attestation_data_matches_chain(&state.historical_block_hashes, data) {
+    if !attestation_data_matches_chain(&state.historical_block_hashes, None, data) {
         return false;
     }
 
@@ -476,25 +476,32 @@ fn serialize_justifications(
 /// Whether both source and target checkpoints in `data` match the chain at
 /// their slots.
 ///
-/// Callers pass a chain view as it would appear after `process_block_header`
-/// on the consuming block: covering `[0, block.slot - 1]` with `parent_root`
-/// at the parent slot and `H256::ZERO` for empty slots between parent and the
-/// candidate.
+/// `parent_root` lets callers extend `historical_block_hashes` by one virtual
+/// entry at index `historical_block_hashes.len()` without allocating an
+/// extended slice. `build_block` uses it to represent the candidate block's
+/// parent (whose root is not yet in the post-state's `historical_block_hashes`);
+/// `process_attestations` passes `None` since by then the state already
+/// contains all relevant entries.
 pub fn attestation_data_matches_chain(
     historical_block_hashes: &[H256],
+    parent_root: Option<H256>,
     data: &AttestationData,
 ) -> bool {
     if data.source.root == H256::ZERO || data.target.root == H256::ZERO {
         return false;
     }
-    let source_slot = data.source.slot as usize;
-    let target_slot = data.target.slot as usize;
-    if source_slot >= historical_block_hashes.len() || target_slot >= historical_block_hashes.len()
-    {
-        return false;
-    }
-    historical_block_hashes[source_slot] == data.source.root
-        && historical_block_hashes[target_slot] == data.target.root
+    let root_at = |slot: u64| -> Option<H256> {
+        let idx = slot as usize;
+        if idx < historical_block_hashes.len() {
+            Some(historical_block_hashes[idx])
+        } else if idx == historical_block_hashes.len() {
+            parent_root
+        } else {
+            None
+        }
+    };
+    root_at(data.source.slot) == Some(data.source.root)
+        && root_at(data.target.slot) == Some(data.target.root)
 }
 
 /// Checks if the slot is a valid candidate for justification after a given finalized slot.

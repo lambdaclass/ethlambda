@@ -1055,17 +1055,6 @@ fn build_block(
         let mut current_finalized_slot = head_state.latest_finalized.slot;
         let mut current_justified_slots = head_state.justified_slots.clone();
 
-        // Chain view that `process_block_header` would produce on the candidate
-        // block: covering [0, slot - 1] with parent_root at parent.slot and
-        // ZERO_HASH for empty slots in between. Lets us validate source/target
-        // roots without waiting for the STF to drop mismatches.
-        let parent_slot = head_state.latest_block_header.slot;
-        let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
-        let mut extended_historical_block_hashes: Vec<H256> =
-            head_state.historical_block_hashes.iter().copied().collect();
-        extended_historical_block_hashes.push(parent_root);
-        extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
-
         let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
         // Sort by target.slot to match the spec's processing order.
@@ -1094,7 +1083,11 @@ fn build_block(
                     continue;
                 }
 
-                if !attestation_data_matches_chain(&extended_historical_block_hashes, att_data) {
+                if !attestation_data_matches_chain(
+                    &head_state.historical_block_hashes,
+                    Some(parent_root),
+                    att_data,
+                ) {
                     continue;
                 }
 
