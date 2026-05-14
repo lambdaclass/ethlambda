@@ -156,11 +156,10 @@ async fn handle_blocks_by_range_request(
         %peer,
         start_slot = request.start_slot,
         count = request.count,
-        step = request.step,
         "Received BlocksByRange request"
     );
 
-    if request.step == 0 || request.count == 0 || request.count > MAX_REQUEST_BLOCKS {
+    if request.count == 0 || request.count > MAX_REQUEST_BLOCKS {
         let response = Response::error(
             ResponseCode::INVALID_REQUEST,
             error_message("invalid BlocksByRange request"),
@@ -169,18 +168,12 @@ async fn handle_blocks_by_range_request(
         return;
     }
 
-    let blocks = canonical_blocks_by_range(
-        &server.store,
-        request.start_slot,
-        request.count,
-        request.step,
-    );
+    let blocks = canonical_blocks_by_range(&server.store, request.start_slot, request.count);
 
     info!(
         %peer,
         start_slot = request.start_slot,
         count = request.count,
-        step = request.step,
         found = blocks.len(),
         "Responding to BlocksByRange request"
     );
@@ -189,19 +182,13 @@ async fn handle_blocks_by_range_request(
     server.swarm_handle.send_response(channel, response);
 }
 
-fn canonical_blocks_by_range(
-    store: &Store,
-    start_slot: u64,
-    count: u64,
-    step: u64,
-) -> Vec<SignedBlock> {
+fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<SignedBlock> {
     if count == 0 {
         return Vec::new();
     }
 
     let Some(end_slot) = count
         .checked_sub(1)
-        .and_then(|value| value.checked_mul(step))
         .and_then(|last_offset| start_slot.checked_add(last_offset))
     else {
         return Vec::new();
@@ -219,16 +206,15 @@ fn canonical_blocks_by_range(
             break;
         }
 
-        if header.slot <= end_slot && (header.slot - start_slot).is_multiple_of(step) {
+        if header.slot <= end_slot {
             roots_by_slot.insert(header.slot, current_root);
         }
 
         current_root = header.parent_root;
     }
 
-    (0..count)
-        .filter_map(|index| {
-            let slot = start_slot.checked_add(index.checked_mul(step)?)?;
+    (start_slot..=end_slot)
+        .filter_map(|slot| {
             let root = roots_by_slot.get(&slot)?;
             store.get_signed_block(root)
         })
@@ -460,7 +446,7 @@ mod tests {
         store.insert_signed_block(root_4, block_4);
         store.update_checkpoints(ForkCheckpoints::head_only(root_4));
 
-        let blocks = canonical_blocks_by_range(&store, 1, 4, 1);
+        let blocks = canonical_blocks_by_range(&store, 1, 4);
         let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();
         let roots: Vec<_> = blocks
             .iter()
