@@ -55,6 +55,13 @@ For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/va
 
 We welcome contributions! Please read our [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get involved.
 
+## Community
+
+- **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
+- **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
+- **Ecosystem coordination**: the [open PQ Interop calls](https://github.com/ethereum/pm/issues/2055) cover cross-client Lean Ethereum work.
+
 ## Philosophy
 
 Many long-established clients accumulate bloat over time. This often occurs due to the need to support legacy features for existing users or through attempts to implement overly ambitious software. The result is often complex, difficult-to-maintain, and error-prone systems.

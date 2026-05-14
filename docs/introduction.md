@@ -29,6 +29,13 @@ into the rendered output:
 - [3SF-mini infographic](./infographics/3sf-mini-infographic.html)
 - [ethlambda architecture infographic](./infographics/ethlambda_architecture.html)
 
+## Community
+
+- **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
+- **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
+- **Ecosystem coordination**: the [open PQ Interop calls](https://github.com/ethereum/pm/issues/2055) cover cross-client Lean Ethereum work.
+
 ## Related projects
 
 ethlambda is one of several Lean Ethereum consensus clients under active development.
