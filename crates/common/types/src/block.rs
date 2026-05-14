@@ -169,14 +169,15 @@ impl TypeOneMultiSignature {
 }
 
 impl TypeTwoMultiSignature {
-    /// Merge a list of Type-1 single-message proofs into a single Type-2
-    /// multi-message proof. Mirrors upstream leanSpec's `aggregate_type_2`
-    /// stub: the metadata list (`TypeOneInfos`) is faithfully preserved so a
-    /// verifier can re-derive the per-message binding inputs, but the merged
-    /// `proof` bytes are left empty until the `lean_multisig_py` bindings ship
-    /// real cryptographic merging. Block-level signature verification stays
-    /// structural-only in the meantime, and per-attestation crypto verification
-    /// continues to run at gossip ingestion.
+    /// Build a metadata-preserving Type-2 envelope with EMPTY merged proof
+    /// bytes. Useful for tests that exercise the structural-only fast-fail leg
+    /// of `verify_block_signatures` (participants mismatch, missing entries…)
+    /// without paying the lean-multisig SNARK cost.
+    ///
+    /// Production block production uses
+    /// [`ethlambda_crypto::merge_type_1s_into_type_2`] to produce a real
+    /// cryptographic Type-2 proof; do not use this helper for any path that
+    /// actually verifies the merged proof.
     pub fn from_type_1s(type_1s: Vec<TypeOneMultiSignature>) -> Self {
         let infos: Vec<TypeOneInfo> = type_1s.into_iter().map(|t1| t1.info).collect();
         let info = TypeOneInfos::try_from(infos)

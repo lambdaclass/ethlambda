@@ -17,7 +17,7 @@ use ethlambda_types::{
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
+    signature::{ValidatorPublicKey, ValidatorSignature},
     state::State,
 };
 use libssz::SszDecode as _;
@@ -1006,9 +1006,9 @@ fn compact_attestations(
 /// one previously-uncovered validator; partially-overlapping participants
 /// between selected proofs are allowed. `compact_attestations` later feeds
 /// these proofs as children to `aggregate_proofs`, which delegates to
-/// `xmss_aggregate` — that function tracks duplicate pubkeys across
-/// children via its `dup_pub_keys` machinery, so overlap is supported by
-/// the underlying aggregation scheme.
+/// lean-multisig devnet5 `aggregate_type_1` — that function tracks duplicate
+/// pubkeys across children via its `dup_pub_keys` machinery, so overlap is
+/// supported by the underlying aggregation scheme.
 ///
 /// Each selected proof is appended to `selected` paired with its
 /// corresponding AggregatedAttestation.
@@ -1189,16 +1189,13 @@ fn build_block(
     Ok((final_block, aggregated_signatures, post_checkpoints))
 }
 
-/// Structural verification of a signed block's merged Type-2 proof.
+/// Full verification of a signed block's merged Type-2 proof.
 ///
-/// Phase 3 of the Type-1 / Type-2 aggregation migration replaces the per-
-/// attestation `verify_aggregated_signature` plus standalone proposer-signature
-/// check with a structural alignment check on the merged Type-2 blob: the
-/// `info` list must hold one entry per block-body attestation plus one
-/// trailing entry for the proposer. Cryptographic verification of each Type-1
-/// still happens at gossip ingestion (`on_gossip_aggregated_attestation`); the
-/// block-level crypto path returns once `lean_multisig` exposes a real
-/// merged-proof verification primitive.
+/// Structural pre-checks (fast fail) ensure the merged proof's `info` list lines
+/// up with the block body (one entry per attestation plus a trailing proposer
+/// entry; messages, slots, and participants match what the body declares).
+/// On success, the lean-multisig devnet5 `verify_type_2` primitive runs the
+/// SNARK verifier over the merged proof bytes against the resolved pubkey set.
 ///
 /// Exposed publicly so RPC handlers (notably the Hive test-driver
 /// `verify_signatures/run` endpoint) can run the exact same verification path
@@ -1228,7 +1225,8 @@ pub fn verify_block_signatures(
     let num_validators = validators.len() as u64;
 
     // Per-attestation entries: messages, slots, and participants must mirror
-    // the block body. The crypto binding for each is already checked at gossip.
+    // the block body. The crypto leg (verify_type_2 below) checks the actual
+    // multi-signature binding once structural alignment holds.
     for (attestation, info) in attestations.iter().zip(merged.info.iter()) {
         if attestation.aggregation_bits != info.participants {
             return Err(StoreError::ParticipantsMismatch);
@@ -1264,12 +1262,60 @@ pub fn verify_block_signatures(
         return Err(StoreError::InvalidValidatorIndex);
     }
 
+    let structural_elapsed = total_start.elapsed();
+
+    // Resolve pubkeys per Type-2 component for verify_type_2. Attestation
+    // components use each participant's attestation_pubkey; the trailing
+    // proposer component uses the proposal_pubkey of `block.proposer_index`.
+    let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
+        Vec::with_capacity(merged.info.len());
+    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(merged.info.len());
+
+    for attestation in attestations.iter() {
+        let mut pubkeys = Vec::new();
+        for vid in validator_indices(&attestation.aggregation_bits) {
+            let validator = validators
+                .get(vid as usize)
+                .ok_or(StoreError::InvalidValidatorIndex)?;
+            let pk = validator
+                .get_attestation_pubkey()
+                .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
+            pubkeys.push(pk);
+        }
+        pubkeys_per_component.push(pubkeys);
+        let slot_u32 = u32::try_from(attestation.data.slot)
+            .map_err(|_| StoreError::ProposerSignatureVerificationFailed)?;
+        expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
+    }
+
+    let proposer_validator = validators
+        .get(block.proposer_index as usize)
+        .ok_or(StoreError::InvalidValidatorIndex)?;
+    let proposer_pubkey = proposer_validator
+        .get_proposal_pubkey()
+        .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
+    pubkeys_per_component.push(vec![proposer_pubkey]);
+    let block_slot_u32 =
+        u32::try_from(block.slot).map_err(|_| StoreError::ProposerSignatureVerificationFailed)?;
+    expected_bindings.push((block_root, block_slot_u32));
+
+    let crypto_start = std::time::Instant::now();
+    ethlambda_crypto::verify_type_2_signature(
+        &merged.proof,
+        pubkeys_per_component,
+        &expected_bindings,
+    )
+    .map_err(StoreError::AggregateVerificationFailed)?;
+    let crypto_elapsed = crypto_start.elapsed();
+
     let total_elapsed = total_start.elapsed();
     info!(
         slot = block.slot,
         attestation_count = attestations.len(),
+        ?structural_elapsed,
+        ?crypto_elapsed,
         ?total_elapsed,
-        "Block proof structural check"
+        "Block Type-2 proof verified"
     );
 
     Ok(())
@@ -1729,7 +1775,7 @@ mod tests {
     /// least one previously-uncovered validator. The greedy prefers the
     /// largest proof first, then picks additional proofs whose coverage
     /// extends `covered`. The resulting overlap is handled downstream by
-    /// `aggregate_proofs` → `xmss_aggregate` (which tracks duplicate pubkeys
+    /// `aggregate_proofs` → `aggregate_type_1` (which tracks duplicate pubkeys
     /// across children via its `dup_pub_keys` machinery).
     #[test]
     fn extend_proofs_greedily_allows_overlap_when_it_adds_coverage() {
