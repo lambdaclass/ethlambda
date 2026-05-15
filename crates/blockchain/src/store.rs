@@ -4,7 +4,7 @@ use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
     is_proposer, process_block, process_slots, slot_is_justifiable_after,
 };
-use ethlambda_storage::{ForkCheckpoints, Store};
+use ethlambda_storage::{ForkCheckpoints, Store, error::Error};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
@@ -119,7 +119,7 @@ fn update_head(store: &mut Store, log_tree: bool) -> Result<(), StoreError> {
 fn update_safe_target(store: &mut Store) -> Result<(), StoreError> {
     let head_state = store
         .get_state(&store.head()?)?
-        .ok_or_else(|| StoreError::Storage("head state not found".into()))?;
+        .ok_or(Error::MissingHeadState)?;
     let num_validators = head_state.validators.len() as u64;
 
     let min_target_score = (num_validators * 2).div_ceil(3);
@@ -589,11 +589,11 @@ pub fn get_attestation_target_with_checkpoints(
     let mut target_block_root = store.head()?;
     let mut target_header = store
         .get_block_header(&target_block_root)?
-        .ok_or_else(|| StoreError::Storage("head block header not found".into()))?;
+        .ok_or(Error::MissingHeadBlockHeader)?;
 
     let safe_target_block_slot = store
         .get_block_header(&store.safe_target()?)?
-        .ok_or_else(|| StoreError::Storage("safe target block header not found".into()))?
+        .ok_or(Error::MissingSafeTargetBlockHeader)?
         .slot;
 
     // Walk back toward safe target (up to `JUSTIFICATION_LOOKBACK_SLOTS` steps)
@@ -605,7 +605,7 @@ pub fn get_attestation_target_with_checkpoints(
             target_block_root = target_header.parent_root;
             target_header = store
                 .get_block_header(&target_block_root)?
-                .ok_or_else(|| StoreError::Storage("parent block header not found".into()))?;
+                .ok_or(Error::MissingParentBlockHeader)?;
         } else {
             break;
         }
@@ -623,7 +623,7 @@ pub fn get_attestation_target_with_checkpoints(
         target_block_root = target_header.parent_root;
         target_header = store
             .get_block_header(&target_block_root)?
-            .ok_or_else(|| StoreError::Storage("parent block header not found".into()))?;
+            .ok_or(Error::MissingParentBlockHeader)?;
     }
     // Guard: clamp target to justified (not in the spec).
     //
@@ -666,7 +666,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> Result<AttestationD
 
     let head_slot = store
         .get_block_header(&head_root)?
-        .ok_or_else(|| StoreError::Storage("head block header not found".into()))?
+        .ok_or(Error::MissingHeadBlockHeader)?
         .slot;
 
     let head_checkpoint = Checkpoint {
@@ -874,11 +874,11 @@ pub enum StoreError {
     },
 
     #[error("Storage error: {0}")]
-    Storage(#[source] ethlambda_storage::Error),
+    Storage(#[source] ethlambda_storage::error::Error),
 }
 
-impl From<ethlambda_storage::Error> for StoreError {
-    fn from(e: ethlambda_storage::Error) -> Self {
+impl From<ethlambda_storage::error::Error> for StoreError {
+    fn from(e: ethlambda_storage::error::Error) -> Self {
         Self::Storage(e)
     }
 }

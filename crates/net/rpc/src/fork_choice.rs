@@ -30,33 +30,33 @@ pub struct ForkChoiceNode {
 pub async fn get_fork_choice(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    use axum::http::StatusCode;
+    let blocks = store
+        .get_live_chain()
+        .expect("failed to load live chain from store");
 
-    macro_rules! try_store {
-        ($e:expr) => {
-            match $e {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(%e, "Storage error in fork_choice handler");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        };
-    }
-
-    let blocks = try_store!(store.get_live_chain());
     let attestations = store.extract_latest_known_attestations();
 
-    let justified = try_store!(store.latest_justified());
-    let finalized = try_store!(store.latest_finalized());
+    let justified = store
+        .latest_justified()
+        .expect("failed to load justified checkpoint");
+
+    let finalized = store
+        .latest_finalized()
+        .expect("failed to load finalized checkpoint");
+
     let start_slot = finalized.slot;
 
     let weights = ethlambda_fork_choice::compute_block_weights(start_slot, &blocks, &attestations);
 
-    let head = try_store!(store.head());
-    let safe_target = try_store!(store.safe_target());
+    let head = store.head().expect("failed to load head block root");
 
-    let validator_count = try_store!(store.head_state()).validators.len() as u64;
+    let safe_target = store.safe_target().expect("failed to load safe target");
+
+    let validator_count = store
+        .head_state()
+        .expect("failed to load head state")
+        .validators
+        .len() as u64;
 
     let nodes: Vec<ForkChoiceNode> = blocks
         .iter()

@@ -7,7 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
-use crate::api::{Error, StorageBackend, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::error::Error;
 
 use ethlambda_types::{
     attestation::{AttestationData, HashedAttestationData, bits_is_subset},
@@ -482,16 +483,16 @@ impl Store {
         anchor_state: State,
         anchor_block: Block,
     ) -> Result<Self, Error> {
-        // Compare headers with state_root zeroed (init_store handles state_root separately)
+        // Compare headers with state_root zeroed
         let mut state_header = anchor_state.latest_block_header.clone();
         let mut block_header = anchor_block.header();
+
         state_header.state_root = H256::ZERO;
         block_header.state_root = H256::ZERO;
 
-        assert_eq!(
-            state_header, block_header,
-            "block header doesn't match state's latest_block_header"
-        );
+        if state_header != block_header {
+            return Err(Error::AnchorHeaderMismatch);
+        }
 
         Self::init_store(backend, anchor_state, Some(anchor_block.body))
     }
@@ -589,14 +590,14 @@ impl Store {
         let view = self.backend.begin_read()?;
         let bytes = view
             .get(Table::Metadata, key)?
-            .ok_or("Metadata key not found")?;
+            .ok_or(Error::MissingMetadata)?;
         T::from_ssz_bytes(&bytes).map_err(|e| e.into())
     }
 
     fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error> {
         let mut batch = self.backend.begin_write()?;
         batch.put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])?;
-        batch.commit()
+        Ok(batch.commit()?)
     }
 
     // ============ Time ============
@@ -728,7 +729,8 @@ impl Store {
             .map(|res| -> Result<(H256, (u64, H256)), Error> {
                 let (k, v) = res?;
                 let (slot, root) = decode_live_chain_key(&k);
-                let parent_root = H256::from_ssz_bytes(&v).map_err(|e| -> Error { Box::new(e) })?;
+                let parent_root = H256::from_ssz_bytes(&v)
+                    .map_err(|e| -> Error { Error::Storage(Box::new(e)) })?;
                 Ok((root, (slot, parent_root)))
             })
             .collect()
@@ -890,7 +892,10 @@ impl Store {
     pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
         let view = self.backend.begin_read()?;
         view.get(Table::BlockHeaders, &root.to_ssz())?
-            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).map_err(|e| -> Error { Box::new(e) }))
+            .map(|bytes| {
+                BlockHeader::from_ssz_bytes(&bytes)
+                    .map_err(|e| -> Error { Error::Storage(Box::new(e)) })
+            })
             .transpose()
     }
 
@@ -912,7 +917,7 @@ impl Store {
     ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write()?;
         write_signed_block(batch.as_mut(), &root, signed_block)?;
-        batch.commit()
+        Ok(batch.commit()?)
     }
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -936,7 +941,7 @@ impl Store {
         )];
         batch.put_batch(Table::LiveChain, index_entries)?;
 
-        batch.commit()
+        Ok(batch.commit()?)
     }
 
     /// Get a signed block by combining header, body, and signatures.
@@ -954,8 +959,8 @@ impl Store {
             return Ok(None);
         };
 
-        let header =
-            BlockHeader::from_ssz_bytes(&header_bytes).map_err(|e| -> Error { Box::new(e) })?;
+        let header = BlockHeader::from_ssz_bytes(&header_bytes)
+            .map_err(|e| -> Error { Error::Storage(Box::new(e)) })?;
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
@@ -964,12 +969,13 @@ impl Store {
             let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
                 return Ok(None);
             };
-            BlockBody::from_ssz_bytes(&body_bytes).map_err(|e| -> Error { Box::new(e) })?
+            BlockBody::from_ssz_bytes(&body_bytes)
+                .map_err(|e| -> Error { Error::Storage(Box::new(e)) })?
         };
 
         let block = Block::from_header_and_body(header, body);
-        let signature =
-            BlockSignatures::from_ssz_bytes(&sig_bytes).map_err(|e| -> Error { Box::new(e) })?;
+        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes)
+            .map_err(|e| -> Error { Error::Storage(Box::new(e)) })?;
 
         Ok(Some(SignedBlock {
             message: block,
@@ -983,7 +989,9 @@ impl Store {
     pub fn get_state(&self, root: &H256) -> Result<Option<State>, Error> {
         let view = self.backend.begin_read()?;
         view.get(Table::States, &root.to_ssz())?
-            .map(|bytes| State::from_ssz_bytes(&bytes).map_err(|e| -> Error { Box::new(e) }))
+            .map(|bytes| {
+                State::from_ssz_bytes(&bytes).map_err(|e| -> Error { Error::Storage(Box::new(e)) })
+            })
             .transpose()
     }
 
@@ -998,7 +1006,7 @@ impl Store {
         let mut batch = self.backend.begin_write()?;
         let entries = vec![(root.to_ssz(), state.to_ssz())];
         batch.put_batch(Table::States, entries)?;
-        batch.commit()
+        Ok(batch.commit()?)
     }
 
     // ============ Attestation Extraction ============
@@ -1186,7 +1194,7 @@ impl Store {
     pub fn head_slot(&self) -> Result<u64, Error> {
         Ok(self
             .get_block_header(&self.head()?)?
-            .ok_or_else(|| -> Error { "head block header not found".into() })?
+            .ok_or(Error::MissingHeadBlockHeader)?
             .slot)
     }
 
@@ -1194,14 +1202,14 @@ impl Store {
     pub fn safe_target_slot(&self) -> Result<u64, Error> {
         Ok(self
             .get_block_header(&self.safe_target()?)?
-            .ok_or_else(|| -> Error { "safe target block header not found".into() })?
+            .ok_or(Error::MissingSafeTarget)?
             .slot)
     }
 
     /// Returns a clone of the head state.
     pub fn head_state(&self) -> Result<State, Error> {
         self.get_state(&self.head()?)?
-            .ok_or_else(|| "head state not found".into())
+            .ok_or(Error::MissingHeadState)
     }
 }
 

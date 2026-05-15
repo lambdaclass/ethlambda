@@ -82,7 +82,10 @@ pub type DriverState = Arc<RwLock<Store>>;
 /// Used as the placeholder seed before the first `fork_choice/init` call.
 pub fn empty_driver_store() -> Result<Store, Error> {
     let backend = Arc::new(InMemoryBackend::new());
-    Store::from_anchor_state(backend, State::from_genesis(0, vec![]))
+    Ok(Store::from_anchor_state(
+        backend,
+        State::from_genesis(0, vec![]),
+    )?)
 }
 
 /// Build the test-driver router, including a `/lean/v0/health` endpoint so the

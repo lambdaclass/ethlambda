@@ -243,7 +243,13 @@ fn canonical_blocks_by_range(
         .filter_map(|index| {
             let slot = start_slot.checked_add(index.checked_mul(step)?)?;
             let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root).ok().flatten()
+            store
+                .get_signed_block(root)
+                .inspect_err(|e| {
+                    tracing::warn!("Failed to get signed block for root {:?}: {:?}", root, e);
+                })
+                .ok()
+                .flatten()
         })
         .collect();
     Ok(blocks)
@@ -298,14 +304,18 @@ async fn handle_blocks_by_root_response(
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized().unwrap_or_default();
-    let head_root = store.head().unwrap_or_default();
+    let finalized = store
+        .latest_finalized()
+        .expect("store should always contain a finalized checkpoint");
+    let head_root = store
+        .head()
+        .expect("store should always contain a head block root");
     let head_slot = store
         .get_block_header(&head_root)
         .ok()
         .flatten()
-        .map(|h| h.slot)
-        .unwrap_or(0);
+        .expect("head block exists")
+        .slot;
     Status {
         finalized,
         head: Checkpoint {
