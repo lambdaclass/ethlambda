@@ -44,8 +44,8 @@ jobs:
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install tokei
-        run: cargo install tokei --locked --version 12.1.2
+      - name: Install cargo-warloc
+        run: cargo install cargo-warloc --locked --version 0.1.1
 
       - name: Restore previous LoC report
         id: cache-loc-report
@@ -61,7 +61,7 @@ jobs:
         run: mv loc_report.json loc_report.json.old
 
       - name: Generate LoC report
-        run: bash .github/scripts/generate_loc_report.sh
+        run: python3 .github/scripts/generate_loc_report.py
 
       - name: Save new LoC report to cache
         if: success()
