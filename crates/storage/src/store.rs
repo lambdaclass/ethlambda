@@ -483,7 +483,7 @@ impl Store {
         anchor_state: State,
         anchor_block: Block,
     ) -> Result<Self, Error> {
-        // Compare headers with state_root zeroed
+        // Compare headers with state_root zeroed (init_store handles state_root separately)
         let mut state_header = anchor_state.latest_block_header.clone();
         let mut block_header = anchor_block.header();
 
