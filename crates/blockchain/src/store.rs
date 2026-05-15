@@ -1245,37 +1245,6 @@ pub fn verify_block_signatures(
 
     let structural_elapsed = total_start.elapsed();
 
-    // Skip crypto when the merged proof carries no SNARK bytes (the stub path
-    // used while the actor-thread SNARK work is being moved off-thread).
-    //
-    // SECURITY CAVEAT: in this branch the proposer's XMSS signature over the
-    // block root is NOT cryptographically verified — only the participants
-    // bitfield is checked against `block.proposer_index`. A peer that knows
-    // the elected proposer for a slot could submit a block claiming that
-    // proposer's authorship without holding the key. Two upstream mitigations
-    // still apply:
-    //   * `ethlambda_state_transition::process_block_header` rejects any block
-    //     whose `proposer_index` doesn't match the slot's elected proposer, so
-    //     impersonation of a *different* validator still fails the state
-    //     transition.
-    //   * Per-attestation Type-1 signatures continue to verify cryptographically
-    //     at gossip ingestion (`on_gossip_aggregated_attestation`), so the
-    //     attestation body of the block is still bound to real signers.
-    // The stub path is a devnet-only convenience pending the SNARK off-thread
-    // refactor; production / interop deployments should run with
-    // `--crypto-merge-t1-into-t2`.
-    if merged.proof.is_empty() {
-        let total_elapsed = total_start.elapsed();
-        info!(
-            slot = block.slot,
-            attestation_count = attestations.len(),
-            ?structural_elapsed,
-            ?total_elapsed,
-            "Block Type-2 proof structural-only (empty SNARK bytes — proposer sig not crypto-verified)"
-        );
-        return Ok(());
-    }
-
     // Resolve pubkeys per Type-2 component for verify_type_2 and rederive the
     // expected (message, slot) bindings from the block body. Attestation
     // components use each participant's attestation_pubkey; the trailing

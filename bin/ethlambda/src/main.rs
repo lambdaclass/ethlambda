@@ -92,18 +92,6 @@ struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
-
-    /// Produce a real cryptographic Type-2 SNARK on the block-building hot
-    /// path (proposer Type-1 wrap + `merge_many_type_1`).
-    ///
-    /// Off by default: each SNARK currently runs on the actor thread and
-    /// takes seconds, starving interval-1 attestation production. With the
-    /// flag off, blocks ship a metadata-only Type-2 envelope (empty SNARK
-    /// bytes); per-attestation crypto verification still runs at gossip
-    /// ingestion, and block-level verify falls back to its structural check.
-    /// Flip the flag on once the SNARK work is moved off the actor thread.
-    #[arg(long, default_value = "false")]
-    crypto_merge_t1_into_t2: bool,
 }
 
 #[tokio::main]
@@ -220,12 +208,7 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    let blockchain = BlockChain::spawn(
-        store.clone(),
-        validator_keys,
-        aggregator.clone(),
-        options.crypto_merge_t1_into_t2,
-    );
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
     // AggregatorController — subnet subscriptions are decided once here and
