@@ -47,7 +47,24 @@ const ASCII_ART: &str = r#"
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
-struct CliOptions {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Commands {
+    /// Run the consensus node.
+    Node(Box<NodeArgs>),
+    /// Run in Hive test-driver mode (spec-asset suites only).
+    ///
+    /// Skips the consensus/p2p stack and exposes only the
+    /// `/lean/v0/test_driver/...` endpoints driven by the hive simulator.
+    TestDriver(TestDriverArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct NodeArgs {
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     genesis: PathBuf,
@@ -111,6 +128,16 @@ struct CliOptions {
     data_dir: PathBuf,
 }
 
+#[derive(Debug, clap::Args)]
+struct TestDriverArgs {
+    #[arg(long, default_value = "127.0.0.1")]
+    http_address: IpAddr,
+    #[arg(long, default_value = "5052")]
+    api_port: u16,
+    #[arg(long, default_value = "5054")]
+    metrics_port: u16,
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
@@ -119,34 +146,37 @@ async fn main() -> eyre::Result<()> {
     let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    let options = CliOptions::parse();
+    let cli = Cli::parse();
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 
+    println!("{ASCII_ART}");
+
+    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+
+    match cli.command {
+        Commands::TestDriver(args) => {
+            let rpc_config = RpcConfig {
+                http_address: args.http_address,
+                api_port: args.api_port,
+                metrics_port: args.metrics_port,
+            };
+            info!("Booting in test-driver mode");
+            return run_test_driver(rpc_config).await;
+        }
+        Commands::Node(options) => run_node(*options).await,
+    }
+}
+
+async fn run_node(options: NodeArgs) -> eyre::Result<()> {
     let rpc_config = RpcConfig {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
     };
-
-    println!("{ASCII_ART}");
-
-    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
-
-    // Hive lean spec-asset suites boot the client with
-    // HIVE_LEAN_TEST_DRIVER=1 so it skips the consensus/p2p stack and
-    // exposes only the `/lean/v0/test_driver/...` endpoints driven by the
-    // simulator. Detected here before any config / key / genesis loading
-    // so the driver run doesn't touch --node-key, --custom-network-config-dir,
-    // or any other consensus prerequisite the hive shim doesn't bother to
-    // provision.
-    if ethlambda_rpc::test_driver::test_driver_enabled() {
-        info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
-        return run_test_driver(rpc_config).await;
-    }
 
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
