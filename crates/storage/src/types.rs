@@ -338,6 +338,7 @@ impl GossipSignatureBuffer {
         self.total_signatures
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.data.len()
     }
