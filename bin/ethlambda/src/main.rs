@@ -637,24 +637,25 @@ async fn fetch_initial_state(
 
     let mut result = try_checkpoint_url(first_url, genesis.genesis_time, &validators).await;
     if let Err(err) = &result {
-        warn!(
-            url = %first_url,
-            %err,
-            "Checkpoint sync failed for this peer; trying next URL"
-        );
+        if !rest_urls.is_empty() {
+            warn!(%first_url, %err, "Checkpoint sync failed for this peer; trying next URL");
+        } else {
+            warn!(%first_url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+        }
     }
 
-    for url in rest_urls {
+    for (idx, url) in rest_urls.iter().enumerate() {
         if result.is_ok() {
             break;
         }
         result = try_checkpoint_url(url, genesis.genesis_time, &validators).await;
         if let Err(err) = &result {
-            warn!(
-                %url,
-                %err,
-                "Checkpoint sync failed for this peer; trying next URL"
-            );
+            let has_more = idx + 1 < rest_urls.len();
+            if has_more {
+                warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
+            } else {
+                warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+            }
         }
     }
 
