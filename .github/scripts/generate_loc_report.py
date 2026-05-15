@@ -26,6 +26,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# Crates whose entire contents are test infrastructure and should never
+# appear in the "no tests" totals or per-crate listing.
+TEST_ONLY_CRATES = frozenset({
+    "crates/common/test-fixtures",
+})
+
+# Individual files that are test infrastructure but live next to production
+# code inside an otherwise-production crate. Their lines are folded into the
+# owning crate's `tests` bucket.
+TEST_ONLY_FILES = frozenset({
+    "crates/net/rpc/src/test_driver.rs",
+})
+
+
 def _run(cmd: list[str]) -> str:
     return subprocess.check_output(cmd, text=True)
 
@@ -55,8 +69,13 @@ def group_by_crate(by_file: dict, crates: list[str]) -> dict[str, dict[str, int]
         owner = next((c for c in crates if path.startswith(c + "/")), None)
         if owner is None:
             continue
-        buckets[owner]["main"] += stats["main"]["code"]
-        buckets[owner]["tests"] += stats["tests"]["code"]
+        is_test_only = owner in TEST_ONLY_CRATES or path in TEST_ONLY_FILES
+        if is_test_only:
+            # All lines from this file/crate count as tests.
+            buckets[owner]["tests"] += stats["main"]["code"] + stats["tests"]["code"]
+        else:
+            buckets[owner]["main"] += stats["main"]["code"]
+            buckets[owner]["tests"] += stats["tests"]["code"]
     return buckets
 
 
@@ -112,6 +131,10 @@ def main() -> None:
 
     per_crate = []
     for r in rows:
+        # Test-only crates fold their lines into the tests bucket and have
+        # main == 0; skip them in the per-crate "no tests" listing.
+        if r["main"] == 0:
+            continue
         old_loc = old_crates.get(r["path"], r["main"])
         per_crate.append({
             "path": r["path"],
