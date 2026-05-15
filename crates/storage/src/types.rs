@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 /// Used with `Store::update_checkpoints` to update head and optionally
 /// update justified/finalized checkpoints (only if higher slot).
 pub struct ForkCheckpoints {
-    pub head: H256,
-    pub justified: Option<Checkpoint>,
-    pub finalized: Option<Checkpoint>,
+    pub(crate) head: H256,
+    pub(crate) justified: Option<Checkpoint>,
+    pub(crate) finalized: Option<Checkpoint>,
 }
 
 impl ForkCheckpoints {
