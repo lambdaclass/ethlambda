@@ -167,9 +167,7 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
           push: false
-          tags: |
-            ghcr.io/lambdaclass/ethlambda:devnet3
-            ghcr.io/lambdaclass/ethlambda:devnet4
+          tags: ghcr.io/lambdaclass/ethlambda:devnet4
           outputs: type=docker,dest=/tmp/ethlambda_image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
