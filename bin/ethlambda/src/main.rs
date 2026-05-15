@@ -596,6 +596,21 @@ async fn try_checkpoint_url(
     }
 }
 
+/// Strip userinfo, query, and fragment from a URL so embedded credentials
+/// (basic-auth or token query params) don't leak into logs. Unparseable
+/// inputs are replaced with a placeholder rather than logged raw.
+fn redact_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|mut u| {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        })
+        .unwrap_or_else(|_| "<unparseable url>".to_string())
+}
+
 /// Fetch the initial state for the node.
 ///
 /// If `checkpoint_urls` is empty, creates a genesis state from the local
@@ -633,14 +648,20 @@ async fn fetch_initial_state(
     };
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.
-    info!(urls = ?checkpoint_urls, "Starting checkpoint sync");
+    // Log only the count — URLs may carry basic-auth credentials or token query
+    // parameters; per-URL log lines below redact those before emission.
+    info!(
+        url_count = checkpoint_urls.len(),
+        "Starting checkpoint sync"
+    );
 
     let mut result = try_checkpoint_url(first_url, genesis.genesis_time, &validators).await;
     if let Err(err) = &result {
+        let url = redact_url(first_url);
         if !rest_urls.is_empty() {
-            warn!(%first_url, %err, "Checkpoint sync failed for this peer; trying next URL");
+            warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
         } else {
-            warn!(%first_url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+            warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
         }
     }
 
@@ -650,6 +671,7 @@ async fn fetch_initial_state(
         }
         result = try_checkpoint_url(url, genesis.genesis_time, &validators).await;
         if let Err(err) = &result {
+            let url = redact_url(url);
             let has_more = idx + 1 < rest_urls.len();
             if has_more {
                 warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
