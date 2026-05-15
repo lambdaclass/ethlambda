@@ -79,7 +79,7 @@ jobs:
             ${{ (github.event_name == 'schedule' || inputs.target == 'prod')
                 && secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK
                 || secrets.ETHLAMBDA_TEST_SLACK_WEBHOOK }}
-        run: bash .github/scripts/publish_slack.sh "$SLACK_WEBHOOK" loc_report_slack.json
+        run: bash .github/scripts/publish_slack.sh loc_report_slack.json
 
       - name: Post to Telegram (weekly, or manual opt-in)
         env:
