@@ -306,4 +306,36 @@ mod tests {
         let b = bits(24, &[0, 1, 16]);
         assert!(!bits_is_subset(&a, &b));
     }
+
+    /// Guard the three SSZ offsets at fixed byte positions so a one-off in any
+    /// constant doesn't silently produce a blob that still has the right outer
+    /// length but decodes incorrectly at the inner `Signature` container level.
+    #[test]
+    fn blank_xmss_signature_has_expected_ssz_offsets() {
+        let sig = blank_xmss_signature();
+        let bytes: Vec<u8> = sig.into_iter().collect();
+
+        assert_eq!(bytes.len(), SIGNATURE_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            SIGNATURE_PATH_OFFSET,
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            SIGNATURE_HASHES_OFFSET,
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            SIGNATURE_PATH_SIBLINGS_OFFSET,
+        );
+
+        // Everything outside the three offset slots must be zero — the
+        // placeholder is "all-zero hashes" once the offsets locate them.
+        for (i, b) in bytes.iter().enumerate() {
+            let in_offset_slot = matches!(i, 0..4 | 32..36 | 36..40);
+            if !in_offset_slot {
+                assert_eq!(*b, 0, "non-offset byte at index {i} should be zero");
+            }
+        }
+    }
 }
