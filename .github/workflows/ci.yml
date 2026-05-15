@@ -150,6 +150,8 @@ jobs:
   docker_build:
     name: Build Docker
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -181,6 +183,8 @@ jobs:
   run-hive:
     name: Hive - ${{ matrix.name }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: docker_build
     strategy:
       fail-fast: false
@@ -249,7 +253,7 @@ jobs:
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
       - name: Run Hive Simulation
-        uses: ethpandaops/hive-github-action@v0.5.0
+        uses: ethpandaops/hive-github-action@1aa8d73dad34de13afbb3113ab16c1a462d2fbc3 # v0.5.0
         with:
           hive_repository: ethereum/hive
           hive_version: 6f704d0cd8fb4dfd3f635abcc5a3ea6cd395e61b
