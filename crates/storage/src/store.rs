@@ -15,10 +15,24 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
-    state::{ChainConfig, State},
+    state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
+use thiserror::Error;
 use tracing::info;
+
+/// Errors returned by [`Store::get_forkchoice_store`].
+#[derive(Debug, Error)]
+pub enum GetForkchoiceStoreError {
+    #[error(
+        "anchor block doesn't match anchor state: \
+         state header = {anchor_state:?}, block = {anchor_block:?}"
+    )]
+    AnchorPairInconsistent {
+        anchor_state: Box<State>,
+        anchor_block: Box<Block>,
+    },
+}
 
 /// Checkpoints to update in the forkchoice store.
 ///
@@ -468,27 +482,28 @@ impl Store {
     /// The block must match the state's `latest_block_header`.
     /// Named to mirror the spec's `get_forkchoice_store` function.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the block's header doesn't match the state's `latest_block_header`
-    /// (comparing all fields except `state_root`, which is computed internally).
+    /// Returns [`GetForkchoiceStoreError::AnchorPairInconsistent`] if the block's header
+    /// doesn't match the state's `latest_block_header` (comparing all fields
+    /// except `state_root`, which is computed internally).
     pub fn get_forkchoice_store(
         backend: Arc<dyn StorageBackend>,
-        anchor_state: State,
+        mut anchor_state: State,
         anchor_block: Block,
-    ) -> Self {
-        // Compare headers with state_root zeroed (init_store handles state_root separately)
-        let mut state_header = anchor_state.latest_block_header.clone();
-        let mut block_header = anchor_block.header();
-        state_header.state_root = H256::ZERO;
-        block_header.state_root = H256::ZERO;
+    ) -> Result<Self, GetForkchoiceStoreError> {
+        if !anchor_pair_is_consistent(&mut anchor_state, &anchor_block) {
+            return Err(GetForkchoiceStoreError::AnchorPairInconsistent {
+                anchor_state: Box::new(anchor_state),
+                anchor_block: Box::new(anchor_block),
+            });
+        }
 
-        assert_eq!(
-            state_header, block_header,
-            "block header doesn't match state's latest_block_header"
-        );
-
-        Self::init_store(backend, anchor_state, Some(anchor_block.body))
+        Ok(Self::init_store(
+            backend,
+            anchor_state,
+            Some(anchor_block.body),
+        ))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -948,6 +963,27 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+    }
+
+    /// Get a block (header + body, no signatures) by root.
+    ///
+    /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
+    /// genesis block, which has no signature entry.
+    pub fn get_block(&self, root: &H256) -> Option<Block> {
+        let view = self.backend.begin_read().expect("read view");
+        let key = root.to_ssz();
+
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+
+        let body = if header.body_root == *EMPTY_BODY_ROOT {
+            BlockBody::default()
+        } else {
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+        };
+
+        Some(Block::from_header_and_body(header, body))
     }
 
     /// Get a signed block by combining header, body, and the merged proof.

@@ -4,11 +4,14 @@ use libssz_types::SszList;
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
+pub const BLOCKS_BY_RANGE_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
+pub const MAX_REQUEST_BLOCKS: u64 = 1024; // Maximum number of blocks in a single request (1024).
 
 #[derive(Debug, Clone)]
 pub enum Request {
     Status(Status),
     BlocksByRoot(BlocksByRootRequest),
+    BlocksByRange(BlocksByRangeRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +91,7 @@ impl std::fmt::Debug for ResponseCode {
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
     Status(Status),
-    BlocksByRoot(Vec<SignedBlock>),
+    Blocks(Vec<SignedBlock>),
 }
 
 #[derive(Debug, Clone, SszEncode, SszDecode)]
@@ -106,8 +109,6 @@ pub type ErrorMessage = SszList<u8, 256>;
 /// Helper to create an ErrorMessage from a string.
 /// Debug builds panic if message exceeds 256 bytes (programming error).
 /// Release builds truncate to 256 bytes.
-#[expect(dead_code)]
-// TODO: map errors to req/resp error messages
 pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     let bytes = msg.as_ref().as_bytes();
     debug_assert!(
@@ -129,4 +130,10 @@ pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
 #[derive(Debug, Clone, SszEncode, SszDecode)]
 pub struct BlocksByRootRequest {
     pub roots: RequestedBlockRoots,
+}
+
+#[derive(Debug, Clone, SszEncode, SszDecode)]
+pub struct BlocksByRangeRequest {
+    pub start_slot: u64,
+    pub count: u64,
 }
