@@ -17,9 +17,8 @@ use super::{
     messages::{ResponseCode, error_message},
 };
 use crate::{
-    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, LONG_RANGE_SYNC_THRESHOLD, MAX_FETCH_RETRIES,
-    MAX_SLOT_LOOKBACK, MAX_SYNC_RANGE, P2PServer, PendingRequest, p2p_protocol,
-    req_resp::RequestedBlockRoots,
+    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
+    PendingRequest, p2p_protocol, req_resp::RequestedBlockRoots,
 };
 
 pub async fn handle_req_resp_message(
@@ -135,18 +134,10 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
         return;
     }
     let gap = status.head.slot - our_head_slot;
-
-    if gap > LONG_RANGE_SYNC_THRESHOLD {
-        // Long-range sync: request blocks by range to efficiently fill large gap.
-        let start_slot = our_head_slot.saturating_add(1);
-        // Cap the range to avoid requesting an excessive number of blocks if the peer is very far ahead.
-        let count = gap.min(MAX_SYNC_RANGE);
-        info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
-        request_blocks_by_range_from_peer(server, peer, start_slot, count).await;
-    } else {
-        // Short-range sync: fetch individual blocks by root, relying on gossip to fill any small gaps.
-        info!(%peer, gap, "Short gap, relying on gossip / FetchBlock for missing slots");
-    }
+    let count = gap.min(MAX_SYNC_RANGE);
+    let start_slot = our_head_slot.saturating_add(1);
+    request_blocks_by_range_from_peer(server, peer, start_slot, count).await;
+    info!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
 }
 
 async fn handle_blocks_by_root_request(
@@ -233,12 +224,6 @@ fn canonical_blocks_by_range(
     else {
         return Vec::new();
     };
-
-    // Avoid expensive lookups if the requested range is too far in the past (beyond recent gossip history).
-    let head_slot = store.head_slot();
-    if head_slot.saturating_sub(end_slot) > MAX_SLOT_LOOKBACK {
-        return Vec::new();
-    }
 
     let mut roots_by_slot = HashMap::new();
     let mut current_root = store.head();
@@ -452,6 +437,14 @@ async fn request_blocks_by_range_from_peer(
     if count == 0 {
         return true;
     }
+    let end_slot = start_slot.saturating_add(count).saturating_sub(1);
+
+    // Deduplicate: skip if we already have this range in-flight
+    if server.pending_sync_ranges.contains(&(start_slot, end_slot)) {
+        info!(%peer, start_slot, end_slot, "BlocksByRange already in-flight, skipping duplicate");
+        return true;
+    }
+    server.pending_sync_ranges.insert((start_slot, end_slot));
 
     let mut remaining = count;
     let mut next_slot = start_slot;
