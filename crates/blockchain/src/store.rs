@@ -1135,7 +1135,10 @@ fn build_block(
                 proposer_index,
                 parent_root,
                 state_root: H256::ZERO,
-                body: BlockBody { attestations },
+                body: BlockBody {
+                    attestations,
+                    execution_payload: Default::default(),
+                },
             };
             let mut post_state = head_state.clone();
             process_slots(&mut post_state, slot)?;
@@ -1170,7 +1173,10 @@ fn build_block(
         proposer_index,
         parent_root,
         state_root: H256::ZERO,
-        body: BlockBody { attestations },
+        body: BlockBody {
+            attestations,
+            execution_payload: Default::default(),
+        },
     };
     let mut post_state = head_state.clone();
     process_slots(&mut post_state, slot)?;
@@ -1404,7 +1410,10 @@ mod tests {
                 proposer_index: 0,
                 parent_root: H256::ZERO,
                 state_root: H256::ZERO,
-                body: BlockBody { attestations },
+                body: BlockBody {
+                    attestations,
+                    execution_payload: Default::default(),
+                },
             },
             signature: BlockSignatures {
                 attestation_signatures,
@@ -1476,6 +1485,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         // process_slots fills in the parent header's state_root before
@@ -1637,6 +1647,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let mut header_for_root = head_state.latest_block_header.clone();
@@ -1855,7 +1866,10 @@ mod tests {
                 proposer_index: 0,
                 parent_root: head_root,
                 state_root: H256::ZERO,
-                body: BlockBody { attestations },
+                body: BlockBody {
+                    attestations,
+                    execution_payload: Default::default(),
+                },
             },
             signature: BlockSignatures {
                 attestation_signatures,

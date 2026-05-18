@@ -213,7 +213,7 @@ New `BlockBody` SSZ root → gossipsub topic hashes change → ethlambda peering
 
 #### Phase 7 — Fixtures, tests, and the leanSpec issue
 
-- Every existing forkchoice / STF / signature SSZ fixture has a `BlockBody` without `execution_payload` and an SSZ-decodes-to-old-shape failure mode. Gate the new field behind a Cargo feature `execution-payload`. Workspace default = ON. The spec-fixture test crate runs with the feature OFF until leanSpec regenerates upstream fixtures.
+- Every existing forkchoice / STF / signature SSZ fixture has a `BlockBody` without `execution_payload` and pre-M6 state/body tree-hash roots. Phase 2c handled this with explicit `FIXTURES_AWAIT_M6_REGEN: bool = true` skip flags at the top of each affected spec-test entry point (no Cargo feature gate — the cfg pollution would have been worse than the loss of coverage). To re-enable a group: flip the flag in the corresponding `tests/*.rs` and regenerate fixtures via `make leanSpec/fixtures`.
 - New ethlambda-native tests:
   - `process_execution_payload_rejects_parent_mismatch`
   - `build_block_embeds_get_payload_response`
