@@ -147,21 +147,96 @@ Resolve A/B/C with user. Plan stays in `docs/plans/`.
 - Devnet config wiring ethlambda → local ethrex; verify ethrex logs receive
   the FCU and respond. No consensus block changes yet.
 
-### M6 — *(blocked on leanSpec)* — Real payload flow (Option C)
-Out of scope for this plan unless C is selected up front.
+### M6 — Real payload flow (Option C, in scope as of 2026-05-18)
+
+#### Scope decisions locked
+
+- **Branch/PR**: extend the existing `engine-api-integration` branch (PR #367) rather than open a new one.
+- **Schema**: mirror canonical Ethereum `ExecutionPayloadV3` (Cancun) verbatim — every field, exact JSON wire shape. We do not invent a Lean-specific minimal payload.
+- **Upstream coordination**: lead unilaterally. Implement in ethlambda first, propose the schema to leanSpec as a follow-up.
+
+#### Cost note (read before phase 1)
+
+M6 is ~5–10× the size of PR #367's Option B scaffold. It touches three core schema types (`BlockBody`, `State`, `ExecutionPayloadHeader`), six functional sites (`process_block`, `build_block`, `on_block`, `notify_execution_layer`, `fcu` call site, capability handshake), every spec fixture (forkchoice / STF / signature SSZ inputs), and the gossipsub `fork_digest` (peering with other Lean clients breaks the moment this lands).
+
+Estimated diff added to PR #367: **~+1600 / −200** on top of the current ~+1300, taking the PR to **~+3000 / −230 net** — at the upper bound of single-PR reviewability. If at any phase boundary this is judged too large to review as one unit, the natural split is `Phase 1–2` (schema additions, no behavior change) on PR #367 and `Phase 3–7` (EL wiring + fixture bump) on a follow-up PR. Decision deferred to end of Phase 2.
+
+#### Phase 1 — Promote `ExecutionPayloadV3` into the canonical types crate
+
+`ExecutionPayloadV3`, `ExecutionPayloadHeader`, `Withdrawal`, and the hex serde helpers live in `crates/net/ethrex-client/src/types.rs`. The block schema needs them, so the types crate (foundational) can't depend on the client crate. Move:
+
+- New module `crates/common/types/src/execution_payload.rs` carrying the moved types.
+- Add `Default`, `SszEncode`, `SszDecode`, `HashTreeRoot` derives — the existing ethrex-client copy only has serde.
+- `crates/net/ethrex-client/src/lib.rs` re-exports from `ethlambda_types` so its public API is unchanged.
+
+No behavior change. Net: +1 module, ~+250/−50.
+
+#### Phase 2 — Embed payload in block schema
+
+- `BlockBody { attestations }` → `BlockBody { attestations, execution_payload: ExecutionPayloadV3 }`.
+- `State` gains `latest_execution_payload_header: ExecutionPayloadHeader`.
+- `State::from_genesis(...)` seeds the header with parent_hash/state_root/block_hash all-zero, `block_number = 0`, `timestamp = GENESIS_TIME`. (Open question on genesis convention — see below.)
+- `process_block` (state_transition) adds `process_execution_payload(state, block)` before `process_attestations`, mirroring the Capella spec line you pointed at:
+  - `assert payload.parent_hash == state.latest_execution_payload_header.block_hash`
+  - `assert payload.timestamp == GENESIS_TIME + slot * SLOT_DURATION`
+  - Cache the new header onto `state.latest_execution_payload_header`.
+
+Files: `crates/common/types/src/{block,state,execution_payload}.rs`, `crates/blockchain/state_transition/src/lib.rs`. ~+400/−20.
+
+#### Phase 3 — `engine_newPayloadV3` on block import
+
+In `crates/blockchain/src/store.rs::on_block` (line 412), after structural / signature gates pass and before fork-choice insertion, call `client.new_payload_v3(body.execution_payload)` when the client is configured:
+
+- `INVALID` → reject with `StoreError::ExecutionPayloadInvalid`.
+- `SYNCING` / `ACCEPTED` → log + accept (CL outpaces EL, EL will catch up).
+- `VALID` → log + accept.
+
+`on_block_without_verification` (the fork-choice-test seam) does NOT call the EL — preserves existing test isolation. ~+150/−10.
+
+#### Phase 4 — `engine_getPayloadV3` on block proposal
+
+Block-build flow today (store.rs:1043 `build_block`) constructs `BlockBody { attestations }` synchronously. Adding the payload requires a pre-arranged `payload_id`:
+
+- At interval 4 of slot N-1, if we're the proposer for slot N: fire `engine_forkchoiceUpdatedV3` with `Some(PayloadAttributesV3 { timestamp: GENESIS_TIME + N*4, prev_randao: 0, suggested_fee_recipient, withdrawals: [], parent_beacon_block_root: 0 })`. EL returns a `payload_id`. Stash on the `BlockChain` actor.
+- At interval 0 of slot N (proposal time), call `client.get_payload_v3(payload_id)` → parse into `ExecutionPayloadV3` → pass into `build_block` to embed in `BlockBody`.
+- No client configured: synthesize a zero payload (parent_hash = prev header's block_hash, timestamp = slot-mapped, txs/withdrawals empty). Keeps non-EL-paired nodes producing parseable blocks.
+
+Files: `crates/blockchain/src/{lib,store}.rs`. ~+250/−10.
+
+#### Phase 5 — Replace `H256::ZERO` in `notify_execution_layer`
+
+The whole conversation that started this expansion. Once blocks carry payloads, the function reads `block.body.execution_payload.block_hash` for head/safe/finalized off the store. Genesis special case stays zero. Drop the "placeholder" doc comment. ~+50/−30.
+
+#### Phase 6 — Fork digest bump
+
+New `BlockBody` SSZ root → gossipsub topic hashes change → ethlambda peering with the existing devnet4 set breaks the moment this is deployed. Pick a new 4-byte sentinel (e.g. `0xdeadbeef`) and coordinate via the leanSpec issue. ENR records unchanged. ~+30/−10.
+
+#### Phase 7 — Fixtures, tests, and the leanSpec issue
+
+- Every existing forkchoice / STF / signature SSZ fixture has a `BlockBody` without `execution_payload` and an SSZ-decodes-to-old-shape failure mode. Gate the new field behind a Cargo feature `execution-payload`. Workspace default = ON. The spec-fixture test crate runs with the feature OFF until leanSpec regenerates upstream fixtures.
+- New ethlambda-native tests:
+  - `process_execution_payload_rejects_parent_mismatch`
+  - `build_block_embeds_get_payload_response`
+  - `on_block_rejects_when_el_says_invalid`
+  - `notify_execution_layer_sends_real_hashes_after_first_block`
+- File the leanSpec issue proposing the schema. Cross-link from this doc.
+
+~+500/−100, almost entirely tests + feature gates.
+
+#### Risks
+
+1. **Wire incompatibility with other Lean clients** until they adopt the same schema. ethlambda runs in isolation for the gap.
+2. **Spec-fixture regeneration burden** if the leanSpec issue lands with a different field ordering/naming than what we shipped.
+3. **Genesis EL hash convention.** ethrex's `engine_newPayloadV3` re-derives `block_hash` from the rest of the payload. An all-zero genesis `block_hash` will fail re-derivation on the first non-genesis block. Mitigation: compute the real keccak-over-fields block_hash even for the synthetic genesis payload, OR pin a real ethrex-blessed genesis EL block and use its hash.
+4. **Slot duration mismatch.** Lean = 4s, Ethereum mainnet = 12s. `compute_time_at_slot` is local to our chain so timestamps are consistent within ethlambda↔ethrex pairing, but if we ever bridge to a mainnet-derived EL state it'll be visible.
 
 ## Open questions
 
-1. **Genesis EL hash mapping**: when Lean genesis is created, what
-   execution-block hash do we pin? `H256::zero()` is the simplest convention
-   but means ethrex must accept ethlambda's FCU pointing at zero.
-2. **Multi-EL support** (Lighthouse/Lodestar style): not in M2-M5. Single EL
-   endpoint only.
-3. **JWT secret format**: file vs. inline hex. ethrex/lighthouse/teku all
-   accept a file containing `0x`-prefixed hex; we follow the same convention.
-4. **Slot → timestamp mapping**: ethlambda has `GENESIS_TIME` + slot duration
-   = 4s. Lean slot 0 timestamp = `GENESIS_TIME`. ethrex `PayloadAttributesV4`
-   wants Unix `timestamp` + `slot_number`. Both available.
+1. **Genesis EL hash mapping**: zero, or a real ethrex-blessed genesis-block header? Recomputing block_hash from zero-fields would let us stay all-zero, but ethrex may reject as a degenerate block.
+2. **Multi-EL support** (Lighthouse/Lodestar style): out of scope. Single EL endpoint only.
+3. **JWT secret format**: file vs. inline hex. ethrex/lighthouse/teku all accept a file containing `0x`-prefixed hex; we follow the same convention. ✓ already in PR #367.
+4. **Slot → timestamp mapping**: ethlambda has `GENESIS_TIME` + slot duration = 4s. Lean slot 0 timestamp = `GENESIS_TIME`. ethrex `PayloadAttributesV4` wants Unix `timestamp` + `slot_number`. Both available.
+5. **Capability handshake update**: today we advertise V3 only. Should the new payload work bump to V4 (Prague + `slot_number` in PayloadAttributesV4)? V3 covers the goal; V4 is a Phase-N option.
 
 ## References
 
