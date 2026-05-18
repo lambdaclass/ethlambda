@@ -687,10 +687,16 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
 ///
 /// Returns the finalized block and attestation signature payloads aligned
 /// with `block.body.attestations`.
+///
+/// `execution_payload` carries the payload the proposer fetched from the EL
+/// via `engine_getPayloadV3`. When `None` (no EL configured, or the EL
+/// roundtrip failed), `build_block` falls back to `synthetic_payload` so
+/// non-EL-paired nodes can still produce parseable blocks.
 pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
+    execution_payload: Option<ExecutionPayloadV3>,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
@@ -725,6 +731,7 @@ pub fn produce_block_with_signatures(
             head_root,
             &known_block_roots,
             &aggregated_payloads,
+            execution_payload,
         )?
     };
 
@@ -1064,7 +1071,11 @@ fn build_block(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<AggregatedSignatureProof>)>,
+    execution_payload: Option<ExecutionPayloadV3>,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
+    // Fetched-from-EL payload wins; otherwise fall back to the synthetic
+    // chain-linking one so non-EL nodes still produce STF-valid blocks.
+    let payload = execution_payload.unwrap_or_else(|| synthetic_payload(head_state, slot));
     let mut selected: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = Vec::new();
 
     if !aggregated_payloads.is_empty() {
@@ -1154,7 +1165,7 @@ fn build_block(
                 state_root: H256::ZERO,
                 body: BlockBody {
                     attestations,
-                    execution_payload: synthetic_payload(head_state, slot),
+                    execution_payload: payload.clone(),
                 },
             };
             let mut post_state = head_state.clone();
@@ -1192,7 +1203,7 @@ fn build_block(
         state_root: H256::ZERO,
         body: BlockBody {
             attestations,
-            execution_payload: synthetic_payload(head_state, slot),
+            execution_payload: payload,
         },
     };
     let mut post_state = head_state.clone();
@@ -1572,6 +1583,7 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
+            None,
         )
         .expect("build_block should succeed");
 
@@ -1714,6 +1726,7 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
+            None,
         )
         .expect("build_block should succeed");
 

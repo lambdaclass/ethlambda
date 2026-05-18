@@ -141,12 +141,23 @@ impl EngineClient {
 
     /// `engine_getPayloadV3` — fetch a payload built under a previously
     /// returned `payload_id`.
-    pub async fn get_payload_v3(&self, payload_id: PayloadId) -> Result<Value, EngineClientError> {
-        // Returns a tagged blob containing `executionPayload`, `blockValue`,
-        // `blobsBundle`, `shouldOverrideBuilder`. We surface the raw JSON
-        // until block-import path needs to consume it.
+    ///
+    /// The EL returns an envelope `{ executionPayload, blockValue, blobsBundle,
+    /// shouldOverrideBuilder }`. We surface only the inner `executionPayload`
+    /// — the only field block proposal consumes. `blobsBundle` and
+    /// `blockValue` are dropped for now; refine when blob transactions or
+    /// MEV/build-value reporting land.
+    pub async fn get_payload_v3(
+        &self,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError> {
         let params = json!([payload_id.to_hex()]);
-        self.rpc_call("engine_getPayloadV3", params).await
+        let envelope: Value = self.rpc_call("engine_getPayloadV3", params).await?;
+        let payload_value = envelope
+            .get("executionPayload")
+            .ok_or(EngineClientError::EmptyResponse)?
+            .clone();
+        serde_json::from_value(payload_value).map_err(EngineClientError::DeserializeResponse)
     }
 
     /// `engine_getClientVersionV1` — used for diagnostics in startup logs.

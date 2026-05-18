@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use ethlambda_ethrex_client::{EngineClient, ForkChoiceState, PayloadStatusKind};
+use ethlambda_ethrex_client::{
+    EngineClient, ForkChoiceState, PayloadAttributesV3, PayloadId, PayloadStatusKind,
+};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
-use ethlambda_state_transition::is_proposer;
+use ethlambda_state_transition::{SECONDS_PER_SLOT, is_proposer};
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -78,6 +80,7 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             execution_client,
+            pending_payload_id: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -142,6 +145,13 @@ pub struct BlockChainServer {
     /// so the EL responds `SYNCING` against zeros until a real payload
     /// pipeline is wired (see docs/plans/engine-api-integration.md).
     execution_client: Option<EngineClient>,
+
+    /// `(target_slot, payload_id)` returned by the EL after a build-mode
+    /// FCU at interval 4 of the previous slot. Consumed at interval 0 by
+    /// `take_prepared_payload`. Absent when no EL is configured, when we
+    /// didn't queue a build for this slot, or when the EL was syncing and
+    /// returned `payload_id = None`.
+    pending_payload_id: Option<(u64, PayloadId)>,
 }
 
 impl BlockChainServer {
@@ -196,7 +206,12 @@ impl BlockChainServer {
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id);
+            // Phase 4 (M6): try to pick up a payload the EL has been building
+            // since interval 4 of the previous slot. None when no EL is
+            // configured, when no build was queued, or when the EL was
+            // syncing. `build_block` falls back to `synthetic_payload`.
+            let payload = self.take_prepared_payload(slot).await;
+            self.propose_block(slot, validator_id, payload);
         }
 
         // Produce attestations at interval 1 (all validators including proposer).
@@ -204,6 +219,13 @@ impl BlockChainServer {
         // of the tick.
         if interval == 1 {
             self.produce_attestations(slot, is_aggregator);
+        }
+
+        // Phase 4 (M6): at the end of this slot, if any of our validators
+        // is the next-slot proposer, ask the EL to start building a payload
+        // we'll fetch at interval 0 of slot+1.
+        if interval == 4 {
+            self.request_payload_id_for_next_slot(slot).await;
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
@@ -249,6 +271,95 @@ impl BlockChainServer {
                 Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
             }
         });
+    }
+
+    /// At interval 4 of slot N-1, ask the EL to start building a payload
+    /// for slot N if any of our validators is the slot-N proposer.
+    ///
+    /// Fires a build-mode `engine_forkchoiceUpdatedV3` (head/safe/finalized
+    /// all zero — see `notify_execution_layer` for the rationale) with
+    /// `PayloadAttributesV3` carrying the correct slot timestamp. If the EL
+    /// returns a `payload_id`, we stash it for `take_prepared_payload` to
+    /// consume at interval 0 of slot N. When the EL is syncing it returns
+    /// `payload_id = None` and we silently fall back to the synthetic
+    /// payload path.
+    ///
+    /// `suggested_fee_recipient` and `prev_randao` are zero for now; refine
+    /// when CLI / config support lands.
+    async fn request_payload_id_for_next_slot(&mut self, current_slot: u64) {
+        let Some(client) = self.execution_client.as_ref() else {
+            return;
+        };
+        let next_slot = current_slot + 1;
+        if self.get_our_proposer(next_slot).is_none() {
+            return;
+        }
+
+        let state = ForkChoiceState {
+            head_block_hash: H256::ZERO,
+            safe_block_hash: H256::ZERO,
+            finalized_block_hash: H256::ZERO,
+        };
+        let attrs = PayloadAttributesV3 {
+            timestamp: self.store.config().genesis_time + next_slot * SECONDS_PER_SLOT,
+            prev_randao: H256::ZERO,
+            suggested_fee_recipient: [0u8; 20],
+            withdrawals: vec![],
+            parent_beacon_block_root: H256::ZERO,
+        };
+        let client = client.clone();
+        match client.forkchoice_updated_v3(state, Some(attrs)).await {
+            Ok(resp) => {
+                if let Some(id) = resp.payload_id {
+                    self.pending_payload_id = Some((next_slot, id));
+                    trace!(
+                        slot = next_slot,
+                        status = ?resp.payload_status.status,
+                        "Queued EL payload build for next slot",
+                    );
+                } else {
+                    trace!(
+                        slot = next_slot,
+                        status = ?resp.payload_status.status,
+                        "EL declined to start build (syncing or unknown head)",
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(slot = next_slot, %err, "engine_forkchoiceUpdatedV3 (build mode) failed");
+            }
+        }
+    }
+
+    /// At interval 0 of slot N, consume the `payload_id` stashed by
+    /// `request_payload_id_for_next_slot` and fetch the now-built payload.
+    ///
+    /// Returns `None` (caller falls back to synthetic) on any of:
+    ///   * no EL configured
+    ///   * no stashed id (we weren't expecting to propose this slot, or
+    ///     the build request was rejected at interval 4)
+    ///   * stashed id is for a different slot (we missed a tick)
+    ///   * the `engine_getPayloadV3` roundtrip failed
+    async fn take_prepared_payload(&mut self, slot: u64) -> Option<ExecutionPayloadV3> {
+        let client = self.execution_client.as_ref()?.clone();
+        let (stashed_slot, payload_id) = self.pending_payload_id.take()?;
+        if stashed_slot != slot {
+            warn!(
+                stashed_slot,
+                slot, "Stashed payload_id doesn't match this slot; discarding"
+            );
+            return None;
+        }
+        match client.get_payload_v3(payload_id).await {
+            Ok(payload) => {
+                trace!(slot, "Fetched execution payload from EL");
+                Some(payload)
+            }
+            Err(err) => {
+                warn!(slot, %err, "engine_getPayloadV3 failed; falling back to synthetic payload");
+                None
+            }
+        }
     }
 
     /// Submit a received block's execution payload to the EL for validation.
@@ -413,15 +524,25 @@ impl BlockChainServer {
     }
 
     /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    fn propose_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        execution_payload: Option<ExecutionPayloadV3>,
+    ) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
         let Ok((block, attestation_signatures, _post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+            store::produce_block_with_signatures(
+                &mut self.store,
+                slot,
+                validator_id,
+                execution_payload,
+            )
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
             metrics::inc_block_building_failures();
             return;
