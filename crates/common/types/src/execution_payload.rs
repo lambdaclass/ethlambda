@@ -17,7 +17,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 use serde::{Deserialize, Serialize};
 
-use crate::primitives::{ByteList, H256};
+use crate::primitives::{ByteList, H256, HashTreeRoot as _};
 
 /// `BYTES_PER_LOGS_BLOOM` — fixed-size logs bloom filter.
 pub const BYTES_PER_LOGS_BLOOM: usize = 256;
@@ -117,6 +117,105 @@ impl Default for ExecutionPayloadV3 {
             blob_gas_used: 0,
             excess_blob_gas: 0,
         }
+    }
+}
+
+impl ExecutionPayloadV3 {
+    /// Project this payload into its `ExecutionPayloadHeader`.
+    ///
+    /// Capella spec (`process_execution_payload`): variable-length `transactions`
+    /// and `withdrawals` collapse to their SSZ hash tree roots; every other
+    /// field copies verbatim. This is what the state caches between blocks
+    /// so the next payload's `parent_hash` can be validated without re-hashing
+    /// the prior block body.
+    pub fn to_header(&self) -> ExecutionPayloadHeader {
+        ExecutionPayloadHeader {
+            parent_hash: self.parent_hash,
+            fee_recipient: self.fee_recipient,
+            state_root: self.state_root,
+            receipts_root: self.receipts_root,
+            logs_bloom: self.logs_bloom,
+            prev_randao: self.prev_randao,
+            block_number: self.block_number,
+            gas_limit: self.gas_limit,
+            gas_used: self.gas_used,
+            timestamp: self.timestamp,
+            extra_data: self.extra_data.clone(),
+            base_fee_per_gas: self.base_fee_per_gas,
+            block_hash: self.block_hash,
+            transactions_root: self.transactions.hash_tree_root(),
+            withdrawals_root: self.withdrawals.hash_tree_root(),
+            blob_gas_used: self.blob_gas_used,
+            excess_blob_gas: self.excess_blob_gas,
+        }
+    }
+}
+
+/// Cached projection of an `ExecutionPayloadV3` that the consensus state
+/// carries between blocks. Mirrors the Capella+Deneb `ExecutionPayloadHeader`:
+/// every fixed-size field copies from the payload verbatim; the two
+/// variable-length lists (`transactions`, `withdrawals`) collapse to their
+/// SSZ hash-tree roots so the header itself stays fixed-size-bounded.
+#[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionPayloadHeader {
+    pub parent_hash: H256,
+    #[serde(with = "hex_address")]
+    pub fee_recipient: [u8; 20],
+    pub state_root: H256,
+    pub receipts_root: H256,
+    #[serde(with = "hex_bytes_fixed")]
+    pub logs_bloom: [u8; BYTES_PER_LOGS_BLOOM],
+    pub prev_randao: H256,
+    #[serde(with = "hex_u64")]
+    pub block_number: u64,
+    #[serde(with = "hex_u64")]
+    pub gas_limit: u64,
+    #[serde(with = "hex_u64")]
+    pub gas_used: u64,
+    #[serde(with = "hex_u64")]
+    pub timestamp: u64,
+    #[serde(with = "byte_list_hex")]
+    pub extra_data: ByteList<MAX_EXTRA_DATA_BYTES>,
+    #[serde(with = "hex_u256")]
+    pub base_fee_per_gas: [u8; 32],
+    pub block_hash: H256,
+    pub transactions_root: H256,
+    pub withdrawals_root: H256,
+    #[serde(with = "hex_u64")]
+    pub blob_gas_used: u64,
+    #[serde(with = "hex_u64")]
+    pub excess_blob_gas: u64,
+}
+
+/// Manual `Default` (same reason as `ExecutionPayloadV3`: `[u8; 256]`).
+impl Default for ExecutionPayloadHeader {
+    fn default() -> Self {
+        Self {
+            parent_hash: H256::default(),
+            fee_recipient: [0u8; 20],
+            state_root: H256::default(),
+            receipts_root: H256::default(),
+            logs_bloom: [0u8; BYTES_PER_LOGS_BLOOM],
+            prev_randao: H256::default(),
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: ByteList::default(),
+            base_fee_per_gas: [0u8; 32],
+            block_hash: H256::default(),
+            transactions_root: H256::default(),
+            withdrawals_root: H256::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        }
+    }
+}
+
+impl From<&ExecutionPayloadV3> for ExecutionPayloadHeader {
+    fn from(p: &ExecutionPayloadV3) -> Self {
+        p.to_header()
     }
 }
 
@@ -311,8 +410,6 @@ pub mod withdrawals_serde {
 mod tests {
     use super::*;
 
-    use crate::primitives::HashTreeRoot as _;
-
     #[test]
     fn hex_u64_roundtrip() {
         #[derive(Serialize, Deserialize)]
@@ -469,5 +566,80 @@ mod tests {
         let bytes = original.to_ssz();
         let back = Withdrawal::from_ssz_bytes(&bytes).unwrap();
         assert_eq!(back.hash_tree_root(), original.hash_tree_root());
+    }
+
+    #[test]
+    fn execution_payload_header_default_is_zero_init() {
+        let h = ExecutionPayloadHeader::default();
+        assert!(h.parent_hash.is_zero());
+        assert!(h.block_hash.is_zero());
+        assert!(h.transactions_root.is_zero());
+        assert!(h.withdrawals_root.is_zero());
+        assert_eq!(h.fee_recipient, [0u8; 20]);
+        assert_eq!(h.block_number, 0);
+    }
+
+    #[test]
+    fn execution_payload_header_ssz_and_json_roundtrip() {
+        use libssz::{SszDecode, SszEncode};
+        let header = ExecutionPayloadHeader {
+            parent_hash: H256([1u8; 32]),
+            block_hash: H256([2u8; 32]),
+            transactions_root: H256([3u8; 32]),
+            withdrawals_root: H256([4u8; 32]),
+            block_number: 42,
+            timestamp: 1_700_000_000,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&header).unwrap();
+        let from_json: ExecutionPayloadHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_json.hash_tree_root(), header.hash_tree_root());
+
+        let ssz_bytes = header.to_ssz();
+        let from_ssz = ExecutionPayloadHeader::from_ssz_bytes(&ssz_bytes).unwrap();
+        assert_eq!(from_ssz.hash_tree_root(), header.hash_tree_root());
+    }
+
+    #[test]
+    fn to_header_projects_lists_to_their_roots() {
+        let payload = ExecutionPayloadV3 {
+            transactions: Transactions::try_from(vec![
+                ByteList::<MAX_BYTES_PER_TRANSACTION>::try_from(vec![0x01, 0x02]).unwrap(),
+                ByteList::<MAX_BYTES_PER_TRANSACTION>::try_from(vec![0x03, 0x04, 0x05]).unwrap(),
+            ])
+            .unwrap(),
+            withdrawals: Withdrawals::try_from(vec![Withdrawal {
+                index: 1,
+                validator_index: 2,
+                address: [9u8; 20],
+                amount: 100,
+            }])
+            .unwrap(),
+            block_number: 7,
+            ..Default::default()
+        };
+        let header = payload.to_header();
+
+        // The variable-length fields collapse to their hash tree roots.
+        assert_eq!(
+            header.transactions_root,
+            payload.transactions.hash_tree_root()
+        );
+        assert_eq!(
+            header.withdrawals_root,
+            payload.withdrawals.hash_tree_root()
+        );
+        // Non-zero because both lists are non-empty.
+        assert!(!header.transactions_root.is_zero());
+        assert!(!header.withdrawals_root.is_zero());
+        // Every other field copies verbatim.
+        assert_eq!(header.block_number, payload.block_number);
+        assert_eq!(header.parent_hash, payload.parent_hash);
+        assert_eq!(header.fee_recipient, payload.fee_recipient);
+
+        // `From<&ExecutionPayloadV3>` and `to_header()` are equivalent.
+        let header_via_from: ExecutionPayloadHeader = (&payload).into();
+        assert_eq!(header_via_from.hash_tree_root(), header.hash_tree_root());
     }
 }
