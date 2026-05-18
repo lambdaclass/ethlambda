@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 // Re-export the moved canonical types so existing callers
 // (`ethlambda_ethrex_client::types::ExecutionPayloadV3`) keep working.
-pub use ethlambda_types::execution_payload::{ExecutionPayloadV3, HexBytes, Withdrawal};
+pub use ethlambda_types::execution_payload::{ExecutionPayloadV3, Withdrawal};
 
 /// `engine_forkchoiceUpdated` head/safe/finalized triplet.
 ///
