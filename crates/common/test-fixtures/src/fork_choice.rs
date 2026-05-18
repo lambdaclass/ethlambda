@@ -7,12 +7,11 @@ use crate::{
     AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
     deser_xmss_hex,
 };
-use ethlambda_types::attestation::XmssSignature;
+use ethlambda_types::attestation::{XmssSignature, blank_xmss_signature};
 use ethlambda_types::block::{
     AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
 };
 use ethlambda_types::primitives::H256;
-use ethlambda_types::signature::SIGNATURE_SIZE;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -171,8 +170,7 @@ impl BlockStepData {
         SignedBlock {
             message: block,
             signature: BlockSignatures {
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE])
-                    .expect("zero-filled signature has the correct length"),
+                proposer_signature: blank_xmss_signature(),
                 attestation_signatures: AttestationSignatures::try_from(proofs)
                     .expect("attestation proofs within limit"),
             },
