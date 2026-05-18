@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use ethlambda_ethrex_client::{EngineClient, ForkChoiceState};
+use ethlambda_ethrex_client::{EngineClient, ForkChoiceState, PayloadStatusKind};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -10,6 +10,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
 };
 
@@ -248,6 +249,53 @@ impl BlockChainServer {
                 Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
             }
         });
+    }
+
+    /// Submit a received block's execution payload to the EL for validation.
+    ///
+    /// Returns `true` when the block should proceed to fork-choice insertion
+    /// (no EL configured, EL says VALID/SYNCING/ACCEPTED, or the EL roundtrip
+    /// itself failed). Returns `false` only on the explicit `INVALID` /
+    /// `INVALID_BLOCK_HASH` verdicts — those mean the EL claims the payload
+    /// is unexecutable on its own chain, so importing the block would be
+    /// pointless.
+    ///
+    /// Network errors and unparseable responses are permissive — same policy
+    /// as `notify_execution_layer`: consensus must keep running regardless
+    /// of EL state. Operators are expected to monitor the warn logs.
+    async fn validate_payload_with_el(&self, payload: &ExecutionPayloadV3) -> bool {
+        let Some(client) = self.execution_client.as_ref() else {
+            return true;
+        };
+        // Cancun-era V3 requires both parameters, but Lean blocks don't yet
+        // carry blob transactions or beacon parent roots in any meaningful
+        // sense. Empty/zero is the spec-friendly placeholder; refine when
+        // we wire blob handling.
+        let result = client
+            .new_payload_v3(payload.clone(), vec![], H256::ZERO)
+            .await;
+        match result {
+            Ok(status) => match status.status {
+                PayloadStatusKind::Valid
+                | PayloadStatusKind::Syncing
+                | PayloadStatusKind::Accepted => {
+                    trace!(status = ?status.status, "engine_newPayloadV3 ok");
+                    true
+                }
+                PayloadStatusKind::Invalid | PayloadStatusKind::InvalidBlockHash => {
+                    warn!(
+                        status = ?status.status,
+                        error = ?status.validation_error,
+                        "engine_newPayloadV3 rejected payload; dropping block"
+                    );
+                    false
+                }
+            },
+            Err(err) => {
+                warn!(%err, "engine_newPayloadV3 transport failure; accepting block");
+                true
+            }
+        }
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -725,6 +773,15 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        // EL pre-check (Phase 3 of M6). When `--execution-endpoint` is
+        // unset this is a no-op. INVALID verdict drops the block before it
+        // touches the store; pending children referencing it as parent are
+        // not enqueued because we never call `on_block`. They will be
+        // pruned by the standard slot-bound timeout.
+        let payload = &msg.block.message.body.execution_payload;
+        if !self.validate_payload_with_el(payload).await {
+            return;
+        }
         self.on_block(msg.block);
     }
 }
