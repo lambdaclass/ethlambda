@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
-    attestation_data_matches_chain, is_proposer, justified_slots_ops, process_block, process_slots,
-    slot_is_justifiable_after,
+    attestation_data_matches_chain, compute_time_at_slot, is_proposer, justified_slots_ops,
+    process_block, process_slots, slot_is_justifiable_after,
 };
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -14,6 +14,7 @@ use ethlambda_types::{
     },
     block::{AggregatedAttestations, AggregatedSignatureProof, Block, BlockBody, SignedBlock},
     checkpoint::Checkpoint,
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
     state::State,
@@ -1032,6 +1033,22 @@ fn extend_proofs_greedily(
     }
 }
 
+/// Synthesize a default execution payload that satisfies STF's
+/// `process_execution_payload` check for a node running without an EL.
+///
+/// Sets `parent_hash` to the last cached header's `block_hash` (so the
+/// chain still links forward) and `timestamp` to `compute_time_at_slot`
+/// (so the slot-time check passes). Every other field stays zero. Phase 4
+/// replaces this with the real `engine_getPayloadV3` response when an EL
+/// endpoint is configured.
+fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
+    ExecutionPayloadV3 {
+        parent_hash: head_state.latest_execution_payload_header.block_hash,
+        timestamp: compute_time_at_slot(head_state, slot),
+        ..Default::default()
+    }
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Works directly with aggregated payloads keyed by data_root, filtering
@@ -1137,7 +1154,7 @@ fn build_block(
                 state_root: H256::ZERO,
                 body: BlockBody {
                     attestations,
-                    execution_payload: Default::default(),
+                    execution_payload: synthetic_payload(head_state, slot),
                 },
             };
             let mut post_state = head_state.clone();
@@ -1175,7 +1192,7 @@ fn build_block(
         state_root: H256::ZERO,
         body: BlockBody {
             attestations,
-            execution_payload: Default::default(),
+            execution_payload: synthetic_payload(head_state, slot),
         },
     };
     let mut post_state = head_state.clone();
