@@ -10,17 +10,15 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSecretKey,
 };
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
-use crate::key_manager::{KeyManagerError, KeyRole, ValidatorKeyPair};
+use crate::key_manager::ValidatorKeyPair;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
-use spawned_concurrency::message::Message;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
@@ -66,7 +64,17 @@ impl BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
-        let key_manager = key_manager::KeyManager::new(validator_keys);
+        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+
+        // Catch XMSS keys up to the current slot before the first tick.
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_millis() as u64;
+        let current_slot =
+            (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
+        key_manager.advance_keys_to(current_slot);
+
         let handle = BlockChainServer {
             store,
             p2p: None,
@@ -183,20 +191,23 @@ impl BlockChainServer {
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id, ctx);
+            self.propose_block(slot, validator_id);
         }
 
         // Produce attestations at interval 1 (all validators including proposer).
         // Reuse the same snapshot so self-delivery decisions match the rest
         // of the tick.
         if interval == 1 {
-            self.produce_attestations(slot, is_aggregator, ctx);
+            self.produce_attestations(slot, is_aggregator);
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
+
+        // Advance XMSS keys for next slot so the signing paths don't have to
+        self.key_manager.advance_keys_to((slot + 1) as u32);
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -266,7 +277,7 @@ impl BlockChainServer {
             .find(|&vid| is_proposer(vid, slot, num_validators))
     }
 
-    fn produce_attestations(&mut self, slot: u64, is_aggregator: bool, ctx: &Context<Self>) {
+    fn produce_attestations(&mut self, slot: u64, is_aggregator: bool) {
         let _timing = metrics::time_attestations_production();
 
         // Produce attestation data once for all validators
@@ -275,24 +286,14 @@ impl BlockChainServer {
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
             // Sign the attestation
-            let signature = match self
+            let Ok(signature) = self
                 .key_manager
                 .sign_attestation(validator_id, &attestation_data)
-            {
-                Ok(sig) => sig,
-                Err(KeyManagerError::KeyNotPreparedForSlot {
-                    role,
-                    slot: target_slot,
-                    ..
-                }) => {
-                    self.prepare_key_for_slot(validator_id, role, target_slot, ctx);
-                    continue;
-                }
-                Err(KeyManagerError::KeyUnavailable(_)) => continue,
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to sign attestation");
-                    continue;
-                }
+                .inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
+                )
+            else {
+                continue;
             };
 
             // Create signed attestation
@@ -324,7 +325,7 @@ impl BlockChainServer {
     }
 
     /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64, ctx: &Context<Self>) {
+    fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let _timing = metrics::time_block_building();
@@ -340,31 +341,14 @@ impl BlockChainServer {
 
         // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();
-        let proposer_signature =
-            match self
-                .key_manager
-                .sign_block_root(validator_id, slot as u32, &block_root)
-            {
-                Ok(sig) => sig,
-                Err(KeyManagerError::KeyNotPreparedForSlot {
-                    role,
-                    slot: target_slot,
-                    ..
-                }) => {
-                    self.prepare_key_for_slot(validator_id, role, target_slot, ctx);
-                    metrics::inc_block_building_failures();
-                    return;
-                }
-                Err(KeyManagerError::KeyUnavailable(_)) => {
-                    metrics::inc_block_building_failures();
-                    return;
-                }
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to sign block root");
-                    metrics::inc_block_building_failures();
-                    return;
-                }
-            };
+        let Ok(proposer_signature) = self
+            .key_manager
+            .sign_block_root(validator_id, slot as u32, &block_root)
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
+        else {
+            metrics::inc_block_building_failures();
+            return;
+        };
 
         // Assemble SignedBlock
         let signed_block = SignedBlock {
@@ -394,39 +378,6 @@ impl BlockChainServer {
         }
 
         info!(%slot, %validator_id, "Published block");
-    }
-
-    /// Move the validator's key off the actor onto a `spawn_blocking` worker
-    /// that runs `advance_preparation` until the prepared window covers `target_slot`.
-    /// The worker sends back `KeyPreparedForSlot` for the actor
-    /// to restore the (possibly advanced) key.
-    fn prepare_key_for_slot(
-        &mut self,
-        validator_id: u64,
-        role: KeyRole,
-        target_slot: u32,
-        ctx: &Context<Self>,
-    ) {
-        let Some(key_pair) = self.key_manager.keys.get_mut(&validator_id) else {
-            return;
-        };
-        let field = match role {
-            KeyRole::Attestation => &mut key_pair.attestation_key,
-            KeyRole::Proposal => &mut key_pair.proposal_key,
-        };
-        let Some(key) = field.take() else { return };
-
-        info!(%validator_id, ?role, %target_slot, "Preparing XMSS key for slot in background");
-        let actor_ref = ctx.actor_ref().clone();
-
-        tokio::task::spawn_blocking(move || {
-            let result = key.advance_until_prepared(target_slot);
-            let _ = actor_ref.send(KeyPreparedForSlot {
-                validator_id,
-                role,
-                key: result,
-            });
-        });
     }
 
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
@@ -809,43 +760,6 @@ impl Handler<AggregationDeadline> for BlockChainServer {
             && session.session_id == msg.session_id
         {
             session.cancel.cancel();
-        }
-    }
-}
-
-/// Worker → actor result for a background XMSS key advance.
-/// `key: None` means the activation interval was exhausted.
-pub(crate) struct KeyPreparedForSlot {
-    pub validator_id: u64,
-    pub role: KeyRole,
-    pub key: Option<ValidatorSecretKey>,
-}
-impl Message for KeyPreparedForSlot {
-    type Result = ();
-}
-
-impl Handler<KeyPreparedForSlot> for BlockChainServer {
-    async fn handle(&mut self, msg: KeyPreparedForSlot, _ctx: &Context<Self>) {
-        let KeyPreparedForSlot {
-            validator_id,
-            role,
-            key,
-        } = msg;
-        let Some(key_pair) = self.key_manager.keys.get_mut(&validator_id) else {
-            return;
-        };
-        match key {
-            Some(advanced) => {
-                info!(%validator_id, ?role, "XMSS key advance complete");
-                match role {
-                    KeyRole::Attestation => key_pair.attestation_key = Some(advanced),
-                    KeyRole::Proposal => key_pair.proposal_key = Some(advanced),
-                }
-            }
-            None => error!(
-                %validator_id, ?role,
-                "XMSS key activation interval exhausted; validator can no longer sign with this key"
-            ),
         }
     }
 }

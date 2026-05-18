@@ -123,20 +123,6 @@ impl ValidatorSecretKey {
     pub fn advance_preparation(&mut self) {
         self.inner.advance_preparation();
     }
-
-    /// Advance the prepared window until it covers `target_slot`. Returns
-    /// `Some(self)` on success, or `None` if the activation interval is
-    /// exhausted (an `advance_preparation` call made no progress).
-    pub fn advance_until_prepared(mut self, target_slot: u32) -> Option<Self> {
-        while !self.is_prepared_for(target_slot) {
-            let before = self.get_prepared_interval();
-            self.advance_preparation();
-            if self.get_prepared_interval() == before {
-                return None;
-            }
-        }
-        Some(self)
-    }
 }
 
 #[cfg(test)]
@@ -196,20 +182,5 @@ mod tests {
             "signing should succeed after advance: {}",
             result.err().map_or(String::new(), |e| e.to_string())
         );
-    }
-
-    #[test]
-    #[ignore = "slow: generates production-size XMSS key (~minutes)"]
-    fn test_advance_until_prepared_advances_then_detects_exhaustion() {
-        let key = generate_key_with_three_bottom_trees();
-        // Initial window covers [0, 2*L). Target lives in tree 2 → one advance reaches it.
-        let target = 2 * LEAVES_PER_BOTTOM_TREE + 100;
-        let advanced = key.advance_until_prepared(target).expect("should advance");
-        assert!(advanced.is_prepared_for(target));
-
-        // 3-tree key cannot reach beyond 3*L; from `advanced`, attempting to go
-        // further hits exhaustion (advance_preparation makes no progress).
-        let beyond_lifetime = 4 * LEAVES_PER_BOTTOM_TREE;
-        assert!(advanced.advance_until_prepared(beyond_lifetime).is_none());
     }
 }

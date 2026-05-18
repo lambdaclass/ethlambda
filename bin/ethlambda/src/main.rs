@@ -527,8 +527,8 @@ fn read_validator_keys(
         validator_keys.insert(
             idx,
             ValidatorKeyPair {
-                attestation_key: Some(attestation_key),
-                proposal_key: Some(proposal_key),
+                attestation_key,
+                proposal_key,
             },
         );
     }
