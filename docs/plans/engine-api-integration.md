@@ -213,15 +213,19 @@ New `BlockBody` SSZ root → gossipsub topic hashes change → ethlambda peering
 
 #### Phase 7 — Fixtures, tests, and the leanSpec issue
 
-- Every existing forkchoice / STF / signature SSZ fixture has a `BlockBody` without `execution_payload` and pre-M6 state/body tree-hash roots. Phase 2c handled this with explicit `FIXTURES_AWAIT_M6_REGEN: bool = true` skip flags at the top of each affected spec-test entry point (no Cargo feature gate — the cfg pollution would have been worse than the loss of coverage). To re-enable a group: flip the flag in the corresponding `tests/*.rs` and regenerate fixtures via `make leanSpec/fixtures`.
-- New ethlambda-native tests:
-  - `process_execution_payload_rejects_parent_mismatch`
-  - `build_block_embeds_get_payload_response`
-  - `on_block_rejects_when_el_says_invalid`
-  - `notify_execution_layer_sends_real_hashes_after_first_block`
-- File the leanSpec issue proposing the schema. Cross-link from this doc.
+What landed:
 
-~+500/−100, almost entirely tests + feature gates.
+- Spec-fixture skip gates (`FIXTURES_AWAIT_M6_REGEN: bool = true`) at the top of `tests/forkchoice_spectests.rs`, `tests/signature_spectests.rs`, `tests/stf_spectests.rs`, and the BlockBody/Block/State/SignedBlock arms of `tests/ssz_spectests.rs`. Phase 2c. To clear: flip the bool and run `make leanSpec/fixtures` after upstream regenerates.
+- `process_execution_payload_*` unit tests (4 cases) in `crates/blockchain/state_transition/src/lib.rs`. Phase 2d.
+- `build_block_embeds_provided_execution_payload` unit test in `crates/blockchain/src/store.rs`. Phase 7 (this commit) — proves the proposer threads the EL-fetched payload into `BlockBody` verbatim instead of synthesizing.
+- `docs/plans/lean-execution-payload-schema.md` — draft of the leanSpec issue. Cross-link when filing upstream.
+
+Deferred (need an `EngineClient` trait abstraction to mock cleanly):
+
+- `on_block_rejects_when_el_says_invalid` — would exercise `Handler<NewBlock>`'s INVALID-verdict drop path. Currently testable end-to-end only via a real TCP-mocked EL (cf. `tests/wire_smoke.rs`), which the sandbox blocks; out of scope until we trait-abstract.
+- `notify_execution_layer_sends_real_hashes_after_first_block` — same blocker, plus the function spawns its FCU call so capturing the wire bytes wants a recording mock.
+
+~+500/−100 originally estimated; actual ~+150/−5 because the EL-mocked tests are deferred.
 
 #### Risks
 
