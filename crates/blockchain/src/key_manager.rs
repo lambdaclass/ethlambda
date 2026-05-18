@@ -49,16 +49,11 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Advances every validator's XMSS preparation windows to cover `slot`.
+    /// Advances every validator's XMSS preparation windows to cover slot
     pub fn advance_keys_to(&mut self, slot: u32) {
         for (validator_id, key_pair) in self.keys.iter_mut() {
-            advance_key(
-                *validator_id,
-                "attestation",
-                &mut key_pair.attestation_key,
-                slot,
-            );
-            advance_key(*validator_id, "proposal", &mut key_pair.proposal_key, slot);
+            advance_key(*validator_id, &mut key_pair.attestation_key, slot);
+            advance_key(*validator_id, &mut key_pair.proposal_key, slot);
         }
     }
 
@@ -181,29 +176,22 @@ impl KeyManager {
     }
 }
 
-fn advance_key(validator_id: u64, role: &'static str, key: &mut ValidatorSecretKey, slot: u32) {
+fn advance_key(validator_id: u64, key: &mut ValidatorSecretKey, slot: u32) {
     if key.is_prepared_for(slot) {
         return;
     }
-    info!(
-        validator_id,
-        role, slot, "Advancing XMSS key preparation window"
-    );
+    info!(validator_id, slot, "Advancing XMSS key preparation window");
     let start = Instant::now();
     while !key.is_prepared_for(slot) {
         let before = key.get_prepared_interval();
         key.advance_preparation();
         if key.get_prepared_interval() == before {
-            warn!(
-                validator_id,
-                role, slot, "XMSS key activation interval exhausted; cannot prepare further"
-            );
+            warn!(validator_id, slot, "XMSS key activation interval exhausted");
             break;
         }
     }
     info!(
         validator_id,
-        role,
         slot,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "Advanced XMSS key preparation window"

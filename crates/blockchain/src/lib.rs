@@ -66,7 +66,9 @@ impl BlockChain {
         let genesis_time = store.config().genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Catch XMSS keys up to the current slot before the first tick.
+        // Catch XMSS keys up to the current slot before the first tick
+        // store.time() doesn't work here: after an offline gap it lags wall-clock by
+        // exactly the gap we need to catch up through
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
