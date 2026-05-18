@@ -18,7 +18,7 @@ use ethlambda_types::{
     signature::ValidatorSignature,
     state::State,
 };
-use tracing::{info, trace, trace_span, warn};
+use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
@@ -1087,11 +1087,9 @@ fn build_block(
         let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
         sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
 
-        let _build_span = trace_span!("build_block", slot, proposer_index).entered();
-        let mut iteration: u32 = 0;
+        info!(slot, proposer_index, "Building block");
+
         loop {
-            iteration += 1;
-            let _iter_span = trace_span!("iter", iteration).entered();
             let mut found_new = false;
             let mut iter_selected: u32 = 0;
             let mut iter_skipped: u32 = 0;
@@ -1160,15 +1158,22 @@ fn build_block(
                 extend_proofs_greedily(proofs, &mut selected, att_data);
 
                 if tracing::enabled!(tracing::Level::TRACE) {
-                    let available_bits: HashSet<u64> =
-                        proofs.iter().flat_map(|p| p.participant_indices()).collect();
+                    let available_bits: HashSet<u64> = proofs
+                        .iter()
+                        .flat_map(|p| p.participant_indices())
+                        .collect();
                     let selected_bits: HashSet<u64> = selected[before..]
                         .iter()
                         .flat_map(|(att, _)| validator_indices(&att.aggregation_bits))
                         .collect();
                     trace!(
                         attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
                         target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
                         data_root = %ShortRoot(&data_root.0),
                         available_bits = available_bits.len(),
                         selected_bits = selected_bits.len(),
