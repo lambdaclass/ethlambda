@@ -139,6 +139,36 @@ impl EngineClient {
         self.rpc_call("engine_newPayloadV3", params).await
     }
 
+    /// `engine_newPayloadV4` — submit a Prague-era payload to the EL.
+    ///
+    /// Same `ExecutionPayloadV3` body shape as V3 (no new fields on the
+    /// payload), plus an `executionRequests` parameter for EIP-7685 system
+    /// contract operations (deposits/withdrawals/consolidations). For Lean
+    /// blocks we don't produce system requests yet, so pass an empty list.
+    ///
+    /// ELs validate the method version against the payload's `timestamp`:
+    /// once `timestamp >= pragueTime`, V3 returns `-38005 Unsupported fork:
+    /// Prague` and V4 is required.
+    pub async fn new_payload_v4(
+        &self,
+        payload: ExecutionPayloadV3,
+        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        parent_beacon_block_root: ethlambda_types::primitives::H256,
+        execution_requests: Vec<Vec<u8>>,
+    ) -> Result<PayloadStatus, EngineClientError> {
+        let requests_hex: Vec<String> = execution_requests
+            .iter()
+            .map(|r| format!("0x{}", hex::encode(r)))
+            .collect();
+        let params = json!([
+            payload,
+            expected_blob_versioned_hashes,
+            parent_beacon_block_root,
+            requests_hex,
+        ]);
+        self.rpc_call("engine_newPayloadV4", params).await
+    }
+
     /// `engine_getPayloadV3` — fetch a payload built under a previously
     /// returned `payload_id`.
     ///

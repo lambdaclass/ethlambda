@@ -238,7 +238,7 @@ impl BlockChainServer {
         // critical path. The hashes carried are `block_hash` fields read
         // off the head/safe/finalized Lean blocks' `execution_payload`s
         // (Phase 5 of M6), so the EL can chain forward off blocks it has
-        // actually seen via `engine_newPayloadV3`.
+        // actually seen via `engine_newPayloadV4`.
         if interval == 0 && self.execution_client.is_some() {
             self.notify_execution_layer();
         }
@@ -258,11 +258,7 @@ impl BlockChainServer {
         let Some(client) = self.execution_client.as_ref() else {
             return;
         };
-        let state = ForkChoiceState {
-            head_block_hash: self.el_hash_at(self.store.head()),
-            safe_block_hash: self.el_hash_at(self.store.safe_target()),
-            finalized_block_hash: self.el_hash_at(self.store.latest_finalized().root),
-        };
+        let state = self.current_el_forkchoice_state();
         let client = client.clone();
         tokio::spawn(async move {
             match client.forkchoice_updated_v3(state, None).await {
@@ -273,6 +269,20 @@ impl BlockChainServer {
                 Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
             }
         });
+    }
+
+    /// Compute the `ForkChoiceState` the EL should see right now: head/safe/
+    /// finalized resolved from Lean roots to the corresponding execution
+    /// payload `block_hash`es via `el_hash_at`. Shared by the per-slot
+    /// notification (`notify_execution_layer`) and the build-mode
+    /// `request_payload_id_for_next_slot`, so the EL sees the same view
+    /// regardless of which call hits first.
+    fn current_el_forkchoice_state(&self) -> ForkChoiceState {
+        ForkChoiceState {
+            head_block_hash: self.el_hash_at(self.store.head()),
+            safe_block_hash: self.el_hash_at(self.store.safe_target()),
+            finalized_block_hash: self.el_hash_at(self.store.latest_finalized().root),
+        }
     }
 
     /// Resolve a Lean block root to its execution payload's `block_hash`.
@@ -299,13 +309,13 @@ impl BlockChainServer {
     /// At interval 4 of slot N-1, ask the EL to start building a payload
     /// for slot N if any of our validators is the slot-N proposer.
     ///
-    /// Fires a build-mode `engine_forkchoiceUpdatedV3` (head/safe/finalized
-    /// all zero — see `notify_execution_layer` for the rationale) with
-    /// `PayloadAttributesV3` carrying the correct slot timestamp. If the EL
-    /// returns a `payload_id`, we stash it for `take_prepared_payload` to
-    /// consume at interval 0 of slot N. When the EL is syncing it returns
-    /// `payload_id = None` and we silently fall back to the synthetic
-    /// payload path.
+    /// Fires a build-mode `engine_forkchoiceUpdatedV3` carrying the same
+    /// real head/safe/finalized triplet `notify_execution_layer` uses,
+    /// plus `PayloadAttributesV3` with the correct slot timestamp. If the
+    /// EL returns a `payload_id`, we stash it for `take_prepared_payload`
+    /// to consume at interval 0 of slot N. When the EL is syncing it
+    /// returns `payload_id = None` and we silently fall back to the
+    /// synthetic payload path.
     ///
     /// `suggested_fee_recipient` and `prev_randao` are zero for now; refine
     /// when CLI / config support lands.
@@ -318,11 +328,7 @@ impl BlockChainServer {
             return;
         }
 
-        let state = ForkChoiceState {
-            head_block_hash: H256::ZERO,
-            safe_block_hash: H256::ZERO,
-            finalized_block_hash: H256::ZERO,
-        };
+        let state = self.current_el_forkchoice_state();
         let attrs = PayloadAttributesV3 {
             timestamp: self.store.config().genesis_time + next_slot * SECONDS_PER_SLOT,
             prev_randao: H256::ZERO,
@@ -401,32 +407,33 @@ impl BlockChainServer {
         let Some(client) = self.execution_client.as_ref() else {
             return true;
         };
-        // Cancun-era V3 requires both parameters, but Lean blocks don't yet
-        // carry blob transactions or beacon parent roots in any meaningful
-        // sense. Empty/zero is the spec-friendly placeholder; refine when
-        // we wire blob handling.
+        // Prague-era V4: same payload shape as V3 plus an
+        // `executionRequests` parameter for EIP-7685 system contract
+        // operations. Lean blocks don't produce system requests yet, blob
+        // transactions, or beacon parent roots, so all three trailing args
+        // are empty/zero placeholders. Refine when those land.
         let result = client
-            .new_payload_v3(payload.clone(), vec![], H256::ZERO)
+            .new_payload_v4(payload.clone(), vec![], H256::ZERO, vec![])
             .await;
         match result {
             Ok(status) => match status.status {
                 PayloadStatusKind::Valid
                 | PayloadStatusKind::Syncing
                 | PayloadStatusKind::Accepted => {
-                    trace!(status = ?status.status, "engine_newPayloadV3 ok");
+                    trace!(status = ?status.status, "engine_newPayloadV4 ok");
                     true
                 }
                 PayloadStatusKind::Invalid | PayloadStatusKind::InvalidBlockHash => {
                     warn!(
                         status = ?status.status,
                         error = ?status.validation_error,
-                        "engine_newPayloadV3 rejected payload; dropping block"
+                        "engine_newPayloadV4 rejected payload; dropping block"
                     );
                     false
                 }
             },
             Err(err) => {
-                warn!(%err, "engine_newPayloadV3 transport failure; accepting block");
+                warn!(%err, "engine_newPayloadV4 transport failure; accepting block");
                 true
             }
         }
@@ -606,7 +613,7 @@ impl BlockChainServer {
         //
         // `engine_getPayloadV3` produced the embedded payload as a *candidate*;
         // the EL doesn't promote it to a real imported block until something
-        // calls `engine_newPayloadV3`. For received blocks that's the import
+        // calls `engine_newPayloadV4`. For received blocks that's the import
         // pre-check in `Handler<NewBlock>`, but for our own builds nobody
         // gossips it back to us — without this call the EL stays at genesis
         // and rejects every subsequent FCU `head_block_hash`.
@@ -618,12 +625,15 @@ impl BlockChainServer {
             let payload = signed_block.message.body.execution_payload.clone();
             let client = client.clone();
             tokio::spawn(async move {
-                match client.new_payload_v3(payload, vec![], H256::ZERO).await {
+                match client
+                    .new_payload_v4(payload, vec![], H256::ZERO, vec![])
+                    .await
+                {
                     Ok(status) => trace!(
                         status = ?status.status,
-                        "engine_newPayloadV3 on own-built block"
+                        "engine_newPayloadV4 on own-built block"
                     ),
-                    Err(err) => warn!(%err, "engine_newPayloadV3 on own-built block failed"),
+                    Err(err) => warn!(%err, "engine_newPayloadV4 on own-built block failed"),
                 }
             });
         }

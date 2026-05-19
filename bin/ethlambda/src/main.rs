@@ -25,6 +25,8 @@ use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs}
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
+    block::{Block, BlockBody},
+    execution_payload::ExecutionPayloadV3,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
@@ -702,17 +704,49 @@ async fn fetch_initial_state(
     let Some(checkpoint_url) = checkpoint_url else {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let mut genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        // M6: seed the cached EL header with the EL's actual genesis block_hash
-        // when paired with an EL. The first engine_forkchoiceUpdatedV3 then
-        // carries a head the EL recognizes, unblocking real payload building.
-        if let Some(el_hash) = execution_genesis_block_hash {
-            genesis_state.latest_execution_payload_header.block_hash = el_hash;
-            info!(
-                %el_hash,
-                "Seeded genesis execution payload header with EL block hash"
-            );
-        }
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+
+        // M6: when paired with an EL, seed both the cached header in state AND
+        // the genesis block's actual `execution_payload.block_hash` with the
+        // EL's genesis hash. The cached header drives STF's
+        // `process_execution_payload` parent_hash check; the body's block_hash
+        // is what `el_hash_at` reads back into `engine_forkchoiceUpdatedV3`'s
+        // `head_block_hash`. Without seeding *both*, either the first non-
+        // genesis block fails STF or every FCU stays at ZERO and the EL never
+        // accepts the build attempt.
+        return Ok(match execution_genesis_block_hash {
+            Some(el_hash) => {
+                info!(%el_hash, "Seeding genesis with EL block hash");
+                genesis_state.latest_execution_payload_header.block_hash = el_hash;
+
+                let body = BlockBody {
+                    attestations: Default::default(),
+                    execution_payload: ExecutionPayloadV3 {
+                        block_hash: el_hash,
+                        ..Default::default()
+                    },
+                };
+                // Header's body_root now reflects the seeded body, not EMPTY_BODY_ROOT.
+                genesis_state.latest_block_header.body_root = body.hash_tree_root();
+
+                let genesis_block = Block {
+                    slot: genesis_state.latest_block_header.slot,
+                    proposer_index: genesis_state.latest_block_header.proposer_index,
+                    parent_root: genesis_state.latest_block_header.parent_root,
+                    // get_forkchoice_store fills state_root after zero-passing
+                    // the anchor consistency check.
+                    state_root: H256::ZERO,
+                    body,
+                };
+
+                Store::get_forkchoice_store(backend, genesis_state, genesis_block).map_err(
+                    |err| {
+                        error!(%err, "Failed to initialize store with seeded genesis body");
+                        checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch
+                    },
+                )?
+            }
+            None => Store::from_anchor_state(backend, genesis_state),
+        });
     };
 
     // Checkpoint sync path

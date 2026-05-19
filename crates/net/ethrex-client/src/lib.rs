@@ -2,13 +2,16 @@
 //! integration with the ethrex execution client.
 //!
 //! Speaks HS256-JWT-authenticated JSON-RPC against an ethrex auth port
-//! (default `:8551`). Exposes typed wrappers for the four engine methods
-//! ethlambda currently uses:
+//! (default `:8551`). Exposes typed wrappers for the engine methods
+//! ethlambda uses:
 //!
 //! - `engine_exchangeCapabilities` (startup handshake)
-//! - `engine_forkchoiceUpdatedV3` (per-tick head/safe/finalized update)
-//! - `engine_newPayloadV3` (block import — not wired in the M4 milestone)
-//! - `engine_getPayloadV3` (block proposal — not wired in the M4 milestone)
+//! - `engine_forkchoiceUpdatedV3` (per-tick head/safe/finalized update,
+//!   plus build-mode at interval 4 with `PayloadAttributesV3`)
+//! - `engine_newPayloadV3` (Cancun-era payload import)
+//! - `engine_newPayloadV4` (Prague-era payload import; adds
+//!   `executionRequests`)
+//! - `engine_getPayloadV3` (block proposal — fetches a built payload by id)
 //!
 //! The schema mirrors the mainline execution-apis spec; we re-derive it
 //! locally instead of depending on ethrex's RPC crate because ethrex is a
@@ -30,11 +33,13 @@ pub use types::{
 /// Capabilities ethlambda advertises in `engine_exchangeCapabilities`.
 ///
 /// We list everything we *might* call; the EL's response is the source of
-/// truth for what we can actually invoke. Today only V3 is exercised.
+/// truth for what we can actually invoke. The V4 newPayload entry covers
+/// Prague-era payloads; the actor picks V3 vs V4 by payload timestamp.
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_exchangeCapabilities",
     "engine_forkchoiceUpdatedV3",
     "engine_newPayloadV3",
+    "engine_newPayloadV4",
     "engine_getPayloadV3",
     "engine_getClientVersionV1",
 ];
