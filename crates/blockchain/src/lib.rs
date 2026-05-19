@@ -235,31 +235,33 @@ impl BlockChainServer {
 
         // Notify the execution layer once per slot (interval 0). Fire and
         // forget: the EL is informational here, never on the consensus
-        // critical path. Until Lean blocks carry execution payloads, we
-        // send all-zero hashes — beacon roots are not EL block hashes, and
-        // passing them confuses the EL into attempting to sync to garbage.
-        // Zero is the spec-friendly "unknown head" sentinel; the EL reliably
-        // replies `SYNCING`, which is the expected scaffold response.
+        // critical path. The hashes carried are `block_hash` fields read
+        // off the head/safe/finalized Lean blocks' `execution_payload`s
+        // (Phase 5 of M6), so the EL can chain forward off blocks it has
+        // actually seen via `engine_newPayloadV3`.
         if interval == 0 && self.execution_client.is_some() {
             self.notify_execution_layer();
         }
     }
 
-    /// Send a zero-valued forkchoice update to the execution layer via
-    /// `engine_forkchoiceUpdatedV3`. Errors are logged but never propagated —
-    /// the consensus loop must continue regardless of EL state.
+    /// Send a forkchoice update to the execution layer via
+    /// `engine_forkchoiceUpdatedV3` carrying the current head/safe/finalized
+    /// EL block hashes (read from the corresponding Lean blocks'
+    /// `execution_payload.block_hash`). Errors are logged but never
+    /// propagated — the consensus loop must continue regardless of EL state.
     ///
-    /// Once Lean blocks carry an `executionPayload`, swap `H256::ZERO` for
-    /// the corresponding EL block hashes derived from the latest known
-    /// head / safe / finalized blocks.
+    /// At genesis every triplet entry is `H256::ZERO` because the genesis
+    /// `BlockBody::default()` carries an `ExecutionPayloadV3::default()`
+    /// whose `block_hash` is zero. Subsequent slots advance once a real
+    /// payload (from `engine_getPayloadV3`) has been imported.
     fn notify_execution_layer(&self) {
         let Some(client) = self.execution_client.as_ref() else {
             return;
         };
         let state = ForkChoiceState {
-            head_block_hash: H256::ZERO,
-            safe_block_hash: H256::ZERO,
-            finalized_block_hash: H256::ZERO,
+            head_block_hash: self.el_hash_at(self.store.head()),
+            safe_block_hash: self.el_hash_at(self.store.safe_target()),
+            finalized_block_hash: self.el_hash_at(self.store.latest_finalized().root),
         };
         let client = client.clone();
         tokio::spawn(async move {
@@ -271,6 +273,27 @@ impl BlockChainServer {
                 Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
             }
         });
+    }
+
+    /// Resolve a Lean block root to its execution payload's `block_hash`.
+    ///
+    /// `H256::ZERO` fallback applies when:
+    ///   * `lean_root` is itself zero (uninitialized head)
+    ///   * the block is missing from storage (defensive — head/safe/
+    ///     finalized are always present, but a torn write or pruning bug
+    ///     shouldn't crash the EL notifier)
+    ///
+    /// At genesis the payload is `ExecutionPayloadV3::default()`, so its
+    /// `block_hash` is `H256::ZERO` and the result naturally rolls back
+    /// to the same sentinel.
+    fn el_hash_at(&self, lean_root: H256) -> H256 {
+        if lean_root.is_zero() {
+            return H256::ZERO;
+        }
+        self.store
+            .get_block(&lean_root)
+            .map(|block| block.body.execution_payload.block_hash)
+            .unwrap_or(H256::ZERO)
     }
 
     /// At interval 4 of slot N-1, ask the EL to start building a payload
