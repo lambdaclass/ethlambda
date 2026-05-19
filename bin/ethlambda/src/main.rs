@@ -121,6 +121,19 @@ struct CliOptions {
     /// by Lighthouse/Teku/Prysm/ethrex.
     #[arg(long, requires = "execution_endpoint")]
     execution_jwt_secret: Option<PathBuf>,
+    /// 32-byte hex hash of the EL's genesis block.
+    ///
+    /// When set, seeds `state.latest_execution_payload_header.block_hash`
+    /// so the very first `engine_forkchoiceUpdatedV3` carries a head the
+    /// EL recognizes. Without this seed the EL replies `SYNCING` forever
+    /// and never starts building payloads, leaving the chain stuck with
+    /// synthetic zero-hash payloads.
+    ///
+    /// Find ethrex's value in its boot log line `Genesis Block Hash: ...`.
+    /// Required when running paired with an EL; only meaningful alongside
+    /// `--execution-endpoint`.
+    #[arg(long, requires = "execution_endpoint")]
+    execution_genesis_block_hash: Option<String>,
 }
 
 #[tokio::main]
@@ -218,10 +231,21 @@ async fn main() -> eyre::Result<()> {
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
     let backend = Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
 
+    let execution_genesis_block_hash = options
+        .execution_genesis_block_hash
+        .as_deref()
+        .map(parse_h256_hex)
+        .transpose()
+        .map_err(|err| {
+            error!(%err, "Invalid --execution-genesis-block-hash");
+            eyre::eyre!(err)
+        })?;
+
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),
         &genesis_config,
         backend.clone(),
+        execution_genesis_block_hash,
     )
     .await
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
@@ -616,6 +640,19 @@ async fn build_execution_client(
     Some(client)
 }
 
+/// Parse a 32-byte hex H256 from a `0x`-prefixed or bare hex string.
+fn parse_h256_hex(s: &str) -> Result<H256, String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{s:?} decoded to {} bytes, expected 32",
+            bytes.len()
+        ));
+    }
+    Ok(H256::from_slice(&bytes))
+}
+
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
     let path = path.as_ref();
     let Ok(file_content) = std::fs::read_to_string(path)
@@ -658,12 +695,23 @@ async fn fetch_initial_state(
     checkpoint_url: Option<&str>,
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
+    execution_genesis_block_hash: Option<H256>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
     let Some(checkpoint_url) = checkpoint_url else {
         info!("No checkpoint sync URL provided, initializing from genesis state");
-        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
+        let mut genesis_state = State::from_genesis(genesis.genesis_time, validators);
+        // M6: seed the cached EL header with the EL's actual genesis block_hash
+        // when paired with an EL. The first engine_forkchoiceUpdatedV3 then
+        // carries a head the EL recognizes, unblocking real payload building.
+        if let Some(el_hash) = execution_genesis_block_hash {
+            genesis_state.latest_execution_payload_header.block_hash = el_hash;
+            info!(
+                %el_hash,
+                "Seeded genesis execution payload header with EL block hash"
+            );
+        }
         return Ok(Store::from_anchor_state(backend, genesis_state));
     };
 
