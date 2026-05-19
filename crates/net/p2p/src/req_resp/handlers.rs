@@ -440,7 +440,6 @@ async fn request_blocks_by_range_from_peer(
         let request = BlocksByRangeRequest {
             start_slot: next_slot,
             count: batch_count,
-            step: 1,
         };
 
         info!(
