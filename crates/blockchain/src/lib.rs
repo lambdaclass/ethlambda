@@ -602,6 +602,32 @@ impl BlockChainServer {
 
         metrics::inc_block_building_success();
 
+        // Inform the EL of our own freshly-built block (M6 phase 5 follow-up).
+        //
+        // `engine_getPayloadV3` produced the embedded payload as a *candidate*;
+        // the EL doesn't promote it to a real imported block until something
+        // calls `engine_newPayloadV3`. For received blocks that's the import
+        // pre-check in `Handler<NewBlock>`, but for our own builds nobody
+        // gossips it back to us — without this call the EL stays at genesis
+        // and rejects every subsequent FCU `head_block_hash`.
+        //
+        // Fire-and-forget; the EL roundtrip is ~ms but the next FCU is 4s
+        // away. If the EL says INVALID we log it but don't reverse — process_block
+        // already accepted into the store and the block is on its way to gossip.
+        if let Some(client) = self.execution_client.as_ref() {
+            let payload = signed_block.message.body.execution_payload.clone();
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client.new_payload_v3(payload, vec![], H256::ZERO).await {
+                    Ok(status) => trace!(
+                        status = ?status.status,
+                        "engine_newPayloadV3 on own-built block"
+                    ),
+                    Err(err) => warn!(%err, "engine_newPayloadV3 on own-built block failed"),
+                }
+            });
+        }
+
         // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
