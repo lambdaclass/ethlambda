@@ -16,7 +16,7 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
-    state::State,
+    state::{JustifiedSlots, State},
 };
 use tracing::{info, trace, warn};
 
@@ -1040,14 +1040,366 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
     );
 }
 
+/// Tiered score for a candidate `AttestationData` entry during block building.
+///
+/// Lower `tier` wins. Tier 1 = finalizes the attestation's source; tier 2 =
+/// justifies the target (crosses 2/3); tier 3 = adds marginal voters toward
+/// the target's 2/3 supermajority. Entries with zero new voters relative to
+/// the running per-target-root voter set are dropped (returned as `None`).
+///
+/// Within a tier, ordering prefers more `new_voters` (descending), then
+/// smaller `target_slot` (older chain progress first), then smaller
+/// `att_slot`, then the entry's `data_root` for determinism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryScore {
+    tier: u8,
+    new_voters: usize,
+    target_slot: u64,
+    att_slot: u64,
+}
+
+impl EntryScore {
+    fn ordering_key(&self, data_root: H256) -> (u8, std::cmp::Reverse<usize>, u64, u64, H256) {
+        (
+            self.tier,
+            std::cmp::Reverse(self.new_voters),
+            self.target_slot,
+            self.att_slot,
+            data_root,
+        )
+    }
+}
+
+/// Deserialize `state.justifications_validators` into a per-target-root voter
+/// map for fast lookup and incremental update during proposer scoring.
+///
+/// The state's flattened layout is `bit[i * N + j] = validator j voted for
+/// justifications_roots[i]` (see `serialize_justifications`).
+fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
+    let validator_count = state.validators.len();
+    let mut votes: HashMap<H256, HashSet<u64>> = HashMap::new();
+    for (i, root) in state.justifications_roots.iter().enumerate() {
+        let mut voters = HashSet::new();
+        for j in 0..validator_count {
+            if state.justifications_validators.get(i * validator_count + j) == Some(true) {
+                voters.insert(j as u64);
+            }
+        }
+        votes.insert(*root, voters);
+    }
+    votes
+}
+
+/// Validate a candidate entry against the projected chain view.
+///
+/// Returns `Err(reason)` matching a `trace_skipped_attestation` label if any
+/// check fails: the entry's head must be known, its source must be justified,
+/// its (source, target) must match the candidate-block chain view, and (unless
+/// it is the genesis self-vote, allowed for fork-choice bootstrapping) its
+/// target must not already be justified.
+fn entry_passes_filters(
+    att_data: &AttestationData,
+    known_block_roots: &HashSet<H256>,
+    extended_historical_block_hashes: &[H256],
+    projected_justified_slots: &JustifiedSlots,
+    projected_finalized_slot: u64,
+) -> Result<(), &'static str> {
+    if !known_block_roots.contains(&att_data.head.root) {
+        return Err("head_root_unknown");
+    }
+    if !justified_slots_ops::is_slot_justified(
+        projected_justified_slots,
+        projected_finalized_slot,
+        att_data.source.slot,
+    ) {
+        return Err("source_not_justified");
+    }
+    if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
+        return Err("chain_mismatch");
+    }
+    let is_genesis_self_vote = att_data.source.slot == 0 && att_data.target.slot == 0;
+    if !is_genesis_self_vote
+        && justified_slots_ops::is_slot_justified(
+            projected_justified_slots,
+            projected_finalized_slot,
+            att_data.target.slot,
+        )
+    {
+        return Err("target_already_justified");
+    }
+    Ok(())
+}
+
+/// Score a single candidate entry under the current projected state.
+///
+/// Returns `None` if the entry has zero new validators relative to the
+/// running voter set for its `target.root` (no marginal value, drop). A
+/// genesis self-vote (source.slot == target.slot == 0) cannot justify or
+/// finalize anything and is scored as tier 3 if it contributes new voters.
+fn score_entry(
+    att_data: &AttestationData,
+    proofs: &[TypeOneMultiSignature],
+    current_votes: &HashMap<H256, HashSet<u64>>,
+    projected_finalized_slot: u64,
+    validator_count: usize,
+) -> Option<EntryScore> {
+    let empty;
+    let prior_voters = match current_votes.get(&att_data.target.root) {
+        Some(set) => set,
+        None => {
+            empty = HashSet::new();
+            &empty
+        }
+    };
+
+    // Union over all proofs: `extend_proofs_greedily` ends up covering this
+    // set (it keeps picking proofs while any add a new validator).
+    let mut union: HashSet<u64> = prior_voters.clone();
+    for proof in proofs {
+        for vid in proof.participant_indices() {
+            union.insert(vid);
+        }
+    }
+    let new_voters = union.len() - prior_voters.len();
+    if new_voters == 0 {
+        return None;
+    }
+
+    let att_slot = att_data.slot;
+    let target_slot = att_data.target.slot;
+
+    let is_genesis_self_vote = att_data.source.slot == 0 && target_slot == 0;
+    if is_genesis_self_vote {
+        return Some(EntryScore {
+            tier: 3,
+            new_voters,
+            target_slot,
+            att_slot,
+        });
+    }
+
+    let crosses_2_3 = 3 * union.len() >= 2 * validator_count;
+    if !crosses_2_3 {
+        return Some(EntryScore {
+            tier: 3,
+            new_voters,
+            target_slot,
+            att_slot,
+        });
+    }
+
+    // Crossing 2/3 justifies target.slot. Finalization of source requires
+    // no slot strictly between source.slot and target.slot to still be
+    // justifiable per 3SF-mini's (delta in 0..=5 ∪ squares ∪ pronics) rule,
+    // i.e., source and target must be two consecutive justified checkpoints
+    // in the projected post-state.
+    let finalizes = (att_data.source.slot + 1..target_slot)
+        .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
+
+    Some(EntryScore {
+        tier: if finalizes { 1 } else { 2 },
+        new_voters,
+        target_slot,
+        att_slot,
+    })
+}
+
+/// Static inputs to the attestation selection scan: the candidate pool and
+/// the chain-level facts used to filter and score entries. Built once before
+/// the round loop in `select_attestations`.
+struct ChainContext<'a> {
+    aggregated_payloads: &'a HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+    known_block_roots: &'a HashSet<H256>,
+    extended_historical_block_hashes: &'a [H256],
+    validator_count: usize,
+}
+
+/// Mutable projection of the post-state that `select_attestations` maintains
+/// across rounds: which slots are justified, which slot is finalized, and the
+/// running per-target-root voter set.
+struct ProjectedState {
+    justified_slots: JustifiedSlots,
+    finalized_slot: u64,
+    current_votes: HashMap<H256, HashSet<u64>>,
+}
+
+/// Scan candidate attestation entries and pick the highest-scoring one.
+///
+/// Skips entries already processed, those failing `entry_passes_filters`
+/// (logging the reason), and those with zero new voters. Among remaining
+/// entries, returns the `(data_root, score)` with the best
+/// `EntryScore::ordering_key` (lower is better). Caller re-indexes
+/// `chain.aggregated_payloads[&data_root]` to get the entry's data and proofs.
+fn pick_best_candidate(
+    chain: &ChainContext<'_>,
+    processed_data_roots: &HashSet<H256>,
+    projected: &ProjectedState,
+) -> Option<(H256, EntryScore)> {
+    let mut best: Option<(H256, EntryScore)> = None;
+    let mut best_key: Option<(u8, std::cmp::Reverse<usize>, u64, u64, H256)> = None;
+
+    for (data_root, (att_data, proofs)) in chain.aggregated_payloads {
+        if processed_data_roots.contains(data_root) {
+            continue;
+        }
+        if let Err(reason) = entry_passes_filters(
+            att_data,
+            chain.known_block_roots,
+            chain.extended_historical_block_hashes,
+            &projected.justified_slots,
+            projected.finalized_slot,
+        ) {
+            trace_skipped_attestation(reason, att_data, data_root);
+            continue;
+        }
+
+        let Some(score) = score_entry(
+            att_data,
+            proofs,
+            &projected.current_votes,
+            projected.finalized_slot,
+            chain.validator_count,
+        ) else {
+            trace_skipped_attestation("zero_new_voters", att_data, data_root);
+            continue;
+        };
+
+        let candidate_key = score.ordering_key(*data_root);
+        if best_key.as_ref().is_none_or(|k| candidate_key < *k) {
+            best = Some((*data_root, score));
+            best_key = Some(candidate_key);
+        }
+    }
+
+    best
+}
+
+/// Tiered greedy attestation selection for block proposal.
+///
+/// Each round scores remaining candidates against a projected post-state and
+/// picks the best per `EntryScore`: tier 1 (finalizes source) beats tier 2
+/// (justifies target) beats tier 3 (adds new voters). Justification and
+/// finalization are projected incrementally so dependent attestations become
+/// eligible on the next round without re-running the STF.
+///
+/// Stops at `MAX_ATTESTATIONS_DATA` distinct data entries or when no
+/// remaining candidate has a positive score. Within-entry proof selection is
+/// delegated to `extend_proofs_greedily`.
+fn select_attestations(
+    head_state: &State,
+    slot: u64,
+    parent_root: H256,
+    known_block_roots: &HashSet<H256>,
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
+    let mut selected: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = Vec::new();
+    if aggregated_payloads.is_empty() {
+        return selected;
+    }
+
+    // Chain view that `process_block_header` would produce on the candidate
+    // block: covering [0, slot - 1] with parent_root at parent.slot and
+    // ZERO_HASH for empty slots in between. Lets us validate source/target
+    // roots without waiting for the STF to drop mismatches.
+    let parent_slot = head_state.latest_block_header.slot;
+    let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
+    let mut extended_historical_block_hashes: Vec<H256> =
+        head_state.historical_block_hashes.iter().copied().collect();
+    extended_historical_block_hashes.push(parent_root);
+    extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
+
+    let chain = ChainContext {
+        aggregated_payloads,
+        known_block_roots,
+        extended_historical_block_hashes: &extended_historical_block_hashes,
+        validator_count: head_state.validators.len(),
+    };
+
+    // Running per-target-root voter set, seeded from state and updated
+    // incrementally as entries are selected. Mirrors the role of Eth2
+    // participation flags in Prysm/Lighthouse-style packing.
+    let mut projected = ProjectedState {
+        justified_slots: head_state.justified_slots.clone(),
+        finalized_slot: head_state.latest_finalized.slot,
+        current_votes: build_running_votes(head_state),
+    };
+    let mut processed_data_roots: HashSet<H256> = HashSet::new();
+
+    for _round in 0..MAX_ATTESTATIONS_DATA {
+        let Some((data_root, score)) =
+            pick_best_candidate(&chain, &processed_data_roots, &projected)
+        else {
+            trace!(
+                selected_total = processed_data_roots.len(),
+                "converged: no scoring candidates"
+            );
+            break;
+        };
+        let (att_data, proofs) = &chain.aggregated_payloads[&data_root];
+
+        processed_data_roots.insert(data_root);
+
+        let before = selected.len();
+        extend_proofs_greedily(proofs, &mut selected, att_data);
+
+        // Project the contribution to current_votes for the target root.
+        // `extend_proofs_greedily` ends up covering the union of all
+        // proof participants, so we read the actual selected voters back
+        // out of `selected[before..]`.
+        let added_voters: HashSet<u64> = selected[before..]
+            .iter()
+            .flat_map(|(att, _)| validator_indices(&att.aggregation_bits))
+            .collect();
+        let target_root = att_data.target.root;
+        projected
+            .current_votes
+            .entry(target_root)
+            .or_default()
+            .extend(added_voters.iter().copied());
+
+        trace!(
+            tier = score.tier,
+            new_voters = score.new_voters,
+            target_slot = score.target_slot,
+            target_root = %ShortRoot(&target_root.0),
+            data_root = %ShortRoot(&data_root.0),
+            selected_proofs = selected.len() - before,
+            "selected"
+        );
+
+        // Project justification / finalization. Tier 1 implies tier 2
+        // (target is justified, AND source is finalized).
+        if score.tier <= 2 {
+            justified_slots_ops::extend_to_slot(
+                &mut projected.justified_slots,
+                projected.finalized_slot,
+                att_data.target.slot,
+            );
+            justified_slots_ops::set_justified(
+                &mut projected.justified_slots,
+                projected.finalized_slot,
+                att_data.target.slot,
+            );
+            // Justified target's voter bucket is no longer relevant for
+            // scoring (no further entry can target it: filter rejects).
+            projected.current_votes.remove(&target_root);
+        }
+        if score.tier == 1 {
+            let new_finalized = att_data.source.slot;
+            let delta = new_finalized.saturating_sub(projected.finalized_slot) as usize;
+            justified_slots_ops::shift_window(&mut projected.justified_slots, delta);
+            projected.finalized_slot = new_finalized;
+        }
+    }
+
+    selected
+}
+
 /// Build a valid block on top of this state.
 ///
-/// Works directly with aggregated payloads keyed by data_root, filtering
-/// and selecting proofs without reconstructing individual attestations.
-///
-/// Returns the block and a list of attestation signature proofs
-/// (one per attestation in block.body.attestations). The proposer signature
-/// is NOT included; it is appended by the caller.
+/// Selects attestations via `select_attestations`, compacts duplicate
+/// `AttestationData` entries, and runs the STF once to seal the state root.
+/// The proposer signature is NOT included; it is appended by the caller.
 fn build_block(
     head_state: &State,
     slot: u64,
@@ -1056,176 +1408,15 @@ fn build_block(
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
-    let mut selected: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = Vec::new();
+    info!(slot, proposer_index, "Building block");
 
-    if !aggregated_payloads.is_empty() {
-        let mut current_justified = head_state.latest_justified;
-        let mut current_finalized_slot = head_state.latest_finalized.slot;
-        let mut current_justified_slots = head_state.justified_slots.clone();
-
-        // Chain view that `process_block_header` would produce on the candidate
-        // block: covering [0, slot - 1] with parent_root at parent.slot and
-        // ZERO_HASH for empty slots in between. Lets us validate source/target
-        // roots without waiting for the STF to drop mismatches.
-        let parent_slot = head_state.latest_block_header.slot;
-        let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
-        let mut extended_historical_block_hashes: Vec<H256> =
-            head_state.historical_block_hashes.iter().copied().collect();
-        extended_historical_block_hashes.push(parent_root);
-        extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
-
-        let mut processed_data_roots: HashSet<H256> = HashSet::new();
-
-        // Sort by target.slot to match the spec's processing order.
-        let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
-        sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
-
-        info!(slot, proposer_index, "Building block");
-
-        loop {
-            let mut found_new = false;
-            let mut iter_selected: u32 = 0;
-            let mut iter_skipped: u32 = 0;
-
-            trace!(
-                candidates = sorted_entries.len(),
-                already_selected = processed_data_roots.len(),
-                current_justified_slot = current_justified.slot,
-                current_justified_root = %ShortRoot(&current_justified.root.0),
-                "start"
-            );
-
-            for &(data_root, (att_data, proofs)) in &sorted_entries {
-                if processed_data_roots.contains(data_root) {
-                    continue;
-                }
-
-                // Cap distinct AttestationData entries per block (leanSpec #536).
-                if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
-                    trace_skipped_attestation("max_attestation_data_cap", att_data, data_root);
-                    iter_skipped += 1;
-                    break;
-                }
-                if !known_block_roots.contains(&att_data.head.root) {
-                    trace_skipped_attestation("head_root_unknown", att_data, data_root);
-                    iter_skipped += 1;
-                    continue;
-                }
-                if !justified_slots_ops::is_slot_justified(
-                    &current_justified_slots,
-                    current_finalized_slot,
-                    att_data.source.slot,
-                ) {
-                    trace_skipped_attestation("source_not_justified", att_data, data_root);
-                    iter_skipped += 1;
-                    continue;
-                }
-
-                if !attestation_data_matches_chain(&extended_historical_block_hashes, att_data) {
-                    trace_skipped_attestation("chain_mismatch", att_data, data_root);
-                    iter_skipped += 1;
-                    continue;
-                }
-
-                // Skip attestations whose target slot is already justified on
-                // this chain (they wouldn't change post-state). Allow the
-                // genesis self-vote (source=target=0) for fork-choice
-                // bootstrapping.
-                let is_genesis_self_vote = att_data.source.slot == 0 && att_data.target.slot == 0;
-                if !is_genesis_self_vote
-                    && justified_slots_ops::is_slot_justified(
-                        &current_justified_slots,
-                        current_finalized_slot,
-                        att_data.target.slot,
-                    )
-                {
-                    trace_skipped_attestation("target_already_justified", att_data, data_root);
-                    iter_skipped += 1;
-                    continue;
-                }
-
-                processed_data_roots.insert(*data_root);
-                found_new = true;
-
-                let before = selected.len();
-                extend_proofs_greedily(proofs, &mut selected, att_data);
-
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    let available_bits: HashSet<u64> = proofs
-                        .iter()
-                        .flat_map(|p| p.participant_indices())
-                        .collect();
-                    let selected_bits: HashSet<u64> = selected[before..]
-                        .iter()
-                        .flat_map(|(att, _)| validator_indices(&att.aggregation_bits))
-                        .collect();
-                    trace!(
-                        attestation_slot = att_data.slot,
-                        source_slot = att_data.source.slot,
-                        source_root = %ShortRoot(&att_data.source.root.0),
-                        target_slot = att_data.target.slot,
-                        target_root = %ShortRoot(&att_data.target.root.0),
-                        head_slot = att_data.head.slot,
-                        head_root = %ShortRoot(&att_data.head.root.0),
-                        data_root = %ShortRoot(&data_root.0),
-                        available_bits = available_bits.len(),
-                        selected_bits = selected_bits.len(),
-                        available_proofs = proofs.len(),
-                        selected_proofs = selected.len() - before,
-                        "selected"
-                    );
-                }
-                iter_selected += 1;
-            }
-
-            if !found_new {
-                trace!(
-                    iter_selected,
-                    iter_skipped,
-                    selected_total = processed_data_roots.len(),
-                    "converged: no new candidates"
-                );
-                break;
-            }
-
-            // Check if justification or finalization advanced
-            let attestations: AggregatedAttestations = selected
-                .iter()
-                .map(|(att, _)| att.clone())
-                .collect::<Vec<_>>()
-                .try_into()
-                .expect("attestation count exceeds limit");
-            let candidate = Block {
-                slot,
-                proposer_index,
-                parent_root,
-                state_root: H256::ZERO,
-                body: BlockBody { attestations },
-            };
-            let mut post_state = head_state.clone();
-            process_slots(&mut post_state, slot)?;
-            process_block(&mut post_state, &candidate)?;
-
-            let advanced = post_state.latest_justified != current_justified
-                || post_state.latest_finalized.slot != current_finalized_slot;
-            trace!(
-                iter_selected,
-                iter_skipped,
-                advanced,
-                justified_slot = post_state.latest_justified.slot,
-                justified_root = %ShortRoot(&post_state.latest_justified.root.0),
-                "post-block checkpoint"
-            );
-            if advanced {
-                current_justified = post_state.latest_justified;
-                current_justified_slots = post_state.justified_slots.clone();
-                current_finalized_slot = post_state.latest_finalized.slot;
-                // Continue: new checkpoint may unlock more attestation data
-            } else {
-                break;
-            }
-        }
-    }
+    let selected = select_attestations(
+        head_state,
+        slot,
+        parent_root,
+        known_block_roots,
+        aggregated_payloads,
+    );
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
