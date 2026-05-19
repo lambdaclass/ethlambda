@@ -28,6 +28,7 @@ use tracing::{error, info, trace, warn};
 use crate::store::StoreError;
 
 pub mod aggregation;
+pub mod block_builder;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
