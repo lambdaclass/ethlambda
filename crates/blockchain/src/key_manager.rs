@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::metrics;
 
@@ -48,6 +49,14 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
+    /// Advances every validator's XMSS preparation windows to cover slot
+    pub fn advance_keys_to(&mut self, slot: u32) {
+        for (validator_id, key_pair) in self.keys.iter_mut() {
+            advance_key(*validator_id, &mut key_pair.attestation_key, slot);
+            advance_key(*validator_id, &mut key_pair.proposal_key, slot);
+        }
+    }
+
     /// Signs an attestation using the validator's attestation key.
     pub fn sign_attestation(
         &mut self,
@@ -85,6 +94,7 @@ impl KeyManager {
         // Multiple advances may be needed if the node was offline for an extended period.
         if !key_pair.attestation_key.is_prepared_for(slot) {
             info!(validator_id, slot, "Advancing XMSS key preparation window");
+            let start = Instant::now();
             while !key_pair.attestation_key.is_prepared_for(slot) {
                 let before = key_pair.attestation_key.get_prepared_interval();
                 key_pair.attestation_key.advance_preparation();
@@ -95,6 +105,12 @@ impl KeyManager {
                     )));
                 }
             }
+            info!(
+                validator_id,
+                slot,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Advanced XMSS key preparation window"
+            );
         }
 
         let signature: ValidatorSignature = {
@@ -130,6 +146,7 @@ impl KeyManager {
                 validator_id,
                 slot, "Advancing XMSS proposal key preparation window"
             );
+            let start = Instant::now();
             while !key_pair.proposal_key.is_prepared_for(slot) {
                 let before = key_pair.proposal_key.get_prepared_interval();
                 key_pair.proposal_key.advance_preparation();
@@ -140,6 +157,12 @@ impl KeyManager {
                     )));
                 }
             }
+            info!(
+                validator_id,
+                slot,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Advanced XMSS proposal key preparation window"
+            );
         }
 
         let signature: ValidatorSignature = key_pair
@@ -151,6 +174,28 @@ impl KeyManager {
         XmssSignature::try_from(sig_bytes)
             .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))
     }
+}
+
+fn advance_key(validator_id: u64, key: &mut ValidatorSecretKey, slot: u32) {
+    if key.is_prepared_for(slot) {
+        return;
+    }
+    info!(validator_id, slot, "Advancing XMSS key preparation window");
+    let start = Instant::now();
+    while !key.is_prepared_for(slot) {
+        let before = key.get_prepared_interval();
+        key.advance_preparation();
+        if key.get_prepared_interval() == before {
+            warn!(validator_id, slot, "XMSS key activation interval exhausted");
+            break;
+        }
+    }
+    info!(
+        validator_id,
+        slot,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Advanced XMSS key preparation window"
+    );
 }
 
 #[cfg(test)]

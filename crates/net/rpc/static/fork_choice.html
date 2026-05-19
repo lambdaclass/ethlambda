@@ -391,12 +391,14 @@
 
       const flatNodes = allDescendants.map(d => {
         const roles = nodeRoles(d.data, data);
+        // Finalized blocks are filled by default, otherwise scale by fork-choice weight.
+        const isFinalized = roles.includes("finalized");
         return {
           ...d.data,
           x: d.x,
           y: d.y,
           _color: roles.length > 0 ? COLORS[roles[0]] : COLORS.default,
-          _ratio: weightRatio(d.data, data.validator_count),
+          _ratio: isFinalized ? 1 : weightRatio(d.data, data.validator_count),
           // Colors of secondary roles, in priority order (after the primary).
           _haloColors: roles.slice(1).map(r => COLORS[r])
         };

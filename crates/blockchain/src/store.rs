@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
-    is_proposer, process_block, process_slots, slot_is_justifiable_after,
+    attestation_data_matches_chain, is_proposer, justified_slots_ops, process_block, process_slots,
+    slot_is_justifiable_after,
 };
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -1031,6 +1032,21 @@ fn extend_proofs_greedily(
     }
 }
 
+fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_root: &H256) {
+    trace!(
+        reason,
+        attestation_slot = att.slot,
+        source_slot = att.source.slot,
+        source_root = %ShortRoot(&att.source.root.0),
+        target_slot = att.target.slot,
+        target_root = %ShortRoot(&att.target.root.0),
+        head_slot = att.head.slot,
+        head_root = %ShortRoot(&att.head.root.0),
+        data_root = %ShortRoot(&data_root.0),
+        "skipped"
+    );
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Works directly with aggregated payloads keyed by data_root, filtering
@@ -1050,17 +1066,20 @@ fn build_block(
     let mut selected: Vec<(AggregatedAttestation, AggregatedSignatureProof)> = Vec::new();
 
     if !aggregated_payloads.is_empty() {
-        // Genesis edge case: when building on genesis (slot 0),
-        // process_block_header will set latest_justified.root = parent_root.
-        // Derive this upfront so attestation filtering matches.
-        let mut current_justified = if head_state.latest_block_header.slot == 0 {
-            Checkpoint {
-                root: parent_root,
-                slot: head_state.latest_justified.slot,
-            }
-        } else {
-            head_state.latest_justified
-        };
+        let mut current_justified = head_state.latest_justified;
+        let mut current_finalized_slot = head_state.latest_finalized.slot;
+        let mut current_justified_slots = head_state.justified_slots.clone();
+
+        // Chain view that `process_block_header` would produce on the candidate
+        // block: covering [0, slot - 1] with parent_root at parent.slot and
+        // ZERO_HASH for empty slots in between. Lets us validate source/target
+        // roots without waiting for the STF to drop mismatches.
+        let parent_slot = head_state.latest_block_header.slot;
+        let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
+        let mut extended_historical_block_hashes: Vec<H256> =
+            head_state.historical_block_hashes.iter().copied().collect();
+        extended_historical_block_hashes.push(parent_root);
+        extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
 
         let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
@@ -1068,35 +1087,115 @@ fn build_block(
         let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
         sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
 
+        info!(slot, proposer_index, "Building block");
+
         loop {
             let mut found_new = false;
+            let mut iter_selected: u32 = 0;
+            let mut iter_skipped: u32 = 0;
+
+            trace!(
+                candidates = sorted_entries.len(),
+                already_selected = processed_data_roots.len(),
+                current_justified_slot = current_justified.slot,
+                current_justified_root = %ShortRoot(&current_justified.root.0),
+                "start"
+            );
 
             for &(data_root, (att_data, proofs)) in &sorted_entries {
                 if processed_data_roots.contains(data_root) {
                     continue;
                 }
+
                 // Cap distinct AttestationData entries per block (leanSpec #536).
                 if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
+                    trace_skipped_attestation("max_attestation_data_cap", att_data, data_root);
+                    iter_skipped += 1;
                     break;
                 }
                 if !known_block_roots.contains(&att_data.head.root) {
+                    trace_skipped_attestation("head_root_unknown", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
-                if att_data.source != current_justified {
+                if !justified_slots_ops::is_slot_justified(
+                    &current_justified_slots,
+                    current_finalized_slot,
+                    att_data.source.slot,
+                ) {
+                    trace_skipped_attestation("source_not_justified", att_data, data_root);
+                    iter_skipped += 1;
+                    continue;
+                }
+
+                if !attestation_data_matches_chain(&extended_historical_block_hashes, att_data) {
+                    trace_skipped_attestation("chain_mismatch", att_data, data_root);
+                    iter_skipped += 1;
+                    continue;
+                }
+
+                // Skip attestations whose target slot is already justified on
+                // this chain (they wouldn't change post-state). Allow the
+                // genesis self-vote (source=target=0) for fork-choice
+                // bootstrapping.
+                let is_genesis_self_vote = att_data.source.slot == 0 && att_data.target.slot == 0;
+                if !is_genesis_self_vote
+                    && justified_slots_ops::is_slot_justified(
+                        &current_justified_slots,
+                        current_finalized_slot,
+                        att_data.target.slot,
+                    )
+                {
+                    trace_skipped_attestation("target_already_justified", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
 
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
+                let before = selected.len();
                 extend_proofs_greedily(proofs, &mut selected, att_data);
+
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    let available_bits: HashSet<u64> = proofs
+                        .iter()
+                        .flat_map(|p| p.participant_indices())
+                        .collect();
+                    let selected_bits: HashSet<u64> = selected[before..]
+                        .iter()
+                        .flat_map(|(att, _)| validator_indices(&att.aggregation_bits))
+                        .collect();
+                    trace!(
+                        attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
+                        target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
+                        data_root = %ShortRoot(&data_root.0),
+                        available_bits = available_bits.len(),
+                        selected_bits = selected_bits.len(),
+                        available_proofs = proofs.len(),
+                        selected_proofs = selected.len() - before,
+                        "selected"
+                    );
+                }
+                iter_selected += 1;
             }
 
             if !found_new {
+                trace!(
+                    iter_selected,
+                    iter_skipped,
+                    selected_total = processed_data_roots.len(),
+                    "converged: no new candidates"
+                );
                 break;
             }
 
-            // Check if justification advanced
+            // Check if justification or finalization advanced
             let attestations: AggregatedAttestations = selected
                 .iter()
                 .map(|(att, _)| att.clone())
@@ -1114,8 +1213,20 @@ fn build_block(
             process_slots(&mut post_state, slot)?;
             process_block(&mut post_state, &candidate)?;
 
-            if post_state.latest_justified != current_justified {
+            let advanced = post_state.latest_justified != current_justified
+                || post_state.latest_finalized.slot != current_finalized_slot;
+            trace!(
+                iter_selected,
+                iter_skipped,
+                advanced,
+                justified_slot = post_state.latest_justified.slot,
+                justified_root = %ShortRoot(&post_state.latest_justified.root.0),
+                "post-block checkpoint"
+            );
+            if advanced {
                 current_justified = post_state.latest_justified;
+                current_justified_slots = post_state.justified_slots.clone();
+                current_finalized_slot = post_state.latest_finalized.slot;
                 // Continue: new checkpoint may unlock more attestation data
             } else {
                 break;
@@ -1325,13 +1436,14 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData, XmssSignature},
+        attestation::{
+            AggregatedAttestation, AggregationBits, AttestationData, blank_xmss_signature,
+        },
         block::{
             AggregatedSignatureProof, AttestationSignatures, BlockBody, BlockSignatures,
             SignedBlock,
         },
         checkpoint::Checkpoint,
-        signature::SIGNATURE_SIZE,
         state::State,
     };
 
@@ -1376,7 +1488,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 
@@ -1396,6 +1508,10 @@ mod tests {
     /// at MAX_ATTESTATIONS_DATA (16) and stays under the gossip size limit.
     #[test]
     fn build_block_caps_attestation_data_entries() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
         use libssz::SszEncode;
         use libssz_types::SszList;
 
@@ -1404,7 +1520,9 @@ mod tests {
         const NUM_VALIDATORS: usize = 50;
         const NUM_PAYLOAD_ENTRIES: usize = 50;
 
-        // Create genesis state with NUM_VALIDATORS validators.
+        const HEAD_SLOT: u64 = 51;
+        const TARGET_SLOT: u64 = 5;
+
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
                 attestation_pubkey: [i as u8; 52],
@@ -1412,47 +1530,75 @@ mod tests {
                 index: i as u64,
             })
             .collect();
-        let head_state = State::from_genesis(1000, validators);
 
-        // process_slots fills in the genesis header's state_root before
+        // Build a head state at slot HEAD_SLOT with valid historical_block_hashes
+        // so attestations referencing in-range slots match the chain (the
+        // chain-match check in build_block now rejects mismatches).
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let historical_block_hashes = SszList::try_from(hashes.clone()).unwrap();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes,
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        // process_slots fills in the parent header's state_root before
         // process_block_header computes the parent hash. Simulate that here.
         let mut header_for_root = head_state.latest_block_header.clone();
         header_for_root.state_root = head_state.hash_tree_root();
         let parent_root = header_for_root.hash_tree_root();
 
-        // Proposer for slot 1 with NUM_VALIDATORS validators: 1 % 50 = 1
-        let proposer_index = 1u64;
-        let slot = 1u64;
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
 
-        // The genesis edge case in build_block sets current_justified to:
-        //   Checkpoint { root: parent_root, slot: 0 }
+        // Common source / target / head referencing valid chain entries so the
+        // chain-match check passes for every payload. We vary AttestationData.slot
+        // alone to produce 50 distinct data_roots.
         let source = Checkpoint {
-            root: parent_root,
+            root: hashes[0],
+            slot: 0,
+        };
+        let target = Checkpoint {
+            root: hashes[TARGET_SLOT as usize],
+            slot: TARGET_SLOT,
+        };
+        let head = Checkpoint {
+            root: hashes[0],
             slot: 0,
         };
 
         let mut known_block_roots = HashSet::new();
         known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
 
         // Simulate a stall: populate the payload pool with many distinct entries.
-        // Each has a unique target (different slot) and a large proof payload.
+        // Each has a unique attestation slot and a large proof payload.
         let mut aggregated_payloads: HashMap<
             H256,
             (AttestationData, Vec<AggregatedSignatureProof>),
         > = HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
-            let target_slot = (i + 1) as u64;
             let att_data = AttestationData {
-                slot: target_slot,
-                head: Checkpoint {
-                    root: parent_root,
-                    slot: 0,
-                },
-                target: Checkpoint {
-                    root: H256([target_slot as u8; 32]),
-                    slot: target_slot,
-                },
+                slot: (i + 1) as u64,
+                head,
+                target,
                 source,
             };
 
@@ -1496,7 +1642,7 @@ mod tests {
             message: block,
             signature: BlockSignatures {
                 attestation_signatures: AttestationSignatures::try_from(attestation_sigs).unwrap(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 
@@ -1510,6 +1656,134 @@ mod tests {
             signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
+        );
+    }
+
+    /// Regression test for leanSpec PR #716: build_block must absorb
+    /// gap-closing attestations whose source is justified on the head
+    /// chain but older than `latest_justified` (e.g., a sibling fork
+    /// advanced the store's justified past what the canonical head has
+    /// proven). Without the relaxed `is_slot_justified(source.slot)`
+    /// filter, the exact-equality check would drop the attestation and
+    /// justification would never converge on this chain.
+    #[test]
+    fn build_block_absorbs_older_but_justified_source() {
+        use ethlambda_state_transition::justified_slots_ops;
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const SUPERMAJORITY: usize = 34; // ceil(2 * 50 / 3)
+        const HEAD_SLOT: u64 = 5;
+        const JUSTIFIED_SLOT: u64 = 1;
+        const GAP_TARGET_SLOT: u64 = 2;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 0, JUSTIFIED_SLOT);
+        justified_slots_ops::set_justified(&mut justified_slots, 0, JUSTIFIED_SLOT);
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint {
+                root: hashes[JUSTIFIED_SLOT as usize],
+                slot: JUSTIFIED_SLOT,
+            },
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // source = genesis (slot 0): older than head.latest_justified at
+        // slot 1. Pre-PR exact-equality filter would drop this; post-PR
+        // it's absorbed and the candidate justifies GAP_TARGET_SLOT.
+        let att_data = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[GAP_TARGET_SLOT as usize],
+                slot: GAP_TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let data_root = att_data.hash_tree_root();
+
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        for i in 0..SUPERMAJORITY {
+            bits.set(i, true).unwrap();
+        }
+        let proof = AggregatedSignatureProof::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(data_root, (att_data.clone(), vec![proof]));
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let (block, _signatures, post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        let targets: Vec<_> = block
+            .body
+            .attestations
+            .iter()
+            .map(|att| att.data.target)
+            .collect();
+        assert!(
+            targets.contains(&att_data.target),
+            "produced block missing gap-closing attestation: {targets:?}"
+        );
+
+        assert_eq!(post_checkpoints.justified.slot, GAP_TARGET_SLOT);
+        assert_eq!(
+            post_checkpoints.justified.root,
+            hashes[GAP_TARGET_SLOT as usize]
         );
     }
 
@@ -1610,17 +1884,11 @@ mod tests {
         use std::sync::Arc;
 
         let genesis_state = State::from_genesis(1000, vec![]);
-        let genesis_block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: AggregatedAttestations::default(),
-            },
-        };
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, genesis_state, genesis_block);
+        // Use `from_anchor_state` here rather than `get_forkchoice_store`:
+        // the latter now enforces `block.state_root == hash_tree_root(state)`,
+        // which a synthetic genesis block with zero state_root cannot satisfy.
+        let mut store = Store::from_anchor_state(backend, genesis_state);
 
         let head_root = store.head();
         let att_data = AttestationData {
@@ -1671,7 +1939,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures,
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         };
 

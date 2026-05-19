@@ -4,7 +4,8 @@ use crate::api::{
     ALL_TABLES, Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table,
 };
 use rocksdb::{
-    ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options, WriteBatch, WriteOptions,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
+    WriteBatch, WriteOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -34,9 +35,29 @@ impl RocksDBBackend {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
+        opts.set_max_open_files(-1);
+        opts.set_max_file_opening_threads(8);
+        opts.set_max_background_jobs(8);
+        opts.set_max_subcompactions(2);
+        opts.set_compaction_readahead_size(4 * 1024 * 1024);
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        opts.set_bytes_per_sync(32 * 1024 * 1024);
+        opts.set_wal_bytes_per_sync(32 * 1024 * 1024);
+        opts.set_max_total_wal_size(256 * 1024 * 1024);
+        opts.set_use_fsync(false);
+        opts.set_enable_pipelined_write(true);
+
+        let block_cache = Cache::new_lru_cache(128 * 1024 * 1024);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&block_cache);
+
         let cf_descriptors: Vec<_> = ALL_TABLES
             .iter()
-            .map(|t| ColumnFamilyDescriptor::new(cf_name(*t), Options::default()))
+            .map(|t| {
+                let mut cf_opts = Options::default();
+                cf_opts.set_block_based_table_factory(&block_opts);
+                ColumnFamilyDescriptor::new(cf_name(*t), cf_opts)
+            })
             .collect();
 
         let db =
