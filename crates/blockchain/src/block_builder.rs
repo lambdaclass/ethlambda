@@ -168,7 +168,7 @@ fn select_attestations(
             .extend(new_voters);
 
         trace!(
-            tier = score.tier,
+            tier = ?score.tier,
             new_voters = score.new_voters,
             target_slot = score.target_slot,
             target_root = %ShortRoot(&target_root.0),
@@ -177,9 +177,9 @@ fn select_attestations(
             "selected"
         );
 
-        // Project justification / finalization. Tier 1 implies tier 2
+        // Project justification / finalization. Finalize implies Justify
         // (target is justified, AND source is finalized).
-        if score.tier <= 2 {
+        if score.tier <= Tier::Justify {
             justified_slots_ops::extend_to_slot(
                 &mut projected.justified_slots,
                 projected.finalized_slot,
@@ -194,7 +194,7 @@ fn select_attestations(
             // scoring (no further entry can target it: filter rejects).
             projected.current_votes.remove(&target_root);
         }
-        if score.tier == 1 {
+        if score.tier == Tier::Finalize {
             let new_finalized = att_data.source.slot;
             let delta = new_finalized.saturating_sub(projected.finalized_slot) as usize;
             justified_slots_ops::shift_window(&mut projected.justified_slots, delta);
@@ -218,7 +218,7 @@ fn pick_best_candidate(
     projected: &ProjectedState,
 ) -> Option<(H256, EntryScore, HashSet<u64>)> {
     let mut best: Option<(H256, EntryScore, HashSet<u64>)> = None;
-    let mut best_key: Option<(u8, std::cmp::Reverse<usize>, u64, u64, H256)> = None;
+    let mut best_key: Option<(Tier, std::cmp::Reverse<usize>, u64, u64, H256)> = None;
 
     for (data_root, (att_data, proofs)) in chain.aggregated_payloads {
         if processed_data_roots.contains(data_root) {
@@ -372,11 +372,11 @@ fn score_entry(
             .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
 
     let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
-        3
+        Tier::Build
     } else if finalizes {
-        1
+        Tier::Finalize
     } else {
-        2
+        Tier::Justify
     };
 
     Some((
@@ -390,26 +390,42 @@ fn score_entry(
     ))
 }
 
+/// Selection tier for a candidate `AttestationData` entry.
+///
+/// Declared in priority order: lower variant beats higher under derived
+/// `Ord`. `#[repr(u8)]` pins the discriminant for self-describing trace
+/// output (`tier = Finalize` is clearer than `tier = 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+enum Tier {
+    /// Applying the entry crosses 2/3 on target AND finalizes the source
+    /// (no slot strictly between source.slot and target.slot is still
+    /// justifiable given projected finalized_slot).
+    Finalize = 1,
+    /// Applying the entry crosses 2/3 on target but does not finalize.
+    Justify = 2,
+    /// Adds marginal new voters toward target's 2/3 supermajority.
+    Build = 3,
+}
+
 /// Tiered score for a candidate `AttestationData` entry during block building.
 ///
-/// Lower `tier` wins. Tier 1 = finalizes the attestation's source; tier 2 =
-/// justifies the target (crosses 2/3); tier 3 = adds marginal voters toward
-/// the target's 2/3 supermajority. Entries with zero new voters relative to
-/// the running per-target-root voter set are dropped (returned as `None`).
+/// Lower `tier` wins. Entries with zero new voters relative to the running
+/// per-target-root voter set are dropped (returned as `None`).
 ///
 /// Within a tier, ordering prefers more `new_voters` (descending), then
 /// smaller `target_slot` (older chain progress first), then smaller
 /// `att_slot`, then the entry's `data_root` for determinism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EntryScore {
-    tier: u8,
+    tier: Tier,
     new_voters: usize,
     target_slot: u64,
     att_slot: u64,
 }
 
 impl EntryScore {
-    fn ordering_key(&self, data_root: H256) -> (u8, std::cmp::Reverse<usize>, u64, u64, H256) {
+    fn ordering_key(&self, data_root: H256) -> (Tier, std::cmp::Reverse<usize>, u64, u64, H256) {
         (
             self.tier,
             std::cmp::Reverse(self.new_voters),
