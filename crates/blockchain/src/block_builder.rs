@@ -277,11 +277,14 @@ struct ProjectedState {
 
 /// Validate a candidate entry against the projected chain view.
 ///
-/// Returns `Err(reason)` matching a `trace_skipped_attestation` label if any
-/// check fails: the entry's head must be known, its source must be justified,
-/// its (source, target) must match the candidate-block chain view, and (unless
-/// it is the genesis self-vote, allowed for fork-choice bootstrapping) its
-/// target must not already be justified.
+/// Mirrors `state_transition::is_valid_vote`: the entry's head must be known,
+/// its source must be justified, its (source, target) must match the
+/// candidate-block chain view, `target.slot > source.slot`, target must not
+/// already be justified, and target must be a justifiable slot relative to
+/// the projected finalized slot. The genesis self-vote (source == target ==
+/// slot 0) is exempt from the `target.slot > source.slot` and
+/// `target_already_justified` checks since fork-choice bootstrapping needs
+/// it; STF will silently drop it, but it carries fork-choice signal.
 fn entry_passes_filters(
     att_data: &AttestationData,
     known_block_roots: &HashSet<H256>,
@@ -302,7 +305,11 @@ fn entry_passes_filters(
     if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
         return Err("chain_mismatch");
     }
-    if !is_genesis_self_vote(att_data)
+    let is_genesis_self_vote = is_genesis_self_vote(att_data);
+    if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
+        return Err("target_not_after_source");
+    }
+    if !is_genesis_self_vote
         && justified_slots_ops::is_slot_justified(
             projected_justified_slots,
             projected_finalized_slot,
@@ -310,6 +317,11 @@ fn entry_passes_filters(
         )
     {
         return Err("target_already_justified");
+    }
+    if !is_genesis_self_vote
+        && !slot_is_justifiable_after(att_data.target.slot, projected_finalized_slot)
+    {
+        return Err("target_not_justifiable");
     }
     Ok(())
 }
@@ -940,6 +952,140 @@ mod tests {
             post_checkpoints.justified.root,
             hashes[GAP_TARGET_SLOT as usize]
         );
+    }
+
+    /// Verifies the in-round projection of justified_slots. Round 1 selects
+    /// attestation A (source=0, target=1), which projects slot 1 as justified.
+    /// Attestation B has source=1 and would have been filtered as
+    /// `source_not_justified` against the initial state; with the projection,
+    /// round 2 admits it and the proposer packs both attestations.
+    #[test]
+    fn build_block_cascades_projected_justification_across_rounds() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const SUPERMAJORITY: usize = 34; // ceil(2 * 50 / 3)
+        const HEAD_SLOT: u64 = 10;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // A: source = slot 0 (implicitly justified), target = slot 1.
+        // B: source = slot 1 (NOT yet justified at block-build start),
+        //    target = slot 2.
+        let att_a = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[1],
+                slot: 1,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let att_b = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[2],
+                slot: 2,
+            },
+            source: Checkpoint {
+                root: hashes[1],
+                slot: 1,
+            },
+        };
+
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        for i in 0..SUPERMAJORITY {
+            bits.set(i, true).unwrap();
+        }
+        let proof_a =
+            AggregatedSignatureProof::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof_b =
+            AggregatedSignatureProof::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(att_a.hash_tree_root(), (att_a.clone(), vec![proof_a]));
+        aggregated_payloads.insert(att_b.hash_tree_root(), (att_b.clone(), vec![proof_b]));
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let (block, _signatures, post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        let target_slots: Vec<u64> = block
+            .body
+            .attestations
+            .iter()
+            .map(|a| a.data.target.slot)
+            .collect();
+        assert!(
+            target_slots.contains(&1),
+            "A (target slot 1) missing: {target_slots:?}"
+        );
+        assert!(
+            target_slots.contains(&2),
+            "B (target slot 2) missing despite cascading projection: {target_slots:?}"
+        );
+
+        // Both attestations justify their targets; STF lands on slot 2.
+        assert_eq!(post_checkpoints.justified.slot, 2);
     }
 
     #[test]
