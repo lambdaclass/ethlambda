@@ -11,7 +11,8 @@
 //! - `engine_newPayloadV3` (Cancun-era payload import)
 //! - `engine_newPayloadV4` (Prague-era payload import; adds
 //!   `executionRequests`)
-//! - `engine_getPayloadV3` (block proposal — fetches a built payload by id)
+//! - `engine_getPayloadV3` (Cancun-era payload fetch by id)
+//! - `engine_getPayloadV4` (Prague-era payload fetch by id)
 //!
 //! The schema mirrors the mainline execution-apis spec; we re-derive it
 //! locally instead of depending on ethrex's RPC crate because ethrex is a
@@ -40,6 +41,9 @@ pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_forkchoiceUpdatedV3",
     "engine_newPayloadV3",
     "engine_newPayloadV4",
+    "engine_newPayloadV5",
     "engine_getPayloadV3",
+    "engine_getPayloadV4",
+    "engine_getPayloadV5",
     "engine_getClientVersionV1",
 ];

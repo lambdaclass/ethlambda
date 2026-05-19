@@ -718,6 +718,9 @@ async fn fetch_initial_state(
                 info!(%el_hash, "Seeding genesis with EL block hash");
                 genesis_state.latest_execution_payload_header.block_hash = el_hash;
 
+                // Build the body, then update the state's latest header so
+                // its body_root reflects the seeded body (rather than the
+                // empty default it had after State::from_genesis).
                 let body = BlockBody {
                     attestations: Default::default(),
                     execution_payload: ExecutionPayloadV3 {
@@ -725,16 +728,21 @@ async fn fetch_initial_state(
                         ..Default::default()
                     },
                 };
-                // Header's body_root now reflects the seeded body, not EMPTY_BODY_ROOT.
                 genesis_state.latest_block_header.body_root = body.hash_tree_root();
+
+                // Compute state_root with the header's state_root zeroed,
+                // then write it back. `anchor_pair_is_consistent` requires
+                // `block.state_root == state.hash_tree_root(state_root=0)`
+                // exactly — not just "block.state_root is zero".
+                genesis_state.latest_block_header.state_root = H256::ZERO;
+                let anchor_state_root = genesis_state.hash_tree_root();
+                genesis_state.latest_block_header.state_root = anchor_state_root;
 
                 let genesis_block = Block {
                     slot: genesis_state.latest_block_header.slot,
                     proposer_index: genesis_state.latest_block_header.proposer_index,
                     parent_root: genesis_state.latest_block_header.parent_root,
-                    // get_forkchoice_store fills state_root after zero-passing
-                    // the anchor consistency check.
-                    state_root: H256::ZERO,
+                    state_root: anchor_state_root,
                     body,
                 };
 

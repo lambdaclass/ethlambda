@@ -156,6 +156,53 @@ impl EngineClient {
         parent_beacon_block_root: ethlambda_types::primitives::H256,
         execution_requests: Vec<Vec<u8>>,
     ) -> Result<PayloadStatus, EngineClientError> {
+        self.new_payload_with_requests(
+            "engine_newPayloadV4",
+            payload,
+            expected_blob_versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests,
+        )
+        .await
+    }
+
+    /// `engine_newPayloadV5` — submit an Amsterdam-era (BAL / EIP-7928) payload
+    /// to the EL.
+    ///
+    /// Same JSON-RPC shape as V4 (4 params: payload, blob hashes,
+    /// parent_beacon_block_root, executionRequests). V5's payload may
+    /// additionally carry a `blockAccessList` field; for Lean blocks we
+    /// don't produce one, so the field is absent — ethrex's handler treats
+    /// that as "no BAL" and proceeds.
+    ///
+    /// ELs validate the method version against the payload's `timestamp`:
+    /// once `timestamp >= amsterdamTime`, V4 returns `-38005 Unsupported
+    /// fork: Osaka/Amsterdam` and V5 is required.
+    pub async fn new_payload_v5(
+        &self,
+        payload: ExecutionPayloadV3,
+        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        parent_beacon_block_root: ethlambda_types::primitives::H256,
+        execution_requests: Vec<Vec<u8>>,
+    ) -> Result<PayloadStatus, EngineClientError> {
+        self.new_payload_with_requests(
+            "engine_newPayloadV5",
+            payload,
+            expected_blob_versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests,
+        )
+        .await
+    }
+
+    async fn new_payload_with_requests(
+        &self,
+        method: &str,
+        payload: ExecutionPayloadV3,
+        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        parent_beacon_block_root: ethlambda_types::primitives::H256,
+        execution_requests: Vec<Vec<u8>>,
+    ) -> Result<PayloadStatus, EngineClientError> {
         let requests_hex: Vec<String> = execution_requests
             .iter()
             .map(|r| format!("0x{}", hex::encode(r)))
@@ -166,11 +213,11 @@ impl EngineClient {
             parent_beacon_block_root,
             requests_hex,
         ]);
-        self.rpc_call("engine_newPayloadV4", params).await
+        self.rpc_call(method, params).await
     }
 
-    /// `engine_getPayloadV3` — fetch a payload built under a previously
-    /// returned `payload_id`.
+    /// `engine_getPayloadV3` — fetch a Cancun-era payload built under a
+    /// previously returned `payload_id`.
     ///
     /// The EL returns an envelope `{ executionPayload, blockValue, blobsBundle,
     /// shouldOverrideBuilder }`. We surface only the inner `executionPayload`
@@ -181,8 +228,49 @@ impl EngineClient {
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
+        self.get_payload_inner("engine_getPayloadV3", payload_id).await
+    }
+
+    /// `engine_getPayloadV4` — fetch a Prague-era payload built under a
+    /// previously returned `payload_id`.
+    ///
+    /// V4 envelope adds `executionRequests` at the top level alongside
+    /// `executionPayload`. The payload shape itself is unchanged from V3,
+    /// so we drop everything except `executionPayload` (same as V3) — the
+    /// EIP-7685 system requests are zero-valued for Lean blocks anyway.
+    ///
+    /// ELs validate the method version against the payload's `timestamp`:
+    /// once `timestamp >= pragueTime`, V3 returns `-38005 Unsupported fork:
+    /// Prague` and V4 is required.
+    pub async fn get_payload_v4(
+        &self,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError> {
+        self.get_payload_inner("engine_getPayloadV4", payload_id).await
+    }
+
+    /// `engine_getPayloadV5` — fetch an Amsterdam-era payload built under a
+    /// previously returned `payload_id`.
+    ///
+    /// V5 envelope is V4 plus a top-level `blockAccessList`. We surface
+    /// only `executionPayload` — Lean blocks don't consume the BAL yet.
+    ///
+    /// Required once `timestamp >= amsterdamTime`; V4 returns `-38005`
+    /// before that point.
+    pub async fn get_payload_v5(
+        &self,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError> {
+        self.get_payload_inner("engine_getPayloadV5", payload_id).await
+    }
+
+    async fn get_payload_inner(
+        &self,
+        method: &str,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError> {
         let params = json!([payload_id.to_hex()]);
-        let envelope: Value = self.rpc_call("engine_getPayloadV3", params).await?;
+        let envelope: Value = self.rpc_call(method, params).await?;
         let payload_value = envelope
             .get("executionPayload")
             .ok_or(EngineClientError::EmptyResponse)?

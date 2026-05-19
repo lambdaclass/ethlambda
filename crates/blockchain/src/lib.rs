@@ -238,7 +238,7 @@ impl BlockChainServer {
         // critical path. The hashes carried are `block_hash` fields read
         // off the head/safe/finalized Lean blocks' `execution_payload`s
         // (Phase 5 of M6), so the EL can chain forward off blocks it has
-        // actually seen via `engine_newPayloadV4`.
+        // actually seen via `engine_newPayloadV5`.
         if interval == 0 && self.execution_client.is_some() {
             self.notify_execution_layer();
         }
@@ -379,13 +379,13 @@ impl BlockChainServer {
             );
             return None;
         }
-        match client.get_payload_v3(payload_id).await {
+        match client.get_payload_v5(payload_id).await {
             Ok(payload) => {
                 trace!(slot, "Fetched execution payload from EL");
                 Some(payload)
             }
             Err(err) => {
-                warn!(slot, %err, "engine_getPayloadV3 failed; falling back to synthetic payload");
+                warn!(slot, %err, "engine_getPayloadV5 failed; falling back to synthetic payload");
                 None
             }
         }
@@ -420,20 +420,20 @@ impl BlockChainServer {
                 PayloadStatusKind::Valid
                 | PayloadStatusKind::Syncing
                 | PayloadStatusKind::Accepted => {
-                    trace!(status = ?status.status, "engine_newPayloadV4 ok");
+                    trace!(status = ?status.status, "engine_newPayloadV5 ok");
                     true
                 }
                 PayloadStatusKind::Invalid | PayloadStatusKind::InvalidBlockHash => {
                     warn!(
                         status = ?status.status,
                         error = ?status.validation_error,
-                        "engine_newPayloadV4 rejected payload; dropping block"
+                        "engine_newPayloadV5 rejected payload; dropping block"
                     );
                     false
                 }
             },
             Err(err) => {
-                warn!(%err, "engine_newPayloadV4 transport failure; accepting block");
+                warn!(%err, "engine_newPayloadV5 transport failure; accepting block");
                 true
             }
         }
@@ -613,7 +613,7 @@ impl BlockChainServer {
         //
         // `engine_getPayloadV3` produced the embedded payload as a *candidate*;
         // the EL doesn't promote it to a real imported block until something
-        // calls `engine_newPayloadV4`. For received blocks that's the import
+        // calls `engine_newPayloadV5`. For received blocks that's the import
         // pre-check in `Handler<NewBlock>`, but for our own builds nobody
         // gossips it back to us — without this call the EL stays at genesis
         // and rejects every subsequent FCU `head_block_hash`.
@@ -631,9 +631,9 @@ impl BlockChainServer {
                 {
                     Ok(status) => trace!(
                         status = ?status.status,
-                        "engine_newPayloadV4 on own-built block"
+                        "engine_newPayloadV5 on own-built block"
                     ),
-                    Err(err) => warn!(%err, "engine_newPayloadV4 on own-built block failed"),
+                    Err(err) => warn!(%err, "engine_newPayloadV5 on own-built block failed"),
                 }
             });
         }
