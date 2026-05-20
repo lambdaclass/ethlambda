@@ -45,6 +45,9 @@ lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
+	@# Remove local devnet data folder to avoid stale data
+	@# NOTE: --cleanData flag in spin-node.sh doesn't work
+	@rm -rf lean-quickstart/local-devnet/data/
 	@echo "Starting local devnet with ethlambda client (\"$(DOCKER_TAG)\" tag). Logs will be dumped in devnet.log, and metrics served in http://localhost:3000"
 	@echo
 	@echo "Devnet will be using the current configuration. For custom configurations, modify lean-quickstart/local-devnet/genesis/validator-config.yaml and restart the devnet."

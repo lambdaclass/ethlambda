@@ -1060,6 +1060,21 @@ fn extend_proofs_greedily(
     }
 }
 
+fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_root: &H256) {
+    trace!(
+        reason,
+        attestation_slot = att.slot,
+        source_slot = att.source.slot,
+        source_root = %ShortRoot(&att.source.root.0),
+        target_slot = att.target.slot,
+        target_root = %ShortRoot(&att.target.root.0),
+        head_slot = att.head.slot,
+        head_root = %ShortRoot(&att.head.root.0),
+        data_root = %ShortRoot(&data_root.0),
+        "skipped"
+    );
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Works directly with aggregated payloads keyed by data_root, filtering
@@ -1100,18 +1115,35 @@ fn build_block(
         let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
         sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
 
+        info!(slot, proposer_index, "Building block");
+
         loop {
             let mut found_new = false;
+            let mut iter_selected: u32 = 0;
+            let mut iter_skipped: u32 = 0;
+
+            trace!(
+                candidates = sorted_entries.len(),
+                already_selected = processed_data_roots.len(),
+                current_justified_slot = current_justified.slot,
+                current_justified_root = %ShortRoot(&current_justified.root.0),
+                "start"
+            );
 
             for &(data_root, (att_data, proofs)) in &sorted_entries {
                 if processed_data_roots.contains(data_root) {
                     continue;
                 }
+
                 // Cap distinct AttestationData entries per block (leanSpec #536).
                 if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
+                    trace_skipped_attestation("max_attestation_data_cap", att_data, data_root);
+                    iter_skipped += 1;
                     break;
                 }
                 if !known_block_roots.contains(&att_data.head.root) {
+                    trace_skipped_attestation("head_root_unknown", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
                 if !justified_slots_ops::is_slot_justified(
@@ -1119,10 +1151,14 @@ fn build_block(
                     current_finalized_slot,
                     att_data.source.slot,
                 ) {
+                    trace_skipped_attestation("source_not_justified", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
 
                 if !attestation_data_matches_chain(&extended_historical_block_hashes, att_data) {
+                    trace_skipped_attestation("chain_mismatch", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
 
@@ -1138,16 +1174,52 @@ fn build_block(
                         att_data.target.slot,
                     )
                 {
+                    trace_skipped_attestation("target_already_justified", att_data, data_root);
+                    iter_skipped += 1;
                     continue;
                 }
 
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
+                let before = selected.len();
                 extend_proofs_greedily(proofs, &mut selected, att_data);
+
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    let available_bits: HashSet<u64> = proofs
+                        .iter()
+                        .flat_map(|p| p.participant_indices())
+                        .collect();
+                    let selected_bits: HashSet<u64> = selected[before..]
+                        .iter()
+                        .flat_map(|(att, _)| validator_indices(&att.aggregation_bits))
+                        .collect();
+                    trace!(
+                        attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
+                        target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
+                        data_root = %ShortRoot(&data_root.0),
+                        available_bits = available_bits.len(),
+                        selected_bits = selected_bits.len(),
+                        available_proofs = proofs.len(),
+                        selected_proofs = selected.len() - before,
+                        "selected"
+                    );
+                }
+                iter_selected += 1;
             }
 
             if !found_new {
+                trace!(
+                    iter_selected,
+                    iter_skipped,
+                    selected_total = processed_data_roots.len(),
+                    "converged: no new candidates"
+                );
                 break;
             }
 
@@ -1169,9 +1241,17 @@ fn build_block(
             process_slots(&mut post_state, slot)?;
             process_block(&mut post_state, &candidate)?;
 
-            if post_state.latest_justified != current_justified
-                || post_state.latest_finalized.slot != current_finalized_slot
-            {
+            let advanced = post_state.latest_justified != current_justified
+                || post_state.latest_finalized.slot != current_finalized_slot;
+            trace!(
+                iter_selected,
+                iter_skipped,
+                advanced,
+                justified_slot = post_state.latest_justified.slot,
+                justified_root = %ShortRoot(&post_state.latest_justified.root.0),
+                "post-block checkpoint"
+            );
+            if advanced {
                 current_justified = post_state.latest_justified;
                 current_justified_slots = post_state.justified_slots.clone();
                 current_finalized_slot = post_state.latest_finalized.slot;

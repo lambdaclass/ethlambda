@@ -554,13 +554,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_latest_finalized_block_returns_404_when_absent() {
-        // Genesis-anchored store: init_store writes header + state but no
-        // BlockSignatures entry, so get_signed_block(genesis_root) returns None
-        // and the endpoint must report 404 rather than panic.
+    async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_proof() {
+        use ethlambda_types::block::{ByteListMiB, SignedBlock};
+        use libssz::SszEncode;
+
+        // Genesis-anchored store: `init_store` writes the header + state but no
+        // `BlockSignatures` (proof) row. `get_signed_block` synthesizes an empty
+        // proof so peers can still receive the genesis block on BlocksByRoot;
+        // the HTTP endpoint stays consistent and returns 200 rather than 404.
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
+
+        // The body the endpoint serves must round-trip to a `SignedBlock`
+        // matching the genesis header paired with the synthetic blank proof —
+        // same shape `get_signed_block` builds in storage.
+        let genesis_block = store
+            .get_signed_block(&store.latest_finalized().root)
+            .expect("genesis served via get_signed_block");
+        let expected = SignedBlock {
+            message: genesis_block.message.clone(),
+            proof: ByteListMiB::default(),
+        };
+        let expected_ssz = expected.to_ssz();
 
         let app = build_api_router(store);
 
@@ -574,6 +590,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            SSZ_CONTENT_TYPE
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_ssz.as_slice());
     }
 }

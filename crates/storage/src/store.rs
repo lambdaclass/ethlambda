@@ -1,12 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
-/// The tree hash root of an empty block body.
-///
-/// Used to detect genesis/anchor blocks that have no attestations,
-/// allowing us to skip storing empty bodies and reconstruct them on read.
-static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
-
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
@@ -33,6 +27,12 @@ pub enum GetForkchoiceStoreError {
         anchor_block: Box<Block>,
     },
 }
+
+/// The tree hash root of an empty block body.
+///
+/// Used to detect genesis/anchor blocks that have no attestations,
+/// allowing us to skip storing empty bodies and reconstruct them on read.
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
 /// Checkpoints to update in the forkchoice store.
 ///
@@ -988,15 +988,21 @@ impl Store {
 
     /// Get a signed block by combining header, body, and the merged proof.
     ///
-    /// Returns None if any of the components are not found.
-    /// Note: Genesis block has no entry in the `BlockSignatures` table.
+    /// Returns None if the header or body (for non-empty bodies) is missing,
+    /// or if the signature row is missing for any block other than the
+    /// slot-0 anchor.
+    ///
+    /// Signatures are absent for genesis-style anchor blocks (no proposer
+    /// ever signed them). To keep BlocksByRoot symmetric with the
+    /// fork-choice view for peers, synthesize an empty proof for the slot-0
+    /// case only; for any other slot the missing-signature state is treated
+    /// as storage corruption and surfaces as `None` rather than as a
+    /// fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let proof_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
-
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
@@ -1007,8 +1013,18 @@ impl Store {
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
+        let proof = match view.get(Table::BlockSignatures, &key).expect("get") {
+            Some(proof_bytes) => {
+                ByteListMiB::from_ssz_bytes(&proof_bytes).expect("valid block proof")
+            }
+            // Synthesis only covers the genesis-style anchor (slot 0). Any other
+            // missing-proof case is a storage corruption that should surface
+            // as `None` rather than fabricating a block with an empty proof.
+            None if header.slot == 0 => ByteListMiB::default(),
+            None => return None,
+        };
+
         let block = Block::from_header_and_body(header, body);
-        let proof = ByteListMiB::from_ssz_bytes(&proof_bytes).expect("valid block proof");
 
         Some(SignedBlock {
             message: block,
@@ -2312,5 +2328,52 @@ mod tests {
         assert!(!buf.data.contains_key(&slot1_root));
         assert_eq!(buf.total_signatures(), 2); // slot 2 (1) + slot 3 (1)
         assert_eq!(buf.len(), 2);
+    }
+
+    /// `Store::from_anchor_state` writes the header but no `BlockSignatures`
+    /// row for the slot-0 anchor. `get_signed_block` must synthesize an empty
+    /// proof so the genesis block can still be served on BlocksByRoot /
+    /// `/lean/v0/blocks/finalized`.
+    #[test]
+    fn get_signed_block_synthesizes_blank_proof_for_genesis_anchor() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+
+        let head_root = store.head();
+        let signed = store
+            .get_signed_block(&head_root)
+            .expect("genesis block must be retrievable with synthetic proof");
+
+        assert_eq!(signed.message.slot, 0);
+        assert_eq!(signed.proof, ByteListMiB::default());
+    }
+
+    /// The synthesis branch must be confined to the slot-0 anchor: a
+    /// non-genesis block whose `BlockSignatures` row is missing is treated
+    /// as storage corruption and surfaces as `None`, not a fabricated block.
+    #[test]
+    fn get_signed_block_returns_none_for_non_genesis_with_missing_signatures() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // Hand-insert a slot-1 header (and empty body, via `EMPTY_BODY_ROOT`)
+        // but skip the `BlockSignatures` row. This mimics the corruption case
+        // the guard is meant to catch, without going through the normal
+        // `insert_signed_block` write path which always writes all three rows.
+        let header = BlockHeader {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: *EMPTY_BODY_ROOT,
+        };
+        let root = header.hash_tree_root();
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockHeaders, vec![(root.to_ssz(), header.to_ssz())])
+            .expect("put header");
+        batch.commit().expect("commit");
+
+        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        assert!(store.get_signed_block(&root).is_none());
     }
 }

@@ -55,8 +55,39 @@ pub struct SignedAttestation {
     pub signature: XmssSignature,
 }
 
-/// XMSS signature as a fixed-length byte vector (3112 bytes).
+/// XMSS signature as a fixed-length byte vector (`SIGNATURE_SIZE` bytes).
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
+
+/// SSZ offset (in bytes) of the `path` body inside an XMSS `Signature` container.
+///
+/// Layout: 4-byte path offset + 28-byte rho + 4-byte hashes offset = 36.
+const SIGNATURE_PATH_OFFSET: u32 = 36;
+
+/// SSZ offset (in bytes) of the `hashes` body inside an XMSS `Signature`.
+///
+/// `path` body is 4-byte siblings offset + LOG_LIFETIME (32) siblings × 32-byte
+/// digest = 1028, starting at byte 36, so hashes start at 36 + 1028 = 1064.
+const SIGNATURE_HASHES_OFFSET: u32 = 1064;
+
+/// SSZ offset (in bytes) of the `siblings` list inside the `path` container.
+const SIGNATURE_PATH_SIBLINGS_OFFSET: u32 = 4;
+
+/// Build a placeholder XMSS signature that decodes as a structurally valid
+/// leanSpec `Signature` container of all-zero hashes.
+///
+/// Used for genesis-style anchor blocks that were never proposed and therefore
+/// have no real signature. Parent containers inline this as an opaque
+/// `SIGNATURE_SIZE`-byte blob; consumers that decode the inner `Signature`
+/// container see `path = HashTreeOpening { siblings = [0; 32] }`, `rho = 0`,
+/// `hashes = [0; 46]`. Matches ream's `Signature::blank()` so the wire format
+/// is byte-identical across clients.
+pub fn blank_xmss_signature() -> XmssSignature {
+    let mut bytes = vec![0u8; SIGNATURE_SIZE];
+    bytes[..4].copy_from_slice(&SIGNATURE_PATH_OFFSET.to_le_bytes());
+    bytes[32..36].copy_from_slice(&SIGNATURE_HASHES_OFFSET.to_le_bytes());
+    bytes[36..40].copy_from_slice(&SIGNATURE_PATH_SIBLINGS_OFFSET.to_le_bytes());
+    XmssSignature::try_from(bytes).expect("size matches SIGNATURE_SIZE")
+}
 
 /// Aggregated attestation consisting of participation bits and message.
 #[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
@@ -278,5 +309,37 @@ mod tests {
         let a = bits(24, &[0, 1, 17]);
         let b = bits(24, &[0, 1, 16]);
         assert!(!bits_is_subset(&a, &b));
+    }
+
+    /// Guard the three SSZ offsets at fixed byte positions so a one-off in any
+    /// constant doesn't silently produce a blob that still has the right outer
+    /// length but decodes incorrectly at the inner `Signature` container level.
+    #[test]
+    fn blank_xmss_signature_has_expected_ssz_offsets() {
+        let sig = blank_xmss_signature();
+        let bytes: Vec<u8> = sig.into_iter().collect();
+
+        assert_eq!(bytes.len(), SIGNATURE_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            SIGNATURE_PATH_OFFSET,
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
+            SIGNATURE_HASHES_OFFSET,
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            SIGNATURE_PATH_SIBLINGS_OFFSET,
+        );
+
+        // Everything outside the three offset slots must be zero — the
+        // placeholder is "all-zero hashes" once the offsets locate them.
+        for (i, b) in bytes.iter().enumerate() {
+            let in_offset_slot = matches!(i, 0..4 | 32..36 | 36..40);
+            if !in_offset_slot {
+                assert_eq!(*b, 0, "non-offset byte at index {i} should be zero");
+            }
+        }
     }
 }
