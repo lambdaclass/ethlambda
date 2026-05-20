@@ -31,6 +31,7 @@ pub mod aggregation;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
+pub mod reaggregate;
 pub mod store;
 
 pub struct BlockChain {
@@ -465,7 +466,9 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
+    /// Run block import, refresh metrics, and report whether the node is in
+    /// sync with the wall-clock slot after the import.
+    fn process_block(&mut self, signed_block: SignedBlock) -> Result<bool, StoreError> {
         store::on_block(&mut self.store, signed_block)?;
         let head_slot = self.store.head_slot();
         metrics::update_head_slot(head_slot);
@@ -475,7 +478,8 @@ impl BlockChainServer {
 
         // Update sync status based on head slot vs wall clock slot
         let current_slot = self.store.time() / INTERVALS_PER_SLOT;
-        let status = if head_slot >= current_slot {
+        let synced = head_slot >= current_slot;
+        let status = if synced {
             metrics::SyncStatus::Synced
         } else {
             metrics::SyncStatus::Syncing
@@ -485,7 +489,7 @@ impl BlockChainServer {
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
-        Ok(())
+        Ok(synced)
     }
 
     /// Process a newly received block.
@@ -603,9 +607,12 @@ impl BlockChainServer {
             return;
         }
 
-        // Parent exists, proceed with processing
+        // Parent exists, proceed with processing. Clone the block so we
+        // can run post-import reaggregation against its merged proof —
+        // `process_block` consumes the original for the storage layer.
+        let block_for_reaggregate = signed_block.clone();
         match self.process_block(signed_block) {
-            Ok(_) => {
+            Ok(synced) => {
                 info!(
                     %slot,
                     proposer,
@@ -613,6 +620,17 @@ impl BlockChainServer {
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
                 );
+
+                // Recover per-attestation Type-1 proofs from the block's
+                // merged Type-2 and fold them into the local pool. Only
+                // run when the chain is in sync — backfilling nodes must
+                // not spam gossip with rederived aggregates. Non-validator
+                // nodes still benefit from the store update because the
+                // recovered proofs feed fork choice on the next acceptance
+                // tick.
+                if synced {
+                    self.run_reaggregate_from_block(&block_for_reaggregate);
+                }
 
                 // Enqueue any pending blocks that were waiting for this parent
                 self.collect_pending_children(block_root, queue);
@@ -627,6 +645,32 @@ impl BlockChainServer {
                     "Failed to process block"
                 );
             }
+        }
+    }
+
+    /// Run the post-import reaggregation pass and publish the resulting
+    /// aggregates when this node is in the aggregator role.
+    fn run_reaggregate_from_block(&mut self, signed_block: &SignedBlock) {
+        let aggregates = reaggregate::reaggregate_from_block(&mut self.store, signed_block);
+        if aggregates.is_empty() {
+            return;
+        }
+        let count = aggregates.len();
+        let is_aggregator = self.aggregator.is_enabled();
+        info!(
+            count,
+            is_aggregator, "Reaggregated block-borne attestations"
+        );
+        if !is_aggregator {
+            return;
+        }
+        let Some(ref p2p) = self.p2p else {
+            return;
+        };
+        for aggregate in aggregates {
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| warn!(%err, "Failed to publish reaggregated attestation"));
         }
     }
 
