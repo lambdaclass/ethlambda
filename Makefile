@@ -24,22 +24,21 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-29
-# NOTE(type1-type2): an attempted bump to anshalshukla/leanSpec@0ab09dd ("dummy
-# type 1 and type 2 aggregation with block proofs") was reverted because the
-# testing harness in that branch still imports `AttestationSignatures`, which
-# the same commit removed — the fixture generator fails to load. We stay on
-# the canonical commit and skip the affected SSZ-spec and signature-spec test
-# cases until the upstream refactor lands together with matching testing-side
-# updates.
-LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
+# 2026-05-20
+# Pinned just after leanSpec PR #717 ("Aggregated block proof - devnet5")
+# merged: the wire format collapses per-attestation Type-1s + proposer
+# signature into a single block-level Type-2 merged proof, and fork-choice
+# fixtures live under `lstar/` instead of `devnet/`. Fixtures must be
+# generated with `--scheme=test`; the `prod` scheme's pre-generated keys
+# upstream still use the pre-#725 JSON shape and break the filler.
+LEAN_SPEC_COMMIT_HASH:=d9d2e6779a4dcbecbe1cf2bdda47cd64f3f4844a
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet -n auto --scheme=prod -o fixtures
+	cd leanSpec && uv run fill --fork Lstar -n auto --scheme=test -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch

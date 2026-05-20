@@ -386,7 +386,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .proof
                 .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
             let participants: EthAggregationBits = proof.participants.into();
-            let proof_bytes: Vec<u8> = proof.proof_data.into();
+            let proof_bytes: Vec<u8> = proof.proof.into();
             let proof_data = ByteList512KiB::try_from(proof_bytes)
                 .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
             let data: ethlambda_types::attestation::AttestationData = att.data.into();

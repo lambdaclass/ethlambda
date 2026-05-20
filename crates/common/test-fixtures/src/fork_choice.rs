@@ -93,11 +93,16 @@ pub struct AttestationStepData {
     pub proof: Option<ProofStepData>,
 }
 
+/// Aggregated-attestation proof carried by `gossipAggregatedAttestation`
+/// steps (leanSpec PR #717 schema).
+///
+/// `participants` arrives as `{ data: [bool, ...] }` and `proof` as
+/// `{ data: "0x<hex>" }`; the latter is the lean-multisig Type-1
+/// `compress_without_pubkeys()` bytes for that AttestationData.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStepData {
     pub participants: AggregationBits,
-    #[serde(rename = "proofData")]
-    pub proof_data: HexByteList,
+    pub proof: HexByteList,
 }
 
 /// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`.

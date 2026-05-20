@@ -1,18 +1,23 @@
-//! Signature-verification test fixture types.
+//! Signature-verification test fixture types (leanSpec PR #717 schema).
 //!
 //! Used both by the offline spec-test runner and the Hive
-//! `/lean/v0/test_driver/verify_signatures/run` endpoint, which receives the
+//! `/lean/v0/test_driver/verify_signatures/run` endpoint, which receive the
 //! same JSON shapes from the lean spec-assets simulator.
+//!
+//! Fixture shape after PR #717:
+//!
+//!   signedBlock:
+//!     block:  {...standard block fields...}
+//!     proof:  { data: "0x<hex-encoded merged Type-2 bytes>" }
 
-use crate::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
-use ethlambda_types::attestation::XmssSignature;
+use crate::{Block, TestInfo, TestState};
 use ethlambda_types::block::{ByteList512KiB, SignedBlock};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-/// Root struct for verify signatures test vectors
+/// Root struct for verify signatures test vectors.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifySignaturesTestVector {
     #[serde(flatten)]
@@ -20,7 +25,6 @@ pub struct VerifySignaturesTestVector {
 }
 
 impl VerifySignaturesTestVector {
-    /// Load a verify signatures test vector from a JSON file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let test_vector = serde_json::from_str(&content)?;
@@ -28,7 +32,7 @@ impl VerifySignaturesTestVector {
     }
 }
 
-/// A single verify signatures test case
+/// A single verify-signatures test case.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifySignaturesTest {
     #[allow(dead_code)]
@@ -47,96 +51,73 @@ pub struct VerifySignaturesTest {
     pub info: TestInfo,
 }
 
-// ============================================================================
-// Signed Block Types
-// ============================================================================
-
-/// Signed block with signature bundle (devnet4: no proposer attestation wrapper)
+/// Fixture-side signed block: a block plus its raw merged Type-2 proof bytes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
-    pub signature: TestSignatureBundle,
+    pub proof: HexBytes,
 }
 
-/// Lossy fixture-to-SignedBlock conversion: every signature byte is dropped.
-///
-/// Under the leanSpec PR #717 wire format the block envelope carries a single
-/// opaque merged proof blob, not per-attestation Type-1s plus a proposer
-/// signature. Existing devnet4-shaped fixtures predate that change and don't
-/// ship a merged Type-2 blob — they ship per-attestation signature metadata
-/// plus a raw XMSS proposer signature. There is no way to reconstruct the
-/// merged Type-2 blob from those bytes without running the lean-multisig
-/// prover, so this `From` impl yields an empty `proof` and the resulting
-/// block fails real `verify_block_signatures`. Callers that don't reach the
-/// verifier (fixtures with `expectException`) are unaffected.
-impl From<TestSignedBlock> for SignedBlock {
-    fn from(value: TestSignedBlock) -> Self {
-        SignedBlock {
-            message: value.block.into(),
-            proof: ByteList512KiB::default(),
-        }
+/// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HexBytes {
+    pub data: String,
+}
+
+impl HexBytes {
+    pub fn decode(&self) -> Result<Vec<u8>, hex::FromHexError> {
+        let s = self.data.strip_prefix("0x").unwrap_or(&self.data);
+        hex::decode(s)
     }
 }
 
 /// Error returned by [`TestSignedBlock::try_into_signed_block_with_proofs`].
 #[derive(Debug)]
 pub enum SignedBlockConvertError {
-    /// Devnet4-shaped fixtures cannot be converted to the leanSpec PR #717
-    /// wire format without rebuilding the merged Type-2 proof through the
-    /// lean-multisig prover. Until fixtures ship the merged proof blob
-    /// directly, the Hive driver path returns this error.
-    LegacyFixtureNotConvertible,
+    InvalidProofHex(String),
+    ProofTooLarge(usize),
 }
 
 impl fmt::Display for SignedBlockConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyFixtureNotConvertible => {
-                f.write_str("fixture predates leanSpec PR #717 — merged Type-2 proof unavailable")
-            }
+            Self::InvalidProofHex(reason) => write!(f, "proof.data hex decode failed: {reason}"),
+            Self::ProofTooLarge(len) => write!(f, "proof bytes exceed cap: {len}"),
         }
     }
 }
 
 impl std::error::Error for SignedBlockConvertError {}
 
-impl TestSignedBlock {
-    /// Materialize a `SignedBlock` that preserves the fixture-supplied
-    /// merged proof bytes. Until fixtures are updated to ship the merged
-    /// Type-2 proof blob directly (post leanSpec PR #717), this returns
-    /// [`SignedBlockConvertError::LegacyFixtureNotConvertible`].
-    pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
-        let _ = self;
-        Err(SignedBlockConvertError::LegacyFixtureNotConvertible)
+/// Lossy fixture-to-SignedBlock conversion that preserves the merged proof.
+///
+/// The conversion is fallible because the proof bytes may not decode as hex
+/// or may exceed the wire cap. Tests with `expectException` set tolerate
+/// failures upstream; the From impl panics so test runners get a clear
+/// signal when fixture shape drifts.
+impl From<TestSignedBlock> for SignedBlock {
+    fn from(value: TestSignedBlock) -> Self {
+        value
+            .try_into_signed_block_with_proofs()
+            .expect("fixture proof decode")
     }
 }
 
-// ============================================================================
-// Signature Types
-// ============================================================================
-
-/// Bundle of signatures for block and attestations
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct TestSignatureBundle {
-    #[serde(rename = "proposerSignature", deserialize_with = "deser_xmss_hex")]
-    pub proposer_signature: XmssSignature,
-    #[serde(rename = "attestationSignatures")]
-    pub attestation_signatures: Container<AttestationSignature>,
-}
-
-/// Attestation signature from a validator
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct AttestationSignature {
-    pub participants: AggregationBits,
-    #[serde(rename = "proofData")]
-    pub proof_data: ProofData,
-}
-
-/// Placeholder for future SNARK proof data
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProofData {
-    pub data: String,
+impl TestSignedBlock {
+    /// Materialize a `SignedBlock` preserving the fixture-supplied merged
+    /// Type-2 proof bytes verbatim.
+    pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
+        let bytes = self
+            .proof
+            .decode()
+            .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
+        let len = bytes.len();
+        let proof = ByteList512KiB::try_from(bytes)
+            .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
+        Ok(SignedBlock {
+            message: self.block.into(),
+            proof,
+        })
+    }
 }
