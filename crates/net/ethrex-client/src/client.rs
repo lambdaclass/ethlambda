@@ -228,7 +228,8 @@ impl EngineClient {
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
-        self.get_payload_inner("engine_getPayloadV3", payload_id).await
+        self.get_payload_inner("engine_getPayloadV3", payload_id)
+            .await
     }
 
     /// `engine_getPayloadV4` — fetch a Prague-era payload built under a
@@ -246,7 +247,8 @@ impl EngineClient {
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
-        self.get_payload_inner("engine_getPayloadV4", payload_id).await
+        self.get_payload_inner("engine_getPayloadV4", payload_id)
+            .await
     }
 
     /// `engine_getPayloadV5` — fetch an Amsterdam-era payload built under a
@@ -261,7 +263,8 @@ impl EngineClient {
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
-        self.get_payload_inner("engine_getPayloadV5", payload_id).await
+        self.get_payload_inner("engine_getPayloadV5", payload_id)
+            .await
     }
 
     async fn get_payload_inner(

@@ -11,8 +11,11 @@
 //! - `engine_newPayloadV3` (Cancun-era payload import)
 //! - `engine_newPayloadV4` (Prague-era payload import; adds
 //!   `executionRequests`)
+//! - `engine_newPayloadV5` (Amsterdam-era payload import; EIP-7928 BAL
+//!   carried as an optional field on the payload)
 //! - `engine_getPayloadV3` (Cancun-era payload fetch by id)
 //! - `engine_getPayloadV4` (Prague-era payload fetch by id)
+//! - `engine_getPayloadV5` (Amsterdam-era payload fetch by id)
 //!
 //! The schema mirrors the mainline execution-apis spec; we re-derive it
 //! locally instead of depending on ethrex's RPC crate because ethrex is a
@@ -34,8 +37,10 @@ pub use types::{
 /// Capabilities ethlambda advertises in `engine_exchangeCapabilities`.
 ///
 /// We list everything we *might* call; the EL's response is the source of
-/// truth for what we can actually invoke. The V4 newPayload entry covers
-/// Prague-era payloads; the actor picks V3 vs V4 by payload timestamp.
+/// truth for what we can actually invoke. V3/V4/V5 newPayload+getPayload
+/// are all advertised; the actor picks the version by payload timestamp
+/// against the EL's fork schedule (`Cancun → V3`, `Prague → V4`,
+/// `Amsterdam → V5`).
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_exchangeCapabilities",
     "engine_forkchoiceUpdatedV3",

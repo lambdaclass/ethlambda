@@ -407,13 +407,15 @@ impl BlockChainServer {
         let Some(client) = self.execution_client.as_ref() else {
             return true;
         };
-        // Prague-era V4: same payload shape as V3 plus an
-        // `executionRequests` parameter for EIP-7685 system contract
-        // operations. Lean blocks don't produce system requests yet, blob
-        // transactions, or beacon parent roots, so all three trailing args
-        // are empty/zero placeholders. Refine when those land.
+        // Amsterdam-era V5: same JSON-RPC shape as V4 (payload, blob hashes,
+        // parent_beacon_block_root, executionRequests); V5 also accepts an
+        // optional `blockAccessList` on the payload (EIP-7928) which Lean
+        // blocks don't produce yet. Lean blocks don't produce system
+        // requests, blob transactions, or beacon parent roots either, so
+        // all three trailing args are empty/zero placeholders. Refine when
+        // those land.
         let result = client
-            .new_payload_v4(payload.clone(), vec![], H256::ZERO, vec![])
+            .new_payload_v5(payload.clone(), vec![], H256::ZERO, vec![])
             .await;
         match result {
             Ok(status) => match status.status {
@@ -611,7 +613,7 @@ impl BlockChainServer {
 
         // Inform the EL of our own freshly-built block (M6 phase 5 follow-up).
         //
-        // `engine_getPayloadV3` produced the embedded payload as a *candidate*;
+        // `engine_getPayloadV5` produced the embedded payload as a *candidate*;
         // the EL doesn't promote it to a real imported block until something
         // calls `engine_newPayloadV5`. For received blocks that's the import
         // pre-check in `Handler<NewBlock>`, but for our own builds nobody
@@ -626,7 +628,7 @@ impl BlockChainServer {
             let client = client.clone();
             tokio::spawn(async move {
                 match client
-                    .new_payload_v4(payload, vec![], H256::ZERO, vec![])
+                    .new_payload_v5(payload, vec![], H256::ZERO, vec![])
                     .await
                 {
                     Ok(status) => trace!(
