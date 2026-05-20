@@ -150,7 +150,7 @@ pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
 ///
 /// The `proof` carries a Type-1 single-message multi-signer aggregate: the
 /// signed message is the attestation data root, participants live in
-/// `proof.info.participants`, and the raw aggregate bytes are in `proof.proof`.
+/// `proof.participants`, and the raw aggregate bytes are in `proof.proof`.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedAggregatedAttestation {
     pub data: AttestationData,

@@ -126,7 +126,7 @@ impl From<SignedAttestation> for DomainSignedAttestation {
 
 // NOTE: After Phase 3 the legacy `BlockSignatures` / `AttestationSignatures` /
 // `AggregatedSignatureProof` containers are removed from the domain, and
-// `SignedBlock` now carries a single `proof: ByteListMiB` field. The pinned
+// `SignedBlock` now carries a single `proof: ByteList512KiB` field. The pinned
 // leanSpec fixtures still use the old shape, so SSZ-byte and root assertions
 // for `SignedBlock`, `BlockSignatures`, `AggregatedSignatureProof`, and
 // `SignedAggregatedAttestation` are intentionally skipped in

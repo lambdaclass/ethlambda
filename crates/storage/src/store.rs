@@ -5,7 +5,7 @@ use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
     attestation::{AttestationData, HashedAttestationData, bits_is_subset},
-    block::{Block, BlockBody, BlockHeader, ByteListMiB, SignedBlock, TypeOneMultiSignature},
+    block::{Block, BlockBody, BlockHeader, ByteList512KiB, SignedBlock, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -154,12 +154,12 @@ impl PayloadBuffer {
             let mut to_remove: Vec<usize> = Vec::new();
             for (i, p) in entry.proofs.iter().enumerate() {
                 // Incoming is subsumed by an existing proof (incl. equal). Skip.
-                if bits_is_subset(&proof.info.participants, &p.info.participants) {
+                if bits_is_subset(&proof.participants, &p.participants) {
                     return;
                 }
                 // Existing is a strict subset of incoming. Mark for removal.
                 // (Non-strict equality was ruled out by the check above.)
-                if bits_is_subset(&p.info.participants, &proof.info.participants) {
+                if bits_is_subset(&p.participants, &proof.participants) {
                     to_remove.push(i);
                 }
             }
@@ -1015,12 +1015,12 @@ impl Store {
 
         let proof = match view.get(Table::BlockSignatures, &key).expect("get") {
             Some(proof_bytes) => {
-                ByteListMiB::from_ssz_bytes(&proof_bytes).expect("valid block proof")
+                ByteList512KiB::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
             // Synthesis only covers the genesis-style anchor (slot 0). Any other
             // missing-proof case is a storage corruption that should surface
             // as `None` rather than fabricating a block with an empty proof.
-            None if header.slot == 0 => ByteListMiB::default(),
+            None if header.slot == 0 => ByteList512KiB::default(),
             None => return None,
         };
 
@@ -2345,7 +2345,7 @@ mod tests {
             .expect("genesis block must be retrievable with synthetic proof");
 
         assert_eq!(signed.message.slot, 0);
-        assert_eq!(signed.proof, ByteListMiB::default());
+        assert_eq!(signed.proof, ByteList512KiB::default());
     }
 
     /// The synthesis branch must be confined to the slot-0 anchor: a

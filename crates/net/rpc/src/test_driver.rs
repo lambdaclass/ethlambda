@@ -42,7 +42,7 @@ use ethlambda_types::{
     attestation::{
         AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
     },
-    block::{Block, ByteListMiB, TypeOneMultiSignature},
+    block::{Block, ByteList512KiB, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::H256,
     state::{State, anchor_pair_is_consistent},
@@ -387,7 +387,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
             let participants: EthAggregationBits = proof.participants.into();
             let proof_bytes: Vec<u8> = proof.proof_data.into();
-            let proof_data = ByteListMiB::try_from(proof_bytes)
+            let proof_data = ByteList512KiB::try_from(proof_bytes)
                 .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
             let data: ethlambda_types::attestation::AttestationData = att.data.into();
             let aggregated = SignedAggregatedAttestation {

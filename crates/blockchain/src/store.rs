@@ -12,16 +12,12 @@ use ethlambda_types::{
         AggregatedAttestation, AggregationBits, Attestation, AttestationData,
         HashedAttestationData, SignedAggregatedAttestation, SignedAttestation, validator_indices,
     },
-    block::{
-        AggregatedAttestations, Block, BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature,
-        TypeTwoMultiSignature,
-    },
+    block::{AggregatedAttestations, Block, BlockBody, SignedBlock, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::State,
 };
-use libssz::SszDecode as _;
 use tracing::{info, trace, warn};
 
 use crate::{
@@ -386,7 +382,7 @@ pub fn on_gossip_aggregated_attestation(
     .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Read stats before moving the proof into the store.
-    let num_participants = aggregated.proof.info.participants.count_ones();
+    let num_participants = aggregated.proof.participants.count_ones();
     let target_slot = aggregated.data.target.slot;
     let target_root = aggregated.data.target.root;
     let source_slot = aggregated.data.source.slot;
@@ -515,34 +511,20 @@ fn on_block_core(
     // Process block body attestations and feed them into the payload buffer
     // so fork choice's LMD GHOST overlay can see block-only votes.
     //
-    // The merged Type-2 envelope carries info-only (participants) entries
-    // for each component to keep the on-wire envelope under the 1 MiB cap.
-    // Standalone Type-1 proof bytes are not recoverable from a block;
+    // Per-attestation participant bitfields come straight from
+    // `block.body.attestations[i].aggregation_bits`. Standalone Type-1
+    // proof bytes are not recoverable from a block at import time;
     // downstream re-aggregation has to come from the gossip channel or be
-    // SNARK-split with `split_type_2_by_message`. Entries we insert here
-    // are info-only, used only for fork-choice vote bookkeeping.
+    // recovered by SNARK-splitting `signed_block.proof` via
+    // `split_type_2_by_message`. The entries inserted here are info-only,
+    // used only for fork-choice vote bookkeeping.
     let aggregated_attestations = &block.body.attestations;
-    let merged = TypeTwoMultiSignature::from_ssz_bytes(signed_block.proof.iter().as_slice())
-        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
-    let expected_info_len = aggregated_attestations.len() + 1;
-    if merged.info.len() != expected_info_len {
-        return Err(StoreError::AttestationSignatureMismatch {
-            signatures: merged.info.len(),
-            attestations: aggregated_attestations.len(),
-        });
-    }
 
     let mut known_entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> =
         Vec::with_capacity(aggregated_attestations.len());
-    for (att, info) in aggregated_attestations
-        .iter()
-        .zip(merged.info.iter().take(aggregated_attestations.len()))
-    {
+    for att in aggregated_attestations.iter() {
         let hashed = HashedAttestationData::new(att.data.clone());
-        let type_one = TypeOneMultiSignature {
-            info: info.clone(),
-            proof: ByteListMiB::default(),
-        };
+        let type_one = TypeOneMultiSignature::empty(att.aggregation_bits.clone());
         known_entries.push((hashed, type_one));
         // Count each participating validator as a valid attestation.
         let count = validator_indices(&att.aggregation_bits).count() as u64;
@@ -788,12 +770,6 @@ pub enum StoreError {
     #[error("Validator signature verification failed")]
     SignatureVerificationFailed,
 
-    #[error("Proposer signature could not be decoded")]
-    ProposerSignatureDecodingFailed,
-
-    #[error("Proposer signature verification failed")]
-    ProposerSignatureVerificationFailed,
-
     #[error("Block slot {0} exceeds u32 range")]
     SlotOutOfRange(u64),
 
@@ -840,17 +816,6 @@ pub enum StoreError {
         attestation_slot: u64,
         store_time: u64,
     },
-
-    #[error(
-        "Attestations and signatures don't match in length: got {signatures} signatures and {attestations} attestations"
-    )]
-    AttestationSignatureMismatch {
-        signatures: usize,
-        attestations: usize,
-    },
-
-    #[error("Aggregated proof participants don't match attestation aggregation bits")]
-    ParticipantsMismatch,
 
     #[error("Aggregated signature verification failed: {0}")]
     AggregateVerificationFailed(ethlambda_crypto::VerificationError),
@@ -1047,7 +1012,7 @@ fn extend_proofs_greedily(
             .collect();
 
         let att = AggregatedAttestation {
-            aggregation_bits: proof.info.participants.clone(),
+            aggregation_bits: proof.participants.clone(),
             data: att_data.clone(),
         };
 
@@ -1314,55 +1279,35 @@ pub fn verify_block_signatures(
     let block = &signed_block.message;
     let attestations = &block.body.attestations;
 
-    let merged = TypeTwoMultiSignature::from_ssz_bytes(signed_block.proof.iter().as_slice())
-        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
-
-    let expected_info_len = attestations.len() + 1;
-    if merged.info.len() != expected_info_len {
-        return Err(StoreError::AttestationSignatureMismatch {
-            signatures: merged.info.len(),
-            attestations: attestations.len(),
-        });
-    }
-
     let validators = &state.validators;
     let num_validators = validators.len() as u64;
 
-    // Per-attestation entries: participant bitfields must mirror the block
-    // body. The signed message and slot live on the body, not on the proof
-    // envelope (leanSpec PR #717), so they're rederived below for the crypto
-    // binding check rather than cross-checked here.
-    for (attestation, info) in attestations.iter().zip(merged.info.iter()) {
-        if attestation.aggregation_bits != info.participants {
-            return Err(StoreError::ParticipantsMismatch);
-        }
+    // Bounds-check participants before paying for the SNARK verifier.
+    // Per-component pubkeys are resolved from the block body itself; the
+    // wire proof carries no separate participant declaration to cross-check
+    // against (leanSpec PR #717).
+    for attestation in attestations.iter() {
         for vid in validator_indices(&attestation.aggregation_bits) {
             if vid >= num_validators {
                 return Err(StoreError::InvalidValidatorIndex);
             }
         }
     }
-
-    // Trailing proposer entry: single bit for `block.proposer_index`.
-    let proposer_info = &merged.info[attestations.len()];
-    let block_root = block.hash_tree_root();
-    let proposer_bits: Vec<u64> = validator_indices(&proposer_info.participants).collect();
-    if proposer_bits != [block.proposer_index] {
-        return Err(StoreError::ProposerSignatureVerificationFailed);
-    }
     if block.proposer_index >= num_validators {
         return Err(StoreError::InvalidValidatorIndex);
     }
 
+    let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
 
     // Resolve pubkeys per Type-2 component for verify_type_2 and rederive the
     // expected (message, slot) bindings from the block body. Attestation
     // components use each participant's attestation_pubkey; the trailing
     // proposer component uses the proposal_pubkey of `block.proposer_index`.
+    let expected_components = attestations.len() + 1;
     let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(merged.info.len());
-    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(merged.info.len());
+        Vec::with_capacity(expected_components);
+    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(expected_components);
 
     for attestation in attestations.iter() {
         let mut pubkeys = Vec::new();
@@ -1394,7 +1339,7 @@ pub fn verify_block_signatures(
 
     let crypto_start = std::time::Instant::now();
     ethlambda_crypto::verify_type_2_signature(
-        &merged.proof,
+        &signed_block.proof,
         pubkeys_per_component,
         &expected_bindings,
     )
@@ -1465,88 +1410,22 @@ mod tests {
     use super::*;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{
-            BlockBody, ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
-        },
+        block::{BlockBody, ByteList512KiB, SignedBlock, TypeOneMultiSignature},
         checkpoint::Checkpoint,
         state::State,
     };
-    use libssz::SszEncode as _;
 
-    /// Test helper: wrap a list of Type-1 attestation proofs plus a stub
-    /// proposer Type-1 into the SSZ-encoded merged Type-2 blob.
+    /// Test helper: placeholder block proof bytes.
+    ///
+    /// In production the merged proof is the raw `compress_without_pubkeys()`
+    /// output of `merge_many_type_1`, which can only be built by the
+    /// lean-multisig prover. Tests that don't go through
+    /// `verify_block_signatures` use an empty blob.
     fn make_signed_block_proof(
-        proposer_index: u64,
-        attestation_proofs: Vec<TypeOneMultiSignature>,
-    ) -> ByteListMiB {
-        let mut all = attestation_proofs;
-        all.push(TypeOneMultiSignature::for_proposer(
-            proposer_index,
-            ByteListMiB::default(),
-        ));
-        let merged = TypeTwoMultiSignature::from_type_1s(all);
-        ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
-    }
-
-    #[test]
-    fn verify_signatures_rejects_participants_mismatch() {
-        // One validator in state so the proposer-index bounds check passes.
-        let state = State::from_genesis(
-            1000,
-            vec![ethlambda_types::state::Validator {
-                attestation_pubkey: [0u8; 52],
-                proposal_pubkey: [0u8; 52],
-                index: 0,
-            }],
-        );
-
-        let attestation_data = AttestationData {
-            slot: 0,
-            head: Checkpoint::default(),
-            target: Checkpoint::default(),
-            source: Checkpoint::default(),
-        };
-
-        // Attestation declares bits [0, 1] in the block body...
-        let mut attestation_bits = AggregationBits::with_length(4).unwrap();
-        attestation_bits.set(0, true).unwrap();
-        attestation_bits.set(1, true).unwrap();
-
-        // ...but the merged Type-2 carries info[0].participants = [0, 1, 2].
-        let mut proof_bits = AggregationBits::with_length(4).unwrap();
-        proof_bits.set(0, true).unwrap();
-        proof_bits.set(1, true).unwrap();
-        proof_bits.set(2, true).unwrap();
-
-        let attestation = AggregatedAttestation {
-            aggregation_bits: attestation_bits,
-            data: attestation_data.clone(),
-        };
-        let attestations = AggregatedAttestations::try_from(vec![attestation]).unwrap();
-
-        let block = Block {
-            slot: 0,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body: BlockBody { attestations },
-        };
-        let block_root = block.hash_tree_root();
-
-        let mismatching_t1 = TypeOneMultiSignature::empty(proof_bits);
-        let _ = block_root; // proof envelope no longer carries the block root
-        let proof = make_signed_block_proof(0, vec![mismatching_t1]);
-
-        let signed_block = SignedBlock {
-            message: block,
-            proof,
-        };
-
-        let result = verify_block_signatures(&state, &signed_block);
-        assert!(
-            matches!(result, Err(StoreError::ParticipantsMismatch)),
-            "Expected ParticipantsMismatch, got: {result:?}"
-        );
+        _proposer_index: u64,
+        _attestation_proofs: Vec<TypeOneMultiSignature>,
+    ) -> ByteList512KiB {
+        ByteList512KiB::default()
     }
 
     /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259
@@ -1566,11 +1445,9 @@ mod tests {
         use libssz_types::SszList;
 
         const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MiB (spec limit)
-        // The Type-2 envelope now embeds each per-component Type-1 proof in
-        // info[i].proof (leanSpec PR #717), so the per-component size has to
-        // budget for `MAX_ATTESTATIONS_DATA + 1` copies fitting in the 1 MiB
-        // ByteListMiB cap. 50 KiB per component is roughly what a real
-        // lean-multisig devnet5 Type-1 SNARK weighs in at.
+        // Each pool entry carries a fake Type-1 proof of this size. Realistic
+        // lean-multisig devnet5 Type-1 SNARKs weigh in around 200-400 KiB; we
+        // stay well under the 512 KiB cap so try_from never rejects.
         const PROOF_SIZE: usize = 50 * 1024;
         const NUM_VALIDATORS: usize = 50;
         const NUM_PAYLOAD_ENTRIES: usize = 50;
@@ -1664,7 +1541,7 @@ mod tests {
             bits.set(validator_id, true).unwrap();
 
             let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
-            let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
+            let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteList512KiB");
             let proof = TypeOneMultiSignature::new(bits, proof_data);
 
             aggregated_payloads.insert(data_root, (att_data, vec![proof]));
@@ -1689,8 +1566,12 @@ mod tests {
             "MAX_ATTESTATIONS_DATA should cap attestations: got {attestation_count}"
         );
 
-        // Build the merged Type-2 proof exactly as `propose_block` would.
-        let proof = make_signed_block_proof(proposer_index, signatures);
+        // Substitute a worst-case-size proof to model what `propose_block`
+        // would attach. The actual SNARK can't be built without lean-multisig,
+        // but the size cap (`ByteList512KiB`) bounds the worst case.
+        let _ = signatures;
+        let proof =
+            ByteList512KiB::try_from(vec![0xAB; 512 * 1024]).expect("worst-case proof fits in cap");
         let signed_block = SignedBlock {
             message: block,
             proof,
@@ -2052,7 +1933,7 @@ mod tests {
 
         // Attestation bits mirror the proof's participants for each entry.
         for (att, proof) in &selected {
-            assert_eq!(att.aggregation_bits, proof.info.participants);
+            assert_eq!(att.aggregation_bits, proof.participants);
             assert_eq!(att.data, data);
         }
     }

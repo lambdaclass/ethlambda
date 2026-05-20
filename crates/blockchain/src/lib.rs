@@ -8,14 +8,10 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{
-        ByteListMiB, SignedBlock, TypeOneInfo, TypeOneInfos, TypeOneMultiSignature,
-        TypeTwoMultiSignature,
-    },
+    block::{ByteList512KiB, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
-use libssz::SszEncode as _;
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
@@ -399,10 +395,7 @@ impl BlockChainServer {
             return;
         };
 
-        let proposer_t1 =
-            TypeOneMultiSignature::for_proposer(validator_id, proposer_proof_bytes.clone());
-
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)> =
+        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
             Vec::with_capacity(type_one_proofs.len() + 1);
         let mut resolve_failed = false;
         for t1 in &type_one_proofs {
@@ -433,7 +426,12 @@ impl BlockChainServer {
         }
         merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        let merged_proof_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+        // Merge yields raw lean-multisig Type-2 bytes; the block envelope
+        // carries them directly with no Rust-side SSZ wrapper (leanSpec PR
+        // #717 wire format). Per-component participants are rederived at
+        // verify time from `block.body.attestations[i].aggregation_bits`
+        // plus `block.proposer_index`, so nothing else needs persisting.
+        let proof_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
             Ok(bytes) => bytes,
             Err(err) => {
                 error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
@@ -441,31 +439,8 @@ impl BlockChainServer {
                 return;
             }
         };
-
-        let mut all_proofs = type_one_proofs;
-        all_proofs.push(proposer_t1);
-        let infos: Vec<TypeOneInfo> = all_proofs
-            .into_iter()
-            .map(|t1| TypeOneInfo {
-                participants: t1.info.participants,
-                proof: ByteListMiB::default(),
-            })
-            .collect();
-        let Ok(merged_infos) = TypeOneInfos::try_from(infos) else {
-            error!(%slot, %validator_id, "Too many Type-1 infos for Type-2 envelope");
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let merged_envelope = TypeTwoMultiSignature {
-            info: merged_infos,
-            proof: merged_proof_bytes,
-        };
-        let Ok(proof_bytes) = ByteListMiB::try_from(merged_envelope.to_ssz()).inspect_err(
-            |err| error!(%slot, %validator_id, ?err, "Merged Type-2 envelope exceeds ByteListMiB"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
+        // `type_one_proofs` is no longer needed past this point.
+        drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
             proof: proof_bytes,

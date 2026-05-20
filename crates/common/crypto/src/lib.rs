@@ -1,7 +1,7 @@
 use std::sync::Once;
 
 use ethlambda_types::{
-    block::ByteListMiB,
+    block::ByteList512KiB,
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
@@ -116,7 +116,7 @@ fn into_lean_pubkeys(pubkeys: Vec<ValidatorPublicKey>) -> Vec<LeanSigPubKey> {
 /// `TypeOneMultiSignature` by attaching the resolved validator pubkeys.
 fn decompress_type1(
     pubkeys: Vec<ValidatorPublicKey>,
-    proof_bytes: &ByteListMiB,
+    proof_bytes: &ByteList512KiB,
     index: usize,
 ) -> Result<LMType1, AggregationError> {
     let lean_pks = into_lean_pubkeys(pubkeys);
@@ -124,16 +124,16 @@ fn decompress_type1(
         .ok_or(AggregationError::ChildDeserializationFailed(index))
 }
 
-fn compress_type1_to_byte_list(sig: &LMType1) -> Result<ByteListMiB, AggregationError> {
+fn compress_type1_to_byte_list(sig: &LMType1) -> Result<ByteList512KiB, AggregationError> {
     let serialized = sig.compress_without_pubkeys();
     let len = serialized.len();
-    ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
+    ByteList512KiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
 }
 
-fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteListMiB, AggregationError> {
+fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteList512KiB, AggregationError> {
     let serialized = sig.compress_without_pubkeys();
     let len = serialized.len();
-    ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
+    ByteList512KiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
 }
 
 // =====================================================================
@@ -147,13 +147,13 @@ fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteListMiB, Aggregation
 /// All signatures must bind to the same `(message, slot)` pair.
 ///
 /// Returns the lean-multisig `TypeOneMultiSignature::compress_without_pubkeys()`
-/// bytes, packed as `ByteListMiB` for the on-wire SSZ proof field.
+/// bytes, packed as `ByteList512KiB` for the on-wire SSZ proof field.
 pub fn aggregate_signatures(
     public_keys: Vec<ValidatorPublicKey>,
     signatures: Vec<ValidatorSignature>,
     message: &H256,
     slot: u32,
-) -> Result<ByteListMiB, AggregationError> {
+) -> Result<ByteList512KiB, AggregationError> {
     if public_keys.len() != signatures.len() {
         return Err(AggregationError::CountMismatch(
             public_keys.len(),
@@ -186,12 +186,12 @@ pub fn aggregate_signatures(
 /// Requires at least one raw signature OR at least 2 children. A lone child is
 /// already a valid Type-1; further aggregation is wasted work.
 pub fn aggregate_mixed(
-    children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    children: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
     raw_public_keys: Vec<ValidatorPublicKey>,
     raw_signatures: Vec<ValidatorSignature>,
     message: &H256,
     slot: u32,
-) -> Result<ByteListMiB, AggregationError> {
+) -> Result<ByteList512KiB, AggregationError> {
     if raw_public_keys.len() != raw_signatures.len() {
         return Err(AggregationError::CountMismatch(
             raw_public_keys.len(),
@@ -227,10 +227,10 @@ pub fn aggregate_mixed(
 /// All children must bind to the same `(message, slot)`. Used during block
 /// building to compact multiple proofs sharing an `AttestationData`.
 pub fn aggregate_proofs(
-    children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    children: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
     message: &H256,
     slot: u32,
-) -> Result<ByteListMiB, AggregationError> {
+) -> Result<ByteList512KiB, AggregationError> {
     if children.len() < 2 {
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
@@ -256,7 +256,7 @@ pub fn aggregate_proofs(
 /// The verifier checks the bound `(message, slot)` matches what the caller
 /// expects, defending against proofs reused from other binding contexts.
 pub fn verify_aggregated_signature(
-    proof_data: &ByteListMiB,
+    proof_data: &ByteList512KiB,
     public_keys: Vec<ValidatorPublicKey>,
     message: &H256,
     slot: u32,
@@ -293,8 +293,8 @@ pub fn verify_aggregated_signature(
 /// `TypeTwoMultiSignature`. A verifier decoding it back needs the per-component
 /// pubkey sets in the same order.
 pub fn merge_type_1s_into_type_2(
-    type_1s: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
-) -> Result<ByteListMiB, AggregationError> {
+    type_1s: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
+) -> Result<ByteList512KiB, AggregationError> {
     if type_1s.is_empty() {
         return Err(AggregationError::EmptyInput);
     }
@@ -319,7 +319,7 @@ pub fn merge_type_1s_into_type_2(
 /// caller-supplied lists, checks they match what the proof binds, and then runs
 /// the inner SNARK verifier.
 pub fn verify_type_2_signature(
-    proof_data: &ByteListMiB,
+    proof_data: &ByteList512KiB,
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     expected_bindings: &[(H256, u32)],
 ) -> Result<(), VerificationError> {
@@ -376,10 +376,10 @@ pub fn verify_type_2_signature(
 /// decompressed proof. Returns the `compress_without_pubkeys()` form of the
 /// resulting Type-1.
 pub fn split_type_2_by_message(
-    proof_data: &ByteListMiB,
+    proof_data: &ByteList512KiB,
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
-) -> Result<ByteListMiB, AggregationError> {
+) -> Result<ByteList512KiB, AggregationError> {
     ensure_prover_ready();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component

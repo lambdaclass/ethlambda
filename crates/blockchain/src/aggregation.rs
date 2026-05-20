@@ -13,7 +13,7 @@ use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
-    block::{ByteListMiB, TypeOneMultiSignature},
+    block::{ByteList512KiB, TypeOneMultiSignature},
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
@@ -46,7 +46,7 @@ pub struct AggregationJob {
     pub(crate) slot: u64,
     /// Pre-resolved `(participant_pubkeys, proof_data)` pairs for children
     /// selected via greedy coverage.
-    pub(crate) children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
+    pub(crate) children: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
     pub(crate) accepted_child_ids: Vec<u64>,
     pub(crate) raw_pubkeys: Vec<ValidatorPublicKey>,
     pub(crate) raw_sigs: Vec<ValidatorSignature>,
@@ -234,7 +234,7 @@ fn build_job(
 fn resolve_child_pubkeys(
     child_proofs: &[TypeOneMultiSignature],
     validators: &[Validator],
-) -> (Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>, Vec<u64>) {
+) -> (Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>, Vec<u64>) {
     let mut children = Vec::with_capacity(child_proofs.len());
     let mut accepted_child_ids: Vec<u64> = Vec::new();
 
