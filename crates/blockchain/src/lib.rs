@@ -427,15 +427,24 @@ impl BlockChainServer {
         }
         merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        // Merge yields raw lean-multisig Type-2 bytes; the block envelope
-        // carries them directly with no Rust-side SSZ wrapper (leanSpec PR
-        // #717 wire format). Per-component participants are rederived at
-        // verify time from `block.body.attestations[i].aggregation_bits`
-        // plus `block.proposer_index`, so nothing else needs persisting.
-        let proof_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+        // Merge yields raw lean-multisig Type-2 bytes; wrap them in the
+        // thin SSZ container the spec uses (`[4-byte offset][type2_wire]`)
+        // before stashing into the block envelope (leanSpec PR #717 wire
+        // format). Per-component participants are rederived at verify time
+        // from `block.body.attestations[i].aggregation_bits` plus
+        // `block.proposer_index`, so nothing else needs persisting.
+        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
             Ok(bytes) => bytes,
             Err(err) => {
                 error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        let proof_bytes = match SignedBlock::wrap_merged_proof(merged_bytes.iter().as_slice()) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to wrap merged proof envelope");
                 metrics::inc_block_building_failures();
                 return;
             }

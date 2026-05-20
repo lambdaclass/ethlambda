@@ -14,11 +14,11 @@ use primitives::HashTreeRoot as _;
 /// Envelope carrying a block and the single merged proof binding every
 /// signature it depends on.
 ///
-/// `proof` holds the raw `compress_without_pubkeys()` form of the
-/// lean-multisig `TypeTwoMultiSignature` covering, in order, every
-/// per-attestation Type-1 plus a singleton Type-1 for the proposer's
-/// signature over the block root. This matches leanSpec PR #717's wire
-/// format exactly: no Rust-side SSZ wrapper around the lean-multisig bytes.
+/// `proof` holds the SSZ-encoded form of a [`TypeTwoMultiSignature`]
+/// container whose only field is a `ByteList512KiB` holding the raw
+/// `compress_without_pubkeys()` Type-2 merged proof bytes. On the wire the
+/// container collapses to `[4-byte offset = 4][type2_wire]` — a thin
+/// 4-byte prefix in front of the lean-multisig bytes (leanSpec PR #717).
 ///
 /// <div class="warning">
 ///
@@ -33,9 +33,66 @@ pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
 
-    /// Raw lean-multisig Type-2 merged proof bytes (no Rust-side SSZ wrapper).
+    /// SSZ-encoded `TypeTwoMultiSignature` envelope. Use
+    /// [`SignedBlock::merged_proof_bytes`] to extract the raw
+    /// lean-multisig Type-2 bytes inside, or
+    /// [`SignedBlock::wrap_merged_proof`] when building an envelope from
+    /// the prover output.
     pub proof: ByteList512KiB,
 }
+
+impl SignedBlock {
+    /// Strip the SSZ-container offset header to return the raw
+    /// lean-multisig Type-2 merged proof bytes the verifier consumes.
+    pub fn merged_proof_bytes(&self) -> Result<&[u8], ProofEnvelopeError> {
+        let bytes = self.proof.iter().as_slice();
+        if bytes.len() < 4 {
+            return Err(ProofEnvelopeError::TruncatedEnvelope);
+        }
+        let mut header = [0u8; 4];
+        header.copy_from_slice(&bytes[..4]);
+        let offset = u32::from_le_bytes(header) as usize;
+        if offset != 4 {
+            return Err(ProofEnvelopeError::UnexpectedOffset(offset));
+        }
+        Ok(&bytes[4..])
+    }
+
+    /// Wrap raw lean-multisig Type-2 bytes into a `SignedBlock.proof`
+    /// envelope: prepend the 4-byte SSZ offset header so the wire matches
+    /// the spec's `TypeTwoMultiSignature { proof: ByteList512KiB }`
+    /// container.
+    pub fn wrap_merged_proof(type2_wire: &[u8]) -> Result<ByteList512KiB, ProofEnvelopeError> {
+        let mut wrapped = Vec::with_capacity(4 + type2_wire.len());
+        wrapped.extend_from_slice(&4u32.to_le_bytes());
+        wrapped.extend_from_slice(type2_wire);
+        let len = wrapped.len();
+        ByteList512KiB::try_from(wrapped).map_err(|_| ProofEnvelopeError::ExceedsCap(len))
+    }
+}
+
+/// Errors returned by the [`SignedBlock`] proof-envelope helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofEnvelopeError {
+    /// Envelope is shorter than the 4-byte SSZ offset header.
+    TruncatedEnvelope,
+    /// Offset header is not the expected single-field value `4`.
+    UnexpectedOffset(usize),
+    /// Wrapped proof would exceed `ByteList512KiB`'s cap.
+    ExceedsCap(usize),
+}
+
+impl core::fmt::Display for ProofEnvelopeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TruncatedEnvelope => f.write_str("block proof envelope truncated"),
+            Self::UnexpectedOffset(o) => write!(f, "block proof envelope offset {o}, expected 4"),
+            Self::ExceedsCap(n) => write!(f, "wrapped proof {n} bytes exceeds 512 KiB cap"),
+        }
+    }
+}
+
+impl std::error::Error for ProofEnvelopeError {}
 
 // Manual Debug impl because the merged proof bytes are large and opaque.
 impl core::fmt::Debug for SignedBlock {
@@ -70,8 +127,9 @@ pub type ByteList512KiB = ByteList<524_288>;
 /// block. Canonical home for the cap shared across `ethlambda-blockchain`,
 /// `ethlambda-test-fixtures`, and the wire types in this crate.
 ///
-/// See: leanSpec commit 0c9528a (PR #536).
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+/// See: leanSpec PR #717, which lowered the cap from 16 to 8 alongside the
+/// merged block-proof refactor.
+pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
 /// A Type-1 single-message proof aggregating signatures from many validators.
 ///

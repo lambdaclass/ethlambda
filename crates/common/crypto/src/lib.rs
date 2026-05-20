@@ -319,7 +319,7 @@ pub fn merge_type_1s_into_type_2(
 /// caller-supplied lists, checks they match what the proof binds, and then runs
 /// the inner SNARK verifier.
 pub fn verify_type_2_signature(
-    proof_data: &ByteList512KiB,
+    proof_data: &[u8],
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     expected_bindings: &[(H256, u32)],
 ) -> Result<(), VerificationError> {
@@ -337,7 +337,7 @@ pub fn verify_type_2_signature(
         .map(into_lean_pubkeys)
         .collect();
 
-    let sig = LMType2::decompress_without_pubkeys(proof_data.iter().as_slice(), pubkeys_per_info)
+    let sig = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
         .ok_or(VerificationError::DeserializationFailed)?;
 
     if sig.info.len() != expected_bindings.len() {
@@ -376,7 +376,7 @@ pub fn verify_type_2_signature(
 /// decompressed proof. Returns the `compress_without_pubkeys()` form of the
 /// resulting Type-1.
 pub fn split_type_2_by_message(
-    proof_data: &ByteList512KiB,
+    proof_data: &[u8],
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
 ) -> Result<ByteList512KiB, AggregationError> {
@@ -387,9 +387,8 @@ pub fn split_type_2_by_message(
         .map(into_lean_pubkeys)
         .collect();
 
-    let type_2 =
-        LMType2::decompress_without_pubkeys(proof_data.iter().as_slice(), pubkeys_per_info)
-            .ok_or(AggregationError::DeserializationFailed)?;
+    let type_2 = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
+        .ok_or(AggregationError::DeserializationFailed)?;
 
     let matches: Vec<usize> = type_2
         .info
@@ -583,14 +582,14 @@ mod tests {
                 .expect("merge");
 
         verify_type_2_signature(
-            &merged,
+            merged.iter().as_slice(),
             vec![vec![pk_a.clone()], vec![pk_b.clone()]],
             &[(msg_a, slot_a), (msg_b, slot_b)],
         )
         .expect("verify type-2");
 
         let split = split_type_2_by_message(
-            &merged,
+            merged.iter().as_slice(),
             vec![vec![pk_a.clone()], vec![pk_b.clone()]],
             &msg_a,
         )
