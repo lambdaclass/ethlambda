@@ -270,21 +270,21 @@ impl PayloadBuffer {
     ///
     /// Returns the number of data_root entries removed.
     fn prune(&mut self, finalized_slot: u64) -> usize {
-        let mut pruned_roots: HashSet<H256> = HashSet::new();
+        let before = self.data.len();
         let total_proofs = &mut self.total_proofs;
-        self.data.retain(|root, entry| {
+        self.data.retain(|_root, entry| {
             if entry.data.target.slot > finalized_slot {
                 true
             } else {
                 *total_proofs -= entry.proofs.len();
-                pruned_roots.insert(*root);
                 false
             }
         });
-        if !pruned_roots.is_empty() {
-            self.order.retain(|r| !pruned_roots.contains(r));
+        let pruned = before - self.data.len();
+        if pruned > 0 {
+            self.order.retain(|r| self.data.contains_key(r));
         }
-        pruned_roots.len()
+        pruned
     }
 
     /// Extract per-validator latest attestations from proofs' participation bits.
