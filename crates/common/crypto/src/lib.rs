@@ -262,11 +262,9 @@ pub fn verify_aggregated_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::signature::LeanSignatureScheme;
     use leansig::{serialization::Serializable, signature::SignatureScheme};
     use rand::{SeedableRng, rngs::StdRng};
-
-    // The signature scheme type used in ethlambda-types
-    type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_poseidon_top_level::lifetime_2_to_the_32::hashing_optimized::SIGTopLevelTargetSumLifetime32Dim64Base8;
 
     /// Generate a test keypair and sign a message.
     ///
