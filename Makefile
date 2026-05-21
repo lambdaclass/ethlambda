@@ -24,21 +24,15 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-05-20
-# Pinned just after leanSpec PR #717 ("Aggregated block proof - devnet5")
-# merged: the wire format collapses per-attestation Type-1s + proposer
-# signature into a single block-level Type-2 merged proof, and fork-choice
-# fixtures live under `lstar/` instead of `devnet/`. Fixtures must be
-# generated with `--scheme=test`; the `prod` scheme's pre-generated keys
-# upstream still use the pre-#725 JSON shape and break the filler.
-LEAN_SPEC_COMMIT_HASH:=d9d2e6779a4dcbecbe1cf2bdda47cd64f3f4844a
+# 2026-05-21
+LEAN_SPEC_COMMIT_HASH:=825bec6bf278920cfc56730d64a7c90522a0bb6c
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork Lstar -n auto --scheme=test -o fixtures
+	cd leanSpec && uv run fill --fork Lstar -n auto --scheme=prod -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
