@@ -5,7 +5,7 @@ use ethlambda_state_transition::{
     attestation_data_matches_chain, is_proposer, justified_slots_ops, process_block, process_slots,
     slot_is_justifiable_after,
 };
-use ethlambda_storage::{ForkCheckpoints, Store};
+use ethlambda_storage::{CoverageSnapshot, ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
@@ -40,10 +40,33 @@ pub struct PostBlockCheckpoints {
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
 fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+    snapshot_pre_merge_new_coverage(store);
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
     update_head(store, log_tree);
+}
+
+/// Capture the participant bits of every entry in `new_payloads` for the
+/// attestation aggregate coverage report. Stored on the Store so the
+/// post-block report at the next slot boundary can read it.
+fn snapshot_pre_merge_new_coverage(store: &Store) {
+    let new_payloads = store.new_aggregated_payloads();
+    if new_payloads.is_empty() {
+        return;
+    }
+    let mut slot: u64 = 0;
+    let mut participant_bits: Vec<AggregationBits> = Vec::new();
+    for (data, proofs) in new_payloads.values() {
+        slot = data.slot;
+        for proof in proofs {
+            participant_bits.push(proof.participants.clone());
+        }
+    }
+    store.save_pre_merge_new_coverage(CoverageSnapshot {
+        slot,
+        participant_bits,
+    });
 }
 
 /// Update the head based on the fork choice rule.
@@ -514,17 +537,26 @@ fn on_block_core(
 
     // Store one proof per attestation data in known aggregated payloads.
     let mut known_entries: Vec<(HashedAttestationData, AggregatedSignatureProof)> = Vec::new();
+    let mut block_participant_bits: Vec<AggregationBits> = Vec::new();
     for (att, proof) in aggregated_attestations
         .iter()
         .zip(attestation_signatures.iter())
     {
         known_entries.push((HashedAttestationData::new(att.data.clone()), proof.clone()));
+        block_participant_bits.push(att.aggregation_bits.clone());
         // Count each participating validator as a valid attestation
         let count = validator_indices(&att.aggregation_bits).count() as u64;
         metrics::inc_attestations_valid(count);
     }
 
     store.insert_known_aggregated_payloads_batch(known_entries);
+
+    // Capture block-included participant bits for the attestation aggregate
+    // coverage report (observability-only; does not affect fork choice).
+    store.save_last_block_coverage(CoverageSnapshot {
+        slot,
+        participant_bits: block_participant_bits,
+    });
 
     // Update forkchoice head based on new block and attestations
     update_head(store, false);
