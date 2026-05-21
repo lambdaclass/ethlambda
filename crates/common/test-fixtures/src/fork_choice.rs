@@ -7,11 +7,12 @@ use crate::{
     AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
     deser_xmss_hex,
 };
-use ethlambda_types::attestation::{XmssSignature, blank_xmss_signature};
+use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
+    ByteListMiB, MAX_ATTESTATIONS_DATA, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
 };
-use ethlambda_types::primitives::H256;
+use ethlambda_types::primitives::{H256, HashTreeRoot as _};
+use libssz::SszEncode as _;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -150,30 +151,52 @@ impl BlockStepData {
         }
     }
 
-    /// Build a SignedBlock with placeholder signatures: one empty aggregated
-    /// proof per attestation (participant bits copied from the block body) and
-    /// a zeroed proposer signature.
+    /// Build a `SignedBlock` whose merged Type-2 proof is structurally correct
+    /// (one Type-1 info entry per block-body attestation plus a trailing
+    /// proposer entry) but carries empty proof bytes — the crypto layer is
+    /// never invoked by callers of this helper.
     ///
     /// Used by callers that import the block via `on_block_without_verification`
-    /// (fork-choice spec-test runner and Hive test-driver), where the crypto
-    /// layer is never invoked but the SignedBlock shape must still satisfy the
-    /// length checks `on_block_core` performs before dispatching.
+    /// (fork-choice spec-test runner and Hive test-driver), where
+    /// `process_new_block` still decodes the merged proof and asserts the info
+    /// list aligns with `attestations.len() + 1` before dispatching.
+    ///
+    /// Oversized-block tests (more than `MAX_ATTESTATIONS_DATA` attestations)
+    /// overflow `TypeOneInfos`'s SSZ-list cap, so we fall back to an empty
+    /// proof blob — `process_new_block` rejects with `TooManyAttestationData`
+    /// before the proof is ever decoded, so its contents don't matter for
+    /// those scenarios.
     pub fn to_blank_signed_block(&self) -> SignedBlock {
         let block = self.to_block();
-        let proofs: Vec<AggregatedSignatureProof> = block
-            .body
-            .attestations
-            .iter()
-            .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-            .collect();
-
+        let block_root = block.hash_tree_root();
+        let proof = if block.body.attestations.len() > MAX_ATTESTATIONS_DATA {
+            ByteListMiB::default()
+        } else {
+            let attestation_proofs: Vec<TypeOneMultiSignature> = block
+                .body
+                .attestations
+                .iter()
+                .map(|att| {
+                    TypeOneMultiSignature::empty(
+                        att.aggregation_bits.clone(),
+                        att.data.hash_tree_root(),
+                        att.data.slot,
+                    )
+                })
+                .collect();
+            let mut all = attestation_proofs;
+            all.push(TypeOneMultiSignature::for_proposer(
+                block.proposer_index,
+                ByteListMiB::default(),
+                block_root,
+                block.slot,
+            ));
+            let merged = TypeTwoMultiSignature::from_type_1s(all);
+            ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
+        };
         SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                proposer_signature: blank_xmss_signature(),
-                attestation_signatures: AttestationSignatures::try_from(proofs)
-                    .expect("attestation proofs within limit"),
-            },
+            proof,
         }
     }
 }

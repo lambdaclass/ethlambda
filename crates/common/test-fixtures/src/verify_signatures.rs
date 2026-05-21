@@ -7,8 +7,10 @@
 use crate::{AggregationBits, Block, Container, TestInfo, TestState, deser_xmss_hex};
 use ethlambda_types::attestation::{AggregationBits as EthAggregationBits, XmssSignature};
 use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, ByteListMiB, SignedBlock,
+    ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
 };
+use ethlambda_types::primitives::HashTreeRoot as _;
+use libssz::SszEncode as _;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -62,34 +64,45 @@ pub struct TestSignedBlock {
 }
 
 /// Lossy fixture-to-SignedBlock conversion: per-attestation proof bytes from
-/// the fixture are dropped, leaving empty payloads. Adequate for callers that
-/// don't reach the leanVM aggregate verifier (e.g. signature spec tests whose
-/// fixtures all set `expectException`). For real signature verification use
-/// [`TestSignedBlock::try_into_signed_block_with_proofs`].
+/// the fixture are dropped, leaving empty payloads. The merged Type-2 proof
+/// preserves the per-attestation metadata (`message`, `slot`, `participants`)
+/// and the proposer's XMSS signature so structural verification passes.
+/// Adequate for callers that don't reach the leanVM aggregate verifier (e.g.
+/// signature spec tests whose fixtures all set `expectException`). For real
+/// signature verification use [`TestSignedBlock::try_into_signed_block_with_proofs`].
 impl From<TestSignedBlock> for SignedBlock {
     fn from(value: TestSignedBlock) -> Self {
-        let block = value.block.into();
-        let proposer_signature = value.signature.proposer_signature;
+        let block: ethlambda_types::block::Block = value.block.into();
+        let block_root = block.hash_tree_root();
+        let proposer_proof = ByteListMiB::try_from(value.signature.proposer_signature.to_vec())
+            .expect("XMSS signature fits in ByteListMiB");
 
-        let attestation_signatures: AttestationSignatures = value
+        let attestation_t1s: Vec<TypeOneMultiSignature> = value
             .signature
             .attestation_signatures
             .data
             .into_iter()
-            .map(|att_sig| {
+            .zip(block.body.attestations.iter())
+            .map(|(att_sig, att)| {
                 let participants: EthAggregationBits = att_sig.participants.into();
-                AggregatedSignatureProof::empty(participants)
+                TypeOneMultiSignature::empty(participants, att.data.hash_tree_root(), att.data.slot)
             })
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("too many attestation signatures");
+            .collect();
+
+        let mut all = attestation_t1s;
+        all.push(TypeOneMultiSignature::for_proposer(
+            block.proposer_index,
+            proposer_proof,
+            block_root,
+            block.slot,
+        ));
+        let merged = TypeTwoMultiSignature::from_type_1s(all);
+        let proof = ByteListMiB::try_from(merged.to_ssz())
+            .expect("merged Type-2 proof fits in ByteListMiB");
 
         SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures,
-                proposer_signature,
-            },
+            proof,
         }
     }
 }
@@ -128,20 +141,25 @@ impl std::error::Error for SignedBlockConvertError {}
 
 impl TestSignedBlock {
     /// Materialize a `SignedBlock` that preserves the fixture-supplied
-    /// per-attestation proof bytes verbatim. Required for verifying signatures
-    /// against the leanVM aggregate path; the lossy [`From`] impl above drops
-    /// these bytes.
+    /// per-attestation proof bytes verbatim by folding every Type-1 plus the
+    /// proposer Type-1 into the block's merged Type-2 proof. The lossy
+    /// [`From`] impl above drops these bytes — use this one when the consumer
+    /// needs the original aggregate bytes (e.g. the Hive test-driver feeds
+    /// them through `verify_block_signatures`).
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
-        let block = self.block.into();
-        let proposer_signature = self.signature.proposer_signature;
+        let block: ethlambda_types::block::Block = self.block.into();
+        let block_root = block.hash_tree_root();
+        let proposer_proof = ByteListMiB::try_from(self.signature.proposer_signature.to_vec())
+            .expect("XMSS signature fits in ByteListMiB");
 
-        let proofs: Vec<AggregatedSignatureProof> = self
+        let attestation_t1s: Vec<TypeOneMultiSignature> = self
             .signature
             .attestation_signatures
             .data
             .into_iter()
+            .zip(block.body.attestations.iter())
             .enumerate()
-            .map(|(index, att_sig)| {
+            .map(|(index, (att_sig, att))| {
                 let participants: EthAggregationBits = att_sig.participants.into();
                 let raw = &att_sig.proof_data.data;
                 let stripped = raw.strip_prefix("0x").unwrap_or(raw);
@@ -154,19 +172,33 @@ impl TestSignedBlock {
                 let len = bytes.len();
                 let proof_data = ByteListMiB::try_from(bytes)
                     .map_err(|_| SignedBlockConvertError::ProofTooLarge { index, len })?;
-                Ok(AggregatedSignatureProof::new(participants, proof_data))
+                Ok(TypeOneMultiSignature::new(
+                    participants,
+                    att.data.hash_tree_root(),
+                    att.data.slot,
+                    proof_data,
+                ))
             })
             .collect::<Result<_, SignedBlockConvertError>>()?;
 
-        let attestation_signatures: AttestationSignatures = AttestationSignatures::try_from(proofs)
-            .map_err(|_| SignedBlockConvertError::TooManyAttestationSignatures)?;
+        if attestation_t1s.len() >= 17 {
+            return Err(SignedBlockConvertError::TooManyAttestationSignatures);
+        }
+
+        let mut all = attestation_t1s;
+        all.push(TypeOneMultiSignature::for_proposer(
+            block.proposer_index,
+            proposer_proof,
+            block_root,
+            block.slot,
+        ));
+        let merged = TypeTwoMultiSignature::from_type_1s(all);
+        let proof = ByteListMiB::try_from(merged.to_ssz())
+            .expect("merged Type-2 proof fits in ByteListMiB");
 
         Ok(SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures,
-                proposer_signature,
-            },
+            proof,
         })
     }
 }

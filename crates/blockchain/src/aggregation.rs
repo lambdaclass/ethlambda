@@ -13,7 +13,7 @@ use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
-    block::{AggregatedSignatureProof, ByteListMiB},
+    block::{ByteListMiB, BytecodeClaim, TypeOneInfo, TypeOneMultiSignature},
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
@@ -65,7 +65,7 @@ pub struct AggregationSnapshot {
 /// as a message payload so the store can be updated and gossip publish fired.
 pub struct AggregatedGroupOutput {
     pub(crate) hashed: HashedAttestationData,
-    pub(crate) proof: AggregatedSignatureProof,
+    pub(crate) proof: TypeOneMultiSignature,
     pub(crate) participants: Vec<u64>,
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
@@ -232,7 +232,7 @@ fn build_job(
 /// can't be fully resolved (passing fewer pubkeys than the proof expects would
 /// produce an invalid aggregate).
 fn resolve_child_pubkeys(
-    child_proofs: &[AggregatedSignatureProof],
+    child_proofs: &[TypeOneMultiSignature],
     validators: &[Validator],
 ) -> (Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>, Vec<u64>) {
     let mut children = Vec::with_capacity(child_proofs.len());
@@ -253,7 +253,7 @@ fn resolve_child_pubkeys(
             continue;
         }
         accepted_child_ids.extend(&participant_ids);
-        children.push((child_pubkeys, proof.proof_data.clone()));
+        children.push((child_pubkeys, proof.proof.clone()));
     }
 
     (children, accepted_child_ids)
@@ -290,8 +290,16 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     participants.dedup();
 
     let aggregation_bits = aggregation_bits_from_validator_indices(&participants);
-    let proof = AggregatedSignatureProof::new(aggregation_bits, proof_data);
-    metrics::observe_aggregated_proof_size(proof.proof_data.len());
+    let proof = TypeOneMultiSignature {
+        info: TypeOneInfo {
+            message: data_root,
+            slot: job.slot,
+            participants: aggregation_bits,
+            bytecode_claim: BytecodeClaim::ZERO,
+        },
+        proof: proof_data,
+    };
+    metrics::observe_aggregated_proof_size(proof.proof.len());
 
     Some(AggregatedGroupOutput {
         hashed: job.hashed,
@@ -328,14 +336,14 @@ pub fn finalize_aggregation_session(store: &Store) {
 /// no proof adds new coverage. This keeps the number of children minimal
 /// while maximizing the validators we can skip re-aggregating from scratch.
 fn select_proofs_greedily(
-    new_proofs: &[AggregatedSignatureProof],
-    known_proofs: &[AggregatedSignatureProof],
-) -> (Vec<AggregatedSignatureProof>, HashSet<u64>) {
-    let mut selected: Vec<AggregatedSignatureProof> = Vec::new();
+    new_proofs: &[TypeOneMultiSignature],
+    known_proofs: &[TypeOneMultiSignature],
+) -> (Vec<TypeOneMultiSignature>, HashSet<u64>) {
+    let mut selected: Vec<TypeOneMultiSignature> = Vec::new();
     let mut covered: HashSet<u64> = HashSet::new();
 
     for proof_set in [new_proofs, known_proofs] {
-        let mut remaining: Vec<&AggregatedSignatureProof> = proof_set.iter().collect();
+        let mut remaining: Vec<&TypeOneMultiSignature> = proof_set.iter().collect();
 
         while !remaining.is_empty() {
             let best_idx = remaining

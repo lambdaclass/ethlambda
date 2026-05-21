@@ -400,11 +400,9 @@ mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::{
-        attestation::blank_xmss_signature,
-        block::{Block, BlockBody, BlockSignatures},
+        block::{Block, BlockBody, ByteListMiB},
         state::State,
     };
-    use libssz_types::SszList;
     use std::sync::Arc;
 
     fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
@@ -416,10 +414,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            signature: BlockSignatures {
-                attestation_signatures: SszList::new(),
-                proposer_signature: blank_xmss_signature(),
-            },
+            proof: ByteListMiB::default(),
         }
     }
 

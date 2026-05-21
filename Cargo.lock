@@ -2180,6 +2180,7 @@ version = "0.1.0"
 dependencies = [
  "ethlambda-types",
  "hex",
+ "libssz",
  "libssz-types",
  "serde",
  "serde_json",

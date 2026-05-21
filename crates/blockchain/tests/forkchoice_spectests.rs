@@ -8,7 +8,7 @@ use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, sto
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
-    block::{AggregatedSignatureProof, Block},
+    block::{Block, TypeOneMultiSignature},
     primitives::{ByteList, H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
@@ -145,13 +145,14 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let proof_bytes: Vec<u8> = proof_fixture.proof_data.into();
                     let proof_data = ByteList::try_from(proof_bytes)
                         .expect("aggregated proof data fits in ByteListMiB");
-                    let aggregated = SignedAggregatedAttestation {
-                        data: att_data.data.into(),
-                        proof: AggregatedSignatureProof::new(
-                            proof_fixture.participants.into(),
-                            proof_data,
-                        ),
-                    };
+                    let data: AttestationData = att_data.data.into();
+                    let proof = TypeOneMultiSignature::new(
+                        proof_fixture.participants.into(),
+                        data.hash_tree_root(),
+                        data.slot,
+                        proof_data,
+                    );
+                    let aggregated = SignedAggregatedAttestation { data, proof };
 
                     let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
                     assert_step_outcome(step_idx, step.valid, result)?;

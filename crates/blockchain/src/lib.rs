@@ -8,9 +8,10 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{BlockSignatures, SignedBlock},
+    block::{ByteListMiB, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature},
     primitives::{H256, HashTreeRoot as _},
 };
+use libssz::SszEncode as _;
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
@@ -42,10 +43,7 @@ pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
-/// Maximum number of distinct AttestationData entries per block.
-///
-/// See: leanSpec commit 0c9528a (PR #536).
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
@@ -333,7 +331,7 @@ impl BlockChainServer {
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures, _post_checkpoints)) =
+        let Ok((block, type_one_proofs, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
@@ -352,15 +350,25 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock
+        // Assemble SignedBlock: wrap the proposer's XMSS signature as a
+        // singleton Type-1 and fold every attestation Type-1 plus the
+        // proposer Type-1 into the block's single merged Type-2 proof.
+        let proposer_proof_bytes = ByteListMiB::try_from(proposer_signature.to_vec())
+            .expect("XMSS signature fits in ByteListMiB");
+        let proposer_t1 = TypeOneMultiSignature::for_proposer(
+            validator_id,
+            proposer_proof_bytes,
+            block_root,
+            slot,
+        );
+        let mut all_proofs = type_one_proofs;
+        all_proofs.push(proposer_t1);
+        let merged = TypeTwoMultiSignature::from_type_1s(all_proofs);
+        let proof_bytes = ByteListMiB::try_from(merged.to_ssz())
+            .expect("merged Type-2 proof fits in ByteListMiB");
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures: attestation_signatures
-                    .try_into()
-                    .expect("attestation signatures within limit"),
-            },
+            proof: proof_bytes,
         };
 
         // Process the block locally before publishing
