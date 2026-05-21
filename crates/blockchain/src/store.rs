@@ -998,7 +998,9 @@ mod tests {
     use super::*;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{AggregatedAttestations, BlockBody, SignedBlock, TypeOneMultiSignature},
+        block::{
+            AggregatedAttestations, BlockBody, ByteList512KiB, SignedBlock, TypeOneMultiSignature,
+        },
         checkpoint::Checkpoint,
         state::State,
     };

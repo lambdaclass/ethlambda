@@ -19,7 +19,7 @@ use ethlambda_state_transition::{
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, TypeOneMultiSignature, Block, BlockBody},
+    block::{AggregatedAttestations, Block, BlockBody, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
@@ -773,10 +773,8 @@ mod tests {
 
         // Simulate a stall: populate the payload pool with many distinct entries.
         // Each has a unique attestation slot and a large proof payload.
-        let mut aggregated_payloads: HashMap<
-            H256,
-            (AttestationData, Vec<TypeOneMultiSignature>),
-        > = HashMap::new();
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+            HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
             let att_data = AttestationData {
@@ -1063,9 +1061,8 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         let proof_a =
-            AggregatedSignatureProof::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
-        let proof_b =
-            AggregatedSignatureProof::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+            TypeOneMultiSignature::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof_b = TypeOneMultiSignature::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
 
         let mut aggregated_payloads = HashMap::new();
         aggregated_payloads.insert(att_a.hash_tree_root(), (att_a.clone(), vec![proof_a]));
