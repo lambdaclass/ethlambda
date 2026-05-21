@@ -12,7 +12,7 @@ use crate::primitives::H256;
 /// This is a post-quantum secure signature scheme based on hash functions.
 /// Uses Poseidon1 hashing with an aborting hypercube message hash,
 /// 32-bit lifetime (2^32 signatures per key), dimension 46, and base 8.
-pub type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::SchemeAbortingTargetSumLifetime32Dim46Base8;
+pub type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::SIGAbortingTargetSumLifetime32Dim46Base8;
 
 /// The public key type from the leansig library.
 pub type LeanSigPublicKey = <LeanSignatureScheme as SignatureScheme>::PublicKey;
