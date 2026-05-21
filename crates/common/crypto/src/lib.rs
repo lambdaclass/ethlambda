@@ -411,13 +411,9 @@ pub fn split_type_2_by_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::signature::LeanSignatureScheme;
     use leansig::{serialization::Serializable, signature::SignatureScheme};
     use rand::{SeedableRng, rngs::StdRng};
-
-    // The signature scheme type used in ethlambda-types (Dim46 to match
-    // production validator keys; lean-multisig's `aggregate_type_1` hard-codes
-    // `SIG_SIZE_FE = 7 + (V + LOG_LIFETIME) * 8 = 631` for V=46).
-    type LeanSignatureScheme = leansig::signature::generalized_xmss::instantiations_aborting::lifetime_2_to_the_32::SchemeAbortingTargetSumLifetime32Dim46Base8;
 
     /// Generate a test keypair and sign a message.
     ///
