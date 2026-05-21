@@ -27,6 +27,7 @@ use tracing::{error, info, trace, warn};
 use crate::store::StoreError;
 
 pub mod aggregation;
+pub mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -60,6 +61,7 @@ impl BlockChain {
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        attestation_committee_count: u64,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -86,6 +88,7 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
+            attestation_committee_count,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -139,6 +142,10 @@ pub struct BlockChainServer {
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
+
+    /// Number of attestation committees (= subnet count). Used by the
+    /// attestation aggregate coverage emission.
+    attestation_committee_count: u64,
 }
 
 impl BlockChainServer {
@@ -187,7 +194,18 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
+        // Emit the post-block attestation aggregate coverage report for the
+        // previous slot at the start of each new slot.
+        if interval == 0 && slot > 0 {
+            coverage::emit_post_block_report(
+                &self.store,
+                self.attestation_committee_count,
+                slot - 1,
+            );
+        }
+
         if interval == 2 && is_aggregator {
+            coverage::emit_agg_start_new(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -340,6 +358,12 @@ impl BlockChainServer {
             metrics::inc_block_building_failures();
             return;
         };
+
+        coverage::emit_proposal_coverage(
+            &self.store,
+            self.attestation_committee_count,
+            block.body.attestations.iter(),
+        );
 
         // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();

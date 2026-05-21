@@ -685,6 +685,27 @@ pub fn set_attestation_committee_count(count: u64) {
     LEAN_ATTESTATION_COMMITTEE_COUNT.set(count.try_into().unwrap_or_default());
 }
 
+/// Set `lean_attestation_aggregate_coverage_validators{section, subnet}`.
+pub fn set_attestation_aggregate_coverage_validators(section: &str, subnet: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS
+        .with_label_values(&[section, subnet])
+        .set(value);
+}
+
+/// Set `lean_attestation_aggregate_coverage_subnets{section}`.
+pub fn set_attestation_aggregate_coverage_subnets(section: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_SUBNETS
+        .with_label_values(&[section])
+        .set(value);
+}
+
+/// Set `lean_attestation_aggregate_coverage_diff_validators{direction}`.
+pub fn set_attestation_aggregate_coverage_diff_validators(direction: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS
+        .with_label_values(&[direction])
+        .set(value);
+}
+
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
