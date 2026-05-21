@@ -354,10 +354,6 @@ impl BlockChainServer {
         // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
         // singleton Type-1 SNARK, then merge it with every attestation Type-1
         // into the block's single Type-2 proof.
-        //
-        // Both proofs run synchronously on the actor thread, so propose_block
-        // currently dominates the slot budget; see PR #370 for the off-thread
-        // refactor follow-up.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         let Some(proposer_validator) = validators.get(validator_id as usize) else {
