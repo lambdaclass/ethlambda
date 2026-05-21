@@ -24,22 +24,15 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-29
-# NOTE(type1-type2): an attempted bump to anshalshukla/leanSpec@0ab09dd ("dummy
-# type 1 and type 2 aggregation with block proofs") was reverted because the
-# testing harness in that branch still imports `AttestationSignatures`, which
-# the same commit removed — the fixture generator fails to load. We stay on
-# the canonical commit and skip the affected SSZ-spec and signature-spec test
-# cases until the upstream refactor lands together with matching testing-side
-# updates.
-LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
+# 2026-05-21
+LEAN_SPEC_COMMIT_HASH:=825bec6bf278920cfc56730d64a7c90522a0bb6c
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet -n auto --scheme=prod -o fixtures
+	cd leanSpec && uv run fill --fork Lstar -n auto --scheme prod -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch

@@ -8,11 +8,8 @@ use crate::{
     deser_xmss_hex,
 };
 use ethlambda_types::attestation::XmssSignature;
-use ethlambda_types::block::{
-    ByteListMiB, MAX_ATTESTATIONS_DATA, SignedBlock, TypeOneMultiSignature, TypeTwoMultiSignature,
-};
-use ethlambda_types::primitives::{H256, HashTreeRoot as _};
-use libssz::SszEncode as _;
+use ethlambda_types::block::{ByteList512KiB, SignedBlock};
+use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -96,11 +93,16 @@ pub struct AttestationStepData {
     pub proof: Option<ProofStepData>,
 }
 
+/// Aggregated-attestation proof carried by `gossipAggregatedAttestation`
+/// steps (leanSpec PR #717 schema).
+///
+/// `participants` arrives as `{ data: [bool, ...] }` and `proof` as
+/// `{ data: "0x<hex>" }`; the latter is the lean-multisig Type-1
+/// `compress_without_pubkeys()` bytes for that AttestationData.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStepData {
     pub participants: AggregationBits,
-    #[serde(rename = "proofData")]
-    pub proof_data: HexByteList,
+    pub proof: HexByteList,
 }
 
 /// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`.
@@ -151,52 +153,17 @@ impl BlockStepData {
         }
     }
 
-    /// Build a `SignedBlock` whose merged Type-2 proof is structurally correct
-    /// (one Type-1 info entry per block-body attestation plus a trailing
-    /// proposer entry) but carries empty proof bytes — the crypto layer is
-    /// never invoked by callers of this helper.
+    /// Build a `SignedBlock` with an empty proof blob.
     ///
     /// Used by callers that import the block via `on_block_without_verification`
-    /// (fork-choice spec-test runner and Hive test-driver), where
-    /// `process_new_block` still decodes the merged proof and asserts the info
-    /// list aligns with `attestations.len() + 1` before dispatching.
-    ///
-    /// Oversized-block tests (more than `MAX_ATTESTATIONS_DATA` attestations)
-    /// overflow `TypeOneInfos`'s SSZ-list cap, so we fall back to an empty
-    /// proof blob — `process_new_block` rejects with `TooManyAttestationData`
-    /// before the proof is ever decoded, so its contents don't matter for
-    /// those scenarios.
+    /// (fork-choice spec-test runner and Hive test-driver), which skip the
+    /// crypto verifier entirely. Under the leanSpec PR #717 wire format the
+    /// merged proof bytes live opaquely on `SignedBlock.proof` and are only
+    /// inspected by `verify_block_signatures`, so an empty blob suffices.
     pub fn to_blank_signed_block(&self) -> SignedBlock {
-        let block = self.to_block();
-        let block_root = block.hash_tree_root();
-        let proof = if block.body.attestations.len() > MAX_ATTESTATIONS_DATA {
-            ByteListMiB::default()
-        } else {
-            let attestation_proofs: Vec<TypeOneMultiSignature> = block
-                .body
-                .attestations
-                .iter()
-                .map(|att| {
-                    TypeOneMultiSignature::empty(
-                        att.aggregation_bits.clone(),
-                        att.data.hash_tree_root(),
-                        att.data.slot,
-                    )
-                })
-                .collect();
-            let mut all = attestation_proofs;
-            all.push(TypeOneMultiSignature::for_proposer(
-                block.proposer_index,
-                ByteListMiB::default(),
-                block_root,
-                block.slot,
-            ));
-            let merged = TypeTwoMultiSignature::from_type_1s(all);
-            ByteListMiB::try_from(merged.to_ssz()).expect("merged proof fits in ByteListMiB")
-        };
         SignedBlock {
-            message: block,
-            proof,
+            message: self.to_block(),
+            proof: ByteList512KiB::default(),
         }
     }
 }

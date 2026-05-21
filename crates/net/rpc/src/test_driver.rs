@@ -42,9 +42,9 @@ use ethlambda_types::{
     attestation::{
         AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
     },
-    block::{Block, ByteListMiB, TypeOneMultiSignature},
+    block::{Block, ByteList512KiB, TypeOneMultiSignature},
     checkpoint::Checkpoint,
-    primitives::{H256, HashTreeRoot},
+    primitives::H256,
     state::{State, anchor_pair_is_consistent},
 };
 use serde::{Deserialize, Serialize};
@@ -386,17 +386,12 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .proof
                 .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
             let participants: EthAggregationBits = proof.participants.into();
-            let proof_bytes: Vec<u8> = proof.proof_data.into();
-            let proof_data = ByteListMiB::try_from(proof_bytes)
+            let proof_bytes: Vec<u8> = proof.proof.into();
+            let proof_data = ByteList512KiB::try_from(proof_bytes)
                 .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
             let data: ethlambda_types::attestation::AttestationData = att.data.into();
             let aggregated = SignedAggregatedAttestation {
-                proof: TypeOneMultiSignature::new(
-                    participants,
-                    data.hash_tree_root(),
-                    data.slot,
-                    proof_data,
-                ),
+                proof: TypeOneMultiSignature::new(participants, proof_data),
                 data,
             };
             store::on_gossip_aggregated_attestation(store, aggregated).map_err(|e| e.to_string())

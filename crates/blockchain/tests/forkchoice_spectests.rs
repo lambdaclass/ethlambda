@@ -142,16 +142,12 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let proof_fixture = att_data
                         .proof
                         .expect("gossipAggregatedAttestation step missing proof");
-                    let proof_bytes: Vec<u8> = proof_fixture.proof_data.into();
+                    let proof_bytes: Vec<u8> = proof_fixture.proof.into();
                     let proof_data = ByteList::try_from(proof_bytes)
-                        .expect("aggregated proof data fits in ByteListMiB");
+                        .expect("aggregated proof data fits in ByteList512KiB");
                     let data: AttestationData = att_data.data.into();
-                    let proof = TypeOneMultiSignature::new(
-                        proof_fixture.participants.into(),
-                        data.hash_tree_root(),
-                        data.slot,
-                        proof_data,
-                    );
+                    let proof =
+                        TypeOneMultiSignature::new(proof_fixture.participants.into(), proof_data);
                     let aggregated = SignedAggregatedAttestation { data, proof };
 
                     let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
