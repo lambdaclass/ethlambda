@@ -426,20 +426,20 @@ impl GossipSignatureBuffer {
     ///
     /// Returns the number of data_root entries pruned.
     fn prune(&mut self, finalized_slot: u64) -> usize {
-        let mut pruned_roots: HashSet<H256> = HashSet::new();
-        self.data.retain(|root, entry| {
+        let before = self.data.len();
+        self.data.retain(|_root, entry| {
             if entry.data.slot > finalized_slot {
                 true
             } else {
                 self.total_signatures -= entry.signatures.len();
-                pruned_roots.insert(*root);
                 false
             }
         });
-        if !pruned_roots.is_empty() {
-            self.order.retain(|r| !pruned_roots.contains(r));
+        let pruned = before - self.data.len();
+        if pruned > 0 {
+            self.order.retain(|r| self.data.contains_key(r));
         }
-        pruned_roots.len()
+        pruned
     }
 
     /// Returns a snapshot of all gossip signatures grouped by attestation data.
