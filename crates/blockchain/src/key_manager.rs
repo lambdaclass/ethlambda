@@ -53,10 +53,10 @@ impl KeyManager {
     pub fn advance_keys_to(&mut self, slot: u32) {
         for (validator_id, key_pair) in self.keys.iter_mut() {
             let _ = advance_key(*validator_id, &mut key_pair.attestation_key, slot).inspect_err(
-                |err| warn!(%err, "Failed to advance attestation key preparation window"),
+                |err| warn!(validator_id, slot, %err, "Failed to advance attestation key preparation window"),
             );
             let _ = advance_key(*validator_id, &mut key_pair.proposal_key, slot).inspect_err(
-                |err| warn!(%err, "Failed to advance proposal key preparation window"),
+                |err| warn!(validator_id, slot, %err, "Failed to advance proposal key preparation window"),
             );
         }
     }
