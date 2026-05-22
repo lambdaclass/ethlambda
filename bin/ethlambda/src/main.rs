@@ -626,7 +626,7 @@ async fn fetch_initial_state(
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
-    let Some((first_url, rest_urls)) = checkpoint_urls.split_first() else {
+    if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
         return Ok(Store::from_anchor_state(backend, genesis_state));
@@ -639,31 +639,26 @@ async fn fetch_initial_state(
         url_count = checkpoint_urls.len(),
         "Starting checkpoint sync"
     );
-    let mut result = try_checkpoint_url(first_url, genesis.genesis_time, &validators).await;
-    if let Err(err) = &result {
-        if rest_urls.is_empty() {
-            warn!(%first_url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
-        } else {
-            warn!(%first_url, %err, "Checkpoint sync failed for this peer; trying next URL");
-        }
-    }
 
-    for (idx, url) in rest_urls.iter().enumerate() {
-        if result.is_ok() {
-            break;
-        }
-        result = try_checkpoint_url(url, genesis.genesis_time, &validators).await;
-        if let Err(err) = &result {
-            let has_more = idx + 1 < rest_urls.len();
-            if has_more {
-                warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
-            } else {
-                warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+    let mut iter = checkpoint_urls.iter().peekable();
+    let (state, signed_block) = loop {
+        let Some(url) = iter.next() else {
+            return Err(checkpoint_sync::CheckpointSyncError::AllPeersFailed);
+        };
+        match try_checkpoint_url(url, genesis.genesis_time, &validators).await {
+            Ok(pair) => {
+                info!(%url, "Checkpoint sync successful with this peer");
+                break pair;
+            }
+            Err(err) => {
+                if iter.peek().is_some() {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
+                } else {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+                }
             }
         }
-    }
-
-    let (state, signed_block) = result?;
+    };
 
     info!(
         slot = state.slot,

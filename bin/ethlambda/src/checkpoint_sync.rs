@@ -58,6 +58,8 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
+    #[error("all checkpoint peers failed")]
+    AllPeersFailed,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
