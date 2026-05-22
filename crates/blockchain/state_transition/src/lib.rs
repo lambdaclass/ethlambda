@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ethlambda_types::{
     ShortRoot,
+    attestation::AttestationData,
     block::{AggregatedAttestations, Block, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -9,7 +10,7 @@ use ethlambda_types::{
 };
 use tracing::{info, warn};
 
-mod justified_slots_ops;
+pub mod justified_slots_ops;
 pub mod metrics;
 
 #[derive(Debug, thiserror::Error)]
@@ -271,7 +272,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, source, target) {
+        if !is_valid_vote(state, attestation_data) {
             continue;
         }
 
@@ -337,11 +338,14 @@ fn process_attestations(
 /// Checks (all must pass):
 /// 1. Source is already justified
 /// 2. Target is not yet justified
-/// 3. Neither root is zero hash
-/// 4. Both checkpoints exist in historical_block_hashes
-/// 5. Target slot > source slot
-/// 6. Target slot is justifiable after the finalized slot
-fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool {
+/// 3. Both checkpoints match the canonical chain at their slots (which also
+///    rejects zero-hash source or target roots)
+/// 4. Target slot > source slot
+/// 5. Target slot is justifiable after the finalized slot
+fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
+    let source = data.source;
+    let target = data.target;
+
     // Check that the source is already justified
     if !justified_slots_ops::is_slot_justified(
         &state.justified_slots,
@@ -361,13 +365,9 @@ fn is_valid_vote(state: &State, source: Checkpoint, target: Checkpoint) -> bool 
         return false;
     }
 
-    // Ignore votes that reference zero-hash slots.
-    if source.root == H256::ZERO || target.root == H256::ZERO {
-        return false;
-    }
-
-    // Ensure the vote refers to blocks that actually exist on our chain
-    if !checkpoint_exists(state, source) || !checkpoint_exists(state, target) {
+    // Ensure the vote refers to blocks that actually exist on our chain;
+    // also rejects zero-hash source or target inline.
+    if !attestation_data_matches_chain(&state.historical_block_hashes, data) {
         return false;
     }
 
@@ -473,12 +473,28 @@ fn serialize_justifications(
     state.justifications_validators = justifications_validators;
 }
 
-fn checkpoint_exists(state: &State, checkpoint: Checkpoint) -> bool {
-    state
-        .historical_block_hashes
-        .get(checkpoint.slot as usize)
-        .map(|root| root == &checkpoint.root)
-        .unwrap_or(false)
+/// Whether both source and target checkpoints in `data` match the chain at
+/// their slots.
+///
+/// Callers pass a chain view as it would appear after `process_block_header`
+/// on the consuming block: covering `[0, block.slot - 1]` with `parent_root`
+/// at the parent slot and `H256::ZERO` for empty slots between parent and the
+/// candidate.
+pub fn attestation_data_matches_chain(
+    historical_block_hashes: &[H256],
+    data: &AttestationData,
+) -> bool {
+    if data.source.root == H256::ZERO || data.target.root == H256::ZERO {
+        return false;
+    }
+    let source_slot = data.source.slot as usize;
+    let target_slot = data.target.slot as usize;
+    if source_slot >= historical_block_hashes.len() || target_slot >= historical_block_hashes.len()
+    {
+        return false;
+    }
+    historical_block_hashes[source_slot] == data.source.root
+        && historical_block_hashes[target_slot] == data.target.root
 }
 
 /// Checks if the slot is a valid candidate for justification after a given finalized slot.
