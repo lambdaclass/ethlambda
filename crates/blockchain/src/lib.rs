@@ -7,7 +7,10 @@ use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
-    attestation::{SignedAggregatedAttestation, SignedAttestation},
+    attestation::{
+        AggregatedAttestation, AggregationBits, SignedAggregatedAttestation, SignedAttestation,
+        validator_indices,
+    },
     block::{BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
 };
@@ -27,7 +30,6 @@ use tracing::{error, info, trace, warn};
 use crate::store::StoreError;
 
 pub mod aggregation;
-pub mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -197,15 +199,11 @@ impl BlockChainServer {
         // Emit the post-block attestation aggregate coverage report for the
         // previous slot at the start of each new slot.
         if interval == 0 && slot > 0 {
-            coverage::emit_post_block_report(
-                &self.store,
-                self.attestation_committee_count,
-                slot - 1,
-            );
+            emit_post_block_coverage(&self.store, self.attestation_committee_count, slot - 1);
         }
 
         if interval == 2 && is_aggregator {
-            coverage::emit_agg_start_new(&self.store, self.attestation_committee_count);
+            emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -359,7 +357,7 @@ impl BlockChainServer {
             return;
         };
 
-        coverage::emit_proposal_coverage(
+        emit_proposal_coverage(
             &self.store,
             self.attestation_committee_count,
             block.body.attestations.iter(),
@@ -788,4 +786,180 @@ impl Handler<AggregationDeadline> for BlockChainServer {
             session.cancel.cancel();
         }
     }
+}
+
+// --- Attestation aggregate coverage emission ---
+//
+// `seen` tracks covered validators; `has_subnet` tracks covered subnets
+// (subnet = `vid % committee_count`, matching the gossip subnet assignment
+// in `crates/net/p2p/src/lib.rs`). Pure observability — no fork-choice or
+// state-transition effect.
+
+fn cov_add(seen: &mut [bool], has_subnet: &mut [bool], bits: &AggregationBits) {
+    let cc = has_subnet.len();
+    if cc == 0 {
+        return;
+    }
+    for vid in validator_indices(bits) {
+        let vid = vid as usize;
+        if vid < seen.len() {
+            seen[vid] = true;
+            has_subnet[vid % cc] = true;
+        }
+    }
+}
+
+fn cov_record(section: &str, seen: &[bool], has_subnet: &[bool]) {
+    metrics::set_attestation_aggregate_coverage_validators(
+        section,
+        "combined",
+        seen.iter().filter(|&&b| b).count() as i64,
+    );
+    metrics::set_attestation_aggregate_coverage_subnets(
+        section,
+        has_subnet.iter().filter(|&&b| b).count() as i64,
+    );
+}
+
+fn or_into(dst: &mut [bool], src: &[bool]) {
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d |= s;
+    }
+}
+
+/// Post-block coverage report for `reporting_slot`. Emits `timely` / `late` /
+/// `block` / `combined` sections plus the `diff_validators` symmetric
+/// difference between `block` and `timely`. Called at interval 0 of the
+/// next slot.
+fn emit_post_block_coverage(store: &Store, committee_count: u64, reporting_slot: u64) {
+    let validator_count = store.head_state().validators.len();
+    if validator_count == 0 || committee_count == 0 {
+        return;
+    }
+    let cc = committee_count as usize;
+    let (mut timely_v, mut timely_s) = (vec![false; validator_count], vec![false; cc]);
+    let (mut late_v, mut late_s) = (vec![false; validator_count], vec![false; cc]);
+    let (mut block_v, mut block_s) = (vec![false; validator_count], vec![false; cc]);
+
+    // `timely`: pre-merge snapshot of `new_payloads` captured before promote.
+    if let Some(snap) = store.pre_merge_new_coverage()
+        && snap.slot == reporting_slot
+    {
+        for bits in &snap.participant_bits {
+            cov_add(&mut timely_v, &mut timely_s, bits);
+        }
+    }
+    // `late`: current `new_payloads` matching the reporting slot
+    // (arrived after the last promote).
+    for (data, proofs) in store.new_aggregated_payloads().values() {
+        if data.slot == reporting_slot {
+            for proof in proofs {
+                cov_add(&mut late_v, &mut late_s, &proof.participants);
+            }
+        }
+    }
+    // `block`: participant bits from the most-recently-imported block.
+    if let Some(snap) = store.last_block_coverage()
+        && snap.slot == reporting_slot
+    {
+        for bits in &snap.participant_bits {
+            cov_add(&mut block_v, &mut block_s, bits);
+        }
+    }
+
+    let mut combined_v = timely_v.clone();
+    let mut combined_s = timely_s.clone();
+    or_into(&mut combined_v, &late_v);
+    or_into(&mut combined_s, &late_s);
+    or_into(&mut combined_v, &block_v);
+    or_into(&mut combined_s, &block_s);
+
+    cov_record("timely", &timely_v, &timely_s);
+    cov_record("late", &late_v, &late_s);
+    cov_record("block", &block_v, &block_s);
+    cov_record("combined", &combined_v, &combined_s);
+
+    let (block_only, timely_only) =
+        block_v
+            .iter()
+            .zip(timely_v.iter())
+            .fold((0i64, 0i64), |(b, t), (bv, tv)| match (bv, tv) {
+                (true, false) => (b + 1, t),
+                (false, true) => (b, t + 1),
+                _ => (b, t),
+            });
+    metrics::set_attestation_aggregate_coverage_diff_validators("block_only", block_only);
+    metrics::set_attestation_aggregate_coverage_diff_validators("timely_only", timely_only);
+}
+
+/// `agg_start_new` coverage from `new_payloads`, called right before fork-
+/// choice aggregation runs at interval 2.
+fn emit_agg_start_new_coverage(store: &Store, committee_count: u64) {
+    let validator_count = store.head_state().validators.len();
+    if validator_count == 0 || committee_count == 0 {
+        return;
+    }
+    let cc = committee_count as usize;
+    let mut seen = vec![false; validator_count];
+    let mut has_subnet = vec![false; cc];
+    for (_, proofs) in store.new_aggregated_payloads().values() {
+        for proof in proofs {
+            cov_add(&mut seen, &mut has_subnet, &proof.participants);
+        }
+    }
+    cov_record("agg_start_new", &seen, &has_subnet);
+}
+
+/// `proposal_payloads` / `proposal_gossip` / `proposal_combined` for a block
+/// we are about to publish. Each block-included validator is classified by
+/// whether its `AttestationData` has a matching known-payload proof.
+fn emit_proposal_coverage<'a>(
+    store: &Store,
+    committee_count: u64,
+    selected: impl IntoIterator<Item = &'a AggregatedAttestation>,
+) {
+    let validator_count = store.head_state().validators.len();
+    if validator_count == 0 || committee_count == 0 {
+        return;
+    }
+    let cc = committee_count as usize;
+    let mut combined_v = vec![false; validator_count];
+    let mut combined_s = vec![false; cc];
+    let mut payload_seen = vec![false; validator_count];
+    let known = store.known_aggregated_payloads();
+    for att in selected {
+        cov_add(&mut combined_v, &mut combined_s, &att.aggregation_bits);
+        let data_root = att.data.hash_tree_root();
+        if let Some((_, proofs)) = known.get(&data_root) {
+            for proof in proofs {
+                for vid in validator_indices(&proof.participants) {
+                    let vid = vid as usize;
+                    if vid < payload_seen.len() {
+                        payload_seen[vid] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut payloads_v = vec![false; validator_count];
+    let mut payloads_s = vec![false; cc];
+    let mut gossip_v = vec![false; validator_count];
+    let mut gossip_s = vec![false; cc];
+    for vid in 0..validator_count {
+        if !combined_v[vid] {
+            continue;
+        }
+        let subnet = vid % cc;
+        if payload_seen[vid] {
+            payloads_v[vid] = true;
+            payloads_s[subnet] = true;
+        } else {
+            gossip_v[vid] = true;
+            gossip_s[subnet] = true;
+        }
+    }
+    cov_record("proposal_payloads", &payloads_v, &payloads_s);
+    cov_record("proposal_gossip", &gossip_v, &gossip_s);
+    cov_record("proposal_combined", &combined_v, &combined_s);
 }
