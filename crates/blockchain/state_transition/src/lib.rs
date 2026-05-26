@@ -304,6 +304,7 @@ fn process_attestations(
         // Check whether the vote count crosses the supermajority threshold
         let vote_count = votes.iter().filter(|voted| **voted).count();
         if 3 * vote_count >= 2 * validator_count {
+            // If the slot is higher, update the latest justified
             state.latest_justified =
                 std::cmp::max_by_key(state.latest_justified, target, |c| c.slot);
             justified_slots_ops::set_justified(
