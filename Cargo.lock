@@ -2153,6 +2153,7 @@ dependencies = [
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
+ "libssz-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
