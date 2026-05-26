@@ -304,18 +304,8 @@ fn process_attestations(
         // Check whether the vote count crosses the supermajority threshold
         let vote_count = votes.iter().filter(|voted| **voted).count();
         if 3 * vote_count >= 2 * validator_count {
-            // The block becomes justified. Only advance `latest_justified` to a
-            // strictly higher slot: attestations within a block can target slots
-            // in non-monotonic order (each independently justifiable from a
-            // common source), and the "latest justified" pointer must remain the
-            // maximum across them. Otherwise a later attestation targeting a
-            // lower slot can clobber an earlier one's higher slot, leaving the
-            // post-state below the store's monotonic `latest_justified` and
-            // permanently failing `JustifiedDivergenceNotClosed` on every future
-            // proposal.
-            if target.slot > state.latest_justified.slot {
-                state.latest_justified = target;
-            }
+            state.latest_justified =
+                std::cmp::max_by_key(state.latest_justified, target, |c| c.slot);
             justified_slots_ops::set_justified(
                 &mut state.justified_slots,
                 state.latest_finalized.slot,
