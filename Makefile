@@ -24,15 +24,15 @@ docker-build: ## 🐳 Build the Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
 	@echo
 
-# 2026-04-29
-LEAN_SPEC_COMMIT_HASH:=18fe71fee49f8865a5c8a4cb8b1787b0cbc9e25b
+# 2026-05-21
+LEAN_SPEC_COMMIT_HASH:=825bec6bf278920cfc56730d64a7c90522a0bb6c
 
 leanSpec:
 	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
 	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
 
 leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork devnet -n auto --scheme=prod -o fixtures
+	cd leanSpec && uv run fill --fork Lstar -n auto --scheme prod -o fixtures
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
