@@ -126,9 +126,6 @@ pub type ByteList512KiB = ByteList<524_288>;
 /// Maximum number of distinct `AttestationData` entries permitted in a single
 /// block. Canonical home for the cap shared across `ethlambda-blockchain`,
 /// `ethlambda-test-fixtures`, and the wire types in this crate.
-///
-/// See: leanSpec PR #717, which lowered the cap from 16 to 8 alongside the
-/// merged block-proof refactor.
 pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
 /// A Type-1 single-message proof aggregating signatures from many validators.
