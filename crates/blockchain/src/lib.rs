@@ -197,12 +197,6 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        // Emit the post-block attestation aggregate coverage report for the
-        // previous slot at the start of each new slot.
-        if interval == 0 && slot > 0 {
-            emit_post_block_coverage(&self.store, self.attestation_committee_count, slot - 1);
-        }
-
         if interval == 2 && is_aggregator {
             emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
@@ -217,6 +211,13 @@ impl BlockChainServer {
         // Reuse the same snapshot so self-delivery decisions match the rest
         // of the tick.
         if interval == 1 {
+            // Emit the post-block coverage report for the previous slot. Fired
+            // at interval 1 (not 0) so the block carrying `slot - 1`'s votes —
+            // proposed at interval 0 of this slot — has typically been received
+            // and processed, letting the `block` section see the same round.
+            if slot > 0 {
+                emit_post_block_coverage(&self.store, self.attestation_committee_count, slot - 1);
+            }
             self.produce_attestations(slot, is_aggregator);
         }
 
@@ -842,16 +843,19 @@ fn emit_post_block_coverage(store: &Store, committee_count: u64, reporting_slot:
     let (mut late_v, mut late_s) = (vec![false; validator_count], vec![false; cc]);
     let (mut block_v, mut block_s) = (vec![false; validator_count], vec![false; cc]);
 
-    // `timely`: pre-merge snapshot of `new_payloads` captured before promote.
-    if let Some(snap) = store.pre_merge_new_coverage()
-        && snap.slot == reporting_slot
-    {
-        for bits in &snap.participant_bits {
-            cov_add(&mut timely_v, &mut timely_s, bits);
+    // Every section is the same cohort: validators whose attestations *for*
+    // `reporting_slot` (`data.slot == reporting_slot`) were seen via that
+    // channel.
+
+    // `timely`: pre-merge snapshot of `new_payloads`, filtered to this round.
+    if let Some(snap) = store.pre_merge_new_coverage() {
+        for (data_slot, bits) in &snap.entries {
+            if *data_slot == reporting_slot {
+                cov_add(&mut timely_v, &mut timely_s, bits);
+            }
         }
     }
-    // `late`: current `new_payloads` matching the reporting slot
-    // (arrived after the last promote).
+    // `late`: current `new_payloads` for this round (arrived after the promote).
     for (data, proofs) in store.new_aggregated_payloads().values() {
         if data.slot == reporting_slot {
             for proof in proofs {
@@ -859,12 +863,15 @@ fn emit_post_block_coverage(store: &Store, committee_count: u64, reporting_slot:
             }
         }
     }
-    // `block`: participant bits from the most-recently-imported block.
-    if let Some(snap) = store.last_block_coverage()
-        && snap.slot == reporting_slot
-    {
-        for bits in &snap.participant_bits {
-            cov_add(&mut block_v, &mut block_s, bits);
+    // `block`: attestations included in the canonical head block. At interval 1
+    // the head is normally the block proposed at `reporting_slot + 1`, which
+    // carries this round's votes; filter by `data.slot` so we count the same
+    // cohort even if the head is at a different slot.
+    if let Some(block) = store.get_block(&store.head()) {
+        for att in block.body.attestations.iter() {
+            if att.data.slot == reporting_slot {
+                cov_add(&mut block_v, &mut block_s, &att.aggregation_bits);
+            }
         }
     }
 
@@ -874,6 +881,13 @@ fn emit_post_block_coverage(store: &Store, committee_count: u64, reporting_slot:
     or_into(&mut combined_s, &late_s);
     or_into(&mut combined_v, &block_v);
     or_into(&mut combined_s, &block_s);
+
+    // Emit nothing when there is no coverage for this round, rather than
+    // pushing a misleading all-zero report (e.g. `block_only=0, timely_only=N`
+    // on a missed slot). Gauges retain their previous value.
+    if !combined_v.iter().any(|&b| b) {
+        return;
+    }
 
     cov_record("timely", &timely_v, &timely_s);
     cov_record("late", &late_v, &late_s);
