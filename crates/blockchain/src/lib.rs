@@ -910,9 +910,8 @@ fn emit_agg_start_new_coverage(store: &Store, committee_count: u64) {
     cov_record("agg_start_new", &seen, &has_subnet);
 }
 
-/// `proposal_payloads` / `proposal_gossip` / `proposal_combined` for a block
-/// we are about to publish. Each block-included validator is classified by
-/// whether its `AttestationData` has a matching known-payload proof.
+/// `proposal_combined` coverage for a block we are about to publish: the full
+/// set of validators included across the block's aggregated attestations.
 fn emit_proposal_coverage<'a>(
     store: &Store,
     committee_count: u64,
@@ -925,41 +924,8 @@ fn emit_proposal_coverage<'a>(
     let cc = committee_count as usize;
     let mut combined_v = vec![false; validator_count];
     let mut combined_s = vec![false; cc];
-    let mut payload_seen = vec![false; validator_count];
-    let known = store.known_aggregated_payloads();
     for att in selected {
         cov_add(&mut combined_v, &mut combined_s, &att.aggregation_bits);
-        let data_root = att.data.hash_tree_root();
-        if let Some((_, proofs)) = known.get(&data_root) {
-            for proof in proofs {
-                for vid in validator_indices(&proof.participants) {
-                    let vid = vid as usize;
-                    if vid < payload_seen.len() {
-                        payload_seen[vid] = true;
-                    }
-                }
-            }
-        }
     }
-
-    let mut payloads_v = vec![false; validator_count];
-    let mut payloads_s = vec![false; cc];
-    let mut gossip_v = vec![false; validator_count];
-    let mut gossip_s = vec![false; cc];
-    for vid in 0..validator_count {
-        if !combined_v[vid] {
-            continue;
-        }
-        let subnet = vid % cc;
-        if payload_seen[vid] {
-            payloads_v[vid] = true;
-            payloads_s[subnet] = true;
-        } else {
-            gossip_v[vid] = true;
-            gossip_s[subnet] = true;
-        }
-    }
-    cov_record("proposal_payloads", &payloads_v, &payloads_s);
-    cov_record("proposal_gossip", &gossip_v, &gossip_s);
     cov_record("proposal_combined", &combined_v, &combined_s);
 }

@@ -16,8 +16,6 @@ pub const ATTESTATION_AGGREGATE_COVERAGE_SECTIONS: &[&str] = &[
     "block",
     "combined",
     "agg_start_new",
-    "proposal_payloads",
-    "proposal_gossip",
     "proposal_combined",
 ];
 
