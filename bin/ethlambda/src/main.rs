@@ -608,25 +608,12 @@ async fn fetch_initial_state(
         "Starting checkpoint sync"
     );
 
-    let mut iter = checkpoint_urls.iter().peekable();
-    let (state, signed_block) = loop {
-        let Some(url) = iter.next() else {
-            return Err(checkpoint_sync::CheckpointSyncError::AllPeersFailed);
-        };
-        match checkpoint_sync::try_checkpoint_url(url, genesis.genesis_time, &validators).await {
-            Ok(pair) => {
-                info!(%url, "Checkpoint sync successful with this peer");
-                break pair;
-            }
-            Err(err) => {
-                if iter.peek().is_some() {
-                    warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
-                } else {
-                    warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
-                }
-            }
-        }
-    };
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_from_peers(
+        checkpoint_urls,
+        genesis.genesis_time,
+        &validators,
+    )
+    .await?;
 
     info!(
         slot = state.slot,

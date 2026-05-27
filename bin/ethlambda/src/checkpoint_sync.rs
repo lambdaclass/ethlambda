@@ -5,7 +5,7 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
 /// Fail fast if the peer is unreachable.
@@ -275,7 +275,7 @@ fn verify_checkpoint_state(
 /// Fetch the finalized anchor from a single checkpoint URL, retrying transient
 /// races where the peer advances finalization between the state and block
 /// fetches.
-pub async fn try_checkpoint_url(
+async fn try_checkpoint_url(
     url: &str,
     genesis_time: u64,
     validators: &[Validator],
@@ -300,6 +300,35 @@ pub async fn try_checkpoint_url(
                 attempt += 1;
             }
             Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Try each checkpoint URL in order, returning the first successful anchor
+/// pair. Logs per-peer success/failure and returns `AllPeersFailed` only when
+/// every URL has been exhausted.
+pub async fn fetch_anchor_from_peers(
+    checkpoint_urls: &[String],
+    genesis_time: u64,
+    validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let mut iter = checkpoint_urls.iter().peekable();
+    loop {
+        let Some(url) = iter.next() else {
+            return Err(CheckpointSyncError::AllPeersFailed);
+        };
+        match try_checkpoint_url(url, genesis_time, validators).await {
+            Ok(pair) => {
+                info!(%url, "Checkpoint sync successful with this peer");
+                return Ok(pair);
+            }
+            Err(err) => {
+                if iter.peek().is_some() {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
+                } else {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+                }
+            }
         }
     }
 }
