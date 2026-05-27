@@ -37,7 +37,7 @@ fn accept_new_attestations(store: &mut Store, log_tree: bool) {
 ///
 /// When `log_tree` is true, also computes block weights and logs an ASCII
 /// fork choice tree to the terminal.
-fn update_head(store: &mut Store, log_tree: bool) {
+pub fn update_head(store: &mut Store, log_tree: bool) {
     let blocks = store.get_live_chain();
     let attestations = store.extract_latest_known_attestations();
     let old_head = store.head();
