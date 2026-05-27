@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorSecretKey, ValidatorSignature},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::metrics;
 
@@ -48,6 +49,18 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
+    /// Advances every validator's XMSS preparation windows to cover slot
+    pub fn advance_keys_to(&mut self, slot: u32) {
+        for (validator_id, key_pair) in self.keys.iter_mut() {
+            let _ = advance_key(*validator_id, &mut key_pair.attestation_key, slot).inspect_err(
+                |err| warn!(validator_id, slot, %err, "Failed to advance attestation key preparation window"),
+            );
+            let _ = advance_key(*validator_id, &mut key_pair.proposal_key, slot).inspect_err(
+                |err| warn!(validator_id, slot, %err, "Failed to advance proposal key preparation window"),
+            );
+        }
+    }
+
     /// Signs an attestation using the validator's attestation key.
     pub fn sign_attestation(
         &mut self,
@@ -83,19 +96,7 @@ impl KeyManager {
         // Advance XMSS key preparation window if the slot is outside the current window.
         // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
         // Multiple advances may be needed if the node was offline for an extended period.
-        if !key_pair.attestation_key.is_prepared_for(slot) {
-            info!(validator_id, slot, "Advancing XMSS key preparation window");
-            while !key_pair.attestation_key.is_prepared_for(slot) {
-                let before = key_pair.attestation_key.get_prepared_interval();
-                key_pair.attestation_key.advance_preparation();
-                if key_pair.attestation_key.get_prepared_interval() == before {
-                    return Err(KeyManagerError::SigningError(format!(
-                        "XMSS key exhausted for validator {validator_id}: \
-                         slot {slot} is beyond the key's activation interval"
-                    )));
-                }
-            }
-        }
+        advance_key(validator_id, &mut key_pair.attestation_key, slot)?;
 
         let signature: ValidatorSignature = {
             let _timing = metrics::time_pq_sig_attestation_signing();
@@ -125,22 +126,7 @@ impl KeyManager {
         // Advance XMSS key preparation window if the slot is outside the current window.
         // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
         // Multiple advances may be needed if the node was offline for an extended period.
-        if !key_pair.proposal_key.is_prepared_for(slot) {
-            info!(
-                validator_id,
-                slot, "Advancing XMSS proposal key preparation window"
-            );
-            while !key_pair.proposal_key.is_prepared_for(slot) {
-                let before = key_pair.proposal_key.get_prepared_interval();
-                key_pair.proposal_key.advance_preparation();
-                if key_pair.proposal_key.get_prepared_interval() == before {
-                    return Err(KeyManagerError::SigningError(format!(
-                        "XMSS proposal key exhausted for validator {validator_id}: \
-                         slot {slot} is beyond the key's activation interval"
-                    )));
-                }
-            }
-        }
+        advance_key(validator_id, &mut key_pair.proposal_key, slot)?;
 
         let signature: ValidatorSignature = key_pair
             .proposal_key
@@ -151,6 +137,35 @@ impl KeyManager {
         XmssSignature::try_from(sig_bytes)
             .map_err(|e| KeyManagerError::SignatureConversionError(e.to_string()))
     }
+}
+
+fn advance_key(
+    validator_id: u64,
+    key: &mut ValidatorSecretKey,
+    slot: u32,
+) -> Result<(), KeyManagerError> {
+    if key.is_prepared_for(slot) {
+        return Ok(());
+    }
+    info!(validator_id, slot, "Advancing XMSS key preparation window");
+    let start = Instant::now();
+    while !key.is_prepared_for(slot) {
+        let before = key.get_prepared_interval();
+        key.advance_preparation();
+        if key.get_prepared_interval() == before {
+            return Err(KeyManagerError::SigningError(format!(
+                "XMSS key exhausted for validator {validator_id}: \
+                 slot {slot} is beyond the key's activation interval"
+            )));
+        }
+    }
+    info!(
+        validator_id,
+        slot,
+        elapsed = ?start.elapsed(),
+        "Advanced XMSS key preparation window"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

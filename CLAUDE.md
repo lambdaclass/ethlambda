@@ -419,5 +419,5 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - ream (Rust): <https://github.com/ReamLabs/ream>
 - qlean (C++): <https://github.com/qdrvm/qlean-mini>
 - grandine (Rust): <https://github.com/grandinetech/lean/tree/main/lean_client>
-- gean (Go): <https://github.com/devlongs/gean>
+- gean (Go): <https://github.com/geanlabs/gean>
 - Lantern (C): <https://github.com/Pier-Two/lantern>

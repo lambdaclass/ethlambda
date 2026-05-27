@@ -1,18 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
-/// The tree hash root of an empty block body.
-///
-/// Used to detect genesis/anchor blocks that have no attestations,
-/// allowing us to skip storing empty bodies and reconstruct them on read.
-static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
-
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData, bits_is_subset},
+    attestation::{AttestationData, HashedAttestationData, bits_is_subset, blank_xmss_signature},
     block::{
-        AggregatedSignatureProof, Block, BlockBody, BlockHeader, BlockSignatures, SignedBlock,
+        AggregatedSignatureProof, AttestationSignatures, Block, BlockBody, BlockHeader,
+        BlockSignatures, SignedBlock,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -34,6 +29,24 @@ pub enum GetForkchoiceStoreError {
         anchor_state: Box<State>,
         anchor_block: Box<Block>,
     },
+}
+
+/// The tree hash root of an empty block body.
+///
+/// Used to detect genesis/anchor blocks that have no attestations,
+/// allowing us to skip storing empty bodies and reconstruct them on read.
+static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
+
+/// Build a placeholder `BlockSignatures` for blocks that were never signed.
+///
+/// Genesis-style anchor blocks have no proposer signature and no per-attestation
+/// proofs (no attestations exist). `get_signed_block` returns this so peers can
+/// still receive the block in BlocksByRoot responses.
+fn empty_block_signatures() -> BlockSignatures {
+    BlockSignatures {
+        attestation_signatures: AttestationSignatures::default(),
+        proposer_signature: blank_xmss_signature(),
+    }
 }
 
 /// Checkpoints to update in the forkchoice store.
@@ -248,6 +261,32 @@ impl PayloadBuffer {
             .collect()
     }
 
+    /// Prune payload entries whose attestation target slot is at or below `finalized_slot`.
+    ///
+    /// Mirrors leanSpec's `prune_stale_attestation_data`: an entry is stale once its
+    /// target checkpoint is finalized — it can no longer contribute to fork choice and
+    /// keeping it around only pollutes `existing_proofs_for_data` lookups, occasionally
+    /// forcing recursive aggregation when plain XMSS aggregation would suffice.
+    ///
+    /// Returns the number of data_root entries removed.
+    fn prune(&mut self, finalized_slot: u64) -> usize {
+        let before = self.data.len();
+        let total_proofs = &mut self.total_proofs;
+        self.data.retain(|_root, entry| {
+            if entry.data.target.slot > finalized_slot {
+                true
+            } else {
+                *total_proofs -= entry.proofs.len();
+                false
+            }
+        });
+        let pruned = before - self.data.len();
+        if pruned > 0 {
+            self.order.retain(|r| self.data.contains_key(r));
+        }
+        pruned
+    }
+
     /// Extract per-validator latest attestations from proofs' participation bits.
     ///
     /// Iterates entries in insertion order (via `self.order`) so that, when two
@@ -387,20 +426,20 @@ impl GossipSignatureBuffer {
     ///
     /// Returns the number of data_root entries pruned.
     fn prune(&mut self, finalized_slot: u64) -> usize {
-        let mut pruned_roots: HashSet<H256> = HashSet::new();
-        self.data.retain(|root, entry| {
+        let before = self.data.len();
+        self.data.retain(|_root, entry| {
             if entry.data.slot > finalized_slot {
                 true
             } else {
                 self.total_signatures -= entry.signatures.len();
-                pruned_roots.insert(*root);
                 false
             }
         });
-        if !pruned_roots.is_empty() {
-            self.order.retain(|r| !pruned_roots.contains(r));
+        let pruned = before - self.data.len();
+        if pruned > 0 {
+            self.order.retain(|r| self.data.contains_key(r));
         }
-        pruned_roots.len()
+        pruned
     }
 
     /// Returns a snapshot of all gossip signatures grouped by attestation data.
@@ -714,11 +753,12 @@ impl Store {
         {
             let pruned_chain = self.prune_live_chain(finalized.slot);
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+            let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
-            if pruned_chain > 0 || pruned_sigs > 0 {
+            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_chain, pruned_sigs, "Pruned finalized data"
+                    pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
                 );
             }
         }
@@ -815,6 +855,18 @@ impl Store {
     pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
         let mut gossip = self.gossip_signatures.lock().unwrap();
         gossip.prune(finalized_slot)
+    }
+
+    /// Prune aggregated payload buffers (new + known) whose target slot is at or below
+    /// `finalized_slot`.
+    ///
+    /// Mirrors leanSpec's `prune_stale_attestation_data` for the two aggregated payload
+    /// pools (gossip signatures are pruned separately by `prune_gossip_signatures`).
+    /// Returns the total number of data_root entries removed across both buffers.
+    pub fn prune_stale_aggregated_payloads(&mut self, finalized_slot: u64) -> usize {
+        let pruned_new = self.new_payloads.lock().unwrap().prune(finalized_slot);
+        let pruned_known = self.known_payloads.lock().unwrap().prune(finalized_slot);
+        pruned_new + pruned_known
     }
 
     /// Prune old states beyond the retention window.
@@ -990,15 +1042,21 @@ impl Store {
 
     /// Get a signed block by combining header, body, and signatures.
     ///
-    /// Returns None if any of the components are not found.
-    /// Note: Genesis block has no entry in BlockSignatures table.
+    /// Returns None if the header or body (for non-empty bodies) is missing,
+    /// or if the signature row is missing for any block other than the
+    /// slot-0 anchor.
+    ///
+    /// Signatures are absent for genesis-style anchor blocks (no proposer
+    /// ever signed them). To keep BlocksByRoot symmetric with the
+    /// fork-choice view for peers, synthesize empty `BlockSignatures` for
+    /// the slot-0 case only; for any other slot the missing-signature
+    /// state is treated as storage corruption and surfaces as `None`
+    /// rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Option<SignedBlock> {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
         let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let sig_bytes = view.get(Table::BlockSignatures, &key).expect("get")?;
-
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
@@ -1009,8 +1067,19 @@ impl Store {
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
+        let signature = match view.get(Table::BlockSignatures, &key).expect("get") {
+            Some(sig_bytes) => {
+                BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures")
+            }
+            // Synthesis only covers the genesis-style anchor (slot 0). Any other
+            // missing-signature case is a storage corruption that should surface
+            // as `None` rather than fabricating a block whose `attestation_signatures`
+            // list is empty regardless of what the body actually carries.
+            None if header.slot == 0 => empty_block_signatures(),
+            None => return None,
+        };
+
         let block = Block::from_header_and_body(header, body);
-        let signature = BlockSignatures::from_ssz_bytes(&sig_bytes).expect("valid signatures");
 
         Some(SignedBlock {
             message: block,
@@ -2045,6 +2114,95 @@ mod tests {
         assert_eq!(buf.total_proofs, 2);
     }
 
+    #[test]
+    fn payload_buffer_prune_drops_entries_with_finalized_target() {
+        let mut buf = PayloadBuffer::new(10);
+        let target_a = H256([0xaa; 32]);
+        let target_b = H256([0xbb; 32]);
+        let target_c = H256([0xcc; 32]);
+
+        // Three entries at different target slots: 3, 5, 7.
+        let data_3 = make_att_data_for_target(3, target_a);
+        let data_5 = make_att_data_for_target(5, target_b);
+        let data_7 = make_att_data_for_target(7, target_c);
+        let root_3 = data_3.hash_tree_root();
+        let root_5 = data_5.hash_tree_root();
+        let root_7 = data_7.hash_tree_root();
+
+        buf.push(
+            HashedAttestationData::new(data_3),
+            make_proof_for_validators(&[0]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_5),
+            make_proof_for_validators(&[1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data_7),
+            make_proof_for_validators(&[3]),
+        );
+        assert_eq!(buf.total_proofs, 3);
+
+        // Finalized slot 5 prunes targets 3 and 5 (≤ 5), keeps target 7.
+        let pruned = buf.prune(5);
+        assert_eq!(pruned, 2);
+        assert!(!buf.data.contains_key(&root_3));
+        assert!(!buf.data.contains_key(&root_5));
+        assert!(buf.data.contains_key(&root_7));
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.order.len(), 1);
+        assert_eq!(buf.order.front(), Some(&root_7));
+    }
+
+    #[test]
+    fn payload_buffer_prune_noop_when_nothing_stale() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data_for_target(10, H256([0xaa; 32]));
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[0]),
+        );
+
+        let pruned = buf.prune(5);
+        assert_eq!(pruned, 0);
+        assert_eq!(buf.total_proofs, 1);
+        assert_eq!(buf.order.len(), 1);
+    }
+
+    #[test]
+    fn store_prune_stale_aggregated_payloads_clears_both_buffers() {
+        let mut store = Store::test_store();
+
+        let stale = make_att_data_for_target(2, H256([0xaa; 32]));
+        let fresh = make_att_data_for_target(10, H256([0xbb; 32]));
+
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(stale.clone()),
+            make_proof_for_validators(&[0]),
+        );
+        store.insert_known_aggregated_payload(
+            HashedAttestationData::new(stale),
+            make_proof_for_validators(&[1]),
+        );
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(fresh.clone()),
+            make_proof_for_validators(&[2]),
+        );
+        store.insert_known_aggregated_payload(
+            HashedAttestationData::new(fresh),
+            make_proof_for_validators(&[3]),
+        );
+
+        assert_eq!(store.new_aggregated_payloads_count(), 2);
+        assert_eq!(store.known_aggregated_payloads_count(), 2);
+
+        // Finalized slot 5: stale (target.slot == 2) is dropped from both buffers.
+        let pruned = store.prune_stale_aggregated_payloads(5);
+        assert_eq!(pruned, 2);
+        assert_eq!(store.new_aggregated_payloads_count(), 1);
+        assert_eq!(store.known_aggregated_payloads_count(), 1);
+    }
+
     /// Build an attestation message at `slot` whose target points at `target_root`,
     /// distinct from the default zero target so two such datas have different roots.
     fn make_att_data_for_target(slot: u64, target_root: H256) -> AttestationData {
@@ -2312,5 +2470,53 @@ mod tests {
         assert!(!buf.data.contains_key(&slot1_root));
         assert_eq!(buf.total_signatures(), 2); // slot 2 (1) + slot 3 (1)
         assert_eq!(buf.len(), 2);
+    }
+
+    /// `Store::from_anchor_state` writes the header but no `BlockSignatures`
+    /// row for the slot-0 anchor. `get_signed_block` must synthesize an empty
+    /// `BlockSignatures` so the genesis block can still be served on
+    /// BlocksByRoot / `/lean/v0/blocks/finalized`.
+    #[test]
+    fn get_signed_block_synthesizes_blank_signatures_for_genesis_anchor() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+
+        let head_root = store.head();
+        let signed = store
+            .get_signed_block(&head_root)
+            .expect("genesis block must be retrievable with synthetic signatures");
+
+        assert_eq!(signed.message.slot, 0);
+        assert_eq!(signed.signature.proposer_signature, blank_xmss_signature());
+        assert_eq!(signed.signature.attestation_signatures.len(), 0);
+    }
+
+    /// The synthesis branch must be confined to the slot-0 anchor: a
+    /// non-genesis block whose `BlockSignatures` row is missing is treated
+    /// as storage corruption and surfaces as `None`, not a fabricated block.
+    #[test]
+    fn get_signed_block_returns_none_for_non_genesis_with_missing_signatures() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // Hand-insert a slot-1 header (and empty body, via `EMPTY_BODY_ROOT`)
+        // but skip the `BlockSignatures` row. This mimics the corruption case
+        // the guard is meant to catch, without going through the normal
+        // `insert_signed_block` write path which always writes all three rows.
+        let header = BlockHeader {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: *EMPTY_BODY_ROOT,
+        };
+        let root = header.hash_tree_root();
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockHeaders, vec![(root.to_ssz(), header.to_ssz())])
+            .expect("put header");
+        batch.commit().expect("commit");
+
+        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        assert!(store.get_signed_block(&root).is_none());
     }
 }

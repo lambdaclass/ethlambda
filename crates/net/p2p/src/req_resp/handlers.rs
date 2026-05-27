@@ -400,9 +400,8 @@ mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::{
-        attestation::XmssSignature,
+        attestation::blank_xmss_signature,
         block::{Block, BlockBody, BlockSignatures},
-        signature::SIGNATURE_SIZE,
         state::State,
     };
     use libssz_types::SszList;
@@ -419,7 +418,7 @@ mod tests {
             },
             signature: BlockSignatures {
                 attestation_signatures: SszList::new(),
-                proposer_signature: XmssSignature::try_from(vec![0u8; SIGNATURE_SIZE]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
             },
         }
     }
