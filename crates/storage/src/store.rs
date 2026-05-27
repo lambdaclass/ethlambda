@@ -4,10 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{
-        AggregationBits, AttestationData, HashedAttestationData, bits_is_subset,
-        blank_xmss_signature,
-    },
+    attestation::{AttestationData, HashedAttestationData, bits_is_subset, blank_xmss_signature},
     block::{
         AggregatedSignatureProof, AttestationSignatures, Block, BlockBody, BlockHeader,
         BlockSignatures, SignedBlock,
@@ -488,19 +485,6 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
     (slot, root)
 }
 
-/// Pre-merge snapshot of `new_payloads` participant bits, used by the
-/// attestation aggregate coverage report.
-///
-/// Each entry is tagged with its attestation `data.slot` (the voting round) so
-/// the consumer can filter to a single round at emit time — `new_payloads` may
-/// hold entries spanning more than one slot. Holds raw participant bits; the
-/// consumer (blockchain crate) constructs coverage bitsets at emit time using
-/// the current validator and committee counts.
-#[derive(Debug, Clone)]
-pub struct CoverageSnapshot {
-    pub entries: Vec<(u64, AggregationBits)>,
-}
-
 /// Fork choice store backed by a pluggable storage backend.
 ///
 /// The Store maintains all state required for fork choice and block processing:
@@ -523,9 +507,6 @@ pub struct Store {
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
-    /// Snapshot of `new_payloads` participant bits captured right before each
-    /// promote-to-known. Observability-only.
-    pre_merge_new_coverage: Arc<Mutex<Option<CoverageSnapshot>>>,
 }
 
 impl Store {
@@ -660,7 +641,6 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-            pre_merge_new_coverage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1285,20 +1265,6 @@ impl Store {
             .collect()
     }
 
-    // ============ Coverage Snapshot ============
-    //
-    // Observability-only state captured by `accept_new_attestations` in the
-    // blockchain crate. Read once per slot by the attestation aggregate
-    // coverage report.
-
-    pub fn save_pre_merge_new_coverage(&self, snapshot: CoverageSnapshot) {
-        *self.pre_merge_new_coverage.lock().unwrap() = Some(snapshot);
-    }
-
-    pub fn pre_merge_new_coverage(&self) -> Option<CoverageSnapshot> {
-        self.pre_merge_new_coverage.lock().unwrap().clone()
-    }
-
     /// Returns the number of gossip signature entries stored.
     pub fn gossip_signatures_count(&self) -> usize {
         let gossip = self.gossip_signatures.lock().unwrap();
@@ -1472,7 +1438,6 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
-                pre_merge_new_coverage: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1486,7 +1451,6 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
-                pre_merge_new_coverage: Arc::new(Mutex::new(None)),
             }
         }
     }
