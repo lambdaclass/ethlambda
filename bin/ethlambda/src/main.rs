@@ -27,7 +27,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
-    state::{State, ValidatorPubkeyBytes},
+    state::{State, Validator, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -570,7 +570,7 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
 async fn try_checkpoint_url(
     url: &str,
     genesis_time: u64,
-    validators: &[ethlambda_types::state::Validator],
+    validators: &[Validator],
 ) -> Result<(State, ethlambda_types::block::SignedBlock), checkpoint_sync::CheckpointSyncError> {
     const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
     const ANCHOR_FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
