@@ -34,15 +34,9 @@ pub(crate) struct CoverageSnapshot {
 /// non-empty snapshot rather than overwriting it with nothing — a node that
 /// missed a round still reports the round it last saw.
 pub(crate) fn snapshot_new_payloads(store: &Store) -> Option<CoverageSnapshot> {
-    let new_payloads = store.new_aggregated_payloads();
-    if new_payloads.is_empty() {
+    let entries = store.new_aggregated_payload_participants();
+    if entries.is_empty() {
         return None;
-    }
-    let mut entries: Vec<(u64, AggregationBits)> = Vec::new();
-    for (data, proofs) in new_payloads.values() {
-        for proof in proofs {
-            entries.push((data.slot, proof.participants.clone()));
-        }
     }
     Some(CoverageSnapshot { entries })
 }
@@ -111,11 +105,9 @@ pub(crate) fn emit_post_block_coverage(
         }
     }
     // `late`: current `new_payloads` for this round (arrived after the promote).
-    for (data, proofs) in store.new_aggregated_payloads().values() {
-        if data.slot == reporting_slot {
-            for proof in proofs {
-                cov_add(&mut late_v, &mut late_s, &proof.participants);
-            }
+    for (data_slot, bits) in store.new_aggregated_payload_participants() {
+        if data_slot == reporting_slot {
+            cov_add(&mut late_v, &mut late_s, &bits);
         }
     }
     // `block`: attestations included in the canonical head block. At interval 1
@@ -137,10 +129,13 @@ pub(crate) fn emit_post_block_coverage(
     or_into(&mut combined_v, &block_v);
     or_into(&mut combined_s, &block_s);
 
-    // Emit nothing when there is no coverage for this round, rather than
-    // pushing a misleading all-zero report (e.g. `block_only=0, timely_only=N`
-    // on a missed slot). Gauges retain their previous value.
-    if !combined_v.iter().any(|&b| b) {
+    // Only report a round once the canonical head block actually carries its
+    // votes (`block_v` non-empty). Gating on `combined` instead would still
+    // fire on a missed slot — the `timely` snapshot for the round is populated
+    // while `block_v` is all-false — pushing exactly the misleading
+    // `block_only=0, timely_only=N` the diff is meant to avoid. When there is
+    // no block for the round the gauges retain their previous value.
+    if !block_v.iter().any(|&b| b) {
         return;
     }
 
@@ -172,10 +167,8 @@ pub(crate) fn emit_agg_start_new_coverage(store: &Store, committee_count: u64) {
     let cc = committee_count as usize;
     let mut seen = vec![false; validator_count];
     let mut has_subnet = vec![false; cc];
-    for (_, proofs) in store.new_aggregated_payloads().values() {
-        for proof in proofs {
-            cov_add(&mut seen, &mut has_subnet, &proof.participants);
-        }
+    for (_slot, bits) in store.new_aggregated_payload_participants() {
+        cov_add(&mut seen, &mut has_subnet, &bits);
     }
     cov_record("agg_start_new", &seen, &has_subnet);
 }

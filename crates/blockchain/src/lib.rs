@@ -159,10 +159,10 @@ pub struct BlockChainServer {
     attestation_committee_count: u64,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
-    /// report. Captured before the store promotes attestations (when proposing
-    /// or at the end of the slot), read at the next slot boundary. Owned solely
-    /// by the actor and only touched from the single-threaded message loop, so
-    /// no synchronization is needed. Observability-only.
+    /// report. Captured at the end-of-slot promote (interval 4), read at the
+    /// next slot boundary. Owned solely by the actor and only touched from the
+    /// single-threaded message loop, so no synchronization is needed.
+    /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
 }
 
@@ -205,13 +205,20 @@ impl BlockChainServer {
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
-        // Snapshot the pre-merge `new_payloads` set before the store may promote
-        // it on this tick, so the post-block coverage report can see the
-        // "timely" cohort. Promotion happens when proposing (interval 0) or at
-        // the end of the slot (interval 4); skip empty snapshots so a missed
-        // round keeps the last set we saw. Pure observability.
-        let will_promote = interval == 4 || (interval == 0 && proposer_validator_id.is_some());
-        if will_promote && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store) {
+        // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
+        // (interval 4), so the post-block report for this round sees its
+        // "timely" cohort just before it is promoted out of `new_payloads`.
+        //
+        // Only interval 4 — not the proposer's interval-0 promote. By interval 0
+        // the round's votes have already been promoted at the previous slot's
+        // interval 4; `new_payloads` then holds only stragglers, and snapshotting
+        // them here would overwrite the good interval-4 snapshot the report still
+        // needs (those stragglers surface in the `late` section instead). Skip
+        // empty snapshots so a missed round keeps the last set we saw. Pure
+        // observability.
+        if interval == 4
+            && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
+        {
             self.pre_merge_coverage = Some(snapshot);
         }
 

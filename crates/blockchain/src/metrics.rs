@@ -128,8 +128,9 @@ static LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS: std::sync::LazyLock<IntGa
         register_int_gauge_vec!(
             "lean_attestation_aggregate_coverage_validators",
             "Validator coverage in attestation aggregate reports, labeled by section and \
-             subnet. subnet=combined is the section total; subnet=subnet_N is per-subnet \
-             coverage. Updated each slot (slot is the X-axis).",
+             subnet. Only subnet=combined (the section total) is currently emitted; the \
+             subnet=subnet_N per-subnet breakdown is reserved and not yet populated. \
+             Updated each slot (slot is the X-axis).",
             &["section", "subnet"]
         )
         .unwrap()
