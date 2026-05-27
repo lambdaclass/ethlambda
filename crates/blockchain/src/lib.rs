@@ -57,6 +57,15 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
+/// Milliseconds until the next interval boundary, measured relative to genesis.
+fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+    // Before genesis: wait until genesis itself.
+    let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
+        return genesis_time_ms - now_ms;
+    };
+    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -679,11 +688,11 @@ impl BlockChainServer {
         let timestamp = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch");
-        self.on_tick(timestamp.as_millis() as u64, ctx).await;
-        // Schedule the next tick at the next 800ms interval boundary
-        let ms_since_epoch = timestamp.as_millis() as u64;
-        let ms_to_next_interval =
-            MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
+        let now_ms = timestamp.as_millis() as u64;
+        self.on_tick(now_ms, ctx).await;
+        // Schedule the next tick at the next interval boundary
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
