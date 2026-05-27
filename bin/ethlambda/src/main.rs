@@ -15,6 +15,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -25,6 +26,7 @@ use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs}
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
+    block::SignedBlock,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, Validator, ValidatorPubkeyBytes},
@@ -571,9 +573,9 @@ async fn try_checkpoint_url(
     url: &str,
     genesis_time: u64,
     validators: &[Validator],
-) -> Result<(State, ethlambda_types::block::SignedBlock), checkpoint_sync::CheckpointSyncError> {
+) -> Result<(State, SignedBlock), checkpoint_sync::CheckpointSyncError> {
     const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
-    const ANCHOR_FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+    const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
     let mut attempt = 1;
     loop {
