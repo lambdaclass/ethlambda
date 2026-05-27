@@ -202,6 +202,31 @@ impl PayloadBuffer {
         }
     }
 
+    /// Register an attestation data key carrying no proofs.
+    ///
+    /// Mirrors the spec, which records each block attestation's data with an
+    /// empty proof set at import time. The bare key reserves its insertion-order
+    /// slot so equivocation tie-breaking stays deterministic once real proofs
+    /// arrive later through reaggregation.
+    ///
+    /// No-op when the data is already present, so a real proof is never replaced
+    /// by a later bare key. Carries no proof bytes, so it adds zero fork-choice
+    /// weight until reaggregation fills it.
+    fn register_data(&mut self, hashed: HashedAttestationData) {
+        let (data_root, att_data) = hashed.into_parts();
+        if self.data.contains_key(&data_root) {
+            return;
+        }
+        self.data.insert(
+            data_root,
+            PayloadEntry {
+                data: att_data,
+                proofs: Vec::new(),
+            },
+        );
+        self.order.push_back(data_root);
+    }
+
     /// Take all entries, leaving the buffer empty.
     ///
     /// Drains in insertion order (via `self.order`) so downstream consumers
@@ -1191,6 +1216,19 @@ impl Store {
         entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>,
     ) {
         self.known_payloads.lock().unwrap().push_batch(entries);
+    }
+
+    /// Register block-attestation data keys in the known buffer with no proofs.
+    ///
+    /// Spec parity: on_block records each block attestation's data with an empty
+    /// proof set. These entries carry no proof bytes, so they contribute zero
+    /// fork-choice weight; the weight arrives once reaggregation recovers real
+    /// Type-1 proofs for the same data into the pool.
+    pub fn register_known_aggregated_data_batch(&mut self, entries: Vec<HashedAttestationData>) {
+        let mut buf = self.known_payloads.lock().unwrap();
+        for hashed in entries {
+            buf.register_data(hashed);
+        }
     }
 
     // ============ New Aggregated Payloads ============

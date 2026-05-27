@@ -495,30 +495,32 @@ fn on_block_core(
     store.insert_signed_block(block_root, signed_block.clone());
     store.insert_state(block_root, post_state);
 
-    // Process block body attestations and feed them into the payload buffer
-    // so fork choice's LMD GHOST overlay can see block-only votes.
+    // Register each block attestation's data in the known payload buffer with
+    // no proofs, mirroring the spec's on_block.
     //
-    // Per-attestation participant bitfields come straight from
-    // `block.body.attestations[i].aggregation_bits`. Standalone Type-1
-    // proof bytes are not recoverable from a block at import time;
-    // downstream re-aggregation has to come from the gossip channel or be
-    // recovered by SNARK-splitting `signed_block.proof` via
-    // `split_type_2_by_message`. The entries inserted here are info-only,
-    // used only for fork-choice vote bookkeeping.
+    // The block carries one merged Type-2 proof binding all its attestations;
+    // that proof is verified as a whole and not decomposed here. Standalone
+    // Type-1 bytes for an individual attestation are not recoverable at import
+    // time, so we only reserve the data key. Real per-attestation proofs reach
+    // the pool later through reaggregation (SNARK-splitting `signed_block.proof`
+    // via `split_type_2_by_message`) and the gossip channel.
+    //
+    // Consequence: a block's own attestations contribute zero fork-choice weight
+    // to the head computation triggered by this import. The recovered Type-1
+    // proofs land in the new pool and migrate to known at the next acceptance
+    // tick, so block-imported vote weight is deferred by up to one slot.
     let aggregated_attestations = &block.body.attestations;
 
-    let mut known_entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> =
+    let mut known_data: Vec<HashedAttestationData> =
         Vec::with_capacity(aggregated_attestations.len());
     for att in aggregated_attestations.iter() {
-        let hashed = HashedAttestationData::new(att.data.clone());
-        let type_one = TypeOneMultiSignature::empty(att.aggregation_bits.clone());
-        known_entries.push((hashed, type_one));
+        known_data.push(HashedAttestationData::new(att.data.clone()));
         // Count each participating validator as a valid attestation.
         let count = validator_indices(&att.aggregation_bits).count() as u64;
         metrics::inc_attestations_valid(count);
     }
 
-    store.insert_known_aggregated_payloads_batch(known_entries);
+    store.register_known_aggregated_data_batch(known_data);
 
     // Update forkchoice head based on new block and attestations
     update_head(store, false);
