@@ -31,6 +31,7 @@ use tracing::{error, info, trace, warn};
 use crate::store::StoreError;
 
 pub mod aggregation;
+pub mod block_builder;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -59,6 +60,15 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
+/// Milliseconds until the next interval boundary, measured relative to genesis.
+fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+    // Before genesis: wait until genesis itself.
+    let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
+        return genesis_time_ms - now_ms;
+    };
+    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -69,7 +79,19 @@ impl BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
-        let key_manager = key_manager::KeyManager::new(validator_keys);
+        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+
+        // Catch XMSS keys up to the current slot before the first tick
+        // store.time() doesn't work here: after an offline gap it lags wall-clock by
+        // exactly the gap we need to catch up through
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_millis() as u64;
+        let current_slot =
+            (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
+        key_manager.advance_keys_to(current_slot);
+
         let handle = BlockChainServer {
             store,
             p2p: None,
@@ -232,6 +254,9 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
+
+        // Advance XMSS keys for next slot so the signing paths don't have to
+        self.key_manager.advance_keys_to((slot + 1) as u32);
 
         // Notify the execution layer once per slot (interval 0). Fire and
         // forget: the EL is informational here, never on the consensus
@@ -902,11 +927,11 @@ impl BlockChainServer {
         let timestamp = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch");
-        self.on_tick(timestamp.as_millis() as u64, ctx).await;
-        // Schedule the next tick at the next 800ms interval boundary
-        let ms_since_epoch = timestamp.as_millis() as u64;
-        let ms_to_next_interval =
-            MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
+        let now_ms = timestamp.as_millis() as u64;
+        self.on_tick(now_ms, ctx).await;
+        // Schedule the next tick at the next interval boundary
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
