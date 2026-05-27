@@ -5,6 +5,7 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
+use tracing::warn;
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
 /// Fail fast if the peer is unreachable.
@@ -269,6 +270,38 @@ fn verify_checkpoint_state(
     }
 
     Ok(())
+}
+
+/// Fetch the finalized anchor from a single checkpoint URL, retrying transient
+/// races where the peer advances finalization between the state and block
+/// fetches.
+pub async fn try_checkpoint_url(
+    url: &str,
+    genesis_time: u64,
+    validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
+    const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+    let mut attempt = 1;
+    loop {
+        match fetch_finalized_anchor(url, genesis_time, validators).await {
+            Ok(pair) => return Ok(pair),
+            Err(CheckpointSyncError::AnchorPairingMismatch)
+                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
+            {
+                warn!(
+                    %url,
+                    attempt,
+                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
+                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
+                );
+                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]

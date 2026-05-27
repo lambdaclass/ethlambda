@@ -15,7 +15,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -26,10 +25,9 @@ use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs}
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
-    block::SignedBlock,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
-    state::{State, Validator, ValidatorPubkeyBytes},
+    state::{State, ValidatorPubkeyBytes},
 };
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -566,38 +564,6 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
     bytes
 }
 
-/// Fetch the finalized anchor from a single checkpoint URL, retrying transient
-/// races where the peer advances finalization between the state and block
-/// fetches.
-async fn try_checkpoint_url(
-    url: &str,
-    genesis_time: u64,
-    validators: &[Validator],
-) -> Result<(State, SignedBlock), checkpoint_sync::CheckpointSyncError> {
-    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
-    const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-    let mut attempt = 1;
-    loop {
-        match checkpoint_sync::fetch_finalized_anchor(url, genesis_time, validators).await {
-            Ok(pair) => return Ok(pair),
-            Err(checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
-                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
-            {
-                warn!(
-                    %url,
-                    attempt,
-                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
-                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
-                );
-                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 /// Fetch the initial state for the node.
 ///
 /// If `checkpoint_urls` is empty, creates a genesis state from the local
@@ -647,7 +613,7 @@ async fn fetch_initial_state(
         let Some(url) = iter.next() else {
             return Err(checkpoint_sync::CheckpointSyncError::AllPeersFailed);
         };
-        match try_checkpoint_url(url, genesis.genesis_time, &validators).await {
+        match checkpoint_sync::try_checkpoint_url(url, genesis.genesis_time, &validators).await {
             Ok(pair) => {
                 info!(%url, "Checkpoint sync successful with this peer");
                 break pair;
