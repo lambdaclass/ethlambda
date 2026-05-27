@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
@@ -8,10 +7,7 @@ use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
-    attestation::{
-        AggregatedAttestation, AggregationBits, SignedAggregatedAttestation, SignedAttestation,
-        validator_indices,
-    },
+    attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
 };
@@ -32,6 +28,7 @@ use crate::store::StoreError;
 
 pub mod aggregation;
 pub mod block_builder;
+pub(crate) mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -93,7 +90,7 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
-            pre_merge_coverage: PreMergeCoverage::default(),
+            pre_merge_coverage: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -153,9 +150,11 @@ pub struct BlockChainServer {
     attestation_committee_count: u64,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
-    /// report. Written during attestation promotion, read at the next slot
-    /// boundary. Observability-only.
-    pre_merge_coverage: PreMergeCoverage,
+    /// report. Captured before the store promotes attestations (when proposing
+    /// or at the end of the slot), read at the next slot boundary. Owned solely
+    /// by the actor and only touched from the single-threaded message loop, so
+    /// no synchronization is needed. Observability-only.
+    pre_merge_coverage: Option<coverage::CoverageSnapshot>,
 }
 
 impl BlockChainServer {
@@ -197,16 +196,25 @@ impl BlockChainServer {
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
+        // Snapshot the pre-merge `new_payloads` set before the store may promote
+        // it on this tick, so the post-block coverage report can see the
+        // "timely" cohort. Promotion happens when proposing (interval 0) or at
+        // the end of the slot (interval 4); skip empty snapshots so a missed
+        // round keeps the last set we saw. Pure observability.
+        let will_promote = interval == 4 || (interval == 0 && proposer_validator_id.is_some());
+        if will_promote && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store) {
+            self.pre_merge_coverage = Some(snapshot);
+        }
+
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(
             &mut self.store,
             timestamp_ms,
             proposer_validator_id.is_some(),
-            Some(&self.pre_merge_coverage),
         );
 
         if interval == 2 && is_aggregator {
-            emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
+            coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -224,9 +232,9 @@ impl BlockChainServer {
             // proposed at interval 0 of this slot — has typically been received
             // and processed, letting the `block` section see the same round.
             if slot > 0 {
-                emit_post_block_coverage(
+                coverage::emit_post_block_coverage(
                     &self.store,
-                    &self.pre_merge_coverage,
+                    self.pre_merge_coverage.as_ref(),
                     self.attestation_committee_count,
                     slot - 1,
                 );
@@ -365,19 +373,14 @@ impl BlockChainServer {
 
         // Build the block with attestation signatures
         let Ok((block, attestation_signatures, _post_checkpoints)) =
-            store::produce_block_with_signatures(
-                &mut self.store,
-                slot,
-                validator_id,
-                Some(&self.pre_merge_coverage),
-            )
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
+                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
             metrics::inc_block_building_failures();
             return;
         };
 
-        emit_proposal_coverage(
+        coverage::emit_proposal_coverage(
             &self.store,
             self.attestation_committee_count,
             block.body.attestations.iter(),
@@ -806,195 +809,4 @@ impl Handler<AggregationDeadline> for BlockChainServer {
             session.cancel.cancel();
         }
     }
-}
-
-// --- Attestation aggregate coverage emission ---
-//
-// `seen` tracks covered validators; `has_subnet` tracks covered subnets
-// (subnet = `vid % committee_count`, matching the gossip subnet assignment
-// in `crates/net/p2p/src/lib.rs`). Pure observability — no fork-choice or
-// state-transition effect.
-
-/// Pre-merge snapshot of `new_payloads` participant bits, used by the
-/// attestation aggregate coverage report.
-///
-/// Each entry is tagged with its attestation `data.slot` (the voting round) so
-/// the consumer can filter to a single round at emit time — `new_payloads` may
-/// hold entries spanning more than one slot. Holds raw participant bits; the
-/// consumer constructs coverage bitsets at emit time using the current
-/// validator and committee counts.
-#[derive(Debug, Clone)]
-pub(crate) struct CoverageSnapshot {
-    pub(crate) entries: Vec<(u64, AggregationBits)>,
-}
-
-/// Observability-only handle holding the most recent pre-merge `new_payloads`
-/// snapshot. Owned by the blockchain actor; written during attestation
-/// promotion (`accept_new_attestations`) and read once per slot by the
-/// post-block coverage report. Kept out of the storage `Store` since it carries
-/// no fork-choice or state-transition state.
-#[derive(Clone, Default)]
-pub struct PreMergeCoverage(Arc<Mutex<Option<CoverageSnapshot>>>);
-
-impl PreMergeCoverage {
-    pub(crate) fn save(&self, snapshot: CoverageSnapshot) {
-        *self.0.lock().unwrap() = Some(snapshot);
-    }
-
-    pub(crate) fn get(&self) -> Option<CoverageSnapshot> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
-fn cov_add(seen: &mut [bool], has_subnet: &mut [bool], bits: &AggregationBits) {
-    let cc = has_subnet.len();
-    if cc == 0 {
-        return;
-    }
-    for vid in validator_indices(bits) {
-        let vid = vid as usize;
-        if vid < seen.len() {
-            seen[vid] = true;
-            has_subnet[vid % cc] = true;
-        }
-    }
-}
-
-fn cov_record(section: &str, seen: &[bool], has_subnet: &[bool]) {
-    metrics::set_attestation_aggregate_coverage_validators(
-        section,
-        "combined",
-        seen.iter().filter(|&&b| b).count() as i64,
-    );
-    metrics::set_attestation_aggregate_coverage_subnets(
-        section,
-        has_subnet.iter().filter(|&&b| b).count() as i64,
-    );
-}
-
-fn or_into(dst: &mut [bool], src: &[bool]) {
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d |= s;
-    }
-}
-
-/// Post-block coverage report for `reporting_slot`. Emits `timely` / `late` /
-/// `block` / `combined` sections plus the `diff_validators` symmetric
-/// difference between `block` and `timely`. Called at interval 0 of the
-/// next slot.
-fn emit_post_block_coverage(
-    store: &Store,
-    pre_merge_coverage: &PreMergeCoverage,
-    committee_count: u64,
-    reporting_slot: u64,
-) {
-    let validator_count = store.head_state().validators.len();
-    if validator_count == 0 || committee_count == 0 {
-        return;
-    }
-    let cc = committee_count as usize;
-    let (mut timely_v, mut timely_s) = (vec![false; validator_count], vec![false; cc]);
-    let (mut late_v, mut late_s) = (vec![false; validator_count], vec![false; cc]);
-    let (mut block_v, mut block_s) = (vec![false; validator_count], vec![false; cc]);
-
-    // Every section is the same cohort: validators whose attestations *for*
-    // `reporting_slot` (`data.slot == reporting_slot`) were seen via that
-    // channel.
-
-    // `timely`: pre-merge snapshot of `new_payloads`, filtered to this round.
-    if let Some(snap) = pre_merge_coverage.get() {
-        for (data_slot, bits) in &snap.entries {
-            if *data_slot == reporting_slot {
-                cov_add(&mut timely_v, &mut timely_s, bits);
-            }
-        }
-    }
-    // `late`: current `new_payloads` for this round (arrived after the promote).
-    for (data, proofs) in store.new_aggregated_payloads().values() {
-        if data.slot == reporting_slot {
-            for proof in proofs {
-                cov_add(&mut late_v, &mut late_s, &proof.participants);
-            }
-        }
-    }
-    // `block`: attestations included in the canonical head block. At interval 1
-    // the head is normally the block proposed at `reporting_slot + 1`, which
-    // carries this round's votes; filter by `data.slot` so we count the same
-    // cohort even if the head is at a different slot.
-    if let Some(block) = store.get_block(&store.head()) {
-        for att in block.body.attestations.iter() {
-            if att.data.slot == reporting_slot {
-                cov_add(&mut block_v, &mut block_s, &att.aggregation_bits);
-            }
-        }
-    }
-
-    let mut combined_v = timely_v.clone();
-    let mut combined_s = timely_s.clone();
-    or_into(&mut combined_v, &late_v);
-    or_into(&mut combined_s, &late_s);
-    or_into(&mut combined_v, &block_v);
-    or_into(&mut combined_s, &block_s);
-
-    // Emit nothing when there is no coverage for this round, rather than
-    // pushing a misleading all-zero report (e.g. `block_only=0, timely_only=N`
-    // on a missed slot). Gauges retain their previous value.
-    if !combined_v.iter().any(|&b| b) {
-        return;
-    }
-
-    cov_record("timely", &timely_v, &timely_s);
-    cov_record("late", &late_v, &late_s);
-    cov_record("block", &block_v, &block_s);
-    cov_record("combined", &combined_v, &combined_s);
-
-    let (block_only, timely_only) =
-        block_v
-            .iter()
-            .zip(timely_v.iter())
-            .fold((0i64, 0i64), |(b, t), (bv, tv)| match (bv, tv) {
-                (true, false) => (b + 1, t),
-                (false, true) => (b, t + 1),
-                _ => (b, t),
-            });
-    metrics::set_attestation_aggregate_coverage_diff_validators("block_only", block_only);
-    metrics::set_attestation_aggregate_coverage_diff_validators("timely_only", timely_only);
-}
-
-/// `agg_start_new` coverage from `new_payloads`, called right before fork-
-/// choice aggregation runs at interval 2.
-fn emit_agg_start_new_coverage(store: &Store, committee_count: u64) {
-    let validator_count = store.head_state().validators.len();
-    if validator_count == 0 || committee_count == 0 {
-        return;
-    }
-    let cc = committee_count as usize;
-    let mut seen = vec![false; validator_count];
-    let mut has_subnet = vec![false; cc];
-    for (_, proofs) in store.new_aggregated_payloads().values() {
-        for proof in proofs {
-            cov_add(&mut seen, &mut has_subnet, &proof.participants);
-        }
-    }
-    cov_record("agg_start_new", &seen, &has_subnet);
-}
-
-/// `proposal_combined` coverage for a block we are about to publish: the full
-/// set of validators included across the block's aggregated attestations.
-fn emit_proposal_coverage<'a>(
-    store: &Store,
-    committee_count: u64,
-    selected: impl IntoIterator<Item = &'a AggregatedAttestation>,
-) {
-    let validator_count = store.head_state().validators.len();
-    if validator_count == 0 || committee_count == 0 {
-        return;
-    }
-    let cc = committee_count as usize;
-    let mut combined_v = vec![false; validator_count];
-    let mut combined_s = vec![false; cc];
-    for att in selected {
-        cov_add(&mut combined_v, &mut combined_s, &att.aggregation_bits);
-    }
-    cov_record("proposal_combined", &combined_v, &combined_s);
 }

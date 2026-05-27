@@ -5,8 +5,8 @@ use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
-        AggregationBits, Attestation, AttestationData, HashedAttestationData,
-        SignedAggregatedAttestation, SignedAttestation, validator_indices,
+        Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
+        SignedAttestation, validator_indices,
     },
     block::{AggregatedSignatureProof, Block, SignedBlock},
     checkpoint::Checkpoint,
@@ -17,8 +17,8 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    CoverageSnapshot, GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, PreMergeCoverage,
+    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     block_builder::{PostBlockCheckpoints, build_block},
     metrics,
 };
@@ -26,34 +26,11 @@ use crate::{
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool, coverage: Option<&PreMergeCoverage>) {
-    if let Some(coverage) = coverage {
-        snapshot_pre_merge_new_coverage(store, coverage);
-    }
+fn accept_new_attestations(store: &mut Store, log_tree: bool) {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
     update_head(store, log_tree);
-}
-
-/// Capture the participant bits of every entry in `new_payloads` for the
-/// attestation aggregate coverage report. Each entry is tagged with its
-/// attestation `data.slot` so the post-block report can filter to a single
-/// voting round (`new_payloads` may span multiple slots). Stored on the
-/// actor-owned `PreMergeCoverage` handle so the report at the next slot
-/// boundary can read it.
-fn snapshot_pre_merge_new_coverage(store: &Store, coverage: &PreMergeCoverage) {
-    let new_payloads = store.new_aggregated_payloads();
-    if new_payloads.is_empty() {
-        return;
-    }
-    let mut entries: Vec<(u64, AggregationBits)> = Vec::new();
-    for (data, proofs) in new_payloads.values() {
-        for proof in proofs {
-            entries.push((data.slot, proof.participants.clone()));
-        }
-    }
-    coverage.save(CoverageSnapshot { entries });
 }
 
 /// Update the head based on the fork choice rule.
@@ -215,12 +192,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// 800ms interval. Slot and interval-within-slot are derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
-pub fn on_tick(
-    store: &mut Store,
-    timestamp_ms: u64,
-    has_proposal: bool,
-    coverage: Option<&PreMergeCoverage>,
-) {
+pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
     let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
@@ -253,7 +225,7 @@ pub fn on_tick(
             0 => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false, coverage);
+                    accept_new_attestations(store, false);
                 }
             }
             1 => {
@@ -268,7 +240,7 @@ pub fn on_tick(
             }
             4 => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true, coverage);
+                accept_new_attestations(store, true);
             }
             _ => unreachable!("slots only have 5 intervals"),
         }
@@ -684,15 +656,15 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 ///
 /// Ensures store is up-to-date and processes any pending attestations
 /// before returning the canonical head.
-fn get_proposal_head(store: &mut Store, slot: u64, coverage: Option<&PreMergeCoverage>) -> H256 {
+fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
-    on_tick(store, slot_time_ms, true, coverage);
+    on_tick(store, slot_time_ms, true);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false, coverage);
+    accept_new_attestations(store, false);
 
     store.head()
 }
@@ -705,10 +677,9 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
-    coverage: Option<&PreMergeCoverage>,
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
-    let head_root = get_proposal_head(store, slot, coverage);
+    let head_root = get_proposal_head(store, slot);
     let head_state = store
         .get_state(&head_root)
         .ok_or(StoreError::MissingParentState {
