@@ -56,6 +56,26 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
+/// Milliseconds until the next interval boundary, measured relative to genesis.
+///
+/// Interval boundaries fall at `genesis_time_ms + k * MILLISECONDS_PER_INTERVAL`,
+/// not at unix-epoch multiples of the interval. Aligning the next tick to the
+/// epoch instead of genesis makes every interval fire
+/// `(MILLISECONDS_PER_INTERVAL - genesis_time_ms % MILLISECONDS_PER_INTERVAL)`
+/// milliseconds late whenever genesis is not itself a multiple of the interval
+/// (genesis is in whole seconds, and `1000 % 800 != 0`, so it rarely is).
+///
+/// Mirrors leanSpec `SlotClock.seconds_until_next_interval`: time is measured
+/// from genesis, before-genesis ticks wait until genesis, and landing exactly
+/// on a boundary schedules a full interval ahead.
+fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+    // Before genesis: wait until genesis itself.
+    let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
+        return genesis_time_ms - now_ms;
+    };
+    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -635,11 +655,13 @@ impl BlockChainServer {
         let timestamp = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch");
-        self.on_tick(timestamp.as_millis() as u64, ctx).await;
-        // Schedule the next tick at the next 800ms interval boundary
-        let ms_since_epoch = timestamp.as_millis() as u64;
-        let ms_to_next_interval =
-            MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
+        let now_ms = timestamp.as_millis() as u64;
+        self.on_tick(now_ms, ctx).await;
+        // Schedule the next tick at the next interval boundary, measured
+        // relative to genesis (not the unix epoch) so interval transitions
+        // line up with the slot/interval arithmetic in `on_tick`.
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
@@ -764,5 +786,119 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         {
             session.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, ms_until_next_interval};
+
+    /// The interval index `on_tick` would compute for a tick firing at `now_ms`,
+    /// given genesis. Mirrors the slot/interval math in `on_tick`.
+    fn interval_at(now_ms: u64, genesis_time_ms: u64) -> u64 {
+        let since = now_ms.saturating_sub(genesis_time_ms);
+        (since % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL
+    }
+
+    /// The buggy, epoch-relative formula the scheduler used before the fix.
+    fn epoch_relative_buggy(now_ms: u64) -> u64 {
+        MILLISECONDS_PER_INTERVAL - (now_ms % MILLISECONDS_PER_INTERVAL)
+    }
+
+    #[test]
+    fn lands_on_genesis_relative_boundary() {
+        // Genesis at a wall-clock time that is NOT a multiple of the interval.
+        // genesis seconds * 1000; 1000 % 800 = 200, so genesis_ms % 800 = 200 here.
+        let genesis_time_ms = 1_770_407_233_u64 * 1000;
+        assert_eq!(genesis_time_ms % MILLISECONDS_PER_INTERVAL, 200);
+
+        // Tick fires exactly at genesis (the first scheduled tick).
+        let wait = ms_until_next_interval(genesis_time_ms, genesis_time_ms);
+        // Next tick should land exactly one interval after genesis.
+        let next_tick = genesis_time_ms + wait;
+        assert_eq!((next_tick - genesis_time_ms) % MILLISECONDS_PER_INTERVAL, 0);
+        assert_eq!(wait, MILLISECONDS_PER_INTERVAL);
+    }
+
+    #[test]
+    fn fix_keeps_ticks_aligned_to_genesis_grid() {
+        let genesis_time_ms = 1_770_407_233_u64 * 1000;
+
+        // Walk the schedule forward across a full slot and assert every tick
+        // lands on a genesis-relative interval boundary and the interval index
+        // advances by exactly one each tick.
+        let mut now = genesis_time_ms;
+        let mut expected_interval = 0;
+        for _ in 0..(super::INTERVALS_PER_SLOT * 2) {
+            assert_eq!(
+                (now - genesis_time_ms) % MILLISECONDS_PER_INTERVAL,
+                0,
+                "tick not on genesis-relative boundary"
+            );
+            assert_eq!(
+                interval_at(now, genesis_time_ms),
+                expected_interval % super::INTERVALS_PER_SLOT,
+                "interval index drifted"
+            );
+            now += ms_until_next_interval(now, genesis_time_ms);
+            expected_interval += 1;
+        }
+    }
+
+    #[test]
+    fn buggy_epoch_formula_fires_intervals_late() {
+        // Demonstrates the original bug the fix corrects: aligning to the unix
+        // epoch makes ticks land off the genesis grid by genesis_ms % interval.
+        let genesis_time_ms = 1_770_407_233_u64 * 1000;
+        let offset = genesis_time_ms % MILLISECONDS_PER_INTERVAL; // 200ms
+
+        // First tick at genesis, then follow the BUGGY epoch-relative schedule.
+        let mut now = genesis_time_ms;
+        // After two buggy steps the schedule settles onto the epoch grid.
+        now += epoch_relative_buggy(now);
+        now += epoch_relative_buggy(now);
+
+        // Steady-state buggy ticks are misaligned from the genesis grid.
+        let misalignment = (now - genesis_time_ms) % MILLISECONDS_PER_INTERVAL;
+        let expected_lateness = (MILLISECONDS_PER_INTERVAL - offset) % MILLISECONDS_PER_INTERVAL;
+        assert_eq!(misalignment, expected_lateness);
+        assert_ne!(misalignment, 0, "buggy formula should be off-grid");
+
+        // The fixed helper, in contrast, stays exactly on the grid.
+        let fixed_next = now + ms_until_next_interval(now, genesis_time_ms);
+        assert_eq!(
+            (fixed_next - genesis_time_ms) % MILLISECONDS_PER_INTERVAL,
+            0
+        );
+    }
+
+    #[test]
+    fn exact_boundary_schedules_full_interval_ahead() {
+        // Landing exactly on a boundary should wait a full interval, matching
+        // leanSpec's behavior, not return 0 (which would busy-loop).
+        let genesis_time_ms = 16_000_u64; // multiple of interval for clarity
+        let on_boundary = genesis_time_ms + 3 * MILLISECONDS_PER_INTERVAL;
+        assert_eq!(
+            ms_until_next_interval(on_boundary, genesis_time_ms),
+            MILLISECONDS_PER_INTERVAL
+        );
+    }
+
+    #[test]
+    fn before_genesis_waits_until_genesis() {
+        let genesis_time_ms = 1_000_000_u64;
+        let now = genesis_time_ms - 1234;
+        assert_eq!(ms_until_next_interval(now, genesis_time_ms), 1234);
+    }
+
+    #[test]
+    fn mid_interval_waits_for_remainder() {
+        let genesis_time_ms = 1_770_407_233_u64 * 1000;
+        // 300ms past a genesis-relative boundary -> 500ms left in the interval.
+        let now = genesis_time_ms + 2 * MILLISECONDS_PER_INTERVAL + 300;
+        assert_eq!(
+            ms_until_next_interval(now, genesis_time_ms),
+            MILLISECONDS_PER_INTERVAL - 300
+        );
     }
 }
