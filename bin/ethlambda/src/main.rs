@@ -609,8 +609,6 @@ async fn fetch_initial_state(
     };
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.
-    // Log only the count — URLs may carry basic-auth credentials or token query
-    // parameters; per-URL log lines below redact those before emission.
     info!(
         url_count = checkpoint_urls.len(),
         "Starting checkpoint sync"
