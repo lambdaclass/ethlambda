@@ -110,8 +110,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: book/html
           destination_dir: .
-          # Re-write the CNAME file on every deploy so the custom domain
-          # binding survives. Without this, peaceiris republishes book/html
-          # without a CNAME, which wipes the custom domain (resetting Pages
-          # `cname` to null) and makes docs.ethlambda.xyz return 404.
           cname: docs.ethlambda.xyz
