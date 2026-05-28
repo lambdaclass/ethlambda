@@ -59,8 +59,10 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
-    #[error("all checkpoint peers failed")]
-    AllPeersFailed,
+    #[error("all checkpoint peers failed; last error: {0}")]
+    AllPeersFailed(Box<CheckpointSyncError>),
+    #[error("no checkpoint peers configured")]
+    NoPeersConfigured,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
@@ -305,17 +307,22 @@ async fn try_checkpoint_url(
 }
 
 /// Try each checkpoint URL in order, returning the first successful anchor
-/// pair. Logs per-peer success/failure and returns `AllPeersFailed` only when
-/// every URL has been exhausted.
+/// pair. Logs per-peer success/failure. On total failure, returns
+/// `AllPeersFailed` wrapping the last peer's error so the underlying cause
+/// is preserved in the propagated error (not just the per-peer `warn!` logs).
 pub async fn fetch_anchor_from_peers(
     checkpoint_urls: &[String],
     genesis_time: u64,
     validators: &[Validator],
 ) -> Result<(State, SignedBlock), CheckpointSyncError> {
     let mut iter = checkpoint_urls.iter().peekable();
+    let mut last_err: Option<CheckpointSyncError> = None;
     loop {
         let Some(url) = iter.next() else {
-            return Err(CheckpointSyncError::AllPeersFailed);
+            return Err(match last_err {
+                Some(err) => CheckpointSyncError::AllPeersFailed(Box::new(err)),
+                None => CheckpointSyncError::NoPeersConfigured,
+            });
         };
         match try_checkpoint_url(url, genesis_time, validators).await {
             Ok(pair) => {
@@ -328,6 +335,7 @@ pub async fn fetch_anchor_from_peers(
                 } else {
                     warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
                 }
+                last_err = Some(err);
             }
         }
     }
