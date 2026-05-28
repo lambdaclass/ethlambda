@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8bc60176.js";
+            window.path_to_searchindex_js = "searchindex-eac69af8.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-031b865e.js"></script>
@@ -217,6 +217,21 @@
 </tbody>
 </table>
 </div>
+<h2 id="block-production-metrics"><a class="header" href="#block-production-metrics">Block Production Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th><th>Supported</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_block_aggregated_payloads</code></td><td>Histogram</td><td>Number of <code>aggregated_payloads</code> in a block</td><td>On block production</td><td></td><td>1, 2, 4, 8, 16, 32, 64, 128</td><td>✅</td></tr>
+<tr><td><code>lean_block_building_payload_aggregation_time_seconds</code></td><td>Histogram</td><td>Time taken to build <code>aggregated_payloads</code> during block building</td><td>On block production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4</td><td>✅</td></tr>
+<tr><td><code>lean_block_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build a block</td><td>On block production</td><td></td><td>0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1</td><td>✅</td></tr>
+<tr><td><code>lean_block_building_success_total</code></td><td>Counter</td><td>Successful block builds</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_block_building_failures_total</code></td><td>Counter</td><td>Failed block builds (error building the block, signing the block root, or processing it locally)</td><td>On block production failure</td><td></td><td></td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="fork-choice-metrics"><a class="header" href="#fork-choice-metrics">Fork-Choice Metrics</a></h2>
 <div class="table-wrapper">
 <table>
@@ -237,7 +252,8 @@
 <tr><td><code>lean_gossip_signatures</code></td><td>Gauge</td><td>Number of gossip signatures in fork-choice store</td><td>On gossip signatures update</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_latest_new_aggregated_payloads</code></td><td>Gauge</td><td>Number of new aggregated payload items</td><td>On <code>latest_new_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_latest_known_aggregated_payloads</code></td><td>Gauge</td><td>Number of known aggregated payload items</td><td>On <code>latest_known_aggregated_payloads</code> update</td><td></td><td></td><td>✅</td></tr>
-<tr><td><code>lean_committee_signatures_aggregation_time_seconds</code></td><td>Histogram</td><td>Time taken to aggregate committee signatures</td><td>On committee signatures aggregation</td><td></td><td>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1</td><td>✅</td></tr>
+<tr><td><code>lean_committee_signatures_aggregation_time_seconds</code></td><td>Histogram</td><td>Time taken to aggregate committee signatures</td><td>On committee signatures aggregation</td><td></td><td>0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4</td><td>✅</td></tr>
+<tr><td><code>lean_node_sync_status</code></td><td>Gauge</td><td>Node sync status</td><td>On node sync status change</td><td>status=idle,syncing,synced</td><td></td><td>✅</td></tr>
 </tbody>
 </table>
 </div>
@@ -250,6 +266,8 @@
 <tbody>
 <tr><td><code>lean_latest_justified_slot</code></td><td>Gauge</td><td>Latest justified slot</td><td>On state transition</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_latest_finalized_slot</code></td><td>Gauge</td><td>Latest finalized slot</td><td>On state transition</td><td></td><td></td><td>✅</td></tr>
+<tr><td><code>lean_justified_slot</code></td><td>Gauge</td><td>Current justified slot</td><td>On state transition</td><td></td><td></td><td>❌</td></tr>
+<tr><td><code>lean_finalized_slot</code></td><td>Gauge</td><td>Current finalized slot</td><td>On state transition</td><td></td><td></td><td>❌</td></tr>
 <tr><td><code>lean_finalizations_total</code></td><td>Counter</td><td>Total number of finalization attempts</td><td>On finalization attempt</td><td>result=success,error</td><td></td><td>✅</td></tr>
 <tr><td><code>lean_state_transition_time_seconds</code></td><td>Histogram</td><td>Time to process state transition</td><td>On state transition</td><td></td><td>0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4</td><td>✅</td></tr>
 <tr><td><code>lean_state_transition_slots_processed_total</code></td><td>Counter</td><td>Total number of processed slots</td><td>On state transition process slots</td><td></td><td></td><td>✅</td></tr>
@@ -283,6 +301,7 @@
 <tr><td><code>lean_attestation_committee_count</code></td><td>Gauge</td><td>Number of attestation committees</td><td>On node start</td><td></td><td>✅</td></tr>
 <tr><td><code>lean_attestation_committee_subnet</code></td><td>Gauge</td><td>Node’s attestation committee subnet</td><td>On node start</td><td></td><td>✅</td></tr>
 <tr><td><code>lean_connected_peers</code></td><td>Gauge</td><td>Number of connected peers</td><td>On scrape</td><td>client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam</td><td>✅(*)</td></tr>
+<tr><td><code>lean_gossip_mesh_peers</code></td><td>Gauge</td><td>Number of peers in the gossipsub mesh</td><td>On scrape</td><td>client=<code>&lt;name&gt;_&lt;N&gt;</code>,unknown (ex. zeam_0)</td><td>✅(*)</td></tr>
 <tr><td><code>lean_peer_connection_events_total</code></td><td>Counter</td><td>Total number of peer connection events</td><td>On peer connection</td><td>direction=inbound,outbound<br>result=success,timeout,error</td><td>✅</td></tr>
 <tr><td><code>lean_peer_disconnection_events_total</code></td><td>Counter</td><td>Total number of peer disconnection events</td><td>On peer disconnection</td><td>direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error</td><td>✅</td></tr>
 </tbody>
@@ -313,6 +332,36 @@
 <tr><td><code>lean_gossip_aggregation_size_bytes</code></td><td>Histogram</td><td>Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire)</td><td>On gossip aggregation send/receive</td><td>compression=raw,snappy</td><td>1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576</td></tr>
 <tr><td><code>lean_reqresp_request_size_bytes</code></td><td>Histogram</td><td>Bytes size of a req/resp request (raw SSZ or snappy on-wire)</td><td>On req/resp request send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>64, 128, 256, 512, 1024, 4096, 16384, 65536</td></tr>
 <tr><td><code>lean_reqresp_response_chunk_size_bytes</code></td><td>Histogram</td><td>Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire)</td><td>On req/resp response chunk send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="storage"><a class="header" href="#storage">Storage</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_table_bytes</code></td><td>Gauge</td><td>Estimated byte size of a storage table (key + value bytes)</td><td>After each processed block (one update per table); retains its previous value on empty slots</td><td>table=<code>&lt;table_name&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="attestation-aggregate-coverage"><a class="header" href="#attestation-aggregate-coverage">Attestation Aggregate Coverage</a></h3>
+<p>Observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section (the <code>section</code> label). The slot is the X-axis. These are sampled roughly once per slot, but emission is gated by the section’s source data, so a gauge can retain its previous value:</p>
+<ul>
+<li><code>timely</code>, <code>late</code>, <code>block</code>, <code>combined</code> and the <code>diff_validators</code> directions are emitted on block import, and <strong>only when the canonical head block carries that round’s votes</strong> (otherwise the round is skipped and prior values are kept).</li>
+<li><code>agg_start_new</code> is emitted at interval 2, right before fork-choice aggregation runs.</li>
+<li><code>proposal_combined</code> is emitted only when this node proposes a block.</li>
+</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_attestation_aggregate_coverage_validators</code></td><td>Gauge</td><td>Validator coverage in attestation aggregate reports</td><td>Per round, per section (see note above)</td><td>section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated)</td></tr>
+<tr><td><code>lean_attestation_aggregate_coverage_subnets</code></td><td>Gauge</td><td>Number of covered subnets in attestation aggregate reports</td><td>Per round, per section (see note above)</td><td>section=timely,late,block,combined,agg_start_new,proposal_combined</td></tr>
+<tr><td><code>lean_attestation_aggregate_coverage_diff_validators</code></td><td>Gauge</td><td>Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot</td><td>On block import, when the head carries the round’s votes (see note above)</td><td>direction=block_only,timely_only</td></tr>
 </tbody>
 </table>
 </div>
