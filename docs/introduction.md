@@ -45,5 +45,5 @@ For comparison and cross-client testing:
 - [ream](https://github.com/ReamLabs/ream) (Rust)
 - [qlean](https://github.com/qdrvm/qlean-mini) (C++)
 - [grandine](https://github.com/grandinetech/lean/tree/main/lean_client) (Rust)
-- [gean](https://github.com/devlongs/gean) (Go)
+- [gean](https://github.com/geanlabs/gean) (Go)
 - [Lantern](https://github.com/Pier-Two/lantern) (C)

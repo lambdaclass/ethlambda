@@ -221,7 +221,12 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, aggregator.clone());
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        validator_keys,
+        aggregator.clone(),
+        attestation_committee_count,
+    );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
     // AggregatorController — subnet subscriptions are decided once here and
