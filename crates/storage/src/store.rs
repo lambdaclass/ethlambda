@@ -774,7 +774,11 @@ impl Store {
     /// this mid-cascade would delete states that pending children still need,
     /// causing infinite re-processing loops when fallback pruning is active.
     pub fn prune_old_data(&mut self) {
-        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
+        let protected_roots = [
+            self.latest_finalized().root,
+            self.latest_justified().root,
+            self.head(),
+        ];
         let pruned_states = self.prune_old_states(&protected_roots);
         let pruned_blocks = self.prune_old_blocks(&protected_roots);
         if pruned_states > 0 || pruned_blocks > 0 {
