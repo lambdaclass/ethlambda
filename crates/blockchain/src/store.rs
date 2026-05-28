@@ -413,8 +413,8 @@ pub fn on_block_without_verification(
 
 /// Core block processing logic.
 ///
-/// When `verify` is true, cryptographic signatures are validated and stored
-/// for future block building. When false, all signature checks are skipped.
+/// When `verify` is true, cryptographic signatures are verified.
+/// When false, all signature checks are skipped.
 fn on_block_core(
     store: &mut Store,
     signed_block: SignedBlock,
@@ -495,12 +495,6 @@ fn on_block_core(
     store.insert_signed_block(block_root, signed_block.clone());
     store.insert_state(block_root, post_state);
 
-    // A block ships one merged Type-2 proof binding all its attestations; it is
-    // verified as a whole and never decomposed at import. Standalone per-attestation
-    // Type-1 proofs are not recoverable here, so block-borne votes carry no
-    // fork-choice weight until reaggregation (SNARK-splitting the block proof via
-    // `split_type_2_by_message`) and gossip deliver real Type-1s into the pool.
-    // Block-imported vote weight is therefore deferred by up to one slot.
     for att in block.body.attestations.iter() {
         // Count each participating validator as a valid attestation.
         let count = validator_indices(&att.aggregation_bits).count() as u64;
