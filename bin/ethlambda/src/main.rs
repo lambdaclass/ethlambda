@@ -89,7 +89,7 @@ struct CliOptions {
     /// in order; the first one that succeeds is used and any failures fall
     /// over to the next URL. Startup only aborts if every URL fails.
     #[arg(long, value_delimiter = ',')]
-    checkpoint_sync_url: Option<Vec<String>>,
+    checkpoint_sync_url: Vec<String>,
     /// Whether this node acts as a committee aggregator.
     ///
     /// Seeds the initial value of the live aggregator flag shared by the
@@ -212,13 +212,16 @@ async fn main() -> eyre::Result<()> {
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
     let backend = Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
 
-    let store = fetch_initial_state(
-        options.checkpoint_sync_url.as_deref().unwrap_or(&[]),
-        &genesis_config,
-        backend.clone(),
-    )
-    .await
-    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let clean_checkpoint_urls: Vec<String> = options
+        .checkpoint_sync_url
+        .into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+
+    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+        .await
+        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
