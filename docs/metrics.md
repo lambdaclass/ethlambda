@@ -38,7 +38,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_block_building_payload_aggregation_time_seconds` | Histogram | Time taken to build `aggregated_payloads` during block building | On block production | | 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
 | `lean_block_building_time_seconds` | Histogram | Time taken to build a block | On block production | | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 | ✅ |
 | `lean_block_building_success_total` | Counter | Successful block builds | On block production | | | ✅ |
-| `lean_block_building_failures_total` | Counter | Failed block builds (exception in build_block) | On block production failure | | | ✅ |
+| `lean_block_building_failures_total` | Counter | Failed block builds (error building the block, signing the block root, or processing it locally) | On block production failure | | | ✅ |
 
 ## Fork-Choice Metrics
 
@@ -57,7 +57,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_gossip_signatures` | Gauge | Number of gossip signatures in fork-choice store | On gossip signatures update | | | ✅ |
 | `lean_latest_new_aggregated_payloads` | Gauge | Number of new aggregated payload items | On `latest_new_aggregated_payloads` update | | | ✅ |
 | `lean_latest_known_aggregated_payloads` | Gauge | Number of known aggregated payload items | On `latest_known_aggregated_payloads` update | | | ✅ |
-| `lean_committee_signatures_aggregation_time_seconds` | Histogram | Time taken to aggregate committee signatures | On committee signatures aggregation | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 | ✅ |
+| `lean_committee_signatures_aggregation_time_seconds` | Histogram | Time taken to aggregate committee signatures | On committee signatures aggregation | | 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
 | `lean_node_sync_status` | Gauge | Node sync status | On node sync status change | status=idle,syncing,synced | | ✅ |
 
 ## State Transition Metrics
@@ -119,17 +119,21 @@ The metrics below are not part of the [leanMetrics specification](https://github
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | On each slot (one update per table) | table=`<table_name>` |
+| `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
 
 ### Attestation Aggregate Coverage
 
-Per-slot observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section. The slot is the X-axis (these are sampled once per slot).
+Observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section (the `section` label). The slot is the X-axis. These are sampled roughly once per slot, but emission is gated by the section's source data, so a gauge can retain its previous value:
+
+- `timely`, `late`, `block`, `combined` and the `diff_validators` directions are emitted on block import, and **only when the canonical head block carries that round's votes** (otherwise the round is skipped and prior values are kept).
+- `agg_start_new` is emitted at interval 2, right before fork-choice aggregation runs.
+- `proposal_combined` is emitted only when this node proposes a block.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Each slot | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated) |
-| `lean_attestation_aggregate_coverage_subnets` | Gauge | Number of covered subnets in attestation aggregate reports | Each slot | section=timely,late,block,combined,agg_start_new,proposal_combined |
-| `lean_attestation_aggregate_coverage_diff_validators` | Gauge | Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot | Each slot | direction=block_only,timely_only |
+| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated) |
+| `lean_attestation_aggregate_coverage_subnets` | Gauge | Number of covered subnets in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined |
+| `lean_attestation_aggregate_coverage_diff_validators` | Gauge | Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot | On block import, when the head carries the round's votes (see note above) | direction=block_only,timely_only |
 
 ---
 
