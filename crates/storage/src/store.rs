@@ -4,7 +4,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::api::{StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
-    attestation::{AttestationData, HashedAttestationData, bits_is_subset, blank_xmss_signature},
+    attestation::{
+        AggregationBits, AttestationData, HashedAttestationData, bits_is_subset,
+        blank_xmss_signature,
+    },
     block::{
         AggregatedSignatureProof, AttestationSignatures, Block, BlockBody, BlockHeader,
         BlockSignatures, SignedBlock,
@@ -771,7 +774,11 @@ impl Store {
     /// this mid-cascade would delete states that pending children still need,
     /// causing infinite re-processing loops when fallback pruning is active.
     pub fn prune_old_data(&mut self) {
-        let protected_roots = [self.latest_finalized().root, self.latest_justified().root];
+        let protected_roots = [
+            self.latest_finalized().root,
+            self.latest_justified().root,
+            self.head(),
+        ];
         let pruned_states = self.prune_old_states(&protected_roots);
         let pruned_blocks = self.prune_old_blocks(&protected_roots);
         if pruned_states > 0 || pruned_blocks > 0 {
@@ -1249,6 +1256,28 @@ impl Store {
     /// Returns the number of entries in the known (fork-choice-active) aggregated payloads buffer.
     pub fn known_aggregated_payloads_count(&self) -> usize {
         self.known_payloads.lock().unwrap().len()
+    }
+
+    /// Returns the participant bitfields of every pending (new) aggregated
+    /// payload, one entry per proof, each tagged with its attestation
+    /// `data.slot`.
+    ///
+    /// Used by the attestation aggregate coverage report, which needs only the
+    /// bitfields. Clones just the `AggregationBits` — not the proofs — so it
+    /// avoids deep-copying the multi-megabyte `proof_data` blobs that a full
+    /// payload snapshot would carry.
+    pub fn new_aggregated_payload_participants(&self) -> Vec<(u64, AggregationBits)> {
+        let buf = self.new_payloads.lock().unwrap();
+        buf.data
+            .values()
+            .flat_map(|entry| {
+                let slot = entry.data.slot;
+                entry
+                    .proofs
+                    .iter()
+                    .map(move |proof| (slot, proof.participants.clone()))
+            })
+            .collect()
     }
 
     /// Returns the number of gossip signature entries stored.

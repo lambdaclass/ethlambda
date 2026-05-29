@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 hex.workspace = true
+libssz-types.workspace = true
 
 datatest-stable = "0.3.3"
 

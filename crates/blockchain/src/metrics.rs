@@ -4,6 +4,25 @@ use std::time::Duration;
 
 use ethlambda_metrics::*;
 
+// --- Label sets ---
+
+/// Section labels for attestation aggregate coverage gauges. Order matches
+/// the names printed in slot/report logs.
+///
+/// Slot is the X-axis (time series), not a label dimension.
+pub const ATTESTATION_AGGREGATE_COVERAGE_SECTIONS: &[&str] = &[
+    "timely",
+    "late",
+    "block",
+    "combined",
+    "agg_start_new",
+    "proposal_combined",
+];
+
+/// Validator-coverage delta directions between block payloads and
+/// locally-aggregated pre-merge (`timely`) payloads.
+pub const ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS: &[&str] = &["block_only", "timely_only"];
+
 // --- Gauges ---
 
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
@@ -103,6 +122,43 @@ static LEAN_TABLE_BYTES: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock:
     )
     .unwrap()
 });
+
+static LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS: std::sync::LazyLock<IntGaugeVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_attestation_aggregate_coverage_validators",
+            "Validator coverage in attestation aggregate reports, labeled by section and \
+             subnet. Only subnet=combined (the section total) is currently emitted; the \
+             subnet=subnet_N per-subnet breakdown is reserved and not yet populated. \
+             Updated each slot (slot is the X-axis).",
+            &["section", "subnet"]
+        )
+        .unwrap()
+    });
+
+static LEAN_ATTESTATION_AGGREGATE_COVERAGE_SUBNETS: std::sync::LazyLock<IntGaugeVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_attestation_aggregate_coverage_subnets",
+            "Number of covered subnets in attestation aggregate reports, labeled by section. \
+             Updated each slot (slot is the X-axis).",
+            &["section"]
+        )
+        .unwrap()
+    });
+
+static LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS: std::sync::LazyLock<IntGaugeVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "lean_attestation_aggregate_coverage_diff_validators",
+            "Count of validators in the symmetric difference between block-included aggregates \
+             and locally-aggregated pre-merge (timely) aggregates for the same slot. \
+             direction=block_only: in block but not in local pool. direction=timely_only: in \
+             local pool but not in block. Updated each slot (slot is the X-axis).",
+            &["direction"]
+        )
+        .unwrap()
+    });
 
 // --- Counters ---
 
@@ -409,6 +465,25 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_IS_AGGREGATOR);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_COMMITTEE_COUNT);
     std::sync::LazyLock::force(&LEAN_TABLE_BYTES);
+    // Attestation aggregate coverage (leanMetrics: Fork-Choice Metrics).
+    // Per upstream leanSpec, seed only the combined-subnet series for each
+    // section; per-subnet series appear lazily when instrumentation writes them.
+    std::sync::LazyLock::force(&LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS);
+    std::sync::LazyLock::force(&LEAN_ATTESTATION_AGGREGATE_COVERAGE_SUBNETS);
+    std::sync::LazyLock::force(&LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS);
+    for &section in ATTESTATION_AGGREGATE_COVERAGE_SECTIONS {
+        LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS
+            .with_label_values(&[section, "combined"])
+            .set(0);
+        LEAN_ATTESTATION_AGGREGATE_COVERAGE_SUBNETS
+            .with_label_values(&[section])
+            .set(0);
+    }
+    for &direction in ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS {
+        LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS
+            .with_label_values(&[direction])
+            .set(0);
+    }
     // Counters
     std::sync::LazyLock::force(&LEAN_ATTESTATIONS_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_ATTESTATIONS_INVALID_TOTAL);
@@ -607,6 +682,27 @@ pub fn set_is_aggregator(is_aggregator: bool) {
 /// Set the attestation committee count gauge.
 pub fn set_attestation_committee_count(count: u64) {
     LEAN_ATTESTATION_COMMITTEE_COUNT.set(count.try_into().unwrap_or_default());
+}
+
+/// Set `lean_attestation_aggregate_coverage_validators{section, subnet}`.
+pub fn set_attestation_aggregate_coverage_validators(section: &str, subnet: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS
+        .with_label_values(&[section, subnet])
+        .set(value);
+}
+
+/// Set `lean_attestation_aggregate_coverage_subnets{section}`.
+pub fn set_attestation_aggregate_coverage_subnets(section: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_SUBNETS
+        .with_label_values(&[section])
+        .set(value);
+}
+
+/// Set `lean_attestation_aggregate_coverage_diff_validators{direction}`.
+pub fn set_attestation_aggregate_coverage_diff_validators(direction: &str, value: i64) {
+    LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS
+        .with_label_values(&[direction])
+        .set(value);
 }
 
 /// Observe the depth of a fork choice reorg.
