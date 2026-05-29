@@ -614,7 +614,7 @@ async fn fetch_initial_state(
         "Starting checkpoint sync"
     );
 
-    let (state, signed_block) = checkpoint_sync::fetch_anchor_from_peers(
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_block_and_state(
         checkpoint_urls,
         genesis.genesis_time,
         &validators,

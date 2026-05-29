@@ -21,6 +21,12 @@ const FINALIZED_STATE_PATH: &str = "/lean/v0/states/finalized";
 /// Path of the finalized-block endpoint (relative to the peer's API base URL).
 const FINALIZED_BLOCK_PATH: &str = "/lean/v0/blocks/finalized";
 
+/// Maximum attempts to refetch the anchor pair if the state and block roots don't match.
+const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
+
+/// Delay between anchor fetch attempts.
+const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
     #[error("HTTP request failed: {0}")]
@@ -61,8 +67,8 @@ pub enum CheckpointSyncError {
     AnchorPairingMismatch,
     #[error("all checkpoint peers failed; last error: {0}")]
     AllPeersFailed(Box<CheckpointSyncError>),
-    #[error("no checkpoint peers configured")]
-    NoPeersConfigured,
+    #[error("no checkpoint urls configured")]
+    NoCheckpointUrls,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
@@ -282,9 +288,6 @@ async fn try_checkpoint_url(
     genesis_time: u64,
     validators: &[Validator],
 ) -> Result<(State, SignedBlock), CheckpointSyncError> {
-    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
-    const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
-
     let mut attempt = 1;
     loop {
         match fetch_finalized_anchor(url, genesis_time, validators).await {
@@ -308,9 +311,8 @@ async fn try_checkpoint_url(
 
 /// Try each checkpoint URL in order, returning the first successful anchor
 /// pair. Logs per-peer success/failure. On total failure, returns
-/// `AllPeersFailed` wrapping the last peer's error so the underlying cause
-/// is preserved in the propagated error (not just the per-peer `warn!` logs).
-pub async fn fetch_anchor_from_peers(
+/// the last fetch error encountered.
+pub async fn fetch_anchor_block_and_state(
     checkpoint_urls: &[String],
     genesis_time: u64,
     validators: &[Validator],
@@ -321,7 +323,7 @@ pub async fn fetch_anchor_from_peers(
         let Some(url) = iter.next() else {
             return Err(match last_err {
                 Some(err) => CheckpointSyncError::AllPeersFailed(Box::new(err)),
-                None => CheckpointSyncError::NoPeersConfigured,
+                None => CheckpointSyncError::NoCheckpointUrls,
             });
         };
         match try_checkpoint_url(url, genesis_time, validators).await {
