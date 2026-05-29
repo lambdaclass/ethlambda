@@ -589,6 +589,9 @@ pub fn get_attestation_target_with_checkpoints(
     // relative to the latest finalized checkpoint.
     while target_header.slot > finalized_slot
         && !slot_is_justifiable_after(target_header.slot, finalized_slot)
+            // The `target_header.slot > finalized_slot` guard short-circuits
+            // before this call, so the slot is always after finalized.
+            .expect("target_header.slot > finalized_slot guaranteed by the loop guard")
     {
         target_block_root = target_header.parent_root;
         target_header = store

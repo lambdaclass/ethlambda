@@ -37,6 +37,8 @@ pub enum Error {
     },
     #[error("zero hash found in justifications_roots")]
     ZeroHashInJustificationRoots,
+    #[error("slot {slot} is before the finalized slot {finalized_slot}")]
+    SlotBeforeFinalized { slot: u64, finalized_slot: u64 },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -272,7 +274,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, attestation_data) {
+        if !is_valid_vote(state, attestation_data)? {
             continue;
         }
 
@@ -325,7 +327,7 @@ fn process_attestations(
 
             justifications.remove(&target.root);
 
-            try_finalize(state, source, target, &mut justifications, &root_to_slot);
+            try_finalize(state, source, target, &mut justifications, &root_to_slot)?;
         }
     }
 
@@ -343,7 +345,7 @@ fn process_attestations(
 ///    rejects zero-hash source or target roots)
 /// 4. Target slot > source slot
 /// 5. Target slot is justifiable after the finalized slot
-fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
+fn is_valid_vote(state: &State, data: &AttestationData) -> Result<bool, Error> {
     let source = data.source;
     let target = data.target;
 
@@ -354,7 +356,7 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         source.slot,
     ) {
         // TODO: why doesn't this make the block invalid?
-        return false;
+        return Ok(false);
     }
 
     // Ignore votes for targets that have already reached consensus
@@ -363,26 +365,28 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         state.latest_finalized.slot,
         target.slot,
     ) {
-        return false;
+        return Ok(false);
     }
 
     // Ensure the vote refers to blocks that actually exist on our chain;
     // also rejects zero-hash source or target inline.
     if !attestation_data_matches_chain(&state.historical_block_hashes, data) {
-        return false;
+        return Ok(false);
     }
 
     // Ensure time flows forward
     if target.slot <= source.slot {
-        return false;
+        return Ok(false);
     }
 
-    // Ensure the target falls on a slot that can be justified after the finalized one.
-    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
-        return false;
+    // Ensure the target falls on a slot that can be justified after the
+    // finalized one. The prior `target_already_justified` check rejects
+    // `target.slot <= finalized_slot`, so this call cannot error here.
+    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot)? {
+        return Ok(false);
     }
 
-    true
+    Ok(true)
 }
 
 /// Attempt to advance finalization from source to target.
@@ -396,13 +400,20 @@ fn try_finalize(
     target: Checkpoint,
     justifications: &mut HashMap<H256, Vec<bool>>,
     root_to_slot: &HashMap<H256, u64>,
-) {
-    // Consider whether finalization can advance.
-    if ((source.slot + 1)..target.slot)
-        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
-    {
-        metrics::inc_finalizations("error");
-        return;
+) -> Result<(), Error> {
+    // Consider whether finalization can advance: source finalizes only when no
+    // slot strictly between source and target is itself justifiable.
+    //
+    // `slot_is_justifiable_after` errors when a scanned slot is before the
+    // finalized slot (the leanSpec assert). That happens precisely when
+    // `source.slot < latest_finalized.slot`, which is an invalid state: a block
+    // justified a target while pointing its vote at a source below finalization.
+    // Propagating the error rejects the block, matching the spec.
+    for slot in (source.slot + 1)..target.slot {
+        if slot_is_justifiable_after(slot, state.latest_finalized.slot)? {
+            metrics::inc_finalizations("error");
+            return Ok(());
+        }
     }
 
     let old_finalized_slot = state.latest_finalized.slot;
@@ -438,6 +449,8 @@ fn try_finalize(
             false
         }
     });
+
+    Ok(())
 }
 
 /// Convert the in-memory vote HashMap back into SSZ-compatible state fields.
@@ -513,15 +526,19 @@ pub fn attestation_data_matches_chain(
 /// scenarios, validators may vote for many different slots, making none of them
 /// reach the supermajority threshold. By having unjustifiable slots, we can
 /// funnel votes towards only some slots, increasing finalization chances.
-pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
+pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> Result<bool, Error> {
+    // Justifiable slot checks before the finalized slot result in an assertion error
+    // according to the spec.
     let Some(delta) = slot.checked_sub(finalized_slot) else {
-        // Candidate slot must not be before finalized slot
-        return false;
+        return Err(Error::SlotBeforeFinalized {
+            slot,
+            finalized_slot,
+        });
     };
     // Rule 1: The first 5 slots after finalization are always justifiable.
     //
     // Examples: delta = 0, 1, 2, 3, 4, 5
-    delta <= 5
+    Ok(delta <= 5
         // Rule 2: Slots at perfect square distances are justifiable.
         //
         // Examples: delta = 1, 4, 9, 16, 25, 36, 49, 64, ...
@@ -536,7 +553,7 @@ pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
         || delta
             .checked_mul(4)
             .and_then(|v| v.checked_add(1))
-            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
+            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1))
 }
 
 #[cfg(test)]
@@ -682,5 +699,95 @@ mod tests {
             ShortRoot(&state.latest_justified.root.0)
         );
         assert_eq!(state.latest_justified.root, r9);
+    }
+
+    /// A block must be rejected when an attestation justifies a target whose
+    /// source lies below the finalized slot, which would drive the
+    /// finalization scan over pre-finalization slots.
+    ///
+    /// This is the leanSpec `Slot.is_justifiable_after` invariant
+    /// (`assert self >= finalized_slot`). ethlambda previously swallowed the
+    /// underflow (returning `false`) and silently accepted such blocks, while
+    /// the spec and other clients (zeam) reject them — a consensus-split risk.
+    ///
+    /// Observed on a mixed ethlambda/zeam devnet at block slot 21: a packed
+    /// attestation `{source.slot=2, target.slot=9}` reached supermajority while
+    /// `finalized=8`; justifying target 9 then scanned slots 3..9, hitting
+    /// slot 3 < finalized 8.
+    #[test]
+    fn block_rejected_when_source_below_finalized() {
+        const NUM_VALIDATORS: usize = 4;
+        let r2 = H256([2u8; 32]);
+        let r8 = H256([8u8; 32]);
+        let r9 = H256([9u8; 32]);
+
+        let mut hashes: Vec<H256> = vec![H256::ZERO; 12];
+        hashes[2] = r2;
+        hashes[8] = r8;
+        hashes[9] = r9;
+
+        let validators = make_validators(NUM_VALIDATORS);
+        let mut justified_slots = JustifiedSlots::new();
+        // Window is relative to finalized=8; track slots 9..=11. Slot 9 stays
+        // unjustified so the (2, 9) vote is not skipped as already-justified.
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 8, 11);
+
+        let mut state = State {
+            config: ChainConfig { genesis_time: 0 },
+            slot: 12,
+            latest_block_header: BlockHeader {
+                slot: 11,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint { slot: 8, root: r8 },
+            latest_finalized: Checkpoint { slot: 8, root: r8 },
+            historical_block_hashes: SszList::try_from(hashes).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        // Supermajority (3 of 4) vote with source below finalized: source=(2, r2),
+        // target=(9, r9). Target 9 is justifiable after finalized 8 (Δ=1) and not
+        // yet justified, so it crosses the threshold and justifies.
+        let atts: Vec<AggregatedAttestation> = vec![make_attestation(
+            10,
+            (2, r2),
+            (9, r9),
+            (9, r9),
+            &[0, 1, 2],
+            NUM_VALIDATORS,
+        )];
+        let atts: AggregatedAttestations = atts.try_into().unwrap();
+
+        let result = process_attestations(&mut state, &atts);
+        assert!(
+            matches!(result, Err(Error::SlotBeforeFinalized { .. })),
+            "expected SlotBeforeFinalized, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn slot_is_justifiable_after_errors_below_finalized() {
+        // slot < finalized: the missing assert -> error.
+        assert!(matches!(
+            slot_is_justifiable_after(3, 8),
+            Err(Error::SlotBeforeFinalized {
+                slot: 3,
+                finalized_slot: 8
+            })
+        ));
+        // slot == finalized: Δ=0, justifiable.
+        assert!(slot_is_justifiable_after(8, 8).unwrap());
+        // Δ within window / square / pronic are justifiable.
+        assert!(slot_is_justifiable_after(13, 8).unwrap()); // Δ=5 (window)
+        assert!(slot_is_justifiable_after(17, 8).unwrap()); // Δ=9 = 3^2
+        assert!(slot_is_justifiable_after(14, 8).unwrap()); // Δ=6 = 2*3 pronic
+        // Δ=7 is none of window/square/pronic.
+        assert!(!slot_is_justifiable_after(15, 8).unwrap());
     }
 }

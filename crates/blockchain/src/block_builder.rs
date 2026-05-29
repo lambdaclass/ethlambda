@@ -302,6 +302,14 @@ fn entry_passes_filters(
     ) {
         return Err("source_not_justified");
     }
+    // The source must not be below the finalized slot. Such a vote, once it
+    // justifies its target, drives the finalization scan over pre-finalization
+    // slots, which the STF now rejects (leanSpec `is_justifiable_after`
+    // assert). Exclude these candidates so we never build a block our own
+    // state transition would reject.
+    if att_data.source.slot < projected_finalized_slot {
+        return Err("source_before_finalized");
+    }
     if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
         return Err("chain_mismatch");
     }
@@ -320,6 +328,9 @@ fn entry_passes_filters(
     }
     if !is_genesis_self_vote
         && !slot_is_justifiable_after(att_data.target.slot, projected_finalized_slot)
+            // `target_already_justified` above rejects target.slot <= finalized,
+            // so target.slot > finalized here and this cannot error.
+            .expect("target slot > finalized: target <= finalized rejected above")
     {
         return Err("target_not_justifiable");
     }
@@ -368,8 +379,12 @@ fn score_entry(
     // and target.slot to still be justifiable (so source and target are
     // consecutive justified checkpoints in the projected post-state).
     let finalizes = crosses_2_3
-        && (att_data.source.slot + 1..att_data.target.slot)
-            .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
+        && (att_data.source.slot + 1..att_data.target.slot).all(|s| {
+            // `entry_passes_filters` rejects source.slot < finalized, so every
+            // scanned slot is >= finalized and this cannot error.
+            !slot_is_justifiable_after(s, projected_finalized_slot)
+                .expect("source slot >= finalized: enforced by entry_passes_filters")
+        });
 
     let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
         Tier::Build
