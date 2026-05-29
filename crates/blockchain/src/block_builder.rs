@@ -304,7 +304,7 @@ fn entry_passes_filters(
     }
     // The source must not be below the finalized slot. Such a vote, once it
     // justifies its target, drives the finalization scan over pre-finalization
-    // slots, which the STF now rejects (leanSpec `is_justifiable_after`
+    // slots, which the STF rejects (leanSpec `is_justifiable_after`
     // assert). Exclude these candidates so we never build a block our own
     // state transition would reject.
     if att_data.source.slot < projected_finalized_slot {

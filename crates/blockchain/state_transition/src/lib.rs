@@ -404,11 +404,8 @@ fn try_finalize(
     // Consider whether finalization can advance: source finalizes only when no
     // slot strictly between source and target is itself justifiable.
     //
-    // `slot_is_justifiable_after` errors when a scanned slot is before the
-    // finalized slot (the leanSpec assert). That happens precisely when
-    // `source.slot < latest_finalized.slot`, which is an invalid state: a block
-    // justified a target while pointing its vote at a source below finalization.
-    // Propagating the error rejects the block, matching the spec.
+    // NOTE: `slot_is_justifiable_after` errors when a scanned slot is before the
+    // finalized slot (the leanSpec assert).
     for slot in (source.slot + 1)..target.slot {
         if slot_is_justifiable_after(slot, state.latest_finalized.slot)? {
             metrics::inc_finalizations("error");
