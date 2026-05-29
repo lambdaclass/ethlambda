@@ -694,25 +694,37 @@ fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str
     }
 }
 
-fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
+/// Compute the gossipsub message ID for a topic and its on-wire (snappy) data.
+///
+/// The ID is the 20-byte truncated SHA256 of `domain || topic_len_le || topic
+/// || payload`, where `payload` is the snappy-decompressed bytes when `data`
+/// is valid snappy (domain `0x01000000`) and the raw `data` otherwise (domain
+/// `0x00000000`). Shared by the gossipsub `message_id_fn` and the publish-side
+/// diagnostics so the logged ID matches the one peers will assign.
+pub(crate) fn gossip_message_id(topic: &str, data: &[u8]) -> [u8; 20] {
     const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
     const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
-    let mut hasher = sha2::Sha256::new();
-    let decompressed = gossipsub::decompress_message(&message.data).ok();
-
-    let (domain, data) = match decompressed.as_deref() {
-        Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
-        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
+    let decompressed = gossipsub::decompress_message(data).ok();
+    let (domain, payload) = match decompressed.as_deref() {
+        Some(payload) => (MESSAGE_DOMAIN_VALID_SNAPPY, payload),
+        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, data),
     };
-    let topic = message.topic.as_str().as_bytes();
-    let topic_len = (topic.len() as u64).to_le_bytes();
+
+    let mut hasher = sha2::Sha256::new();
     hasher.update(domain);
-    hasher.update(topic_len);
-    hasher.update(topic);
-    hasher.update(data);
+    hasher.update((topic.len() as u64).to_le_bytes());
+    hasher.update(topic.as_bytes());
+    hasher.update(payload);
     let hash = hasher.finalize();
-    libp2p::gossipsub::MessageId(hash[..20].to_vec())
+
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&hash[..20]);
+    id
+}
+
+fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
+    libp2p::gossipsub::MessageId(gossip_message_id(message.topic.as_str(), &message.data).to_vec())
 }
 
 #[cfg(test)]

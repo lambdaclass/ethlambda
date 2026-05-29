@@ -44,6 +44,7 @@ libssz-merkle.workspace = true
 libssz-types.workspace = true
 
 sha2 = "0.10"
-
-[dev-dependencies]
 hex.workspace = true
+
+[build-dependencies]
+vergen-git2.workspace = true

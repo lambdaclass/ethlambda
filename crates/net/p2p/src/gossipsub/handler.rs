@@ -6,6 +6,7 @@ use ethlambda_types::{
 };
 use libp2p::gossipsub::Event;
 use libssz::{SszDecode, SszEncode};
+use sha2::{Digest as _, Sha256};
 use tracing::{error, info, trace};
 
 use super::{
@@ -15,7 +16,52 @@ use super::{
         attestation_subnet_topic,
     },
 };
-use crate::{P2PServer, metrics};
+use crate::{P2PServer, gossip_message_id, metrics};
+
+/// Short git SHA of this build, embedded by `build.rs`. Logged with publish-side
+/// gossip diagnostics so a captured message can be traced to the emitting build.
+const CLIENT_GIT_SHA: &str = env!("VERGEN_GIT_SHA");
+
+/// Snappy implementation and resolved version (the Rust `snap` crate), embedded
+/// by `build.rs`. Logged so cross-client byte comparisons can attribute the
+/// compressed output to a specific snappy library.
+const SNAPPY_LIB_VERSION: &str = concat!("rust-snap/", env!("SNAP_VERSION"));
+
+/// Pre-publish diagnostics for a gossipsub message, capturing the exact bytes a
+/// node is about to put on the wire. Used to debug cross-client snappy/SSZ
+/// corruption (e.g. blockblaz/zeam#942): comparing these fields against what a
+/// peer logs on receipt pinpoints whether divergence is at the compression,
+/// transport, or decode stage.
+struct PublishDiagnostics {
+    /// Lowercase hex SHA256 of the uncompressed SSZ payload.
+    ssz_sha256: String,
+    /// Lowercase hex SHA256 of the snappy-compressed payload (the on-wire bytes).
+    compressed_sha256: String,
+    /// Length in bytes of the compressed payload.
+    compressed_len: usize,
+    /// Whether decompressing our own output round-trips back to the SSZ bytes.
+    /// `false` signals a local snappy encoder bug before the message ever leaves.
+    snappy_self_decode_ok: bool,
+    /// Lowercase hex gossipsub message ID, computed identically to the receive
+    /// path so it matches the ID peers will assign.
+    message_id: String,
+}
+
+impl PublishDiagnostics {
+    /// Compute diagnostics for `topic` from the uncompressed `ssz` and its
+    /// `compressed` (on-wire) form.
+    fn new(topic: &str, ssz: &[u8], compressed: &[u8]) -> Self {
+        let snappy_self_decode_ok =
+            decompress_message(compressed).is_ok_and(|decoded| decoded == ssz);
+        Self {
+            ssz_sha256: hex::encode(Sha256::digest(ssz)),
+            compressed_sha256: hex::encode(Sha256::digest(compressed)),
+            compressed_len: compressed.len(),
+            snappy_self_decode_ok,
+            message_id: hex::encode(gossip_message_id(topic, compressed)),
+        }
+    }
+}
 
 pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
@@ -154,6 +200,22 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .cloned()
         .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
+    let topic_hash = topic.hash();
+    let diagnostics = PublishDiagnostics::new(topic_hash.as_str(), &ssz_bytes, &compressed);
+    info!(
+        topic = %topic_hash,
+        %slot,
+        validator,
+        ssz_sha256 = %diagnostics.ssz_sha256,
+        compressed_sha256 = %diagnostics.compressed_sha256,
+        compressed_len = diagnostics.compressed_len,
+        snappy_self_decode_ok = diagnostics.snappy_self_decode_ok,
+        message_id = %diagnostics.message_id,
+        git_sha = CLIENT_GIT_SHA,
+        snappy = SNAPPY_LIB_VERSION,
+        "Publishing attestation to gossipsub (publish diagnostics)"
+    );
+
     server.swarm_handle.publish(topic, compressed);
     info!(
         %slot,
@@ -182,6 +244,23 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
 
     metrics::observe_gossip_block_size(ssz_bytes.len(), compressed.len());
 
+    let topic_hash = server.block_topic.hash();
+    let diagnostics = PublishDiagnostics::new(topic_hash.as_str(), &ssz_bytes, &compressed);
+    info!(
+        topic = %topic_hash,
+        %slot,
+        proposer,
+        block_root = %hex::encode(block_root.0),
+        ssz_sha256 = %diagnostics.ssz_sha256,
+        compressed_sha256 = %diagnostics.compressed_sha256,
+        compressed_len = diagnostics.compressed_len,
+        snappy_self_decode_ok = diagnostics.snappy_self_decode_ok,
+        message_id = %diagnostics.message_id,
+        git_sha = CLIENT_GIT_SHA,
+        snappy = SNAPPY_LIB_VERSION,
+        "Publishing block to gossipsub (publish diagnostics)"
+    );
+
     // Publish to gossipsub
     server
         .swarm_handle
@@ -209,6 +288,21 @@ pub async fn publish_aggregated_attestation(
     let compressed = compress_message(&ssz_bytes);
 
     metrics::observe_gossip_aggregation_size(ssz_bytes.len(), compressed.len());
+
+    let topic_hash = server.aggregation_topic.hash();
+    let diagnostics = PublishDiagnostics::new(topic_hash.as_str(), &ssz_bytes, &compressed);
+    info!(
+        topic = %topic_hash,
+        %slot,
+        ssz_sha256 = %diagnostics.ssz_sha256,
+        compressed_sha256 = %diagnostics.compressed_sha256,
+        compressed_len = diagnostics.compressed_len,
+        snappy_self_decode_ok = diagnostics.snappy_self_decode_ok,
+        message_id = %diagnostics.message_id,
+        git_sha = CLIENT_GIT_SHA,
+        snappy = SNAPPY_LIB_VERSION,
+        "Publishing aggregated attestation to gossipsub (publish diagnostics)"
+    );
 
     // Publish to the aggregation topic
     server
