@@ -78,6 +78,12 @@ pub enum VerificationError {
 /// # Returns
 ///
 /// The serialized aggregated proof as `ByteListMiB`, or an error if aggregation fails.
+///
+/// # Errors
+///
+/// Returns [`AggregationError::CountMismatch`] / [`AggregationError::EmptyInput`] on
+/// malformed input, and [`AggregationError::Aggregation`] if any raw signature is
+/// cryptographically invalid for `message`/`slot`.
 pub fn aggregate_signatures(
     public_keys: Vec<ValidatorPublicKey>,
     signatures: Vec<ValidatorSignature>,
@@ -123,8 +129,9 @@ pub fn aggregate_signatures(
 ///
 /// # Errors
 ///
-/// Returns [`AggregationError::Aggregation`] if any deserialized child proof is
-/// cryptographically invalid (e.g., was produced for a different message or slot).
+/// Returns [`AggregationError::Aggregation`] if any raw signature or deserialized
+/// child proof is cryptographically invalid (e.g., was produced for a different
+/// message or slot).
 pub fn aggregate_mixed(
     children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
     raw_public_keys: Vec<ValidatorPublicKey>,
@@ -175,6 +182,13 @@ pub fn aggregate_mixed(
 ///
 /// This is used during block building to compact multiple proofs sharing the same
 /// `AttestationData` into a single merged proof (leanSpec PR #510).
+///
+/// # Errors
+///
+/// Returns [`AggregationError::InsufficientChildren`] if fewer than 2 children are
+/// given, [`AggregationError::ChildDeserializationFailed`] if a child cannot be
+/// decompressed, and [`AggregationError::Aggregation`] if a decompressed child proof
+/// is cryptographically invalid for `message`/`slot`.
 pub fn aggregate_proofs(
     children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
     message: &H256,
@@ -406,6 +420,34 @@ mod tests {
         assert!(
             verify_result.is_err(),
             "Verification should have failed with wrong slot"
+        );
+    }
+
+    /// A child proof that is valid for one message must not be re-aggregable under a
+    /// different message. Since the f66d4a9 bump, `xmss_aggregate` returns an error in
+    /// this case instead of panicking, so the failure surfaces as
+    /// `AggregationError::Aggregation` rather than unwinding the thread.
+    #[test]
+    #[ignore = "too slow"]
+    fn test_aggregate_proofs_wrong_message_errors_without_panic() {
+        let message = H256::from([42u8; 32]);
+        let wrong_message = H256::from([43u8; 32]);
+        let slot = 10u32;
+        let activation_epoch = 5u32;
+
+        let (pk, sig) = generate_keypair_and_sign(1, activation_epoch, slot, &message);
+
+        // Produce a valid child proof bound to `message`/`slot`.
+        let child = aggregate_signatures(vec![pk.clone()], vec![sig], &message, slot).unwrap();
+
+        // Feed it as two children but claim a different message: the upstream
+        // child-validity check must reject this and we must get an error, not a panic.
+        let children = vec![(vec![pk.clone()], child.clone()), (vec![pk], child)];
+        let result = aggregate_proofs(children, &wrong_message, slot);
+
+        assert!(
+            matches!(result, Err(AggregationError::Aggregation(_))),
+            "expected AggregationError::Aggregation, got {result:?}"
         );
     }
 }
