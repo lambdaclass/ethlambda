@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-eac69af8.js";
+            window.path_to_searchindex_js = "searchindex-16a9b1e4.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-031b865e.js"></script>
@@ -1597,7 +1597,7 @@ clients.</p>
 <tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
 </thead>
 <tbody>
-<tr><td><code>lean_attestation_aggregate_coverage_validators</code></td><td>Gauge</td><td>Validator coverage in attestation aggregate reports</td><td>Per round, per section (see note above)</td><td>section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated)</td></tr>
+<tr><td><code>lean_attestation_aggregate_coverage_validators</code></td><td>Gauge</td><td>Validator coverage in attestation aggregate reports</td><td>Per round, per section (see note above)</td><td>section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined,subnet_0,subnet_1,…,subnet_N-1</td></tr>
 <tr><td><code>lean_attestation_aggregate_coverage_subnets</code></td><td>Gauge</td><td>Number of covered subnets in attestation aggregate reports</td><td>Per round, per section (see note above)</td><td>section=timely,late,block,combined,agg_start_new,proposal_combined</td></tr>
 <tr><td><code>lean_attestation_aggregate_coverage_diff_validators</code></td><td>Gauge</td><td>Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot</td><td>On block import, when the head carries the round’s votes (see note above)</td><td>direction=block_only,timely_only</td></tr>
 </tbody>
