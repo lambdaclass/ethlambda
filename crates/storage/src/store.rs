@@ -2426,4 +2426,28 @@ mod tests {
         let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
         assert!(store.get_signed_block(&root).is_none());
     }
+
+    // ============ from_db_state Tests ============
+
+    #[test]
+    fn from_db_state_returns_none_on_empty_backend() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        assert!(Store::from_db_state(backend, 12345).is_none());
+    }
+
+    #[test]
+    fn from_db_state_returns_some_on_matching_genesis_time() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write an initial state to the backend.
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        assert!(Store::from_db_state(backend, 12345).is_some());
+    }
+
+    #[test]
+    fn from_db_state_returns_none_on_genesis_time_mismatch() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write an initial state to the backend.
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        assert!(Store::from_db_state(backend, 99999).is_none());
+    }
 }
