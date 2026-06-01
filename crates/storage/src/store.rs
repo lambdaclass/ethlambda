@@ -535,6 +535,9 @@ impl Store {
         let persisted_config = {
             let view = backend.begin_read().expect("read view");
             let bytes = view.get(Table::Metadata, KEY_CONFIG).expect("get config")?;
+            // probe KEY_LATEST_FINALIZED
+            view.get(Table::Metadata, KEY_LATEST_FINALIZED)
+                .expect("get latest finalized")?;
             ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
         };
         if persisted_config.genesis_time != expected_genesis_time {
@@ -2449,5 +2452,23 @@ mod tests {
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
         assert!(Store::from_db_state(backend, 99999).is_none());
+    }
+
+    #[test]
+    fn from_db_state_returns_none_when_latest_finalized_is_missing() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write only KEY_CONFIG, leaving KEY_LATEST_FINALIZED absent.
+        let config = ChainConfig {
+            genesis_time: 12345,
+        };
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Metadata,
+                vec![(KEY_CONFIG.to_vec(), config.to_ssz())],
+            )
+            .expect("put config");
+        batch.commit().expect("commit");
+        assert!(Store::from_db_state(backend, 12345).is_none());
     }
 }
