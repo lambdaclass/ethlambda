@@ -27,6 +27,8 @@ use tracing::{error, info, trace, warn};
 use crate::store::StoreError;
 
 pub mod aggregation;
+pub mod block_builder;
+pub(crate) mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -55,11 +57,21 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
+/// Milliseconds until the next interval boundary, measured relative to genesis.
+fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+    // Before genesis: wait until genesis itself.
+    let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
+        return genesis_time_ms - now_ms;
+    };
+    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        attestation_committee_count: u64,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -86,6 +98,8 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
+            attestation_committee_count,
+            pre_merge_coverage: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -139,6 +153,17 @@ pub struct BlockChainServer {
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
+
+    /// Number of attestation committees (= subnet count). Used by the
+    /// attestation aggregate coverage emission.
+    attestation_committee_count: u64,
+
+    /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
+    /// report. Captured at the end-of-slot promote (interval 4), read at the
+    /// next slot boundary. Owned solely by the actor and only touched from the
+    /// single-threaded message loop, so no synchronization is needed.
+    /// Observability-only.
+    pre_merge_coverage: Option<coverage::CoverageSnapshot>,
 }
 
 impl BlockChainServer {
@@ -180,6 +205,23 @@ impl BlockChainServer {
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
+        // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
+        // (interval 4), so the post-block report for this round sees its
+        // "timely" cohort just before it is promoted out of `new_payloads`.
+        //
+        // Only interval 4 — not the proposer's interval-0 promote. By interval 0
+        // the round's votes have already been promoted at the previous slot's
+        // interval 4; `new_payloads` then holds only stragglers, and snapshotting
+        // them here would overwrite the good interval-4 snapshot the report still
+        // needs (those stragglers surface in the `late` section instead). Skip
+        // empty snapshots so a missed round keeps the last set we saw. Pure
+        // observability.
+        if interval == 4
+            && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
+        {
+            self.pre_merge_coverage = Some(snapshot);
+        }
+
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(
             &mut self.store,
@@ -188,6 +230,7 @@ impl BlockChainServer {
         );
 
         if interval == 2 && is_aggregator {
+            coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -200,6 +243,18 @@ impl BlockChainServer {
         // Reuse the same snapshot so self-delivery decisions match the rest
         // of the tick.
         if interval == 1 {
+            // Emit the post-block coverage report for the previous slot. Fired
+            // at interval 1 (not 0) so the block carrying `slot - 1`'s votes —
+            // proposed at interval 0 of this slot — has typically been received
+            // and processed, letting the `block` section see the same round.
+            if slot > 0 {
+                coverage::emit_post_block_coverage(
+                    &self.store,
+                    self.pre_merge_coverage.as_ref(),
+                    self.attestation_committee_count,
+                    slot - 1,
+                );
+            }
             self.produce_attestations(slot, is_aggregator);
         }
 
@@ -340,6 +395,12 @@ impl BlockChainServer {
             metrics::inc_block_building_failures();
             return;
         };
+
+        coverage::emit_proposal_coverage(
+            &self.store,
+            self.attestation_committee_count,
+            block.body.attestations.iter(),
+        );
 
         // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();
@@ -634,11 +695,11 @@ impl BlockChainServer {
         let timestamp = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch");
-        self.on_tick(timestamp.as_millis() as u64, ctx).await;
-        // Schedule the next tick at the next 800ms interval boundary
-        let ms_since_epoch = timestamp.as_millis() as u64;
-        let ms_to_next_interval =
-            MILLISECONDS_PER_INTERVAL - (ms_since_epoch % MILLISECONDS_PER_INTERVAL);
+        let now_ms = timestamp.as_millis() as u64;
+        self.on_tick(now_ms, ctx).await;
+        // Schedule the next tick at the next interval boundary
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),

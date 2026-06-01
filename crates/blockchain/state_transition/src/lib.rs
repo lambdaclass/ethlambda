@@ -304,8 +304,9 @@ fn process_attestations(
         // Check whether the vote count crosses the supermajority threshold
         let vote_count = votes.iter().filter(|voted| **voted).count();
         if 3 * vote_count >= 2 * validator_count {
-            // The block becomes justified
-            state.latest_justified = target;
+            // If the slot is higher, update the latest justified
+            state.latest_justified =
+                std::cmp::max_by_key(state.latest_justified, target, |c| c.slot);
             justified_slots_ops::set_justified(
                 &mut state.justified_slots,
                 state.latest_finalized.slot,
@@ -536,4 +537,150 @@ pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
             .checked_mul(4)
             .and_then(|v| v.checked_add(1))
             .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::{
+        attestation::{AggregatedAttestation, AggregationBits, AttestationData},
+        block::BlockBody,
+        checkpoint::Checkpoint,
+        primitives::H256,
+        state::{ChainConfig, JustifiedSlots, State, Validator},
+    };
+    use libssz_types::SszList;
+
+    fn make_validators(n: usize) -> Vec<Validator> {
+        (0..n)
+            .map(|i| Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect()
+    }
+
+    fn make_bits(set: &[usize], len: usize) -> AggregationBits {
+        let mut b = AggregationBits::with_length(len).unwrap();
+        for &i in set {
+            b.set(i, true).unwrap();
+        }
+        b
+    }
+
+    fn make_attestation(
+        att_slot: u64,
+        src: (u64, H256),
+        tgt: (u64, H256),
+        head: (u64, H256),
+        bits_set: &[usize],
+        bits_len: usize,
+    ) -> AggregatedAttestation {
+        AggregatedAttestation {
+            aggregation_bits: make_bits(bits_set, bits_len),
+            data: AttestationData {
+                slot: att_slot,
+                source: Checkpoint {
+                    slot: src.0,
+                    root: src.1,
+                },
+                target: Checkpoint {
+                    slot: tgt.0,
+                    root: tgt.1,
+                },
+                head: Checkpoint {
+                    slot: head.0,
+                    root: head.1,
+                },
+            },
+        }
+    }
+
+    /// Regression: `process_attestations` must not let `state.latest_justified`
+    /// regress within a single block when attestations appear in body order
+    /// whose target slots are not monotonically increasing.
+    ///
+    /// Observed on devnet at canonical slot 27984: a block carried three
+    /// supermajority attestations targeting slots 27978, 27981, and 27974 (in
+    /// that order). Each reached the supermajority threshold and the
+    /// unconditional `state.latest_justified = target` assignment caused the
+    /// post-state to end at `latest_justified.slot = 27974`. Because the
+    /// store had already latched `latest_justified = 27978` from importing a
+    /// fork block, every subsequent proposal failed
+    /// `JustifiedDivergenceNotClosed` and the chain froze.
+    ///
+    /// Compressed setup: finalized=0, source=3 (justified), targets in body
+    /// order 4 / 9 / 6 — all justifiable from finalized=0 (Δ=4 ≤ 5, Δ=9=3²,
+    /// Δ=6=2·3). With 4 validators, three votes is supermajority, so each
+    /// attestation crosses the threshold.
+    #[test]
+    fn latest_justified_does_not_regress_within_block() {
+        const NUM_VALIDATORS: usize = 4;
+        let r3 = H256([3u8; 32]);
+        let r4 = H256([4u8; 32]);
+        let r6 = H256([6u8; 32]);
+        let r9 = H256([9u8; 32]);
+
+        // historical_block_hashes indexed by slot. Genesis at slot 0 is ZERO
+        // (matches the default finalized checkpoint), then we place the
+        // canonical roots at slots 3 / 4 / 6 / 9. Other slots are empty and
+        // are not referenced by any attestation in the test.
+        let mut hashes: Vec<H256> = vec![H256::ZERO; 10];
+        hashes[3] = r3;
+        hashes[4] = r4;
+        hashes[6] = r6;
+        hashes[9] = r9;
+
+        let validators = make_validators(NUM_VALIDATORS);
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 0, 9);
+        // Mark slot 3 as justified so source=(3, r3) passes is_valid_vote.
+        justified_slots_ops::set_justified(&mut justified_slots, 0, 3);
+
+        let mut state = State {
+            config: ChainConfig { genesis_time: 0 },
+            slot: 10,
+            latest_block_header: BlockHeader {
+                slot: 9,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint { slot: 3, root: r3 },
+            latest_finalized: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            historical_block_hashes: SszList::try_from(hashes).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        // Three supermajority attestations (3 of 4 validators each), all from
+        // source=(3, r3), in body order targeting slots 4 → 9 → 6.
+        let atts: Vec<AggregatedAttestation> = vec![
+            make_attestation(3, (3, r3), (4, r4), (4, r4), &[0, 1, 3], NUM_VALIDATORS),
+            make_attestation(3, (3, r3), (9, r9), (9, r9), &[0, 1, 2], NUM_VALIDATORS),
+            make_attestation(3, (3, r3), (6, r6), (6, r6), &[0, 2, 3], NUM_VALIDATORS),
+        ];
+        let atts: AggregatedAttestations = atts.try_into().unwrap();
+
+        process_attestations(&mut state, &atts).expect("process_attestations should succeed");
+
+        // After processing, the chain's view of "latest justified" must be the
+        // highest justified target (slot 9), not the last-processed one
+        // (slot 6). Pre-fix this assertion fails with slot=6.
+        assert_eq!(
+            state.latest_justified.slot,
+            9,
+            "latest_justified regressed: got slot={}, root={}; expected slot=9",
+            state.latest_justified.slot,
+            ShortRoot(&state.latest_justified.root.0)
+        );
+        assert_eq!(state.latest_justified.root, r9);
+    }
 }
