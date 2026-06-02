@@ -65,7 +65,7 @@ impl PublishDiagnostics {
 
 pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
-        propagation_source: _,
+        propagation_source,
         message_id: _,
         message,
     } = event
@@ -78,9 +78,9 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
         Some(BLOCK_TOPIC_KIND) => {
             info!(kind = "block", peer_count, "P2P message received");
             let compressed_len = message.data.len();
-            let Ok(uncompressed_data) = decompress_message(&message.data)
-                .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
-            else {
+            let Ok(uncompressed_data) = decompress_message(&message.data).inspect_err(
+                |err| error!(%err, %propagation_source, "Failed to decompress gossipped block"),
+            ) else {
                 return;
             };
             metrics::observe_gossip_block_size(uncompressed_data.len(), compressed_len);
@@ -113,7 +113,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             info!(kind = "aggregation", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
-                .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
+                .inspect_err(|err| error!(%err, %propagation_source, "Failed to decompress gossipped aggregation"))
             else {
                 return;
             };
@@ -145,7 +145,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             info!(kind = "attestation", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
-                .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
+                .inspect_err(|err| error!(%err, %propagation_source, "Failed to decompress gossipped attestation"))
             else {
                 return;
             };
