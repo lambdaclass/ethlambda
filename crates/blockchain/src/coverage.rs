@@ -56,15 +56,27 @@ fn cov_add(seen: &mut [bool], has_subnet: &mut [bool], bits: &AggregationBits) {
 }
 
 fn cov_record(section: &str, seen: &[bool], has_subnet: &[bool]) {
-    // TODO(#398): emit a per-subnet breakdown (subnet=subnet_N) alongside the
-    // subnet=combined total. `has_subnet` already tracks which subnets are
-    // covered, but we only report the aggregate count here; the per-subnet
-    // label is reserved in the metric definition and not yet populated.
     metrics::set_attestation_aggregate_coverage_validators(
         section,
         "combined",
         seen.iter().filter(|&&b| b).count() as i64,
     );
+    let cc = has_subnet.len();
+    if cc > 0 {
+        let mut subnet_counts = vec![0i64; cc];
+        for (vid, &was_seen) in seen.iter().enumerate() {
+            if was_seen {
+                subnet_counts[vid % cc] += 1;
+            }
+        }
+        for (i, &count) in subnet_counts.iter().enumerate() {
+            metrics::set_attestation_aggregate_coverage_validators(
+                section,
+                &format!("subnet_{i}"),
+                count,
+            );
+        }
+    }
     metrics::set_attestation_aggregate_coverage_subnets(
         section,
         has_subnet.iter().filter(|&&b| b).count() as i64,

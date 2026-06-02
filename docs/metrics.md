@@ -131,7 +131,7 @@ Observability into how many validators/subnets are covered by the attestations t
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated) |
+| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined,subnet_0,subnet_1,…,subnet_N-1 |
 | `lean_attestation_aggregate_coverage_subnets` | Gauge | Number of covered subnets in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined |
 | `lean_attestation_aggregate_coverage_diff_validators` | Gauge | Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot | On block import, when the head carries the round's votes (see note above) | direction=block_only,timely_only |
 
