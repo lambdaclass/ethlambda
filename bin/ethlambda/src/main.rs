@@ -29,6 +29,7 @@ use ethlambda_types::{
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
 };
+use eyre::WrapErr;
 use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
@@ -117,7 +118,8 @@ async fn main() -> eyre::Result<()> {
         .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
     let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    tracing::subscriber::set_global_default(subscriber)
+        .wrap_err("failed to set global tracing subscriber")?;
 
     let options = CliOptions::parse();
 
@@ -148,7 +150,12 @@ async fn main() -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key);
+    let node_p2p_key = read_hex_file_bytes(&options.node_key).wrap_err_with(|| {
+        format!(
+            "failed to load node key from {}",
+            options.node_key.display()
+        )
+    })?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
     #[cfg(not(target_env = "msvc"))]
@@ -164,9 +171,19 @@ async fn main() -> eyre::Result<()> {
     let validator_config = options.validator_config;
     let validator_keys_dir = options.hash_sig_keys_dir;
 
-    let config_yaml = std::fs::read_to_string(&config_path).expect("Failed to read config.yaml");
+    let config_yaml = std::fs::read_to_string(&config_path).wrap_err_with(|| {
+        format!(
+            "failed to read genesis config from {}",
+            config_path.display()
+        )
+    })?;
     let genesis_config: GenesisConfig =
-        serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse config.yaml");
+        serde_yaml_ng::from_str(&config_yaml).wrap_err_with(|| {
+            format!(
+                "failed to parse genesis config from {}",
+                config_path.display()
+            )
+        })?;
 
     info!(
         genesis_time = genesis_config.genesis_time,
@@ -174,7 +191,7 @@ async fn main() -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
-    let validator_config_file = read_validator_config_file(&validator_config);
+    let validator_config_file = read_validator_config_file(&validator_config)?;
     let node_names = load_node_names(&validator_config_file);
 
     // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
@@ -194,17 +211,22 @@ async fn main() -> eyre::Result<()> {
     );
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
-    let bootnodes = read_bootnodes(&bootnodes_path);
+    let bootnodes = read_bootnodes(&bootnodes_path)?;
 
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
-            .expect("Failed to load validator keys");
+            .wrap_err("failed to load validator keys")?;
 
     let data_dir =
         std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
     info!(data_dir = %data_dir.display(), "Initializing DB");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-    let backend = Arc::new(RocksDBBackend::open(&data_dir).expect("Failed to open RocksDB"));
+    std::fs::create_dir_all(&data_dir)
+        .wrap_err_with(|| format!("failed to create data directory {}", data_dir.display()))?;
+    let backend = Arc::new(
+        RocksDBBackend::open(&data_dir)
+            .map_err(|err| eyre::eyre!("{err}"))
+            .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
+    );
 
     let store = fetch_initial_state(
         options.checkpoint_sync_url.as_deref(),
@@ -242,7 +264,7 @@ async fn main() -> eyre::Result<()> {
         is_aggregator: options.is_aggregator,
         aggregate_subnet_ids: options.aggregate_subnet_ids,
     })
-    .expect("failed to build swarm");
+    .wrap_err("failed to build swarm")?;
 
     let p2p = P2P::spawn(built, store.clone(), node_names);
 
@@ -365,9 +387,20 @@ struct ValidatorConfigEntry {
     privkey: H256,
 }
 
-fn read_validator_config_file(path: impl AsRef<Path>) -> ValidatorConfigFile {
-    let yaml = std::fs::read_to_string(&path).expect("Failed to read validator config file");
-    serde_yaml_ng::from_str(&yaml).expect("Failed to parse validator config file")
+fn read_validator_config_file(path: impl AsRef<Path>) -> eyre::Result<ValidatorConfigFile> {
+    let path = path.as_ref();
+    let yaml = std::fs::read_to_string(path).wrap_err_with(|| {
+        format!(
+            "failed to read validator config file from {}",
+            path.display()
+        )
+    })?;
+    serde_yaml_ng::from_str(&yaml).wrap_err_with(|| {
+        format!(
+            "failed to parse validator config file from {}",
+            path.display()
+        )
+    })
 }
 
 fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
@@ -380,12 +413,21 @@ fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
     ethlambda_p2p::derive_peer_ids(names_and_privkeys)
 }
 
-fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> Vec<Bootnode> {
-    let bootnodes_yaml =
-        std::fs::read_to_string(bootnodes_path).expect("Failed to read bootnodes file");
-    let enrs: Vec<String> =
-        serde_yaml_ng::from_str(&bootnodes_yaml).expect("Failed to parse bootnodes file");
-    parse_enrs(enrs)
+fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> eyre::Result<Vec<Bootnode>> {
+    let bootnodes_path = bootnodes_path.as_ref();
+    let bootnodes_yaml = std::fs::read_to_string(bootnodes_path).wrap_err_with(|| {
+        format!(
+            "failed to read bootnodes file from {}",
+            bootnodes_path.display()
+        )
+    })?;
+    let enrs: Vec<String> = serde_yaml_ng::from_str(&bootnodes_yaml).wrap_err_with(|| {
+        format!(
+            "failed to parse bootnodes file from {}",
+            bootnodes_path.display()
+        )
+    })?;
+    Ok(parse_enrs(enrs))
 }
 
 /// One entry in `annotated_validators.yaml` as emitted by `lean-quickstart`'s
@@ -458,18 +500,26 @@ fn read_validator_keys(
     validators_path: impl AsRef<Path>,
     validator_keys_dir: impl AsRef<Path>,
     node_id: &str,
-) -> Result<HashMap<u64, ValidatorKeyPair>, String> {
+) -> eyre::Result<HashMap<u64, ValidatorKeyPair>> {
     let validators_path = validators_path.as_ref();
     let validator_keys_dir = validator_keys_dir.as_ref();
-    let validators_yaml = std::fs::read_to_string(validators_path)
-        .map_err(|err| format!("Failed to read validators file: {err}"))?;
+    let validators_yaml = std::fs::read_to_string(validators_path).wrap_err_with(|| {
+        format!(
+            "failed to read validators file from {}",
+            validators_path.display()
+        )
+    })?;
     let validator_infos: BTreeMap<String, Vec<AnnotatedValidator>> =
-        serde_yaml_ng::from_str(&validators_yaml)
-            .map_err(|err| format!("Failed to parse validators file: {err}"))?;
+        serde_yaml_ng::from_str(&validators_yaml).wrap_err_with(|| {
+            format!(
+                "failed to parse validators file from {}",
+                validators_path.display()
+            )
+        })?;
 
     let validator_vec = validator_infos
         .get(node_id)
-        .ok_or_else(|| format!("Node ID '{node_id}' not found in validators config"))?;
+        .ok_or_else(|| eyre::eyre!("node ID '{node_id}' not found in validators config"))?;
 
     let resolve_path = |file: &Path| -> PathBuf {
         if file.is_absolute() {
@@ -482,7 +532,7 @@ fn read_validator_keys(
     // Group entries per validator index, routing each to its role slot.
     let mut grouped: BTreeMap<u64, RoleSlots> = BTreeMap::new();
     for entry in validator_vec {
-        let role = classify_role(&entry.privkey_file)?;
+        let role = classify_role(&entry.privkey_file).map_err(eyre::Report::msg)?;
         let path = resolve_path(&entry.privkey_file);
         let slots = grouped.entry(entry.index).or_default();
         let target = match role {
@@ -490,33 +540,26 @@ fn read_validator_keys(
             ValidatorKeyRole::Proposal => &mut slots.proposal,
         };
         if target.is_some() {
-            return Err(format!(
-                "validator {}: duplicate {role:?} entry",
-                entry.index
-            ));
+            eyre::bail!("validator {}: duplicate {role:?} entry", entry.index);
         }
         *target = Some(path);
     }
 
-    let load_key = |path: &Path, purpose: &str| -> Result<ValidatorSecretKey, String> {
-        let bytes = std::fs::read(path).map_err(|err| {
-            format!(
-                "Failed to read {purpose} key file {}: {err}",
-                path.display()
-            )
-        })?;
+    let load_key = |path: &Path, purpose: &str| -> eyre::Result<ValidatorSecretKey> {
+        let bytes = std::fs::read(path)
+            .wrap_err_with(|| format!("failed to read {purpose} key file {}", path.display()))?;
         ValidatorSecretKey::from_bytes(&bytes)
-            .map_err(|err| format!("Failed to parse {purpose} key {}: {err:?}", path.display()))
+            .map_err(|err| eyre::eyre!("failed to parse {purpose} key {}: {err:?}", path.display()))
     };
 
     let mut validator_keys = HashMap::new();
     for (idx, slots) in grouped {
         let att_path = slots
             .attestation
-            .ok_or_else(|| format!("validator {idx}: missing attester entry"))?;
+            .ok_or_else(|| eyre::eyre!("validator {idx}: missing attester entry"))?;
         let prop_path = slots
             .proposal
-            .ok_or_else(|| format!("validator {idx}: missing proposer entry"))?;
+            .ok_or_else(|| eyre::eyre!("validator {idx}: missing proposer entry"))?;
 
         info!(
             %node_id,
@@ -547,20 +590,13 @@ fn read_validator_keys(
     Ok(validator_keys)
 }
 
-fn read_hex_file_bytes(path: impl AsRef<Path>) -> Vec<u8> {
+fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
     let path = path.as_ref();
-    let Ok(file_content) = std::fs::read_to_string(path)
-        .inspect_err(|err| error!(file=%path.display(), %err, "Failed to read hex file"))
-    else {
-        std::process::exit(1);
-    };
+    let file_content = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read hex file from {}", path.display()))?;
     let hex_string = file_content.trim().trim_start_matches("0x");
-    let Ok(bytes) = hex::decode(hex_string)
-        .inspect_err(|err| error!(file=%path.display(), %err, "Failed to decode hex file"))
-    else {
-        std::process::exit(1);
-    };
-    bytes
+    hex::decode(hex_string)
+        .wrap_err_with(|| format!("failed to decode hex file from {}", path.display()))
 }
 
 /// Fetch the initial state for the node.
