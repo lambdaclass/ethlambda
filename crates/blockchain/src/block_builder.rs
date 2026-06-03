@@ -67,8 +67,6 @@ pub(crate) fn build_block(
     );
     metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
 
-    // Each entry in `selected` is one greedily-picked child payload, counted
-    // before compaction merges proofs sharing the same AttestationData.
     let child_payloads_consumed = selected.len();
 
     // Compact: merge proofs sharing the same AttestationData via recursive
@@ -100,7 +98,6 @@ pub(crate) fn build_block(
     metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
     final_block.state_root = post_state.hash_tree_root();
 
-    metrics::inc_block_proposal_attestation_builds();
     metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
     metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
     metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
@@ -177,6 +174,7 @@ fn select_attestations(
         let (att_data, proofs) = &chain.aggregated_payloads[&data_root];
 
         processed_data_roots.insert(data_root);
+        metrics::inc_block_proposal_attestation_builds();
 
         let before = selected.len();
         extend_proofs_greedily(proofs, &mut selected, att_data);

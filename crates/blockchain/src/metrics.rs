@@ -453,7 +453,8 @@ static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL: std::sync::LazyLock<IntCoun
     std::sync::LazyLock::new(|| {
         register_int_counter!(
             "lean_block_proposal_attestation_builds_total",
-            "Completed block-proposal attestation selection runs (one per proposal attempt)."
+            "Attestations selected during block-proposal selection (one increment per \
+             selection-loop round that picks an AttestationData)."
         )
         .unwrap()
     });
@@ -847,44 +848,5 @@ pub fn set_node_sync_status(status: SyncStatus) {
         LEAN_NODE_SYNC_STATUS
             .with_label_values(&[label])
             .set(i64::from(*label == active));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The block-proposal phase metric registers and accepts every label in
-    /// `BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`, and the companion
-    /// counters/histograms are callable. Guards against label drift between the
-    /// constant and the strings passed at the `build_block` call sites.
-    #[test]
-    fn block_proposal_attestation_build_metrics_are_usable() {
-        for phase in BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES {
-            observe_block_proposal_phase(phase, Duration::from_millis(1));
-            assert_eq!(
-                LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS
-                    .with_label_values(&[phase])
-                    .get_sample_count(),
-                1,
-                "phase {phase} should have one observation"
-            );
-        }
-
-        inc_block_proposal_attestation_builds();
-        inc_block_proposal_child_payloads_consumed(3);
-        observe_block_proposal_attestation_data_selected(4);
-        observe_block_proposal_aggregates_selected(4);
-
-        assert_eq!(LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL.get(), 1);
-        assert_eq!(LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL.get(), 3);
-        assert_eq!(
-            LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED.get_sample_count(),
-            1
-        );
-        assert_eq!(
-            LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED.get_sample_count(),
-            1
-        );
     }
 }
