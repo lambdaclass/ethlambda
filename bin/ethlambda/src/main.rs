@@ -15,10 +15,12 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
+use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
@@ -36,7 +38,9 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
 use ethlambda_rpc::RpcConfig;
-use ethlambda_storage::{StorageBackend, Store, backend::RocksDBBackend};
+use ethlambda_storage::{
+    MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
+};
 
 const ASCII_ART: &str = r#"
       _   _     _                 _         _
@@ -635,6 +639,30 @@ async fn fetch_initial_state(
     };
 
     // Checkpoint sync path
+
+    // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
+    if let Some(store) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_millis() as u64;
+        let current_slot =
+            now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
+        let finalized_slot = store.latest_finalized().slot;
+        let gap = current_slot.saturating_sub(finalized_slot);
+        if gap <= MAX_RESUMABLE_DB_STATE_AGE {
+            info!(
+                finalized_slot,
+                current_slot, gap, "Resuming from existing DB state"
+            );
+            return Ok(store);
+        }
+        warn!(
+            finalized_slot,
+            current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
+        );
+    }
+
     info!(%checkpoint_url, "Starting checkpoint sync");
 
     // The state and block are fetched in parallel; if the peer advances
