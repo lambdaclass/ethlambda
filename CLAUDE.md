@@ -254,7 +254,7 @@ actual_slot = finalized_slot + 1 + relative_index
 - Post-quantum signature scheme
 - 52-byte public keys, 3112-byte signatures
 - Epoch-based to prevent reuse
-- Aggregation via leanVM for efficiency
+- Aggregation via leanVM (previously leanMultisig) for efficiency
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM

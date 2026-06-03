@@ -387,9 +387,12 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
 
 /// Attempt to advance finalization from source to target.
 ///
-/// Finalization succeeds when there are no justifiable slots between
-/// source.slot and target.slot (exclusive). When finalization advances,
-/// shifts the justified_slots window and prunes stale justifications.
+/// Finalization advances only when the source lies past the old finalized point
+/// and there are no justifiable slots between source.slot and target.slot
+/// (exclusive). A source at or behind the finalized boundary is already final:
+/// it may justify a newer target, but it must not re-finalize or scan below the
+/// finalized boundary. When finalization advances, shifts the justified_slots
+/// window and prunes stale justifications.
 fn try_finalize(
     state: &mut State,
     source: Checkpoint,
@@ -397,6 +400,12 @@ fn try_finalize(
     justifications: &mut HashMap<H256, Vec<bool>>,
     root_to_slot: &HashMap<H256, u64>,
 ) {
+    // A stale or boundary source is already finalized; advancing from it would
+    // rewind the finalized checkpoint and scan slots below the boundary.
+    if source.slot <= state.latest_finalized.slot {
+        return;
+    }
+
     // Consider whether finalization can advance.
     if ((source.slot + 1)..target.slot)
         .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
@@ -682,5 +691,73 @@ mod tests {
             ShortRoot(&state.latest_justified.root.0)
         );
         assert_eq!(state.latest_justified.root, r9);
+    }
+
+    /// Regression (leanSpec #802): a supermajority attestation whose source sits
+    /// at or behind the finalized boundary may justify a newer target, but must
+    /// never advance (rewind) finalization below that boundary.
+    ///
+    /// Setup: finalized = justified = slot 4. A supermajority votes from a stale
+    /// source at slot 1 to a fresh target at slot 6 (Δ=2 is pronic, so the target
+    /// is justifiable). The target should become justified while the finalized
+    /// checkpoint stays pinned at slot 4.
+    #[test]
+    fn stale_finalized_source_justifies_without_rewinding_finalization() {
+        const NUM_VALIDATORS: usize = 4;
+        let r1 = H256([1u8; 32]);
+        let r4 = H256([4u8; 32]);
+        let r6 = H256([6u8; 32]);
+
+        let mut hashes: Vec<H256> = vec![H256::ZERO; 7];
+        hashes[1] = r1;
+        hashes[4] = r4;
+        hashes[6] = r6;
+
+        let validators = make_validators(NUM_VALIDATORS);
+        // Window is relative to finalized=4; cover up to slot 6 (slots 5 and 6).
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 4, 6);
+
+        let mut state = State {
+            config: ChainConfig { genesis_time: 0 },
+            slot: 7,
+            latest_block_header: BlockHeader {
+                slot: 6,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint { slot: 4, root: r4 },
+            latest_finalized: Checkpoint { slot: 4, root: r4 },
+            historical_block_hashes: SszList::try_from(hashes).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        // Supermajority (3 of 4) attesting from the stale source (slot 1) to the
+        // fresh target (slot 6). Source slot 1 <= finalized 4, so it is implicitly
+        // justified and passes is_valid_vote.
+        let atts: Vec<AggregatedAttestation> = vec![make_attestation(
+            7,
+            (1, r1),
+            (6, r6),
+            (6, r6),
+            &[0, 1, 2],
+            NUM_VALIDATORS,
+        )];
+        let atts: AggregatedAttestations = atts.try_into().unwrap();
+
+        process_attestations(&mut state, &atts).expect("process_attestations should succeed");
+
+        // The target is justified.
+        assert_eq!(state.latest_justified.slot, 6);
+        assert_eq!(state.latest_justified.root, r6);
+        // Finalization stays pinned at the boundary: the stale source must not
+        // rewind or re-finalize.
+        assert_eq!(state.latest_finalized.slot, 4);
+        assert_eq!(state.latest_finalized.root, r4);
     }
 }
