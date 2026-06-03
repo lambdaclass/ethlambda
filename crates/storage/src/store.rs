@@ -13,7 +13,7 @@ use ethlambda_types::{
 };
 use libssz::{SszDecode, SszEncode};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -86,6 +86,9 @@ const BLOCKS_TO_KEEP: usize = 21_600;
 
 /// ~3.3 hours of state history at 4-second slots (12000 / 4 = 3000).
 const STATES_TO_KEEP: usize = 3_000;
+
+/// ~30 minutes of resume window at 4-second slots (1800 / 4 = 450).
+pub const MAX_RESUMABLE_DB_STATE_AGE: u64 = 450;
 
 const _: () = assert!(
     BLOCKS_TO_KEEP >= STATES_TO_KEEP,
@@ -530,6 +533,41 @@ impl Store {
             anchor_state,
             Some(anchor_block.body),
         ))
+    }
+
+    /// Build a Store from the state already persisted in the storage backend.
+    ///
+    /// Returns `None` if the backend is empty or its persisted `genesis_time`
+    /// doesn't match `expected_genesis_time`.
+    pub fn from_db_state(
+        backend: Arc<dyn StorageBackend>,
+        expected_genesis_time: u64,
+    ) -> Option<Self> {
+        let persisted_config = {
+            let view = backend.begin_read().expect("read view");
+            let bytes = view.get(Table::Metadata, KEY_CONFIG).expect("get config")?;
+            // probe KEY_LATEST_FINALIZED
+            view.get(Table::Metadata, KEY_LATEST_FINALIZED)
+                .expect("get latest finalized")?;
+            ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
+        };
+        if persisted_config.genesis_time != expected_genesis_time {
+            warn!(
+                db_genesis_time = persisted_config.genesis_time,
+                expected_genesis_time,
+                "Persisted DB has a different genesis_time; treating as empty"
+            );
+            return None;
+        }
+        info!("Loaded store from persisted DB state");
+        Some(Self {
+            backend,
+            new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
+            known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
+                GOSSIP_SIGNATURE_CAP,
+            ))),
+        })
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -2529,5 +2567,47 @@ mod tests {
 
         let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
         assert!(store.get_signed_block(&root).is_none());
+    }
+
+    // ============ from_db_state Tests ============
+
+    #[test]
+    fn from_db_state_returns_none_on_empty_backend() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        assert!(Store::from_db_state(backend, 12345).is_none());
+    }
+
+    #[test]
+    fn from_db_state_returns_some_on_matching_genesis_time() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write an initial state to the backend.
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        assert!(Store::from_db_state(backend, 12345).is_some());
+    }
+
+    #[test]
+    fn from_db_state_returns_none_on_genesis_time_mismatch() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write an initial state to the backend.
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        assert!(Store::from_db_state(backend, 99999).is_none());
+    }
+
+    #[test]
+    fn from_db_state_returns_none_when_latest_finalized_is_missing() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // Write only KEY_CONFIG, leaving KEY_LATEST_FINALIZED absent.
+        let config = ChainConfig {
+            genesis_time: 12345,
+        };
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Metadata,
+                vec![(KEY_CONFIG.to_vec(), config.to_ssz())],
+            )
+            .expect("put config");
+        batch.commit().expect("commit");
+        assert!(Store::from_db_state(backend, 12345).is_none());
     }
 }
