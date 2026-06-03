@@ -364,10 +364,14 @@ fn score_entry(
     let total = prior_count + new_voters.len();
     let crosses_2_3 = 3 * total >= 2 * validator_count;
 
-    // 3SF-mini finalization requires no slot strictly between source.slot
-    // and target.slot to still be justifiable (so source and target are
-    // consecutive justified checkpoints in the projected post-state).
+    // 3SF-mini finalization requires the source to lie past the finalized
+    // boundary (a source at or behind it is already final and must not
+    // re-finalize) and no slot strictly between source.slot and target.slot to
+    // still be justifiable (so source and target are consecutive justified
+    // checkpoints in the projected post-state). Mirrors `try_finalize` in the
+    // state transition.
     let finalizes = crosses_2_3
+        && att_data.source.slot > projected_finalized_slot
         && (att_data.source.slot + 1..att_data.target.slot)
             .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
 
@@ -686,6 +690,52 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         bits
+    }
+
+    /// Regression (leanSpec #802): a supermajority entry whose source sits at
+    /// the finalized boundary must be scored `Justify`, not `Finalize`. Such a
+    /// source is already final, so it advances nothing; the empty scan range
+    /// `(source.slot + 1..target.slot)` would otherwise make `.all(...)`
+    /// vacuously true and mis-tier the entry as a finalizer.
+    #[test]
+    fn score_entry_does_not_finalize_source_at_boundary() {
+        const NUM_VALIDATORS: usize = 4;
+        const FINALIZED_SLOT: u64 = 4;
+
+        // Source at the finalized boundary, target one slot ahead (empty scan).
+        let att_data = AttestationData {
+            slot: 7,
+            head: Checkpoint {
+                slot: 5,
+                root: H256([5u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 5,
+                root: H256([5u8; 32]),
+            },
+            source: Checkpoint {
+                slot: FINALIZED_SLOT,
+                root: H256([4u8; 32]),
+            },
+        };
+
+        // Supermajority (3 of 4) so the entry crosses 2/3.
+        let proofs = vec![AggregatedSignatureProof::empty(make_bits(&[0, 1, 2]))];
+
+        let (score, _) = score_entry(
+            &att_data,
+            &proofs,
+            &HashMap::new(),
+            FINALIZED_SLOT,
+            NUM_VALIDATORS,
+        )
+        .expect("entry contributes new voters");
+
+        assert_eq!(
+            score.tier,
+            Tier::Justify,
+            "source at the finalized boundary must justify, not finalize"
+        );
     }
 
     /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259
