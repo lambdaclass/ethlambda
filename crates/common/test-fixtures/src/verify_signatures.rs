@@ -56,7 +56,29 @@ pub struct VerifySignaturesTest {
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
-    pub proof: HexBytes,
+    pub proof: ProofField,
+}
+
+/// Merged Type-2 proof bytes, in either fixture shape.
+///
+/// leanSpec PR #799 typed `SignedBlock.proof` as a multi-signature container,
+/// nesting the bytes one level deeper: `{ "proof": { "data": "0x..." } }`.
+/// The flat `{ "data": "0x..." }` shape (PR #717) is still accepted since the
+/// Hive test driver receives the same JSON from older spec-assets simulators.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProofField {
+    Typed { proof: HexBytes },
+    Flat(HexBytes),
+}
+
+impl ProofField {
+    pub fn decode(&self) -> Result<Vec<u8>, hex::FromHexError> {
+        match self {
+            Self::Typed { proof } => proof.decode(),
+            Self::Flat(bytes) => bytes.decode(),
+        }
+    }
 }
 
 /// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
@@ -107,14 +129,22 @@ impl From<TestSignedBlock> for SignedBlock {
 impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
     /// Type-2 proof bytes verbatim.
+    ///
+    /// The typed shape carries the raw lean-multisig wire, so it gets wrapped
+    /// into the SSZ-container envelope `SignedBlock.proof` stores. The flat
+    /// shape already includes that envelope and passes through unchanged.
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let bytes = self
             .proof
             .decode()
             .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
         let len = bytes.len();
-        let proof = ByteList512KiB::try_from(bytes)
-            .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
+        let proof = match self.proof {
+            ProofField::Typed { .. } => SignedBlock::wrap_merged_proof(&bytes)
+                .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?,
+            ProofField::Flat(_) => ByteList512KiB::try_from(bytes)
+                .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?,
+        };
         Ok(SignedBlock {
             message: self.block.into(),
             proof,

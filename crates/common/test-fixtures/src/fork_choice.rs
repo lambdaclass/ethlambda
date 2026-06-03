@@ -84,7 +84,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationStepData {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: Option<u64>,
     pub data: AttestationData,
     #[serde(default, deserialize_with = "deser_opt_xmss_hex")]

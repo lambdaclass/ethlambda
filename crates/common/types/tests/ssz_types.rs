@@ -74,7 +74,7 @@ pub fn decode_hex_h256(hex_str: &str) -> Result<H256, Box<dyn std::error::Error>
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Attestation {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: u64,
     pub data: AttestationData,
 }
@@ -107,7 +107,7 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignedAttestation {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: u64,
     pub data: AttestationData,
     #[serde(deserialize_with = "deser_signature_hex")]
