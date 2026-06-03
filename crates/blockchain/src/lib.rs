@@ -57,36 +57,13 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
-/// Milliseconds until the interval boundary for interval-count `time`.
-fn ms_until_tick(time: u64, now_ms: u64, genesis_time_ms: u64) -> u64 {
-    let boundary_ms = genesis_time_ms + time * MILLISECONDS_PER_INTERVAL;
-    boundary_ms.saturating_sub(now_ms)
-}
-
-/// Next interval whose duties should run, given the last processed interval
-/// (`store.time()`) and the current wall-clock interval. Returns `None` when
-/// caught up.
-///
-/// Each missed interval is processed one at a time so its duties still run
-/// when a previous duty overran its interval (issue #413). When more than a
-/// slot behind (e.g. a long stall), jump straight to the wall clock instead;
-/// `store::on_tick` fast-forwards through the gap the same way.
-fn next_tick_time(store_time: u64, wall_time: u64) -> Option<u64> {
-    if store_time >= wall_time {
-        None
-    } else if wall_time - store_time > INTERVALS_PER_SLOT {
-        Some(wall_time)
-    } else {
-        Some(store_time + 1)
-    }
-}
-
-/// Current UNIX timestamp in milliseconds.
-fn unix_now_ms() -> u64 {
-    SystemTime::UNIX_EPOCH
-        .elapsed()
-        .expect("already past the unix epoch")
-        .as_millis() as u64
+/// Milliseconds until the next interval boundary, measured relative to genesis.
+fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+    // Before genesis: wait until genesis itself.
+    let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
+        return genesis_time_ms - now_ms;
+    };
+    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
 }
 
 impl BlockChain {
@@ -104,7 +81,10 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = unix_now_ms();
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_millis() as u64;
         let current_slot =
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
@@ -712,47 +692,16 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
+        let timestamp = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch");
+        let now_ms = timestamp.as_millis() as u64;
+        self.on_tick(now_ms, ctx).await;
+        // Schedule the next tick at the next interval boundary
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-
-        // Process every interval boundary that has passed but was not ticked
-        // yet (`store.time()` tracks the last processed interval), deriving
-        // each tick's timestamp from its boundary rather than the wall clock.
-        // A duty that overruns its interval (e.g. inline block-building
-        // proofs) then delays the following duties instead of silently
-        // skipping them (issue #413).
-        loop {
-            let wall_time =
-                unix_now_ms().saturating_sub(genesis_time_ms) / MILLISECONDS_PER_INTERVAL;
-            let Some(tick_time) = next_tick_time(self.store.time(), wall_time) else {
-                break;
-            };
-            if tick_time < wall_time {
-                let slot = tick_time / INTERVALS_PER_SLOT;
-                let interval = tick_time % INTERVALS_PER_SLOT;
-                warn!(
-                    %slot,
-                    %interval,
-                    "Tick duties overran their interval; running missed tick in place"
-                );
-            }
-            let timestamp_ms = genesis_time_ms + tick_time * MILLISECONDS_PER_INTERVAL;
-            let store_time_before = self.store.time();
-            self.on_tick(timestamp_ms, ctx).await;
-            if self.store.time() == store_time_before {
-                // on_tick bailed without processing (e.g. the no-validators
-                // guard); break instead of spinning, and retry next interval.
-                break;
-            }
-        }
-
-        // Schedule the next tick at the next interval boundary. Computed from
-        // the wall clock rather than store.time() so a tick that made no
-        // progress retries at the next boundary instead of immediately.
-        let now_ms = unix_now_ms();
-        let wall_time = now_ms.saturating_sub(genesis_time_ms) / MILLISECONDS_PER_INTERVAL;
-        let delay = ms_until_tick(wall_time + 1, now_ms, genesis_time_ms);
+        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
         send_after(
-            Duration::from_millis(delay),
+            Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
             block_chain_protocol::Tick,
         );
@@ -875,73 +824,5 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         {
             session.cancel.cancel();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GENESIS_MS: u64 = 1_000_000;
-
-    #[test]
-    fn ms_until_tick_before_boundary_returns_exact_delay() {
-        // Tick 3 fires at genesis + 2400ms; now is 100ms before that.
-        let now = GENESIS_MS + 3 * MILLISECONDS_PER_INTERVAL - 100;
-        assert_eq!(ms_until_tick(3, now, GENESIS_MS), 100);
-    }
-
-    #[test]
-    fn ms_until_tick_past_boundary_returns_zero() {
-        let now = GENESIS_MS + 3 * MILLISECONDS_PER_INTERVAL + 500;
-        assert_eq!(ms_until_tick(3, now, GENESIS_MS), 0);
-    }
-
-    #[test]
-    fn ms_until_tick_pre_genesis_waits_until_genesis() {
-        let now = GENESIS_MS - 5_000;
-        assert_eq!(ms_until_tick(0, now, GENESIS_MS), 5_000);
-    }
-
-    #[test]
-    fn next_tick_time_caught_up_returns_none() {
-        assert_eq!(next_tick_time(7, 7), None);
-        // Clock skew (store ahead of wall) must not produce a tick either.
-        assert_eq!(next_tick_time(8, 7), None);
-    }
-
-    #[test]
-    fn next_tick_time_steps_one_interval() {
-        assert_eq!(next_tick_time(6, 7), Some(7));
-    }
-
-    #[test]
-    fn next_tick_time_replays_each_missed_interval() {
-        // Scenario from issue #413: interval 0 of some slot processed on
-        // time, but block building overran into interval 2's window. Both
-        // missed intervals are still processed, one at a time, so interval
-        // 1's attestation duty runs instead of being silently skipped.
-        let store_time = 2 * INTERVALS_PER_SLOT; // slot 2, interval 0
-        let wall_time = store_time + 2;
-        let next = next_tick_time(store_time, wall_time).unwrap();
-        assert_eq!(next % INTERVALS_PER_SLOT, 1); // attestation interval
-        assert_eq!(next_tick_time(next, wall_time), Some(next + 1));
-        assert_eq!(next_tick_time(next + 1, wall_time), None);
-    }
-
-    #[test]
-    fn next_tick_time_replays_up_to_a_full_slot() {
-        let store_time = 7;
-        let wall_time = store_time + INTERVALS_PER_SLOT;
-        assert_eq!(next_tick_time(store_time, wall_time), Some(store_time + 1));
-    }
-
-    #[test]
-    fn next_tick_time_jumps_when_more_than_a_slot_behind() {
-        // Mirrors store::on_tick's fast-forward: don't replay every missed
-        // interval after a long stall, jump straight to the wall clock.
-        let store_time = 7;
-        let wall_time = store_time + INTERVALS_PER_SLOT + 1;
-        assert_eq!(next_tick_time(store_time, wall_time), Some(wall_time));
     }
 }
