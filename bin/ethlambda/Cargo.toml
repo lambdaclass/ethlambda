@@ -33,5 +33,14 @@ eyre.workspace = true
 
 tikv-jemallocator.workspace = true
 
+# Only used by the `zk-alloc` feature, to install the proving-scoped global
+# allocator and run leanVM's startup core-count assertion.
+ethlambda-crypto = { workspace = true, optional = true }
+
+[features]
+# Benchmark-only: swap jemalloc for leanVM's arena allocator, scoped to proving
+# threads. Drops jemalloc + /debug/pprof heap profiling for this build.
+zk-alloc = ["dep:ethlambda-crypto", "ethlambda-crypto/zk-alloc"]
+
 [build-dependencies]
 vergen-git2.workspace = true

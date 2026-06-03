@@ -32,6 +32,72 @@ pub fn ensure_verifier_ready() {
     VERIFIER_INIT.call_once(setup_verifier);
 }
 
+#[cfg(feature = "zk-alloc")]
+mod zk_alloc;
+#[cfg(feature = "zk-alloc")]
+pub use zk_alloc::{ScopedZkAlloc, init_allocator, init_arena_rayon_pool};
+
+// Exercise the real arena path in this crate's test binary: the aggregate/verify
+// round-trip tests below then allocate through `ScopedZkAlloc`, so proving
+// allocations actually hit leanVM's arena and outputs must survive serialization.
+#[cfg(all(test, feature = "zk-alloc"))]
+#[global_allocator]
+static TEST_ALLOC: ScopedZkAlloc = ScopedZkAlloc;
+
+/// Run a Type-1 prover call, then serialize the proof to its on-wire bytes.
+///
+/// Under the `zk-alloc` feature the prover call runs inside an arena phase
+/// (serialized behind a global proving lock), and serialization happens *after*
+/// the phase ends so the returned bytes land in the system allocator and survive
+/// the next phase's slab reset. Without the feature this is just
+/// `ensure_prover_ready` + `produce` + serialize.
+#[cfg(feature = "zk-alloc")]
+fn prove_type1<F>(produce: F) -> Result<ByteList512KiB, AggregationError>
+where
+    F: FnOnce() -> Result<LMType1, AggregationError>,
+{
+    // Must precede `ensure_prover_ready`: `setup_prover` is the first rayon user
+    // and would otherwise build an unflagged global pool.
+    zk_alloc::init_arena_rayon_pool();
+    let session = zk_alloc::ArenaSession::begin();
+    ensure_prover_ready();
+    let proof = session.prove(produce);
+    compress_type1_to_byte_list(&proof?)
+}
+
+#[cfg(not(feature = "zk-alloc"))]
+fn prove_type1<F>(produce: F) -> Result<ByteList512KiB, AggregationError>
+where
+    F: FnOnce() -> Result<LMType1, AggregationError>,
+{
+    ensure_prover_ready();
+    compress_type1_to_byte_list(&produce()?)
+}
+
+/// Type-2 counterpart of [`prove_type1`].
+#[cfg(feature = "zk-alloc")]
+fn prove_type2<F>(produce: F) -> Result<ByteList512KiB, AggregationError>
+where
+    F: FnOnce() -> Result<LMType2, AggregationError>,
+{
+    // Must precede `ensure_prover_ready`: `setup_prover` is the first rayon user
+    // and would otherwise build an unflagged global pool.
+    zk_alloc::init_arena_rayon_pool();
+    let session = zk_alloc::ArenaSession::begin();
+    ensure_prover_ready();
+    let proof = session.prove(produce);
+    compress_type2_to_byte_list(&proof?)
+}
+
+#[cfg(not(feature = "zk-alloc"))]
+fn prove_type2<F>(produce: F) -> Result<ByteList512KiB, AggregationError>
+where
+    F: FnOnce() -> Result<LMType2, AggregationError>,
+{
+    ensure_prover_ready();
+    compress_type2_to_byte_list(&produce()?)
+}
+
 /// Error type for signature aggregation operations.
 #[derive(Debug, Error)]
 pub enum AggregationError {
@@ -164,18 +230,16 @@ pub fn aggregate_signatures(
         return Err(AggregationError::EmptyInput);
     }
 
-    ensure_prover_ready();
+    prove_type1(move || {
+        let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
+            .into_iter()
+            .zip(signatures)
+            .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
+            .collect();
 
-    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
-        .into_iter()
-        .zip(signatures)
-        .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
-        .collect();
-
-    let proof = aggregate_type_1(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
-
-    compress_type1_to_byte_list(&proof)
+        aggregate_type_1(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
+            .map_err(|err| AggregationError::ProverFailure(err.to_string()))
+    })
 }
 
 /// Aggregate both existing Type-1 proofs (children) and raw XMSS signatures.
@@ -202,24 +266,22 @@ pub fn aggregate_mixed(
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
 
-    ensure_prover_ready();
+    prove_type1(move || {
+        let children_native: Vec<LMType1> = children
+            .into_iter()
+            .enumerate()
+            .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
+            .collect::<Result<_, _>>()?;
 
-    let children_native: Vec<LMType1> = children
-        .into_iter()
-        .enumerate()
-        .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
-        .collect::<Result<_, _>>()?;
+        let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = raw_public_keys
+            .into_iter()
+            .zip(raw_signatures)
+            .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
+            .collect();
 
-    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = raw_public_keys
-        .into_iter()
-        .zip(raw_signatures)
-        .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
-        .collect();
-
-    let proof = aggregate_type_1(&children_native, raw_xmss, message.0, slot, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
-
-    compress_type1_to_byte_list(&proof)
+        aggregate_type_1(&children_native, raw_xmss, message.0, slot, LOG_INV_RATE)
+            .map_err(|err| AggregationError::ProverFailure(err.to_string()))
+    })
 }
 
 /// Recursively aggregate two or more already-aggregated Type-1 proofs into one.
@@ -235,18 +297,16 @@ pub fn aggregate_proofs(
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
 
-    ensure_prover_ready();
+    prove_type1(move || {
+        let children_native: Vec<LMType1> = children
+            .into_iter()
+            .enumerate()
+            .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
+            .collect::<Result<_, _>>()?;
 
-    let children_native: Vec<LMType1> = children
-        .into_iter()
-        .enumerate()
-        .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
-        .collect::<Result<_, _>>()?;
-
-    let proof = aggregate_type_1(&children_native, vec![], message.0, slot, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
-
-    compress_type1_to_byte_list(&proof)
+        aggregate_type_1(&children_native, vec![], message.0, slot, LOG_INV_RATE)
+            .map_err(|err| AggregationError::ProverFailure(err.to_string()))
+    })
 }
 
 /// Verify a Type-1 aggregated signature proof.
@@ -299,18 +359,16 @@ pub fn merge_type_1s_into_type_2(
         return Err(AggregationError::EmptyInput);
     }
 
-    ensure_prover_ready();
+    prove_type2(move || {
+        let type_1s_native: Vec<LMType1> = type_1s
+            .into_iter()
+            .enumerate()
+            .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
+            .collect::<Result<_, _>>()?;
 
-    let type_1s_native: Vec<LMType1> = type_1s
-        .into_iter()
-        .enumerate()
-        .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
-        .collect::<Result<_, _>>()?;
-
-    let merged = merge_many_type_1(type_1s_native, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
-
-    compress_type2_to_byte_list(&merged)
+        merge_many_type_1(type_1s_native, LOG_INV_RATE)
+            .map_err(|err| AggregationError::ProverFailure(err.to_string()))
+    })
 }
 
 /// Verify a Type-2 merged proof against the per-component expected bindings.
@@ -380,32 +438,30 @@ pub fn split_type_2_by_message(
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
 ) -> Result<ByteList512KiB, AggregationError> {
-    ensure_prover_ready();
+    prove_type1(move || {
+        let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
+            .into_iter()
+            .map(into_lean_pubkeys)
+            .collect();
 
-    let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
-        .into_iter()
-        .map(into_lean_pubkeys)
-        .collect();
+        let type_2 = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
+            .ok_or(AggregationError::DeserializationFailed)?;
 
-    let type_2 = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
-        .ok_or(AggregationError::DeserializationFailed)?;
+        let matches: Vec<usize> = type_2
+            .info
+            .iter()
+            .enumerate()
+            .filter_map(|(i, info)| (info.without_pubkeys.message == message.0).then_some(i))
+            .collect();
+        let index = match matches.as_slice() {
+            [i] => *i,
+            [] => return Err(AggregationError::UnknownMessage),
+            _ => return Err(AggregationError::MultipleMessages),
+        };
 
-    let matches: Vec<usize> = type_2
-        .info
-        .iter()
-        .enumerate()
-        .filter_map(|(i, info)| (info.without_pubkeys.message == message.0).then_some(i))
-        .collect();
-    let index = match matches.as_slice() {
-        [i] => *i,
-        [] => return Err(AggregationError::UnknownMessage),
-        _ => return Err(AggregationError::MultipleMessages),
-    };
-
-    let component = split_type_2(type_2, index, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
-
-    compress_type1_to_byte_list(&component)
+        split_type_2(type_2, index, LOG_INV_RATE)
+            .map_err(|err| AggregationError::ProverFailure(err.to_string()))
+    })
 }
 
 #[cfg(test)]

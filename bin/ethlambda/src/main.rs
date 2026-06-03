@@ -1,14 +1,21 @@
 mod checkpoint_sync;
 mod version;
 
-#[cfg(not(target_env = "msvc"))]
+// Default allocator: jemalloc with heap profiling. Under the `zk-alloc`
+// benchmark feature this is replaced by leanVM's proving-scoped arena allocator
+// (`ethlambda_crypto::ScopedZkAlloc`), which is incompatible with jemalloc.
+#[cfg(all(not(target_env = "msvc"), not(feature = "zk-alloc")))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(feature = "zk-alloc")))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
+#[cfg(feature = "zk-alloc")]
+#[global_allocator]
+static ALLOC: ethlambda_crypto::ScopedZkAlloc = ethlambda_crypto::ScopedZkAlloc;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -151,10 +158,21 @@ async fn main() -> eyre::Result<()> {
     let node_p2p_key = read_hex_file_bytes(&options.node_key);
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(all(not(target_env = "msvc"), not(feature = "zk-alloc")))]
     info!("Using jemalloc allocator with heap profiling enabled");
-    #[cfg(target_env = "msvc")]
+    #[cfg(all(target_env = "msvc", not(feature = "zk-alloc")))]
     info!("Using system allocator (MSVC target)");
+    #[cfg(feature = "zk-alloc")]
+    {
+        // Asserts available_parallelism() == the core count this binary was
+        // built for; panics on mismatch. The binary must be built on (or for)
+        // the machine it runs on. See ethlambda_crypto::zk_alloc.
+        ethlambda_crypto::init_allocator();
+        // Build the global rayon pool with arena-flagged workers before any
+        // other rayon user (leanVM's setup_prover) creates it unflagged.
+        ethlambda_crypto::init_arena_rayon_pool();
+        info!("Using zk-alloc arena allocator (proving-scoped, benchmark build)");
+    }
 
     info!(node_key=?options.node_key, "got node key");
 

@@ -20,5 +20,14 @@ leansig.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 
+# Only needed by the `zk-alloc` feature, to mark the global rayon pool's prover
+# threads around an arena phase.
+rayon = { workspace = true, optional = true }
+
+[features]
+# Benchmark-only: route leanVM's bump-arena allocator to proving threads via a
+# scoped global allocator. See `src/zk_alloc.rs`. OFF by default.
+zk-alloc = ["dep:rayon"]
+
 [dev-dependencies]
 hex.workspace = true
