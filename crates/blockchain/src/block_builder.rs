@@ -9,7 +9,10 @@
 //! without re-running the STF. The final STF runs once after selection to
 //! seal `state_root`.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
@@ -54,6 +57,7 @@ pub(crate) fn build_block(
 ) -> Result<(Block, Vec<AggregatedSignatureProof>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
+    let select_start = Instant::now();
     let selected = select_attestations(
         head_state,
         slot,
@@ -61,10 +65,15 @@ pub(crate) fn build_block(
         known_block_roots,
         aggregated_payloads,
     );
+    metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
+
+    let child_payloads_consumed = selected.len();
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
+    let compact_start = Instant::now();
     let compacted = compact_attestations(selected, head_state)?;
+    metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
@@ -80,9 +89,18 @@ pub(crate) fn build_block(
         body: BlockBody { attestations },
     };
     let mut post_state = head_state.clone();
+    // ethlambda runs the STF once after selection (it projects justification
+    // incrementally instead of re-running the STF per loop round), so this is
+    // a single `stf_simulate` observation per build.
+    let stf_start = Instant::now();
     process_slots(&mut post_state, slot)?;
     process_block(&mut post_state, &final_block)?;
+    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
     final_block.state_root = post_state.hash_tree_root();
+
+    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
+    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
+    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
 
     let post_checkpoints = PostBlockCheckpoints {
         justified: post_state.latest_justified,
@@ -156,6 +174,7 @@ fn select_attestations(
         let (att_data, proofs) = &chain.aggregated_payloads[&data_root];
 
         processed_data_roots.insert(data_root);
+        metrics::inc_block_proposal_attestation_builds();
 
         let before = selected.len();
         extend_proofs_greedily(proofs, &mut selected, att_data);
