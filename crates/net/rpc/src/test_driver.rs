@@ -17,8 +17,8 @@
 //! store-mutating operations themselves are synchronous, so the write lock is
 //! never held across `.await`.
 //!
-//! Activated by setting `HIVE_LEAN_TEST_DRIVER=1` in the container env; see
-//! [`test_driver_enabled`] and the boot path in `bin/ethlambda/src/main.rs`.
+//! Activated via the `test-driver` subcommand; see the boot path in
+//! `bin/ethlambda/src/main.rs`.
 
 use std::sync::Arc;
 
@@ -50,27 +50,6 @@ use ethlambda_types::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::debug;
-
-/// Environment variable that activates the test driver at boot time.
-///
-/// The hive simulator sets this to `"1"` for each spec-asset fixture run; any
-/// of `"1"`, `"true"`, or `"yes"` (case-insensitive) enables the driver.
-pub const TEST_DRIVER_ENV: &str = "HIVE_LEAN_TEST_DRIVER";
-
-/// Whether the supplied env-var value should activate the driver.
-fn parse_truthy_env_value(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes"
-    )
-}
-
-/// Returns true when the binary should boot into test-driver mode.
-pub fn test_driver_enabled() -> bool {
-    std::env::var(TEST_DRIVER_ENV)
-        .map(|value| parse_truthy_env_value(&value))
-        .unwrap_or(false)
-}
 
 /// Shared, runtime-replaceable Store backing every test-driver handler.
 ///
@@ -428,16 +407,6 @@ fn snapshot_store(store: &Store) -> DriverSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_truthy_env_value_accepts_canonical_truthy_strings() {
-        for value in ["1", "true", "TRUE", " Yes ", "yes\n"] {
-            assert!(parse_truthy_env_value(value), "{value:?} should be truthy");
-        }
-        for value in ["0", "false", "no", "", "  ", "1.0"] {
-            assert!(!parse_truthy_env_value(value), "{value:?} should be falsy");
-        }
-    }
 
     #[test]
     fn empty_driver_store_is_usable_as_seed() {
