@@ -135,7 +135,7 @@ jobs:
               sleep 15
             done ) &
           MON=$!
-          trap "kill $MON 2>/dev/null" EXIT
+          trap 'kill "$MON" 2>/dev/null' EXIT
           uv run fill --fork Lstar -n 1 --scheme prod -o fixtures
 
       # Save fixtures even if a later step fails, so a re-run does not
