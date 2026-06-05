@@ -127,6 +127,7 @@ jobs:
       # The background sampler logs RAM/swap every 15s so we can confirm memory
       # is the cause and tune the worker count. Remove once generation is green.
       - name: Generate test fixtures
+        id: generate-fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         working-directory: leanSpec
         run: |
@@ -138,10 +139,18 @@ jobs:
           trap 'kill "$MON" 2>/dev/null' EXIT
           uv run fill --fork Lstar -n 1 --scheme prod -o fixtures
 
-      # Save fixtures even if a later step fails, so a re-run does not
-      # have to regenerate them. See: https://github.com/actions/cache/tree/main/save#always-save-cache
+      # Save fixtures only when generation actually SUCCEEDED. A bare
+      # `always()` here previously saved the (empty) fixtures dir when
+      # generation was cancelled or OOM-killed mid-run, poisoning the cache:
+      # later runs hit the empty cache, skipped generation, and the Rust tests
+      # failed with no fixtures. Gating on the generate step's outcome keeps
+      # the "save even if the later Rust test step fails" intent without ever
+      # persisting a partial fixture set.
       - name: Save test fixtures cache
-        if: always() && steps.cache-fixtures.outputs.cache-hit != 'true'
+        if: >-
+          always()
+          && steps.cache-fixtures.outputs.cache-hit != 'true'
+          && steps.generate-fixtures.outcome == 'success'
         uses: actions/cache/save@v5
         with:
           path: leanSpec/fixtures
