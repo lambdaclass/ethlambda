@@ -261,7 +261,7 @@ async fn verify_signatures_with_empty_validator_set_fails_cleanly() {
             "stateRoot": ZERO_ROOT,
             "body": {"attestations": {"data": []}},
         },
-        "proof": {"data": "0x"},
+        "proof": {"proof": {"data": "0x"}},
     });
 
     let body = json!({

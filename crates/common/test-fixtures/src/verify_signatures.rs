@@ -1,17 +1,17 @@
-//! Signature-verification test fixture types (leanSpec PR #717 schema).
+//! Signature-verification test fixture types (leanSpec PR #799 schema).
 //!
 //! Used both by the offline spec-test runner and the Hive
 //! `/lean/v0/test_driver/verify_signatures/run` endpoint, which receive the
 //! same JSON shapes from the lean spec-assets simulator.
 //!
-//! Fixture shape after PR #717:
+//! Fixture shape after PR #799:
 //!
 //!   signedBlock:
 //!     block:  {...standard block fields...}
-//!     proof:  { data: "0x<hex-encoded merged Type-2 bytes>" }
+//!     proof:  { proof: { data: "0x<hex-encoded merged Type-2 bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
-use ethlambda_types::block::{ByteList512KiB, SignedBlock};
+use ethlambda_types::block::SignedBlock;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -56,28 +56,21 @@ pub struct VerifySignaturesTest {
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
-    pub proof: ProofField,
+    pub proof: MergedProof,
 }
 
-/// Merged Type-2 proof bytes, in either fixture shape.
+/// Merged Type-2 proof container for `SignedBlock.proof` (leanSpec PR #799).
 ///
-/// leanSpec PR #799 typed `SignedBlock.proof` as a multi-signature container,
-/// nesting the bytes one level deeper: `{ "proof": { "data": "0x..." } }`.
-/// The flat `{ "data": "0x..." }` shape (PR #717) is still accepted since the
-/// Hive test driver receives the same JSON from older spec-assets simulators.
+/// The multi-signature container nests the raw lean-multisig wire one level
+/// deep: `{ "proof": { "data": "0x..." } }`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ProofField {
-    Typed { proof: HexBytes },
-    Flat(HexBytes),
+pub struct MergedProof {
+    pub proof: HexBytes,
 }
 
-impl ProofField {
+impl MergedProof {
     pub fn decode(&self) -> Result<Vec<u8>, hex::FromHexError> {
-        match self {
-            Self::Typed { proof } => proof.decode(),
-            Self::Flat(bytes) => bytes.decode(),
-        }
+        self.proof.decode()
     }
 }
 
@@ -130,21 +123,16 @@ impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
     /// Type-2 proof bytes verbatim.
     ///
-    /// The typed shape carries the raw lean-multisig wire, so it gets wrapped
-    /// into the SSZ-container envelope `SignedBlock.proof` stores. The flat
-    /// shape already includes that envelope and passes through unchanged.
+    /// The container carries the raw lean-multisig wire, so it gets wrapped
+    /// into the SSZ-container envelope that `SignedBlock.proof` stores.
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let bytes = self
             .proof
             .decode()
             .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
         let len = bytes.len();
-        let proof = match self.proof {
-            ProofField::Typed { .. } => SignedBlock::wrap_merged_proof(&bytes)
-                .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?,
-            ProofField::Flat(_) => ByteList512KiB::try_from(bytes)
-                .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?,
-        };
+        let proof = SignedBlock::wrap_merged_proof(&bytes)
+            .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
         Ok(SignedBlock {
             message: self.block.into(),
             proof,
