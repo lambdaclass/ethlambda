@@ -97,7 +97,7 @@ impl RangeSyncState {
 
     pub(crate) fn next_batch(&self) -> Option<(PeerId, Range<u64>)> {
         if self.in_flight || self.current_range.is_empty() {
-            return None;
+            return Option::None;
         }
 
         let (&peer, &peer_head) = self
@@ -586,8 +586,8 @@ async fn handle_swarm_event(
         } => {
             let direction = connection_direction(&endpoint);
             let reason = match cause {
-                None => "remote_close",
-                Some(err) => {
+                Option::None => "remote_close",
+                Option::Some(err) => {
                     // Categorize disconnection reasons
                     let err_str = err.to_string().to_lowercase();
                     if err_str.contains("timeout")
@@ -774,8 +774,8 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     let decompressed = gossipsub::decompress_message(&message.data).ok();
 
     let (domain, data) = match decompressed.as_deref() {
-        Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
-        None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
+        Option::Some(data) => (MESSAGE_DOMAIN_VALID_SNAPPY, data),
+        Option::None => (MESSAGE_DOMAIN_INVALID_SNAPPY, message.data.as_slice()),
     };
     let topic = message.topic.as_str().as_bytes();
     let topic_len = (topic.len() as u64).to_le_bytes();
