@@ -118,26 +118,16 @@ jobs:
           key: ${{ steps.cache-prod-keys.outputs.cache-primary-key }}
 
       # `-n 1` (not `-n auto`) runs a single leanVM prover at a time. The
-      # devnet5 prover peaks at ~4-5 GiB per proof; more workers multiply that
-      # past the 4-vCPU/16 GiB runner's RAM. `-n auto` (4 provers) OOM-killed
-      # the runner outright; `-n 2` (2 provers) thrashed and lost its heartbeat
-      # mid-generation, so GitHub cancelled the job. One prover (~4.5 GiB)
-      # should stay responsive. The Makefile keeps `-n auto` for local machines.
-      #
-      # The background sampler logs RAM/swap every 15s so we can confirm memory
-      # is the cause and tune the worker count. Remove once generation is green.
+      # devnet5 prover peaks at ~12 GiB per proof (measured), so more workers
+      # blow past the 4-vCPU/16 GiB runner's RAM: `-n auto` (4 provers) hard
+      # OOM-killed the runner, `-n 2` thrashed and lost its heartbeat so GitHub
+      # cancelled the job. One prover peaks ~12.4 GiB with 0 swap and completes
+      # in ~2h36m. The Makefile keeps `-n auto` for local machines with more RAM.
       - name: Generate test fixtures
         id: generate-fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
         working-directory: leanSpec
-        run: |
-          ( while true; do
-              echo "[mem $(date -u +%H:%M:%S)] $(free -m | awk 'NR==2{m=sprintf("mem_used=%sMiB avail=%sMiB",$3,$7)} NR==3{s=sprintf("swap_used=%sMiB",$3)} END{print m, s}')"
-              sleep 15
-            done ) &
-          MON=$!
-          trap 'kill "$MON" 2>/dev/null' EXIT
-          uv run fill --fork Lstar -n 1 --scheme prod -o fixtures
+        run: uv run fill --fork Lstar -n 1 --scheme prod -o fixtures
 
       # Save fixtures only when generation actually SUCCEEDED. A bare
       # `always()` here previously saved the (empty) fixtures dir when
