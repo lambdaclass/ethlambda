@@ -65,6 +65,14 @@ fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
     MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
 }
 
+/// Current UNIX timestamp in milliseconds.
+fn unix_now_ms() -> u64 {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .expect("already past the unix epoch")
+        .as_millis() as u64
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -80,10 +88,7 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
         let current_slot =
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
@@ -824,14 +829,22 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
-        let timestamp = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch");
-        let now_ms = timestamp.as_millis() as u64;
+        let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
-        // Schedule the next tick at the next interval boundary
+
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
+        let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
+        let now_after_tick = unix_now_ms();
+        let elapsed = now_after_tick.saturating_sub(now_ms);
+
+        // If on_tick ran past the next interval boundary, tick again
+        // immediately so that interval's duty still runs (issue #413).
+        let ms_to_next_interval = if elapsed >= remaining_at_entry {
+            0
+        } else {
+            // Schedule the next tick at the next interval boundary
+            ms_until_next_interval(now_after_tick, genesis_time_ms)
+        };
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
