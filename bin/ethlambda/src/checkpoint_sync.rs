@@ -5,7 +5,7 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
 /// Fail fast if the peer is unreachable.
@@ -65,8 +65,6 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
-    #[error("all checkpoint peers failed; last error: {0}")]
-    AllPeersFailed(Box<CheckpointSyncError>),
     #[error("no checkpoint urls configured")]
     NoCheckpointUrls,
 }
@@ -322,7 +320,10 @@ pub async fn fetch_anchor_block_and_state(
     loop {
         let Some(url) = iter.next() else {
             return Err(match last_err {
-                Some(err) => CheckpointSyncError::AllPeersFailed(Box::new(err)),
+                Some(err) => {
+                    error!(%err, "All checkpoint sync attempts failed");
+                    err
+                }
                 None => CheckpointSyncError::NoCheckpointUrls,
             });
         };
