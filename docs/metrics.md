@@ -39,6 +39,11 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_block_building_time_seconds` | Histogram | Time taken to build a block | On block production | | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 | ✅ |
 | `lean_block_building_success_total` | Counter | Successful block builds | On block production | | | ✅ |
 | `lean_block_building_failures_total` | Counter | Failed block builds (error building the block, signing the block root, or processing it locally) | On block production failure | | | ✅ |
+| `lean_block_proposal_attestation_build_phase_seconds` | Histogram | Phase-level time in block-proposal attestation selection | On block production | phase=select_payloads,compact,stf_simulate | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 | ✅ |
+| `lean_block_proposal_attestation_builds_total` | Counter | Attestations selected during block-proposal selection (one per selection-loop round that picks an `AttestationData`) | On each attestation selection | | | ✅ |
+| `lean_block_proposal_child_payloads_consumed_total` | Counter | Child aggregated payloads selected during greedy proof picking (before compaction) | On block production | | | ✅ |
+| `lean_block_proposal_attestation_data_selected` | Histogram | Distinct `AttestationData` entries in the proposal block body | On block production | | 0, 1, 2, 4, 8, 16, 32 | ✅ |
+| `lean_block_proposal_aggregates_selected` | Histogram | Aggregated signature proofs in the proposal result after compaction | On block production | | 0, 1, 2, 4, 8, 16, 32, 64, 128 | ✅ |
 
 ## Fork-Choice Metrics
 
@@ -131,7 +136,7 @@ Observability into how many validators/subnets are covered by the attestations t
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined (per-subnet breakdown reserved, not yet populated) |
+| `lean_attestation_aggregate_coverage_validators` | Gauge | Validator coverage in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined<br>subnet=combined,subnet_0,subnet_1,…,subnet_N-1 |
 | `lean_attestation_aggregate_coverage_subnets` | Gauge | Number of covered subnets in attestation aggregate reports | Per round, per section (see note above) | section=timely,late,block,combined,agg_start_new,proposal_combined |
 | `lean_attestation_aggregate_coverage_diff_validators` | Gauge | Validators in the symmetric difference between block-included aggregates and locally-aggregated timely aggregates for the same slot | On block import, when the head carries the round's votes (see note above) | direction=block_only,timely_only |
 
