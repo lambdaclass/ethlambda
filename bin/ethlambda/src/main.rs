@@ -1,11 +1,21 @@
 mod checkpoint_sync;
 mod version;
 
-#[cfg(not(target_env = "msvc"))]
+// Jemalloc causes programs to deadlock during process startup under Shadow.
+// See https://github.com/shadow/shadow/issues/3763. Build the Shadow binary
+// with `--no-default-features --features shadow-integration` to drop the
+// (default) `jemalloc` feature and thus the `tikv-jemallocator` dependency.
+#[cfg(all(feature = "jemalloc", feature = "shadow-integration"))]
+compile_error!(
+    "the `jemalloc` feature is incompatible with `shadow-integration`; \
+     build the Shadow binary with `--no-default-features --features shadow-integration`"
+);
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
@@ -116,7 +126,12 @@ struct CliOptions {
     data_dir: PathBuf,
 }
 
-#[tokio::main]
+// Shadow single-steps execution in a discrete-event simulation, so the default
+// multi-threaded runtime's worker threads add only scheduling noise, never
+// parallelism. Use a single-threaded runtime under Shadow. This is an
+// optimization, not a correctness requirement.
+#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
+#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn main() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
@@ -162,10 +177,10 @@ async fn main() -> eyre::Result<()> {
     })?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
-    #[cfg(target_env = "msvc")]
-    info!("Using system allocator (MSVC target)");
+    #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
+    info!("Using system allocator");
 
     info!(node_key=?options.node_key, "got node key");
 
