@@ -33,5 +33,7 @@ eyre.workspace = true
 
 tikv-jemallocator.workspace = true
 
+libc.workspace = true
+
 [build-dependencies]
 vergen-git2.workspace = true
