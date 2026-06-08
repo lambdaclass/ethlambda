@@ -22,7 +22,7 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::store::StoreError;
 
@@ -185,6 +185,26 @@ impl BlockChainServer {
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
+
+        // Idempotency guard
+        //
+        // `slot`/`interval` come from the wall clock, but the tick cadence is driven
+        // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
+        // inside VMs, so a tick scheduled for the next interval boundary can fire
+        // while the wall clock still reads the previous interval.
+        let tick_interval = time_since_genesis_ms / MILLISECONDS_PER_INTERVAL;
+        let store_time = self.store.time();
+
+        if store_time > 0 && tick_interval <= store_time {
+            debug!(
+                %slot,
+                %interval,
+                tick_interval,
+                store_time,
+                "Skipping already-processed tick"
+            );
+            return;
+        }
 
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing.
