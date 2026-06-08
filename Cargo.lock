@@ -2017,6 +2017,7 @@ dependencies = [
  "ethlambda-types",
  "eyre",
  "hex",
+ "libc",
  "libssz",
  "libssz-types",
  "reqwest",

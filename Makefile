@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -22,6 +22,20 @@ docker-build: ## 🐳 Build the Docker image
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) .
+	@echo
+
+shadow-build: ## 👻 Build a Shadow-simulator-compatible binary (single-threaded, no jemalloc)
+	./shadow/build.sh cargo build --release --no-default-features --features shadow-integration --bin ethlambda
+
+shadow-docker-build: ## 👻🐳 Build a Shadow-compatible Docker image
+	docker build \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
+		--build-arg SHADOW=1 \
+		--build-arg FEATURES=shadow-integration \
+		--build-arg NO_DEFAULT_FEATURES=--no-default-features \
+		--build-arg LOCKED= \
+		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)-shadow .
 	@echo
 
 # 2026-05-17

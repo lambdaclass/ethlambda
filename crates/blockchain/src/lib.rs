@@ -22,7 +22,7 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::store::StoreError;
 
@@ -66,6 +66,14 @@ fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
     MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
 }
 
+/// Current UNIX timestamp in milliseconds.
+fn unix_now_ms() -> u64 {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .expect("already past the unix epoch")
+        .as_millis() as u64
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
@@ -81,10 +89,7 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
         let current_slot =
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
@@ -168,12 +173,6 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        // Observe tick interval duration before any processing
-        if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant.elapsed());
-        }
-        self.last_tick_instant = Some(Instant::now());
-
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -181,12 +180,39 @@ impl BlockChainServer {
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
+        // Idempotency guard
+        //
+        // `slot`/`interval` come from the wall clock, but the tick cadence is driven
+        // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
+        // inside VMs, so a tick scheduled for the next interval boundary can fire
+        // while the wall clock still reads the previous interval.
+        let tick_interval = time_since_genesis_ms / MILLISECONDS_PER_INTERVAL;
+        let store_time = self.store.time();
+
+        if store_time > 0 && tick_interval <= store_time {
+            debug!(
+                %slot,
+                %interval,
+                tick_interval,
+                store_time,
+                "Skipping already-processed tick"
+            );
+            return;
+        }
+
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing.
         if self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
+
+        // Observe tick interval duration. Done after the idempotency guard so a
+        // skipped duplicate tick doesn't shorten the next real tick's sample.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
 
         // Update current slot metric
         metrics::update_current_slot(slot);
@@ -692,14 +718,22 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
-        let timestamp = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch");
-        let now_ms = timestamp.as_millis() as u64;
+        let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
-        // Schedule the next tick at the next interval boundary
+
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
+        let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
+        let now_after_tick = unix_now_ms();
+        let elapsed = now_after_tick.saturating_sub(now_ms);
+
+        // If on_tick ran past the next interval boundary, tick again
+        // immediately so that interval's duty still runs (issue #413).
+        let ms_to_next_interval = if elapsed >= remaining_at_entry {
+            0
+        } else {
+            // Schedule the next tick at the next interval boundary
+            ms_until_next_interval(now_after_tick, genesis_time_ms)
+        };
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),
