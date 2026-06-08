@@ -173,12 +173,6 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        // Observe tick interval duration before any processing
-        if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant.elapsed());
-        }
-        self.last_tick_instant = Some(Instant::now());
-
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -205,6 +199,13 @@ impl BlockChainServer {
             );
             return;
         }
+
+        // Observe tick interval duration. Done after the idempotency guard so a
+        // skipped duplicate tick doesn't shorten the next real tick's sample.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
 
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing.
