@@ -70,10 +70,16 @@ vergen-git2 = { version = "9", features = ["rustc"] }
 rayon = "1.11"
 rand = "0.10"
 rocksdb = "0.24"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 eyre = "0.6"
 
 # Allocator + heap profiling
 tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
+
+# NOTE: Shadow-simulator builds also replace quinn-udp with the fallback crate
+# in `shadow/quinn-udp-patch` (no GSO/GRO batch syscalls). A Cargo `[patch]`
+# cannot be feature-gated, so it is NOT committed here; `shadow/build.sh` injects
+# it into this manifest at build time. See `make shadow-build`.
 
