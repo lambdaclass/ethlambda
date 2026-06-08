@@ -652,7 +652,7 @@ dependencies = [
 [[package]]
 name = "backend"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
@@ -663,8 +663,9 @@ dependencies = [
  "mt-symetric",
  "mt-utils",
  "mt-whir",
- "rayon",
+ "parallel",
  "tracing",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -3663,12 +3664,13 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lean-multisig"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "clap",
  "lean_vm",
  "leansig_wrapper",
+ "parallel",
  "rand 0.10.1",
  "rec_aggregation",
  "serde_json",
@@ -3681,7 +3683,7 @@ dependencies = [
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "include_dir",
@@ -3697,7 +3699,7 @@ dependencies = [
 [[package]]
 name = "lean_prover"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3715,7 +3717,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "itertools 0.14.0",
@@ -3771,7 +3773,7 @@ dependencies = [
 [[package]]
 name = "leansig_wrapper"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "ethereum_ssz",
@@ -4806,7 +4808,7 @@ dependencies = [
 [[package]]
 name = "mt-air"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "mt-field",
  "mt-poly",
@@ -4815,13 +4817,13 @@ dependencies = [
 [[package]]
 name = "mt-fiat-shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
  "mt-symetric",
  "mt-utils",
- "rayon",
+ "parallel",
  "serde",
  "tracing",
 ]
@@ -4829,14 +4831,14 @@ dependencies = [
 [[package]]
 name = "mt-field"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "itertools 0.14.0",
  "mt-utils",
  "num-bigint 0.3.3",
+ "parallel",
  "paste",
  "rand 0.10.1",
- "rayon",
  "serde",
  "tracing",
 ]
@@ -4844,7 +4846,7 @@ dependencies = [
 [[package]]
 name = "mt-koala-bear"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
@@ -4852,7 +4854,6 @@ dependencies = [
  "num-bigint 0.3.3",
  "paste",
  "rand 0.10.1",
- "rayon",
  "serde",
  "tracing",
 ]
@@ -4860,44 +4861,47 @@ dependencies = [
 [[package]]
 name = "mt-poly"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "itertools 0.14.0",
  "mt-field",
  "mt-utils",
+ "parallel",
  "rand 0.10.1",
- "rayon",
  "serde",
  "system-info",
+ "zk-alloc",
 ]
 
 [[package]]
 name = "mt-sumcheck"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "mt-air",
  "mt-fiat-shamir",
  "mt-field",
  "mt-poly",
- "rayon",
+ "parallel",
  "tracing",
+ "zk-alloc",
 ]
 
 [[package]]
 name = "mt-symetric"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "mt-field",
  "mt-koala-bear",
- "rayon",
+ "parallel",
+ "zk-alloc",
 ]
 
 [[package]]
 name = "mt-utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "serde",
 ]
@@ -4905,7 +4909,7 @@ dependencies = [
 [[package]]
 name = "mt-whir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "itertools 0.14.0",
  "mt-fiat-shamir",
@@ -4915,10 +4919,11 @@ dependencies = [
  "mt-sumcheck",
  "mt-symetric",
  "mt-utils",
+ "parallel",
  "rand 0.10.1",
- "rayon",
  "system-info",
  "tracing",
+ "zk-alloc",
 ]
 
 [[package]]
@@ -5617,6 +5622,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
 dependencies = [
  "group",
+]
+
+[[package]]
+name = "parallel"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
+dependencies = [
+ "system-info",
 ]
 
 [[package]]
@@ -6378,7 +6391,7 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "include_dir",
@@ -7427,10 +7440,11 @@ dependencies = [
 [[package]]
 name = "sub_protocols"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "lean_vm",
+ "parallel",
  "tracing",
  "utils",
 ]
@@ -7521,10 +7535,9 @@ dependencies = [
 [[package]]
 name = "system-info"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "libc",
- "rayon",
 ]
 
 [[package]]
@@ -8071,7 +8084,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "backend",
  "tracing",
@@ -9037,9 +9050,10 @@ dependencies = [
 [[package]]
 name = "zk-alloc"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=f66d4a9#f66d4a974eced803574eb0ea43d812e523c8d7ad"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=a44bca4#a44bca4d2b991175f3f176c03f9fe681227f5bdc"
 dependencies = [
  "libc",
+ "parallel",
  "system-info",
 ]
 
