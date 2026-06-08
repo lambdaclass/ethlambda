@@ -92,14 +92,20 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
-    /// Base URL of a checkpoint-sync peer's API server (e.g., http://peer:5052).
+    /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
     /// When set, skips genesis initialization and fetches the finalized state
-    /// and block from the peer's `/lean/v0/states/finalized` and
+    /// and block from each peer's `/lean/v0/states/finalized` and
     /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
     /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
     /// path is stripped.
-    #[arg(long)]
-    checkpoint_sync_url: Option<String>,
+    ///
+    /// Multiple URLs may be supplied for redundancy, either comma-separated
+    /// (`--checkpoint-sync-url u1,u2`) or by repeating the flag
+    /// (`--checkpoint-sync-url u1 --checkpoint-sync-url u2`). URLs are tried
+    /// in order; the first one that succeeds is used and any failures fall
+    /// over to the next URL. Startup only aborts if every URL fails.
+    #[arg(long, value_delimiter = ',')]
+    checkpoint_sync_url: Vec<String>,
     /// Whether this node acts as a committee aggregator.
     ///
     /// Seeds the initial value of the live aggregator flag shared by the
@@ -255,13 +261,16 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
-    let store = fetch_initial_state(
-        options.checkpoint_sync_url.as_deref(),
-        &genesis_config,
-        backend.clone(),
-    )
-    .await
-    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let clean_checkpoint_urls: Vec<String> = options
+        .checkpoint_sync_url
+        .into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+
+    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+        .await
+        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -628,10 +637,11 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 
 /// Fetch the initial state for the node.
 ///
-/// If `checkpoint_url` is provided, performs checkpoint sync by downloading
-/// and verifying the finalized state AND signed block in parallel from a
-/// remote peer. Otherwise, creates a genesis state from the local genesis
-/// configuration.
+/// If `checkpoint_urls` is empty, creates a genesis state from the local
+/// genesis configuration. Otherwise performs checkpoint sync by downloading
+/// and verifying the finalized state AND signed block from a peer. URLs are
+/// tried in order: the first peer that succeeds wins, and failures fall over
+/// to the next URL. Startup only aborts if every URL fails.
 ///
 /// Fetching the matching signed block lets the local store serve a valid
 /// anchor via the `BlocksByRoot` req-resp protocol; without it, peers
@@ -640,7 +650,7 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 ///
 /// # Arguments
 ///
-/// * `checkpoint_url` - Optional base URL to a peer's API server
+/// * `checkpoint_urls` - Zero or more base URLs of peer API servers
 /// * `genesis` - Genesis configuration (for genesis_time verification and genesis state creation)
 /// * `backend` - Storage backend for Store creation
 ///
@@ -649,18 +659,23 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 /// `Ok(Store)` on success, or `Err(CheckpointSyncError)` if checkpoint sync fails.
 /// Genesis path is infallible and always returns `Ok`.
 async fn fetch_initial_state(
-    checkpoint_url: Option<&str>,
+    checkpoint_urls: &[String],
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
-    let Some(checkpoint_url) = checkpoint_url else {
+    if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
         return Ok(Store::from_anchor_state(backend, genesis_state));
     };
 
+    // Checkpoint sync path: try URLs in order, fail over to the next on error.
+    info!(
+        url_count = checkpoint_urls.len(),
+        "Starting checkpoint sync"
+    );
     // Checkpoint sync path
 
     // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
@@ -686,38 +701,14 @@ async fn fetch_initial_state(
         );
     }
 
-    info!(%checkpoint_url, "Starting checkpoint sync");
+    info!(?checkpoint_urls, "Starting checkpoint sync");
 
-    // The state and block are fetched in parallel; if the peer advances
-    // finalization between the two requests the pair won't match. Retry a
-    // small number of times so this transient race doesn't fail node startup.
-    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
-    const ANCHOR_FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
-    let mut attempt = 1;
-    let (state, signed_block) = loop {
-        match checkpoint_sync::fetch_finalized_anchor(
-            checkpoint_url,
-            genesis.genesis_time,
-            &validators,
-        )
-        .await
-        {
-            Ok(pair) => break pair,
-            Err(checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
-                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
-            {
-                warn!(
-                    attempt,
-                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
-                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
-                );
-                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    };
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_block_and_state(
+        checkpoint_urls,
+        genesis.genesis_time,
+        &validators,
+    )
+    .await?;
 
     info!(
         slot = state.slot,
