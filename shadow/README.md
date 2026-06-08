@@ -12,9 +12,9 @@ things in a stock ethlambda build need to change for Shadow:
 
 | Area | Stock build | Under Shadow | Why |
 |------|-------------|--------------|-----|
-| Allocator | jemalloc with `unprefixed_malloc` (interposes the global C `malloc`) | system allocator (drop jemalloc) | **Correctness.** Self-deadlocks at startup ([shadow#3763]): Shadow's shim `fopen`s `/proc/self/maps` on its first intercepted syscall, calling `malloc`, which re-enters jemalloc mid-init while it holds its non-recursive init lock. |
-| QUIC UDP I/O | `quinn-udp` uses GSO/GRO batch syscalls (`sendmmsg`, segmentation offload) | fall back to `send_to`/`recv_from` | **Correctness.** Shadow's UDP emulation doesn't support those batch syscalls. |
-| Tokio runtime | multi-threaded | `current_thread` | **Optimization only.** Shadow single-steps execution, so worker threads add only scheduling noise, never parallelism. |
+| Allocator | jemalloc with `unprefixed_malloc` (interposes the global C `malloc`) | system allocator (drop jemalloc) | Self-deadlocks at startup ([shadow#3763]) |
+| QUIC UDP I/O | `quinn-udp` uses GSO/GRO batch syscalls (`sendmmsg`, segmentation offload) | fall back to `send_to`/`recv_from` | Shadow's UDP emulation doesn't support those batch syscalls. |
+| Tokio runtime | multi-threaded | `current_thread` | Shadow single-steps execution, so worker threads add only scheduling noise. |
 
 The allocator change (dropping jemalloc) and the runtime flavor are gated behind
 the `shadow-integration` Cargo feature (jemalloc is dropped via
