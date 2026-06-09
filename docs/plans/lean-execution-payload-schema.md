@@ -188,13 +188,22 @@ the schema once it's agreed upstream.
    are internally consistent; it only matters if/when we bridge to a
    mainnet-derived EL state.
 
-2. **Suggested fee recipient.** Per-validator? Per-node CLI? For the
-   proposal-mode `engine_forkchoiceUpdated` call, every client needs to
-   supply *something*. Convention TBD.
+2. **Suggested fee recipient.** ethlambda implements node-level config: an
+   optional `suggested_fee_recipient` key in `validator-config.yaml`'s
+   network `config` block (additive — clients that don't read it ignore it).
+   Defaults to the zero address, which burns the rewards; ethlambda warns at
+   startup when EL-paired with the zero default. Per-validator granularity is
+   a possible future refinement.
 
-3. **`parent_beacon_block_root` in `PayloadAttributes`.** Lean has no beacon
-   root analogue. Pass `ZERO` and document, or define a meaningful value
-   (e.g., `state.latest_block_header.hash_tree_root()`).
+3. **`parent_beacon_block_root` in `PayloadAttributes`.** ethlambda
+   implements the **lean-parent-root convention**: the value is the Lean
+   parent block's root — at build time the proposer's current head root
+   (the block being built will carry it as `parent_root`), at validate time
+   `block.parent_root`. Deterministic on both paths and mirrors EIP-4788
+   semantics, so the EL block hash commits to the Lean chain. Note this is
+   consensus-relevant for any client validating payloads against an EL
+   (the value is part of the EL block hash), so other Lean clients must
+   adopt the same rule when they pair.
 
 4. **Blob transactions (EIP-4844).** Out of scope here. Future item.
 

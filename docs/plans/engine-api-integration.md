@@ -92,7 +92,7 @@ Minimal V1 subset to start:
 |---|---|---|
 | `--execution-endpoint` | (unset; integration disabled if missing) | URL of ethrex auth RPC, e.g. `http://127.0.0.1:8551` |
 | `--execution-jwt-secret` | (unset) | Path to JWT hex secret file (same format ethrex/lighthouse/etc. use) |
-| `--execution-fee-recipient` | (unset) | 20-byte hex; required only when proposing |
+| `--execution-fee-recipient` | (unset) | 20-byte hex; required only when proposing — **superseded**: landed as `suggested_fee_recipient` in `validator-config.yaml`'s `config` block instead of a CLI flag |
 
 Behavior:
 - Both unset → integration **disabled**, ethlambda runs as before.
@@ -197,7 +197,7 @@ In `crates/blockchain/src/store.rs::on_block` (line 412), after structural / sig
 
 Block-build flow today (store.rs:1043 `build_block`) constructs `BlockBody { attestations }` synchronously. Adding the payload requires a pre-arranged `payload_id`:
 
-- At interval 4 of slot N-1, if we're the proposer for slot N: fire `engine_forkchoiceUpdatedV3` with `Some(PayloadAttributesV3 { timestamp: GENESIS_TIME + N*4, prev_randao: 0, suggested_fee_recipient, withdrawals: [], parent_beacon_block_root: 0 })`. EL returns a `payload_id`. Stash on the `BlockChain` actor.
+- At interval 4 of slot N-1, if we're the proposer for slot N: fire `engine_forkchoiceUpdatedV3` with `Some(PayloadAttributesV3 { timestamp: GENESIS_TIME + N*4, prev_randao: 0, suggested_fee_recipient, withdrawals: [], parent_beacon_block_root })`. EL returns a `payload_id`. Stash on the `BlockChain` actor. *(Landed; later refined: `suggested_fee_recipient` comes from `validator-config.yaml`, `parent_beacon_block_root` follows the lean-parent-root convention — see `lean-execution-payload-schema.md` — and the stash carries the build-head root so a head change before interval 0 discards the stale id. `prev_randao` stays 0 until Lean defines a RANDAO mix.)*
 - At interval 0 of slot N (proposal time), call `client.get_payload_v3(payload_id)` → parse into `ExecutionPayloadV3` → pass into `build_block` to embed in `BlockBody`.
 - No client configured: synthesize a zero payload (parent_hash = prev header's block_hash, timestamp = slot-mapped, txs/withdrawals empty). Keeps non-EL-paired nodes producing parseable blocks.
 

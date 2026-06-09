@@ -273,6 +273,21 @@ async fn main() -> eyre::Result<()> {
     );
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
+    // Resolve the suggested fee recipient: validator-config.yaml > zero
+    // address. Zero is valid on the wire but burns the block rewards, so
+    // EL-paired nodes get a warning below once the EL client is built.
+    let suggested_fee_recipient = validator_config_file
+        .config
+        .suggested_fee_recipient
+        .as_deref()
+        .map(parse_address_hex)
+        .transpose()
+        .map_err(|err| {
+            error!(%err, "Invalid suggested_fee_recipient in validator config");
+            eyre::eyre!(err)
+        })?
+        .unwrap_or([0u8; 20]);
+
     let bootnodes = read_bootnodes(&bootnodes_path)?;
 
     let validator_keys =
@@ -329,12 +344,17 @@ async fn main() -> eyre::Result<()> {
     )
     .await;
 
+    if execution_client.is_some() && suggested_fee_recipient == [0u8; 20] {
+        warn!("suggested_fee_recipient not set in validator config; block rewards will be burned");
+    }
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
         execution_client,
+        suggested_fee_recipient,
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
@@ -466,6 +486,12 @@ struct ValidatorConfigFile {
 struct ValidatorConfigBlock {
     #[serde(default)]
     attestation_committee_count: Option<u64>,
+    /// 20-byte hex address (optionally `0x`-prefixed) the EL is asked to
+    /// pay block rewards to via `PayloadAttributes.suggestedFeeRecipient`.
+    /// Only meaningful for EL-paired nodes; defaults to the zero address,
+    /// which burns the rewards.
+    #[serde(default)]
+    suggested_fee_recipient: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,6 +765,16 @@ fn parse_h256_hex(s: &str) -> Result<H256, String> {
         ));
     }
     Ok(H256::from_slice(&bytes))
+}
+
+/// Parse a 20-byte hex address from a `0x`-prefixed or bare hex string.
+fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| format!("{s:?} decoded to {len} bytes, expected 20"))
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {

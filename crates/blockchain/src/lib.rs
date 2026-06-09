@@ -86,6 +86,7 @@ impl BlockChain {
         aggregator: AggregatorController,
         attestation_committee_count: u64,
         execution_client: Option<Arc<dyn ExecutionEngine>>,
+        suggested_fee_recipient: [u8; 20],
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -112,6 +113,7 @@ impl BlockChain {
             attestation_committee_count,
             pre_merge_coverage: None,
             execution_client,
+            suggested_fee_recipient,
             pending_payload_id: None,
         }
         .start();
@@ -196,12 +198,21 @@ pub struct BlockChainServer {
     /// the production value is an `EngineClient`.
     execution_client: Option<Arc<dyn ExecutionEngine>>,
 
-    /// `(target_slot, payload_id)` returned by the EL after a build-mode
-    /// FCU at interval 4 of the previous slot. Consumed at interval 0 by
-    /// `take_prepared_payload`. Absent when no EL is configured, when we
-    /// didn't queue a build for this slot, or when the EL was syncing and
-    /// returned `payload_id = None`.
-    pending_payload_id: Option<(u64, PayloadId)>,
+    /// Address the EL is asked to pay block rewards to, sent as
+    /// `suggestedFeeRecipient` in build-mode FCU payload attributes. Comes
+    /// from `validator-config.yaml`; the zero default is valid on the wire
+    /// but burns the rewards.
+    suggested_fee_recipient: [u8; 20],
+
+    /// `(target_slot, build_head_root, payload_id)` returned by the EL after
+    /// a build-mode FCU at interval 4 of the previous slot. Consumed at
+    /// interval 0 by `take_prepared_payload`. `build_head_root` is the fork
+    /// choice head the build was requested on; if the head moved before the
+    /// proposal, the prepared payload's `parent_hash` and embedded
+    /// `parent_beacon_block_root` are stale and the id is discarded. Absent
+    /// when no EL is configured, when we didn't queue a build for this slot,
+    /// or when the EL was syncing and returned `payload_id = None`.
+    pending_payload_id: Option<(u64, H256, PayloadId)>,
 }
 
 impl BlockChainServer {
@@ -421,8 +432,11 @@ impl BlockChainServer {
     /// returns `payload_id = None` and we silently fall back to the
     /// synthetic payload path.
     ///
-    /// `suggested_fee_recipient` and `prev_randao` are zero for now; refine
-    /// when CLI / config support lands.
+    /// `parent_beacon_block_root` follows the lean-parent-root convention:
+    /// the proposed block's parent is the current head, so the EL builds the
+    /// payload committing to the same root validators will pass to
+    /// `engine_newPayloadV5` as `block.parent_root`. `prev_randao` stays
+    /// zero until Lean defines a RANDAO mix.
     async fn request_payload_id_for_next_slot(&mut self, current_slot: u64) {
         let Some(client) = self.execution_client.as_ref() else {
             return;
@@ -432,19 +446,20 @@ impl BlockChainServer {
             return;
         }
 
+        let head_root = self.store.head();
         let state = self.current_el_forkchoice_state();
         let attrs = PayloadAttributesV3 {
             timestamp: compute_time_at_slot(self.store.config().genesis_time, next_slot),
             prev_randao: H256::ZERO,
-            suggested_fee_recipient: [0u8; 20],
+            suggested_fee_recipient: self.suggested_fee_recipient,
             withdrawals: vec![],
-            parent_beacon_block_root: H256::ZERO,
+            parent_beacon_block_root: head_root,
         };
         let client = client.clone();
         match client.forkchoice_updated_v3(state, Some(attrs)).await {
             Ok(resp) => {
                 if let Some(id) = resp.payload_id {
-                    self.pending_payload_id = Some((next_slot, id));
+                    self.pending_payload_id = Some((next_slot, head_root, id));
                     trace!(
                         slot = next_slot,
                         status = ?resp.payload_status.status,
@@ -472,14 +487,27 @@ impl BlockChainServer {
     ///   * no stashed id (we weren't expecting to propose this slot, or
     ///     the build request was rejected at interval 4)
     ///   * stashed id is for a different slot (we missed a tick)
+    ///   * the head moved since the build was requested — the prepared
+    ///     payload's `parent_hash` and embedded `parent_beacon_block_root`
+    ///     point at the old head, so the block would fail EL validation
     ///   * the `engine_getPayloadV5` roundtrip failed
     async fn take_prepared_payload(&mut self, slot: u64) -> Option<ExecutionPayloadV3> {
         let client = self.execution_client.as_ref()?.clone();
-        let (stashed_slot, payload_id) = self.pending_payload_id.take()?;
+        let (stashed_slot, build_head_root, payload_id) = self.pending_payload_id.take()?;
         if stashed_slot != slot {
             warn!(
                 stashed_slot,
                 slot, "Stashed payload_id doesn't match this slot; discarding"
+            );
+            return None;
+        }
+        let head_root = self.store.head();
+        if build_head_root != head_root {
+            warn!(
+                slot,
+                build_head_root = %ShortRoot(&build_head_root.0),
+                head_root = %ShortRoot(&head_root.0),
+                "Head moved since the EL build was requested; discarding stale payload_id"
             );
             return None;
         }
@@ -507,7 +535,15 @@ impl BlockChainServer {
     /// Network errors and unparseable responses are permissive — same policy
     /// as `notify_execution_layer`: consensus must keep running regardless
     /// of EL state. Operators are expected to monitor the warn logs.
-    async fn validate_payload_with_el(&self, payload: &ExecutionPayloadV3) -> bool {
+    /// `parent_beacon_block_root` must be the block's `parent_root` (the
+    /// lean-parent-root convention): the proposer's build-mode FCU committed
+    /// the EL payload to its head root, which becomes the proposed block's
+    /// `parent_root` — mismatching values fail the EL's block-hash check.
+    async fn validate_payload_with_el(
+        &self,
+        payload: &ExecutionPayloadV3,
+        parent_beacon_block_root: H256,
+    ) -> bool {
         let Some(client) = self.execution_client.as_ref() else {
             return true;
         };
@@ -515,11 +551,10 @@ impl BlockChainServer {
         // parent_beacon_block_root, executionRequests); V5 also accepts an
         // optional `blockAccessList` on the payload (EIP-7928) which Lean
         // blocks don't produce yet. Lean blocks don't produce system
-        // requests, blob transactions, or beacon parent roots either, so
-        // all three trailing args are empty/zero placeholders. Refine when
-        // those land.
+        // requests or blob transactions either, so the blob-hash and
+        // execution-request args stay empty. Refine when those land.
         let result = client
-            .new_payload_v5(payload.clone(), vec![], H256::ZERO, vec![])
+            .new_payload_v5(payload.clone(), vec![], parent_beacon_block_root, vec![])
             .await;
         match result {
             Ok(status) => match status.status {
@@ -735,10 +770,11 @@ impl BlockChainServer {
         // already accepted into the store and the block is on its way to gossip.
         if let Some(client) = self.execution_client.as_ref() {
             let payload = signed_block.message.body.execution_payload.clone();
+            let parent_beacon_block_root = signed_block.message.parent_root;
             let client = client.clone();
             tokio::spawn(async move {
                 match client
-                    .new_payload_v5(payload, vec![], H256::ZERO, vec![])
+                    .new_payload_v5(payload, vec![], parent_beacon_block_root, vec![])
                     .await
                 {
                     Ok(status) => trace!(
@@ -1079,7 +1115,11 @@ impl Handler<NewBlock> for BlockChainServer {
         // not enqueued because we never call `on_block`. They will be
         // pruned by the standard slot-bound timeout.
         let payload = &msg.block.message.body.execution_payload;
-        if !self.validate_payload_with_el(payload).await {
+        let parent_beacon_block_root = msg.block.message.parent_root;
+        if !self
+            .validate_payload_with_el(payload, parent_beacon_block_root)
+            .await
+        {
             return;
         }
         self.on_block(msg.block);
@@ -1180,9 +1220,12 @@ mod execution_engine_tests {
 
     /// Mock execution engine. `forkchoice_updated_v3` and `get_payload_v5`
     /// return innocuous defaults; only `new_payload_v5` is configurable since
-    /// that is the call whose verdict gates block import.
+    /// that is the call whose verdict gates block import. The
+    /// `parent_beacon_block_root` passed to `new_payload_v5` is recorded so
+    /// tests can assert the lean-parent-root convention.
     struct MockEngine {
         new_payload: NewPayloadOutcome,
+        seen_beacon_root: std::sync::Mutex<Option<H256>>,
     }
 
     fn ok_status(status: PayloadStatusKind) -> PayloadStatus {
@@ -1217,9 +1260,10 @@ mod execution_engine_tests {
             &self,
             _payload: ExecutionPayloadV3,
             _expected_blob_versioned_hashes: Vec<H256>,
-            _parent_beacon_block_root: H256,
+            parent_beacon_block_root: H256,
             _execution_requests: Vec<Vec<u8>>,
         ) -> Result<PayloadStatus, EngineClientError> {
+            *self.seen_beacon_root.lock().unwrap() = Some(parent_beacon_block_root);
             match &self.new_payload {
                 NewPayloadOutcome::Status(kind) => Ok(ok_status(*kind)),
                 NewPayloadOutcome::Error => Err(EngineClientError::EmptyResponse),
@@ -1227,9 +1271,10 @@ mod execution_engine_tests {
         }
     }
 
-    fn mock(outcome: NewPayloadOutcome) -> Arc<dyn ExecutionEngine> {
+    fn mock(outcome: NewPayloadOutcome) -> Arc<MockEngine> {
         Arc::new(MockEngine {
             new_payload: outcome,
+            seen_beacon_root: std::sync::Mutex::new(None),
         })
     }
 
@@ -1252,6 +1297,7 @@ mod execution_engine_tests {
             attestation_committee_count: 1,
             pre_merge_coverage: None,
             execution_client: engine,
+            suggested_fee_recipient: [0u8; 20],
             pending_payload_id: None,
         }
     }
@@ -1295,7 +1341,7 @@ mod execution_engine_tests {
         ] {
             let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Status(verdict))));
             let accepted = server
-                .validate_payload_with_el(&ExecutionPayloadV3::default())
+                .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
                 .await;
             assert!(!accepted, "EL verdict {verdict:?} must drop the block");
         }
@@ -1310,7 +1356,7 @@ mod execution_engine_tests {
         ] {
             let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Status(verdict))));
             let accepted = server
-                .validate_payload_with_el(&ExecutionPayloadV3::default())
+                .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
                 .await;
             assert!(
                 accepted,
@@ -1324,7 +1370,7 @@ mod execution_engine_tests {
         // A failed EL roundtrip must not block consensus: import proceeds.
         let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Error)));
         let accepted = server
-            .validate_payload_with_el(&ExecutionPayloadV3::default())
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
             .await;
         assert!(accepted, "EL roundtrip failure must be permissive");
     }
@@ -1333,9 +1379,73 @@ mod execution_engine_tests {
     async fn validate_payload_accepts_when_no_el_configured() {
         let server = test_server(test_store(), None);
         let accepted = server
-            .validate_payload_with_el(&ExecutionPayloadV3::default())
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
             .await;
         assert!(accepted, "no EL configured must always accept");
+    }
+
+    #[tokio::test]
+    async fn validate_payload_passes_parent_root_as_beacon_root() {
+        // The lean-parent-root convention: whatever the caller resolves as the
+        // block's parent_root must reach the EL verbatim as
+        // parent_beacon_block_root.
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let server = test_server(test_store(), Some(engine.clone()));
+
+        let parent_root = H256([0x42; 32]);
+        let accepted = server
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), parent_root)
+            .await;
+
+        assert!(accepted);
+        assert_eq!(*engine.seen_beacon_root.lock().unwrap(), Some(parent_root));
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_discards_on_head_change() {
+        // Stash a payload_id built on a head that no longer matches the
+        // store's: the id must be discarded (caller falls back to synthetic).
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let mut server = test_server(store, Some(engine));
+
+        let stale_root = H256([0x77; 32]);
+        assert_ne!(stale_root, server.store.head());
+        server.pending_payload_id = Some((5, stale_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(5).await.is_none());
+        assert!(
+            server.pending_payload_id.is_none(),
+            "stash must be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_fetches_when_head_unchanged() {
+        // Happy path: slot and build-head both match → the EL payload is
+        // fetched and returned.
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let head_root = store.head();
+        let mut server = test_server(store, Some(engine));
+        server.pending_payload_id = Some((5, head_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(5).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_discards_on_slot_mismatch() {
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let head_root = store.head();
+        let mut server = test_server(store, Some(engine));
+        server.pending_payload_id = Some((5, head_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(6).await.is_none());
+        assert!(
+            server.pending_payload_id.is_none(),
+            "stash must be consumed"
+        );
     }
 
     #[test]
