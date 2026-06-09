@@ -6,8 +6,8 @@ use ethlambda_types::{
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
 use lean_multisig::{
-    AggregatedXMSS, ProofError, setup_prover, setup_verifier, xmss_aggregate,
-    xmss_verify_aggregation,
+    AggregatedXMSS, AggregationError as LeanAggregationError, ProofError, setup_prover,
+    setup_verifier, xmss_aggregate, xmss_verify_aggregation,
 };
 use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
@@ -43,6 +43,9 @@ pub enum AggregationError {
 
     #[error("need at least 2 children for recursive aggregation, got {0}")]
     InsufficientChildren(usize),
+
+    #[error("aggregation failed: {0}")]
+    Upstream(#[from] LeanAggregationError),
 }
 
 /// Error type for signature verification operations.
@@ -104,7 +107,7 @@ pub fn aggregate_signatures(
     // log_inv_rate=2 matches the devnet-4 cross-client convention (zeam, ream,
     // grandine, lantern's c-leanvm-xmss all use 2). Ethlambda previously
     // hardcoded 1, which produced proofs incompatible with every other client.
-    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&[], raw_xmss, &message.0, slot, 2);
+    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&[], raw_xmss, &message.0, slot, 2)?;
 
     serialize_aggregate(aggregate)
 }
@@ -118,11 +121,8 @@ pub fn aggregate_signatures(
 /// Requires at least one raw signature OR at least 2 children. A lone child proof
 /// is already valid and needs no further aggregation.
 ///
-/// # Panics
-///
-/// Panics if any deserialized child proof is cryptographically invalid (e.g., was
-/// produced for a different message or slot). This is an upstream constraint of
-/// `xmss_aggregate`.
+/// Fails with [`AggregationError::Upstream`] if any deserialized child proof is
+/// cryptographically invalid (e.g., was produced for a different message or slot).
 pub fn aggregate_mixed(
     children: Vec<(Vec<ValidatorPublicKey>, ByteListMiB)>,
     raw_public_keys: Vec<ValidatorPublicKey>,
@@ -160,7 +160,7 @@ pub fn aggregate_mixed(
         .collect();
 
     let (_sorted_pubkeys, aggregate) =
-        xmss_aggregate(&children_refs, raw_xmss, &message.0, slot, 2);
+        xmss_aggregate(&children_refs, raw_xmss, &message.0, slot, 2)?;
 
     serialize_aggregate(aggregate)
 }
@@ -190,7 +190,7 @@ pub fn aggregate_proofs(
     let children_refs: Vec<(&[LeanSigPubKey], AggregatedXMSS)> =
         pks_list.iter().map(Vec::as_slice).zip(aggs).collect();
 
-    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2);
+    let (_sorted_pubkeys, aggregate) = xmss_aggregate(&children_refs, vec![], &message.0, slot, 2)?;
 
     serialize_aggregate(aggregate)
 }
@@ -206,7 +206,7 @@ fn deserialize_children(
         .map(|(i, (pubkeys, proof_data))| {
             let lean_pks: Vec<LeanSigPubKey> =
                 pubkeys.into_iter().map(|pk| pk.into_inner()).collect();
-            let aggregate = AggregatedXMSS::deserialize(proof_data.iter().as_slice())
+            let aggregate = AggregatedXMSS::decompress(proof_data.iter().as_slice())
                 .ok_or(AggregationError::ChildDeserializationFailed(i))?;
             Ok((lean_pks, aggregate))
         })
@@ -215,7 +215,7 @@ fn deserialize_children(
 
 /// Serialize an `AggregatedXMSS` into the `ByteListMiB` wire format.
 fn serialize_aggregate(aggregate: AggregatedXMSS) -> Result<ByteListMiB, AggregationError> {
-    let serialized = aggregate.serialize();
+    let serialized = aggregate.compress();
     let serialized_len = serialized.len();
     ByteListMiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(serialized_len))
 }
@@ -250,7 +250,7 @@ pub fn verify_aggregated_signature(
         .collect();
 
     // Deserialize the aggregate proof
-    let aggregate = AggregatedXMSS::deserialize(proof_data.iter().as_slice())
+    let aggregate = AggregatedXMSS::decompress(proof_data.iter().as_slice())
         .ok_or(VerificationError::DeserializationFailed)?;
 
     // Verify using lean-multisig

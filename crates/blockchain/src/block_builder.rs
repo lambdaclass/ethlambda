@@ -9,7 +9,10 @@
 //! without re-running the STF. The final STF runs once after selection to
 //! seal `state_root`.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
@@ -81,6 +84,7 @@ pub(crate) fn build_block(
     // chain-linking one so non-EL nodes still produce STF-valid blocks.
     let payload = execution_payload.unwrap_or_else(|| synthetic_payload(head_state, slot));
 
+    let select_start = Instant::now();
     let selected = select_attestations(
         head_state,
         slot,
@@ -88,10 +92,15 @@ pub(crate) fn build_block(
         known_block_roots,
         aggregated_payloads,
     );
+    metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
+
+    let child_payloads_consumed = selected.len();
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
+    let compact_start = Instant::now();
     let compacted = compact_attestations(selected, head_state)?;
+    metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
@@ -110,9 +119,18 @@ pub(crate) fn build_block(
         },
     };
     let mut post_state = head_state.clone();
+    // ethlambda runs the STF once after selection (it projects justification
+    // incrementally instead of re-running the STF per loop round), so this is
+    // a single `stf_simulate` observation per build.
+    let stf_start = Instant::now();
     process_slots(&mut post_state, slot)?;
     process_block(&mut post_state, &final_block)?;
+    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
     final_block.state_root = post_state.hash_tree_root();
+
+    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
+    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
+    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
 
     let post_checkpoints = PostBlockCheckpoints {
         justified: post_state.latest_justified,
@@ -186,6 +204,7 @@ fn select_attestations(
         let (att_data, proofs) = &chain.aggregated_payloads[&data_root];
 
         processed_data_roots.insert(data_root);
+        metrics::inc_block_proposal_attestation_builds();
 
         let before = selected.len();
         extend_proofs_greedily(proofs, &mut selected, att_data);
@@ -394,10 +413,14 @@ fn score_entry(
     let total = prior_count + new_voters.len();
     let crosses_2_3 = 3 * total >= 2 * validator_count;
 
-    // 3SF-mini finalization requires no slot strictly between source.slot
-    // and target.slot to still be justifiable (so source and target are
-    // consecutive justified checkpoints in the projected post-state).
+    // 3SF-mini finalization requires the source to lie past the finalized
+    // boundary (a source at or behind it is already final and must not
+    // re-finalize) and no slot strictly between source.slot and target.slot to
+    // still be justifiable (so source and target are consecutive justified
+    // checkpoints in the projected post-state). Mirrors `try_finalize` in the
+    // state transition.
     let finalizes = crosses_2_3
+        && att_data.source.slot > projected_finalized_slot
         && (att_data.source.slot + 1..att_data.target.slot)
             .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
 
@@ -716,6 +739,52 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         bits
+    }
+
+    /// Regression (leanSpec #802): a supermajority entry whose source sits at
+    /// the finalized boundary must be scored `Justify`, not `Finalize`. Such a
+    /// source is already final, so it advances nothing; the empty scan range
+    /// `(source.slot + 1..target.slot)` would otherwise make `.all(...)`
+    /// vacuously true and mis-tier the entry as a finalizer.
+    #[test]
+    fn score_entry_does_not_finalize_source_at_boundary() {
+        const NUM_VALIDATORS: usize = 4;
+        const FINALIZED_SLOT: u64 = 4;
+
+        // Source at the finalized boundary, target one slot ahead (empty scan).
+        let att_data = AttestationData {
+            slot: 7,
+            head: Checkpoint {
+                slot: 5,
+                root: H256([5u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 5,
+                root: H256([5u8; 32]),
+            },
+            source: Checkpoint {
+                slot: FINALIZED_SLOT,
+                root: H256([4u8; 32]),
+            },
+        };
+
+        // Supermajority (3 of 4) so the entry crosses 2/3.
+        let proofs = vec![AggregatedSignatureProof::empty(make_bits(&[0, 1, 2]))];
+
+        let (score, _) = score_entry(
+            &att_data,
+            &proofs,
+            &HashMap::new(),
+            FINALIZED_SLOT,
+            NUM_VALIDATORS,
+        )
+        .expect("entry contributes new voters");
+
+        assert_eq!(
+            score.tier,
+            Tier::Justify,
+            "source at the finalized boundary must justify, not finalize"
+        );
     }
 
     /// Regression test for https://github.com/lambdaclass/ethlambda/issues/259

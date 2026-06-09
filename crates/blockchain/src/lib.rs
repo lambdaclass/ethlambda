@@ -26,12 +26,13 @@ use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::store::StoreError;
 
 pub mod aggregation;
 pub mod block_builder;
+pub(crate) mod coverage;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -69,11 +70,20 @@ fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
     MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
 }
 
+/// Current UNIX timestamp in milliseconds.
+fn unix_now_ms() -> u64 {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .expect("already past the unix epoch")
+        .as_millis() as u64
+}
+
 impl BlockChain {
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        attestation_committee_count: u64,
         execution_client: Option<EngineClient>,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
@@ -84,10 +94,7 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
         let current_slot =
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
@@ -101,6 +108,8 @@ impl BlockChain {
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
+            attestation_committee_count,
+            pre_merge_coverage: None,
             execution_client,
             pending_payload_id: None,
         }
@@ -157,6 +166,17 @@ pub struct BlockChainServer {
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
 
+    /// Number of attestation committees (= subnet count). Used by the
+    /// attestation aggregate coverage emission.
+    attestation_committee_count: u64,
+
+    /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
+    /// report. Captured at the end-of-slot promote (interval 4), read at the
+    /// next slot boundary. Owned solely by the actor and only touched from the
+    /// single-threaded message loop, so no synchronization is needed.
+    /// Observability-only.
+    pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
     /// Optional Engine API client to the execution layer (e.g. ethrex).
     ///
     /// Present only when ethlambda was started with `--execution-endpoint`
@@ -178,12 +198,6 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        // Observe tick interval duration before any processing
-        if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant.elapsed());
-        }
-        self.last_tick_instant = Some(Instant::now());
-
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -191,12 +205,39 @@ impl BlockChainServer {
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
         let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
+        // Idempotency guard
+        //
+        // `slot`/`interval` come from the wall clock, but the tick cadence is driven
+        // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
+        // inside VMs, so a tick scheduled for the next interval boundary can fire
+        // while the wall clock still reads the previous interval.
+        let tick_interval = time_since_genesis_ms / MILLISECONDS_PER_INTERVAL;
+        let store_time = self.store.time();
+
+        if store_time > 0 && tick_interval <= store_time {
+            debug!(
+                %slot,
+                %interval,
+                tick_interval,
+                store_time,
+                "Skipping already-processed tick"
+            );
+            return;
+        }
+
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing.
         if self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
+
+        // Observe tick interval duration. Done after the idempotency guard so a
+        // skipped duplicate tick doesn't shorten the next real tick's sample.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
 
         // Update current slot metric
         metrics::update_current_slot(slot);
@@ -215,6 +256,23 @@ impl BlockChainServer {
             .then(|| self.get_our_proposer(slot))
             .flatten();
 
+        // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
+        // (interval 4), so the post-block report for this round sees its
+        // "timely" cohort just before it is promoted out of `new_payloads`.
+        //
+        // Only interval 4 — not the proposer's interval-0 promote. By interval 0
+        // the round's votes have already been promoted at the previous slot's
+        // interval 4; `new_payloads` then holds only stragglers, and snapshotting
+        // them here would overwrite the good interval-4 snapshot the report still
+        // needs (those stragglers surface in the `late` section instead). Skip
+        // empty snapshots so a missed round keeps the last set we saw. Pure
+        // observability.
+        if interval == 4
+            && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
+        {
+            self.pre_merge_coverage = Some(snapshot);
+        }
+
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(
             &mut self.store,
@@ -223,6 +281,7 @@ impl BlockChainServer {
         );
 
         if interval == 2 && is_aggregator {
+            coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
             self.start_aggregation_session(slot, ctx).await;
         }
 
@@ -240,6 +299,18 @@ impl BlockChainServer {
         // Reuse the same snapshot so self-delivery decisions match the rest
         // of the tick.
         if interval == 1 {
+            // Emit the post-block coverage report for the previous slot. Fired
+            // at interval 1 (not 0) so the block carrying `slot - 1`'s votes —
+            // proposed at interval 0 of this slot — has typically been received
+            // and processed, letting the `block` section see the same round.
+            if slot > 0 {
+                coverage::emit_post_block_coverage(
+                    &self.store,
+                    self.pre_merge_coverage.as_ref(),
+                    self.attestation_committee_count,
+                    slot - 1,
+                );
+            }
             self.produce_attestations(slot, is_aggregator);
         }
 
@@ -605,6 +676,12 @@ impl BlockChainServer {
             return;
         };
 
+        coverage::emit_proposal_coverage(
+            &self.store,
+            self.attestation_committee_count,
+            block.body.attestations.iter(),
+        );
+
         // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();
         let Ok(proposer_signature) = self
@@ -924,14 +1001,22 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
-        let timestamp = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch");
-        let now_ms = timestamp.as_millis() as u64;
+        let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
-        // Schedule the next tick at the next interval boundary
+
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let ms_to_next_interval = ms_until_next_interval(now_ms, genesis_time_ms);
+        let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
+        let now_after_tick = unix_now_ms();
+        let elapsed = now_after_tick.saturating_sub(now_ms);
+
+        // If on_tick ran past the next interval boundary, tick again
+        // immediately so that interval's duty still runs (issue #413).
+        let ms_to_next_interval = if elapsed >= remaining_at_entry {
+            0
+        } else {
+            // Schedule the next tick at the next interval boundary
+            ms_until_next_interval(now_after_tick, genesis_time_ms)
+        };
         send_after(
             Duration::from_millis(ms_to_next_interval),
             ctx.clone(),

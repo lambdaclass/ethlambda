@@ -28,12 +28,28 @@ ENV BUILD_PROFILE=$BUILD_PROFILE
 ARG FEATURES=""
 ENV FEATURES=$FEATURES
 
-RUN cargo chef cook --profile $BUILD_PROFILE --features "$FEATURES" --recipe-path recipe.json
+# Disable default features (e.g. for `shadow-integration`, which must drop the
+# default jemalloc allocator). Set to "--no-default-features" to enable.
+ARG NO_DEFAULT_FEATURES=""
+ENV NO_DEFAULT_FEATURES=$NO_DEFAULT_FEATURES
+
+# Cargo --locked by default. The Shadow build injects a [patch] (see below) that
+# is absent from the committed lockfile, so it must build unlocked: set LOCKED= .
+ARG LOCKED="--locked"
+ENV LOCKED=$LOCKED
+
+RUN cargo chef cook --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
 # Include .git so vergen-git2 can extract version info (branch, commit SHA)
 COPY --exclude=target . .
-RUN cargo build --profile $BUILD_PROFILE --features "$FEATURES" --locked --bin ethlambda
+
+# Shadow builds inject the quinn-udp [patch] into the workspace manifest, since a
+# Cargo patch cannot be feature-gated and is therefore not committed. Set SHADOW=1.
+ARG SHADOW=""
+RUN if [ -n "$SHADOW" ]; then cat shadow/cargo-patch.toml >> Cargo.toml; fi
+
+RUN cargo build --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" $LOCKED --bin ethlambda
 
 # ARG is not resolved in COPY so we have to hack around it by copying the
 # binary to a temporary location

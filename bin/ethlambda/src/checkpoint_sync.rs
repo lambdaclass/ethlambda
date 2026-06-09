@@ -5,6 +5,7 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
 use reqwest::Client;
+use tracing::{error, info, warn};
 
 /// Timeout for establishing the HTTP connection to the checkpoint peer.
 /// Fail fast if the peer is unreachable.
@@ -19,6 +20,12 @@ const FINALIZED_STATE_PATH: &str = "/lean/v0/states/finalized";
 
 /// Path of the finalized-block endpoint (relative to the peer's API base URL).
 const FINALIZED_BLOCK_PATH: &str = "/lean/v0/blocks/finalized";
+
+/// Maximum attempts to refetch the anchor pair if the state and block roots don't match.
+const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
+
+/// Delay between anchor fetch attempts.
+const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
@@ -58,6 +65,8 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
+    #[error("no checkpoint urls configured")]
+    NoCheckpointUrls,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
@@ -267,6 +276,72 @@ fn verify_checkpoint_state(
     }
 
     Ok(())
+}
+
+/// Fetch the finalized anchor from a single checkpoint URL, retrying transient
+/// races where the peer advances finalization between the state and block
+/// fetches.
+async fn try_checkpoint_url(
+    url: &str,
+    genesis_time: u64,
+    validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let mut attempt = 1;
+    loop {
+        match fetch_finalized_anchor(url, genesis_time, validators).await {
+            Ok(pair) => return Ok(pair),
+            Err(CheckpointSyncError::AnchorPairingMismatch)
+                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
+            {
+                warn!(
+                    %url,
+                    attempt,
+                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
+                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
+                );
+                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Try each checkpoint URL in order, returning the first successful anchor
+/// pair. Logs per-peer success/failure. On total failure, returns
+/// the last fetch error encountered.
+pub async fn fetch_anchor_block_and_state(
+    checkpoint_urls: &[String],
+    genesis_time: u64,
+    validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let mut iter = checkpoint_urls.iter().peekable();
+    let mut last_err: Option<CheckpointSyncError> = None;
+    loop {
+        let Some(url) = iter.next() else {
+            return Err(match last_err {
+                Some(err) => {
+                    error!(%err, "All checkpoint sync attempts failed");
+                    err
+                }
+                None => CheckpointSyncError::NoCheckpointUrls,
+            });
+        };
+        match try_checkpoint_url(url, genesis_time, validators).await {
+            Ok(pair) => {
+                info!(%url, "Checkpoint sync successful with this peer");
+                return Ok(pair);
+            }
+            Err(err) => {
+                if iter.peek().is_some() {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
+                } else {
+                    warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+                }
+                last_err = Some(err);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

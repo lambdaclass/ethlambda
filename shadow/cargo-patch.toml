@@ -1,0 +1,7 @@
+
+# Shadow simulator compatibility: replace quinn-udp with a fallback that uses
+# plain send_to/recv_from instead of GSO/GRO batch syscalls, which Shadow's UDP
+# emulation does not support. Appended to the workspace Cargo.toml at build time
+# by shadow/build.sh (and the Dockerfile's SHADOW path); never committed.
+[patch.crates-io]
+quinn-udp = { path = "shadow/quinn-udp-patch" }
