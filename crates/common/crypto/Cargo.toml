@@ -14,9 +14,9 @@ ethlambda-types.workspace = true
 
 # lean-multisig is the XMSS signature aggregation crate from leanVM (the repo was
 # previously named leanMultisig). The crate package keeps the lean-multisig name.
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a44bca4" }
+lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "2498896" }
 # leansig_wrapper provides XmssPublicKey/XmssSignature types used by lean-multisig's public API
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a44bca4" }
+leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "2498896" }
 
 leansig.workspace = true
 thiserror.workspace = true
