@@ -276,13 +276,7 @@ fn process_attestations(
             continue;
         }
 
-        // Record the vote
-        attestations_processed += 1;
-        let votes = justifications
-            .entry(target.root)
-            .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
         // Reject attestations with aggregation_bits longer than the validator set.
-        // The spec would crash (IndexError) on OOB access; Zeam and Lantern reject.
         if attestation.aggregation_bits.len() > validator_count {
             warn!(
                 bits_len = attestation.aggregation_bits.len(),
@@ -290,6 +284,12 @@ fn process_attestations(
             );
             continue;
         }
+        // Record the vote
+        attestations_processed += 1;
+        let votes = justifications
+            .entry(target.root)
+            .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
+
         // Mark that each validator in this aggregation has voted for the target.
         for (validator_id, voted) in votes
             .iter_mut()
