@@ -2,6 +2,7 @@ pub mod aggregator;
 pub mod attestation;
 pub mod block;
 pub mod checkpoint;
+mod el_genesis;
 pub mod execution_payload;
 pub mod genesis;
 pub mod primitives;
