@@ -1,11 +1,22 @@
 mod checkpoint_sync;
+mod fd_limit;
 mod version;
 
-#[cfg(not(target_env = "msvc"))]
+// Jemalloc causes programs to deadlock during process startup under Shadow.
+// See https://github.com/shadow/shadow/issues/3763. Build the Shadow binary
+// with `--no-default-features --features shadow-integration` to drop the
+// (default) `jemalloc` feature and thus the `tikv-jemallocator` dependency.
+#[cfg(all(feature = "jemalloc", feature = "shadow-integration"))]
+compile_error!(
+    "the `jemalloc` feature is incompatible with `shadow-integration`; \
+     build the Shadow binary with `--no-default-features --features shadow-integration`"
+);
+
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
@@ -81,14 +92,20 @@ struct CliOptions {
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     node_id: String,
-    /// Base URL of a checkpoint-sync peer's API server (e.g., http://peer:5052).
+    /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
     /// When set, skips genesis initialization and fetches the finalized state
-    /// and block from the peer's `/lean/v0/states/finalized` and
+    /// and block from each peer's `/lean/v0/states/finalized` and
     /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
     /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
     /// path is stripped.
-    #[arg(long)]
-    checkpoint_sync_url: Option<String>,
+    ///
+    /// Multiple URLs may be supplied for redundancy, either comma-separated
+    /// (`--checkpoint-sync-url u1,u2`) or by repeating the flag
+    /// (`--checkpoint-sync-url u1 --checkpoint-sync-url u2`). URLs are tried
+    /// in order; the first one that succeeds is used and any failures fall
+    /// over to the next URL. Startup only aborts if every URL fails.
+    #[arg(long, value_delimiter = ',')]
+    checkpoint_sync_url: Vec<String>,
     /// Whether this node acts as a committee aggregator.
     ///
     /// Seeds the initial value of the live aggregator flag shared by the
@@ -116,7 +133,12 @@ struct CliOptions {
     data_dir: PathBuf,
 }
 
-#[tokio::main]
+// Shadow single-steps execution in a discrete-event simulation, so the default
+// multi-threaded runtime's worker threads add only scheduling noise, never
+// parallelism. Use a single-threaded runtime under Shadow. This is an
+// optimization, not a correctness requirement.
+#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
+#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn main() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
@@ -142,6 +164,13 @@ async fn main() -> eyre::Result<()> {
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
 
+    // Raise the soft open-file-descriptor limit to the hard limit. RocksDB
+    // keeps an unbounded table cache (`set_max_open_files(-1)`), so on
+    // containerized hosts with the default ulimit of 1024 the store
+    // eventually panics with `EMFILE`. Fail fast at startup rather than
+    // stall days later when the cache outgrows the limit.
+    fd_limit::raise_fd_limit().wrap_err("failed to raise RLIMIT_NOFILE")?;
+
     // Hive lean spec-asset suites boot the client with
     // HIVE_LEAN_TEST_DRIVER=1 so it skips the consensus/p2p stack and
     // exposes only the `/lean/v0/test_driver/...` endpoints driven by the
@@ -162,10 +191,10 @@ async fn main() -> eyre::Result<()> {
     })?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
-    #[cfg(not(target_env = "msvc"))]
+    #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
-    #[cfg(target_env = "msvc")]
-    info!("Using system allocator (MSVC target)");
+    #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
+    info!("Using system allocator");
 
     info!(node_key=?options.node_key, "got node key");
 
@@ -232,13 +261,16 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
-    let store = fetch_initial_state(
-        options.checkpoint_sync_url.as_deref(),
-        &genesis_config,
-        backend.clone(),
-    )
-    .await
-    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let clean_checkpoint_urls: Vec<String> = options
+        .checkpoint_sync_url
+        .into_iter()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+
+    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+        .await
+        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -605,10 +637,11 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 
 /// Fetch the initial state for the node.
 ///
-/// If `checkpoint_url` is provided, performs checkpoint sync by downloading
-/// and verifying the finalized state AND signed block in parallel from a
-/// remote peer. Otherwise, creates a genesis state from the local genesis
-/// configuration.
+/// If `checkpoint_urls` is empty, creates a genesis state from the local
+/// genesis configuration. Otherwise performs checkpoint sync by downloading
+/// and verifying the finalized state AND signed block from a peer. URLs are
+/// tried in order: the first peer that succeeds wins, and failures fall over
+/// to the next URL. Startup only aborts if every URL fails.
 ///
 /// Fetching the matching signed block lets the local store serve a valid
 /// anchor via the `BlocksByRoot` req-resp protocol; without it, peers
@@ -617,7 +650,7 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 ///
 /// # Arguments
 ///
-/// * `checkpoint_url` - Optional base URL to a peer's API server
+/// * `checkpoint_urls` - Zero or more base URLs of peer API servers
 /// * `genesis` - Genesis configuration (for genesis_time verification and genesis state creation)
 /// * `backend` - Storage backend for Store creation
 ///
@@ -626,18 +659,23 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 /// `Ok(Store)` on success, or `Err(CheckpointSyncError)` if checkpoint sync fails.
 /// Genesis path is infallible and always returns `Ok`.
 async fn fetch_initial_state(
-    checkpoint_url: Option<&str>,
+    checkpoint_urls: &[String],
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
-    let Some(checkpoint_url) = checkpoint_url else {
+    if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
         return Ok(Store::from_anchor_state(backend, genesis_state));
     };
 
+    // Checkpoint sync path: try URLs in order, fail over to the next on error.
+    info!(
+        url_count = checkpoint_urls.len(),
+        "Starting checkpoint sync"
+    );
     // Checkpoint sync path
 
     // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
@@ -663,38 +701,14 @@ async fn fetch_initial_state(
         );
     }
 
-    info!(%checkpoint_url, "Starting checkpoint sync");
+    info!(?checkpoint_urls, "Starting checkpoint sync");
 
-    // The state and block are fetched in parallel; if the peer advances
-    // finalization between the two requests the pair won't match. Retry a
-    // small number of times so this transient race doesn't fail node startup.
-    const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
-    const ANCHOR_FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
-    let mut attempt = 1;
-    let (state, signed_block) = loop {
-        match checkpoint_sync::fetch_finalized_anchor(
-            checkpoint_url,
-            genesis.genesis_time,
-            &validators,
-        )
-        .await
-        {
-            Ok(pair) => break pair,
-            Err(checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
-                if attempt < MAX_ANCHOR_FETCH_ATTEMPTS =>
-            {
-                warn!(
-                    attempt,
-                    max = MAX_ANCHOR_FETCH_ATTEMPTS,
-                    "Anchor state and block disagree (peer likely advanced finalization mid-fetch); retrying"
-                );
-                tokio::time::sleep(ANCHOR_FETCH_RETRY_DELAY).await;
-                attempt += 1;
-            }
-            Err(err) => return Err(err),
-        }
-    };
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_block_and_state(
+        checkpoint_urls,
+        genesis.genesis_time,
+        &validators,
+    )
+    .await?;
 
     info!(
         slot = state.slot,

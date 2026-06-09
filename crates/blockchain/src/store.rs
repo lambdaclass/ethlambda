@@ -8,7 +8,7 @@ use ethlambda_types::{
         Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
         SignedAttestation, validator_indices,
     },
-    block::{AggregatedSignatureProof, Block, SignedBlock},
+    block::{AggregatedSignatureProof, Block, BlockHeader, SignedBlock},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -116,6 +116,56 @@ fn update_safe_target(store: &mut Store) {
     store.set_safe_target(safe_target);
 }
 
+/// Maximum number of parent links [`checkpoint_is_ancestor`] walks before
+/// giving up. Bounds the per-attestation work on the gossip path; a vote whose
+/// source/target sits more than this many slots below the descendant is
+/// conservatively rejected.
+const MAX_ANCESTRY_WALK_SLOTS: u64 = 128;
+
+/// Return whether `ancestor` lies on `descendant`'s parent chain.
+///
+/// `descendant_header` is the descendant's already-fetched header, so the walk
+/// starts from its parent without re-reading it. Walks parent links down to the
+/// ancestor's slot, up to [`MAX_ANCESTRY_WALK_SLOTS`] steps. Empty (skipped)
+/// slots on the path are traversed transparently since they carry no block.
+/// Conservative: a block missing from the store, or exceeding the walk cap,
+/// yields `false`.
+fn checkpoint_is_ancestor(
+    store: &Store,
+    ancestor: &Checkpoint,
+    descendant: &Checkpoint,
+    descendant_header: &BlockHeader,
+) -> bool {
+    if ancestor.slot >= descendant.slot {
+        // Equal slot: a checkpoint is its own ancestor only if the roots match.
+        // Greater: the ancestor cannot sit below the descendant in the chain.
+        return ancestor.slot == descendant.slot && ancestor.root == descendant.root;
+    }
+
+    // The descendant header is already in hand, so begin the walk at its parent.
+    let mut current_root = descendant_header.parent_root;
+    let mut steps: u64 = 0;
+    while let Some(current_header) = store.get_block_header(&current_root) {
+        if current_header.slot == ancestor.slot {
+            return current_root == ancestor.root;
+        }
+        if current_header.slot < ancestor.slot {
+            return false;
+        }
+        steps += 1;
+        if steps >= MAX_ANCESTRY_WALK_SLOTS {
+            warn!(
+                cap = MAX_ANCESTRY_WALK_SLOTS,
+                "Attestation ancestry walk exceeded cap, rejecting"
+            );
+            return false;
+        }
+        current_root = current_header.parent_root;
+    }
+
+    false
+}
+
 /// Validate incoming attestation before processing.
 ///
 /// Ensures the vote respects the basic laws of time and topology:
@@ -123,7 +173,8 @@ fn update_safe_target(store: &mut Store) {
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
-///     5. The vote's slot must have started locally (a small disparity margin is allowed).
+///     5. Source, target, and head must lie on one parent chain.
+///     6. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -168,6 +219,18 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
             checkpoint_slot: data.head.slot,
             block_slot: head_header.slot,
         });
+    }
+
+    // Ancestry Check - Source, target, and head must lie on one parent chain.
+    //
+    // Fork-choice weight accrues to every ancestor of the attested head. A sibling
+    // head would steer that weight onto a non-canonical branch, so reject a vote
+    // whose checkpoints are slot-ordered but not actually on the same chain.
+    if !checkpoint_is_ancestor(store, &data.source, &data.target, &target_header) {
+        return Err(StoreError::SourceNotAncestorOfTarget);
+    }
+    if !checkpoint_is_ancestor(store, &data.target, &data.head, &head_header) {
+        return Err(StoreError::TargetNotAncestorOfHead);
     }
 
     // Time Check - Honest validators emit votes only after their slot has begun.
@@ -792,6 +855,12 @@ pub enum StoreError {
         block_slot: u64,
     },
 
+    #[error("Source checkpoint must be ancestor of target")]
+    SourceNotAncestorOfTarget,
+
+    #[error("Target checkpoint must be ancestor of head")]
+    TargetNotAncestorOfHead,
+
     #[error(
         "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
     )]
@@ -1160,6 +1229,146 @@ mod tests {
                 })
             ),
             "Expected DuplicateAttestationData, got: {result:?}"
+        );
+    }
+
+    /// Insert a header-only block at `root` with the given slot and parent.
+    ///
+    /// Empty body means `get_block_header` resolves it without a body row, which
+    /// is all `validate_attestation_data` needs for the ancestry walk.
+    fn insert_test_block(store: &mut Store, root: H256, slot: u64, parent_root: H256) {
+        let signed_block = SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            signature: BlockSignatures {
+                attestation_signatures: AttestationSignatures::try_from(vec![]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
+            },
+        };
+        store.insert_signed_block(root, signed_block);
+    }
+
+    fn new_test_store() -> Store {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        Store::from_anchor_state(backend, genesis_state)
+    }
+
+    /// leanSpec #833: a vote whose head sits on a sibling fork of the target
+    /// must be rejected by gossip validation, even though every slot and
+    /// availability check passes.
+    #[test]
+    fn validate_attestation_rejects_head_on_sibling_fork() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let base = H256([1u8; 32]);
+        let fork_left = H256([2u8; 32]);
+        let fork_right = H256([3u8; 32]);
+        insert_test_block(&mut store, base, 1, genesis);
+        insert_test_block(&mut store, fork_left, 2, base);
+        insert_test_block(&mut store, fork_right, 3, base);
+        store.set_time(3 * INTERVALS_PER_SLOT);
+
+        // source=base, target=fork_left, head=fork_right: target and head share a
+        // parent (base) but neither is an ancestor of the other.
+        let data = AttestationData {
+            slot: 3,
+            source: Checkpoint {
+                root: base,
+                slot: 1,
+            },
+            target: Checkpoint {
+                root: fork_left,
+                slot: 2,
+            },
+            head: Checkpoint {
+                root: fork_right,
+                slot: 3,
+            },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(result, Err(StoreError::TargetNotAncestorOfHead)),
+            "Expected TargetNotAncestorOfHead, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #833: a vote whose source sits on a sibling fork of the target
+    /// must be rejected, even though `source.slot < target.slot`.
+    #[test]
+    fn validate_attestation_rejects_source_on_sibling_fork() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let base = H256([1u8; 32]);
+        let fork_left = H256([2u8; 32]);
+        let fork_right = H256([3u8; 32]);
+        let fork_right_head = H256([4u8; 32]);
+        insert_test_block(&mut store, base, 1, genesis);
+        insert_test_block(&mut store, fork_left, 2, base);
+        insert_test_block(&mut store, fork_right, 3, base);
+        insert_test_block(&mut store, fork_right_head, 4, fork_right);
+        store.set_time(4 * INTERVALS_PER_SLOT);
+
+        // source=fork_left (abandoned branch), target=head=fork_right_head:
+        // source precedes target in slot but lies off the target's chain.
+        let data = AttestationData {
+            slot: 4,
+            source: Checkpoint {
+                root: fork_left,
+                slot: 2,
+            },
+            target: Checkpoint {
+                root: fork_right_head,
+                slot: 4,
+            },
+            head: Checkpoint {
+                root: fork_right_head,
+                slot: 4,
+            },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(result, Err(StoreError::SourceNotAncestorOfTarget)),
+            "Expected SourceNotAncestorOfTarget, got: {result:?}"
+        );
+    }
+
+    /// A vote whose source, target, and head form one parent chain validates.
+    #[test]
+    fn validate_attestation_accepts_proper_ancestor_chain() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        store.set_time(2 * INTERVALS_PER_SLOT);
+
+        let data = AttestationData {
+            slot: 2,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b1, slot: 1 },
+            head: Checkpoint { root: b2, slot: 2 },
+        };
+
+        assert!(
+            validate_attestation_data(&store, &data).is_ok(),
+            "fully canonical vote must validate"
         );
     }
 }
