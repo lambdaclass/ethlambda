@@ -50,7 +50,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
-use ethlambda_ethrex_client::{ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, JwtSecret};
+use ethlambda_ethrex_client::{
+    ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, ExecutionEngine, JwtSecret,
+};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -683,7 +685,7 @@ fn read_validator_keys(
 async fn build_execution_client(
     endpoint: Option<&str>,
     jwt_path: Option<&Path>,
-) -> Option<EngineClient> {
+) -> Option<Arc<dyn ExecutionEngine>> {
     // CLI requires both-or-neither; defensive recheck for clarity.
     let (endpoint, jwt_path) = match (endpoint, jwt_path) {
         (Some(e), Some(p)) => (e, p),
@@ -723,7 +725,7 @@ async fn build_execution_client(
         ),
     }
 
-    Some(client)
+    Some(Arc::new(client))
 }
 
 /// Parse a 32-byte hex H256 from a `0x`-prefixed or bare hex string.

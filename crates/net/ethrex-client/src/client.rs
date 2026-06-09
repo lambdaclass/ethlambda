@@ -294,6 +294,76 @@ impl EngineClient {
     }
 }
 
+// ---------- ExecutionEngine trait ----------
+
+/// Async abstraction over the subset of Engine API methods the consensus
+/// actor drives each slot.
+///
+/// `EngineClient` is the production implementation (real JSON-RPC over JWT).
+/// Modelling it as a trait lets the blockchain actor hold
+/// `Arc<dyn ExecutionEngine>` and be exercised against a mock EL — without
+/// it, the only way to test the import/propose hooks is a live TCP server.
+///
+/// Only the three methods the actor calls live here. The version-selection
+/// surface (V3/V4 variants, capability handshake, client-version diagnostics)
+/// stays inherent on `EngineClient` because nothing dynamic dispatches it.
+#[async_trait::async_trait]
+pub trait ExecutionEngine: Send + Sync {
+    async fn forkchoice_updated_v3(
+        &self,
+        state: ForkChoiceState,
+        payload_attributes: Option<PayloadAttributesV3>,
+    ) -> Result<ForkChoiceUpdatedResponse, EngineClientError>;
+
+    async fn get_payload_v5(
+        &self,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError>;
+
+    async fn new_payload_v5(
+        &self,
+        payload: ExecutionPayloadV3,
+        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        parent_beacon_block_root: ethlambda_types::primitives::H256,
+        execution_requests: Vec<Vec<u8>>,
+    ) -> Result<PayloadStatus, EngineClientError>;
+}
+
+#[async_trait::async_trait]
+impl ExecutionEngine for EngineClient {
+    async fn forkchoice_updated_v3(
+        &self,
+        state: ForkChoiceState,
+        payload_attributes: Option<PayloadAttributesV3>,
+    ) -> Result<ForkChoiceUpdatedResponse, EngineClientError> {
+        EngineClient::forkchoice_updated_v3(self, state, payload_attributes).await
+    }
+
+    async fn get_payload_v5(
+        &self,
+        payload_id: PayloadId,
+    ) -> Result<ExecutionPayloadV3, EngineClientError> {
+        EngineClient::get_payload_v5(self, payload_id).await
+    }
+
+    async fn new_payload_v5(
+        &self,
+        payload: ExecutionPayloadV3,
+        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        parent_beacon_block_root: ethlambda_types::primitives::H256,
+        execution_requests: Vec<Vec<u8>>,
+    ) -> Result<PayloadStatus, EngineClientError> {
+        EngineClient::new_payload_v5(
+            self,
+            payload,
+            expected_blob_versioned_hashes,
+            parent_beacon_block_root,
+            execution_requests,
+        )
+        .await
+    }
+}
+
 // ---------- JSON-RPC envelope ----------
 
 #[derive(Serialize)]

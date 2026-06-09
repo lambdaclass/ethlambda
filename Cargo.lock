@@ -2037,6 +2037,7 @@ dependencies = [
 name = "ethlambda-blockchain"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "datatest-stable 0.3.3",
  "ethlambda-crypto",
  "ethlambda-ethrex-client",
@@ -2077,6 +2078,7 @@ dependencies = [
 name = "ethlambda-ethrex-client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ethlambda-types",
  "hex",
  "jsonwebtoken",

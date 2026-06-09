@@ -27,7 +27,7 @@ pub mod error;
 pub mod types;
 
 pub use auth::{JwtSecret, JwtSecretError};
-pub use client::EngineClient;
+pub use client::{EngineClient, ExecutionEngine};
 pub use error::EngineClientError;
 pub use types::{
     ExecutionPayloadV3, ForkChoiceState, ForkChoiceUpdatedResponse, PayloadAttributesV3, PayloadId,
