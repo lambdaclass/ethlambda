@@ -53,12 +53,42 @@ Configurable via env vars (see the header of `run.sh`): `ETHREX`,
 The round-trip invariant: ethrex's FCU `head` equals ethlambda's
 `block.body.execution_payload.block_hash`.
 
+## With transactions
+
+ethrex builds payloads from its mempool, so anything submitted to its HTTP-RPC
+lands in the next slot's payload — and therefore inside the Lean block. The
+genesis prefunds the well-known hardhat/anvil dev account #0
+(`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`, 10k ETH), and `send-txs.sh`
+signs EIP-1559 self-transfers from it (via `uv run --with eth-account`; no
+permanent install):
+
+```bash
+scripts/engine-api-demo/send-txs.sh 5      # sign + submit 5 transfers
+```
+
+One slot later (~4s), show the full tx → mempool → payload → Lean block →
+execution round-trip:
+
+```bash
+# The receipt: executed on the EL (status 0x1, note the block number N)
+curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":["<tx hash>"]}' \
+  | jq '.result | {status, blockNumber}'
+
+# The same transactions, raw, inside the Lean block's execution payload at slot N
+curl -s http://127.0.0.1:5052/lean/v0/blocks/<N> \
+  | jq '.body.execution_payload | {blockNumber, gasUsed, transactions}'
+```
+
+Override `RPC_URL` / `KEY` via env to use a different endpoint or sender.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `run.sh` | Orchestrator (`run` / `stop`); reads the EL genesis hash from ethrex's log, so nothing is hardcoded. |
-| `genesis-el.json` | Execution-layer genesis: chainId 9, Shanghai/Cancun/Prague @0 (pre-Amsterdam → no EIP-7928 block-access-list), Prague system contracts only. |
+| `send-txs.sh` | Signs and submits demo transactions from the prefunded dev account (requires `uv`). |
+| `genesis-el.json` | Execution-layer genesis: chainId 9, Shanghai/Cancun/Prague @0 (pre-Amsterdam → no EIP-7928 block-access-list), Prague system contracts + one prefunded dev account. |
 
 ## Notes
 

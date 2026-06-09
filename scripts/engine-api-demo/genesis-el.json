@@ -75,6 +75,9 @@
       "storage": {},
       "balance": "0x0",
       "nonce": "0x0"
+    },
+    "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266": {
+      "balance": "0x21e19e0c9bab2400000"
     }
   }
 }
