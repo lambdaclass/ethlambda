@@ -177,6 +177,7 @@ impl From<TestState> for State {
             validators,
             justifications_roots,
             justifications_validators,
+            latest_execution_payload_header: Default::default(),
         }
     }
 }
@@ -224,6 +225,7 @@ impl From<BlockBody> for DomainBlockBody {
             .collect::<Vec<_>>();
         Self {
             attestations: SszList::try_from(attestations).expect("too many attestations"),
+            execution_payload: Default::default(),
         }
     }
 }

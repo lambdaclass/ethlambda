@@ -378,6 +378,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         }
     }
 

@@ -38,6 +38,8 @@ use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs}
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
+    block::{Block, BlockBody},
+    execution_payload::ExecutionPayloadV3,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
@@ -48,6 +50,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 use ethlambda_blockchain::BlockChain;
+use ethlambda_ethrex_client::{
+    ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, ExecutionEngine, JwtSecret,
+};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -131,6 +136,30 @@ struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
+    /// URL of the ethrex (or other EL) Engine API auth endpoint, e.g. `http://127.0.0.1:8551`.
+    ///
+    /// When unset, Engine API integration is disabled and ethlambda runs as
+    /// a consensus-only node. When set, `--execution-jwt-secret` is required.
+    #[arg(long, requires = "execution_jwt_secret")]
+    execution_endpoint: Option<String>,
+    /// Path to a file containing the 32-byte JWT secret shared with the EL,
+    /// as a single line of hex (optionally `0x`-prefixed). Same format used
+    /// by Lighthouse/Teku/Prysm/ethrex.
+    #[arg(long, requires = "execution_endpoint")]
+    execution_jwt_secret: Option<PathBuf>,
+    /// 32-byte hex hash of the EL's genesis block.
+    ///
+    /// When set, seeds `state.latest_execution_payload_header.block_hash`
+    /// so the very first `engine_forkchoiceUpdatedV3` carries a head the
+    /// EL recognizes. Without this seed the EL replies `SYNCING` forever
+    /// and never starts building payloads, leaving the chain stuck with
+    /// synthetic zero-hash payloads.
+    ///
+    /// Find ethrex's value in its boot log line `Genesis Block Hash: ...`.
+    /// Required when running paired with an EL; only meaningful alongside
+    /// `--execution-endpoint`.
+    #[arg(long, requires = "execution_endpoint")]
+    execution_genesis_block_hash: Option<String>,
 }
 
 // Shadow single-steps execution in a discrete-event simulation, so the default
@@ -244,6 +273,21 @@ async fn main() -> eyre::Result<()> {
     );
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
+    // Resolve the suggested fee recipient: validator-config.yaml > zero
+    // address. Zero is valid on the wire but burns the block rewards, so
+    // EL-paired nodes get a warning below once the EL client is built.
+    let suggested_fee_recipient = validator_config_file
+        .config
+        .suggested_fee_recipient
+        .as_deref()
+        .map(parse_address_hex)
+        .transpose()
+        .map_err(|err| {
+            error!(%err, "Invalid suggested_fee_recipient in validator config");
+            eyre::eyre!(err)
+        })?
+        .unwrap_or([0u8; 20]);
+
     let bootnodes = read_bootnodes(&bootnodes_path)?;
 
     let validator_keys =
@@ -261,6 +305,16 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
+    let execution_genesis_block_hash = options
+        .execution_genesis_block_hash
+        .as_deref()
+        .map(parse_h256_hex)
+        .transpose()
+        .map_err(|err| {
+            error!(%err, "Invalid --execution-genesis-block-hash");
+            eyre::eyre!(err)
+        })?;
+
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
         .into_iter()
@@ -268,9 +322,14 @@ async fn main() -> eyre::Result<()> {
         .filter(|url| !url.is_empty())
         .collect();
 
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
-        .await
-        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let store = fetch_initial_state(
+        &clean_checkpoint_urls,
+        &genesis_config,
+        backend.clone(),
+        execution_genesis_block_hash,
+    )
+    .await
+    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -279,11 +338,23 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    let execution_client = build_execution_client(
+        options.execution_endpoint.as_deref(),
+        options.execution_jwt_secret.as_deref(),
+    )
+    .await;
+
+    if execution_client.is_some() && suggested_fee_recipient == [0u8; 20] {
+        warn!("suggested_fee_recipient not set in validator config; block rewards will be burned");
+    }
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
+        execution_client,
+        suggested_fee_recipient,
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
@@ -415,6 +486,12 @@ struct ValidatorConfigFile {
 struct ValidatorConfigBlock {
     #[serde(default)]
     attestation_committee_count: Option<u64>,
+    /// 20-byte hex address (optionally `0x`-prefixed) the EL is asked to
+    /// pay block rewards to via `PayloadAttributes.suggestedFeeRecipient`.
+    /// Only meaningful for EL-paired nodes; defaults to the zero address,
+    /// which burns the rewards.
+    #[serde(default)]
+    suggested_fee_recipient: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,6 +703,80 @@ fn read_validator_keys(
     Ok(validator_keys)
 }
 
+/// Build the optional Engine API client and run the capability handshake.
+///
+/// Returns `None` when integration is disabled (neither flag provided).
+/// Returns `None` and logs an error when construction or the handshake
+/// fails — consensus must keep running regardless of EL state.
+async fn build_execution_client(
+    endpoint: Option<&str>,
+    jwt_path: Option<&Path>,
+) -> Option<Arc<dyn ExecutionEngine>> {
+    // CLI requires both-or-neither; defensive recheck for clarity.
+    let (endpoint, jwt_path) = match (endpoint, jwt_path) {
+        (Some(e), Some(p)) => (e, p),
+        (None, None) => return None,
+        _ => {
+            error!("Both --execution-endpoint and --execution-jwt-secret are required together");
+            return None;
+        }
+    };
+
+    let secret = match JwtSecret::from_file(jwt_path) {
+        Ok(s) => s,
+        Err(err) => {
+            error!(path = %jwt_path.display(), %err, "Failed to load JWT secret");
+            return None;
+        }
+    };
+
+    let client = match EngineClient::new(endpoint, secret) {
+        Ok(c) => c,
+        Err(err) => {
+            error!(%err, "Failed to construct EngineClient");
+            return None;
+        }
+    };
+
+    info!(endpoint, "Engine API integration enabled");
+
+    match client
+        .exchange_capabilities(ETHLAMBDA_ENGINE_CAPABILITIES)
+        .await
+    {
+        Ok(caps) => info!(count = caps.len(), "EL capability handshake succeeded"),
+        Err(err) => warn!(
+            %err,
+            "EL capability handshake failed; per-slot FCU calls will still be attempted"
+        ),
+    }
+
+    Some(Arc::new(client))
+}
+
+/// Parse a 32-byte hex H256 from a `0x`-prefixed or bare hex string.
+fn parse_h256_hex(s: &str) -> Result<H256, String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{s:?} decoded to {} bytes, expected 32",
+            bytes.len()
+        ));
+    }
+    Ok(H256::from_slice(&bytes))
+}
+
+/// Parse a 20-byte hex address from a `0x`-prefixed or bare hex string.
+fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| format!("{s:?} decoded to {len} bytes, expected 20"))
+}
+
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
     let path = path.as_ref();
     let file_content = std::fs::read_to_string(path)
@@ -662,13 +813,64 @@ async fn fetch_initial_state(
     checkpoint_urls: &[String],
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
+    execution_genesis_block_hash: Option<H256>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
     if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
-        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+        let mut genesis_state = State::from_genesis(genesis.genesis_time, validators);
+
+        // M6: when paired with an EL, seed both the cached header in state AND
+        // the genesis block's actual `execution_payload.block_hash` with the
+        // EL's genesis hash. The cached header drives STF's
+        // `process_execution_payload` parent_hash check; the body's block_hash
+        // is what `el_hash_at` reads back into `engine_forkchoiceUpdatedV3`'s
+        // `head_block_hash`. Without seeding *both*, either the first non-
+        // genesis block fails STF or every FCU stays at ZERO and the EL never
+        // accepts the build attempt.
+        return Ok(match execution_genesis_block_hash {
+            Some(el_hash) => {
+                info!(%el_hash, "Seeding genesis with EL block hash");
+                genesis_state.latest_execution_payload_header.block_hash = el_hash;
+
+                // Build the body, then update the state's latest header so
+                // its body_root reflects the seeded body (rather than the
+                // empty default it had after State::from_genesis).
+                let body = BlockBody {
+                    attestations: Default::default(),
+                    execution_payload: ExecutionPayloadV3 {
+                        block_hash: el_hash,
+                        ..Default::default()
+                    },
+                };
+                genesis_state.latest_block_header.body_root = body.hash_tree_root();
+
+                // Compute state_root with the header's state_root zeroed,
+                // then write it back. `anchor_pair_is_consistent` requires
+                // `block.state_root == state.hash_tree_root(state_root=0)`
+                // exactly — not just "block.state_root is zero".
+                genesis_state.latest_block_header.state_root = H256::ZERO;
+                let anchor_state_root = genesis_state.hash_tree_root();
+                genesis_state.latest_block_header.state_root = anchor_state_root;
+
+                let genesis_block = Block {
+                    slot: genesis_state.latest_block_header.slot,
+                    proposer_index: genesis_state.latest_block_header.proposer_index,
+                    parent_root: genesis_state.latest_block_header.parent_root,
+                    state_root: anchor_state_root,
+                    body,
+                };
+
+                Store::get_forkchoice_store(backend, genesis_state, genesis_block).map_err(
+                    |err| {
+                        error!(%err, "Failed to initialize store with seeded genesis body");
+                        checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch
+                    },
+                )?
+            }
+            None => Store::from_anchor_state(backend, genesis_state),
+        });
     };
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.

@@ -1,14 +1,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_ethrex_client::{
+    ExecutionEngine, ForkChoiceState, PayloadAttributesV3, PayloadId, PayloadStatusKind,
+};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
-use ethlambda_state_transition::is_proposer;
+use ethlambda_state_transition::{compute_time_at_slot, is_proposer};
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockSignatures, SignedBlock},
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
 };
 
@@ -80,6 +85,8 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        execution_client: Option<Arc<dyn ExecutionEngine>>,
+        suggested_fee_recipient: [u8; 20],
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -105,6 +112,9 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
+            execution_client,
+            suggested_fee_recipient,
+            pending_payload_id: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -169,6 +179,40 @@ pub struct BlockChainServer {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
+    /// Optional Engine API client to the execution layer (e.g. ethrex).
+    ///
+    /// Present only when ethlambda was started with `--execution-endpoint`
+    /// and `--execution-jwt-secret`. When set, the actor drives the full
+    /// payload pipeline against the EL: a per-slot `engine_forkchoiceUpdatedV3`
+    /// keeps the EL informed of our head/justified/finalized; at interval 4 a
+    /// build-mode FCU (with `PayloadAttributes`) requests the next slot's
+    /// payload; at interval 0 the proposer consumes it via `getPayloadV5`,
+    /// embeds the `ExecutionPayloadV3` in the block body, and fires
+    /// `newPayloadV5` so the EL imports it; received blocks are revalidated
+    /// with `newPayloadV5` before the STF runs. FCU block hashes are the real
+    /// `execution_payload.block_hash` values carried by Lean blocks
+    /// (see docs/plans/engine-api-integration.md).
+    ///
+    /// Held as `Arc<dyn ExecutionEngine>` so tests can substitute a mock EL;
+    /// the production value is an `EngineClient`.
+    execution_client: Option<Arc<dyn ExecutionEngine>>,
+
+    /// Address the EL is asked to pay block rewards to, sent as
+    /// `suggestedFeeRecipient` in build-mode FCU payload attributes. Comes
+    /// from `validator-config.yaml`; the zero default is valid on the wire
+    /// but burns the rewards.
+    suggested_fee_recipient: [u8; 20],
+
+    /// `(target_slot, build_head_root, payload_id)` returned by the EL after
+    /// a build-mode FCU at interval 4 of the previous slot. Consumed at
+    /// interval 0 by `take_prepared_payload`. `build_head_root` is the fork
+    /// choice head the build was requested on; if the head moved before the
+    /// proposal, the prepared payload's `parent_hash` and embedded
+    /// `parent_beacon_block_root` are stale and the id is discarded. Absent
+    /// when no EL is configured, when we didn't queue a build for this slot,
+    /// or when the EL was syncing and returned `payload_id = None`.
+    pending_payload_id: Option<(u64, H256, PayloadId)>,
 }
 
 impl BlockChainServer {
@@ -262,7 +306,12 @@ impl BlockChainServer {
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id);
+            // Phase 4 (M6): try to pick up a payload the EL has been building
+            // since interval 4 of the previous slot. None when no EL is
+            // configured, when no build was queued, or when the EL was
+            // syncing. `build_block` falls back to `synthetic_payload`.
+            let payload = self.take_prepared_payload(slot).await;
+            self.propose_block(slot, validator_id, payload);
         }
 
         // Produce attestations at interval 1 (all validators including proposer).
@@ -284,6 +333,13 @@ impl BlockChainServer {
             self.produce_attestations(slot, is_aggregator);
         }
 
+        // Phase 4 (M6): at the end of this slot, if any of our validators
+        // is the next-slot proposer, ask the EL to start building a payload
+        // we'll fetch at interval 0 of slot+1.
+        if interval == 4 {
+            self.request_payload_id_for_next_slot(slot).await;
+        }
+
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
@@ -291,6 +347,237 @@ impl BlockChainServer {
 
         // Advance XMSS keys for next slot so the signing paths don't have to
         self.key_manager.advance_keys_to((slot + 1) as u32);
+
+        // Notify the execution layer once per slot (interval 0). Fire and
+        // forget: the EL is informational here, never on the consensus
+        // critical path. The hashes carried are `block_hash` fields read
+        // off the head/safe/finalized Lean blocks' `execution_payload`s
+        // (Phase 5 of M6), so the EL can chain forward off blocks it has
+        // actually seen via `engine_newPayloadV5`.
+        if interval == 0 && self.execution_client.is_some() {
+            self.notify_execution_layer();
+        }
+    }
+
+    /// Send a forkchoice update to the execution layer via
+    /// `engine_forkchoiceUpdatedV3` carrying the current head/safe/finalized
+    /// EL block hashes (read from the corresponding Lean blocks'
+    /// `execution_payload.block_hash`). Errors are logged but never
+    /// propagated — the consensus loop must continue regardless of EL state.
+    ///
+    /// At genesis every triplet entry is `H256::ZERO` because the genesis
+    /// `BlockBody::default()` carries an `ExecutionPayloadV3::default()`
+    /// whose `block_hash` is zero. Subsequent slots advance once a real
+    /// payload (from `engine_getPayloadV5`) has been imported.
+    fn notify_execution_layer(&self) {
+        let Some(client) = self.execution_client.as_ref() else {
+            return;
+        };
+        let state = self.current_el_forkchoice_state();
+        let client = client.clone();
+        tokio::spawn(async move {
+            match client.forkchoice_updated_v3(state, None).await {
+                Ok(resp) => trace!(
+                    status = ?resp.payload_status.status,
+                    "engine_forkchoiceUpdatedV3 ok"
+                ),
+                Err(err) => warn!(%err, "engine_forkchoiceUpdatedV3 failed"),
+            }
+        });
+    }
+
+    /// Compute the `ForkChoiceState` the EL should see right now: head/safe/
+    /// finalized resolved from Lean roots to the corresponding execution
+    /// payload `block_hash`es via `el_hash_at`. Shared by the per-slot
+    /// notification (`notify_execution_layer`) and the build-mode
+    /// `request_payload_id_for_next_slot`, so the EL sees the same view
+    /// regardless of which call hits first.
+    fn current_el_forkchoice_state(&self) -> ForkChoiceState {
+        ForkChoiceState {
+            head_block_hash: self.el_hash_at(self.store.head()),
+            safe_block_hash: self.el_hash_at(self.store.safe_target()),
+            finalized_block_hash: self.el_hash_at(self.store.latest_finalized().root),
+        }
+    }
+
+    /// Resolve a Lean block root to its execution payload's `block_hash`.
+    ///
+    /// `H256::ZERO` fallback applies when:
+    ///   * `lean_root` is itself zero (uninitialized head)
+    ///   * the block is missing from storage (defensive — head/safe/
+    ///     finalized are always present, but a torn write or pruning bug
+    ///     shouldn't crash the EL notifier)
+    ///
+    /// At genesis the payload is `ExecutionPayloadV3::default()`, so its
+    /// `block_hash` is `H256::ZERO` and the result naturally rolls back
+    /// to the same sentinel.
+    fn el_hash_at(&self, lean_root: H256) -> H256 {
+        if lean_root.is_zero() {
+            return H256::ZERO;
+        }
+        self.store
+            .get_block(&lean_root)
+            .map(|block| block.body.execution_payload.block_hash)
+            .unwrap_or(H256::ZERO)
+    }
+
+    /// At interval 4 of slot N-1, ask the EL to start building a payload
+    /// for slot N if any of our validators is the slot-N proposer.
+    ///
+    /// Fires a build-mode `engine_forkchoiceUpdatedV3` carrying the same
+    /// real head/safe/finalized triplet `notify_execution_layer` uses,
+    /// plus `PayloadAttributesV3` with the correct slot timestamp. If the
+    /// EL returns a `payload_id`, we stash it for `take_prepared_payload`
+    /// to consume at interval 0 of slot N. When the EL is syncing it
+    /// returns `payload_id = None` and we silently fall back to the
+    /// synthetic payload path.
+    ///
+    /// `parent_beacon_block_root` follows the lean-parent-root convention:
+    /// the proposed block's parent is the current head, so the EL builds the
+    /// payload committing to the same root validators will pass to
+    /// `engine_newPayloadV5` as `block.parent_root`. `prev_randao` stays
+    /// zero until Lean defines a RANDAO mix.
+    async fn request_payload_id_for_next_slot(&mut self, current_slot: u64) {
+        let Some(client) = self.execution_client.as_ref() else {
+            return;
+        };
+        let next_slot = current_slot + 1;
+        if self.get_our_proposer(next_slot).is_none() {
+            return;
+        }
+
+        let head_root = self.store.head();
+        let state = self.current_el_forkchoice_state();
+        let attrs = PayloadAttributesV3 {
+            timestamp: compute_time_at_slot(self.store.config().genesis_time, next_slot),
+            prev_randao: H256::ZERO,
+            suggested_fee_recipient: self.suggested_fee_recipient,
+            withdrawals: vec![],
+            parent_beacon_block_root: head_root,
+        };
+        let client = client.clone();
+        match client.forkchoice_updated_v3(state, Some(attrs)).await {
+            Ok(resp) => {
+                if let Some(id) = resp.payload_id {
+                    self.pending_payload_id = Some((next_slot, head_root, id));
+                    trace!(
+                        slot = next_slot,
+                        status = ?resp.payload_status.status,
+                        "Queued EL payload build for next slot",
+                    );
+                } else {
+                    trace!(
+                        slot = next_slot,
+                        status = ?resp.payload_status.status,
+                        "EL declined to start build (syncing or unknown head)",
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(slot = next_slot, %err, "engine_forkchoiceUpdatedV3 (build mode) failed");
+            }
+        }
+    }
+
+    /// At interval 0 of slot N, consume the `payload_id` stashed by
+    /// `request_payload_id_for_next_slot` and fetch the now-built payload.
+    ///
+    /// Returns `None` (caller falls back to synthetic) on any of:
+    ///   * no EL configured
+    ///   * no stashed id (we weren't expecting to propose this slot, or
+    ///     the build request was rejected at interval 4)
+    ///   * stashed id is for a different slot (we missed a tick)
+    ///   * the head moved since the build was requested — the prepared
+    ///     payload's `parent_hash` and embedded `parent_beacon_block_root`
+    ///     point at the old head, so the block would fail EL validation
+    ///   * the `engine_getPayloadV5` roundtrip failed
+    async fn take_prepared_payload(&mut self, slot: u64) -> Option<ExecutionPayloadV3> {
+        let client = self.execution_client.as_ref()?.clone();
+        let (stashed_slot, build_head_root, payload_id) = self.pending_payload_id.take()?;
+        if stashed_slot != slot {
+            warn!(
+                stashed_slot,
+                slot, "Stashed payload_id doesn't match this slot; discarding"
+            );
+            return None;
+        }
+        let head_root = self.store.head();
+        if build_head_root != head_root {
+            warn!(
+                slot,
+                build_head_root = %ShortRoot(&build_head_root.0),
+                head_root = %ShortRoot(&head_root.0),
+                "Head moved since the EL build was requested; discarding stale payload_id"
+            );
+            return None;
+        }
+        match client.get_payload_v5(payload_id).await {
+            Ok(payload) => {
+                trace!(slot, "Fetched execution payload from EL");
+                Some(payload)
+            }
+            Err(err) => {
+                warn!(slot, %err, "engine_getPayloadV5 failed; falling back to synthetic payload");
+                None
+            }
+        }
+    }
+
+    /// Submit a received block's execution payload to the EL for validation.
+    ///
+    /// Returns `true` when the block should proceed to fork-choice insertion
+    /// (no EL configured, EL says VALID/SYNCING/ACCEPTED, or the EL roundtrip
+    /// itself failed). Returns `false` only on the explicit `INVALID` /
+    /// `INVALID_BLOCK_HASH` verdicts — those mean the EL claims the payload
+    /// is unexecutable on its own chain, so importing the block would be
+    /// pointless.
+    ///
+    /// Network errors and unparseable responses are permissive — same policy
+    /// as `notify_execution_layer`: consensus must keep running regardless
+    /// of EL state. Operators are expected to monitor the warn logs.
+    /// `parent_beacon_block_root` must be the block's `parent_root` (the
+    /// lean-parent-root convention): the proposer's build-mode FCU committed
+    /// the EL payload to its head root, which becomes the proposed block's
+    /// `parent_root` — mismatching values fail the EL's block-hash check.
+    async fn validate_payload_with_el(
+        &self,
+        payload: &ExecutionPayloadV3,
+        parent_beacon_block_root: H256,
+    ) -> bool {
+        let Some(client) = self.execution_client.as_ref() else {
+            return true;
+        };
+        // Amsterdam-era V5: same JSON-RPC shape as V4 (payload, blob hashes,
+        // parent_beacon_block_root, executionRequests); V5 also accepts an
+        // optional `blockAccessList` on the payload (EIP-7928) which Lean
+        // blocks don't produce yet. Lean blocks don't produce system
+        // requests or blob transactions either, so the blob-hash and
+        // execution-request args stay empty. Refine when those land.
+        let result = client
+            .new_payload_v5(payload.clone(), vec![], parent_beacon_block_root, vec![])
+            .await;
+        match result {
+            Ok(status) => match status.status {
+                PayloadStatusKind::Valid
+                | PayloadStatusKind::Syncing
+                | PayloadStatusKind::Accepted => {
+                    trace!(status = ?status.status, "engine_newPayloadV5 ok");
+                    true
+                }
+                PayloadStatusKind::Invalid | PayloadStatusKind::InvalidBlockHash => {
+                    warn!(
+                        status = ?status.status,
+                        error = ?status.validation_error,
+                        "engine_newPayloadV5 rejected payload; dropping block"
+                    );
+                    false
+                }
+            },
+            Err(err) => {
+                warn!(%err, "engine_newPayloadV5 transport failure; accepting block");
+                true
+            }
+        }
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -408,15 +695,25 @@ impl BlockChainServer {
     }
 
     /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    fn propose_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        execution_payload: Option<ExecutionPayloadV3>,
+    ) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
         let Ok((block, attestation_signatures, _post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+            store::produce_block_with_signatures(
+                &mut self.store,
+                slot,
+                validator_id,
+                execution_payload,
+            )
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
             metrics::inc_block_building_failures();
             return;
@@ -458,6 +755,36 @@ impl BlockChainServer {
         };
 
         metrics::inc_block_building_success();
+
+        // Inform the EL of our own freshly-built block (M6 phase 5 follow-up).
+        //
+        // `engine_getPayloadV5` produced the embedded payload as a *candidate*;
+        // the EL doesn't promote it to a real imported block until something
+        // calls `engine_newPayloadV5`. For received blocks that's the import
+        // pre-check in `Handler<NewBlock>`, but for our own builds nobody
+        // gossips it back to us — without this call the EL stays at genesis
+        // and rejects every subsequent FCU `head_block_hash`.
+        //
+        // Fire-and-forget; the EL roundtrip is ~ms but the next FCU is 4s
+        // away. If the EL says INVALID we log it but don't reverse — process_block
+        // already accepted into the store and the block is on its way to gossip.
+        if let Some(client) = self.execution_client.as_ref() {
+            let payload = signed_block.message.body.execution_payload.clone();
+            let parent_beacon_block_root = signed_block.message.parent_root;
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client
+                    .new_payload_v5(payload, vec![], parent_beacon_block_root, vec![])
+                    .await
+                {
+                    Ok(status) => trace!(
+                        status = ?status.status,
+                        "engine_newPayloadV5 on own-built block"
+                    ),
+                    Err(err) => warn!(%err, "engine_newPayloadV5 on own-built block failed"),
+                }
+            });
+        }
 
         // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
@@ -782,6 +1109,19 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        // EL pre-check (Phase 3 of M6). When `--execution-endpoint` is
+        // unset this is a no-op. INVALID verdict drops the block before it
+        // touches the store; pending children referencing it as parent are
+        // not enqueued because we never call `on_block`. They will be
+        // pruned by the standard slot-bound timeout.
+        let payload = &msg.block.message.body.execution_payload;
+        let parent_beacon_block_root = msg.block.message.parent_root;
+        if !self
+            .validate_payload_with_el(payload, parent_beacon_block_root)
+            .await
+        {
+            return;
+        }
         self.on_block(msg.block);
     }
 }
@@ -858,5 +1198,270 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         {
             session.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_engine_tests {
+    use super::*;
+    use crate::key_manager::KeyManager;
+    use ethlambda_ethrex_client::{EngineClientError, ForkChoiceUpdatedResponse, PayloadStatus};
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::attestation::blank_xmss_signature;
+    use ethlambda_types::block::{AttestationSignatures, Block, BlockBody};
+    use ethlambda_types::state::State;
+
+    /// Outcome the mock EL returns from `new_payload_v5`, covering both the
+    /// EL's typed verdicts and a non-fatal roundtrip failure.
+    enum NewPayloadOutcome {
+        Status(PayloadStatusKind),
+        Error,
+    }
+
+    /// Mock execution engine. `forkchoice_updated_v3` and `get_payload_v5`
+    /// return innocuous defaults; only `new_payload_v5` is configurable since
+    /// that is the call whose verdict gates block import. The
+    /// `parent_beacon_block_root` passed to `new_payload_v5` is recorded so
+    /// tests can assert the lean-parent-root convention.
+    struct MockEngine {
+        new_payload: NewPayloadOutcome,
+        seen_beacon_root: std::sync::Mutex<Option<H256>>,
+    }
+
+    fn ok_status(status: PayloadStatusKind) -> PayloadStatus {
+        PayloadStatus {
+            status,
+            latest_valid_hash: None,
+            validation_error: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionEngine for MockEngine {
+        async fn forkchoice_updated_v3(
+            &self,
+            _state: ForkChoiceState,
+            _payload_attributes: Option<PayloadAttributesV3>,
+        ) -> Result<ForkChoiceUpdatedResponse, EngineClientError> {
+            Ok(ForkChoiceUpdatedResponse {
+                payload_status: ok_status(PayloadStatusKind::Valid),
+                payload_id: None,
+            })
+        }
+
+        async fn get_payload_v5(
+            &self,
+            _payload_id: PayloadId,
+        ) -> Result<ExecutionPayloadV3, EngineClientError> {
+            Ok(ExecutionPayloadV3::default())
+        }
+
+        async fn new_payload_v5(
+            &self,
+            _payload: ExecutionPayloadV3,
+            _expected_blob_versioned_hashes: Vec<H256>,
+            parent_beacon_block_root: H256,
+            _execution_requests: Vec<Vec<u8>>,
+        ) -> Result<PayloadStatus, EngineClientError> {
+            *self.seen_beacon_root.lock().unwrap() = Some(parent_beacon_block_root);
+            match &self.new_payload {
+                NewPayloadOutcome::Status(kind) => Ok(ok_status(*kind)),
+                NewPayloadOutcome::Error => Err(EngineClientError::EmptyResponse),
+            }
+        }
+    }
+
+    fn mock(outcome: NewPayloadOutcome) -> Arc<MockEngine> {
+        Arc::new(MockEngine {
+            new_payload: outcome,
+            seen_beacon_root: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn test_store() -> Store {
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        Store::from_anchor_state(backend, genesis_state)
+    }
+
+    fn test_server(store: Store, engine: Option<Arc<dyn ExecutionEngine>>) -> BlockChainServer {
+        BlockChainServer {
+            store,
+            p2p: None,
+            key_manager: KeyManager::new(HashMap::new()),
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            aggregator: AggregatorController::new(false),
+            current_aggregation: None,
+            last_tick_instant: None,
+            attestation_committee_count: 1,
+            pre_merge_coverage: None,
+            execution_client: engine,
+            suggested_fee_recipient: [0u8; 20],
+            pending_payload_id: None,
+        }
+    }
+
+    /// Insert a block whose execution payload carries `block_hash`, so
+    /// `el_hash_at` has a real (non-zero) value to resolve.
+    fn insert_block_with_payload_hash(
+        store: &mut Store,
+        root: H256,
+        slot: u64,
+        parent_root: H256,
+        block_hash: H256,
+    ) {
+        let signed_block = SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: Default::default(),
+                    execution_payload: ExecutionPayloadV3 {
+                        block_hash,
+                        ..Default::default()
+                    },
+                },
+            },
+            signature: BlockSignatures {
+                attestation_signatures: AttestationSignatures::try_from(vec![]).unwrap(),
+                proposer_signature: blank_xmss_signature(),
+            },
+        };
+        store.insert_signed_block(root, signed_block);
+    }
+
+    #[tokio::test]
+    async fn validate_payload_rejects_invalid_verdict() {
+        for verdict in [
+            PayloadStatusKind::Invalid,
+            PayloadStatusKind::InvalidBlockHash,
+        ] {
+            let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Status(verdict))));
+            let accepted = server
+                .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
+                .await;
+            assert!(!accepted, "EL verdict {verdict:?} must drop the block");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_payload_accepts_non_invalid_verdicts() {
+        for verdict in [
+            PayloadStatusKind::Valid,
+            PayloadStatusKind::Syncing,
+            PayloadStatusKind::Accepted,
+        ] {
+            let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Status(verdict))));
+            let accepted = server
+                .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
+                .await;
+            assert!(
+                accepted,
+                "EL verdict {verdict:?} must let the block proceed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_payload_is_permissive_on_el_roundtrip_failure() {
+        // A failed EL roundtrip must not block consensus: import proceeds.
+        let server = test_server(test_store(), Some(mock(NewPayloadOutcome::Error)));
+        let accepted = server
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
+            .await;
+        assert!(accepted, "EL roundtrip failure must be permissive");
+    }
+
+    #[tokio::test]
+    async fn validate_payload_accepts_when_no_el_configured() {
+        let server = test_server(test_store(), None);
+        let accepted = server
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), H256::ZERO)
+            .await;
+        assert!(accepted, "no EL configured must always accept");
+    }
+
+    #[tokio::test]
+    async fn validate_payload_passes_parent_root_as_beacon_root() {
+        // The lean-parent-root convention: whatever the caller resolves as the
+        // block's parent_root must reach the EL verbatim as
+        // parent_beacon_block_root.
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let server = test_server(test_store(), Some(engine.clone()));
+
+        let parent_root = H256([0x42; 32]);
+        let accepted = server
+            .validate_payload_with_el(&ExecutionPayloadV3::default(), parent_root)
+            .await;
+
+        assert!(accepted);
+        assert_eq!(*engine.seen_beacon_root.lock().unwrap(), Some(parent_root));
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_discards_on_head_change() {
+        // Stash a payload_id built on a head that no longer matches the
+        // store's: the id must be discarded (caller falls back to synthetic).
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let mut server = test_server(store, Some(engine));
+
+        let stale_root = H256([0x77; 32]);
+        assert_ne!(stale_root, server.store.head());
+        server.pending_payload_id = Some((5, stale_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(5).await.is_none());
+        assert!(
+            server.pending_payload_id.is_none(),
+            "stash must be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_fetches_when_head_unchanged() {
+        // Happy path: slot and build-head both match → the EL payload is
+        // fetched and returned.
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let head_root = store.head();
+        let mut server = test_server(store, Some(engine));
+        server.pending_payload_id = Some((5, head_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(5).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn take_prepared_payload_discards_on_slot_mismatch() {
+        let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Valid));
+        let store = test_store();
+        let head_root = store.head();
+        let mut server = test_server(store, Some(engine));
+        server.pending_payload_id = Some((5, head_root, PayloadId([7u8; 8])));
+
+        assert!(server.take_prepared_payload(6).await.is_none());
+        assert!(
+            server.pending_payload_id.is_none(),
+            "stash must be consumed"
+        );
+    }
+
+    #[test]
+    fn el_hash_at_resolves_real_payload_hash_after_block_import() {
+        let mut store = test_store();
+        let genesis_root = store.head();
+        let block_root = H256([1u8; 32]);
+        let payload_hash = H256([0xAB; 32]);
+        insert_block_with_payload_hash(&mut store, block_root, 1, genesis_root, payload_hash);
+
+        let server = test_server(store, None);
+
+        // After import the EL hash is the block's real payload block_hash...
+        assert_eq!(server.el_hash_at(block_root), payload_hash);
+        // ...while the zero root and unknown roots fall back to ZERO.
+        assert_eq!(server.el_hash_at(H256::ZERO), H256::ZERO);
+        assert_eq!(server.el_hash_at(H256([0x99; 32])), H256::ZERO);
     }
 }
