@@ -192,7 +192,7 @@ impl Block {
 /// The body of a block, containing payload data.
 ///
 /// Carries the consensus payload (attestations) plus the execution payload
-/// the proposer fetched from the EL via `engine_getPayloadV5`. The execution
+/// the proposer fetched from the EL via `engine_getPayload`. The execution
 /// payload is what the next block's `process_execution_payload` will validate
 /// `parent_hash` against (it points at this block's `execution_payload.block_hash`).
 #[derive(Debug, Default, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
@@ -207,8 +207,8 @@ pub struct BlockBody {
     /// Cancun-era execution payload (EIP-4844 + withdrawals).
     ///
     /// At genesis the payload is all-zero. From the first non-genesis block
-    /// onwards, the proposer obtains it from the EL via `engine_getPayloadV5`
-    /// and the importer revalidates with `engine_newPayloadV5`. Defaults to
+    /// onwards, the proposer obtains it from the EL via `engine_getPayload`
+    /// and the importer revalidates with `engine_newPayload`. Defaults to
     /// `ExecutionPayloadV3::default()` for nodes running without an EL endpoint.
     pub execution_payload: ExecutionPayloadV3,
 }

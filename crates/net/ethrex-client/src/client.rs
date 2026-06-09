@@ -127,7 +127,7 @@ impl EngineClient {
     /// `engine_newPayloadV3` — submit a Cancun-era payload to the EL.
     pub async fn new_payload_v3(
         &self,
-        payload: ExecutionPayloadV3,
+        payload: &ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
     ) -> Result<PayloadStatus, EngineClientError> {
@@ -151,7 +151,7 @@ impl EngineClient {
     /// Prague` and V4 is required.
     pub async fn new_payload_v4(
         &self,
-        payload: ExecutionPayloadV3,
+        payload: &ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
         execution_requests: Vec<Vec<u8>>,
@@ -180,7 +180,7 @@ impl EngineClient {
     /// fork: Osaka/Amsterdam` and V5 is required.
     pub async fn new_payload_v5(
         &self,
-        payload: ExecutionPayloadV3,
+        payload: &ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
         execution_requests: Vec<Vec<u8>>,
@@ -198,7 +198,7 @@ impl EngineClient {
     async fn new_payload_with_requests(
         &self,
         method: &str,
-        payload: ExecutionPayloadV3,
+        payload: &ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
         execution_requests: Vec<Vec<u8>>,
@@ -273,11 +273,13 @@ impl EngineClient {
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
         let params = json!([payload_id.to_hex()]);
-        let envelope: Value = self.rpc_call(method, params).await?;
+        let mut envelope: Value = self.rpc_call(method, params).await?;
+        // `take` rather than `clone`: the payload subtree can be large
+        // (transaction byte strings) and the rest of the envelope is dropped.
         let payload_value = envelope
-            .get("executionPayload")
-            .ok_or(EngineClientError::EmptyResponse)?
-            .clone();
+            .get_mut("executionPayload")
+            .map(Value::take)
+            .ok_or(EngineClientError::EmptyResponse)?;
         serde_json::from_value(payload_value).map_err(EngineClientError::DeserializeResponse)
     }
 
@@ -304,9 +306,14 @@ impl EngineClient {
 /// `Arc<dyn ExecutionEngine>` and be exercised against a mock EL — without
 /// it, the only way to test the import/propose hooks is a live TCP server.
 ///
-/// Only the three methods the actor calls live here. The version-selection
-/// surface (V3/V4 variants, capability handshake, client-version diagnostics)
-/// stays inherent on `EngineClient` because nothing dynamic dispatches it.
+/// Only the three methods the actor calls live here, and the payload pair is
+/// deliberately version-agnostic: the actor asks for "the payload" / submits
+/// "the payload", and this trait's implementation owns the Engine-method
+/// version choice (today: pinned to V4/Prague, the pre-Amsterdam no-BAL path).
+/// Upgrading versions or adding timestamp-based fork selection is then a
+/// change to the `EngineClient` impl alone — call sites and mocks don't move.
+/// The full versioned surface (V3/V4/V5 variants, capability handshake,
+/// client-version diagnostics) stays inherent on `EngineClient`.
 #[async_trait::async_trait]
 pub trait ExecutionEngine: Send + Sync {
     async fn forkchoice_updated_v3(
@@ -315,17 +322,21 @@ pub trait ExecutionEngine: Send + Sync {
         payload_attributes: Option<PayloadAttributesV3>,
     ) -> Result<ForkChoiceUpdatedResponse, EngineClientError>;
 
-    async fn get_payload_v4(
+    /// Fetch the payload the EL built under `payload_id`.
+    async fn get_payload(
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError>;
 
-    async fn new_payload_v4(
+    /// Submit a Lean block's payload for validation/import.
+    ///
+    /// Lean blocks carry no blob transactions and no EIP-7685 system
+    /// requests, so the implementation supplies those wire parameters as
+    /// empty — that policy lives here, in one place.
+    async fn new_payload(
         &self,
-        payload: ExecutionPayloadV3,
-        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        payload: &ExecutionPayloadV3,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
-        execution_requests: Vec<Vec<u8>>,
     ) -> Result<PayloadStatus, EngineClientError>;
 }
 
@@ -339,28 +350,20 @@ impl ExecutionEngine for EngineClient {
         EngineClient::forkchoice_updated_v3(self, state, payload_attributes).await
     }
 
-    async fn get_payload_v4(
+    async fn get_payload(
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
-        EngineClient::get_payload_v4(self, payload_id).await
+        self.get_payload_v4(payload_id).await
     }
 
-    async fn new_payload_v4(
+    async fn new_payload(
         &self,
-        payload: ExecutionPayloadV3,
-        expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
+        payload: &ExecutionPayloadV3,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
-        execution_requests: Vec<Vec<u8>>,
     ) -> Result<PayloadStatus, EngineClientError> {
-        EngineClient::new_payload_v4(
-            self,
-            payload,
-            expected_blob_versioned_hashes,
-            parent_beacon_block_root,
-            execution_requests,
-        )
-        .await
+        self.new_payload_v4(payload, vec![], parent_beacon_block_root, vec![])
+            .await
     }
 }
 

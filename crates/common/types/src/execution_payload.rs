@@ -213,12 +213,6 @@ impl Default for ExecutionPayloadHeader {
     }
 }
 
-impl From<&ExecutionPayloadV3> for ExecutionPayloadHeader {
-    fn from(p: &ExecutionPayloadV3) -> Self {
-        p.to_header()
-    }
-}
-
 // ---------- Hex serde helpers ----------
 //
 // `pub` so engine-API wire types living in `ethlambda-ethrex-client`
@@ -356,7 +350,7 @@ pub mod byte_list_hex {
 
 /// JSON serde for the bounded transaction list. Each transaction is encoded
 /// as a `0x`-prefixed hex `DATA` string (opaque, RLP at the EL layer).
-pub mod transactions_serde {
+mod transactions_serde {
     use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
 
     use super::{ByteList, MAX_BYTES_PER_TRANSACTION, Transactions};
@@ -386,7 +380,7 @@ pub mod transactions_serde {
 
 /// JSON serde for the bounded withdrawal list. Withdrawal's own Serialize/
 /// Deserialize derives handle each element.
-pub mod withdrawals_serde {
+mod withdrawals_serde {
     use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
 
     use super::{Withdrawal, Withdrawals};
@@ -637,9 +631,5 @@ mod tests {
         assert_eq!(header.block_number, payload.block_number);
         assert_eq!(header.parent_hash, payload.parent_hash);
         assert_eq!(header.fee_recipient, payload.fee_recipient);
-
-        // `From<&ExecutionPayloadV3>` and `to_header()` are equivalent.
-        let header_via_from: ExecutionPayloadHeader = (&payload).into();
-        assert_eq!(header_via_from.hash_tree_root(), header.hash_tree_root());
     }
 }

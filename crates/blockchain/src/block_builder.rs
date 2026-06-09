@@ -50,7 +50,7 @@ pub struct PostBlockCheckpoints {
 /// Sets `parent_hash` to the last cached header's `block_hash` (so the chain
 /// still links forward) and `timestamp` to `compute_time_at_slot` (so the
 /// slot-time check passes). Every other field stays zero. The real
-/// `engine_getPayloadV5` response replaces this when an EL endpoint is wired in.
+/// `engine_getPayload` response replaces this when an EL endpoint is wired in.
 fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
     ExecutionPayloadV3 {
         parent_hash: head_state.latest_execution_payload_header.block_hash,
@@ -66,7 +66,7 @@ fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
 /// The proposer signature is NOT included; it is appended by the caller.
 ///
 /// `execution_payload` carries the payload the proposer fetched from the EL
-/// (`engine_getPayloadV5`). When `None` (no EL configured, or the roundtrip
+/// (`engine_getPayload`). When `None` (no EL configured, or the roundtrip
 /// failed) it falls back to `synthetic_payload` so non-EL nodes still produce
 /// STF-valid blocks.
 pub(crate) fn build_block(
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     /// Phase 7 (M6): when the proposer supplies an `execution_payload`
-    /// from `engine_getPayloadV5`, `build_block` embeds it verbatim
+    /// from `engine_getPayload`, `build_block` embeds it verbatim
     /// instead of synthesizing one. Empty attestation pool keeps the
     /// scaffolding minimal — this test only exercises the payload
     /// threading, not the attestation-packing loop.
@@ -1409,7 +1409,7 @@ mod tests {
         let slot = HEAD_SLOT + 1;
         let proposer_index = slot % NUM_VALIDATORS as u64;
 
-        // Caller-supplied payload from a hypothetical `engine_getPayloadV5`
+        // Caller-supplied payload from a hypothetical `engine_getPayload`
         // response. Honest values for `parent_hash` (matches the cached
         // genesis header) and `timestamp` (matches `compute_time_at_slot`)
         // so STF's `process_execution_payload` accepts it at the end of

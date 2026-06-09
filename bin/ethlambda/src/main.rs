@@ -38,8 +38,6 @@ use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs}
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
-    block::{Block, BlockBody},
-    execution_payload::ExecutionPayloadV3,
     genesis::GenesisConfig,
     signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
@@ -754,27 +752,24 @@ async fn build_execution_client(
     Some(Arc::new(client))
 }
 
-/// Parse a 32-byte hex H256 from a `0x`-prefixed or bare hex string.
-fn parse_h256_hex(s: &str) -> Result<H256, String> {
-    let stripped = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
-    if bytes.len() != 32 {
-        return Err(format!(
-            "{s:?} decoded to {} bytes, expected 32",
-            bytes.len()
-        ));
-    }
-    Ok(H256::from_slice(&bytes))
-}
-
-/// Parse a 20-byte hex address from a `0x`-prefixed or bare hex string.
-fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
+/// Parse an `N`-byte array from a `0x`-prefixed or bare hex string.
+fn parse_fixed_hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(stripped).map_err(|e| format!("{s:?} is not valid hex: {e}"))?;
     let len = bytes.len();
     bytes
         .try_into()
-        .map_err(|_| format!("{s:?} decoded to {len} bytes, expected 20"))
+        .map_err(|_| format!("{s:?} decoded to {len} bytes, expected {N}"))
+}
+
+/// Parse a 32-byte hex H256 from a `0x`-prefixed or bare hex string.
+fn parse_h256_hex(s: &str) -> Result<H256, String> {
+    parse_fixed_hex::<32>(s).map(H256)
+}
+
+/// Parse a 20-byte hex address from a `0x`-prefixed or bare hex string.
+fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
+    parse_fixed_hex(s)
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
@@ -819,49 +814,14 @@ async fn fetch_initial_state(
 
     if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
-        let mut genesis_state = State::from_genesis(genesis.genesis_time, validators);
-
-        // M6: when paired with an EL, seed both the cached header in state AND
-        // the genesis block's actual `execution_payload.block_hash` with the
-        // EL's genesis hash. The cached header drives STF's
-        // `process_execution_payload` parent_hash check; the body's block_hash
-        // is what `el_hash_at` reads back into `engine_forkchoiceUpdatedV3`'s
-        // `head_block_hash`. Without seeding *both*, either the first non-
-        // genesis block fails STF or every FCU stays at ZERO and the EL never
-        // accepts the build attempt.
+        // M6: when paired with an EL, the genesis anchor pair must be seeded
+        // with the EL's genesis block hash. `from_genesis_with_el_hash` owns
+        // that protocol (see its doc comment).
         return Ok(match execution_genesis_block_hash {
             Some(el_hash) => {
                 info!(%el_hash, "Seeding genesis with EL block hash");
-                genesis_state.latest_execution_payload_header.block_hash = el_hash;
-
-                // Build the body, then update the state's latest header so
-                // its body_root reflects the seeded body (rather than the
-                // empty default it had after State::from_genesis).
-                let body = BlockBody {
-                    attestations: Default::default(),
-                    execution_payload: ExecutionPayloadV3 {
-                        block_hash: el_hash,
-                        ..Default::default()
-                    },
-                };
-                genesis_state.latest_block_header.body_root = body.hash_tree_root();
-
-                // Compute state_root with the header's state_root zeroed,
-                // then write it back. `anchor_pair_is_consistent` requires
-                // `block.state_root == state.hash_tree_root(state_root=0)`
-                // exactly — not just "block.state_root is zero".
-                genesis_state.latest_block_header.state_root = H256::ZERO;
-                let anchor_state_root = genesis_state.hash_tree_root();
-                genesis_state.latest_block_header.state_root = anchor_state_root;
-
-                let genesis_block = Block {
-                    slot: genesis_state.latest_block_header.slot,
-                    proposer_index: genesis_state.latest_block_header.proposer_index,
-                    parent_root: genesis_state.latest_block_header.parent_root,
-                    state_root: anchor_state_root,
-                    body,
-                };
-
+                let (genesis_state, genesis_block) =
+                    State::from_genesis_with_el_hash(genesis.genesis_time, validators, el_hash);
                 Store::get_forkchoice_store(backend, genesis_state, genesis_block).map_err(
                     |err| {
                         error!(%err, "Failed to initialize store with seeded genesis body");
@@ -869,7 +829,10 @@ async fn fetch_initial_state(
                     },
                 )?
             }
-            None => Store::from_anchor_state(backend, genesis_state),
+            None => Store::from_anchor_state(
+                backend,
+                State::from_genesis(genesis.genesis_time, validators),
+            ),
         });
     };
 

@@ -138,7 +138,7 @@ pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
 ///
 /// Mirrors the Capella spec's `process_execution_payload` minus the
 /// `verify_and_notify_new_payload` EL roundtrip — that lands in the
-/// blockchain actor in Phase 3 (`engine_newPayloadV5` on import). The
+/// blockchain actor in Phase 3 (`engine_newPayload` on import). The
 /// `prev_randao` check is also omitted: Lean state has no randao mix yet,
 /// and leanSpec hasn't defined one. The two remaining assertions are
 /// purely state-internal and run cheaply:
