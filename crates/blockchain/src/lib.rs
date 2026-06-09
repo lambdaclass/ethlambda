@@ -180,12 +180,16 @@ pub struct BlockChainServer {
     /// Optional Engine API client to the execution layer (e.g. ethrex).
     ///
     /// Present only when ethlambda was started with `--execution-endpoint`
-    /// and `--execution-jwt-secret`. When set, the actor fires
-    /// `engine_forkchoiceUpdatedV3` at the start of each slot to keep the EL
-    /// informed of our head/justified/finalized. The schema is currently
-    /// scaffolding only — Lean blocks do not yet carry execution payloads,
-    /// so the EL responds `SYNCING` against zeros until a real payload
-    /// pipeline is wired (see docs/plans/engine-api-integration.md).
+    /// and `--execution-jwt-secret`. When set, the actor drives the full
+    /// payload pipeline against the EL: a per-slot `engine_forkchoiceUpdatedV3`
+    /// keeps the EL informed of our head/justified/finalized; at interval 4 a
+    /// build-mode FCU (with `PayloadAttributes`) requests the next slot's
+    /// payload; at interval 0 the proposer consumes it via `getPayloadV5`,
+    /// embeds the `ExecutionPayloadV3` in the block body, and fires
+    /// `newPayloadV5` so the EL imports it; received blocks are revalidated
+    /// with `newPayloadV5` before the STF runs. FCU block hashes are the real
+    /// `execution_payload.block_hash` values carried by Lean blocks
+    /// (see docs/plans/engine-api-integration.md).
     execution_client: Option<EngineClient>,
 
     /// `(target_slot, payload_id)` returned by the EL after a build-mode
