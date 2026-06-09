@@ -24,9 +24,12 @@ pub const SECONDS_PER_SLOT: u64 = 4;
 /// Compute the Unix-seconds timestamp the canonical chain assigns to `slot`.
 ///
 /// Genesis is `slot = 0`, timestamp `genesis_time`. Each subsequent slot adds
-/// `SECONDS_PER_SLOT`. Mirrors the Capella spec's `compute_time_at_slot`.
-pub fn compute_time_at_slot(state: &State, slot: u64) -> u64 {
-    state.config.genesis_time + slot * SECONDS_PER_SLOT
+/// `SECONDS_PER_SLOT`. Mirrors the Capella spec's `compute_time_at_slot`,
+/// taking `genesis_time` directly so callers without a full `State` (e.g. the
+/// blockchain actor preparing `PayloadAttributes`) can share the same
+/// formula as the STF.
+pub fn compute_time_at_slot(genesis_time: u64, slot: u64) -> u64 {
+    genesis_time + slot * SECONDS_PER_SLOT
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,7 +138,7 @@ pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
 ///
 /// Mirrors the Capella spec's `process_execution_payload` minus the
 /// `verify_and_notify_new_payload` EL roundtrip — that lands in the
-/// blockchain actor in Phase 3 (`engine_newPayloadV3` on import). The
+/// blockchain actor in Phase 3 (`engine_newPayloadV5` on import). The
 /// `prev_randao` check is also omitted: Lean state has no randao mix yet,
 /// and leanSpec hasn't defined one. The two remaining assertions are
 /// purely state-internal and run cheaply:
@@ -157,7 +160,7 @@ fn process_execution_payload(state: &mut State, block: &Block) -> Result<(), Err
         });
     }
 
-    let expected_timestamp = compute_time_at_slot(state, state.slot);
+    let expected_timestamp = compute_time_at_slot(state.config.genesis_time, state.slot);
     if payload.timestamp != expected_timestamp {
         return Err(Error::InvalidPayloadTimestamp {
             expected: expected_timestamp,

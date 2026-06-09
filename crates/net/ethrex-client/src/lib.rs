@@ -38,11 +38,15 @@ pub use types::{
 ///
 /// We list everything we *might* call; the EL's response is the source of
 /// truth for what we can actually invoke. V3/V4/V5 newPayload+getPayload
-/// are all advertised; the actor picks the version by payload timestamp
-/// against the EL's fork schedule (`Cancun → V3`, `Prague → V4`,
-/// `Amsterdam → V5`).
+/// are all advertised so the EL accepts handshakes across the Cancun→
+/// Amsterdam range. Today the actor pins `forkchoiceUpdatedV3` and the V5
+/// flavours of new/get payload (matching ethrex main); selecting the
+/// version per payload timestamp against the EL's fork schedule is a
+/// future refinement once the V4/V5 FCU wrappers land.
+///
+/// Per the execution-apis spec, `engine_exchangeCapabilities` itself must
+/// NOT appear in the advertised set.
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
-    "engine_exchangeCapabilities",
     "engine_forkchoiceUpdatedV3",
     "engine_newPayloadV3",
     "engine_newPayloadV4",

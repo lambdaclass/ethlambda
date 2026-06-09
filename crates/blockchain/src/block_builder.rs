@@ -51,7 +51,7 @@ pub struct PostBlockCheckpoints {
 fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
     ExecutionPayloadV3 {
         parent_hash: head_state.latest_execution_payload_header.block_hash,
-        timestamp: compute_time_at_slot(head_state, slot),
+        timestamp: compute_time_at_slot(head_state.config.genesis_time, slot),
         ..Default::default()
     }
 }

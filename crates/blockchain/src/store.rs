@@ -676,7 +676,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
 /// with `block.body.attestations`.
 ///
 /// `execution_payload` carries the payload the proposer fetched from the EL
-/// via `engine_getPayloadV3`. When `None` (no EL configured, or the EL
+/// via `engine_getPayloadV5`. When `None` (no EL configured, or the EL
 /// roundtrip failed), `build_block` falls back to `synthetic_payload` so
 /// non-EL-paired nodes can still produce parseable blocks.
 pub fn produce_block_with_signatures(

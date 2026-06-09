@@ -5,7 +5,7 @@ use ethlambda_ethrex_client::{
     EngineClient, ForkChoiceState, PayloadAttributesV3, PayloadId, PayloadStatusKind,
 };
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
-use ethlambda_state_transition::{SECONDS_PER_SLOT, is_proposer};
+use ethlambda_state_transition::{compute_time_at_slot, is_proposer};
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -278,7 +278,7 @@ impl BlockChainServer {
     /// At genesis every triplet entry is `H256::ZERO` because the genesis
     /// `BlockBody::default()` carries an `ExecutionPayloadV3::default()`
     /// whose `block_hash` is zero. Subsequent slots advance once a real
-    /// payload (from `engine_getPayloadV3`) has been imported.
+    /// payload (from `engine_getPayloadV5`) has been imported.
     fn notify_execution_layer(&self) {
         let Some(client) = self.execution_client.as_ref() else {
             return;
@@ -355,7 +355,7 @@ impl BlockChainServer {
 
         let state = self.current_el_forkchoice_state();
         let attrs = PayloadAttributesV3 {
-            timestamp: self.store.config().genesis_time + next_slot * SECONDS_PER_SLOT,
+            timestamp: compute_time_at_slot(self.store.config().genesis_time, next_slot),
             prev_randao: H256::ZERO,
             suggested_fee_recipient: [0u8; 20],
             withdrawals: vec![],
@@ -393,7 +393,7 @@ impl BlockChainServer {
     ///   * no stashed id (we weren't expecting to propose this slot, or
     ///     the build request was rejected at interval 4)
     ///   * stashed id is for a different slot (we missed a tick)
-    ///   * the `engine_getPayloadV3` roundtrip failed
+    ///   * the `engine_getPayloadV5` roundtrip failed
     async fn take_prepared_payload(&mut self, slot: u64) -> Option<ExecutionPayloadV3> {
         let client = self.execution_client.as_ref()?.clone();
         let (stashed_slot, payload_id) = self.pending_payload_id.take()?;
