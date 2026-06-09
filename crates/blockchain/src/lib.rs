@@ -187,10 +187,10 @@ pub struct BlockChainServer {
     /// payload pipeline against the EL: a per-slot `engine_forkchoiceUpdatedV3`
     /// keeps the EL informed of our head/justified/finalized; at interval 4 a
     /// build-mode FCU (with `PayloadAttributes`) requests the next slot's
-    /// payload; at interval 0 the proposer consumes it via `getPayloadV5`,
+    /// payload; at interval 0 the proposer consumes it via `getPayloadV4`,
     /// embeds the `ExecutionPayloadV3` in the block body, and fires
-    /// `newPayloadV5` so the EL imports it; received blocks are revalidated
-    /// with `newPayloadV5` before the STF runs. FCU block hashes are the real
+    /// `newPayloadV4` so the EL imports it; received blocks are revalidated
+    /// with `newPayloadV4` before the STF runs. FCU block hashes are the real
     /// `execution_payload.block_hash` values carried by Lean blocks
     /// (see docs/plans/engine-api-integration.md).
     ///
@@ -353,7 +353,7 @@ impl BlockChainServer {
         // critical path. The hashes carried are `block_hash` fields read
         // off the head/safe/finalized Lean blocks' `execution_payload`s
         // (Phase 5 of M6), so the EL can chain forward off blocks it has
-        // actually seen via `engine_newPayloadV5`.
+        // actually seen via `engine_newPayloadV4`.
         if interval == 0 && self.execution_client.is_some() {
             self.notify_execution_layer();
         }
@@ -368,7 +368,7 @@ impl BlockChainServer {
     /// At genesis every triplet entry is `H256::ZERO` because the genesis
     /// `BlockBody::default()` carries an `ExecutionPayloadV3::default()`
     /// whose `block_hash` is zero. Subsequent slots advance once a real
-    /// payload (from `engine_getPayloadV5`) has been imported.
+    /// payload (from `engine_getPayloadV4`) has been imported.
     fn notify_execution_layer(&self) {
         let Some(client) = self.execution_client.as_ref() else {
             return;
@@ -435,7 +435,7 @@ impl BlockChainServer {
     /// `parent_beacon_block_root` follows the lean-parent-root convention:
     /// the proposed block's parent is the current head, so the EL builds the
     /// payload committing to the same root validators will pass to
-    /// `engine_newPayloadV5` as `block.parent_root`. `prev_randao` stays
+    /// `engine_newPayloadV4` as `block.parent_root`. `prev_randao` stays
     /// zero until Lean defines a RANDAO mix.
     async fn request_payload_id_for_next_slot(&mut self, current_slot: u64) {
         let Some(client) = self.execution_client.as_ref() else {
@@ -490,7 +490,7 @@ impl BlockChainServer {
     ///   * the head moved since the build was requested — the prepared
     ///     payload's `parent_hash` and embedded `parent_beacon_block_root`
     ///     point at the old head, so the block would fail EL validation
-    ///   * the `engine_getPayloadV5` roundtrip failed
+    ///   * the `engine_getPayloadV4` roundtrip failed
     async fn take_prepared_payload(&mut self, slot: u64) -> Option<ExecutionPayloadV3> {
         let client = self.execution_client.as_ref()?.clone();
         let (stashed_slot, build_head_root, payload_id) = self.pending_payload_id.take()?;
@@ -511,13 +511,13 @@ impl BlockChainServer {
             );
             return None;
         }
-        match client.get_payload_v5(payload_id).await {
+        match client.get_payload_v4(payload_id).await {
             Ok(payload) => {
                 trace!(slot, "Fetched execution payload from EL");
                 Some(payload)
             }
             Err(err) => {
-                warn!(slot, %err, "engine_getPayloadV5 failed; falling back to synthetic payload");
+                warn!(slot, %err, "engine_getPayloadV4 failed; falling back to synthetic payload");
                 None
             }
         }
@@ -547,34 +547,33 @@ impl BlockChainServer {
         let Some(client) = self.execution_client.as_ref() else {
             return true;
         };
-        // Amsterdam-era V5: same JSON-RPC shape as V4 (payload, blob hashes,
-        // parent_beacon_block_root, executionRequests); V5 also accepts an
-        // optional `blockAccessList` on the payload (EIP-7928) which Lean
-        // blocks don't produce yet. Lean blocks don't produce system
-        // requests or blob transactions either, so the blob-hash and
-        // execution-request args stay empty. Refine when those land.
+        // Prague-era V4 (4 params: payload, blob hashes,
+        // parent_beacon_block_root, executionRequests). Pairing targets a
+        // pre-Amsterdam EL, so no EIP-7928 block-access-list is involved; V5
+        // would require it. Lean blocks carry no system requests or blob
+        // transactions, so the blob-hash and execution-request args stay empty.
         let result = client
-            .new_payload_v5(payload.clone(), vec![], parent_beacon_block_root, vec![])
+            .new_payload_v4(payload.clone(), vec![], parent_beacon_block_root, vec![])
             .await;
         match result {
             Ok(status) => match status.status {
                 PayloadStatusKind::Valid
                 | PayloadStatusKind::Syncing
                 | PayloadStatusKind::Accepted => {
-                    trace!(status = ?status.status, "engine_newPayloadV5 ok");
+                    trace!(status = ?status.status, "engine_newPayloadV4 ok");
                     true
                 }
                 PayloadStatusKind::Invalid | PayloadStatusKind::InvalidBlockHash => {
                     warn!(
                         status = ?status.status,
                         error = ?status.validation_error,
-                        "engine_newPayloadV5 rejected payload; dropping block"
+                        "engine_newPayloadV4 rejected payload; dropping block"
                     );
                     false
                 }
             },
             Err(err) => {
-                warn!(%err, "engine_newPayloadV5 transport failure; accepting block");
+                warn!(%err, "engine_newPayloadV4 transport failure; accepting block");
                 true
             }
         }
@@ -758,9 +757,9 @@ impl BlockChainServer {
 
         // Inform the EL of our own freshly-built block (M6 phase 5 follow-up).
         //
-        // `engine_getPayloadV5` produced the embedded payload as a *candidate*;
+        // `engine_getPayloadV4` produced the embedded payload as a *candidate*;
         // the EL doesn't promote it to a real imported block until something
-        // calls `engine_newPayloadV5`. For received blocks that's the import
+        // calls `engine_newPayloadV4`. For received blocks that's the import
         // pre-check in `Handler<NewBlock>`, but for our own builds nobody
         // gossips it back to us — without this call the EL stays at genesis
         // and rejects every subsequent FCU `head_block_hash`.
@@ -774,14 +773,14 @@ impl BlockChainServer {
             let client = client.clone();
             tokio::spawn(async move {
                 match client
-                    .new_payload_v5(payload, vec![], parent_beacon_block_root, vec![])
+                    .new_payload_v4(payload, vec![], parent_beacon_block_root, vec![])
                     .await
                 {
                     Ok(status) => trace!(
                         status = ?status.status,
-                        "engine_newPayloadV5 on own-built block"
+                        "engine_newPayloadV4 on own-built block"
                     ),
-                    Err(err) => warn!(%err, "engine_newPayloadV5 on own-built block failed"),
+                    Err(err) => warn!(%err, "engine_newPayloadV4 on own-built block failed"),
                 }
             });
         }
@@ -1211,17 +1210,17 @@ mod execution_engine_tests {
     use ethlambda_types::block::{AttestationSignatures, Block, BlockBody};
     use ethlambda_types::state::State;
 
-    /// Outcome the mock EL returns from `new_payload_v5`, covering both the
+    /// Outcome the mock EL returns from `new_payload_v4`, covering both the
     /// EL's typed verdicts and a non-fatal roundtrip failure.
     enum NewPayloadOutcome {
         Status(PayloadStatusKind),
         Error,
     }
 
-    /// Mock execution engine. `forkchoice_updated_v3` and `get_payload_v5`
-    /// return innocuous defaults; only `new_payload_v5` is configurable since
+    /// Mock execution engine. `forkchoice_updated_v3` and `get_payload_v4`
+    /// return innocuous defaults; only `new_payload_v4` is configurable since
     /// that is the call whose verdict gates block import. The
-    /// `parent_beacon_block_root` passed to `new_payload_v5` is recorded so
+    /// `parent_beacon_block_root` passed to `new_payload_v4` is recorded so
     /// tests can assert the lean-parent-root convention.
     struct MockEngine {
         new_payload: NewPayloadOutcome,
@@ -1249,14 +1248,14 @@ mod execution_engine_tests {
             })
         }
 
-        async fn get_payload_v5(
+        async fn get_payload_v4(
             &self,
             _payload_id: PayloadId,
         ) -> Result<ExecutionPayloadV3, EngineClientError> {
             Ok(ExecutionPayloadV3::default())
         }
 
-        async fn new_payload_v5(
+        async fn new_payload_v4(
             &self,
             _payload: ExecutionPayloadV3,
             _expected_blob_versioned_hashes: Vec<H256>,

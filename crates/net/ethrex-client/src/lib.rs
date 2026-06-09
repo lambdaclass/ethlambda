@@ -39,10 +39,11 @@ pub use types::{
 /// We list everything we *might* call; the EL's response is the source of
 /// truth for what we can actually invoke. V3/V4/V5 newPayload+getPayload
 /// are all advertised so the EL accepts handshakes across the Cancun→
-/// Amsterdam range. Today the actor pins `forkchoiceUpdatedV3` and the V5
-/// flavours of new/get payload (matching ethrex main); selecting the
-/// version per payload timestamp against the EL's fork schedule is a
-/// future refinement once the V4/V5 FCU wrappers land.
+/// Amsterdam range. Today the actor pins `forkchoiceUpdatedV3` and the V4
+/// (Prague) flavours of new/get payload — the pre-Amsterdam, no-BAL path
+/// that pairs with a default ethrex. Selecting the version per payload
+/// timestamp against the EL's fork schedule (and supplying the EIP-7928
+/// block-access-list for V5) is a future refinement.
 ///
 /// Per the execution-apis spec, `engine_exchangeCapabilities` itself must
 /// NOT appear in the advertised set.

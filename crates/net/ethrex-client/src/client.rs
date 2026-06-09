@@ -315,12 +315,12 @@ pub trait ExecutionEngine: Send + Sync {
         payload_attributes: Option<PayloadAttributesV3>,
     ) -> Result<ForkChoiceUpdatedResponse, EngineClientError>;
 
-    async fn get_payload_v5(
+    async fn get_payload_v4(
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError>;
 
-    async fn new_payload_v5(
+    async fn new_payload_v4(
         &self,
         payload: ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
@@ -339,21 +339,21 @@ impl ExecutionEngine for EngineClient {
         EngineClient::forkchoice_updated_v3(self, state, payload_attributes).await
     }
 
-    async fn get_payload_v5(
+    async fn get_payload_v4(
         &self,
         payload_id: PayloadId,
     ) -> Result<ExecutionPayloadV3, EngineClientError> {
-        EngineClient::get_payload_v5(self, payload_id).await
+        EngineClient::get_payload_v4(self, payload_id).await
     }
 
-    async fn new_payload_v5(
+    async fn new_payload_v4(
         &self,
         payload: ExecutionPayloadV3,
         expected_blob_versioned_hashes: Vec<ethlambda_types::primitives::H256>,
         parent_beacon_block_root: ethlambda_types::primitives::H256,
         execution_requests: Vec<Vec<u8>>,
     ) -> Result<PayloadStatus, EngineClientError> {
-        EngineClient::new_payload_v5(
+        EngineClient::new_payload_v4(
             self,
             payload,
             expected_blob_versioned_hashes,
