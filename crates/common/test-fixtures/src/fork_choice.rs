@@ -7,10 +7,8 @@ use crate::{
     AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
     deser_xmss_hex,
 };
-use ethlambda_types::attestation::{XmssSignature, blank_xmss_signature};
-use ethlambda_types::block::{
-    AggregatedSignatureProof, AttestationSignatures, BlockSignatures, SignedBlock,
-};
+use ethlambda_types::attestation::XmssSignature;
+use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
 use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
@@ -86,7 +84,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AttestationStepData {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: Option<u64>,
     pub data: AttestationData,
     #[serde(default, deserialize_with = "deser_opt_xmss_hex")]
@@ -95,11 +93,16 @@ pub struct AttestationStepData {
     pub proof: Option<ProofStepData>,
 }
 
+/// Aggregated-attestation proof carried by `gossipAggregatedAttestation`
+/// steps (leanSpec PR #717 schema).
+///
+/// `participants` arrives as `{ data: [bool, ...] }` and `proof` as
+/// `{ data: "0x<hex>" }`; the latter is the lean-multisig Type-1
+/// `compress_without_pubkeys()` bytes for that AttestationData.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProofStepData {
     pub participants: AggregationBits,
-    #[serde(rename = "proofData")]
-    pub proof_data: HexByteList,
+    pub proof: HexByteList,
 }
 
 /// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`.
@@ -150,30 +153,16 @@ impl BlockStepData {
         }
     }
 
-    /// Build a SignedBlock with placeholder signatures: one empty aggregated
-    /// proof per attestation (participant bits copied from the block body) and
-    /// a zeroed proposer signature.
+    /// Build a `SignedBlock` with an empty proof blob.
     ///
     /// Used by callers that import the block via `on_block_without_verification`
-    /// (fork-choice spec-test runner and Hive test-driver), where the crypto
-    /// layer is never invoked but the SignedBlock shape must still satisfy the
-    /// length checks `on_block_core` performs before dispatching.
+    /// (fork-choice spec-test runner and Hive test-driver), which skip the
+    /// crypto verifier entirely. The merged proof bytes are only inspected by
+    /// `verify_block_signatures`, so an empty aggregate suffices.
     pub fn to_blank_signed_block(&self) -> SignedBlock {
-        let block = self.to_block();
-        let proofs: Vec<AggregatedSignatureProof> = block
-            .body
-            .attestations
-            .iter()
-            .map(|att| AggregatedSignatureProof::empty(att.aggregation_bits.clone()))
-            .collect();
-
         SignedBlock {
-            message: block,
-            signature: BlockSignatures {
-                proposer_signature: blank_xmss_signature(),
-                attestation_signatures: AttestationSignatures::try_from(proofs)
-                    .expect("attestation proofs within limit"),
-            },
+            message: self.to_block(),
+            proof: MultiMessageAggregate::default(),
         }
     }
 }

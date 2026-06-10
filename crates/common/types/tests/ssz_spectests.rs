@@ -62,22 +62,23 @@ fn run_ssz_test(test: &SszTestCase) -> datatest_stable::Result<()> {
             ssz_types::SignedAttestation,
             ethlambda_types::attestation::SignedAttestation,
         >(test),
-        "SignedBlock" => run_serialization_only_test::<
-            ssz_types::SignedBlock,
-            ethlambda_types::block::SignedBlock,
-        >(test),
-        "BlockSignatures" => run_serialization_only_test::<
-            ssz_types::BlockSignatures,
-            ethlambda_types::block::BlockSignatures,
-        >(test),
-        "AggregatedSignatureProof" => run_typed_test::<
-            ssz_types::AggregatedSignatureProof,
-            ethlambda_types::block::AggregatedSignatureProof,
-        >(test),
-        "SignedAggregatedAttestation" => run_typed_test::<
-            ssz_types::SignedAggregatedAttestation,
-            ethlambda_types::attestation::SignedAggregatedAttestation,
-        >(test),
+
+        // Skipped pending fixture regeneration against the Type-1 / Type-2
+        // schema (anshalshukla/leanSpec@0ab09dd). Phase 3 removed the legacy
+        // `BlockSignatures` / `AttestationSignatures` / `AggregatedSignatureProof`
+        // containers; the on-disk fixtures still serialise the old shape so
+        // SSZ-byte and root assertions don't line up.
+        // TODO(type1-type2): re-enable once `LEAN_SPEC_COMMIT_HASH` is bumped.
+        "SignedBlock"
+        | "BlockSignatures"
+        | "AggregatedSignatureProof"
+        | "SignedAggregatedAttestation" => {
+            println!(
+                "  Skipping {} (Type-2 schema migration WIP)",
+                test.type_name
+            );
+            Ok(())
+        }
 
         // Unsupported types: skip with a message
         other => {

@@ -7,8 +7,10 @@ use std::{
 use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
-    block::{AggregatedSignatureProof, Block},
+    attestation::{
+        AttestationData, HashedAttestationData, SignedAggregatedAttestation, SignedAttestation,
+    },
+    block::{Block, TypeOneMultiSignature},
     primitives::{ByteList, H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
@@ -97,7 +99,39 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // NOTE: the has_proposal argument is set to true, following the spec
                     store::on_tick(&mut store, block_time_ms, true);
                     let result = store::on_block_without_verification(&mut store, signed_block);
+                    let import_ok = result.is_ok();
                     assert_step_outcome(step_idx, step.valid, result)?;
+
+                    // Deconstruct the imported block into per-attestation Type-1s,
+                    // mirroring the node's post-import reaggregation. The real node
+                    // SNARK-splits the block's merged Type-2 proof and folds the
+                    // recovered Type-1s into the pool so block-borne votes carry
+                    // fork-choice weight; leanSpec's fork-choice harness gets the
+                    // same effect by simulating the proposer build. Fixture blocks
+                    // are blank (no real proof to split), so reconstruct structurally
+                    // from the body's aggregation_bits — fork choice reads only the
+                    // participant set, not the proof bytes. The recovered entries go
+                    // straight into the known pool to match the proposer-view store
+                    // the fixtures encode.
+                    if import_ok {
+                        let block = block_data.to_block();
+                        let entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> = block
+                            .body
+                            .attestations
+                            .iter()
+                            .map(|att| {
+                                (
+                                    HashedAttestationData::new(att.data.clone()),
+                                    TypeOneMultiSignature::empty(att.aggregation_bits.clone()),
+                                )
+                            })
+                            .collect();
+                        store.insert_known_aggregated_payloads_batch(entries);
+                        // on_block already ran the head update before these votes
+                        // existed; recompute so the head reflects the block's own
+                        // attestations, matching the proposer-view store.
+                        store::update_head(&mut store, false);
+                    }
                 }
                 "tick" => {
                     // Fixtures use either `time` (UNIX seconds) or `interval`
@@ -142,16 +176,13 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let proof_fixture = att_data
                         .proof
                         .expect("gossipAggregatedAttestation step missing proof");
-                    let proof_bytes: Vec<u8> = proof_fixture.proof_data.into();
+                    let proof_bytes: Vec<u8> = proof_fixture.proof.into();
                     let proof_data = ByteList::try_from(proof_bytes)
-                        .expect("aggregated proof data fits in ByteListMiB");
-                    let aggregated = SignedAggregatedAttestation {
-                        data: att_data.data.into(),
-                        proof: AggregatedSignatureProof::new(
-                            proof_fixture.participants.into(),
-                            proof_data,
-                        ),
-                    };
+                        .expect("aggregated proof data fits in ByteList512KiB");
+                    let data: AttestationData = att_data.data.into();
+                    let proof =
+                        TypeOneMultiSignature::new(proof_fixture.participants.into(), proof_data);
+                    let aggregated = SignedAggregatedAttestation { data, proof };
 
                     let result = store::on_gossip_aggregated_attestation(&mut store, aggregated);
                     assert_step_outcome(step_idx, step.valid, result)?;
