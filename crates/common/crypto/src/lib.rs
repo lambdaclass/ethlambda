@@ -14,8 +14,6 @@ use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSi
 use thiserror::Error;
 
 /// log(1/rate) for the WHIR commitment scheme used inside lean-multisig.
-/// 2 matches the devnet-4 cross-client convention (zeam, ream, grandine, lantern
-/// all use 2); the leanVM devnet5 examples also use 2 for recursion.
 const LOG_INV_RATE: usize = 2;
 
 // Lazy initialization for prover and verifier setup
