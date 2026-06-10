@@ -77,21 +77,12 @@ impl MultiMessageAggregate {
 }
 
 /// Errors returned when constructing a [`MultiMessageAggregate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MultiMessageAggregateError {
     /// Proof bytes exceed `ByteList512KiB`'s cap.
+    #[error("proof {0} bytes exceeds 512 KiB cap")]
     ProofTooLarge(usize),
 }
-
-impl core::fmt::Display for MultiMessageAggregateError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ProofTooLarge(n) => write!(f, "proof {n} bytes exceeds 512 KiB cap"),
-        }
-    }
-}
-
-impl std::error::Error for MultiMessageAggregateError {}
 
 // ============================================================================
 // Type-1 multi-signature
