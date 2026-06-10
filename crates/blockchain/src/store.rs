@@ -1170,10 +1170,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            signature: BlockSignatures {
-                attestation_signatures: AttestationSignatures::try_from(vec![]).unwrap(),
-                proposer_signature: blank_xmss_signature(),
-            },
+            proof: make_signed_block_proof(0, vec![]),
         };
         store.insert_signed_block(root, signed_block);
     }
