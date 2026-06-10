@@ -37,6 +37,13 @@ pub enum Error {
     },
     #[error("zero hash found in justifications_roots")]
     ZeroHashInJustificationRoots,
+    #[error("aggregated attestation has no participants")]
+    EmptyAggregationBits,
+    #[error("aggregation bit set at index {index} beyond validator count {validator_count}")]
+    AggregationBitsOutOfBounds {
+        index: usize,
+        validator_count: usize,
+    },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -276,20 +283,32 @@ fn process_attestations(
             continue;
         }
 
+        // The spec asserts that an aggregated attestation references at least
+        // one validator; the failed assert invalidates the whole block.
+        if attestation.aggregation_bits.count_ones() == 0 {
+            return Err(Error::EmptyAggregationBits);
+        }
+
+        // The spec indexes the per-root vote list with each participant index,
+        // so a set bit beyond the validator set crashes it (IndexError) and
+        // invalidates the whole block; Zeam and Lantern also reject such
+        // blocks. The spec has no bitlist length check: oversized
+        // aggregation_bits whose set bits are all in range process normally.
+        let oob_bit = (validator_count..attestation.aggregation_bits.len())
+            .find(|&i| attestation.aggregation_bits.get(i) == Some(true));
+        if let Some(index) = oob_bit {
+            return Err(Error::AggregationBitsOutOfBounds {
+                index,
+                validator_count,
+            });
+        }
+
         // Record the vote
         attestations_processed += 1;
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
-        // Reject attestations with aggregation_bits longer than the validator set.
-        // The spec would crash (IndexError) on OOB access; Zeam and Lantern reject.
-        if attestation.aggregation_bits.len() > validator_count {
-            warn!(
-                bits_len = attestation.aggregation_bits.len(),
-                validator_count, "Skipping attestation: aggregation_bits exceeds validator count"
-            );
-            continue;
-        }
+
         // Mark that each validator in this aggregation has voted for the target.
         for (validator_id, voted) in votes
             .iter_mut()
@@ -483,28 +502,39 @@ fn serialize_justifications(
     state.justifications_validators = justifications_validators;
 }
 
-/// Whether both source and target checkpoints in `data` match the chain at
-/// their slots.
+/// Whether the source, target, and head checkpoints in `data` match the chain
+/// at their slots.
 ///
 /// Callers pass a chain view as it would appear after `process_block_header`
 /// on the consuming block: covering `[0, block.slot - 1]` with `parent_root`
 /// at the parent slot and `H256::ZERO` for empty slots between parent and the
 /// candidate.
+///
+/// Checking `head` against the canonical view keeps counted votes internally
+/// consistent: justification is keyed on `target.root`, so a sibling head must
+/// not pair a canonical FFG vote with an LMD head on a non-canonical fork.
 pub fn attestation_data_matches_chain(
     historical_block_hashes: &[H256],
     data: &AttestationData,
 ) -> bool {
-    if data.source.root == H256::ZERO || data.target.root == H256::ZERO {
+    if data.source.root == H256::ZERO
+        || data.target.root == H256::ZERO
+        || data.head.root == H256::ZERO
+    {
         return false;
     }
     let source_slot = data.source.slot as usize;
     let target_slot = data.target.slot as usize;
-    if source_slot >= historical_block_hashes.len() || target_slot >= historical_block_hashes.len()
+    let head_slot = data.head.slot as usize;
+    if source_slot >= historical_block_hashes.len()
+        || target_slot >= historical_block_hashes.len()
+        || head_slot >= historical_block_hashes.len()
     {
         return false;
     }
     historical_block_hashes[source_slot] == data.source.root
         && historical_block_hashes[target_slot] == data.target.root
+        && historical_block_hashes[head_slot] == data.head.root
 }
 
 /// Checks if the slot is a valid candidate for justification after a given finalized slot.
@@ -604,6 +634,70 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// leanSpec #833: `attestation_data_matches_chain` must reject a vote whose
+    /// head sits off the canonical chain, even when source and target are both
+    /// canonical. Justification is keyed on `target.root`, so accepting a
+    /// canonical FFG vote paired with a sibling LMD head would decouple the two.
+    #[test]
+    fn matches_chain_rejects_off_canonical_head() {
+        let r1 = H256([1u8; 32]);
+        let r2 = H256([2u8; 32]);
+        let sibling = H256([0x99u8; 32]);
+
+        // Canonical chain: slot 0 genesis (ZERO is fine for source here only if
+        // non-zero; use explicit roots), slot 1 -> r1, slot 2 -> r2.
+        let g = H256([7u8; 32]);
+        let hashes: Vec<H256> = vec![g, r1, r2];
+
+        // source=(0,g), target=(1,r1) both canonical; head=(2, sibling) is not.
+        let off_head = AttestationData {
+            slot: 2,
+            source: Checkpoint { slot: 0, root: g },
+            target: Checkpoint { slot: 1, root: r1 },
+            head: Checkpoint {
+                slot: 2,
+                root: sibling,
+            },
+        };
+        assert!(
+            !attestation_data_matches_chain(&hashes, &off_head),
+            "off-canonical head must be rejected"
+        );
+
+        // Control: the same vote with the canonical head=(2, r2) is accepted.
+        let canonical_head = AttestationData {
+            head: Checkpoint { slot: 2, root: r2 },
+            ..off_head
+        };
+        assert!(
+            attestation_data_matches_chain(&hashes, &canonical_head),
+            "fully canonical vote must be accepted"
+        );
+
+        // A zero-hash head is also rejected up front.
+        let zero_head = AttestationData {
+            head: Checkpoint {
+                slot: 2,
+                root: H256::ZERO,
+            },
+            ..off_head
+        };
+        assert!(
+            !attestation_data_matches_chain(&hashes, &zero_head),
+            "zero-hash head must be rejected"
+        );
+
+        // A head slot beyond the chain view is rejected.
+        let out_of_range_head = AttestationData {
+            head: Checkpoint { slot: 99, root: r2 },
+            ..off_head
+        };
+        assert!(
+            !attestation_data_matches_chain(&hashes, &out_of_range_head),
+            "out-of-range head slot must be rejected"
+        );
     }
 
     /// Regression: `process_attestations` must not let `state.latest_justified`
