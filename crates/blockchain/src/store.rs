@@ -393,6 +393,26 @@ pub fn on_gossip_aggregated_attestation(
     store: &mut Store,
     aggregated: SignedAggregatedAttestation,
 ) -> Result<(), StoreError> {
+    on_gossip_aggregated_attestation_core(store, aggregated, true)
+}
+
+/// Process a gossiped aggregated attestation WITHOUT verifying its proof.
+///
+/// Only for spec tests whose fixtures carry mocked (placeholder) proofs
+/// (`proofSetting == 0`); production paths must use
+/// [`on_gossip_aggregated_attestation`].
+pub fn on_gossip_aggregated_attestation_without_verification(
+    store: &mut Store,
+    aggregated: SignedAggregatedAttestation,
+) -> Result<(), StoreError> {
+    on_gossip_aggregated_attestation_core(store, aggregated, false)
+}
+
+fn on_gossip_aggregated_attestation_core(
+    store: &mut Store,
+    aggregated: SignedAggregatedAttestation,
+    verify: bool,
+) -> Result<(), StoreError> {
     validate_attestation_data(store, &aggregated.data)
         .inspect_err(|_| metrics::inc_attestations_invalid())?;
 
@@ -420,7 +440,7 @@ pub fn on_gossip_aggregated_attestation(
     let data_root = hashed.root();
     let slot: u32 = aggregated.data.slot.try_into().expect("slot exceeds u32");
 
-    {
+    if verify {
         let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
         ethlambda_crypto::verify_aggregated_signature(
             &aggregated.proof.proof,
@@ -428,8 +448,8 @@ pub fn on_gossip_aggregated_attestation(
             &data_root,
             slot,
         )
+        .map_err(StoreError::AggregateVerificationFailed)?;
     }
-    .map_err(StoreError::AggregateVerificationFailed)?;
 
     // Read stats before moving the proof into the store.
     let num_participants = aggregated.proof.participants.count_ones();
