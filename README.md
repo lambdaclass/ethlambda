@@ -120,7 +120,7 @@ Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the followin
 
 ### pq-devnet-5
 
-We are running the `pq-devnet-5` spec. A Docker tag `devnet5` will be published for this version.
+We are running the `pq-devnet-5` spec. A Docker tag `devnet5` is available for this version.
 
 ### pq-devnet-6
 
