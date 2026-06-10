@@ -124,7 +124,7 @@ We are running the `pq-devnet-5` spec. A Docker tag `devnet5` is available for t
 
 ### pq-devnet-6
 
-`pq-devnet-6` is in a planning phase; no features have been specified yet. Likely candidates are replacing [LMD-GHOST](docs/lmd_ghost.md) and [3SF-mini](docs/3sf_mini.md), or execution layer integration.
+`pq-devnet-6` is in a planning phase; no features have been specified yet. Likely candidates are replacing [LMD-GHOST](docs/lmd_ghost.md) and [3SF-mini](docs/3sf_mini.md), or [execution layer integration](https://github.com/lambdaclass/ethlambda/pull/367).
 
 ### Older devnets
 
