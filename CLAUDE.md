@@ -7,7 +7,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 
 **Main branch:** `main`
 **Rust version:** 1.92.0 (edition 2024)
-**Test fixtures commit:** Check `LEAN_SPEC_COMMIT_HASH` in Makefile
+**Test fixtures release:** Download latest production fixtures from leanSpec releases
 
 ## Codebase Structure (10 crates)
 
@@ -81,7 +81,7 @@ make test                                    # All tests + forkchoice spec tests
 ### Common Operations
 ```bash
 .claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
-rm -rf leanSpec && make leanSpec/fixtures                # Regenerate test fixtures (requires uv)
+rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
 ```

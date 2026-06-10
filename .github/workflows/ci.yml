@@ -47,100 +47,56 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Read the pinned leanSpec commit from the Makefile (single source of truth)
-      - name: Get leanSpec pinned commit
-        id: lean-spec
-        run: echo "commit=$(sed -n 's/^LEAN_SPEC_COMMIT_HASH:= *//p' Makefile)" >> $GITHUB_OUTPUT
+      - name: Get leanSpec fixtures release info
+        id: fixtures-release
+        run: |
+          api_url="https://api.github.com/repos/leanEthereum/leanSpec/releases/latest"
+          json=$(curl -sL "$api_url")
+            fixtures_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz'))")
+            sha_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz.sha256'))")
+          sha=$(curl -sL "$sha_url" | cut -d' ' -f1)
+          {
+            echo "url=$fixtures_url"
+            echo "sha_url=$sha_url"
+            echo "sha=$sha"
+          } >> $GITHUB_OUTPUT
 
       - name: Restore test fixtures cache
         id: cache-fixtures
         uses: actions/cache/restore@v5
         with:
           path: leanSpec/fixtures
-          key: leanspec-fixtures-${{ steps.lean-spec.outputs.commit }}
+          key: leanspec-fixtures-${{ steps.fixtures-release.outputs.sha }}
 
-      # All fixture generation steps are skipped when the cache hits
-      - name: Checkout leanSpec at pinned commit
+      - name: Download leanSpec fixtures release
+        id: download-fixtures
         if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        uses: actions/checkout@v6
-        with:
-          repository: leanEthereum/leanSpec
-          ref: ${{ steps.lean-spec.outputs.commit }}
-          path: leanSpec
-
-      - name: Install uv and Python 3.14
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-          cache-dependency-glob: "leanSpec/pyproject.toml"
-          python-version: "3.14"
-
-      - name: Sync leanSpec dependencies
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        working-directory: leanSpec
-        run: uv sync --no-progress
-
-      - name: Get production keys URL hash
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        id: prod-keys-url
-        working-directory: leanSpec
         run: |
-          URL=$(uv run python -c "from consensus_testing.keys import KEY_DOWNLOAD_URLS; print(KEY_DOWNLOAD_URLS['prod'])")
-          HASH=$(echo -n "$URL" | sha256sum | awk '{print $1}')
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          fixtures_url="${{ steps.fixtures-release.outputs.url }}"
+          sha_url="${{ steps.fixtures-release.outputs.sha_url }}"
+          echo "Downloading fixtures from $fixtures_url"
+          curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
+          curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"
+          expected=$(cut -d' ' -f1 "$tmpdir/fixtures-prod-scheme.tar.gz.sha256")
+          actual=$(sha256sum "$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "SHA256 mismatch: expected $expected, got $actual"
+            exit 1
+          fi
+          rm -rf leanSpec/fixtures
+          mkdir -p leanSpec/fixtures
+          tar -xzf "$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
 
-      - name: Restore production keys cache
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        id: cache-prod-keys
-        uses: actions/cache/restore@v5
-        with:
-          path: leanSpec/packages/testing/src/consensus_testing/test_keys/prod_scheme
-          key: prod-keys-${{ steps.prod-keys-url.outputs.hash }}
-
-      - name: Download production keys
-        if: steps.cache-fixtures.outputs.cache-hit != 'true' && steps.cache-prod-keys.outputs.cache-hit != 'true'
-        working-directory: leanSpec
-        run: uv run python -m consensus_testing.keys --download --scheme prod
-
-      # Save production keys even if a later step fails, so a re-run does
-      # not have to re-download. See: https://github.com/actions/cache/tree/main/save#always-save-cache
-      #
-      # `cache-hit == 'false'` (rather than `!= 'true'`) only matches when
-      # the restore step actually ran and missed: when fixtures were already
-      # cached, the restore was skipped and `cache-hit` is empty, so save
-      # is skipped too.
-      - name: Save production keys cache
-        if: always() && steps.cache-prod-keys.outputs.cache-hit == 'false'
-        uses: actions/cache/save@v5
-        with:
-          path: leanSpec/packages/testing/src/consensus_testing/test_keys/prod_scheme
-          key: ${{ steps.cache-prod-keys.outputs.cache-primary-key }}
-
-      # `-n 1` (not `-n auto`) runs a single leanVM prover at a time. The
-      # devnet5 prover peaks at ~12 GiB per proof (measured), so more workers
-      # blow past the 4-vCPU/16 GiB runner's RAM: `-n auto` (4 provers) hard
-      # OOM-killed the runner, `-n 2` thrashed and lost its heartbeat so GitHub
-      # cancelled the job. One prover peaks ~12.4 GiB with 0 swap and completes
-      # in ~2h36m. The Makefile keeps `-n auto` for local machines with more RAM.
-      - name: Generate test fixtures
-        id: generate-fixtures
-        if: steps.cache-fixtures.outputs.cache-hit != 'true'
-        working-directory: leanSpec
-        run: uv run fill --fork Lstar -n 1 --scheme prod -o fixtures
-
-      # Save fixtures only when generation actually SUCCEEDED. A bare
-      # `always()` here previously saved the (empty) fixtures dir when
-      # generation was cancelled or OOM-killed mid-run, poisoning the cache:
-      # later runs hit the empty cache, skipped generation, and the Rust tests
-      # failed with no fixtures. Gating on the generate step's outcome keeps
-      # the "save even if the later Rust test step fails" intent without ever
-      # persisting a partial fixture set.
+      # Save fixtures only when the download actually SUCCEEDED, so a
+      # cancelled or failed download never persists a partial fixture set,
+      # while still saving even if the later Rust test step fails.
       - name: Save test fixtures cache
         if: >-
           always()
           && steps.cache-fixtures.outputs.cache-hit != 'true'
-          && steps.generate-fixtures.outcome == 'success'
+          && steps.download-fixtures.outcome == 'success'
         uses: actions/cache/save@v5
         with:
           path: leanSpec/fixtures
