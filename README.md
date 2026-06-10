@@ -118,17 +118,17 @@ Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the followin
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.
 
-### pq-devnet-4
-
-We are running the `pq-devnet-4` spec. A Docker tag `devnet4` is available for this version.
-
 ### pq-devnet-5
 
-[We are working on adding support for the `pq-devnet-5` spec](https://github.com/lambdaclass/ethlambda/issues/285). A Docker tag `devnet5` will be published for this version.
+We are running the `pq-devnet-5` spec. A Docker tag `devnet5` will be published for this version.
+
+### pq-devnet-6
+
+`pq-devnet-6` is in a planning phase; no features have been specified yet.
 
 ### Older devnets
 
-Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`, `devnet3`).
+Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`, `devnet2`, `devnet3`, `devnet4`).
 
 Support for older devnet releases is discontinued when the next devnet version is released.
 
@@ -136,7 +136,6 @@ Support for older devnet releases is discontinued when the next devnet version i
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [Add support for pq-devnet-5](https://github.com/lambdaclass/ethlambda/issues/285)
 - [RPC endpoints for chain data consumption](https://github.com/lambdaclass/ethlambda/issues/75)
 - [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
 
