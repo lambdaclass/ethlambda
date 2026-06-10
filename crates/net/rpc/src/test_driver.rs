@@ -356,10 +356,13 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .ok_or_else(|| "block step missing block data".to_string())?;
             let signed_block = block_data.to_blank_signed_block();
             // Match the spec-test runner: advance time to the block's slot
-            // before importing so the future-slot guard doesn't reject it.
-            let block_time_ms = store.config().genesis_time * 1000
-                + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-            store::on_tick(store, block_time_ms, true);
+            // before importing, unless the step delivers the block ahead of
+            // the store clock.
+            if step.tick_to_slot {
+                let block_time_ms = store.config().genesis_time * 1000
+                    + signed_block.message.slot * MILLISECONDS_PER_SLOT;
+                store::on_tick(store, block_time_ms, true);
+            }
             store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
         }
         "attestation" => {

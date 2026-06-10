@@ -76,6 +76,11 @@ pub struct ForkChoiceStep {
     pub has_proposal: Option<bool>,
     #[serde(rename = "isAggregator")]
     pub is_aggregator: Option<bool>,
+    /// Whether the harness must advance the store clock to the block's slot
+    /// before delivering a `block` step. Early-arrival tests set this to
+    /// `false` to deliver the block ahead of the store clock.
+    #[serde(rename = "tickToSlot", default = "default_true")]
+    pub tick_to_slot: bool,
 }
 
 fn default_true() -> bool {

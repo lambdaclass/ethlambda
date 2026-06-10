@@ -44,7 +44,10 @@ pub struct VerifySignaturesTest {
     pub anchor_state: TestState,
     #[serde(rename = "signedBlock")]
     pub signed_block: TestSignedBlock,
-    #[serde(rename = "expectException")]
+    /// Expected rejection, when present. Newer fixtures name this field
+    /// `rejectionReason` (leanSpec replaced `expectException`); both
+    /// spellings are accepted.
+    #[serde(default, rename = "expectException", alias = "rejectionReason")]
     pub expect_exception: Option<String>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
