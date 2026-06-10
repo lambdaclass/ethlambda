@@ -38,15 +38,23 @@ shadow-docker-build: ## 👻🐳 Build a Shadow-compatible Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)-shadow .
 	@echo
 
-# 2026-06-03
-LEAN_SPEC_COMMIT_HASH:=30ffb6cab54ca6d2e2e1c82e8e2713ebb9a8fa3f
+LEAN_SPEC_FIXTURES_URL ?= https://github.com/leanEthereum/leanSpec/releases/latest/download/fixtures-prod-scheme.tar.gz
+LEAN_SPEC_FIXTURES_SHA_URL ?= $(LEAN_SPEC_FIXTURES_URL).sha256
 
-leanSpec:
-	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
-	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
-
-leanSpec/fixtures: leanSpec
-	cd leanSpec && uv run fill --fork Lstar -n auto --scheme prod -o fixtures
+leanSpec/fixtures:
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz" "$(LEAN_SPEC_FIXTURES_URL)"; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$(LEAN_SPEC_FIXTURES_SHA_URL)"; \
+	expected=$$(cut -d' ' -f1 "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256"); \
+	actual=$$(sha256sum "$$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $$1}'); \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "SHA256 mismatch: expected $$expected, got $$actual" >&2; \
+		exit 1; \
+	fi; \
+	rm -rf leanSpec/fixtures; \
+	mkdir -p leanSpec/fixtures; \
+	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
