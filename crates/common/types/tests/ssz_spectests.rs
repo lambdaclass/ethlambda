@@ -5,18 +5,16 @@ use ethlambda_types::primitives::HashTreeRoot;
 mod ssz_types;
 use ssz_types::{SszTestCase, SszTestVector, decode_hex, decode_hex_h256};
 
-/// Newer leanSpec releases name the format `ssz_test`; the pinned-commit
-/// fixtures still use `ssz`. Accept both.
-const SUPPORTED_FIXTURE_FORMATS: &[&str] = &["ssz", "ssz_test"];
+const SUPPORTED_FIXTURE_FORMAT: &str = "ssz_test";
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
     let tests = SszTestVector::from_file(path)?;
 
     for (name, test) in tests.tests {
-        if !SUPPORTED_FIXTURE_FORMATS.contains(&test.info.fixture_format.as_str()) {
+        if test.info.fixture_format != SUPPORTED_FIXTURE_FORMAT {
             return Err(format!(
-                "Unsupported fixture format: {} (expected one of {:?})",
-                test.info.fixture_format, SUPPORTED_FIXTURE_FORMATS
+                "Unsupported fixture format: {} (expected {})",
+                test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
             )
             .into());
         }
