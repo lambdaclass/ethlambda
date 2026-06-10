@@ -6,9 +6,10 @@ use ethlambda_types::{
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
 use lean_multisig::{
-    ProofError, TypeOneMultiSignature as LMType1, TypeTwoMultiSignature as LMType2,
-    aggregate_type_1, merge_many_type_1, setup_prover, setup_verifier, split_type_2, verify_type_1,
-    verify_type_2,
+    MultiMessageAggregateSignature as LMType2, ProofError,
+    SingleMessageAggregateSignature as LMType1, aggregate_single_message_signatures,
+    merge_single_message_aggregates, setup_prover, setup_verifier, split_multi_message_aggregate,
+    verify_multi_message_aggregate, verify_single_message_aggregate,
 };
 use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
@@ -111,7 +112,7 @@ fn into_lean_pubkeys(pubkeys: Vec<ValidatorPublicKey>) -> Vec<LeanSigPubKey> {
 }
 
 /// Decompress a stored Type-1 proof (without-pubkeys form) into a native
-/// `TypeOneMultiSignature` by attaching the resolved validator pubkeys.
+/// `SingleMessageAggregateSignature` by attaching the resolved validator pubkeys.
 fn decompress_type1(
     pubkeys: Vec<ValidatorPublicKey>,
     proof_bytes: &ByteList512KiB,
@@ -140,11 +141,11 @@ fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteList512KiB, Aggregat
 
 /// Aggregate multiple XMSS signatures into a single Type-1 proof.
 ///
-/// Equivalent to `aggregate_type_1([], raw_xmss, ...)` in lean-multisig.
+/// Equivalent to `aggregate_single_message_signatures([], raw_xmss, ...)` in lean-multisig.
 ///
 /// All signatures must bind to the same `(message, slot)` pair.
 ///
-/// Returns the lean-multisig `TypeOneMultiSignature::compress_without_pubkeys()`
+/// Returns the lean-multisig `SingleMessageAggregateSignature::compress_without_pubkeys()`
 /// bytes, packed as `ByteList512KiB` for the on-wire SSZ proof field.
 pub fn aggregate_signatures(
     public_keys: Vec<ValidatorPublicKey>,
@@ -170,7 +171,7 @@ pub fn aggregate_signatures(
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
 
-    let proof = aggregate_type_1(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
+    let proof = aggregate_single_message_signatures(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     compress_type1_to_byte_list(&proof)
@@ -214,8 +215,14 @@ pub fn aggregate_mixed(
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
 
-    let proof = aggregate_type_1(&children_native, raw_xmss, message.0, slot, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
+    let proof = aggregate_single_message_signatures(
+        &children_native,
+        raw_xmss,
+        message.0,
+        slot,
+        LOG_INV_RATE,
+    )
+    .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     compress_type1_to_byte_list(&proof)
 }
@@ -241,8 +248,14 @@ pub fn aggregate_proofs(
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
 
-    let proof = aggregate_type_1(&children_native, vec![], message.0, slot, LOG_INV_RATE)
-        .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
+    let proof = aggregate_single_message_signatures(
+        &children_native,
+        vec![],
+        message.0,
+        slot,
+        LOG_INV_RATE,
+    )
+    .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     compress_type1_to_byte_list(&proof)
 }
@@ -274,7 +287,7 @@ pub fn verify_aggregated_signature(
         });
     }
 
-    verify_type_1(&sig)?;
+    verify_single_message_aggregate(&sig)?;
     Ok(())
 }
 
@@ -285,10 +298,10 @@ pub fn verify_aggregated_signature(
 /// Merge many independent Type-1 multi-signatures into a single Type-2 proof.
 ///
 /// Each input is `(participant_pubkeys, type_1_proof_bytes)` where the bytes
-/// are the `compress_without_pubkeys()` form of a `TypeOneMultiSignature`.
+/// are the `compress_without_pubkeys()` form of a `SingleMessageAggregateSignature`.
 ///
 /// The returned blob is the `compress_without_pubkeys()` form of the resulting
-/// `TypeTwoMultiSignature`. A verifier decoding it back needs the per-component
+/// `MultiMessageAggregateSignature`. A verifier decoding it back needs the per-component
 /// pubkey sets in the same order.
 pub fn merge_type_1s_into_type_2(
     type_1s: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
@@ -305,7 +318,7 @@ pub fn merge_type_1s_into_type_2(
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
 
-    let merged = merge_many_type_1(type_1s_native, LOG_INV_RATE)
+    let merged = merge_single_message_aggregates(type_1s_native, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     compress_type2_to_byte_list(&merged)
@@ -361,14 +374,14 @@ pub fn verify_type_2_signature(
         let _ = idx; // index reserved for richer diagnostics if needed
     }
 
-    verify_type_2(&sig)?;
+    verify_multi_message_aggregate(&sig)?;
     Ok(())
 }
 
 /// Split (disaggregate) a Type-2 merged proof into a single Type-1 proof for
 /// the component bound to `message`. Generates a fresh SNARK; expensive.
 ///
-/// Mirrors leanSpec PR #717 `TypeTwoMultiSignature.split_by_msg`: the caller
+/// Mirrors leanSpec PR #717 `split_multi_message_aggregate_by_message`: the caller
 /// supplies the expected message (an attestation data root or the block
 /// root) and the wrapper locates the unique matching component inside the
 /// decompressed proof. Returns the `compress_without_pubkeys()` form of the
@@ -400,7 +413,7 @@ pub fn split_type_2_by_message(
         _ => return Err(AggregationError::MultipleMessages),
     };
 
-    let component = split_type_2(type_2, index, LOG_INV_RATE)
+    let component = split_multi_message_aggregate(type_2, index, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     compress_type1_to_byte_list(&component)
