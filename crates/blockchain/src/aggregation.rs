@@ -403,11 +403,14 @@ pub(crate) fn run_aggregation_worker(
     let mut groups_aggregated = 0usize;
     let mut total_raw_sigs = 0usize;
     let mut total_children = 0usize;
+    let jobs_total = snapshot.jobs.len();
+    let mut jobs_attempted = 0usize;
 
     for job in snapshot.jobs {
         if cancel.is_cancelled() {
             break;
         }
+        jobs_attempted += 1;
 
         let slot = job.slot;
         let raw_sigs = job.raw_ids.len();
@@ -448,6 +451,13 @@ pub(crate) fn run_aggregation_worker(
             // Actor is gone; no point producing more.
             break;
         }
+    }
+
+    // Jobs the loop never reached (deadline cancellation or actor gone) are
+    // skipped aggregation submissions per leanMetrics.
+    let jobs_dropped = jobs_total - jobs_attempted;
+    if jobs_dropped > 0 {
+        metrics::inc_aggregator_skipped_other(jobs_dropped as u64);
     }
 
     let _ = actor.send(AggregationDone {

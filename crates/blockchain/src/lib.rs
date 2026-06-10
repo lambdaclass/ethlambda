@@ -254,9 +254,16 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        if interval == 2 && is_aggregator {
-            coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
-            self.start_aggregation_session(slot, ctx).await;
+        if interval == 2 {
+            if is_aggregator {
+                coverage::emit_agg_start_new_coverage(
+                    &self.store,
+                    self.attestation_committee_count,
+                );
+                self.start_aggregation_session(slot, ctx).await;
+            } else {
+                metrics::inc_aggregator_skipped_not_aggregator();
+            }
         }
 
         // Now build and publish the block (after attestations have been accepted)
