@@ -8,7 +8,7 @@ use crate::{
     deser_xmss_hex,
 };
 use ethlambda_types::attestation::XmssSignature;
-use ethlambda_types::block::{ByteList512KiB, SignedBlock};
+use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
 use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
@@ -157,13 +157,12 @@ impl BlockStepData {
     ///
     /// Used by callers that import the block via `on_block_without_verification`
     /// (fork-choice spec-test runner and Hive test-driver), which skip the
-    /// crypto verifier entirely. Under the leanSpec PR #717 wire format the
-    /// merged proof bytes live opaquely on `SignedBlock.proof` and are only
-    /// inspected by `verify_block_signatures`, so an empty blob suffices.
+    /// crypto verifier entirely. The merged proof bytes are only inspected by
+    /// `verify_block_signatures`, so an empty aggregate suffices.
     pub fn to_blank_signed_block(&self) -> SignedBlock {
         SignedBlock {
             message: self.to_block(),
-            proof: ByteList512KiB::default(),
+            proof: MultiMessageAggregate::default(),
         }
     }
 }

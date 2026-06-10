@@ -964,16 +964,7 @@ pub fn verify_block_signatures(
         u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
     expected_bindings.push((block_root, block_slot_u32));
 
-    // Strip the thin SSZ container wrapper to recover the raw lean-multisig
-    // Type-2 bytes the verifier consumes. The spec carries
-    // `signed_block.proof = [4-byte offset = 4][type2_wire]` so other clients
-    // can decode through the spec's `TypeTwoMultiSignature` SSZ container
-    // (leanSpec PR #717).
-    let merged_bytes = signed_block.merged_proof_bytes().map_err(|_| {
-        StoreError::AggregateVerificationFailed(
-            ethlambda_crypto::VerificationError::DeserializationFailed,
-        )
-    })?;
+    let merged_bytes = signed_block.proof.proof_bytes();
 
     let crypto_start = std::time::Instant::now();
     ethlambda_crypto::verify_type_2_signature(
@@ -1049,7 +1040,8 @@ mod tests {
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{
-            AggregatedAttestations, BlockBody, ByteList512KiB, SignedBlock, TypeOneMultiSignature,
+            AggregatedAttestations, BlockBody, MultiMessageAggregate, SignedBlock,
+            TypeOneMultiSignature,
         },
         checkpoint::Checkpoint,
         state::State,
@@ -1064,8 +1056,8 @@ mod tests {
     fn make_signed_block_proof(
         _proposer_index: u64,
         _attestation_proofs: Vec<TypeOneMultiSignature>,
-    ) -> ByteList512KiB {
-        ByteList512KiB::default()
+    ) -> MultiMessageAggregate {
+        MultiMessageAggregate::default()
     }
 
     fn make_bits(indices: &[usize]) -> AggregationBits {

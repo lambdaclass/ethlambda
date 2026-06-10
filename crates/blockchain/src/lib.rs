@@ -8,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteList512KiB, SignedBlock},
+    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
@@ -510,11 +510,9 @@ impl BlockChainServer {
         }
         merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        // Merge yields raw lean-multisig Type-2 bytes; wrap them in the
-        // thin SSZ container the spec uses (`[4-byte offset][type2_wire]`)
-        // before stashing into the block envelope (leanSpec PR #717 wire
-        // format). Per-component participants are rederived at verify time
-        // from `block.body.attestations[i].aggregation_bits` plus
+        // Merge yields raw lean-multisig Type-2 bytes. Per-component
+        // participants are rederived at verify time from
+        // `block.body.attestations[i].aggregation_bits` plus
         // `block.proposer_index`, so nothing else needs persisting.
         let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
             Ok(bytes) => bytes,
@@ -524,10 +522,10 @@ impl BlockChainServer {
                 return;
             }
         };
-        let proof_bytes = match SignedBlock::wrap_merged_proof(merged_bytes.iter().as_slice()) {
+        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
             Ok(p) => p,
             Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to wrap merged proof envelope");
+                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
                 metrics::inc_block_building_failures();
                 return;
             }
@@ -536,7 +534,7 @@ impl BlockChainServer {
         drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
-            proof: proof_bytes,
+            proof,
         };
 
         // Process the block locally before publishing

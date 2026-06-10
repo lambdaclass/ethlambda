@@ -118,13 +118,9 @@ pub fn reaggregate_from_block(
             Err(_) => continue,
         };
 
-        // Step 1: SNARK-split this attestation's component out of the
-        // block's merged Type-2 proof. Strip the SSZ container header so
-        // lean-multisig sees raw bytes.
-        let Ok(merged_bytes) = signed_block.merged_proof_bytes() else {
-            debug!("Reaggregation skipped: block proof envelope unusable");
-            return Vec::new();
-        };
+        // Step 1: SNARK-split this attestation's component out of the block's
+        // merged Type-2 proof.
+        let merged_bytes = signed_block.proof.proof_bytes();
         let split_bytes = match ethlambda_crypto::split_type_2_by_message(
             merged_bytes,
             pubkeys_per_component.clone(),

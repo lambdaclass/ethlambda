@@ -11,7 +11,7 @@
 //!     proof:  { proof: { data: "0x<hex-encoded merged Type-2 bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
-use ethlambda_types::block::SignedBlock;
+use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -123,15 +123,15 @@ impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
     /// Type-2 proof bytes verbatim.
     ///
-    /// The container carries the raw lean-multisig wire, so it gets wrapped
-    /// into the SSZ-container envelope that `SignedBlock.proof` stores.
+    /// The container carries the raw lean-multisig wire in the
+    /// `MultiMessageAggregate` stored by `SignedBlock.proof`.
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let bytes = self
             .proof
             .decode()
             .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
         let len = bytes.len();
-        let proof = SignedBlock::wrap_merged_proof(&bytes)
+        let proof = MultiMessageAggregate::from_bytes(&bytes)
             .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
         Ok(SignedBlock {
             message: self.block.into(),

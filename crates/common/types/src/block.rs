@@ -14,12 +14,6 @@ use primitives::HashTreeRoot as _;
 /// Envelope carrying a block and the single merged proof binding every
 /// signature it depends on.
 ///
-/// `proof` holds the SSZ-encoded form of a [`TypeTwoMultiSignature`]
-/// container whose only field is a `ByteList512KiB` holding the raw
-/// `compress_without_pubkeys()` Type-2 merged proof bytes. On the wire the
-/// container collapses to `[4-byte offset = 4][type2_wire]` — a thin
-/// 4-byte prefix in front of the lean-multisig bytes (leanSpec PR #717).
-///
 /// <div class="warning">
 ///
 /// `HashTreeRoot` is intentionally not derived: consumers never hash a
@@ -33,73 +27,16 @@ pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
 
-    /// SSZ-encoded `TypeTwoMultiSignature` envelope. Use
-    /// [`SignedBlock::merged_proof_bytes`] to extract the raw
-    /// lean-multisig Type-2 bytes inside, or
-    /// [`SignedBlock::wrap_merged_proof`] when building an envelope from
-    /// the prover output.
-    pub proof: ByteList512KiB,
+    /// Single full-block proof covering attestations and the proposer signature.
+    pub proof: MultiMessageAggregate,
 }
-
-impl SignedBlock {
-    /// Strip the SSZ-container offset header to return the raw
-    /// lean-multisig Type-2 merged proof bytes the verifier consumes.
-    pub fn merged_proof_bytes(&self) -> Result<&[u8], ProofEnvelopeError> {
-        let bytes = self.proof.iter().as_slice();
-        if bytes.len() < 4 {
-            return Err(ProofEnvelopeError::TruncatedEnvelope);
-        }
-        let mut header = [0u8; 4];
-        header.copy_from_slice(&bytes[..4]);
-        let offset = u32::from_le_bytes(header) as usize;
-        if offset != 4 {
-            return Err(ProofEnvelopeError::UnexpectedOffset(offset));
-        }
-        Ok(&bytes[4..])
-    }
-
-    /// Wrap raw lean-multisig Type-2 bytes into a `SignedBlock.proof`
-    /// envelope: prepend the 4-byte SSZ offset header so the wire matches
-    /// the spec's `TypeTwoMultiSignature { proof: ByteList512KiB }`
-    /// container.
-    pub fn wrap_merged_proof(type2_wire: &[u8]) -> Result<ByteList512KiB, ProofEnvelopeError> {
-        let mut wrapped = Vec::with_capacity(4 + type2_wire.len());
-        wrapped.extend_from_slice(&4u32.to_le_bytes());
-        wrapped.extend_from_slice(type2_wire);
-        let len = wrapped.len();
-        ByteList512KiB::try_from(wrapped).map_err(|_| ProofEnvelopeError::ExceedsCap(len))
-    }
-}
-
-/// Errors returned by the [`SignedBlock`] proof-envelope helpers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProofEnvelopeError {
-    /// Envelope is shorter than the 4-byte SSZ offset header.
-    TruncatedEnvelope,
-    /// Offset header is not the expected single-field value `4`.
-    UnexpectedOffset(usize),
-    /// Wrapped proof would exceed `ByteList512KiB`'s cap.
-    ExceedsCap(usize),
-}
-
-impl core::fmt::Display for ProofEnvelopeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::TruncatedEnvelope => f.write_str("block proof envelope truncated"),
-            Self::UnexpectedOffset(o) => write!(f, "block proof envelope offset {o}, expected 4"),
-            Self::ExceedsCap(n) => write!(f, "wrapped proof {n} bytes exceeds 512 KiB cap"),
-        }
-    }
-}
-
-impl std::error::Error for ProofEnvelopeError {}
 
 // Manual Debug impl because the merged proof bytes are large and opaque.
 impl core::fmt::Debug for SignedBlock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SignedBlock")
             .field("message", &self.message)
-            .field("proof", &format_args!("<{} bytes>", self.proof.len()))
+            .field("proof", &format_args!("<{} bytes>", self.proof.proof.len()))
             .finish()
     }
 }
@@ -107,6 +44,54 @@ impl core::fmt::Debug for SignedBlock {
 /// 512 KiB byte-list cap shared by every block-level / Type-1 proof field.
 /// Matches leanSpec PR #717's `ByteList512KiB` SSZ container.
 pub type ByteList512KiB = ByteList<524_288>;
+
+/// A merged proof covering multiple messages with a single proof blob.
+///
+/// The proof bytes use lean-multisig's compact public-key-free
+/// representation. SSZ encoding this container adds the offset required for
+/// its variable-length field.
+#[derive(Debug, Default, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+pub struct MultiMessageAggregate {
+    /// Serialized multi-message aggregate proof bytes.
+    pub proof: ByteList512KiB,
+}
+
+impl MultiMessageAggregate {
+    /// Build an aggregate from an already bounded proof byte list.
+    pub fn new(proof: ByteList512KiB) -> Self {
+        Self { proof }
+    }
+
+    /// Copy raw lean-multisig proof bytes into the bounded SSZ container.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MultiMessageAggregateError> {
+        let len = bytes.len();
+        ByteList512KiB::try_from(bytes.to_vec())
+            .map(Self::new)
+            .map_err(|_| MultiMessageAggregateError::ProofTooLarge(len))
+    }
+
+    /// Return the raw lean-multisig proof bytes.
+    pub fn proof_bytes(&self) -> &[u8] {
+        self.proof.iter().as_slice()
+    }
+}
+
+/// Errors returned when constructing a [`MultiMessageAggregate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiMessageAggregateError {
+    /// Proof bytes exceed `ByteList512KiB`'s cap.
+    ProofTooLarge(usize),
+}
+
+impl core::fmt::Display for MultiMessageAggregateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ProofTooLarge(n) => write!(f, "proof {n} bytes exceeds 512 KiB cap"),
+        }
+    }
+}
+
+impl std::error::Error for MultiMessageAggregateError {}
 
 // ============================================================================
 // Type-1 multi-signature
@@ -118,10 +103,10 @@ pub type ByteList512KiB = ByteList<524_288>;
 // from the surrounding block body (attestation `data` + slot for body
 // components, block root + slot for the proposer component).
 //
-// `TypeTwoMultiSignature` has no Rust-side struct: the block carries the
-// raw lean-multisig Type-2 bytes directly on `SignedBlock.proof`. Component
-// participant bitfields come from `block.body.attestations[i].aggregation_bits`
-// (and `block.proposer_index` for the trailing proposer entry).
+// `MultiMessageAggregate` carries the raw lean-multisig Type-2 bytes.
+// Component participant bitfields come from
+// `block.body.attestations[i].aggregation_bits` (and `block.proposer_index` for
+// the trailing proposer entry).
 
 /// Maximum number of distinct `AttestationData` entries permitted in a single
 /// block. Canonical home for the cap shared across `ethlambda-blockchain`,
@@ -322,15 +307,27 @@ mod tests {
         };
         let signed = SignedBlock {
             message: block,
-            proof: ByteList512KiB::default(),
+            proof: MultiMessageAggregate::default(),
         };
         let bytes = signed.to_ssz();
         let decoded = SignedBlock::from_ssz_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.proof.len(), 0);
+        assert_eq!(decoded.proof.proof.len(), 0);
         assert_eq!(decoded.message.slot, signed.message.slot);
         assert_eq!(
             decoded.message.proposer_index,
             signed.message.proposer_index
         );
+    }
+
+    #[test]
+    fn multi_message_aggregate_ssz_wraps_proof_bytes() {
+        let proof_bytes: Vec<u8> = (0..64).collect();
+        let aggregate = MultiMessageAggregate::from_bytes(&proof_bytes).unwrap();
+
+        let encoded = aggregate.to_ssz();
+
+        assert_eq!(&encoded[..4], &4u32.to_le_bytes());
+        assert_eq!(&encoded[4..], proof_bytes);
+        assert_eq!(aggregate.proof_bytes(), proof_bytes);
     }
 }
