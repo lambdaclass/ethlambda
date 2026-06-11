@@ -171,6 +171,14 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
         return;
     }
     let gap = status.head.slot - our_head_slot;
+    warn!(
+        %peer,
+        peer_head_slot = status.head.slot,
+        local_head_slot = our_head_slot,
+        slot_gap = gap,
+        "Peer status head is ahead of local head"
+    );
+
     let start_slot = our_head_slot.saturating_add(1);
     let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
 
