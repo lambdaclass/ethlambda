@@ -120,10 +120,8 @@ fn update_safe_target(store: &mut Store) {
 ///
 /// `descendant_header` is the descendant's already-fetched header, so the walk
 /// starts from its parent without re-reading it. Walks parent links down to the
-/// ancestor's slot, up to [`MAX_ANCESTRY_WALK_SLOTS`] steps. Empty (skipped)
-/// slots on the path are traversed transparently since they carry no block.
-/// Conservative: a block missing from the store, or exceeding the walk cap,
-/// yields `false`.
+/// ancestor's slot. Empty (skipped) slots on the path are traversed transparently
+/// since they carry no block. A block missing from the store yields `false`.
 fn checkpoint_is_ancestor(
     store: &Store,
     ancestor: &Checkpoint,
