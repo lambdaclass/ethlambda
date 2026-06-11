@@ -843,6 +843,16 @@ impl Store {
             .collect()
     }
 
+    /// Return the highest slot in the live chain.
+    pub fn max_live_chain_slot(&self) -> Option<u64> {
+        let view = self.backend.begin_read().expect("read view");
+        view.prefix_iterator(Table::LiveChain, &[])
+            .expect("iterator")
+            .filter_map(Result::ok)
+            .map(|(key, _)| decode_live_chain_key(&key).0)
+            .max()
+    }
+
     /// Get all known block roots as HashSet.
     ///
     /// Useful for checking block existence without deserializing.

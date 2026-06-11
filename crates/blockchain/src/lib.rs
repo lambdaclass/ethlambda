@@ -744,10 +744,7 @@ impl BlockChainServer {
 
     fn update_sync_status(&mut self, current_slot: u64) {
         let head_slot = self.store.head_slot();
-        let max_seen_slot = self
-            .store
-            .max_live_chain_slot()
-            .unwrap_or(head_slot);
+        let max_seen_slot = self.store.max_live_chain_slot().unwrap_or(head_slot);
         let status = self
             .sync_status
             .update(current_slot, head_slot, max_seen_slot);
