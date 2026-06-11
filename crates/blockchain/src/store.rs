@@ -116,12 +116,6 @@ fn update_safe_target(store: &mut Store) {
     store.set_safe_target(safe_target);
 }
 
-/// Maximum number of parent links [`checkpoint_is_ancestor`] walks before
-/// giving up. Bounds the per-attestation work on the gossip path; a vote whose
-/// source/target sits more than this many slots below the descendant is
-/// conservatively rejected.
-const MAX_ANCESTRY_WALK_SLOTS: u64 = 128;
-
 /// Return whether `ancestor` lies on `descendant`'s parent chain.
 ///
 /// `descendant_header` is the descendant's already-fetched header, so the walk
@@ -144,20 +138,11 @@ fn checkpoint_is_ancestor(
 
     // The descendant header is already in hand, so begin the walk at its parent.
     let mut current_root = descendant_header.parent_root;
-    let mut steps: u64 = 0;
     while let Some(current_header) = store.get_block_header(&current_root) {
         if current_header.slot == ancestor.slot {
             return current_root == ancestor.root;
         }
         if current_header.slot < ancestor.slot {
-            return false;
-        }
-        steps += 1;
-        if steps >= MAX_ANCESTRY_WALK_SLOTS {
-            warn!(
-                cap = MAX_ANCESTRY_WALK_SLOTS,
-                "Attestation ancestry walk exceeded cap, rejecting"
-            );
             return false;
         }
         current_root = current_header.parent_root;
