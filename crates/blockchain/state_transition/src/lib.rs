@@ -37,6 +37,13 @@ pub enum Error {
     },
     #[error("zero hash found in justifications_roots")]
     ZeroHashInJustificationRoots,
+    #[error("aggregated attestation has no participants")]
+    EmptyAggregationBits,
+    #[error("aggregation bit set at index {index} beyond validator count {validator_count}")]
+    AggregationBitsOutOfBounds {
+        index: usize,
+        validator_count: usize,
+    },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -276,20 +283,32 @@ fn process_attestations(
             continue;
         }
 
+        // The spec asserts that an aggregated attestation references at least
+        // one validator; the failed assert invalidates the whole block.
+        if attestation.aggregation_bits.count_ones() == 0 {
+            return Err(Error::EmptyAggregationBits);
+        }
+
+        // The spec indexes the per-root vote list with each participant index,
+        // so a set bit beyond the validator set crashes it (IndexError) and
+        // invalidates the whole block; Zeam and Lantern also reject such
+        // blocks. The spec has no bitlist length check: oversized
+        // aggregation_bits whose set bits are all in range process normally.
+        let oob_bit = (validator_count..attestation.aggregation_bits.len())
+            .find(|&i| attestation.aggregation_bits.get(i) == Some(true));
+        if let Some(index) = oob_bit {
+            return Err(Error::AggregationBitsOutOfBounds {
+                index,
+                validator_count,
+            });
+        }
+
         // Record the vote
         attestations_processed += 1;
         let votes = justifications
             .entry(target.root)
             .or_insert_with(|| std::iter::repeat_n(false, validator_count).collect());
-        // Reject attestations with aggregation_bits longer than the validator set.
-        // The spec would crash (IndexError) on OOB access; Zeam and Lantern reject.
-        if attestation.aggregation_bits.len() > validator_count {
-            warn!(
-                bits_len = attestation.aggregation_bits.len(),
-                validator_count, "Skipping attestation: aggregation_bits exceeds validator count"
-            );
-            continue;
-        }
+
         // Mark that each validator in this aggregation has voted for the target.
         for (validator_id, voted) in votes
             .iter_mut()

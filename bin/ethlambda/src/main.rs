@@ -735,7 +735,7 @@ mod tests {
     use super::*;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
-    /// (devnet-4) where networks share a non-default committee count.
+    /// where networks share a non-default committee count.
     const VC_WITH_COMMITTEE_COUNT: &str = r#"
 shuffle: roundrobin
 deployment_mode: ansible
