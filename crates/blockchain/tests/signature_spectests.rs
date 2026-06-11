@@ -13,6 +13,12 @@ use ethlambda_test_fixtures::verify_signatures::VerifySignaturesTestVector;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 
+/// Tests that require cryptographic signature verification at block level.
+///
+/// Block-level crypto verification is now wired through lean-multisig devnet5's
+/// `verify_type_2`, so every fixture is exercised against the real primitive.
+const SKIP_TESTS: &[&str] = &[];
+
 fn run(path: &Path) -> datatest_stable::Result<()> {
     let tests = VerifySignaturesTestVector::from_file(path)?;
 
@@ -23,6 +29,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
             )
             .into());
+        }
+
+        if SKIP_TESTS.iter().any(|skip| name.contains(skip)) {
+            println!("Skipping test (Phase-3 crypto stub): {name}");
+            continue;
         }
 
         println!("Running test: {}", name);

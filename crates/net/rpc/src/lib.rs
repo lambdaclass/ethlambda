@@ -494,8 +494,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
-            attestation::blank_xmss_signature,
-            block::{Block, BlockBody, BlockSignatures, SignedBlock},
+            block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
         };
@@ -505,7 +504,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(backend, state);
 
-        // Build a non-genesis signed block with empty body and zero proposer signature.
+        // Build a non-genesis signed block with empty body and empty proof blob.
         let block = Block {
             slot: 1,
             proposer_index: 0,
@@ -516,10 +515,7 @@ mod tests {
         let block_root = block.header().hash_tree_root();
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                attestation_signatures: Default::default(),
-                proposer_signature: blank_xmss_signature(),
-            },
+            proof: MultiMessageAggregate::default(),
         };
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
@@ -558,34 +554,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_signature() {
-        use ethlambda_types::{
-            attestation::blank_xmss_signature,
-            block::{BlockSignatures, SignedBlock},
-        };
+    async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_proof() {
+        use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
         use libssz::SszEncode;
 
         // Genesis-anchored store: `init_store` writes the header + state but no
-        // `BlockSignatures` row. `get_signed_block` synthesizes an empty
-        // `BlockSignatures` so peers can still receive the genesis block on
-        // BlocksByRoot; the HTTP endpoint stays consistent and returns 200
-        // rather than 404.
+        // `BlockSignatures` (proof) row. `get_signed_block` synthesizes an empty
+        // proof so peers can still receive the genesis block on BlocksByRoot;
+        // the HTTP endpoint stays consistent and returns 200 rather than 404.
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
 
         // The body the endpoint serves must round-trip to a `SignedBlock`
-        // matching the genesis header paired with the synthetic blank
-        // signatures — same shape `get_signed_block` builds in storage.
+        // matching the genesis header paired with the synthetic blank proof —
+        // same shape `get_signed_block` builds in storage.
         let genesis_block = store
             .get_signed_block(&store.latest_finalized().root)
             .expect("genesis served via get_signed_block");
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
-            signature: BlockSignatures {
-                attestation_signatures: Default::default(),
-                proposer_signature: blank_xmss_signature(),
-            },
+            proof: MultiMessageAggregate::default(),
         };
         let expected_ssz = expected.to_ssz();
 

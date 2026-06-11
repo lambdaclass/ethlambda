@@ -19,6 +19,6 @@ use serde::Deserialize;
 pub struct StateTransitionRunRequest {
     pub pre: TestState,
     pub blocks: Vec<Block>,
-    #[serde(default, rename = "expectException")]
+    #[serde(default, rename = "expectException", alias = "rejectionReason")]
     pub expect_exception: Option<String>,
 }

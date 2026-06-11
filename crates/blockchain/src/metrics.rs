@@ -514,6 +514,33 @@ static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::Lazy
     register_int_gauge_vec!("lean_node_sync_status", "Node sync status", &["status"]).unwrap()
 });
 
+// --- Aggregator Skips ---
+
+/// Cross-client label set for `lean_aggregator_skipped_total` (leanMetrics).
+///
+/// `not_synced`, `missing_state` and `spawn_failed` never fire in ethlambda
+/// today: aggregation is not gated on sync status, needs no per-target
+/// pre-state resolution, and the `spawn_blocking` worker cannot fail to
+/// start. They are seeded at zero so fleet-wide dashboards see the full
+/// series.
+const AGGREGATOR_SKIP_REASONS: &[&str] = &[
+    "not_aggregator",
+    "not_synced",
+    "missing_state",
+    "spawn_failed",
+    "other",
+];
+
+static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_aggregator_skipped_total",
+            "Aggregation submissions skipped, by reason",
+            &["reason"]
+        )
+        .unwrap()
+    });
+
 // --- Initialization ---
 
 /// Register all metrics with the Prometheus registry so they appear in `/metrics` from startup.
@@ -589,6 +616,13 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED);
     // Sync status
     std::sync::LazyLock::force(&LEAN_NODE_SYNC_STATUS);
+    // Aggregator skip counter: instantiate every cross-client reason so the
+    // full series is visible from startup, including reasons ethlambda
+    // never fires.
+    std::sync::LazyLock::force(&LEAN_AGGREGATOR_SKIPPED_TOTAL);
+    for &reason in AGGREGATOR_SKIP_REASONS {
+        LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
+    }
 }
 
 // --- Public API ---
@@ -724,6 +758,23 @@ pub fn observe_aggregated_proof_size(bytes: usize) {
 /// drop-guard that crosses the thread boundary is not appropriate here.
 pub fn observe_committee_signatures_aggregation(elapsed: std::time::Duration) {
     LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS.observe(elapsed.as_secs_f64());
+}
+
+/// One aggregation cycle (interval-2 tick) skipped because this node has no
+/// aggregation duty. Bookkeeping label that lets dashboards separate "no
+/// duty" from genuine misses.
+pub fn inc_aggregator_skipped_not_aggregator() {
+    LEAN_AGGREGATOR_SKIPPED_TOTAL
+        .with_label_values(&["not_aggregator"])
+        .inc();
+}
+
+/// Aggregation jobs dropped without being attempted, e.g. because the
+/// session deadline cancelled the worker before it reached them.
+pub fn inc_aggregator_skipped_other(count: u64) {
+    LEAN_AGGREGATOR_SKIPPED_TOTAL
+        .with_label_values(&["other"])
+        .inc_by(count);
 }
 
 /// Update a table byte size gauge.
