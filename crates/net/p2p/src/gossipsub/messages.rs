@@ -9,6 +9,10 @@ pub const FORK_DIGEST: &str = "12345678";
 
 /// Topic kind for block gossip
 pub const BLOCK_TOPIC_KIND: &str = "block";
+
+/// Topic kind for heartbeat gossip
+pub const HEARTBEAT_TOPIC_KIND: &str = "heartbeat";
+
 /// Topic kind prefix for per-committee attestation subnets.
 ///
 /// Full topic format: `/leanconsensus/{FORK_DIGEST}/attestation_{subnet_id}/ssz_snappy`
@@ -36,5 +40,12 @@ pub fn aggregation_topic() -> libp2p::gossipsub::IdentTopic {
 pub fn attestation_subnet_topic(subnet_id: u64) -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!(
         "/leanconsensus/{FORK_DIGEST}/{ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet_id}/ssz_snappy"
+    ))
+}
+
+/// Build a heartbeat gossipsub topic.
+pub fn heartbeat_topic() -> libp2p::gossipsub::IdentTopic {
+    libp2p::gossipsub::IdentTopic::new(format!(
+        "/leanconsensus/{FORK_DIGEST}/{HEARTBEAT_TOPIC_KIND}/ssz_snappy"
     ))
 }

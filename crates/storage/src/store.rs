@@ -36,6 +36,8 @@ pub enum GetForkchoiceStoreError {
 /// allowing us to skip storing empty bodies and reconstruct them on read.
 static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().hash_tree_root());
 
+const INTERVALS_PER_SLOT: u64 = 5;
+
 /// Checkpoints to update in the forkchoice store.
 ///
 /// Used with `Store::update_checkpoints` to update head and optionally
@@ -493,6 +495,8 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
+    /// List of votes observed in the last [`RLMD_LOOKBACK_LIMIT`] slots.
+    votes_per_slot: Arc<Mutex<BTreeMap<u64, HashMap<u64, AttestationData>>>>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
@@ -564,6 +568,7 @@ impl Store {
         info!("Loaded store from persisted DB state");
         Some(Self {
             backend,
+            votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -661,6 +666,7 @@ impl Store {
 
         Self {
             backend,
+            votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -778,12 +784,17 @@ impl Store {
         {
             let pruned_chain = self.prune_live_chain(finalized.slot);
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+            let pruned_votes = self.prune_heartbeat_votes(finalized.slot);
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
             if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
+                    pruned_chain,
+                    pruned_sigs,
+                    pruned_votes,
+                    pruned_payloads,
+                    "Pruned finalized data"
                 );
             }
         }
@@ -894,6 +905,16 @@ impl Store {
     pub fn prune_gossip_signatures(&mut self, finalized_slot: u64) -> usize {
         let mut gossip = self.gossip_signatures.lock().unwrap();
         gossip.prune(finalized_slot)
+    }
+
+    /// Prune heartbeat votes for slots <= finalized_slot.
+    ///
+    /// Returns the number of entries pruned.
+    pub fn prune_heartbeat_votes(&mut self, finalized_slot: u64) -> usize {
+        let mut votes_per_slot = self.votes_per_slot.lock().unwrap();
+        let initial_len = votes_per_slot.len();
+        votes_per_slot.retain(|slot, _| *slot >= finalized_slot);
+        initial_len - votes_per_slot.len()
     }
 
     /// Prune aggregated payload buffers (new + known) whose target slot is at or below
@@ -1169,6 +1190,16 @@ impl Store {
             .extract_latest_attestations()
     }
 
+    pub fn get_last_slot_votes(&self) -> HashMap<u64, AttestationData> {
+        let current_slot = self.time() / INTERVALS_PER_SLOT;
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .get(&current_slot)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     // ============ Known Aggregated Payloads ============
     //
     // "Known" aggregated payloads are active in fork choice weight calculations.
@@ -1352,6 +1383,15 @@ impl Store {
         gossip.insert(hashed, validator_id, signature);
     }
 
+    pub fn insert_heartbeat_vote(&self, validator_id: u64, data: AttestationData) {
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .entry(data.slot)
+            .or_default()
+            .insert(validator_id, data);
+    }
+
     // ============ Derived Accessors ============
 
     /// Returns the slot of the current head block.
@@ -1481,6 +1521,7 @@ mod tests {
             let backend = Arc::new(InMemoryBackend::new());
             Self {
                 backend,
+                votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -1494,6 +1535,7 @@ mod tests {
         fn test_store_with_backend(backend: Arc<InMemoryBackend>) -> Self {
             Self {
                 backend,
+                votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(

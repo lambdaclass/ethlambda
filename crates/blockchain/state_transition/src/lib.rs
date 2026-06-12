@@ -13,6 +13,8 @@ use tracing::{info, warn};
 pub mod justified_slots_ops;
 pub mod metrics;
 
+pub const HEARTBEAT_COMMITTEE_SIZE: usize = 4;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("target slot {target_slot} is in the past (current is {current_slot})")]
@@ -229,6 +231,21 @@ fn current_proposer(slot: u64, num_validators: u64) -> Option<u64> {
 /// Proposer selection uses simple round-robin: `slot % num_validators`.
 pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool {
     current_proposer(slot, num_validators) == Some(validator_index)
+}
+
+/// Check if a validator is part of the heartbeat committee for a given slot.
+///
+/// The heartbeat committee is formed by the proposer and the next N validators.
+pub fn is_heartbeat_committee_member(validator_index: u64, slot: u64, num_validators: u64) -> bool {
+    let Some(proposer) = current_proposer(slot, num_validators) else {
+        return false;
+    };
+    for i in 0..HEARTBEAT_COMMITTEE_SIZE as u64 {
+        if validator_index == (proposer + i) % num_validators {
+            return true;
+        }
+    }
+    false
 }
 
 /// Apply attestations and update justification/finalization
