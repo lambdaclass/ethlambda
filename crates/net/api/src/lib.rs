@@ -13,6 +13,10 @@ use spawned_concurrency::protocol;
 pub trait BlockChainToP2P: Send + Sync {
     fn publish_block(&self, block: SignedBlock) -> Result<(), ActorError>;
     fn publish_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    fn publish_heartbeat_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<(), ActorError>;
     fn publish_aggregated_attestation(
         &self,
         attestation: SignedAggregatedAttestation,

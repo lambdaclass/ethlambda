@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
+use ethlambda_state_transition::{
+    is_heartbeat_committee_member, is_proposer, slot_is_justifiable_after,
+};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -39,7 +41,7 @@ fn accept_new_attestations(store: &mut Store, log_tree: bool) {
 /// fork choice tree to the terminal.
 pub fn update_head(store: &mut Store, log_tree: bool) {
     let blocks = store.get_live_chain();
-    let attestations = store.extract_latest_known_attestations();
+    let attestations = store.get_last_slot_votes();
     let old_head = store.head();
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
@@ -339,6 +341,12 @@ pub fn on_gossip_attestation(
         return Err(StoreError::SignatureVerificationFailed);
     }
     metrics::inc_pq_sig_attestation_signatures_valid();
+
+    let num_validators = target_state.validators.len() as u64;
+    // If the validator is in the heartbeat committee, persist the vote for fork choice usage.
+    if is_heartbeat_committee_member(validator_id, attestation.data.slot, num_validators) {
+        store.insert_heartbeat_vote(validator_id, attestation.data.clone());
+    }
 
     // Only aggregators persist the signature for later aggregation at
     // interval 2. Non-aggregators drop the validated attestation — they
