@@ -117,3 +117,130 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  docker_build:
+    name: Build Docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ethlambda Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+          push: false
+          tags: ghcr.io/lambdaclass/ethlambda:devnet4
+          outputs: type=docker,dest=/tmp/ethlambda_image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ethlambda_image
+          path: /tmp/ethlambda_image.tar
+
+  run-hive:
+    name: Hive - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: docker_build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Lean RPC Compat"
+            limit: "rpc-compat"
+            artifact_prefix: lean_rpc_compat
+          - name: "Lean Sync"
+            limit: "sync"
+            artifact_prefix: lean_sync
+          - name: "Lean Client Interop"
+            limit: "client-interop"
+            artifact_prefix: lean_client_interop
+          - name: "Lean Validation"
+            limit: "validation"
+            artifact_prefix: lean_validation
+          - name: "Lean Gossip"
+            limit: "gossip"
+            artifact_prefix: lean_gossip
+          - name: "Lean ReqResp"
+            limit: "reqresp"
+            artifact_prefix: lean_reqresp
+          - name: "Lean Fork Choice Spec Tests"
+            limit: "lean-spec-tests-fork-choice"
+            artifact_prefix: lean_spec_fork_choice
+          - name: "Lean State Transition Spec Tests"
+            limit: "lean-spec-tests-state-transition"
+            artifact_prefix: lean_spec_state_transition
+          - name: "Lean Verify Signatures Spec Tests"
+            limit: "lean-spec-tests-verify-signatures"
+            artifact_prefix: lean_spec_verify_signatures
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ethlambda image artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: ethlambda_image
+          path: /tmp
+
+      - name: Load image
+        run: docker load --input /tmp/ethlambda_image.tar
+
+      - name: Load hive client config
+        id: client-config
+        shell: bash
+        run: |
+          {
+            echo "config<<EOF"
+            cat .github/config/hive/clients.yaml
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Determine hive flags
+        id: hive-flags
+        shell: bash
+        env:
+          SIM_LIMIT: ${{ matrix.limit }}
+        run: |
+          FLAGS="--sim.parallelism 4 --sim.loglevel 3"
+          if [[ -n "$SIM_LIMIT" ]]; then
+            escaped_limit=${SIM_LIMIT//\'/\'\\\'\'}
+            FLAGS+=" --sim.limit '$escaped_limit'"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Run Hive Simulation
+        uses: ethpandaops/hive-github-action@1aa8d73dad34de13afbb3113ab16c1a462d2fbc3 # v0.5.0
+        with:
+          hive_repository: ethereum/hive
+          hive_version: 6f704d0cd8fb4dfd3f635abcc5a3ea6cd395e61b
+          simulator: lean
+          client: ethlambda
+          client_config: ${{ steps.client-config.outputs.config }}
+          extra_flags: ${{ steps.hive-flags.outputs.flags }}
+
+      - name: Check Hive Results For Failures
+        id: verify-hive-results
+        if: ${{ success() }}
+        shell: bash
+        run: bash ./.github/scripts/check-hive-results.sh src/results
+
+      - name: Upload Hive Failure Logs
+        if: ${{ failure() && steps.verify-hive-results.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hive_failed_logs_${{ matrix.artifact_prefix }}
+          path: src/results/failed_logs
+          if-no-files-found: warn
