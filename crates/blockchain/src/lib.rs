@@ -18,6 +18,7 @@ use crate::aggregation::{
     AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
+use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
@@ -35,6 +36,7 @@ pub mod key_manager;
 pub mod metrics;
 pub mod reaggregate;
 pub mod store;
+mod sync_status;
 
 pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,
