@@ -1,0 +1,80 @@
+name: Daily CI Test
+
+on:
+  schedule:
+    # Every day at 12:00 UTC.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Slack channel to post to (test channel or prod)"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - prod
+
+# Allow one daily run at a time; don't cancel an in-progress run.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run fixture-based tests
+        uses: ./.github/actions/run-fixture-tests
+
+  notify:
+    name: Post result to Slack
+    needs: test
+    # Run even when the test job fails or is cancelled, so we always report.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build Slack payload
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          case "$TEST_RESULT" in
+            success)   emoji="✅"; status="passed";;
+            failure)   emoji="❌"; status="FAILED";;
+            cancelled) emoji="⚠️"; status="was cancelled";;
+            *)         emoji="❔"; status="finished with status \`$TEST_RESULT\`";;
+          esac
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat > ci_result_slack.json <<EOF
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "$emoji *Daily CI Test* $status on \`${{ github.ref_name }}\`\n<$run_url|View run #${{ github.run_number }}>"
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: >-
+            ${{ (github.event_name == 'schedule' || inputs.target == 'prod')
+                && secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK
+                || secrets.ETHLAMBDA_TEST_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_slack.sh ci_result_slack.json
