@@ -412,9 +412,6 @@ fn on_gossip_aggregated_attestation_core(
     let num_validators = validators.len() as u64;
 
     let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
-    // An aggregate must name at least one signer. The spec rejects empty
-    // participants (EMPTY_AGGREGATION_BITS) when resolving validator indices,
-    // before any bounds check or signature verification.
     if participant_indices.is_empty() {
         return Err(StoreError::EmptyAggregationBits);
     }
