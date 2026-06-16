@@ -62,6 +62,9 @@ jobs:
             cancelled) emoji="⚠️"; status="was cancelled";;
             *)         emoji="❔"; status="finished with status \`$TEST_RESULT\`";;
           esac
+          # The backticks below are literal Slack mrkdwn, not command
+          # substitution, so SC2016's single-quote warning is a false positive.
+          # shellcheck disable=SC2016
           text=$(printf '%s *Daily CI Test* %s on `%s`\n<%s|View run #%s>' \
             "$emoji" "$status" "$REF_NAME" "$RUN_URL" "$RUN_NUMBER")
           jq -n --arg text "$text" \
