@@ -52,7 +52,17 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         metrics::observe_fork_choice_reorg_depth(depth);
         info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
-    store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+
+    // Keep the finalized checkpoint on the head's chain (leanSpec `update_head`).
+    //
+    // Finalization is *not* a monotonic max over everything ever seen: it is
+    // derived from the chosen head's post-state and pinned to the block at that
+    // slot on the head's own ancestry. When fork choice switches to a fork that
+    // finalized less than a now-losing fork, finalized must follow the head
+    // downward rather than latch the higher value (which would let a losing
+    // fork's finalization persist on a chain that never contained it).
+    let finalized = recompute_finalized(store, new_head);
+    store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
 
     if old_head != new_head {
         let old_slot = store
@@ -86,6 +96,33 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         );
         info!("\n{tree}");
     }
+}
+
+/// Resolve the finalized checkpoint that sits on `head`'s chain.
+///
+/// Mirrors leanSpec `update_head`: take the finalized slot recorded in the
+/// head's post-state, then climb the head's parent chain to the block at that
+/// slot. Returns `None` (caller keeps the existing checkpoint) when no block is
+/// stored at that slot, which happens only for a checkpoint-sync anchor whose
+/// pre-anchor history is absent.
+fn recompute_finalized(store: &Store, head: H256) -> Option<Checkpoint> {
+    let finalized_slot = store.get_state(&head)?.latest_finalized.slot;
+
+    let mut finalized_root = head;
+    while let Some(header) = store.get_block_header(&finalized_root) {
+        if header.slot <= finalized_slot {
+            break;
+        }
+        finalized_root = header.parent_root;
+    }
+
+    store
+        .get_block_header(&finalized_root)
+        .filter(|header| header.slot == finalized_slot)
+        .map(|_| Checkpoint {
+            root: finalized_root,
+            slot: finalized_slot,
+        })
 }
 
 /// Update the safe target for attestation.
@@ -406,6 +443,12 @@ fn on_gossip_aggregated_attestation_core(
     let num_validators = validators.len() as u64;
 
     let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
+    // An aggregate must name at least one signer. The spec rejects empty
+    // participants (EMPTY_AGGREGATION_BITS) when resolving validator indices,
+    // before any bounds check or signature verification.
+    if participant_indices.is_empty() {
+        return Err(StoreError::EmptyAggregationBits);
+    }
     if participant_indices.iter().any(|&vid| vid >= num_validators) {
         return Err(StoreError::InvalidValidatorIndex);
     }
@@ -547,14 +590,14 @@ fn on_block_core(
     let state_root = block.state_root;
     post_state.latest_block_header.state_root = state_root;
 
-    // Update justified/finalized checkpoints if they have higher slots
+    // Advance the justified checkpoint when the post-state names a higher one
+    // (leanSpec `advance_to`: monotonic by slot). Finalized is intentionally not
+    // latched here; it is recomputed from the head's chain in `update_head`.
     let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
         .then_some(post_state.latest_justified);
-    let finalized = (post_state.latest_finalized.slot > store.latest_finalized().slot)
-        .then_some(post_state.latest_finalized);
 
-    if justified.is_some() || finalized.is_some() {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
+    if let Some(justified) = justified {
+        store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
     }
 
     // Store signed block and state
@@ -865,6 +908,9 @@ pub enum StoreError {
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
+
+    #[error("Aggregated attestation references no participants")]
+    EmptyAggregationBits,
 
     #[error("Validator {validator_index} is not the proposer for slot {slot}")]
     NotProposer { validator_index: u64, slot: u64 },
