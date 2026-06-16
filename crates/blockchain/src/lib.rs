@@ -630,10 +630,6 @@ impl BlockChainServer {
     }
 
     /// Run block import and refresh metrics.
-    ///
-    /// Sync status is owned solely by [`SyncStatusTracker`], refreshed on each
-    /// tick via [`Self::update_sync_status`], so this path does not touch
-    /// `lean_node_sync_status`.
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
         store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
