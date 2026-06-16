@@ -100,29 +100,22 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
 
 /// Resolve the finalized checkpoint that sits on `head`'s chain.
 ///
-/// Mirrors leanSpec `update_head`: take the finalized slot recorded in the
-/// head's post-state, then climb the head's parent chain to the block at that
-/// slot. Returns `None` (caller keeps the existing checkpoint) when no block is
-/// stored at that slot, which happens only for a checkpoint-sync anchor whose
-/// pre-anchor history is absent.
+/// Mirrors leanSpec `update_head`: the finalized checkpoint is the one recorded
+/// in the head's post-state. That checkpoint's root is, by construction, an
+/// ancestor of `head` (the state was produced by a transition over `head`'s
+/// own history), so it always stays on the canonical chain.
+///
+/// Returns `None` (caller keeps the existing checkpoint) when the finalized
+/// block is not in the store. This happens only for a checkpoint-sync anchor
+/// whose pre-anchor history we never downloaded, or before any block has
+/// finalized (genesis post-state names the zero root).
 fn recompute_finalized(store: &Store, head: H256) -> Option<Checkpoint> {
-    let finalized_slot = store.get_state(&head)?.latest_finalized.slot;
+    let finalized = store.get_state(&head)?.latest_finalized;
 
-    let mut finalized_root = head;
-    while let Some(header) = store.get_block_header(&finalized_root) {
-        if header.slot <= finalized_slot {
-            break;
-        }
-        finalized_root = header.parent_root;
-    }
+    // Confirm the finalized block actually exists in the DB before adopting it.
+    store.get_block_header(&finalized.root)?;
 
-    store
-        .get_block_header(&finalized_root)
-        .filter(|header| header.slot == finalized_slot)
-        .map(|_| Checkpoint {
-            root: finalized_root,
-            slot: finalized_slot,
-        })
+    Some(finalized)
 }
 
 /// Update the safe target for attestation.
