@@ -629,30 +629,18 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    /// Run block import, refresh metrics, and report whether the node is in
-    /// sync with the wall-clock slot after the import.
-    fn process_block(&mut self, signed_block: SignedBlock) -> Result<bool, StoreError> {
+    /// Run block import and refresh metrics.
+    fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
         store::on_block(&mut self.store, signed_block)?;
-        let head_slot = self.store.head_slot();
-        metrics::update_head_slot(head_slot);
+        metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
 
-        // Update sync status based on head slot vs wall clock slot
-        let current_slot = self.store.time() / INTERVALS_PER_SLOT;
-        let synced = head_slot >= current_slot;
-        let status = if synced {
-            metrics::SyncStatus::Synced
-        } else {
-            metrics::SyncStatus::Syncing
-        };
-        metrics::set_node_sync_status(status);
-
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
-        Ok(synced)
+        Ok(())
     }
 
     /// Process a newly received block.
@@ -775,7 +763,7 @@ impl BlockChainServer {
         // `process_block` consumes the original for the storage layer.
         let block_for_reaggregate = signed_block.clone();
         match self.process_block(signed_block) {
-            Ok(synced) => {
+            Ok(()) => {
                 info!(
                     %slot,
                     proposer,
@@ -787,11 +775,8 @@ impl BlockChainServer {
                 // Recover per-attestation Type-1 proofs from the block's
                 // merged Type-2 and fold them into the local pool. Only
                 // run when the chain is in sync — backfilling nodes must
-                // not spam gossip with rederived aggregates. Non-validator
-                // nodes still benefit from the store update because the
-                // recovered proofs feed fork choice on the next acceptance
-                // tick.
-                if synced {
+                // not spam gossip with rederived aggregates.
+                if self.sync_status.duties_allowed() {
                     self.run_reaggregate_from_block(&block_for_reaggregate);
                 }
 
