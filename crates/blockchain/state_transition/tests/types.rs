@@ -82,6 +82,10 @@ pub struct PostState {
     #[serde(rename = "validatorCount")]
     pub validator_count: Option<u64>,
 
+    /// Full validator registry check: each entry's index and public keys must
+    /// match the post-state registry exactly.
+    pub validators: Option<Container<Validator>>,
+
     // Label-based root checks: "block_N" labels resolved to hash_tree_root of the Nth block.
     #[serde(rename = "latestJustifiedRootLabel")]
     pub latest_justified_root_label: Option<String>,

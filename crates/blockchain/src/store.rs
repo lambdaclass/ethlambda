@@ -52,7 +52,13 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         metrics::observe_fork_choice_reorg_depth(depth);
         info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
-    store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+
+    // Override the store's latest finalized with the head state's
+    let finalized = store
+        .get_state(&new_head)
+        .map(|state| state.latest_finalized)
+        .filter(|finalized| store.get_block_header(&finalized.root).is_some());
+    store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
 
     if old_head != new_head {
         let old_slot = store
@@ -406,6 +412,9 @@ fn on_gossip_aggregated_attestation_core(
     let num_validators = validators.len() as u64;
 
     let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
+    if participant_indices.is_empty() {
+        return Err(StoreError::EmptyAggregationBits);
+    }
     if participant_indices.iter().any(|&vid| vid >= num_validators) {
         return Err(StoreError::InvalidValidatorIndex);
     }
@@ -547,14 +556,14 @@ fn on_block_core(
     let state_root = block.state_root;
     post_state.latest_block_header.state_root = state_root;
 
-    // Update justified/finalized checkpoints if they have higher slots
+    // Advance the justified checkpoint when the post-state names a higher one
+    // (leanSpec `advance_to`: monotonic by slot). Finalized is intentionally not
+    // latched here; it is recomputed from the head's chain in `update_head`.
     let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
         .then_some(post_state.latest_justified);
-    let finalized = (post_state.latest_finalized.slot > store.latest_finalized().slot)
-        .then_some(post_state.latest_finalized);
 
-    if justified.is_some() || finalized.is_some() {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
+    if let Some(justified) = justified {
+        store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
     }
 
     // Store signed block and state
@@ -865,6 +874,9 @@ pub enum StoreError {
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
+
+    #[error("Aggregated attestation references no participants")]
+    EmptyAggregationBits,
 
     #[error("Validator {validator_index} is not the proposer for slot {slot}")]
     NotProposer { validator_index: u64, slot: u64 },
