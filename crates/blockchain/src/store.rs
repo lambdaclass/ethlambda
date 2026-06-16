@@ -53,21 +53,7 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
 
-    // Keep the finalized checkpoint on the head's chain (leanSpec `update_head`).
-    //
-    // Finalization is *not* a monotonic max over everything ever seen: it is the
-    // checkpoint recorded in the chosen head's post-state. That root is, by
-    // construction, an ancestor of the head (the state was produced by a
-    // transition over the head's own history), so it always stays on the
-    // canonical chain. When fork choice switches to a fork that finalized less
-    // than a now-losing fork, finalized must follow the head downward rather
-    // than latch the higher value (which would let a losing fork's finalization
-    // persist on a chain that never contained it).
-    //
-    // Adopt it only when the finalized block is actually in the DB. It is absent
-    // for a checkpoint-sync anchor whose pre-anchor history we never downloaded,
-    // or before any block has finalized (genesis post-state names the zero
-    // root); in those cases keep the existing checkpoint.
+    // Override the store's latest finalized with the head state's
     let finalized = store
         .get_state(&new_head)
         .map(|state| state.latest_finalized)
