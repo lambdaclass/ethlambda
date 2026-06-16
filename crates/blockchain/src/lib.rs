@@ -775,11 +775,7 @@ impl BlockChainServer {
                 // Recover per-attestation Type-1 proofs from the block's
                 // merged Type-2 and fold them into the local pool. Only
                 // run when the chain is in sync — backfilling nodes must
-                // not spam gossip with rederived aggregates. Reuse the sync
-                // gate that governs validator duties so "in sync" has a single
-                // spec-aligned definition. Non-validator nodes still benefit
-                // from the store update because the recovered proofs feed fork
-                // choice on the next acceptance tick.
+                // not spam gossip with rederived aggregates.
                 if self.sync_status.duties_allowed() {
                     self.run_reaggregate_from_block(&block_for_reaggregate);
                 }
