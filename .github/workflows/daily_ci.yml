@@ -47,8 +47,14 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Build Slack payload
+        # Context values are passed through the environment (never interpolated
+        # directly into the script) and the JSON is assembled with `jq`, so a
+        # ref name containing `"`, `\`, or a newline can't break the payload.
         env:
           TEST_RESULT: ${{ needs.test.result }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           case "$TEST_RESULT" in
             success)   emoji="✅"; status="passed";;
@@ -56,20 +62,11 @@ jobs:
             cancelled) emoji="⚠️"; status="was cancelled";;
             *)         emoji="❔"; status="finished with status \`$TEST_RESULT\`";;
           esac
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          cat > ci_result_slack.json <<EOF
-          {
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "$emoji *Daily CI Test* $status on \`${{ github.ref_name }}\`\n<$run_url|View run #${{ github.run_number }}>"
-                }
-              }
-            ]
-          }
-          EOF
+          text=$(printf '%s *Daily CI Test* %s on `%s`\n<%s|View run #%s>' \
+            "$emoji" "$status" "$REF_NAME" "$RUN_URL" "$RUN_NUMBER")
+          jq -n --arg text "$text" \
+            '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
+            > ci_result_slack.json
 
       - name: Post to Slack
         env:
