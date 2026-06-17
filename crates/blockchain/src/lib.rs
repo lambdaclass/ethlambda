@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_ethrex_client::{ExecutionEngine, PayloadId};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -9,6 +11,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
@@ -30,6 +33,7 @@ use crate::store::StoreError;
 pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
+mod el_integration;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -129,6 +133,8 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        execution_client: Option<Arc<dyn ExecutionEngine>>,
+        suggested_fee_recipient: [u8; 20],
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -154,6 +160,9 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
+            execution_client,
+            suggested_fee_recipient,
+            pending_payload_id: None,
             sync_status: SyncStatusTracker::default(),
         }
         .start();
@@ -219,6 +228,40 @@ pub struct BlockChainServer {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
+    /// Optional Engine API client to the execution layer (e.g. ethrex).
+    ///
+    /// Present only when ethlambda was started with `--execution-endpoint`
+    /// and `--execution-jwt-secret`. When set, the actor drives the full
+    /// payload pipeline against the EL: a per-slot `engine_forkchoiceUpdatedV3`
+    /// keeps the EL informed of our head/justified/finalized; at interval 4 a
+    /// build-mode FCU (with `PayloadAttributes`) requests the next slot's
+    /// payload; at interval 0 the proposer consumes it via `getPayload`,
+    /// embeds the `ExecutionPayloadV3` in the block body, and fires
+    /// `newPayload` so the EL imports it; received blocks are revalidated
+    /// with `newPayload` before the STF runs. FCU block hashes are the real
+    /// `execution_payload.block_hash` values carried by Lean blocks
+    /// (see docs/plans/engine-api-integration.md).
+    ///
+    /// Held as `Arc<dyn ExecutionEngine>` so tests can substitute a mock EL;
+    /// the production value is an `EngineClient`.
+    execution_client: Option<Arc<dyn ExecutionEngine>>,
+
+    /// Address the EL is asked to pay block rewards to, sent as
+    /// `suggestedFeeRecipient` in build-mode FCU payload attributes. Comes
+    /// from `validator-config.yaml`; the zero default is valid on the wire
+    /// but burns the rewards.
+    suggested_fee_recipient: [u8; 20],
+
+    /// `(target_slot, build_head_root, payload_id)` returned by the EL after
+    /// a build-mode FCU at interval 4 of the previous slot. Consumed at
+    /// interval 0 by `take_prepared_payload`. `build_head_root` is the fork
+    /// choice head the build was requested on; if the head moved before the
+    /// proposal, the prepared payload's `parent_hash` and embedded
+    /// `parent_beacon_block_root` are stale and the id is discarded. Absent
+    /// when no EL is configured, when we didn't queue a build for this slot,
+    /// or when the EL was syncing and returned `payload_id = None`.
+    pending_payload_id: Option<(u64, H256, PayloadId)>,
 
     /// Stateful sync heuristic used by `lean_node_sync_status`.
     sync_status: SyncStatusTracker,
@@ -330,7 +373,12 @@ impl BlockChainServer {
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id);
+            // Phase 4 (M6): try to pick up a payload the EL has been building
+            // since interval 4 of the previous slot. None when no EL is
+            // configured, when no build was queued, or when the EL was
+            // syncing. `build_block` falls back to `synthetic_payload`.
+            let payload = self.take_prepared_payload(slot).await;
+            self.propose_block(slot, validator_id, payload);
         }
 
         // Produce attestations at interval 1 (all validators including proposer).
@@ -356,6 +404,13 @@ impl BlockChainServer {
             }
         }
 
+        // Phase 4 (M6): at the end of this slot, if any of our validators
+        // is the next-slot proposer, ask the EL to start building a payload
+        // we'll fetch at interval 0 of slot+1.
+        if interval == 4 {
+            self.request_payload_id_for_next_slot(slot).await;
+        }
+
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
@@ -363,6 +418,16 @@ impl BlockChainServer {
 
         // Advance XMSS keys for next slot so the signing paths don't have to
         self.key_manager.advance_keys_to((slot + 1) as u32);
+
+        // Notify the execution layer once per slot (interval 0). Fire and
+        // forget: the EL is informational here, never on the consensus
+        // critical path. The hashes carried are `block_hash` fields read
+        // off the head/safe/finalized Lean blocks' `execution_payload`s
+        // (Phase 5 of M6), so the EL can chain forward off blocks it has
+        // actually seen via `engine_newPayload`.
+        if interval == 0 && self.execution_client.is_some() {
+            self.notify_execution_layer();
+        }
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -480,16 +545,24 @@ impl BlockChainServer {
     }
 
     /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    fn propose_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        execution_payload: Option<ExecutionPayloadV3>,
+    ) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
-        let Ok((block, type_one_proofs, _post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let Ok((block, type_one_proofs, _post_checkpoints)) = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            execution_payload,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -618,6 +691,33 @@ impl BlockChainServer {
         };
 
         metrics::inc_block_building_success();
+
+        // Inform the EL of our own freshly-built block (M6 phase 5 follow-up).
+        //
+        // `engine_getPayload` produced the embedded payload as a *candidate*;
+        // the EL doesn't promote it to a real imported block until something
+        // calls `engine_newPayload`. For received blocks that's the import
+        // pre-check in `Handler<NewBlock>`, but for our own builds nobody
+        // gossips it back to us — without this call the EL stays at genesis
+        // and rejects every subsequent FCU `head_block_hash`.
+        //
+        // Fire-and-forget; the EL roundtrip is ~ms but the next FCU is 4s
+        // away. If the EL says INVALID we log it but don't reverse — process_block
+        // already accepted into the store and the block is on its way to gossip.
+        if let Some(client) = self.execution_client.as_ref() {
+            let payload = signed_block.message.body.execution_payload.clone();
+            let parent_beacon_block_root = signed_block.message.parent_root;
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client.new_payload(&payload, parent_beacon_block_root).await {
+                    Ok(status) => trace!(
+                        status = ?status.status,
+                        "engine_newPayload on own-built block"
+                    ),
+                    Err(err) => warn!(%err, "engine_newPayload on own-built block failed"),
+                }
+            });
+        }
 
         // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
@@ -979,7 +1079,7 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
-        self.on_block(msg.block);
+        self.import_gossiped_block(msg.block).await;
     }
 }
 
@@ -1057,6 +1157,9 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         }
     }
 }
+
+#[cfg(test)]
+mod execution_engine_tests;
 
 #[cfg(test)]
 mod tests {

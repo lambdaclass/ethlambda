@@ -5,6 +5,7 @@ use libssz_types::SszList;
 
 use crate::{
     attestation::{AggregatedAttestation, AggregationBits, validator_indices},
+    execution_payload::ExecutionPayloadV3,
     primitives::{self, ByteList, H256},
 };
 
@@ -232,8 +233,10 @@ impl Block {
 
 /// The body of a block, containing payload data.
 ///
-/// Currently, the main operation is voting. Validators submit attestations which are
-/// packaged into blocks.
+/// Carries the consensus payload (attestations) plus the execution payload
+/// the proposer fetched from the EL via `engine_getPayload`. The execution
+/// payload is what the next block's `process_execution_payload` will validate
+/// `parent_hash` against (it points at this block's `execution_payload.block_hash`).
 #[derive(Debug, Default, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
@@ -242,6 +245,14 @@ pub struct BlockBody {
     /// these entries contain only attestation data without per-attestation signatures.
     #[serde(serialize_with = "serialize_attestations")]
     pub attestations: AggregatedAttestations,
+
+    /// Cancun-era execution payload (EIP-4844 + withdrawals).
+    ///
+    /// At genesis the payload is all-zero. From the first non-genesis block
+    /// onwards, the proposer obtains it from the EL via `engine_getPayload`
+    /// and the importer revalidates with `engine_newPayload`. Defaults to
+    /// `ExecutionPayloadV3::default()` for nodes running without an EL endpoint.
+    pub execution_payload: ExecutionPayloadV3,
 }
 
 /// List of aggregated attestations included in a block.

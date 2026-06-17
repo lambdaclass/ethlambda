@@ -20,6 +20,7 @@ shadow-integration = []
 
 [dependencies]
 ethlambda-blockchain.workspace = true
+ethlambda-ethrex-client.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-p2p.workspace = true
 ethlambda-types.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
+    "crates/net/ethrex-client",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
@@ -35,6 +36,7 @@ ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
+ethlambda-ethrex-client = { path = "crates/net/ethrex-client" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
@@ -50,6 +52,7 @@ spawned-concurrency = "0.5.0"
 spawned-rt = "0.5.0"
 tokio = "1.0"
 tokio-util = "0.7"
+async-trait = "0.1.83"
 
 prometheus = "0.14"
 
