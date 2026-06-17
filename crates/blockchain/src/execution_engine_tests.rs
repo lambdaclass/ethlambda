@@ -104,6 +104,25 @@ fn test_server(store: Store, engine: Option<Arc<dyn ExecutionEngine>>) -> BlockC
     }
 }
 
+/// Build a minimal `SignedBlock` on `parent_root` with a default (zero)
+/// execution payload. The merged proof is empty because these tests never
+/// run signature verification.
+fn signed_block_with_parent(slot: u64, parent_root: H256) -> SignedBlock {
+    SignedBlock {
+        message: Block {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            state_root: H256::ZERO,
+            body: BlockBody {
+                attestations: Default::default(),
+                execution_payload: ExecutionPayloadV3::default(),
+            },
+        },
+        proof: MultiMessageAggregate::default(),
+    }
+}
+
 /// Insert a block whose execution payload carries `block_hash`, so
 /// `el_hash_at` has a real (non-zero) value to resolve.
 fn insert_block_with_payload_hash(
@@ -113,24 +132,8 @@ fn insert_block_with_payload_hash(
     parent_root: H256,
     block_hash: H256,
 ) {
-    let signed_block = SignedBlock {
-        message: Block {
-            slot,
-            proposer_index: 0,
-            parent_root,
-            state_root: H256::ZERO,
-            body: BlockBody {
-                attestations: Default::default(),
-                execution_payload: ExecutionPayloadV3 {
-                    block_hash,
-                    ..Default::default()
-                },
-            },
-        },
-        // This helper feeds `insert_signed_block` directly (no signature
-        // verification path), so an empty merged proof is sufficient.
-        proof: MultiMessageAggregate::default(),
-    };
+    let mut signed_block = signed_block_with_parent(slot, parent_root);
+    signed_block.message.body.execution_payload.block_hash = block_hash;
     store.insert_signed_block(root, signed_block);
 }
 
@@ -264,4 +267,32 @@ fn el_hash_at_resolves_real_payload_hash_after_block_import() {
     // ...while the zero root and unknown roots fall back to ZERO.
     assert_eq!(server.el_hash_at(H256::ZERO), H256::ZERO);
     assert_eq!(server.el_hash_at(H256([0x99; 32])), H256::ZERO);
+}
+
+#[tokio::test]
+async fn import_gossiped_block_drops_block_on_invalid_verdict() {
+    use ethlambda_types::primitives::HashTreeRoot as _;
+
+    // End-to-end of the gossip-import gate (Handler<NewBlock> body): an
+    // INVALID EL verdict must drop the block before it reaches the store,
+    // and the EL must have been consulted with the block's parent_root as
+    // the beacon root.
+    let engine = mock(NewPayloadOutcome::Status(PayloadStatusKind::Invalid));
+    let mut server = test_server(test_store(), Some(engine.clone()));
+
+    let parent_root = server.store.head();
+    let block = signed_block_with_parent(1, parent_root);
+    let block_root = block.message.hash_tree_root();
+
+    server.import_gossiped_block(block).await;
+
+    assert!(
+        server.store.get_block(&block_root).is_none(),
+        "INVALID verdict must drop the block before it reaches the store"
+    );
+    assert_eq!(
+        *engine.seen_beacon_root.lock().unwrap(),
+        Some(parent_root),
+        "the EL must have been consulted with the block's parent_root"
+    );
 }

@@ -1079,20 +1079,7 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
-        // EL pre-check (Phase 3 of M6). When `--execution-endpoint` is
-        // unset this is a no-op. INVALID verdict drops the block before it
-        // touches the store; pending children referencing it as parent are
-        // not enqueued because we never call `on_block`. They will be
-        // pruned by the standard slot-bound timeout.
-        let payload = &msg.block.message.body.execution_payload;
-        let parent_beacon_block_root = msg.block.message.parent_root;
-        if !self
-            .validate_payload_with_el(payload, parent_beacon_block_root)
-            .await
-        {
-            return;
-        }
-        self.on_block(msg.block);
+        self.import_gossiped_block(msg.block).await;
     }
 }
 

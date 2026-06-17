@@ -6,7 +6,9 @@
 
 use ethlambda_ethrex_client::{ForkChoiceState, PayloadAttributesV3, PayloadStatusKind};
 use ethlambda_state_transition::compute_time_at_slot;
-use ethlambda_types::{ShortRoot, execution_payload::ExecutionPayloadV3, primitives::H256};
+use ethlambda_types::{
+    ShortRoot, block::SignedBlock, execution_payload::ExecutionPayloadV3, primitives::H256,
+};
 use tracing::{trace, warn};
 
 use crate::BlockChainServer;
@@ -223,5 +225,24 @@ impl BlockChainServer {
                 true
             }
         }
+    }
+
+    /// Import a gossiped block: gate it on the EL, then hand it to the store.
+    ///
+    /// EL pre-check (Phase 3 of M6). When `--execution-endpoint` is unset
+    /// `validate_payload_with_el` is a no-op that returns `true`. An INVALID
+    /// verdict drops the block before it touches the store; pending children
+    /// referencing it as parent are not enqueued because we never call
+    /// `on_block`, and are pruned by the standard slot-bound timeout.
+    pub(crate) async fn import_gossiped_block(&mut self, block: SignedBlock) {
+        let payload = &block.message.body.execution_payload;
+        let parent_beacon_block_root = block.message.parent_root;
+        if !self
+            .validate_payload_with_el(payload, parent_beacon_block_root)
+            .await
+        {
+            return;
+        }
+        self.on_block(block);
     }
 }
