@@ -126,6 +126,7 @@ fn compare_post_states(
         justifications_roots,
         justifications_validators,
         validator_count,
+        validators,
         latest_justified_root_label,
         latest_finalized_root_label,
         justifications_roots_labels,
@@ -289,6 +290,39 @@ fn compare_post_states(
                 validator_count, count
             )
             .into());
+        }
+    }
+    if let Some(validators) = validators {
+        let expected = &validators.data;
+        let post_validators: Vec<_> = post_state.validators.iter().collect();
+        if post_validators.len() != expected.len() {
+            return Err(format!(
+                "validators count mismatch: expected {}, got {}",
+                expected.len(),
+                post_validators.len()
+            )
+            .into());
+        }
+        for (i, expected_validator) in expected.iter().enumerate() {
+            let expected_domain: ethlambda_types::state::Validator =
+                expected_validator.clone().into();
+            let actual = post_validators[i];
+            if actual.index != expected_domain.index
+                || actual.attestation_pubkey != expected_domain.attestation_pubkey
+                || actual.proposal_pubkey != expected_domain.proposal_pubkey
+            {
+                return Err(format!(
+                    "validator[{i}] mismatch: expected index={} att={} prop={}, \
+                     got index={} att={} prop={}",
+                    expected_domain.index,
+                    hex::encode(expected_domain.attestation_pubkey),
+                    hex::encode(expected_domain.proposal_pubkey),
+                    actual.index,
+                    hex::encode(actual.attestation_pubkey),
+                    hex::encode(actual.proposal_pubkey),
+                )
+                .into());
+            }
         }
     }
     if let Some(label) = latest_justified_root_label {

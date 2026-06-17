@@ -59,7 +59,7 @@ prometheus = "0.14"
 clap = { version = "4.3", features = ["derive", "env"] }
 
 # XMSS signatures
-leansig = { git = "https://github.com/leanEthereum/leanSig" }
+leansig = { git = "https://github.com/leanEthereum/leanSig", branch = "devnet4" }
 
 # SSZ implementation
 libssz = "0.2.2"
@@ -85,4 +85,3 @@ jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 # in `shadow/quinn-udp-patch` (no GSO/GRO batch syscalls). A Cargo `[patch]`
 # cannot be feature-gated, so it is NOT committed here; `shadow/build.sh` injects
 # it into this manifest at build time. See `make shadow-build`.
-

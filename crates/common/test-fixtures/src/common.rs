@@ -98,10 +98,10 @@ impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Validator {
     index: u64,
-    #[serde(rename = "attestationPubkey")]
+    #[serde(rename = "attestationPublicKey")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
     attestation_pubkey: ValidatorPubkeyBytes,
-    #[serde(rename = "proposalPubkey")]
+    #[serde(rename = "proposalPublicKey")]
     #[serde(deserialize_with = "deser_pubkey_hex")]
     proposal_pubkey: ValidatorPubkeyBytes,
 }

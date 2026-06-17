@@ -249,6 +249,10 @@ async fn verify_signatures_with_empty_validator_set_fails_cleanly() {
     // proposer (no validators in the set). The driver should return
     // succeeded:false with a descriptive error, matching the simulator's
     // expectException path.
+    //
+    // The proof blob is empty (`0x`): the verifier rejects the proposer-index
+    // bound before reaching the SNARK decode, so the bytes content doesn't
+    // matter for this test.
     let signed_block = json!({
         "message": {
             "slot": 1,
@@ -257,10 +261,7 @@ async fn verify_signatures_with_empty_validator_set_fails_cleanly() {
             "stateRoot": ZERO_ROOT,
             "body": {"attestations": {"data": []}},
         },
-        "signature": {
-            "proposerSignature": "0x".to_string() + &"00".repeat(ethlambda_types::signature::SIGNATURE_SIZE),
-            "attestationSignatures": {"data": []},
-        },
+        "proof": {"proof": {"data": "0x"}},
     });
 
     let body = json!({

@@ -20,6 +20,8 @@ ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 
+libssz.workspace = true
+
 spawned-concurrency.workspace = true
 
 tokio.workspace = true

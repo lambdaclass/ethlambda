@@ -11,8 +11,7 @@ use ethlambda_ethrex_client::{
     PayloadStatus, PayloadStatusKind,
 };
 use ethlambda_storage::backend::InMemoryBackend;
-use ethlambda_types::attestation::blank_xmss_signature;
-use ethlambda_types::block::{AttestationSignatures, Block, BlockBody};
+use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate};
 use ethlambda_types::state::State;
 
 /// Outcome the mock EL returns from `new_payload`, covering both the
@@ -101,6 +100,7 @@ fn test_server(store: Store, engine: Option<Arc<dyn ExecutionEngine>>) -> BlockC
         execution_client: engine,
         suggested_fee_recipient: [0u8; 20],
         pending_payload_id: None,
+        sync_status: SyncStatusTracker::default(),
     }
 }
 
@@ -127,10 +127,9 @@ fn insert_block_with_payload_hash(
                 },
             },
         },
-        signature: BlockSignatures {
-            attestation_signatures: AttestationSignatures::try_from(vec![]).unwrap(),
-            proposer_signature: blank_xmss_signature(),
-        },
+        // This helper feeds `insert_signed_block` directly (no signature
+        // verification path), so an empty merged proof is sufficient.
+        proof: MultiMessageAggregate::default(),
     };
     store.insert_signed_block(root, signed_block);
 }

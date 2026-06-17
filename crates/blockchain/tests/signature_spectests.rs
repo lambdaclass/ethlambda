@@ -22,6 +22,12 @@ const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 /// schema upstream and we regenerate fixtures via `make leanSpec/fixtures`.
 const FIXTURES_AWAIT_M6_REGEN: bool = true;
 
+/// Tests that require cryptographic signature verification at block level.
+///
+/// Block-level crypto verification is now wired through lean-multisig devnet5's
+/// `verify_type_2`, so every fixture is exercised against the real primitive.
+const SKIP_TESTS: &[&str] = &[];
+
 fn run(path: &Path) -> datatest_stable::Result<()> {
     if FIXTURES_AWAIT_M6_REGEN {
         println!(
@@ -39,6 +45,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
             )
             .into());
+        }
+
+        if SKIP_TESTS.iter().any(|skip| name.contains(skip)) {
+            println!("Skipping test (Phase-3 crypto stub): {name}");
+            continue;
         }
 
         println!("Running test: {}", name);

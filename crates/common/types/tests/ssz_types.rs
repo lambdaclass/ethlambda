@@ -8,18 +8,13 @@ use std::path::Path;
 // TODO(M6): drop the allow once the dispatch uses these again.
 #[allow(unused_imports)]
 pub use ethlambda_test_fixtures::{
-    AggregatedAttestation, AggregationBits, AttestationData, Block, BlockBody, BlockHeader,
-    Checkpoint, Config, Container, TestInfo, TestState, Validator,
+    AggregatedAttestation, AttestationData, Block, BlockBody, BlockHeader, Checkpoint, Config,
+    TestInfo, TestState, Validator,
 };
 use ethlambda_types::{
     attestation::{
-        Attestation as DomainAttestation,
-        SignedAggregatedAttestation as DomainSignedAggregatedAttestation,
-        SignedAttestation as DomainSignedAttestation, XmssSignature,
-    },
-    block::{
-        AggregatedSignatureProof as DomainAggregatedSignatureProof, AttestationSignatures,
-        BlockSignatures as DomainBlockSignatures, ByteListMiB, SignedBlock as DomainSignedBlock,
+        Attestation as DomainAttestation, SignedAttestation as DomainSignedAttestation,
+        XmssSignature,
     },
     primitives::H256,
 };
@@ -85,7 +80,7 @@ pub fn decode_hex_h256(hex_str: &str) -> Result<H256, Box<dyn std::error::Error>
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Attestation {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: u64,
     pub data: AttestationData,
 }
@@ -118,7 +113,7 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SignedAttestation {
-    #[serde(rename = "validatorId")]
+    #[serde(rename = "validatorIndex")]
     pub validator_id: u64,
     pub data: AttestationData,
     #[serde(deserialize_with = "deser_signature_hex")]
@@ -135,87 +130,11 @@ impl From<SignedAttestation> for DomainSignedAttestation {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SignedBlock {
-    pub block: Block,
-    pub signature: BlockSignatures,
-}
-
-impl From<SignedBlock> for DomainSignedBlock {
-    fn from(value: SignedBlock) -> Self {
-        Self {
-            message: value.block.into(),
-            signature: value.signature.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct BlockSignatures {
-    #[serde(rename = "attestationSignatures")]
-    pub attestation_signatures: Container<AggregatedSignatureProof>,
-    #[serde(rename = "proposerSignature")]
-    #[serde(deserialize_with = "deser_signature_hex")]
-    pub proposer_signature: XmssSignature,
-}
-
-impl From<BlockSignatures> for DomainBlockSignatures {
-    fn from(value: BlockSignatures) -> Self {
-        let att_sigs: Vec<DomainAggregatedSignatureProof> = value
-            .attestation_signatures
-            .data
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        Self {
-            attestation_signatures: AttestationSignatures::try_from(att_sigs)
-                .expect("too many attestation signatures"),
-            proposer_signature: value.proposer_signature,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AggregatedSignatureProof {
-    pub participants: AggregationBits,
-    #[serde(rename = "proofData")]
-    pub proof_data: HexByteList,
-}
-
-impl From<AggregatedSignatureProof> for DomainAggregatedSignatureProof {
-    fn from(value: AggregatedSignatureProof) -> Self {
-        let proof_bytes: Vec<u8> = value.proof_data.into();
-        Self {
-            participants: value.participants.into(),
-            proof_data: ByteListMiB::try_from(proof_bytes).expect("proof data too large"),
-        }
-    }
-}
-
-/// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`
-#[derive(Debug, Clone, Deserialize)]
-pub struct HexByteList {
-    data: String,
-}
-
-impl From<HexByteList> for Vec<u8> {
-    fn from(value: HexByteList) -> Self {
-        let stripped = value.data.strip_prefix("0x").unwrap_or(&value.data);
-        hex::decode(stripped).expect("invalid hex in proof data")
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SignedAggregatedAttestation {
-    pub data: AttestationData,
-    pub proof: AggregatedSignatureProof,
-}
-
-impl From<SignedAggregatedAttestation> for DomainSignedAggregatedAttestation {
-    fn from(value: SignedAggregatedAttestation) -> Self {
-        Self {
-            data: value.data.into(),
-            proof: value.proof.into(),
-        }
-    }
-}
+// NOTE: After Phase 3 the legacy `BlockSignatures` / `AttestationSignatures` /
+// `AggregatedSignatureProof` containers are removed from the domain, and
+// `SignedBlock` now carries a single `proof: MultiMessageAggregate` field. The pinned
+// leanSpec fixtures still use the old shape, so SSZ-byte and root assertions
+// for `SignedBlock`, `BlockSignatures`, `AggregatedSignatureProof`, and
+// `SignedAggregatedAttestation` are intentionally skipped in
+// `ssz_spectests.rs::run_ssz_test` until the fixture commit is bumped to the
+// Type-1/Type-2 schema.

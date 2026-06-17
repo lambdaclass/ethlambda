@@ -38,27 +38,23 @@ shadow-docker-build: ## 👻🐳 Build a Shadow-compatible Docker image
 		-t ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)-shadow .
 	@echo
 
-# 2026-05-17
-LEAN_SPEC_COMMIT_HASH:=f12000bd68a9640cffdfbd9a07503c9112d32bee
+LEAN_SPEC_FIXTURES_URL ?= https://github.com/leanEthereum/leanSpec/releases/latest/download/fixtures-prod-scheme.tar.gz
+LEAN_SPEC_FIXTURES_SHA_URL ?= $(LEAN_SPEC_FIXTURES_URL).sha256
 
-leanSpec:
-	git clone https://github.com/leanEthereum/leanSpec.git --single-branch
-	cd leanSpec && git checkout $(LEAN_SPEC_COMMIT_HASH)
-
-# Pre-download the prod keys ourselves before `fill`. The pinned leanSpec
-# commit predates leanSpec PR #745, whose `download_keys` reads the still-open
-# (unflushed) download tempfile, intermittently truncating the gzip tail and
-# aborting with EOFError. A plain curl+tar fully writes the archive before
-# reading it, sidestepping the bug. `fill` then sees the keys already present
-# and skips its own download. Remove once the pin moves past PR #745.
-leanSpec/fixtures: leanSpec
-	cd leanSpec && \
-		KEYS_URL=$$(uv run python -c "from consensus_testing.keys import KEY_DOWNLOAD_URLS; print(KEY_DOWNLOAD_URLS['prod'])") && \
-		KEYS_DIR=packages/testing/src/consensus_testing/test_keys && \
-		mkdir -p $$KEYS_DIR && \
-		curl -sSL "$$KEYS_URL" -o /tmp/prod_scheme.tar.gz && \
-		tar -xzf /tmp/prod_scheme.tar.gz -C $$KEYS_DIR && \
-		uv run fill --fork Lstar -n auto --scheme prod -o fixtures
+leanSpec/fixtures:
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz" "$(LEAN_SPEC_FIXTURES_URL)"; \
+	curl -L -f -o "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$(LEAN_SPEC_FIXTURES_SHA_URL)"; \
+	expected=$$(cut -d' ' -f1 "$$tmpdir/fixtures-prod-scheme.tar.gz.sha256"); \
+	actual=$$(sha256sum "$$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $$1}'); \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "SHA256 mismatch: expected $$expected, got $$actual" >&2; \
+		exit 1; \
+	fi; \
+	rm -rf leanSpec/fixtures; \
+	mkdir -p leanSpec/fixtures; \
+	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch

@@ -10,9 +10,10 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{BlockSignatures, SignedBlock},
+    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
+    signature::{ValidatorPublicKey, ValidatorSignature},
 };
 
 use crate::aggregation::{
@@ -36,6 +37,7 @@ mod el_integration;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
+pub mod reaggregate;
 pub mod store;
 
 pub struct BlockChain {
@@ -48,10 +50,7 @@ pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
-/// Maximum number of distinct AttestationData entries per block.
-///
-/// See: leanSpec commit 0c9528a (PR #536).
-pub const MAX_ATTESTATIONS_DATA: usize = 16;
+pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
@@ -60,6 +59,56 @@ pub const MAX_ATTESTATIONS_DATA: usize = 16;
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
+/// Local head lag beyond which the node is considered to be syncing.
+///
+/// See: leanSpec PR #708.
+const SYNC_LAG_THRESHOLD: u64 = 4;
+/// Freshest-known block lag beyond which the network is considered stalled.
+///
+/// During a network-wide stall the node remains synced so validators can help
+/// the chain recover.
+const NETWORK_STALL_THRESHOLD: u64 = 8;
+/// Recovery band that prevents the sync status from flapping near the threshold.
+const SYNC_HYSTERESIS_BAND: u64 = 2;
+
+#[derive(Default)]
+struct SyncStatusTracker {
+    syncing: bool,
+}
+
+impl SyncStatusTracker {
+    fn update(
+        &mut self,
+        current_slot: u64,
+        head_slot: u64,
+        max_seen_slot: u64,
+    ) -> metrics::SyncStatus {
+        let head_lag = current_slot.saturating_sub(head_slot);
+        let network_lag = current_slot.saturating_sub(max_seen_slot);
+
+        if network_lag > NETWORK_STALL_THRESHOLD {
+            self.syncing = false;
+        } else if self.syncing {
+            self.syncing = head_lag > SYNC_LAG_THRESHOLD.saturating_sub(SYNC_HYSTERESIS_BAND);
+        } else {
+            self.syncing = head_lag > SYNC_LAG_THRESHOLD;
+        }
+
+        if self.syncing {
+            metrics::SyncStatus::Syncing
+        } else {
+            metrics::SyncStatus::Synced
+        }
+    }
+
+    fn duties_allowed(&self) -> bool {
+        !self.syncing
+    }
+
+    fn gate_proposer(&self, proposer: Option<u64>) -> Option<u64> {
+        proposer.filter(|_| self.duties_allowed())
+    }
+}
 
 /// Milliseconds until the next interval boundary, measured relative to genesis.
 fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
@@ -114,6 +163,7 @@ impl BlockChain {
             execution_client,
             suggested_fee_recipient,
             pending_payload_id: None,
+            sync_status: SyncStatusTracker::default(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -212,6 +262,9 @@ pub struct BlockChainServer {
     /// when no EL is configured, when we didn't queue a build for this slot,
     /// or when the EL was syncing and returned `payload_id = None`.
     pending_payload_id: Option<(u64, H256, PayloadId)>,
+
+    /// Stateful sync heuristic used by `lean_node_sync_status`.
+    sync_status: SyncStatusTracker,
 }
 
 impl BlockChainServer {
@@ -259,6 +312,7 @@ impl BlockChainServer {
 
         // Update current slot metric
         metrics::update_current_slot(slot);
+        self.update_sync_status(slot);
 
         // Snapshot the aggregator flag once per tick so all read sites within
         // the tick see a consistent value even if the admin API toggles it
@@ -270,9 +324,16 @@ impl BlockChainServer {
         // At interval 0, check if we will propose (but don't build the block yet).
         // Tick forkchoice first to accept attestations, then build the block
         // using the freshly-accepted attestations.
-        let proposer_validator_id = (interval == 0 && slot > 0)
+        let scheduled_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
+        let proposer_validator_id = self.sync_status.gate_proposer(scheduled_proposer);
+
+        if let Some(validator_id) = scheduled_proposer
+            && proposer_validator_id.is_none()
+        {
+            info!(%slot, %validator_id, "Skipping block proposal while syncing");
+        }
 
         // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
         // (interval 4), so the post-block report for this round sees its
@@ -298,9 +359,16 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        if interval == 2 && is_aggregator {
-            coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
-            self.start_aggregation_session(slot, ctx).await;
+        if interval == 2 {
+            if is_aggregator {
+                coverage::emit_agg_start_new_coverage(
+                    &self.store,
+                    self.attestation_committee_count,
+                );
+                self.start_aggregation_session(slot, ctx).await;
+            } else {
+                metrics::inc_aggregator_skipped_not_aggregator();
+            }
         }
 
         // Now build and publish the block (after attestations have been accepted)
@@ -329,7 +397,11 @@ impl BlockChainServer {
                     slot - 1,
                 );
             }
-            self.produce_attestations(slot, is_aggregator);
+            if self.sync_status.duties_allowed() {
+                self.produce_attestations(slot, is_aggregator);
+            } else if !self.key_manager.validator_ids().is_empty() {
+                info!(%slot, "Skipping attestations while syncing");
+            }
         }
 
         // Phase 4 (M6): at the end of this slot, if any of our validators
@@ -484,15 +556,13 @@ impl BlockChainServer {
         let _timing = metrics::time_block_building();
 
         // Build the block with attestation signatures
-        let Ok((block, attestation_signatures, _post_checkpoints)) =
-            store::produce_block_with_signatures(
-                &mut self.store,
-                slot,
-                validator_id,
-                execution_payload,
-            )
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let Ok((block, type_one_proofs, _post_checkpoints)) = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            execution_payload,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -514,15 +584,103 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock
+        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
+        // singleton Type-1 SNARK, then merge it with every attestation Type-1
+        // into the block's single Type-2 proof.
+        let head_state = self.store.head_state();
+        let validators = &head_state.validators;
+        let Some(proposer_validator) = validators.get(validator_id as usize) else {
+            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        // Decode the proposer's proposal pubkey once and reuse it both for the
+        // singleton Type-1 wrap and for the Type-2 merge inputs.
+        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let Ok(proposer_validator_signature) =
+            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
+                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
+            })
+        else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
+            vec![proposer_pubkey.clone()],
+            vec![proposer_validator_signature],
+            &block_root,
+            slot as u32,
+        )
+        .inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
+            Vec::with_capacity(type_one_proofs.len() + 1);
+        let mut resolve_failed = false;
+        for t1 in &type_one_proofs {
+            let mut pubkeys = Vec::new();
+            for vid in t1.participant_indices() {
+                let Some(validator) = validators.get(vid as usize) else {
+                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
+                    resolve_failed = true;
+                    break;
+                };
+                match validator.get_attestation_pubkey() {
+                    Ok(pk) => pubkeys.push(pk),
+                    Err(err) => {
+                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+                        resolve_failed = true;
+                        break;
+                    }
+                }
+            }
+            if resolve_failed {
+                break;
+            }
+            merge_inputs.push((pubkeys, t1.proof.clone()));
+        }
+        if resolve_failed {
+            metrics::inc_block_building_failures();
+            return;
+        }
+        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+
+        // Merge yields raw lean-multisig Type-2 bytes. Per-component
+        // participants are rederived at verify time from
+        // `block.body.attestations[i].aggregation_bits` plus
+        // `block.proposer_index`, so nothing else needs persisting.
+        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        // `type_one_proofs` is no longer needed past this point.
+        drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
-            signature: BlockSignatures {
-                proposer_signature,
-                attestation_signatures: attestation_signatures
-                    .try_into()
-                    .expect("attestation signatures within limit"),
-            },
+            proof,
         };
 
         // Process the block locally before publishing
@@ -571,22 +729,13 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
+    /// Run block import and refresh metrics.
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
         store::on_block(&mut self.store, signed_block)?;
-        let head_slot = self.store.head_slot();
-        metrics::update_head_slot(head_slot);
+        metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
-
-        // Update sync status based on head slot vs wall clock slot
-        let current_slot = self.store.time() / INTERVALS_PER_SLOT;
-        let status = if head_slot >= current_slot {
-            metrics::SyncStatus::Synced
-        } else {
-            metrics::SyncStatus::Syncing
-        };
-        metrics::set_node_sync_status(status);
 
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
@@ -709,9 +858,12 @@ impl BlockChainServer {
             return;
         }
 
-        // Parent exists, proceed with processing
+        // Parent exists, proceed with processing. Clone the block so we
+        // can run post-import reaggregation against its merged proof —
+        // `process_block` consumes the original for the storage layer.
+        let block_for_reaggregate = signed_block.clone();
         match self.process_block(signed_block) {
-            Ok(_) => {
+            Ok(()) => {
                 info!(
                     %slot,
                     proposer,
@@ -719,6 +871,14 @@ impl BlockChainServer {
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
                 );
+
+                // Recover per-attestation Type-1 proofs from the block's
+                // merged Type-2 and fold them into the local pool. Only
+                // run when the chain is in sync — backfilling nodes must
+                // not spam gossip with rederived aggregates.
+                if self.sync_status.duties_allowed() {
+                    self.run_reaggregate_from_block(&block_for_reaggregate);
+                }
 
                 // Enqueue any pending blocks that were waiting for this parent
                 self.collect_pending_children(block_root, queue);
@@ -733,6 +893,32 @@ impl BlockChainServer {
                     "Failed to process block"
                 );
             }
+        }
+    }
+
+    /// Run the post-import reaggregation pass and publish the resulting
+    /// aggregates when this node is in the aggregator role.
+    fn run_reaggregate_from_block(&mut self, signed_block: &SignedBlock) {
+        let aggregates = reaggregate::reaggregate_from_block(&mut self.store, signed_block);
+        if aggregates.is_empty() {
+            return;
+        }
+        let count = aggregates.len();
+        let is_aggregator = self.aggregator.is_enabled();
+        info!(
+            count,
+            is_aggregator, "Reaggregated block-borne attestations"
+        );
+        if !is_aggregator {
+            return;
+        }
+        let Some(ref p2p) = self.p2p else {
+            return;
+        };
+        for aggregate in aggregates {
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| warn!(%err, "Failed to publish reaggregated attestation"));
         }
     }
 
@@ -804,6 +990,15 @@ impl BlockChainServer {
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
         let _ = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"));
+    }
+
+    fn update_sync_status(&mut self, current_slot: u64) {
+        let head_slot = self.store.head_slot();
+        let max_seen_slot = self.store.max_live_chain_slot().unwrap_or(head_slot);
+        let status = self
+            .sync_status
+            .update(current_slot, head_slot, max_seen_slot);
+        metrics::set_node_sync_status(status);
     }
 }
 
@@ -978,3 +1173,97 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 
 #[cfg(test)]
 mod execution_engine_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_status_allows_lag_through_threshold() {
+        let mut tracker = SyncStatusTracker::default();
+
+        for lag in 0..=SYNC_LAG_THRESHOLD {
+            assert_eq!(
+                tracker.update(10 + lag, 10, 10 + lag),
+                metrics::SyncStatus::Synced
+            );
+        }
+
+        let first_syncing_slot = 10 + SYNC_LAG_THRESHOLD + 1;
+        assert_eq!(
+            tracker.update(first_syncing_slot, 10, first_syncing_slot),
+            metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn sync_status_detects_local_lag_when_fresh_blocks_are_known() {
+        let mut tracker = SyncStatusTracker::default();
+        let current_slot = 10 + SYNC_LAG_THRESHOLD + 1;
+
+        assert_eq!(
+            tracker.update(current_slot, 10, current_slot),
+            metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn sync_status_treats_stale_known_blocks_as_network_stall() {
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(tracker.update(100, 0, 0), metrics::SyncStatus::Synced);
+    }
+
+    #[test]
+    fn sync_status_hysteresis_prevents_flapping() {
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(tracker.update(15, 10, 15), metrics::SyncStatus::Syncing);
+        assert_eq!(tracker.update(15, 11, 15), metrics::SyncStatus::Syncing);
+        assert_eq!(tracker.update(15, 10, 15), metrics::SyncStatus::Syncing);
+        assert_eq!(tracker.update(15, 13, 15), metrics::SyncStatus::Synced);
+    }
+
+    #[test]
+    fn network_stall_reopens_sync_status() {
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(tracker.update(20, 0, 20), metrics::SyncStatus::Syncing);
+        assert_eq!(tracker.update(30, 0, 20), metrics::SyncStatus::Synced);
+    }
+
+    #[test]
+    fn future_head_saturates_lag_at_zero() {
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(tracker.update(15, 20, 20), metrics::SyncStatus::Synced);
+    }
+
+    #[test]
+    fn syncing_gates_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+
+        assert!(!tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), None);
+    }
+
+    #[test]
+    fn caught_up_node_allows_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+        tracker.update(20, 18, 20);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
+    }
+
+    #[test]
+    fn network_stall_keeps_proposals_and_attestations_enabled() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(100, 0, 0);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
+    }
+}
