@@ -49,7 +49,7 @@ pub struct Withdrawal {
     pub index: u64,
     #[serde(with = "hex_u64")]
     pub validator_index: u64,
-    #[serde(with = "hex_address")]
+    #[serde(with = "hex_bytes_fixed")]
     pub address: [u8; 20],
     #[serde(with = "hex_u64")]
     pub amount: u64,
@@ -64,7 +64,7 @@ pub struct Withdrawal {
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionPayloadV3 {
     pub parent_hash: H256,
-    #[serde(with = "hex_address")]
+    #[serde(with = "hex_bytes_fixed")]
     pub fee_recipient: [u8; 20],
     pub state_root: H256,
     pub receipts_root: H256,
@@ -160,7 +160,7 @@ impl ExecutionPayloadV3 {
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionPayloadHeader {
     pub parent_hash: H256,
-    #[serde(with = "hex_address")]
+    #[serde(with = "hex_bytes_fixed")]
     pub fee_recipient: [u8; 20],
     pub state_root: H256,
     pub receipts_root: H256,
@@ -266,29 +266,6 @@ pub mod hex_u256 {
 }
 
 /// 20-byte Ethereum address as a `0x`-prefixed hex `DATA` string.
-pub mod hex_address {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &[u8; 20], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&format!("0x{}", hex::encode(v)))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u8; 20], D::Error> {
-        let s = String::deserialize(de)?;
-        let stripped = s.strip_prefix("0x").unwrap_or(&s);
-        let bytes = hex::decode(stripped).map_err(serde::de::Error::custom)?;
-        if bytes.len() != 20 {
-            return Err(serde::de::Error::custom(format!(
-                "address expected 20 bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let mut out = [0u8; 20];
-        out.copy_from_slice(&bytes);
-        Ok(out)
-    }
-}
-
 /// Fixed-size byte array as a single `0x`-prefixed hex `DATA` string.
 ///
 /// Generic over the array length, so it covers `logs_bloom` (256 bytes) and
@@ -421,7 +398,7 @@ mod tests {
     fn address_serializes_as_hex_data_string() {
         #[derive(Serialize, Deserialize)]
         struct Wrap {
-            #[serde(with = "hex_address")]
+            #[serde(with = "hex_bytes_fixed")]
             addr: [u8; 20],
         }
         let w = Wrap { addr: [0xab; 20] };
@@ -436,7 +413,7 @@ mod tests {
     fn address_rejects_wrong_length() {
         #[derive(Debug, Deserialize)]
         struct Wrap {
-            #[serde(with = "hex_address")]
+            #[serde(with = "hex_bytes_fixed")]
             #[allow(dead_code)]
             addr: [u8; 20],
         }

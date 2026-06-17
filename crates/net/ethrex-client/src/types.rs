@@ -12,7 +12,7 @@
 //! and request types (`ForkChoiceState`, `PayloadAttributesV3`,
 //! `PayloadStatus`, etc.) stay here.
 
-use ethlambda_types::execution_payload::{hex_address, hex_u64};
+use ethlambda_types::execution_payload::{hex_bytes_fixed, hex_u64};
 use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ pub struct PayloadAttributesV3 {
     #[serde(with = "hex_u64")]
     pub timestamp: u64,
     pub prev_randao: H256,
-    #[serde(with = "hex_address")]
+    #[serde(with = "hex_bytes_fixed")]
     pub suggested_fee_recipient: [u8; 20],
     pub withdrawals: Vec<Withdrawal>,
     pub parent_beacon_block_root: H256,

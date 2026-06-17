@@ -41,25 +41,6 @@ impl EngineClient {
         })
     }
 
-    /// Build a client with a caller-supplied `reqwest::Client` (lets the
-    /// caller plug in a custom timeout / connector). Useful for tests.
-    pub fn with_http_client(
-        url: impl Into<String>,
-        secret: JwtSecret,
-        http: reqwest::Client,
-    ) -> Self {
-        Self {
-            http,
-            url: url.into(),
-            secret,
-        }
-    }
-
-    /// Endpoint URL this client targets.
-    pub fn endpoint(&self) -> &str {
-        &self.url
-    }
-
     async fn rpc_call<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -286,8 +267,8 @@ mod tests {
 
     #[test]
     fn client_builds_with_url() {
-        let c = EngineClient::new("http://127.0.0.1:8551", fake_secret()).unwrap();
-        assert_eq!(c.endpoint(), "http://127.0.0.1:8551");
+        EngineClient::new("http://127.0.0.1:8551", fake_secret())
+            .expect("client builds with a valid url");
     }
 
     #[tokio::test]
