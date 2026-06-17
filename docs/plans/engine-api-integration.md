@@ -2,7 +2,12 @@
 
 > Plan owner: pablo
 > Created: 2026-05-13
-> Status: draft, awaiting scope confirmation
+> Status: implemented (Option C, M1–M7) and verified live against ethrex v15 —
+> payloads build, import, and the chain advances on both layers. Pinned to the
+> V4 (Prague) engine methods. Remaining items are upstream-gated: filing the
+> leanSpec execution-payload schema (drafted in `lean-execution-payload-schema.md`),
+> the `fork_digest` bump, and spec-fixture regeneration (skip-gated behind
+> `FIXTURES_AWAIT_M6_REGEN`).
 
 ## Goal
 
