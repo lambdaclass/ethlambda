@@ -469,10 +469,14 @@ fn encode_live_chain_key(slot: u64, root: &H256) -> Vec<u8> {
 }
 
 /// Decode a LiveChain key from bytes.
-fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
+fn decode_live_chain_key(bytes: &[u8]) -> Option<(u64, H256)> {
+    if bytes.len() != 40 {
+        return None;
+    }
+
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
-    (slot, root)
+    Some((slot, root))
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -819,10 +823,10 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .map(|(k, v)| {
-                let (slot, root) = decode_live_chain_key(&k);
+            .filter_map(|(k, v)| {
+                let (slot, root) = decode_live_chain_key(&k)?;
                 let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
-                (root, (slot, parent_root))
+                Some((root, (slot, parent_root)))
             })
             .collect()
     }
@@ -833,7 +837,7 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(Result::ok)
-            .map(|(key, _)| decode_live_chain_key(&key).0)
+            .filter_map(|(key, _)| decode_live_chain_key(&key).map(|(slot, _)| slot))
             .max()
     }
 
@@ -845,10 +849,7 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .map(|(k, _)| {
-                let (_, root) = decode_live_chain_key(&k);
-                root
-            })
+            .filter_map(|(k, _)| decode_live_chain_key(&k).map(|(_, root)| root))
             .collect()
     }
 
@@ -868,8 +869,9 @@ impl Store {
             .expect("iterator")
             .filter_map(|res| res.ok())
             .take_while(|(k, _)| {
-                let (slot, _) = decode_live_chain_key(k);
-                slot < finalized_slot
+                decode_live_chain_key(k)
+                    .map(|(slot, _)| slot < finalized_slot)
+                    .unwrap_or(true)
             })
             .map(|(k, _)| k.to_vec())
             .collect();
@@ -1419,6 +1421,33 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+
+    #[test]
+    fn live_chain_queries_skip_malformed_keys() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::test_store_with_backend(backend.clone());
+        let root = root(1);
+        let parent = H256::ZERO;
+
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::LiveChain,
+                vec![
+                    (vec![1, 2, 3], parent.to_ssz()),
+                    (encode_live_chain_key(42, &root), parent.to_ssz()),
+                ],
+            )
+            .expect("put live chain");
+        batch.commit().expect("commit");
+
+        assert_eq!(store.max_live_chain_slot(), Some(42));
+        assert_eq!(store.get_block_roots(), HashSet::from([root]));
+
+        let live_chain = store.get_live_chain();
+        assert_eq!(live_chain.len(), 1);
+        assert_eq!(live_chain.get(&root), Some(&(42, parent)));
+    }
 
     /// Insert a block header (and dummy body + signature) for a given root and slot.
     fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64) {
