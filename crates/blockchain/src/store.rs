@@ -711,12 +711,26 @@ pub fn get_attestation_target_with_checkpoints(
 ///
 /// The target walk-back is fed the same head-state justified so its clamp guard
 /// stays consistent with the source we emit.
+///
+/// Matches leanSpec PR #1166, including its genesis handling: the raw genesis
+/// state carries a zero-root justified placeholder that the state transition
+/// rebases to the real genesis root on the first block. A vote cast directly on
+/// the genesis head normalizes the placeholder the same way, so the source
+/// always names a real block (otherwise `validate_attestation_data` rejects it
+/// with `UnknownSourceBlock`).
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_root = store.head();
-    let source = store
+    let mut source = store
         .get_state(&head_root)
         .expect("head state exists")
         .latest_justified;
+
+    // Replace the placeholder genesis root with the real (head) one. This only
+    // fires on the genesis head, whose state still holds the zero-root
+    // placeholder; after the first block the root is already rebased.
+    if source.root == H256::ZERO {
+        source.root = head_root;
+    }
 
     let head_checkpoint = Checkpoint {
         root: head_root,
@@ -1259,6 +1273,33 @@ mod tests {
             data.source,
             store.latest_justified(),
             "source must not be the store's off-head global justified"
+        );
+    }
+
+    /// A vote cast on the genesis head must normalize the raw genesis state's
+    /// zero-root justified placeholder to the real genesis root, otherwise the
+    /// source names an unknown block and `validate_attestation_data` rejects it.
+    #[test]
+    fn produce_attestation_data_normalizes_genesis_placeholder_source() {
+        let store = new_test_store();
+        let genesis = store.head();
+
+        // The persisted genesis state carries the zero-root placeholder.
+        assert_eq!(store.head_state().latest_justified.root, H256::ZERO);
+
+        let data = produce_attestation_data(&store, 0);
+
+        assert_eq!(
+            data.source,
+            Checkpoint {
+                root: genesis,
+                slot: 0
+            },
+            "genesis-head source should be rebased to the real genesis root"
+        );
+        assert!(
+            validate_attestation_data(&store, &data).is_ok(),
+            "normalized genesis source must pass attestation validation"
         );
     }
 
