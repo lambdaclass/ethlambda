@@ -225,8 +225,6 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 
     // Head Consistency Check - A vote cannot have observed its head before that
     // head existed, so the vote's slot must not precede the head block's slot.
-    // This lower bound also keeps the wire slot clear of the overflow edge that a
-    // crafted near-`u64::MAX` slot would otherwise probe in the time check below.
     if data.slot < data.head.slot {
         return Err(StoreError::AttestationSlotBeforeHead {
             attestation_slot: data.slot,
