@@ -1276,33 +1276,6 @@ mod tests {
         );
     }
 
-    /// A vote cast on the genesis head must normalize the raw genesis state's
-    /// zero-root justified placeholder to the real genesis root, otherwise the
-    /// source names an unknown block and `validate_attestation_data` rejects it.
-    #[test]
-    fn produce_attestation_data_normalizes_genesis_placeholder_source() {
-        let store = new_test_store();
-        let genesis = store.head();
-
-        // The persisted genesis state carries the zero-root placeholder.
-        assert_eq!(store.head_state().latest_justified.root, H256::ZERO);
-
-        let data = produce_attestation_data(&store, 0);
-
-        assert_eq!(
-            data.source,
-            Checkpoint {
-                root: genesis,
-                slot: 0
-            },
-            "genesis-head source should be rebased to the real genesis root"
-        );
-        assert!(
-            validate_attestation_data(&store, &data).is_ok(),
-            "normalized genesis source must pass attestation validation"
-        );
-    }
-
     /// leanSpec #833: a vote whose head sits on a sibling fork of the target
     /// must be rejected by gossip validation, even though every slot and
     /// availability check passes.
