@@ -10,6 +10,7 @@
 //! seal `state_root`.
 
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     time::Instant,
 };
@@ -237,7 +238,7 @@ fn pick_best_candidate(
     projected: &ProjectedState,
 ) -> Option<(H256, EntryScore, HashSet<u64>)> {
     let mut best: Option<(H256, EntryScore, HashSet<u64>)> = None;
-    let mut best_key: Option<(Tier, std::cmp::Reverse<usize>, u64, u64, H256)> = None;
+    let mut best_key: Option<OrderingKey> = None;
 
     for (data_root, (att_data, proofs)) in chain.aggregated_payloads {
         if processed_data_roots.contains(data_root) {
@@ -436,9 +437,17 @@ enum Tier {
 /// Lower `tier` wins. Entries with zero new voters relative to the running
 /// per-target-root voter set are dropped (returned as `None`).
 ///
-/// Within a tier, ordering prefers more `new_voters` (descending), then
-/// smaller `target_slot` (older chain progress first), then smaller
-/// `att_slot`, then the entry's `data_root` for determinism.
+/// The within-tier ordering is tier-dependent (leanSpec PR #1149):
+///
+/// - **Finalize / Justify**: the entry already crosses 2/3 on its target, so
+///   newer chain progress leads: larger `target_slot`, then larger `att_slot`,
+///   then more `new_voters`. Pushing the justified slot as far forward as
+///   possible shortens recovery from a justification or finalization stall.
+/// - **Build**: the entry only adds marginal voters toward the threshold, so
+///   coverage leads: more `new_voters`, then larger `target_slot`, then larger
+///   `att_slot`.
+///
+/// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EntryScore {
     tier: Tier,
@@ -447,15 +456,35 @@ struct EntryScore {
     att_slot: u64,
 }
 
+/// Total order over candidate entries; the smallest value is the best pick.
+/// `tier` leads, then three tier-dependent `Reverse`-encoded priorities, then
+/// `data_root` as the deterministic tiebreak. See [`EntryScore::ordering_key`].
+type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
+
 impl EntryScore {
-    fn ordering_key(&self, data_root: H256) -> (Tier, std::cmp::Reverse<usize>, u64, u64, H256) {
-        (
-            self.tier,
-            std::cmp::Reverse(self.new_voters),
-            self.target_slot,
-            self.att_slot,
-            data_root,
-        )
+    /// Sort key where the smallest tuple is the best candidate. `tier` always
+    /// leads; the remaining three slots carry tier-dependent priorities (see
+    /// the type-level docs), all encoded as `Reverse` so "larger is better".
+    fn ordering_key(&self, data_root: H256) -> OrderingKey {
+        let more_new_voters = Reverse(self.new_voters as u64);
+        let newer_target = Reverse(self.target_slot);
+        let newer_att = Reverse(self.att_slot);
+        match self.tier {
+            Tier::Build => (
+                self.tier,
+                more_new_voters,
+                newer_target,
+                newer_att,
+                data_root,
+            ),
+            Tier::Finalize | Tier::Justify => (
+                self.tier,
+                newer_target,
+                newer_att,
+                more_new_voters,
+                data_root,
+            ),
+        }
     }
 }
 
@@ -749,6 +778,74 @@ mod tests {
             score.tier,
             Tier::Justify,
             "source at the finalized boundary must justify, not finalize"
+        );
+    }
+
+    /// In the finalize/justify tiers the entry already crosses 2/3 on its
+    /// target, so a newer (larger) target slot wins even against an entry with
+    /// more new voters. Pushing the justified slot forward shortens recovery
+    /// from a stall (leanSpec PR #1149).
+    #[test]
+    fn ordering_key_justify_tier_prefers_newer_target_over_more_voters() {
+        let newer = EntryScore {
+            tier: Tier::Justify,
+            new_voters: 1,
+            target_slot: 5,
+            att_slot: 5,
+        };
+        let older = EntryScore {
+            tier: Tier::Justify,
+            new_voters: 10,
+            target_slot: 4,
+            att_slot: 5,
+        };
+        let root = H256::ZERO;
+        assert!(
+            newer.ordering_key(root) < older.ordering_key(root),
+            "justify tier must prefer the newer (larger) target slot over more voters"
+        );
+    }
+
+    /// The build tier only adds marginal voters toward the threshold, so
+    /// coverage leads: more new voters wins. A newer target only breaks ties
+    /// once coverage is equal (leanSpec PR #1149).
+    #[test]
+    fn ordering_key_build_tier_prefers_voters_then_newer_target() {
+        let root = H256::ZERO;
+
+        let more_voters = EntryScore {
+            tier: Tier::Build,
+            new_voters: 10,
+            target_slot: 4,
+            att_slot: 5,
+        };
+        let newer_target = EntryScore {
+            tier: Tier::Build,
+            new_voters: 1,
+            target_slot: 5,
+            att_slot: 5,
+        };
+        assert!(
+            more_voters.ordering_key(root) < newer_target.ordering_key(root),
+            "build tier must prefer more new voters over a newer target"
+        );
+
+        // With equal coverage, the newer (larger) target breaks the tie.
+        let newer = EntryScore {
+            tier: Tier::Build,
+            new_voters: 5,
+            target_slot: 5,
+            att_slot: 5,
+        };
+        let older = EntryScore {
+            tier: Tier::Build,
+            new_voters: 5,
+            target_slot: 4,
+            att_slot: 5,
+        };
+        assert!(
+            newer.ordering_key(root) < older.ordering_key(root),
+            "build tier tiebreak must prefer the newer (larger) target slot"
         );
     }
 
