@@ -245,9 +245,16 @@ impl BlockChainServer {
             info!(%slot, %validator_id, "Skipping block proposal while syncing");
         }
 
+        // ==== interval 4 (pre-tick) ====
+
         // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
         // (interval 4), so the post-block report for this round sees its
         // "timely" cohort just before it is promoted out of `new_payloads`.
+        //
+        // This MUST stay ahead of `store::on_tick` below: the interval-4 tick
+        // promotes `new_payloads` out, so snapshotting afterwards would capture
+        // an already-drained set. It is the one interval action that cannot live
+        // in its grouped block downstream.
         //
         // Only interval 4 — not the proposer's interval-0 promote. By interval 0
         // the round's votes have already been promoted at the previous slot's
@@ -269,22 +276,14 @@ impl BlockChainServer {
             proposer_validator_id.is_some(),
         );
 
-        if interval == 2 {
-            if is_aggregator {
-                coverage::emit_agg_start_new_coverage(
-                    &self.store,
-                    self.attestation_committee_count,
-                );
-                self.start_aggregation_session(slot, ctx).await;
-            } else {
-                metrics::inc_aggregator_skipped_not_aggregator();
-            }
-        }
+        // ==== interval 0 ====
 
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = proposer_validator_id {
             self.propose_block(slot, validator_id);
         }
+
+        // ==== interval 1 ====
 
         // Produce attestations at interval 1 (all validators including proposer).
         // Reuse the same snapshot so self-delivery decisions match the rest
@@ -308,6 +307,24 @@ impl BlockChainServer {
                 info!(%slot, "Skipping attestations while syncing");
             }
         }
+
+        // ==== interval 2 ====
+
+        if interval == 2 {
+            if is_aggregator {
+                coverage::emit_agg_start_new_coverage(
+                    &self.store,
+                    self.attestation_committee_count,
+                );
+                self.start_aggregation_session(slot, ctx).await;
+            } else {
+                metrics::inc_aggregator_skipped_not_aggregator();
+            }
+        }
+
+        // ==== interval 3 ====
+
+        // Interval 3 (safe-target update) is handled inside `store::on_tick`.
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
