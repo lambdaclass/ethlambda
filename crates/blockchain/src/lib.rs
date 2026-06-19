@@ -236,7 +236,8 @@ impl BlockChainServer {
         let scheduled_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten();
-        let proposer_validator_id = self.sync_status.gate_proposer(scheduled_proposer);
+        let proposer_validator_id =
+            scheduled_proposer.filter(|_| self.sync_status.duties_allowed());
 
         if let Some(validator_id) = scheduled_proposer
             && proposer_validator_id.is_none()
