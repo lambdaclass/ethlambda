@@ -321,6 +321,10 @@ impl BlockChainServer {
 
         // Interval 3 (safe-target update) is handled inside `store::on_tick`.
 
+        // ==== interval 4 ====
+
+        // Handled by the pre-tick snapshot above.
+
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
