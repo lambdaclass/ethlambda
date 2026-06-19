@@ -41,6 +41,14 @@ impl SyncStatusTracker {
             SyncStatus::Synced
         }
     }
+
+    pub(crate) fn duties_allowed(&self) -> bool {
+        !self.syncing
+    }
+
+    pub(crate) fn gate_proposer(&self, proposer: Option<u64>) -> Option<u64> {
+        proposer.filter(|_| self.duties_allowed())
+    }
 }
 
 #[cfg(test)]
@@ -54,6 +62,12 @@ mod tests {
         for lag in 0..=SYNC_LAG_THRESHOLD {
             assert_eq!(tracker.update(10 + lag, 10, 10 + lag), SyncStatus::Synced);
         }
+
+        let first_syncing_slot = 10 + SYNC_LAG_THRESHOLD + 1;
+        assert_eq!(
+            tracker.update(first_syncing_slot, 10, first_syncing_slot),
+            SyncStatus::Syncing
+        );
     }
 
     #[test]
@@ -97,5 +111,33 @@ mod tests {
         let mut tracker = SyncStatusTracker::default();
 
         assert_eq!(tracker.update(15, 20, 20), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn syncing_gates_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+
+        assert!(!tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), None);
+    }
+
+    #[test]
+    fn caught_up_node_allows_proposals_and_attestations() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(20, 0, 20);
+        tracker.update(20, 18, 20);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
+    }
+
+    #[test]
+    fn network_stall_keeps_proposals_and_attestations_enabled() {
+        let mut tracker = SyncStatusTracker::default();
+        tracker.update(100, 0, 0);
+
+        assert!(tracker.duties_allowed());
+        assert_eq!(tracker.gate_proposer(Some(3)), Some(3));
     }
 }
