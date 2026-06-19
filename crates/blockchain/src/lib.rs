@@ -230,21 +230,6 @@ impl BlockChainServer {
         let is_aggregator = self.aggregator.is_enabled();
         metrics::set_is_aggregator(is_aggregator);
 
-        // At interval 0, check if we will propose (but don't build the block yet).
-        // Tick forkchoice first to accept attestations, then build the block
-        // using the freshly-accepted attestations.
-        let scheduled_proposer = (interval == 0 && slot > 0)
-            .then(|| self.get_our_proposer(slot))
-            .flatten();
-        let proposer_validator_id =
-            scheduled_proposer.filter(|_| self.sync_status.duties_allowed());
-
-        if let Some(validator_id) = scheduled_proposer
-            && proposer_validator_id.is_none()
-        {
-            info!(%slot, %validator_id, "Skipping block proposal while syncing");
-        }
-
         // ==== interval 4 (pre-tick) ====
 
         // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
@@ -264,18 +249,23 @@ impl BlockChainServer {
             self.pre_merge_coverage = Some(snapshot);
         }
 
+        let scheduled_proposer = (interval == 0 && slot > 0)
+            .then(|| self.get_our_proposer(slot))
+            .flatten();
+        let is_proposer = scheduled_proposer.is_some();
+
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        store::on_tick(
-            &mut self.store,
-            timestamp_ms,
-            proposer_validator_id.is_some(),
-        );
+        store::on_tick(&mut self.store, timestamp_ms, is_proposer);
 
         // ==== interval 0 ====
 
         // Now build and publish the block (after attestations have been accepted)
-        if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id);
+        if let Some(validator_id) = scheduled_proposer {
+            if self.sync_status.duties_allowed() {
+                self.propose_block(slot, validator_id);
+            } else {
+                info!(%slot, %validator_id, "Skipping block proposal while syncing");
+            }
         }
 
         // ==== interval 1 ====
