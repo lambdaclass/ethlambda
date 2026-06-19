@@ -54,7 +54,13 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         metrics::observe_fork_choice_reorg_depth(depth);
         info!(%old_head, %new_head, depth, "Fork choice reorg detected");
     }
-    store.update_checkpoints(ForkCheckpoints::head_only(new_head));
+
+    // Override the store's latest finalized with the head state's
+    let finalized = store
+        .get_state(&new_head)
+        .map(|state| state.latest_finalized)
+        .filter(|finalized| store.get_block_header(&finalized.root).is_some());
+    store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
 
     if old_head != new_head {
         let old_slot = store
@@ -159,7 +165,8 @@ fn checkpoint_is_ancestor(
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
 ///     5. Source, target, and head must lie on one parent chain.
-///     6. The vote's slot must have started locally (a small disparity margin is allowed).
+///     6. The vote's slot cannot precede the slot of the head it claims to have seen.
+///     7. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -216,6 +223,15 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     }
     if !checkpoint_is_ancestor(store, &data.target, &data.head, &head_header) {
         return Err(StoreError::TargetNotAncestorOfHead);
+    }
+
+    // Head Consistency Check - A vote cannot have observed its head before that
+    // head existed, so the vote's slot must not precede the head block's slot.
+    if data.slot < data.head.slot {
+        return Err(StoreError::AttestationSlotBeforeHead {
+            attestation_slot: data.slot,
+            head_slot: data.head.slot,
+        });
     }
 
     // Time Check - Honest validators emit votes only after their slot has begun.
@@ -414,6 +430,9 @@ fn on_gossip_aggregated_attestation_core(
     let num_validators = validators.len() as u64;
 
     let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
+    if participant_indices.is_empty() {
+        return Err(StoreError::EmptyAggregationBits);
+    }
     if participant_indices.iter().any(|&vid| vid >= num_validators) {
         return Err(StoreError::InvalidValidatorIndex);
     }
@@ -555,14 +574,14 @@ fn on_block_core(
     let state_root = block.state_root;
     post_state.latest_block_header.state_root = state_root;
 
-    // Update justified/finalized checkpoints if they have higher slots
+    // Advance the justified checkpoint when the post-state names a higher one
+    // (leanSpec `advance_to`: monotonic by slot). Finalized is intentionally not
+    // latched here; it is recomputed from the head's chain in `update_head`.
     let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
         .then_some(post_state.latest_justified);
-    let finalized = (post_state.latest_finalized.slot > store.latest_finalized().slot)
-        .then_some(post_state.latest_finalized);
 
-    if justified.is_some() || finalized.is_some() {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), justified, finalized));
+    if let Some(justified) = justified {
+        store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
     }
 
     // Store signed block and state
@@ -857,6 +876,12 @@ pub enum StoreError {
     #[error("Target checkpoint must be ancestor of head")]
     TargetNotAncestorOfHead,
 
+    #[error("Attestation slot {attestation_slot} precedes head block slot {head_slot}")]
+    AttestationSlotBeforeHead {
+        attestation_slot: u64,
+        head_slot: u64,
+    },
+
     #[error(
         "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
     )]
@@ -873,6 +898,9 @@ pub enum StoreError {
 
     #[error("Missing target state for block: {0}")]
     MissingTargetState(H256),
+
+    #[error("Aggregated attestation references no participants")]
+    EmptyAggregationBits,
 
     #[error("Validator {validator_index} is not the proposer for slot {slot}")]
     NotProposer { validator_index: u64, slot: u64 },
@@ -1266,6 +1294,81 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::SourceNotAncestorOfTarget)),
             "Expected SourceNotAncestorOfTarget, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1020: a vote whose slot precedes the slot of the head block it
+    /// claims to have seen must be rejected. The vote cannot have observed its
+    /// head before that head existed.
+    #[test]
+    fn validate_attestation_rejects_slot_before_head() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        let b3 = H256([3u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        insert_test_block(&mut store, b3, 3, b2);
+        store.set_time(3 * INTERVALS_PER_SLOT);
+
+        // head=b3 at slot 3, but the vote's own slot is 2: it claims to have seen
+        // a head that did not yet exist when the vote was cast.
+        let data = AttestationData {
+            slot: 2,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b2, slot: 2 },
+            head: Checkpoint { root: b3, slot: 3 },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::AttestationSlotBeforeHead {
+                    attestation_slot: 2,
+                    head_slot: 3,
+                })
+            ),
+            "Expected AttestationSlotBeforeHead, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1020: a vote whose slot sits at the unsigned 64-bit ceiling must
+    /// be rejected cleanly as too-far-in-future, without overflowing the
+    /// slot-to-interval multiplication. `saturating_mul` clamps the product at
+    /// `u64::MAX` rather than panicking on overflow.
+    #[test]
+    fn validate_attestation_rejects_ceiling_slot_without_overflow() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        store.set_time(2 * INTERVALS_PER_SLOT);
+
+        // A crafted gossip vote with a near-`u64::MAX` slot. The head-consistency
+        // check passes (slot >= head.slot), so this exercises the time check.
+        let data = AttestationData {
+            slot: u64::MAX,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b1, slot: 1 },
+            head: Checkpoint { root: b2, slot: 2 },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(result, Err(StoreError::AttestationTooFarInFuture { .. })),
+            "Expected AttestationTooFarInFuture, got: {result:?}"
         );
     }
 
