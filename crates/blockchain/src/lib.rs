@@ -251,11 +251,6 @@ impl BlockChainServer {
         // (interval 4), so the post-block report for this round sees its
         // "timely" cohort just before it is promoted out of `new_payloads`.
         //
-        // This MUST stay ahead of `store::on_tick` below: the interval-4 tick
-        // promotes `new_payloads` out, so snapshotting afterwards would capture
-        // an already-drained set. It is the one interval action that cannot live
-        // in its grouped block downstream.
-        //
         // Only interval 4 — not the proposer's interval-0 promote. By interval 0
         // the round's votes have already been promoted at the previous slot's
         // interval 4; `new_payloads` then holds only stragglers, and snapshotting
