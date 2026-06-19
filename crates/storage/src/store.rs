@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::api::{Error, StorageBackend, StorageWriteBatch, Table};
 
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
@@ -506,6 +506,7 @@ impl Store {
     /// No block body is stored since it's not available.
     pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
         Self::init_store(backend, anchor_state, None)
+            .expect("store initialization should succeed in from_anchor_state")
     }
 
     /// Initialize a Store from an anchor state and block.
@@ -530,11 +531,10 @@ impl Store {
             });
         }
 
-        Ok(Self::init_store(
-            backend,
-            anchor_state,
-            Some(anchor_block.body),
-        ))
+        Ok(
+            Self::init_store(backend, anchor_state, Some(anchor_block.body))
+                .expect("store initialization should succeed in get_forkchoice_store"),
+        )
     }
 
     /// Build a Store from the state already persisted in the storage backend.
@@ -579,7 +579,7 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_body: Option<BlockBody>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         // Save original state_root for validation
         let original_state_root = anchor_state.latest_block_header.state_root;
 
@@ -659,14 +659,14 @@ impl Store {
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
 
-        Self {
+        Ok(Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-        }
+        })
     }
 
     // ============ Metadata Helpers ============
