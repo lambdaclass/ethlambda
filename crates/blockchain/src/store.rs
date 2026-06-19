@@ -740,8 +740,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
             .slot,
     };
 
-    let target_checkpoint =
-        get_attestation_target_with_checkpoints(store, source, store.latest_finalized());
+    let target_checkpoint = get_attestation_target(store);
 
     AttestationData {
         slot,
