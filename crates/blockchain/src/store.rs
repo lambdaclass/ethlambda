@@ -163,7 +163,8 @@ fn checkpoint_is_ancestor(
 ///     3. The head must be at least as recent as source and target.
 ///     4. Checkpoint slots must match the actual block slots.
 ///     5. Source, target, and head must lie on one parent chain.
-///     6. The vote's slot must have started locally (a small disparity margin is allowed).
+///     6. The vote's slot cannot precede the slot of the head it claims to have seen.
+///     7. The vote's slot must have started locally (a small disparity margin is allowed).
 fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<(), StoreError> {
     let _timing = metrics::time_attestation_validation();
 
@@ -220,6 +221,15 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     }
     if !checkpoint_is_ancestor(store, &data.target, &data.head, &head_header) {
         return Err(StoreError::TargetNotAncestorOfHead);
+    }
+
+    // Head Consistency Check - A vote cannot have observed its head before that
+    // head existed, so the vote's slot must not precede the head block's slot.
+    if data.slot < data.head.slot {
+        return Err(StoreError::AttestationSlotBeforeHead {
+            attestation_slot: data.slot,
+            head_slot: data.head.slot,
+        });
     }
 
     // Time Check - Honest validators emit votes only after their slot has begun.
@@ -687,15 +697,40 @@ pub fn get_attestation_target_with_checkpoints(
 
 /// Produce attestation data for the given slot.
 ///
-/// The source comes from the store's global `latest_justified` checkpoint.
-/// When the store's justified has advanced past the head state (a minority
-/// fork justified a slot the head chain hasn't seen yet), the next block
-/// produced on the head chain is expected to close the gap via the
-/// fixed-point attestation loop in `build_block`.
+/// The source is the **head state's** latest justified checkpoint, which always
+/// lies on the head's own chain. This deliberately diverges from leanSpec, which
+/// sources from the store's global `latest_justified` (see
+/// <https://github.com/leanEthereum/leanSpec/pull/595>).
 ///
-/// See: <https://github.com/leanEthereum/leanSpec/pull/595>
+/// The store's justified is a highest-slot-wins maximum that can latch onto an
+/// off-head sibling justified by a minority fork. Voting with such an off-chain
+/// source makes every head-chain target fail `is_valid_vote` (the target no
+/// longer descends from the source), so the head can never re-justify and block
+/// production stalls. Sourcing from the head state keeps the source and target
+/// on the same chain, letting justification advance again.
+///
+/// The target walk-back is fed the same head-state justified so its clamp guard
+/// stays consistent with the source we emit.
+///
+/// Matches leanSpec PR #1166, including its genesis handling: the raw genesis
+/// state carries a zero-root justified placeholder that the state transition
+/// rebases to the real genesis root on the first block. A vote cast directly on
+/// the genesis head normalizes the placeholder the same way, so the source
+/// always names a real block (otherwise `validate_attestation_data` rejects it
+/// with `UnknownSourceBlock`).
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_root = store.head();
+    let mut source = store
+        .get_state(&head_root)
+        .expect("head state exists")
+        .latest_justified;
+
+    // Replace the placeholder genesis root with the real (head) one. This only
+    // fires on the genesis head, whose state still holds the zero-root
+    // placeholder; after the first block the root is already rebased.
+    if source.root == H256::ZERO {
+        source.root = head_root;
+    }
 
     let head_checkpoint = Checkpoint {
         root: head_root,
@@ -711,7 +746,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
+        source,
     }
 }
 
@@ -857,6 +892,12 @@ pub enum StoreError {
 
     #[error("Target checkpoint must be ancestor of head")]
     TargetNotAncestorOfHead,
+
+    #[error("Attestation slot {attestation_slot} precedes head block slot {head_slot}")]
+    AttestationSlotBeforeHead {
+        attestation_slot: u64,
+        head_slot: u64,
+    },
 
     #[error(
         "Attestation slot {attestation_slot} is too far in future (store time: {store_time} intervals)"
@@ -1190,6 +1231,50 @@ mod tests {
         Store::from_anchor_state(backend, genesis_state)
     }
 
+    /// The produced attestation source must track the head state's justified
+    /// checkpoint, not the store's global `latest_justified`. When the store's
+    /// justified has latched onto a higher, off-head sibling (a minority fork),
+    /// sourcing from it would put the vote's source off the head chain and stall
+    /// re-justification; sourcing from the head state keeps it on-chain.
+    #[test]
+    fn produce_attestation_data_sources_from_head_state_not_store() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        // Head chain: genesis(0) <- a(1) <- b(2), with `b` as head.
+        let a = H256([1u8; 32]);
+        let b = H256([2u8; 32]);
+        insert_test_block(&mut store, a, 1, genesis);
+        insert_test_block(&mut store, b, 2, a);
+
+        // Head state justified `a` (slot 1), which lies on the head's chain.
+        let head_justified = Checkpoint { root: a, slot: 1 };
+        let mut head_state = State::from_genesis(1000, vec![]);
+        head_state.latest_justified = head_justified;
+        store.insert_state(b, head_state);
+
+        // Store's global justified latched onto a higher, off-head checkpoint,
+        // as it would after a minority fork justified a slot the head never saw.
+        let off_head_justified = Checkpoint {
+            root: H256([9u8; 32]),
+            slot: 5,
+        };
+        store.update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None));
+        store.set_time(2 * INTERVALS_PER_SLOT);
+
+        let data = produce_attestation_data(&store, 2);
+
+        assert_eq!(
+            data.source, head_justified,
+            "source should follow the head state's justified checkpoint"
+        );
+        assert_ne!(
+            data.source,
+            store.latest_justified(),
+            "source must not be the store's off-head global justified"
+        );
+    }
+
     /// leanSpec #833: a vote whose head sits on a sibling fork of the target
     /// must be rejected by gossip validation, even though every slot and
     /// availability check passes.
@@ -1270,6 +1355,81 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::SourceNotAncestorOfTarget)),
             "Expected SourceNotAncestorOfTarget, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1020: a vote whose slot precedes the slot of the head block it
+    /// claims to have seen must be rejected. The vote cannot have observed its
+    /// head before that head existed.
+    #[test]
+    fn validate_attestation_rejects_slot_before_head() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        let b3 = H256([3u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        insert_test_block(&mut store, b3, 3, b2);
+        store.set_time(3 * INTERVALS_PER_SLOT);
+
+        // head=b3 at slot 3, but the vote's own slot is 2: it claims to have seen
+        // a head that did not yet exist when the vote was cast.
+        let data = AttestationData {
+            slot: 2,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b2, slot: 2 },
+            head: Checkpoint { root: b3, slot: 3 },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::AttestationSlotBeforeHead {
+                    attestation_slot: 2,
+                    head_slot: 3,
+                })
+            ),
+            "Expected AttestationSlotBeforeHead, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1020: a vote whose slot sits at the unsigned 64-bit ceiling must
+    /// be rejected cleanly as too-far-in-future, without overflowing the
+    /// slot-to-interval multiplication. `saturating_mul` clamps the product at
+    /// `u64::MAX` rather than panicking on overflow.
+    #[test]
+    fn validate_attestation_rejects_ceiling_slot_without_overflow() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        store.set_time(2 * INTERVALS_PER_SLOT);
+
+        // A crafted gossip vote with a near-`u64::MAX` slot. The head-consistency
+        // check passes (slot >= head.slot), so this exercises the time check.
+        let data = AttestationData {
+            slot: u64::MAX,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b1, slot: 1 },
+            head: Checkpoint { root: b2, slot: 2 },
+        };
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(result, Err(StoreError::AttestationTooFarInFuture { .. })),
+            "Expected AttestationTooFarInFuture, got: {result:?}"
         );
     }
 

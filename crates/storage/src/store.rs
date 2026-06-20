@@ -534,7 +534,7 @@ impl Store {
 
         Ok(
             Self::init_store(backend, anchor_state, Some(anchor_block.body))
-                .expect(" store initialization should succeed in get_forkchoice_store"),
+                .expect("store initialization should succeed in get_forkchoice_store"),
         )
     }
 
