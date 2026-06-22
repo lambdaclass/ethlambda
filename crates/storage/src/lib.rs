@@ -1,5 +1,6 @@
 mod api;
 pub mod backend;
+mod error;
 mod store;
 
 pub use api::{ALL_TABLES, StorageBackend, StorageReadView, StorageWriteBatch, Table};

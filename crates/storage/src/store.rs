@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::api::{Error, StorageBackend, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::error::Error;
 
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
