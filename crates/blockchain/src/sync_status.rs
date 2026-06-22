@@ -12,12 +12,35 @@ const NETWORK_STALL_THRESHOLD: u64 = 8;
 /// Recovery band that prevents the sync status from flapping near the threshold.
 const SYNC_HYSTERESIS_BAND: u64 = 2;
 
-#[derive(Default)]
 pub(crate) struct SyncStatusTracker {
     syncing: bool,
+    /// Whether the syncing state suppresses validator duties.
+    ///
+    /// When `false`, [`Self::update`] still tracks `syncing` and drives the
+    /// `lean_node_sync_status` metric, but [`Self::duties_allowed`] always
+    /// returns `true`: the gate is observe-only. Seeded from the CLI
+    /// `--disable-duty-sync-gate` flag (gating stays on by default).
+    gate_duties: bool,
+}
+
+impl Default for SyncStatusTracker {
+    fn default() -> Self {
+        Self {
+            syncing: false,
+            gate_duties: true,
+        }
+    }
 }
 
 impl SyncStatusTracker {
+    /// Build a tracker, choosing whether the syncing state gates duties.
+    pub(crate) fn new(gate_duties: bool) -> Self {
+        Self {
+            gate_duties,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn update(
         &mut self,
         current_slot: u64,
@@ -43,7 +66,8 @@ impl SyncStatusTracker {
     }
 
     pub(crate) fn duties_allowed(&self) -> bool {
-        !self.syncing
+        // Gate disabled: the syncing state is observe-only, never suppresses duties.
+        !self.gate_duties || !self.syncing
     }
 }
 
@@ -107,5 +131,23 @@ mod tests {
         let mut tracker = SyncStatusTracker::default();
 
         assert_eq!(tracker.update(15, 20, 20), SyncStatus::Synced);
+    }
+
+    #[test]
+    fn gating_on_by_default_suppresses_duties_while_syncing() {
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(tracker.update(20, 0, 20), SyncStatus::Syncing);
+        assert!(!tracker.duties_allowed());
+    }
+
+    #[test]
+    fn disabled_gate_still_tracks_status_but_allows_duties() {
+        let mut tracker = SyncStatusTracker::new(false);
+
+        // Status still tracked for the metric...
+        assert_eq!(tracker.update(20, 0, 20), SyncStatus::Syncing);
+        // ...but duties are never suppressed.
+        assert!(tracker.duties_allowed());
     }
 }

@@ -81,6 +81,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        gate_duties: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -106,7 +107,7 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
-            sync_status: SyncStatusTracker::default(),
+            sync_status: SyncStatusTracker::new(gate_duties),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -172,7 +173,9 @@ pub struct BlockChainServer {
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
 
-    /// Stateful sync heuristic used by `lean_node_sync_status`.
+    /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
+    /// validator duties while syncing, unless that gating was disabled at
+    /// startup via `--disable-duty-sync-gate` (then it is metric-only).
     sync_status: SyncStatusTracker,
 }
 
