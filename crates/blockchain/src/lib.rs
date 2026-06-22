@@ -265,6 +265,13 @@ impl BlockChainServer {
         // Now build and publish the block (after attestations have been accepted)
         if let Some(validator_id) = scheduled_proposer {
             if self.sync_status.duties_allowed() {
+                if self.sync_status.duty_gate_overridden() {
+                    warn!(
+                        %slot,
+                        %validator_id,
+                        "Proposing block while syncing: duty sync-gate disabled"
+                    );
+                }
                 self.propose_block(slot, validator_id);
             } else {
                 info!(%slot, %validator_id, "Skipping block proposal while syncing");
@@ -290,6 +297,11 @@ impl BlockChainServer {
                 );
             }
             if self.sync_status.duties_allowed() {
+                if self.sync_status.duty_gate_overridden()
+                    && !self.key_manager.validator_ids().is_empty()
+                {
+                    warn!(%slot, "Producing attestations while syncing: duty sync-gate disabled");
+                }
                 self.produce_attestations(slot, is_aggregator);
             } else if !self.key_manager.validator_ids().is_empty() {
                 info!(%slot, "Skipping attestations while syncing");
@@ -739,6 +751,9 @@ impl BlockChainServer {
                 // run when the chain is in sync — backfilling nodes must
                 // not spam gossip with rederived aggregates.
                 if self.sync_status.duties_allowed() {
+                    if self.sync_status.duty_gate_overridden() {
+                        warn!(%slot, "Re-aggregating while syncing: duty sync-gate disabled");
+                    }
                     self.run_reaggregate_from_block(&block_for_reaggregate);
                 }
 

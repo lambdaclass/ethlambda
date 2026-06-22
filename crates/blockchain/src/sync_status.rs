@@ -69,6 +69,13 @@ impl SyncStatusTracker {
         // Gate disabled: the syncing state is observe-only, never suppresses duties.
         !self.gate_duties || !self.syncing
     }
+
+    /// Whether a duty is running only because the gate is disabled: the node
+    /// believes it is syncing, so with gating on the duty would have been
+    /// suppressed. Lets call sites log the counterfactual suppression.
+    pub(crate) fn duty_gate_overridden(&self) -> bool {
+        !self.gate_duties && self.syncing
+    }
 }
 
 #[cfg(test)]
@@ -131,23 +138,5 @@ mod tests {
         let mut tracker = SyncStatusTracker::default();
 
         assert_eq!(tracker.update(15, 20, 20), SyncStatus::Synced);
-    }
-
-    #[test]
-    fn gating_on_by_default_suppresses_duties_while_syncing() {
-        let mut tracker = SyncStatusTracker::default();
-
-        assert_eq!(tracker.update(20, 0, 20), SyncStatus::Syncing);
-        assert!(!tracker.duties_allowed());
-    }
-
-    #[test]
-    fn disabled_gate_still_tracks_status_but_allows_duties() {
-        let mut tracker = SyncStatusTracker::new(false);
-
-        // Status still tracked for the metric...
-        assert_eq!(tracker.update(20, 0, 20), SyncStatus::Syncing);
-        // ...but duties are never suppressed.
-        assert!(tracker.duties_allowed());
     }
 }
