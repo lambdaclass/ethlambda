@@ -18,7 +18,6 @@ use std::{
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
-    slot_is_justifiable_after,
 };
 use ethlambda_types::{
     ShortRoot,
@@ -338,11 +337,6 @@ fn entry_passes_filters(
     {
         return Err("target_already_justified");
     }
-    if !is_genesis_self_vote
-        && !slot_is_justifiable_after(att_data.target.slot, projected_finalized_slot)
-    {
-        return Err("target_not_justifiable");
-    }
     Ok(())
 }
 
@@ -384,16 +378,14 @@ fn score_entry(
     let total = prior_count + new_voters.len();
     let crosses_2_3 = 3 * total >= 2 * validator_count;
 
-    // 3SF-mini finalization requires the source to lie past the finalized
-    // boundary (a source at or behind it is already final and must not
-    // re-finalize) and no slot strictly between source.slot and target.slot to
-    // still be justifiable (so source and target are consecutive justified
-    // checkpoints in the projected post-state). Mirrors `try_finalize` in the
-    // state transition.
+    // The simple BFT finality condition finalizes the source when it lies past
+    // the finalized boundary (a source at or behind it is already final and must
+    // not re-finalize) and the target is its immediate successor, so the two are
+    // consecutive justified checkpoints in the projected post-state. Mirrors
+    // `try_finalize` in the state transition.
     let finalizes = crosses_2_3
         && att_data.source.slot > projected_finalized_slot
-        && (att_data.source.slot + 1..att_data.target.slot)
-            .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
+        && att_data.source.slot + 1 == att_data.target.slot;
 
     let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
         Tier::Build

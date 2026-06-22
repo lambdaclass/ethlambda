@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 
-use ethlambda_state_transition::{
-    is_heartbeat_committee_member, is_proposer, slot_is_justifiable_after,
-};
+use ethlambda_state_transition::{is_heartbeat_committee_member, is_proposer};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -632,7 +630,10 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 pub fn get_attestation_target_with_checkpoints(
     store: &Store,
     justified: Checkpoint,
-    finalized: Checkpoint,
+    // Unused under the simple BFT finality condition (every slot is justifiable,
+    // so the target no longer needs a justifiability walk-back). Kept on the
+    // signature pending the finality redesign.
+    _finalized: Checkpoint,
 ) -> Checkpoint {
     // Start from current head
     let mut target_block_root = store.head();
@@ -660,20 +661,6 @@ pub fn get_attestation_target_with_checkpoints(
         }
     }
 
-    let finalized_slot = finalized.slot;
-
-    // Ensure target is in justifiable slot range
-    //
-    // Walk back until we find a slot that satisfies justifiability rules
-    // relative to the latest finalized checkpoint.
-    while target_header.slot > finalized_slot
-        && !slot_is_justifiable_after(target_header.slot, finalized_slot)
-    {
-        target_block_root = target_header.parent_root;
-        target_header = store
-            .get_block_header(&target_block_root)
-            .expect("parent block exists");
-    }
     // Guard: clamp target to justified (not in the spec).
     //
     // The spec's walk-back has no lower bound, so it can produce attestations
