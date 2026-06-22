@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use crate::metrics::SyncStatus;
 
 /// Local head lag beyond which the node is considered to be syncing.
@@ -49,6 +51,7 @@ impl SyncStatusTracker {
     ) -> SyncStatus {
         let head_lag = current_slot.saturating_sub(head_slot);
         let network_lag = current_slot.saturating_sub(max_seen_slot);
+        let was_syncing = self.syncing;
 
         if network_lag > NETWORK_STALL_THRESHOLD {
             self.syncing = false;
@@ -56,6 +59,18 @@ impl SyncStatusTracker {
             self.syncing = head_lag > SYNC_LAG_THRESHOLD.saturating_sub(SYNC_HYSTERESIS_BAND);
         } else {
             self.syncing = head_lag > SYNC_LAG_THRESHOLD;
+        }
+
+        if self.syncing != was_syncing {
+            debug!(
+                current_slot,
+                head_slot,
+                max_seen_slot,
+                head_lag,
+                network_lag,
+                syncing = self.syncing,
+                "Sync status changed"
+            );
         }
 
         if self.syncing {
@@ -68,13 +83,6 @@ impl SyncStatusTracker {
     pub(crate) fn duties_allowed(&self) -> bool {
         // Gate disabled: the syncing state is observe-only, never suppresses duties.
         !self.gate_duties || !self.syncing
-    }
-
-    /// Whether a duty is running only because the gate is disabled: the node
-    /// believes it is syncing, so with gating on the duty would have been
-    /// suppressed. Lets call sites log the counterfactual suppression.
-    pub(crate) fn duty_gate_overridden(&self) -> bool {
-        !self.gate_duties && self.syncing
     }
 }
 
