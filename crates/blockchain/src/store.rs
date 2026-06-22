@@ -705,15 +705,40 @@ pub fn get_attestation_target_with_checkpoints(
 
 /// Produce attestation data for the given slot.
 ///
-/// The source comes from the store's global `latest_justified` checkpoint.
-/// When the store's justified has advanced past the head state (a minority
-/// fork justified a slot the head chain hasn't seen yet), the next block
-/// produced on the head chain is expected to close the gap via the
-/// fixed-point attestation loop in `build_block`.
+/// The source is the **head state's** latest justified checkpoint, which always
+/// lies on the head's own chain. This deliberately diverges from leanSpec, which
+/// sources from the store's global `latest_justified` (see
+/// <https://github.com/leanEthereum/leanSpec/pull/595>).
 ///
-/// See: <https://github.com/leanEthereum/leanSpec/pull/595>
+/// The store's justified is a highest-slot-wins maximum that can latch onto an
+/// off-head sibling justified by a minority fork. Voting with such an off-chain
+/// source makes every head-chain target fail `is_valid_vote` (the target no
+/// longer descends from the source), so the head can never re-justify and block
+/// production stalls. Sourcing from the head state keeps the source and target
+/// on the same chain, letting justification advance again.
+///
+/// The target walk-back is fed the same head-state justified so its clamp guard
+/// stays consistent with the source we emit.
+///
+/// Matches leanSpec PR #1166, including its genesis handling: the raw genesis
+/// state carries a zero-root justified placeholder that the state transition
+/// rebases to the real genesis root on the first block. A vote cast directly on
+/// the genesis head normalizes the placeholder the same way, so the source
+/// always names a real block (otherwise `validate_attestation_data` rejects it
+/// with `UnknownSourceBlock`).
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_root = store.head();
+    let mut source = store
+        .get_state(&head_root)
+        .expect("head state exists")
+        .latest_justified;
+
+    // Replace the placeholder genesis root with the real (head) one. This only
+    // fires on the genesis head, whose state still holds the zero-root
+    // placeholder; after the first block the root is already rebased.
+    if source.root == H256::ZERO {
+        source.root = head_root;
+    }
 
     let head_checkpoint = Checkpoint {
         root: head_root,
@@ -729,7 +754,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot,
         head: head_checkpoint,
         target: target_checkpoint,
-        source: store.latest_justified(),
+        source,
     }
 }
 
@@ -1212,6 +1237,50 @@ mod tests {
         let genesis_state = State::from_genesis(1000, vec![]);
         let backend = Arc::new(InMemoryBackend::new());
         Store::from_anchor_state(backend, genesis_state)
+    }
+
+    /// The produced attestation source must track the head state's justified
+    /// checkpoint, not the store's global `latest_justified`. When the store's
+    /// justified has latched onto a higher, off-head sibling (a minority fork),
+    /// sourcing from it would put the vote's source off the head chain and stall
+    /// re-justification; sourcing from the head state keeps it on-chain.
+    #[test]
+    fn produce_attestation_data_sources_from_head_state_not_store() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        // Head chain: genesis(0) <- a(1) <- b(2), with `b` as head.
+        let a = H256([1u8; 32]);
+        let b = H256([2u8; 32]);
+        insert_test_block(&mut store, a, 1, genesis);
+        insert_test_block(&mut store, b, 2, a);
+
+        // Head state justified `a` (slot 1), which lies on the head's chain.
+        let head_justified = Checkpoint { root: a, slot: 1 };
+        let mut head_state = State::from_genesis(1000, vec![]);
+        head_state.latest_justified = head_justified;
+        store.insert_state(b, head_state);
+
+        // Store's global justified latched onto a higher, off-head checkpoint,
+        // as it would after a minority fork justified a slot the head never saw.
+        let off_head_justified = Checkpoint {
+            root: H256([9u8; 32]),
+            slot: 5,
+        };
+        store.update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None));
+        store.set_time(2 * INTERVALS_PER_SLOT);
+
+        let data = produce_attestation_data(&store, 2);
+
+        assert_eq!(
+            data.source, head_justified,
+            "source should follow the head state's justified checkpoint"
+        );
+        assert_ne!(
+            data.source,
+            store.latest_justified(),
+            "source must not be the store's off-head global justified"
+        );
     }
 
     /// leanSpec #833: a vote whose head sits on a sibling fork of the target
