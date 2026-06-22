@@ -8,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    block::{Block, ByteList512KiB, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
@@ -17,6 +17,7 @@ use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
+use crate::block_builder::{PreparedBlock, prebuilt_block_is_usable};
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
@@ -103,6 +104,7 @@ impl BlockChain {
             aggregator,
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
+            prepared_block: None,
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
@@ -157,6 +159,11 @@ pub struct BlockChainServer {
     /// worker started at the most recent interval 2 is still running or until
     /// the next interval 2 takes over.
     current_aggregation: Option<AggregationSession>,
+
+    /// Block built synchronously at the previous slot's interval 4, awaiting
+    /// publication at this proposal slot's interval 0. Cleared on use, on
+    /// staleness, or when superseded by the next interval-4 build.
+    prepared_block: Option<PreparedBlock>,
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
@@ -313,7 +320,20 @@ impl BlockChainServer {
 
         // ==== interval 4 ====
 
-        // Handled by the pre-tick snapshot above.
+        // The pre-merge `new_payloads` snapshot is taken pre-tick above. If one
+        // of our validators proposes the NEXT slot, build its block now
+        // (synchronously, blocking the actor) so the heavy leanVM work is done
+        // before interval 0 and the proposer only has to publish.
+        if interval == 4 {
+            let next_slot = slot + 1;
+            let next_proposer = self
+                .get_our_proposer(next_slot)
+                .filter(|_| self.sync_status.duties_allowed());
+
+            if let Some(validator_id) = next_proposer {
+                self.prebuild_block(next_slot, validator_id);
+            }
+        }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
@@ -380,6 +400,74 @@ impl BlockChainServer {
         });
     }
 
+    /// Build the next slot's block synchronously and stash it for publication
+    /// at interval 0.
+    ///
+    /// Runs on the actor thread, blocking it for the duration of the build
+    /// (the expensive part is the leanVM Type-1 → Type-2 merge). That is
+    /// acceptable here: between interval 4 and the next slot the actor has no
+    /// other consensus-critical duty, and a prepared block lets the proposer
+    /// publish at interval 0 without paying the build cost then.
+    fn prebuild_block(&mut self, slot: u64, validator_id: u64) {
+        // Build against the current canonical head, READ-ONLY. We must not use
+        // `get_proposal_head` here: it ticks the store to `slot` time one interval
+        // early, which would skew finalization and diverge the captured head from
+        // the interval-0 state (making every prebuilt block stale). The interval-4
+        // promote has already run in `store::on_tick` this tick, so `store.head()`
+        // reflects the latest accepted attestations.
+        let parent_root = self.store.head();
+
+        let Some((signed_block, built_justified_slot)) =
+            self.build_signed_block(slot, validator_id, parent_root)
+        else {
+            return;
+        };
+
+        self.prepared_block = Some(PreparedBlock {
+            slot,
+            validator_id,
+            parent_root,
+            built_justified_slot,
+            signed_block,
+        });
+        info!(%slot, %validator_id, "Pre-built block ready");
+    }
+
+    /// Build the block on `head_root` and assemble it into a `SignedBlock`.
+    ///
+    /// Shared by the interval-0 proposal path and the interval-4 pre-build; the
+    /// only difference between callers is how `head_root` is resolved (ticking
+    /// `get_proposal_head` vs read-only `store.head()`). Returns the signed block
+    /// and the justified slot it closed over, or `None` on any build/sign
+    /// failure (already logged and counted).
+    fn build_signed_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        head_root: H256,
+    ) -> Option<(SignedBlock, u64)> {
+        let _timing = metrics::time_block_building();
+        let (block, type_one_proofs, post_checkpoints) =
+            match store::produce_block_on_head(&mut self.store, slot, validator_id, head_root) {
+                Ok(built) => built,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to build block");
+                    metrics::inc_block_building_failures();
+                    return None;
+                }
+            };
+
+        coverage::emit_proposal_coverage(
+            &self.store,
+            self.attestation_committee_count,
+            block.body.attestations.iter(),
+        );
+
+        let signed_block =
+            self.assemble_signed_block(slot, validator_id, block, type_one_proofs)?;
+        Some((signed_block, post_checkpoints.justified.slot))
+    }
+
     /// Returns the validator ID if any of our validators is the proposer for this slot.
     fn get_our_proposer(&self, slot: u64) -> Option<u64> {
         let head_state = self.store.head_state();
@@ -442,24 +530,51 @@ impl BlockChainServer {
     fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        let _timing = metrics::time_block_building();
+        // Resolve the canonical head once. This ticks the store to `slot` and
+        // accepts pending attestations, so both the pre-built-block revalidation
+        // and a fresh build below see the same interval-0 state.
+        let head_root = store::get_proposal_head(&mut self.store, slot);
 
-        // Build the block with attestation signatures
-        let Ok((block, type_one_proofs, _post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
+        // Fast path: publish a block pre-built at the previous slot's interval 4,
+        // if it is still valid against the live head and justified checkpoint.
+        if let Some(prepared) = self.prepared_block.take() {
+            let store_justified_slot = self.store.latest_justified().slot;
+            if prebuilt_block_is_usable(
+                &prepared,
+                slot,
+                validator_id,
+                head_root,
+                store_justified_slot,
+            ) && self.process_and_publish_block(
+                slot,
+                validator_id,
+                prepared.signed_block,
+                "Published pre-built block",
+            ) {
+                return;
+            }
+            // Stale, or import failed: fall through to a fresh synchronous build.
+            info!(%slot, %validator_id, "Pre-built block unusable; rebuilding");
+        }
 
-        coverage::emit_proposal_coverage(
-            &self.store,
-            self.attestation_committee_count,
-            block.body.attestations.iter(),
-        );
+        if let Some((signed_block, _)) = self.build_signed_block(slot, validator_id, head_root) {
+            self.process_and_publish_block(slot, validator_id, signed_block, "Published block");
+        }
+    }
 
-        // Sign the block root with the proposal key
+    /// Sign the block root and merge every Type-1 proof (attestations plus the
+    /// proposer's own signature) into the block's single Type-2 proof.
+    ///
+    /// Shared by the synchronous proposal path and `prebuild_block`. Returns
+    /// `None` on any signing/aggregation failure (already logged and counted).
+    fn assemble_signed_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        block: Block,
+        type_one_proofs: Vec<TypeOneMultiSignature>,
+    ) -> Option<SignedBlock> {
+        // Sign the block root with the proposal key.
         let block_root = block.hash_tree_root();
         let Ok(proposer_signature) = self
             .key_manager
@@ -467,18 +582,17 @@ impl BlockChainServer {
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
         else {
             metrics::inc_block_building_failures();
-            return;
+            return None;
         };
 
-        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
-        // singleton Type-1 SNARK, then merge it with every attestation Type-1
-        // into the block's single Type-2 proof.
+        // Wrap the proposer's raw XMSS signature into a singleton Type-1 SNARK,
+        // then merge it with every attestation Type-1 into the single Type-2.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         let Some(proposer_validator) = validators.get(validator_id as usize) else {
             error!(%slot, %validator_id, "Proposer index out of range when assembling block");
             metrics::inc_block_building_failures();
-            return;
+            return None;
         };
 
         // Decode the proposer's proposal pubkey once and reuse it both for the
@@ -487,7 +601,7 @@ impl BlockChainServer {
             |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
         ) else {
             metrics::inc_block_building_failures();
-            return;
+            return None;
         };
 
         let Ok(proposer_validator_signature) =
@@ -496,7 +610,7 @@ impl BlockChainServer {
             })
         else {
             metrics::inc_block_building_failures();
-            return;
+            return None;
         };
         let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
             vec![proposer_pubkey.clone()],
@@ -508,7 +622,7 @@ impl BlockChainServer {
             |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
         ) else {
             metrics::inc_block_building_failures();
-            return;
+            return None;
         };
 
         let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
@@ -538,7 +652,7 @@ impl BlockChainServer {
         }
         if resolve_failed {
             metrics::inc_block_building_failures();
-            return;
+            return None;
         }
         merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
@@ -551,7 +665,7 @@ impl BlockChainServer {
             Err(err) => {
                 error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
                 metrics::inc_block_building_failures();
-                return;
+                return None;
             }
         };
         let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
@@ -559,33 +673,41 @@ impl BlockChainServer {
             Err(err) => {
                 error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
                 metrics::inc_block_building_failures();
-                return;
+                return None;
             }
         };
-        // `type_one_proofs` is no longer needed past this point.
-        drop(type_one_proofs);
-        let signed_block = SignedBlock {
+        Some(SignedBlock {
             message: block,
             proof,
-        };
+        })
+    }
 
-        // Process the block locally before publishing
+    /// Import a freshly built block locally, then publish it to gossip. Returns
+    /// `true` on successful import; on failure logs, counts it, and returns
+    /// `false` so the caller can fall back to a fresh build.
+    fn process_and_publish_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        signed_block: SignedBlock,
+        published_msg: &'static str,
+    ) -> bool {
         if let Err(err) = self.process_block(signed_block.clone()) {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
-            return;
-        };
+            return false;
+        }
 
         metrics::inc_block_building_success();
 
-        // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
                 .publish_block(signed_block)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"));
         }
 
-        info!(%slot, %validator_id, "Published block");
+        info!(%slot, %validator_id, "{}", published_msg);
+        true
     }
 
     /// Run block import and refresh metrics.

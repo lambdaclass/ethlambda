@@ -23,7 +23,7 @@ use ethlambda_state_transition::{
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, Block, BlockBody, TypeOneMultiSignature},
+    block::{AggregatedAttestations, Block, BlockBody, SignedBlock, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
@@ -41,6 +41,40 @@ use crate::{MAX_ATTESTATIONS_DATA, metrics, store::StoreError};
 pub struct PostBlockCheckpoints {
     pub justified: Checkpoint,
     pub finalized: Checkpoint,
+}
+
+/// A block built ahead of its proposal slot (at the previous slot's interval 4)
+/// and signed, awaiting publication at interval 0.
+pub(crate) struct PreparedBlock {
+    /// Proposal slot this block targets.
+    pub(crate) slot: u64,
+    /// Validator that will propose it.
+    pub(crate) validator_id: u64,
+    /// Head the block was built on. Must still be the canonical head at
+    /// publish time, or a late block / reorg has invalidated it.
+    pub(crate) parent_root: H256,
+    /// Justified slot the build closed over. Per leanSpec #595 the published
+    /// block must not lag the store's justified checkpoint; if the store's
+    /// justified slot advanced past this between build and publish, fall back.
+    pub(crate) built_justified_slot: u64,
+    /// Fully assembled block + Type-2 proof, ready to process and publish.
+    pub(crate) signed_block: SignedBlock,
+}
+
+/// Decide whether a prepared block is still safe to publish at interval 0.
+///
+/// Pure so it can be unit-tested without an actor or store.
+pub(crate) fn prebuilt_block_is_usable(
+    prepared: &PreparedBlock,
+    proposal_slot: u64,
+    proposer_id: u64,
+    live_head: H256,
+    store_justified_slot: u64,
+) -> bool {
+    prepared.slot == proposal_slot
+        && prepared.validator_id == proposer_id
+        && prepared.parent_root == live_head
+        && prepared.built_justified_slot >= store_justified_slot
 }
 
 /// Build a valid block on top of this state.
@@ -1334,5 +1368,64 @@ mod tests {
         assert_eq!(selected.len(), 1);
         let covered: HashSet<u64> = selected[0].1.participant_indices().collect();
         assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+    }
+}
+
+#[cfg(test)]
+mod prebuild_tests {
+    use super::*;
+    use ethlambda_types::block::{BlockBody, MultiMessageAggregate};
+
+    fn root(b: u8) -> H256 {
+        H256::from_slice(&[b; 32])
+    }
+
+    fn dummy_signed_block() -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
+    fn prepared(slot: u64, vid: u64, parent: H256, just: u64) -> PreparedBlock {
+        PreparedBlock {
+            slot,
+            validator_id: vid,
+            parent_root: parent,
+            built_justified_slot: just,
+            signed_block: dummy_signed_block(),
+        }
+    }
+
+    #[test]
+    fn usable_when_head_and_justified_match() {
+        let p = prepared(10, 3, root(0xAB), 7);
+        assert!(prebuilt_block_is_usable(&p, 10, 3, root(0xAB), 7));
+    }
+
+    #[test]
+    fn unusable_when_head_moved() {
+        let p = prepared(10, 3, root(0xAB), 7);
+        assert!(!prebuilt_block_is_usable(&p, 10, 3, root(0xCD), 7));
+    }
+
+    #[test]
+    fn unusable_when_justified_advanced_past_build() {
+        let p = prepared(10, 3, root(0xAB), 7);
+        // store justified is now 8 > 7 → would regress justification.
+        assert!(!prebuilt_block_is_usable(&p, 10, 3, root(0xAB), 8));
+    }
+
+    #[test]
+    fn unusable_for_wrong_slot_or_proposer() {
+        let p = prepared(10, 3, root(0xAB), 7);
+        assert!(!prebuilt_block_is_usable(&p, 11, 3, root(0xAB), 7));
+        assert!(!prebuilt_block_is_usable(&p, 10, 4, root(0xAB), 7));
     }
 }

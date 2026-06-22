@@ -752,9 +752,11 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 
 /// Get the head for block proposal at the given slot.
 ///
-/// Ensures store is up-to-date and processes any pending attestations
-/// before returning the canonical head.
-fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
+/// NOT read-only: advances the store clock to `slot` and promotes pending
+/// attestations before returning the canonical head. Use only at interval 0
+/// (the proposal tick); callers that must not move the clock should read
+/// [`Store::head`] directly.
+pub(crate) fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
@@ -767,24 +769,39 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     store.head()
 }
 
-/// Produce a block and per-aggregated-attestation signature payloads for the target slot.
+/// Produce a block and its signature payloads, resolving the head via
+/// [`get_proposal_head`] (which advances the store clock to `slot`).
 ///
-/// Returns the finalized block and attestation signature payloads aligned
-/// with `block.body.attestations`.
+/// Use at interval 0. To build against an already-known head without ticking
+/// the clock (e.g. a pre-build one interval early), call [`produce_block_on_head`].
 pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
-    // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
+    produce_block_on_head(store, slot, validator_index, head_root)
+}
+
+/// Produce a block and per-aggregated-attestation signature payloads on top of
+/// `head_root`, without moving the store clock.
+///
+/// Returns the block and attestation signature payloads aligned with
+/// `block.body.attestations`. Shared by the interval-0 proposal path and the
+/// interval-4 pre-build; the only difference between them is how `head_root` is
+/// resolved (ticking vs read-only).
+pub(crate) fn produce_block_on_head(
+    store: &mut Store,
+    slot: u64,
+    validator_index: u64,
+    head_root: H256,
+) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
     let head_state = store
         .get_state(&head_root)
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
-        })?
-        .clone();
+        })?;
 
     // Validate proposer authorization for this slot
     let num_validators = head_state.validators.len() as u64;
