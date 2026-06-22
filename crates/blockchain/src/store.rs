@@ -44,7 +44,7 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
     let attestations = store.get_last_slot_votes();
     let old_head = store.head();
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        store.safe_target(),
         &blocks,
         &attestations,
         0,
@@ -108,13 +108,11 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
-    let head_state = store.get_state(&store.head()).expect("head state exists");
-    let num_validators = head_state.validators.len() as u64;
-
-    let min_target_score = (num_validators * 2).div_ceil(3);
-
     let blocks = store.get_live_chain();
-    let attestations = store.extract_latest_new_attestations();
+    let attestations = store.get_last_period_votes();
+    // Use a 2/3 threshold of the number of voting validators
+    let min_target_score = (attestations.len() as u64 * 2).div_ceil(3);
+
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,

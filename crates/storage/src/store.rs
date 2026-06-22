@@ -39,6 +39,8 @@ static EMPTY_BODY_ROOT: LazyLock<H256> = LazyLock::new(|| BlockBody::default().h
 
 const INTERVALS_PER_SLOT: u64 = 5;
 
+const RLMD_LOOKBACK_LIMIT: u64 = 8;
+
 /// Checkpoints to update in the forkchoice store.
 ///
 /// Used with `Store::update_checkpoints` to update head and optionally
@@ -1189,6 +1191,19 @@ impl Store {
             .lock()
             .unwrap()
             .extract_latest_attestations()
+    }
+
+    pub fn get_last_period_votes(&self) -> HashMap<u64, AttestationData> {
+        let current_slot = self.time() / INTERVALS_PER_SLOT;
+        let period_start_slot = current_slot.saturating_sub(RLMD_LOOKBACK_LIMIT);
+        // Deduplicate entries by keeping the latest attestation per validator
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .range(period_start_slot..current_slot)
+            .flat_map(|(_, votes)| votes)
+            .map(|(x, y)| (*x, y.clone()))
+            .collect()
     }
 
     pub fn get_last_slot_votes(&self) -> HashMap<u64, AttestationData> {
