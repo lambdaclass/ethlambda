@@ -17,7 +17,7 @@ use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
-use crate::block_builder::{PreparedBlock, prebuilt_block_is_usable};
+use crate::block_builder::build_overran_publish_window;
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
@@ -105,7 +105,6 @@ impl BlockChain {
             aggregator,
             pending_block_parents: HashMap::new(),
             current_aggregation: None,
-            prepared_block: None,
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
@@ -160,11 +159,6 @@ pub struct BlockChainServer {
     /// worker started at the most recent interval 2 is still running or until
     /// the next interval 2 takes over.
     current_aggregation: Option<AggregationSession>,
-
-    /// Block built synchronously at the previous slot's interval 4, awaiting
-    /// publication at this proposal slot's interval 0. Cleared on use, on
-    /// staleness, or when superseded by the next interval-4 build.
-    prepared_block: Option<PreparedBlock>,
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
@@ -259,24 +253,16 @@ impl BlockChainServer {
             self.pre_merge_coverage = Some(snapshot);
         }
 
-        let scheduled_proposer = (interval == 0 && slot > 0)
+        // Whether one of our validators proposes this slot. Drives the store's
+        // interval-0 attestation acceptance. The proposal itself is built and
+        // published one interval early — see the interval-4 block below.
+        let is_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
-            .flatten();
-        let is_proposer = scheduled_proposer.is_some();
+            .flatten()
+            .is_some();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(&mut self.store, timestamp_ms, is_proposer);
-
-        // ==== interval 0 ====
-
-        // Now build and publish the block (after attestations have been accepted)
-        if let Some(validator_id) = scheduled_proposer {
-            if self.sync_status.duties_allowed() {
-                self.propose_block(slot, validator_id);
-            } else {
-                info!(%slot, %validator_id, "Skipping block proposal while syncing");
-            }
-        }
 
         // ==== interval 1 ====
 
@@ -323,10 +309,12 @@ impl BlockChainServer {
 
         // ==== interval 4 ====
 
-        // The pre-merge `new_payloads` snapshot is taken pre-tick above. If one
-        // of our validators proposes the NEXT slot, build its block now
-        // (synchronously, blocking the actor) so the heavy leanVM work is done
-        // before interval 0 and the proposer only has to publish.
+        // Build and publish the NEXT slot's block here, one interval early, so
+        // the heavy leanVM work happens during this otherwise-idle interval.
+        // `propose_block` blocks the actor for the build and aligns publication
+        // to the slot boundary. Doing the whole proposal here — rather than
+        // stashing it for the interval-0 tick — keeps it robust: `handle_tick`
+        // skips the interval-0 tick whenever this build overruns its interval.
         if interval == 4 {
             let next_slot = slot + 1;
             let next_proposer = self
@@ -334,7 +322,7 @@ impl BlockChainServer {
                 .filter(|_| self.sync_status.duties_allowed());
 
             if let Some(validator_id) = next_proposer {
-                self.prebuild_block(next_slot, validator_id);
+                self.propose_block(next_slot, validator_id).await;
             }
         }
 
@@ -403,21 +391,24 @@ impl BlockChainServer {
         });
     }
 
-    /// Build the next slot's block synchronously and stash it for publication
-    /// at interval 0.
+    /// Build the target slot's block and publish it, one interval early.
     ///
-    /// Runs on the actor thread, blocking it for the duration of the build
-    /// (the expensive part is the leanVM Type-1 → Type-2 merge). That is
-    /// acceptable here: between interval 4 and the next slot the actor has no
-    /// other consensus-critical duty, and a prepared block lets the proposer
-    /// publish at interval 0 without paying the build cost then.
-    fn prebuild_block(&mut self, slot: u64, validator_id: u64) {
+    /// Runs at the previous slot's interval 4, blocking the actor for the build
+    /// (the expensive part is the leanVM Type-1 → Type-2 merge). The block is
+    /// built against the current canonical head; publication is aligned to the
+    /// slot boundary. If the build finishes before the slot opens we wait out
+    /// the remainder so the block is not published early; if it overran (the
+    /// common case under load) we publish at once. The whole proposal is
+    /// self-contained here, so it never depends on the interval-0 tick — which
+    /// `handle_tick` skips whenever this build overruns its interval.
+    async fn propose_block(&mut self, slot: u64, validator_id: u64) {
+        info!(%slot, %validator_id, "We are the proposer for this slot");
+
         // Build against the current canonical head, READ-ONLY. We must not use
-        // `get_proposal_head` here: it ticks the store to `slot` time one interval
-        // early, which would skew finalization and diverge the captured head from
-        // the interval-0 state (making every prebuilt block stale). The interval-4
-        // promote has already run in `store::on_tick` this tick, so `store.head()`
-        // reflects the latest accepted attestations.
+        // `get_proposal_head` here: it ticks the store to `slot` time, which at
+        // interval 4 is one interval early and would skew finalization. The
+        // interval-4 promote has already run in `store::on_tick` this tick, so
+        // `store.head()` reflects the latest accepted attestations.
         let parent_root = self.store.head();
 
         let Some((signed_block, built_justified_slot)) =
@@ -426,23 +417,35 @@ impl BlockChainServer {
             return;
         };
 
-        self.prepared_block = Some(PreparedBlock {
-            slot,
-            validator_id,
-            parent_root,
-            built_justified_slot,
-            signed_block,
-        });
-        info!(%slot, %validator_id, "Pre-built block ready");
+        // Align publication to the slot boundary. If the build finished before
+        // the slot opened, wait out the remainder so the block is not published
+        // early; if it overran, publish immediately.
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        if !build_overran_publish_window(unix_now_ms(), genesis_time_ms, slot) {
+            let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
+            let wait_ms = slot_start_ms.saturating_sub(unix_now_ms());
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        }
+
+        // The build (and any wait) may have let a competing block become head.
+        // Publish on the head we built on if it still holds and our justified
+        // checkpoint has not regressed past it; otherwise rebuild on the live
+        // head (the slot has already opened, so publish the rebuild at once).
+        let live_head = self.store.head();
+        let store_justified_slot = self.store.latest_justified().slot;
+        if live_head == parent_root && built_justified_slot >= store_justified_slot {
+            self.process_and_publish_block(slot, validator_id, signed_block, "Published block");
+        } else if let Some((rebuilt, _)) = self.build_signed_block(slot, validator_id, live_head) {
+            info!(%slot, %validator_id, "Head moved during pre-build; rebuilt on new head");
+            self.process_and_publish_block(slot, validator_id, rebuilt, "Published block");
+        }
     }
 
     /// Build the block on `head_root` and assemble it into a `SignedBlock`.
     ///
-    /// Shared by the interval-0 proposal path and the interval-4 pre-build; the
-    /// only difference between callers is how `head_root` is resolved (ticking
-    /// `get_proposal_head` vs read-only `store.head()`). Returns the signed block
-    /// and the justified slot it closed over, or `None` on any build/sign
-    /// failure (already logged and counted).
+    /// Returns the signed block and the justified slot it closed over, or `None`
+    /// on any build/sign failure (already logged and counted). Used by
+    /// `propose_block`, both for the initial build and the rebuild-on-moved-head.
     fn build_signed_block(
         &mut self,
         slot: u64,
@@ -530,41 +533,6 @@ impl BlockChainServer {
     }
 
     /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64) {
-        info!(%slot, %validator_id, "We are the proposer for this slot");
-
-        // Resolve the canonical head once. This ticks the store to `slot` and
-        // accepts pending attestations, so both the pre-built-block revalidation
-        // and a fresh build below see the same interval-0 state.
-        let head_root = store::get_proposal_head(&mut self.store, slot);
-
-        // Fast path: publish a block pre-built at the previous slot's interval 4,
-        // if it is still valid against the live head and justified checkpoint.
-        if let Some(prepared) = self.prepared_block.take() {
-            let store_justified_slot = self.store.latest_justified().slot;
-            if prebuilt_block_is_usable(
-                &prepared,
-                slot,
-                validator_id,
-                head_root,
-                store_justified_slot,
-            ) && self.process_and_publish_block(
-                slot,
-                validator_id,
-                prepared.signed_block,
-                "Published pre-built block",
-            ) {
-                return;
-            }
-            // Stale, or import failed: fall through to a fresh synchronous build.
-            info!(%slot, %validator_id, "Pre-built block unusable; rebuilding");
-        }
-
-        if let Some((signed_block, _)) = self.build_signed_block(slot, validator_id, head_root) {
-            self.process_and_publish_block(slot, validator_id, signed_block, "Published block");
-        }
-    }
-
     /// Sign the block root and merge every Type-1 proof (attestations plus the
     /// proposer's own signature) into the block's single Type-2 proof.
     ///
