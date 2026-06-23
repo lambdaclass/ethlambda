@@ -81,6 +81,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        gate_duties: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -106,7 +107,7 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             pre_merge_coverage: None,
-            sync_status: SyncStatusTracker::default(),
+            sync_status: SyncStatusTracker::new(gate_duties),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -172,7 +173,9 @@ pub struct BlockChainServer {
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
 
-    /// Stateful sync heuristic used by `lean_node_sync_status`.
+    /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
+    /// validator duties while syncing, unless that gating was disabled at
+    /// startup via `--disable-duty-sync-gate` (then it is metric-only).
     sync_status: SyncStatusTracker,
 }
 
@@ -230,19 +233,7 @@ impl BlockChainServer {
         let is_aggregator = self.aggregator.is_enabled();
         metrics::set_is_aggregator(is_aggregator);
 
-        // At interval 0, check if we will propose (but don't build the block yet).
-        // Tick forkchoice first to accept attestations, then build the block
-        // using the freshly-accepted attestations.
-        let scheduled_proposer = (interval == 0 && slot > 0)
-            .then(|| self.get_our_proposer(slot))
-            .flatten();
-        let proposer_validator_id = self.sync_status.gate_proposer(scheduled_proposer);
-
-        if let Some(validator_id) = scheduled_proposer
-            && proposer_validator_id.is_none()
-        {
-            info!(%slot, %validator_id, "Skipping block proposal while syncing");
-        }
+        // ==== interval 4 (pre-tick) ====
 
         // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
         // (interval 4), so the post-block report for this round sees its
@@ -261,29 +252,26 @@ impl BlockChainServer {
             self.pre_merge_coverage = Some(snapshot);
         }
 
-        // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        store::on_tick(
-            &mut self.store,
-            timestamp_ms,
-            proposer_validator_id.is_some(),
-        );
+        let scheduled_proposer = (interval == 0 && slot > 0)
+            .then(|| self.get_our_proposer(slot))
+            .flatten();
+        let is_proposer = scheduled_proposer.is_some();
 
-        if interval == 2 {
-            if is_aggregator {
-                coverage::emit_agg_start_new_coverage(
-                    &self.store,
-                    self.attestation_committee_count,
-                );
-                self.start_aggregation_session(slot, ctx).await;
+        // Tick the store first - this accepts attestations at interval 0 if we have a proposal
+        store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+
+        // ==== interval 0 ====
+
+        // Now build and publish the block (after attestations have been accepted)
+        if let Some(validator_id) = scheduled_proposer {
+            if self.sync_status.duties_allowed() {
+                self.propose_block(slot, validator_id);
             } else {
-                metrics::inc_aggregator_skipped_not_aggregator();
+                info!(%slot, %validator_id, "Skipping block proposal while syncing");
             }
         }
 
-        // Now build and publish the block (after attestations have been accepted)
-        if let Some(validator_id) = proposer_validator_id {
-            self.propose_block(slot, validator_id);
-        }
+        // ==== interval 1 ====
 
         // Produce attestations at interval 1 (all validators including proposer).
         // Reuse the same snapshot so self-delivery decisions match the rest
@@ -307,6 +295,28 @@ impl BlockChainServer {
                 info!(%slot, "Skipping attestations while syncing");
             }
         }
+
+        // ==== interval 2 ====
+
+        if interval == 2 {
+            if is_aggregator {
+                coverage::emit_agg_start_new_coverage(
+                    &self.store,
+                    self.attestation_committee_count,
+                );
+                self.start_aggregation_session(slot, ctx).await;
+            } else {
+                metrics::inc_aggregator_skipped_not_aggregator();
+            }
+        }
+
+        // ==== interval 3 ====
+
+        // Interval 3 (safe-target update) is handled inside `store::on_tick`.
+
+        // ==== interval 4 ====
+
+        // Handled by the pre-tick snapshot above.
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
