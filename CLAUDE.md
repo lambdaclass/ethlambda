@@ -47,11 +47,11 @@ crates/
 
 ### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
-Interval 0: Block proposal → accept attestations if proposal exists
+Interval 0: Accept attestations if we are this slot's proposer (block is built/published at interval 4 of the previous slot)
 Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregation (aggregators create proofs from gossip signatures)
 Interval 3: Safe target update (fork choice)
-Interval 4: Accept accumulated attestations
+Interval 4: Accept accumulated attestations; build + publish the NEXT slot's block (aligned to the slot boundary)
 ```
 
 ### Attestation Pipeline

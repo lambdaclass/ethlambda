@@ -264,6 +264,13 @@ impl BlockChainServer {
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(&mut self.store, timestamp_ms, is_proposer);
 
+        // ==== interval 0 ====
+
+        // Block building/proposal is handled at interval 4 of the previous slot
+        // (see below): the proposer builds one interval early and publishes
+        // aligned to this slot's boundary. The only interval-0 work is the
+        // store tick above accepting attestations when we have a proposal.
+
         // ==== interval 1 ====
 
         // Produce attestations at interval 1 (all validators including proposer).
@@ -427,10 +434,15 @@ impl BlockChainServer {
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
 
-        // The build (and any wait) may have let a competing block become head.
-        // Publish on the head we built on if it still holds and our justified
-        // checkpoint has not regressed past it; otherwise rebuild on the live
-        // head (the slot has already opened, so publish the rebuild at once).
+        // Publish on the head we built on, rebuilding if it no longer holds.
+        //
+        // Today this guard always passes: the actor is single-threaded and
+        // processes no other message while `propose_block` runs (not even across
+        // the sleep above), so `store.head()` cannot change mid-build and our
+        // justified checkpoint cannot regress. The check is kept as a cheap
+        // safety net for the day the build is moved off the actor thread (where
+        // a competing block could land mid-build); then the rebuild path becomes
+        // live and the slot has already opened, so the rebuild publishes at once.
         let live_head = self.store.head();
         let store_justified_slot = self.store.latest_justified().slot;
         if live_head == parent_root && built_justified_slot >= store_justified_slot {
@@ -536,8 +548,8 @@ impl BlockChainServer {
     /// Sign the block root and merge every Type-1 proof (attestations plus the
     /// proposer's own signature) into the block's single Type-2 proof.
     ///
-    /// Shared by the synchronous proposal path and `prebuild_block`. Returns
-    /// `None` on any signing/aggregation failure (already logged and counted).
+    /// Called from `build_signed_block`. Returns `None` on any
+    /// signing/aggregation failure (already logged and counted).
     fn assemble_signed_block(
         &mut self,
         slot: u64,
