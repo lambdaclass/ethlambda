@@ -78,12 +78,20 @@ impl StorageReadView for InMemoryReadView<'_> {
         prefix: &[u8],
     ) -> Result<Box<dyn Iterator<Item = PrefixResult> + '_>, Error> {
         let table_data = self.guard.get(&table).expect("table exists");
-        let prefix_owned = prefix.to_vec();
 
-        let iter = table_data
+        // Collect and sort by key so iteration order matches the RocksDB backend
+        // (lexicographic). Callers rely on this for early-stop range scans over
+        // slot||root keys (e.g. signature/live-chain pruning).
+        let mut items: Vec<(Vec<u8>, Vec<u8>)> = table_data
             .iter()
-            .filter(move |(k, _)| k.starts_with(&prefix_owned))
-            .map(|(k, v)| Ok((k.clone().into_boxed_slice(), v.clone().into_boxed_slice())));
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let iter = items
+            .into_iter()
+            .map(|(k, v)| Ok((k.into_boxed_slice(), v.into_boxed_slice())));
 
         Ok(Box::new(iter))
     }
