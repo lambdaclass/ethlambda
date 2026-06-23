@@ -254,8 +254,7 @@ impl BlockChainServer {
         }
 
         // Whether one of our validators proposes this slot. Drives the store's
-        // interval-0 attestation acceptance. The proposal itself is built and
-        // published one interval early — see the interval-4 block below.
+        // interval-0 attestation acceptance.
         let is_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten()
@@ -266,10 +265,12 @@ impl BlockChainServer {
 
         // ==== interval 0 ====
 
-        // Block building/proposal is handled at interval 4 of the previous slot
-        // (see below): the proposer builds one interval early and publishes
-        // aligned to this slot's boundary. The only interval-0 work is the
-        // store tick above accepting attestations when we have a proposal.
+        // No actor work at interval 0. The block is published here conceptually
+        // (at the slot boundary), but the build+publish code path runs at
+        // interval 4 of the previous slot — where it also advances the store to
+        // this slot's interval 0 before building (see `propose_block`). The real
+        // interval-0 tick is then skipped by the idempotency guard above, since
+        // the store clock is already here.
 
         // ==== interval 1 ====
 
@@ -401,21 +402,29 @@ impl BlockChainServer {
     /// Build the target slot's block and publish it, one interval early.
     ///
     /// Runs at the previous slot's interval 4, blocking the actor for the build
-    /// (the expensive part is the leanVM Type-1 → Type-2 merge). The block is
-    /// built against the current canonical head; publication is aligned to the
-    /// slot boundary. If the build finishes before the slot opens we wait out
-    /// the remainder so the block is not published early; if it overran (the
+    /// (the expensive part is the leanVM Type-1 → Type-2 merge). It first
+    /// advances the store to the target slot's interval 0 (accepting
+    /// attestations) so the block is built on exactly the interval-0 state a
+    /// non-prebuilding proposer would see, then builds and publishes — aligned
+    /// to the slot boundary: if the build finishes before the slot opens we wait
+    /// out the remainder so the block is not published early; if it overran (the
     /// common case under load) we publish at once. The whole proposal is
     /// self-contained here, so it never depends on the interval-0 tick — which
     /// `handle_tick` skips whenever this build overruns its interval.
     async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        // Build against the current canonical head, READ-ONLY. We must not use
-        // `get_proposal_head` here: it ticks the store to `slot` time, which at
-        // interval 4 is one interval early and would skew finalization. The
-        // interval-4 promote has already run in `store::on_tick` this tick, so
-        // `store.head()` reflects the latest accepted attestations.
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
+
+        // Advance the store to this slot's interval 0 — one interval ahead of the
+        // interval-4 tick we are running in — accepting attestations exactly as
+        // the real interval-0 tick would, so the block is built on the interval-0
+        // state rather than the previous slot's end state. Building early is safe
+        // because we publish below (nothing is stashed for a later tick), and the
+        // real interval-0 tick is then skipped by the idempotency guard in
+        // `on_tick`, since the store clock is already here.
+        store::on_tick(&mut self.store, slot_start_ms, true);
         let parent_root = self.store.head();
 
         let Some((signed_block, built_justified_slot)) =
@@ -427,9 +436,7 @@ impl BlockChainServer {
         // Align publication to the slot boundary. If the build finished before
         // the slot opened, wait out the remainder so the block is not published
         // early; if it overran, publish immediately.
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
         if !build_overran_publish_window(unix_now_ms(), genesis_time_ms, slot) {
-            let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
             let wait_ms = slot_start_ms.saturating_sub(unix_now_ms());
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
