@@ -131,6 +131,15 @@ struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
+    /// Disable the sync-gate's suppression of validator duties.
+    ///
+    /// By default a node that judges itself to be syncing (local head lagging
+    /// wall clock while the network still progresses) skips block proposal,
+    /// attestation production, and aggregate re-derivation. With this flag the
+    /// sync state is still tracked and exported via `lean_node_sync_status`,
+    /// but it no longer suppresses any duty: the gate becomes observe-only.
+    #[arg(long, default_value = "false")]
+    disable_duty_sync_gate: bool,
 }
 
 // Shadow single-steps execution in a discrete-event simulation, so the default
@@ -284,6 +293,7 @@ async fn main() -> eyre::Result<()> {
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
+        !options.disable_duty_sync_gate,
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the

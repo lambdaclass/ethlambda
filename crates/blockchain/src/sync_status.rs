@@ -1,3 +1,5 @@
+use tracing::debug;
+
 use crate::metrics::SyncStatus;
 
 /// Local head lag beyond which the node is considered to be syncing.
@@ -12,12 +14,35 @@ const NETWORK_STALL_THRESHOLD: u64 = 8;
 /// Recovery band that prevents the sync status from flapping near the threshold.
 const SYNC_HYSTERESIS_BAND: u64 = 2;
 
-#[derive(Default)]
 pub(crate) struct SyncStatusTracker {
     syncing: bool,
+    /// Whether the syncing state suppresses validator duties.
+    ///
+    /// When `false`, [`Self::update`] still tracks `syncing` and drives the
+    /// `lean_node_sync_status` metric, but [`Self::duties_allowed`] always
+    /// returns `true`: the gate is observe-only. Seeded from the CLI
+    /// `--disable-duty-sync-gate` flag (gating stays on by default).
+    gate_duties: bool,
+}
+
+impl Default for SyncStatusTracker {
+    fn default() -> Self {
+        Self {
+            syncing: false,
+            gate_duties: true,
+        }
+    }
 }
 
 impl SyncStatusTracker {
+    /// Build a tracker, choosing whether the syncing state gates duties.
+    pub(crate) fn new(gate_duties: bool) -> Self {
+        Self {
+            gate_duties,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn update(
         &mut self,
         current_slot: u64,
@@ -26,6 +51,7 @@ impl SyncStatusTracker {
     ) -> SyncStatus {
         let head_lag = current_slot.saturating_sub(head_slot);
         let network_lag = current_slot.saturating_sub(max_seen_slot);
+        let was_syncing = self.syncing;
 
         if network_lag > NETWORK_STALL_THRESHOLD {
             self.syncing = false;
@@ -33,6 +59,18 @@ impl SyncStatusTracker {
             self.syncing = head_lag > SYNC_LAG_THRESHOLD.saturating_sub(SYNC_HYSTERESIS_BAND);
         } else {
             self.syncing = head_lag > SYNC_LAG_THRESHOLD;
+        }
+
+        if self.syncing != was_syncing {
+            debug!(
+                current_slot,
+                head_slot,
+                max_seen_slot,
+                head_lag,
+                network_lag,
+                syncing = self.syncing,
+                "Sync status changed"
+            );
         }
 
         if self.syncing {
@@ -43,7 +81,8 @@ impl SyncStatusTracker {
     }
 
     pub(crate) fn duties_allowed(&self) -> bool {
-        !self.syncing
+        // Gate disabled: the syncing state is observe-only, never suppresses duties.
+        !self.gate_duties || !self.syncing
     }
 }
 
