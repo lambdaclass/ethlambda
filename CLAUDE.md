@@ -362,7 +362,10 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - Blocks are split into three tables: `BlockHeaders`, `BlockBodies`, `BlockSignatures`
 - Genesis/anchor blocks have empty bodies (detected via `EMPTY_BODY_ROOT`) — no entry in `BlockBodies`
 - Genesis block has no signatures — no entry in `BlockSignatures`
-- All other blocks must have entries in all three tables
+- Non-genesis blocks have a `BlockSignatures` entry until finalized: once below the
+  finalized boundary, signatures are pruned (`prune_old_block_signatures`) while
+  headers and bodies are kept forever. `get_signed_block` returns `None` for a
+  pruned finalized block
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
