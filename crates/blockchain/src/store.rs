@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
-use ethlambda_storage::{ForkCheckpoints, Store};
+use ethlambda_storage::{DiffBase, ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
@@ -556,6 +556,10 @@ fn on_block_core(
 
     let block = signed_block.message.clone();
 
+    // Capture the diff base before the parent is consumed into the post-state
+    // (avoids cloning the multi-MB historical_block_hashes list).
+    let diff_base = DiffBase::from_state(block.parent_root, &parent_state);
+
     // Execute state transition function to compute post-block state
     let state_transition_start = std::time::Instant::now();
     let mut post_state = parent_state;
@@ -576,9 +580,9 @@ fn on_block_core(
         store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
     }
 
-    // Store signed block and state
+    // Store signed block and state (as a parent-linked diff + snapshot)
     store.insert_signed_block(block_root, signed_block.clone());
-    store.insert_state(block_root, post_state);
+    store.insert_state_with_diff(block_root, diff_base, post_state);
 
     for att in block.body.attestations.iter() {
         // Count each participating validator as a valid attestation.
@@ -1251,7 +1255,10 @@ mod tests {
         let head_justified = Checkpoint { root: a, slot: 1 };
         let mut head_state = State::from_genesis(1000, vec![]);
         head_state.latest_justified = head_justified;
-        store.insert_state(b, head_state);
+        // Persist `b`'s post-state via the diff API (parented on `a`); a full
+        // snapshot is written, so `get_state(b)` returns it directly.
+        let diff_base = DiffBase::from_state(a, &head_state);
+        store.insert_state_with_diff(b, diff_base, head_state);
 
         // Store's global justified latched onto a higher, off-head checkpoint,
         // as it would after a minority fork justified a slot the head never saw.
