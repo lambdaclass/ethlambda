@@ -255,6 +255,11 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
+    // `has_proposal` currently has no effect: it gated the interval-0 attestation
+    // accept that is now disabled (see the interval 0 arm below). Kept in the
+    // signature so re-enabling that path needs no call-site change.
+    let _ = has_proposal;
+
     // Convert UNIX timestamp (ms) to interval count since genesis
     let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
@@ -274,10 +279,6 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
 
         trace!(%slot, %interval, "processing tick");
 
-        // has_proposal is only signaled for the final tick (matching Python spec behavior)
-        let is_final_tick = store.time() == time;
-        let should_signal_proposal = has_proposal && is_final_tick;
-
         // NOTE: here we assume on_tick never skips intervals.
         // Interval 2 (committee-signature aggregation) is no longer handled here:
         // the blockchain actor orchestrates the aggregation worker directly so
@@ -285,10 +286,25 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
         match interval {
             0 => {
-                // Start of slot - process attestations if proposal exists
-                if should_signal_proposal {
-                    accept_new_attestations(store, false);
-                }
+                // Interval-0 attestation acceptance is intentionally disabled.
+                //
+                // It used to promote pending attestations (new -> known) and
+                // refresh the head at the start of the slot, so the proposer's
+                // block — built at interval 0 — closed over the freshest votes.
+                // The proposer now builds and publishes its block at interval 4
+                // of the PREVIOUS slot, so by the time we reach interval 0 the
+                // block is already out. Promoting here would accept attestations
+                // only AFTER the block was built: too late to be included, and
+                // it would diverge the proposer's fork-choice view from the one
+                // its block closed over. We want the accept immediately BEFORE
+                // the build, which is exactly what the unconditional interval-4
+                // accept below does — it runs at the top of the same tick, just
+                // before `propose_block`. (`has_proposal` is thus no longer read.)
+                //
+                // let is_final_tick = store.time() == time;
+                // if has_proposal && is_final_tick {
+                //     accept_new_attestations(store, false);
+                // }
             }
             1 => {
                 // Vote propagation — no action
