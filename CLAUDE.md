@@ -47,7 +47,7 @@ crates/
 
 ### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
-Interval 0: Accept attestations if we are this slot's proposer (block is built/published at interval 4 of the previous slot)
+Interval 0: No duty (the block is built/published at interval 4 of the previous slot; attestations are no longer accepted here)
 Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregation (aggregators create proofs from gossip signatures)
 Interval 3: Safe target update (fork choice)
@@ -57,7 +57,7 @@ Interval 4: Accept accumulated attestations; build + publish the NEXT slot's blo
 ### Attestation Pipeline
 ```
 Gossip → Signature verification → new_attestations (pending)
-  ↓ (intervals 0/4)
+  ↓ (interval 4)
 promote → known_attestations (fork choice active)
   ↓
 Fork choice head update
