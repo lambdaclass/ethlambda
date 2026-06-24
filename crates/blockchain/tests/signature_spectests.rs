@@ -61,10 +61,10 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Advance time to the block's slot
         let block_time_ms = genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-        store::on_tick(&mut st, block_time_ms, true);
+        store::on_tick(&mut st, block_time_ms, true, None);
 
         // Process the block (this includes signature verification)
-        let result = store::on_block(&mut st, signed_block);
+        let result = store::on_block(&mut st, signed_block, None);
 
         // Step 3: Check that it succeeded or failed as expected
         match (result.is_ok(), test.expect_exception.as_ref()) {
