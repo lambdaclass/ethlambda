@@ -8,9 +8,9 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    block::{BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
+    signature::ValidatorPublicKey,
 };
 
 use crate::aggregation::{
@@ -473,103 +473,85 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
-        // singleton Type-1 SNARK, then merge it with every attestation Type-1
-        // into the block's single Type-2 proof.
+        // Assemble SignedBlock: carry the proposer's raw XMSS signature as a
+        // standalone field, and aggregate the attestation Type-1s (only) into
+        // the block's attestation Type-2. The proposer no longer enters the
+        // aggregate, so a block with no attestations needs no prover work and
+        // the attestation Type-2 can be built independently of the block root.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
-        let Some(proposer_validator) = validators.get(validator_id as usize) else {
+        if validators.get(validator_id as usize).is_none() {
             error!(%slot, %validator_id, "Proposer index out of range when assembling block");
             metrics::inc_block_building_failures();
             return;
-        };
+        }
 
-        // Decode the proposer's proposal pubkey once and reuse it both for the
-        // singleton Type-1 wrap and for the Type-2 merge inputs.
-        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
+        // `sign_block_root` already returns an `XmssSignature`, so the proposer
+        // signature is carried verbatim — no packing or prover work needed.
 
-        let Ok(proposer_validator_signature) =
-            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
-                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
-            })
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
-            vec![proposer_pubkey.clone()],
-            vec![proposer_validator_signature],
-            &block_root,
-            slot as u32,
-        )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-            Vec::with_capacity(type_one_proofs.len() + 1);
-        let mut resolve_failed = false;
-        for t1 in &type_one_proofs {
-            let mut pubkeys = Vec::new();
-            for vid in t1.participant_indices() {
-                let Some(validator) = validators.get(vid as usize) else {
-                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
-                    resolve_failed = true;
-                    break;
-                };
-                match validator.get_attestation_pubkey() {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(err) => {
-                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+        // Aggregate the attestation Type-1s into a single Type-2. With no
+        // attestations the aggregate is empty: the proposer signature stands
+        // alone, mirroring `(prop-sig, empty-proof)`.
+        let attestation_proof = if type_one_proofs.is_empty() {
+            MultiMessageAggregate::default()
+        } else {
+            let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
+                Vec::with_capacity(type_one_proofs.len());
+            let mut resolve_failed = false;
+            for t1 in &type_one_proofs {
+                let mut pubkeys = Vec::new();
+                for vid in t1.participant_indices() {
+                    let Some(validator) = validators.get(vid as usize) else {
+                        error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
                         resolve_failed = true;
                         break;
+                    };
+                    match validator.get_attestation_pubkey() {
+                        Ok(pk) => pubkeys.push(pk),
+                        Err(err) => {
+                            error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+                            resolve_failed = true;
+                            break;
+                        }
                     }
                 }
+                if resolve_failed {
+                    break;
+                }
+                merge_inputs.push((pubkeys, t1.proof.clone()));
             }
             if resolve_failed {
-                break;
+                metrics::inc_block_building_failures();
+                return;
             }
-            merge_inputs.push((pubkeys, t1.proof.clone()));
-        }
-        if resolve_failed {
-            metrics::inc_block_building_failures();
-            return;
-        }
-        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        // Merge yields raw lean-multisig Type-2 bytes. Per-component
-        // participants are rederived at verify time from
-        // `block.body.attestations[i].aggregation_bits` plus
-        // `block.proposer_index`, so nothing else needs persisting.
-        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
-                metrics::inc_block_building_failures();
-                return;
+            // Merge yields raw lean-multisig Type-2 bytes. Per-component
+            // participants are rederived at verify time from
+            // `block.body.attestations[i].aggregation_bits`, so nothing else
+            // needs persisting.
+            let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            };
+            match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
+                Ok(p) => p,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
             }
         };
-        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
-            Ok(p) => p,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
+
         // `type_one_proofs` is no longer needed past this point.
         drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
-            proof,
+            proof: BlockProof::new(proposer_signature, attestation_proof),
         };
 
         // Process the block locally before publishing

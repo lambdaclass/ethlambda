@@ -4,22 +4,27 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
 
 use crate::{
-    attestation::{AggregatedAttestation, AggregationBits, validator_indices},
+    attestation::{
+        AggregatedAttestation, AggregationBits, XmssSignature, blank_xmss_signature,
+        validator_indices,
+    },
     primitives::{self, ByteList, H256},
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
 use primitives::HashTreeRoot as _;
 
-/// Envelope carrying a block and the single merged proof binding every
-/// signature it depends on.
+/// Envelope carrying a block and its [`BlockProof`].
+///
+/// The proof keeps the proposer's raw signature separate from the attestation
+/// aggregate (see [`BlockProof`]).
 ///
 /// <div class="warning">
 ///
 /// `HashTreeRoot` is intentionally not derived: consumers never hash a
 /// `SignedBlock` directly — they always hash the inner `Block`. Keeping the
 /// envelope structurally minimal also means the on-chain root is independent
-/// of how the merged proof is serialised.
+/// of how the proof is serialised.
 ///
 /// </div>
 #[derive(Clone, SszEncode, SszDecode)]
@@ -27,16 +32,23 @@ pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
 
-    /// Single full-block proof covering attestations and the proposer signature.
-    pub proof: MultiMessageAggregate,
+    /// Full-block proof: proposer signature + attestation aggregate.
+    pub proof: BlockProof,
 }
 
-// Manual Debug impl because the merged proof bytes are large and opaque.
+// Manual Debug impl because the proof bytes are large and opaque.
 impl core::fmt::Debug for SignedBlock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SignedBlock")
             .field("message", &self.message)
-            .field("proof", &format_args!("<{} bytes>", self.proof.proof.len()))
+            .field(
+                "proposer_signature",
+                &format_args!("<{} bytes>", self.proof.proposer_signature.len()),
+            )
+            .field(
+                "attestation_proof",
+                &format_args!("<{} bytes>", self.proof.attestation_proof.proof.len()),
+            )
             .finish()
     }
 }
@@ -85,19 +97,82 @@ pub enum MultiMessageAggregateError {
 }
 
 // ============================================================================
+// Block proof (proposer signature outside the attestation aggregate)
+// ============================================================================
+
+/// A full-block proof: the proposer's raw signature plus the attestation
+/// aggregate, carried as two independent fields.
+///
+/// ```text
+/// attestations = [att0, att1]   ->  (proposer_signature, aggregate([att0, att1]))
+/// attestations = []             ->  (proposer_signature, empty-proof)
+/// ```
+///
+/// `proposer_signature` is the proposer's raw XMSS signature over the block
+/// root — the same fixed-size [`XmssSignature`] wire type carried by
+/// `SignedAttestation`. It is verified directly against the proposer's
+/// `proposal_pubkey` with the hash-based XMSS verifier, so it never enters the
+/// lean-multisig prover/verifier.
+///
+/// `attestation_proof` is the lean-multisig Type-2 over the block body's
+/// attestations *only* — the proposer is no longer one of its components, so
+/// it is empty when the block carries no attestations.
+///
+/// <div class="warning">
+///
+/// `HashTreeRoot` is intentionally not derived (as on `SignedAttestation`):
+/// `XmssSignature` is a fixed-size byte vector here, but the spec Merkleizes
+/// the signature as a container, so a derived root would diverge. Nothing
+/// hashes a `BlockProof`.
+///
+/// </div>
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct BlockProof {
+    /// The proposer's raw XMSS signature over the block root.
+    pub proposer_signature: XmssSignature,
+    /// Type-2 aggregate over the body attestations (empty if there are none).
+    pub attestation_proof: MultiMessageAggregate,
+}
+
+impl BlockProof {
+    /// Build a proof from a proposer signature and an attestation aggregate.
+    pub fn new(
+        proposer_signature: XmssSignature,
+        attestation_proof: MultiMessageAggregate,
+    ) -> Self {
+        Self {
+            proposer_signature,
+            attestation_proof,
+        }
+    }
+}
+
+impl Default for BlockProof {
+    /// A blank proof: the structurally-valid all-zero XMSS placeholder used by
+    /// genesis-style anchor blocks (see [`blank_xmss_signature`]) plus an empty
+    /// attestation aggregate. `XmssSignature` is fixed-size and has no empty
+    /// form, so the blank doubles as the genesis placeholder.
+    fn default() -> Self {
+        Self {
+            proposer_signature: blank_xmss_signature(),
+            attestation_proof: MultiMessageAggregate::default(),
+        }
+    }
+}
+
+// ============================================================================
 // Type-1 multi-signature
 // ============================================================================
 //
 // Wire format mirrors leanSpec PR #717: `TypeOneMultiSignature` is a flat
 // `{ participants, proof }` pair. The signed `message` and `slot` are NOT
 // carried on the envelope — verifiers rederive each component's binding
-// from the surrounding block body (attestation `data` + slot for body
-// components, block root + slot for the proposer component).
+// from the surrounding block body (attestation `data` + slot).
 //
-// `MultiMessageAggregate` carries the raw lean-multisig Type-2 bytes.
-// Component participant bitfields come from
-// `block.body.attestations[i].aggregation_bits` (and `block.proposer_index` for
-// the trailing proposer entry).
+// `MultiMessageAggregate` carries the raw lean-multisig Type-2 bytes for the
+// body attestations only; the proposer signature is carried separately in
+// `BlockProof::proposer_signature`. Component participant bitfields come from
+// `block.body.attestations[i].aggregation_bits`.
 
 /// Maximum number of distinct `AttestationData` entries permitted in a single
 /// block. Canonical home for the cap shared across `ethlambda-blockchain`,
@@ -298,11 +373,13 @@ mod tests {
         };
         let signed = SignedBlock {
             message: block,
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         let bytes = signed.to_ssz();
         let decoded = SignedBlock::from_ssz_bytes(&bytes).expect("decode");
-        assert_eq!(decoded.proof.proof.len(), 0);
+        // Default proof: empty attestation aggregate + the blank XMSS placeholder.
+        assert_eq!(decoded.proof.attestation_proof.proof.len(), 0);
+        assert_eq!(decoded.proof.proposer_signature, blank_xmss_signature());
         assert_eq!(decoded.message.slot, signed.message.slot);
         assert_eq!(
             decoded.message.proposer_index,
@@ -320,5 +397,43 @@ mod tests {
         assert_eq!(&encoded[..4], &4u32.to_le_bytes());
         assert_eq!(&encoded[4..], proof_bytes);
         assert_eq!(aggregate.proof_bytes(), proof_bytes);
+    }
+
+    #[test]
+    fn signed_block_ssz_round_trip_with_proposer_signature() {
+        let block = Block {
+            slot: 9,
+            proposer_index: 2,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        // A distinctive, full-size XMSS signature blob (fixed `SIGNATURE_SIZE`).
+        let proposer_bytes: Vec<u8> = (0..crate::signature::SIGNATURE_SIZE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let proposer_signature = XmssSignature::try_from(proposer_bytes.clone()).unwrap();
+        let attestation_bytes: Vec<u8> = (0..64).collect();
+        let signed = SignedBlock {
+            message: block,
+            proof: BlockProof::new(
+                proposer_signature,
+                MultiMessageAggregate::from_bytes(&attestation_bytes).unwrap(),
+            ),
+        };
+
+        let bytes = signed.to_ssz();
+        let decoded = SignedBlock::from_ssz_bytes(&bytes).expect("decode");
+
+        assert_eq!(
+            &*decoded.proof.proposer_signature,
+            proposer_bytes.as_slice()
+        );
+        assert_eq!(
+            decoded.proof.attestation_proof.proof_bytes(),
+            attestation_bytes
+        );
+        assert_eq!(decoded.message.slot, 9);
+        assert_eq!(decoded.message.proposer_index, 2);
     }
 }

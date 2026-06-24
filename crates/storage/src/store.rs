@@ -6,9 +6,7 @@ use crate::error::Error;
 
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
-    block::{
-        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature,
-    },
+    block::{Block, BlockBody, BlockHeader, BlockProof, SignedBlock, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorSignature,
@@ -1135,12 +1133,12 @@ impl Store {
         let sig_key = encode_slot_root_key(header.slot, root);
         let proof = match view.get(Table::BlockSignatures, &sig_key).expect("get") {
             Some(proof_bytes) => {
-                MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
+                BlockProof::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
             // Synthesis only covers the genesis-style anchor (slot 0). Any other
             // missing-proof case is a storage corruption that should surface
             // as `None` rather than fabricating a block with an empty proof.
-            None if header.slot == 0 => MultiMessageAggregate::default(),
+            None if header.slot == 0 => BlockProof::default(),
             None => return None,
         };
 
@@ -2568,7 +2566,7 @@ mod tests {
             .expect("genesis block must be retrievable with synthetic proof");
 
         assert_eq!(signed.message.slot, 0);
-        assert_eq!(signed.proof, MultiMessageAggregate::default());
+        assert_eq!(signed.proof, BlockProof::default());
     }
 
     /// The synthesis branch must be confined to the slot-0 anchor: a
