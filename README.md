@@ -141,7 +141,7 @@ Some features we are looking to implement in the near future, in order of priori
 - [Optimize block building](https://github.com/lambdaclass/ethlambda/issues/465)
 - [Use state-diffs for storing states in the database](https://github.com/lambdaclass/ethlambda/issues/238)
 - Prototype Goldfish + RLMD GHOST + BFT — devnet-6
-- Integrate with execution clients, in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
+- [Integrate with execution clients](https://github.com/lambdaclass/ethlambda/pull/367), in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
 - Replace libp2p with the experimental [ethp2p](https://github.com/ethp2p/ethp2p), which we are porting to Rust
 - [Add a guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
 - Rewrite the STF in the concrete programming language to enable formal verification
