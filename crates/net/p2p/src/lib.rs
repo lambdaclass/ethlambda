@@ -48,6 +48,8 @@ use crate::{
     swarm_adapter::SwarmHandle,
 };
 
+#[cfg(feature = "ethp2p")]
+pub mod ethp2p;
 mod gossipsub;
 pub mod metrics;
 mod req_resp;
@@ -180,6 +182,17 @@ pub struct BuiltSwarm {
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    /// Parameters for the experimental ethp2p broadcast engine (Phase 2).
+    #[cfg(feature = "ethp2p")]
+    pub(crate) ethp2p: crate::ethp2p::Ethp2pParams,
+}
+
+/// Extract the 33-byte compressed secp256k1 public key from a libp2p
+/// identity public key, for deriving a stable ethp2p `u64` peer id.
+#[cfg(feature = "ethp2p")]
+fn secp256k1_compressed(pk: &PublicKey) -> Option<[u8; 33]> {
+    let secp: secp256k1::PublicKey = pk.clone().try_into().ok()?;
+    Some(secp.to_bytes())
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -237,6 +250,12 @@ pub fn build_swarm(
         secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
+    // ethp2p: derive this node's u64 broadcast peer id from its secp256k1 key.
+    #[cfg(feature = "ethp2p")]
+    let ethp2p_local_peer = crate::ethp2p::derive_peer_id(
+        &secp256k1_compressed(&identity.public()).expect("local node key is secp256k1"),
+    );
+
     // Use the same `protocol_version` string as zeam
     let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
         "/ipfs/0.1.0".to_owned(),
@@ -263,10 +282,25 @@ pub fn build_swarm(
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let mut bootnode_addrs = HashMap::new();
+    // ethp2p: parallel QUIC mesh peers, derived from the same bootnodes.
+    // Each peer's ethp2p QUIC port is the gossipsub QUIC port + 1; we dial
+    // them (Some(addr)) since ethlambda's bootnode topology is static.
+    #[cfg(feature = "ethp2p")]
+    let mut ethp2p_peers: Vec<(u64, Option<SocketAddr>)> = Vec::new();
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
             continue;
+        }
+        #[cfg(feature = "ethp2p")]
+        if let Some(pubkey) = secp256k1_compressed(&bootnode.public_key) {
+            ethp2p_peers.push((
+                crate::ethp2p::derive_peer_id(&pubkey),
+                Some(SocketAddr::new(
+                    bootnode.ip,
+                    bootnode.quic_port.wrapping_add(1),
+                )),
+            ));
         }
         let addr = Multiaddr::empty()
             .with(bootnode.ip.into())
@@ -338,6 +372,17 @@ pub fn build_swarm(
 
     info!(socket=%config.listening_socket, "P2P node started");
 
+    // ethp2p: bind the parallel QUIC endpoint on gossipsub port + 1.
+    #[cfg(feature = "ethp2p")]
+    let ethp2p = crate::ethp2p::Ethp2pParams::new(
+        ethp2p_local_peer,
+        SocketAddr::new(
+            config.listening_socket.ip(),
+            config.listening_socket.port().wrapping_add(1),
+        ),
+        ethp2p_peers,
+    );
+
     Ok(BuiltSwarm {
         swarm,
         attestation_topics,
@@ -345,6 +390,8 @@ pub fn build_swarm(
         block_topic,
         aggregation_topic,
         bootnode_addrs,
+        #[cfg(feature = "ethp2p")]
+        ethp2p,
     })
 }
 
@@ -361,6 +408,10 @@ impl P2P {
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
+        #[cfg(feature = "ethp2p")]
+        let (ethp2p_tx, ethp2p_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::ethp2p::PublishCmd>();
+
         let server = P2PServer {
             swarm_handle,
             store,
@@ -375,9 +426,21 @@ impl P2P {
             range_sync_state: None,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
+            #[cfg(feature = "ethp2p")]
+            ethp2p_publish: Some(ethp2p_tx),
         };
         let handle = server.start();
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
+
+        // Spawn the experimental ethp2p broadcast engine task, forwarding
+        // reconstructed messages back into this actor.
+        #[cfg(feature = "ethp2p")]
+        tokio::spawn(crate::ethp2p::run_engine_task(
+            built.ethp2p,
+            ethp2p_rx,
+            handle.clone(),
+        ));
+
         P2P { handle }
     }
 
@@ -390,6 +453,16 @@ impl P2P {
 /// `SwarmEvent` contains non-Clone types (e.g. `ResponseChannel`).
 pub(crate) struct WrappedSwarmEvent(SwarmEvent<BehaviourEvent>);
 impl Message for WrappedSwarmEvent {
+    type Result = ();
+}
+
+/// Wrapper for a message reconstructed by the ethp2p broadcast engine,
+/// forwarded from the engine task into the actor so it flows through the
+/// same consensus pipeline as gossipsub.
+#[cfg(feature = "ethp2p")]
+pub(crate) struct WrappedEthp2pDelivery(pub(crate) ethp2p_broadcast::engine::DeliveredMessage);
+#[cfg(feature = "ethp2p")]
+impl Message for WrappedEthp2pDelivery {
     type Result = ();
 }
 
@@ -412,6 +485,13 @@ pub struct P2PServer {
     pub(crate) range_sync_state: Option<RangeSyncState>,
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
     node_names: HashMap<PeerId, String>,
+
+    /// Command sender to the experimental ethp2p broadcast engine task.
+    /// `None` when the engine isn't running (feature off path). The
+    /// publish handlers tee gossip here.
+    #[cfg(feature = "ethp2p")]
+    pub(crate) ethp2p_publish:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::ethp2p::PublishCmd>>,
 }
 
 impl P2PServer {
@@ -501,6 +581,20 @@ impl Handler<PublishAttestation> for P2PServer {
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
+    }
+}
+
+#[cfg(feature = "ethp2p")]
+impl Handler<WrappedEthp2pDelivery> for P2PServer {
+    async fn handle(&mut self, msg: WrappedEthp2pDelivery, _ctx: &Context<Self>) {
+        let delivered = msg.0;
+        if let Some(ref blockchain) = self.blockchain {
+            crate::ethp2p::dispatch_delivered(
+                blockchain,
+                &delivered.channel_id,
+                &delivered.payload,
+            );
+        }
     }
 }
 
