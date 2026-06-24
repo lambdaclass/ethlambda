@@ -144,7 +144,7 @@ Some features we are looking to implement in the near future, in order of priori
 - Integrate with execution clients, in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
 - Replace libp2p with the experimental [ethp2p](https://github.com/ethp2p/ethp2p), which we are porting to Rust
 - [Add a guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
-- Rewrite the STF in a concrete language to enable formal verification
+- Rewrite the STF in the concrete programming language to enable formal verification
 
 ### Experimental features
 
