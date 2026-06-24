@@ -446,6 +446,32 @@ impl GossipSignatureBuffer {
             .collect()
     }
 
+    /// Extract per-validator latest attestations from the raw signature pool.
+    ///
+    /// Mirrors `PayloadBuffer::extract_latest_attestations`: iterate data_roots
+    /// in insertion order (via `self.order`) so that, when two votes share the
+    /// same `slot`, the first-observed one wins for the validators present in
+    /// both. This matches the leanSpec `location == "signatures"` checker, which
+    /// folds `attestation_signatures` keeping each validator's highest-slot vote
+    /// with first-seen-wins on slot ties.
+    fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
+        let mut result: HashMap<u64, AttestationData> = HashMap::new();
+        for data_root in &self.order {
+            let Some(entry) = self.data.get(data_root) else {
+                continue;
+            };
+            for &vid in entry.signatures.keys() {
+                let should_update = result
+                    .get(&vid)
+                    .is_none_or(|existing| existing.slot < entry.data.slot);
+                if should_update {
+                    result.insert(vid, entry.data.clone());
+                }
+            }
+        }
+        result
+    }
+
     /// Returns the total number of individual signatures stored.
     fn total_signatures(&self) -> usize {
         self.total_signatures
@@ -1165,6 +1191,19 @@ impl Store {
     /// Extract per-validator latest attestations from new (pending) payloads.
     pub fn extract_latest_new_attestations(&self) -> HashMap<u64, AttestationData> {
         self.new_payloads
+            .lock()
+            .unwrap()
+            .extract_latest_attestations()
+    }
+
+    /// Extract per-validator latest attestations from the raw gossip signature
+    /// pool (the spec's `attestation_signatures`).
+    ///
+    /// Unlike the aggregated pools, this pool holds one entry per validator per
+    /// vote, so it reflects raw per-validator signatures before aggregation.
+    /// Each validator maps to its highest-slot vote (first-seen-wins on ties).
+    pub fn extract_latest_signature_attestations(&self) -> HashMap<u64, AttestationData> {
+        self.gossip_signatures
             .lock()
             .unwrap()
             .extract_latest_attestations()
