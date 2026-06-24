@@ -1255,9 +1255,12 @@ mod tests {
         let head_justified = Checkpoint { root: a, slot: 1 };
         let mut head_state = State::from_genesis(1000, vec![]);
         head_state.latest_justified = head_justified;
-        // Persist `b`'s post-state via the diff API (parented on `a`); a full
-        // snapshot is written, so `get_state(b)` returns it directly.
-        let diff_base = DiffBase::from_state(a, &head_state);
+        // Persist `b`'s post-state via the diff API, diffed against the genesis
+        // anchor that already lives in the store. The base must describe the
+        // parent (genesis) state, not the target; `get_state(b)` then resolves
+        // via the cache or by replaying this diff onto the genesis snapshot.
+        let genesis_state = store.get_state(&genesis).expect("genesis state");
+        let diff_base = DiffBase::from_state(genesis, &genesis_state);
         store.insert_state_with_diff(b, diff_base, head_state);
 
         // Store's global justified latched onto a higher, off-head checkpoint,
