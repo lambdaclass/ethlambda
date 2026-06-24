@@ -132,11 +132,19 @@ Docker tags for each devnet are released, with format `devnetX` (i.e. `devnet1`,
 
 Support for older devnet releases is discontinued when the next devnet version is released.
 
-## Incoming features
+## Incoming features / Roadmap
+
+We wrote a [blogpost](https://blog.lambdaclass.com/ethlambda-devnet-5-and-beyond/) about what we think should be included in the near future.
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- [Add guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
+- Optimize block building
+- Store the state-diff in the database
+- Prototype Goldfish + RLMD GHOST + BFT — devnet-6
+- Integrate with execution clients, in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
+- Replace libp2p with the experimental [ethp2p](https://github.com/ethp2p/ethp2p), which we are porting to Rust
+- [Add a guest program and ZK proving of the STF](https://github.com/lambdaclass/ethlambda/issues/156)
+- Rewrite the STF in a concrete language to enable formal verification
 
 ### Experimental features
 
