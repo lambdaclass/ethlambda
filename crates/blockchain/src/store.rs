@@ -70,14 +70,15 @@ pub fn update_head(store: &mut Store, log_tree: bool, events: Option<&ChainEvent
         // Emit the new head whenever fork choice moved it. Read the header once
         // and reuse it for slot and parent_root so they stay consistent.
         if old_head != new_head {
-            let new_header = store
-                .get_block_header(&new_head)
-                .expect("head block exists");
-            let _ = events.send(ChainEvent::Head {
-                slot: new_header.slot,
-                root: new_head,
-                parent_root: new_header.parent_root,
-            });
+            if let Some(new_header) = store.get_block_header(&new_head) {
+                let _ = events.send(ChainEvent::Head {
+                    slot: new_header.slot,
+                    root: new_head,
+                    parent_root: new_header.parent_root,
+                });
+            } else {
+                tracing::warn!("head header missing while emitting Head event; skipping");
+            }
         }
 
         // Emit a finalized-checkpoint event only when finalization advanced.

@@ -40,9 +40,13 @@ async fn get_events(
             ChainEvent::Block { .. } => "block",
             ChainEvent::FinalizedCheckpoint { .. } => "finalized_checkpoint",
         };
-        Some(Ok(Event::default().event(name).json_data(ev).ok()?))
+        Some(Ok(Event::default()
+            .event(name)
+            .json_data(ev)
+            .inspect_err(|err| tracing::warn!(%err, "failed to serialize SSE chain event"))
+            .ok()?))
     });
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 pub(crate) fn routes() -> Router<Store> {
