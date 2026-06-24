@@ -9,14 +9,14 @@ pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
+mod base;
 mod blocks;
-mod core;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 pub mod test_driver;
 
-pub(crate) use core::json_response;
+pub(crate) use base::json_response;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -96,7 +96,7 @@ pub async fn start_rpc_server(
 /// know about it and admin handlers extract it independently.
 fn build_api_router(store: Store) -> Router {
     Router::new()
-        .merge(core::routes())
+        .merge(base::routes())
         .merge(blocks::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())

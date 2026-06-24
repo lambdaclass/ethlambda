@@ -15,7 +15,7 @@ pub(crate) fn routes() -> Router<Store> {
         .route("/lean/v0/blocks/finalized", get(get_latest_finalized_block))
         .route(
             "/lean/v0/checkpoints/justified",
-            get(get_latest_justified_state),
+            get(get_latest_justified_checkpoint),
         )
 }
 
@@ -40,14 +40,15 @@ pub(crate) async fn get_latest_finalized_block(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let finalized = store.latest_finalized();
-    // Returns 404 for genesis since it doesn't have a valid signature
+    // Genesis has no stored signature; `get_signed_block` synthesizes a
+    // placeholder blank proof so this always returns 200.
     match store.get_signed_block(&finalized.root) {
         Some(block) => ssz_response(block.to_ssz()),
         None => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-pub(crate) async fn get_latest_justified_state(
+pub(crate) async fn get_latest_justified_checkpoint(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let checkpoint = store.latest_justified();
