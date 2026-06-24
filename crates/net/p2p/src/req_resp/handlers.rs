@@ -589,7 +589,7 @@ mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::{
-        block::{Block, BlockBody, MultiMessageAggregate},
+        block::{Block, BlockBody, BlockProof},
         state::State,
     };
     use std::sync::Arc;
@@ -603,7 +603,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 
