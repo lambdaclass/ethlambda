@@ -17,7 +17,6 @@ use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
-use crate::block_builder::build_overran_publish_window;
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
@@ -433,11 +432,13 @@ impl BlockChainServer {
             return;
         };
 
+        let now_ms = unix_now_ms();
+
         // Align publication to the slot boundary. If the build finished before
         // the slot opened, wait out the remainder so the block is not published
         // early; if it overran, publish immediately.
-        if !build_overran_publish_window(unix_now_ms(), genesis_time_ms, slot) {
-            let wait_ms = slot_start_ms.saturating_sub(unix_now_ms());
+        if now_ms < genesis_time_ms + slot * crate::MILLISECONDS_PER_SLOT {
+            let wait_ms = slot_start_ms.saturating_sub(now_ms);
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
 

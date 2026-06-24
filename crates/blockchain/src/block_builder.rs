@@ -43,18 +43,6 @@ pub struct PostBlockCheckpoints {
     pub finalized: Checkpoint,
 }
 
-/// Whether a pre-build that has just finished has already run into (or past)
-/// the start of its target slot — i.e. into the interval-0 publish window.
-///
-/// When true, the overrun-catch-up in `handle_tick` will have skipped that
-/// slot's interval-0 proposal tick, so the freshly built block must be
-/// published in place rather than stashed for a tick that will never fire.
-///
-/// Pure so it can be unit-tested without an actor or store.
-pub(crate) fn build_overran_publish_window(now_ms: u64, genesis_time_ms: u64, slot: u64) -> bool {
-    now_ms >= genesis_time_ms + slot * crate::MILLISECONDS_PER_SLOT
-}
-
 /// Build a valid block on top of this state.
 ///
 /// Selects attestations via `select_attestations`, compacts duplicate
