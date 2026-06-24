@@ -67,16 +67,16 @@ pub fn update_head(store: &mut Store, log_tree: bool, events: Option<&ChainEvent
     store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
 
     if let Some(events) = events {
-        // Emit the new head whenever fork choice moved it.
+        // Emit the new head whenever fork choice moved it. Read the header once
+        // and reuse it for slot and parent_root so they stay consistent.
         if old_head != new_head {
-            let parent_root = store
+            let new_header = store
                 .get_block_header(&new_head)
-                .map(|h| h.parent_root)
-                .unwrap_or(H256::ZERO);
+                .expect("head block exists");
             let _ = events.send(ChainEvent::Head {
-                slot: store.head_slot(),
+                slot: new_header.slot,
                 root: new_head,
-                parent_root,
+                parent_root: new_header.parent_root,
             });
         }
 

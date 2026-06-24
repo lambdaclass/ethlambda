@@ -288,12 +288,20 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    // Chain-event broadcast channel: the blockchain actor is the sole sender;
+    // each SSE client (`GET /lean/v0/events`) subscribes its own receiver. The
+    // initial receiver is dropped — subscribers attach on demand and a fully
+    // unsubscribed channel just drops events.
+    let (chain_events, _) =
+        tokio::sync::broadcast::channel(ethlambda_blockchain::CHAIN_EVENT_CHANNEL_CAPACITY);
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
         !options.disable_duty_sync_gate,
+        chain_events.clone(),
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
@@ -333,9 +341,15 @@ async fn main() -> eyre::Result<()> {
     let rpc_shutdown = shutdown_token.clone();
 
     let rpc_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "RPC server failed"));
+        let _ = ethlambda_rpc::start_rpc_server(
+            rpc_config,
+            store,
+            aggregator,
+            chain_events,
+            rpc_shutdown,
+        )
+        .await
+        .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
