@@ -103,7 +103,7 @@ const SNAPSHOT_ANCHOR_INTERVAL: u64 = 1_024;
 /// needs invalidation; it only bounds how many recent states stay hot for reads
 /// (e.g. a block's `parent_state` right after import). A miss falls back to a
 /// snapshot read or a diff-chain reconstruction.
-const STATE_CACHE_CAPACITY: usize = 256;
+const STATE_CACHE_CAPACITY: usize = 32;
 
 /// Keep block signatures for at least this many slots below the tip, even once
 /// finalized. Signatures older than this window are pruned only when the window
