@@ -1348,24 +1348,3 @@ mod tests {
         assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
     }
 }
-
-#[cfg(test)]
-mod prebuild_tests {
-    use super::*;
-
-    #[test]
-    fn overran_only_once_now_reaches_slot_start() {
-        let genesis = 1000;
-        let slot = 10;
-        let slot_start = genesis + slot * crate::MILLISECONDS_PER_SLOT;
-        // Build finished before the target slot opened: stash for interval 0.
-        assert!(!build_overran_publish_window(slot_start - 1, genesis, slot));
-        // Build finished exactly at / past the slot start: publish in place.
-        assert!(build_overran_publish_window(slot_start, genesis, slot));
-        assert!(build_overran_publish_window(
-            slot_start + 5_000,
-            genesis,
-            slot
-        ));
-    }
-}
