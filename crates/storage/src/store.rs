@@ -1727,11 +1727,7 @@ mod tests {
             slot: 0,
         };
         insert_header(backend.as_ref(), r1, 1);
-        let base = DiffBase {
-            root: r0,
-            hbh_len: s0.historical_block_hashes.len(),
-            slot: s0.slot,
-        };
+        let base = DiffBase::from_state(r0, &s0);
         store.insert_state_with_diff(r1, base, s1.clone());
 
         // Not an anchor, so no snapshot was written; only the diff.
@@ -1761,21 +1757,13 @@ mod tests {
         let r1 = root(1);
         let s1 = sample_state(1, vec![root(42)]);
         insert_header(backend.as_ref(), r1, 1);
-        let base = DiffBase {
-            root: r0,
-            hbh_len: s0.historical_block_hashes.len(),
-            slot: s0.slot,
-        };
+        let base = DiffBase::from_state(r0, &s0);
         store.insert_state_with_diff(r1, base, s1.clone());
 
         let r2 = root(2);
         let s2 = sample_state(2, vec![root(42), root(43)]);
         insert_header(backend.as_ref(), r2, 2);
-        let base = DiffBase {
-            root: r1,
-            hbh_len: s1.historical_block_hashes.len(),
-            slot: s1.slot,
-        };
+        let base = DiffBase::from_state(r1, &s1);
         store.insert_state_with_diff(r2, base, s2.clone());
 
         // Neither child is an anchor, so a cold store reconstructs s2 by walking
@@ -1801,11 +1789,7 @@ mod tests {
         let r1 = root(1);
         let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, vec![root(42)]);
         insert_header(backend.as_ref(), r1, s1.slot);
-        let base = DiffBase {
-            root: r0,
-            hbh_len: s0.historical_block_hashes.len(),
-            slot: s0.slot,
-        };
+        let base = DiffBase::from_state(r0, &s0);
         store.insert_state_with_diff(r1, base, s1.clone());
         assert!(has_key(backend.as_ref(), Table::States, &r1));
 
@@ -1813,11 +1797,7 @@ mod tests {
         let r2 = root(2);
         let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, vec![root(42), root(43)]);
         insert_header(backend.as_ref(), r2, s2.slot);
-        let base = DiffBase {
-            root: r1,
-            hbh_len: s1.historical_block_hashes.len(),
-            slot: s1.slot,
-        };
+        let base = DiffBase::from_state(r1, &s1);
         store.insert_state_with_diff(r2, base, s2.clone());
         assert!(!has_key(backend.as_ref(), Table::States, &r2));
     }
