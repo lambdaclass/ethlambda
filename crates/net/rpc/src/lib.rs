@@ -1,15 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 
-use axum::{
-    Extension, Json, Router,
-    http::{HeaderValue, StatusCode, header},
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Extension, Router};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
-use ethlambda_types::primitives::H256;
-use libssz::SszEncode;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
@@ -17,10 +10,13 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
 mod blocks;
+mod core;
 mod fork_choice;
 mod heap_profiling;
 pub mod metrics;
 pub mod test_driver;
+
+pub(crate) use core::json_response;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -100,91 +96,22 @@ pub async fn start_rpc_server(
 /// know about it and admin handlers extract it independently.
 fn build_api_router(store: Store) -> Router {
     Router::new()
-        .route("/lean/v0/health", get(metrics::get_health))
-        .route("/lean/v0/states/finalized", get(get_latest_finalized_state))
-        .route("/lean/v0/blocks/finalized", get(get_latest_finalized_block))
-        .route(
-            "/lean/v0/checkpoints/justified",
-            get(get_latest_justified_state),
-        )
-        .route("/lean/v0/fork_choice", get(fork_choice::get_fork_choice))
-        .route(
-            "/lean/v0/fork_choice/ui",
-            get(fork_choice::get_fork_choice_ui),
-        )
-        .route("/lean/v0/blocks/{block_id}", get(blocks::get_block))
-        .route(
-            "/lean/v0/blocks/{block_id}/header",
-            get(blocks::get_block_header),
-        )
-        .route(
-            "/lean/v0/admin/aggregator",
-            get(admin::get_aggregator).post(admin::post_aggregator),
-        )
+        .merge(core::routes())
+        .merge(blocks::routes())
+        .merge(fork_choice::routes())
+        .merge(admin::routes())
         .with_state(store)
 }
 
 /// Build the debug router for profiling endpoints.
 fn build_debug_router() -> Router {
+    use axum::routing::get;
     Router::new()
         .route("/debug/pprof/allocs", get(heap_profiling::handle_get_heap))
         .route(
             "/debug/pprof/allocs/flamegraph",
             get(heap_profiling::handle_get_heap_flamegraph),
         )
-}
-
-async fn get_latest_finalized_state(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
-    let mut state = store
-        .get_state(&finalized.root)
-        .expect("finalized state exists");
-
-    // Zero state_root to match the canonical post-state representation.
-    // The spec's state_transition sets state_root to zero during process_block_header,
-    // and only fills it in lazily at the next slot's process_slots.
-    // Serving the canonical form ensures checkpoint sync interoperability.
-    state.latest_block_header.state_root = H256::ZERO;
-
-    ssz_response(state.to_ssz())
-}
-
-async fn get_latest_finalized_block(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
-    // Returns 404 for genesis since it doesn't have a valid signature
-    match store.get_signed_block(&finalized.root) {
-        Some(block) => ssz_response(block.to_ssz()),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn get_latest_justified_state(
-    axum::extract::State(store): axum::extract::State<Store>,
-) -> impl IntoResponse {
-    let checkpoint = store.latest_justified();
-    json_response(checkpoint)
-}
-
-fn json_response<T: serde::Serialize>(value: T) -> axum::response::Response {
-    let mut response = Json(value).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(JSON_CONTENT_TYPE),
-    );
-    response
-}
-
-fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(SSZ_CONTENT_TYPE),
-    );
-    response
 }
 
 #[cfg(test)]
@@ -267,7 +194,7 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, http::StatusCode, http::header};
     use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use serde_json::json;

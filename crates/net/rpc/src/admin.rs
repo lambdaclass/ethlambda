@@ -12,16 +12,25 @@
 //! the role (hot-standby model). See leanSpec PR #636 for the full rationale.
 
 use axum::{
-    Extension, Json,
+    Extension, Json, Router,
     http::StatusCode,
     response::{IntoResponse, Response},
+    routing::get,
 };
+use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::info;
 
 use crate::json_response;
+
+pub(crate) fn routes() -> Router<Store> {
+    Router::new().route(
+        "/lean/v0/admin/aggregator",
+        get(get_aggregator).post(post_aggregator),
+    )
+}
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -44,7 +53,9 @@ struct ToggleResponse {
 /// `Extension<T>` would cause axum to short-circuit with a 500 when the
 /// extension is missing, whereas `Option` yields `None` and lets us return
 /// a clean 503 with a useful message.
-pub async fn get_aggregator(controller: Option<Extension<AggregatorController>>) -> Response {
+pub(crate) async fn get_aggregator(
+    controller: Option<Extension<AggregatorController>>,
+) -> Response {
     match controller {
         Some(Extension(controller)) => json_response(StatusResponse {
             is_aggregator: controller.is_enabled(),
@@ -62,7 +73,7 @@ pub async fn get_aggregator(controller: Option<Extension<AggregatorController>>)
 /// `Extension<T>` would cause axum to short-circuit with a 500 when the
 /// extension is missing, whereas `Option` yields `None` and lets us return
 /// a clean 503 with a useful message.
-pub async fn post_aggregator(
+pub(crate) async fn post_aggregator(
     controller: Option<Extension<AggregatorController>>,
     body: Option<Json<Value>>,
 ) -> Response {
