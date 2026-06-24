@@ -10,6 +10,7 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
 mod base;
+mod attestations;
 mod blocks;
 mod fork_choice;
 mod heap_profiling;
@@ -97,6 +98,7 @@ pub async fn start_rpc_server(
 fn build_api_router(store: Store) -> Router {
     Router::new()
         .merge(base::routes())
+        .merge(attestations::routes())
         .merge(blocks::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
