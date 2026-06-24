@@ -429,6 +429,7 @@ impl BlockChainServer {
         let Some((signed_block, built_justified_slot)) =
             self.build_signed_block(slot, validator_id, parent_root)
         else {
+            // Already logged inside `build_signed_block`
             return;
         };
 
@@ -442,23 +443,7 @@ impl BlockChainServer {
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
 
-        // Publish on the head we built on, rebuilding if it no longer holds.
-        //
-        // Today this guard always passes: the actor is single-threaded and
-        // processes no other message while `propose_block` runs (not even across
-        // the sleep above), so `store.head()` cannot change mid-build and our
-        // justified checkpoint cannot regress. The check is kept as a cheap
-        // safety net for the day the build is moved off the actor thread (where
-        // a competing block could land mid-build); then the rebuild path becomes
-        // live and the slot has already opened, so the rebuild publishes at once.
-        let live_head = self.store.head();
-        let store_justified_slot = self.store.latest_justified().slot;
-        if live_head == parent_root && built_justified_slot >= store_justified_slot {
-            self.process_and_publish_block(slot, validator_id, signed_block, "Published block");
-        } else if let Some((rebuilt, _)) = self.build_signed_block(slot, validator_id, live_head) {
-            info!(%slot, %validator_id, "Head moved during pre-build; rebuilt on new head");
-            self.process_and_publish_block(slot, validator_id, rebuilt, "Published block");
-        }
+        self.process_and_publish_block(slot, validator_id, signed_block);
     }
 
     /// Build the block on `head_root` and assemble it into a `SignedBlock`.
@@ -681,12 +666,11 @@ impl BlockChainServer {
         slot: u64,
         validator_id: u64,
         signed_block: SignedBlock,
-        published_msg: &'static str,
-    ) -> bool {
+    ) {
         if let Err(err) = self.process_block(signed_block.clone()) {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
-            return false;
+            return;
         }
 
         metrics::inc_block_building_success();
@@ -697,8 +681,7 @@ impl BlockChainServer {
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to publish block"));
         }
 
-        info!(%slot, %validator_id, "{}", published_msg);
-        true
+        info!(%slot, %validator_id, "Published block");
     }
 
     /// Run block import and refresh metrics.
