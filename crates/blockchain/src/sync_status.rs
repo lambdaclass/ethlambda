@@ -5,7 +5,7 @@ use crate::metrics::SyncStatus;
 /// Local head lag beyond which the node is considered to be syncing.
 ///
 /// See: leanSpec PR #708.
-const SYNC_LAG_THRESHOLD: u64 = 4;
+pub const SYNC_LAG_THRESHOLD: u64 = 4;
 /// Freshest-known block lag beyond which the network is considered stalled.
 ///
 /// During a network-wide stall the node remains synced so validators can help

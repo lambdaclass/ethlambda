@@ -49,6 +49,7 @@ pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
+pub use sync_status::SYNC_LAG_THRESHOLD;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
