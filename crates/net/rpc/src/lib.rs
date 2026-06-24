@@ -9,8 +9,8 @@ pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
-mod base;
 mod attestations;
+mod base;
 mod blocks;
 mod fork_choice;
 mod heap_profiling;
