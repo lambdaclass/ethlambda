@@ -8,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{Block, ByteList512KiB, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature},
+    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
 };
@@ -426,12 +426,134 @@ impl BlockChainServer {
         store::on_tick(&mut self.store, slot_start_ms, true);
         let parent_root = self.store.head();
 
-        let Some((signed_block, built_justified_slot)) =
-            self.build_signed_block(slot, validator_id, parent_root)
+        // Build the block on the interval-0 head.
+        let _timing = metrics::time_block_building();
+        let (block, type_one_proofs, _post_checkpoints) =
+            match store::produce_block_on_head(&mut self.store, slot, validator_id, parent_root) {
+                Ok(built) => built,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to build block");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            };
+
+        coverage::emit_proposal_coverage(
+            &self.store,
+            self.attestation_committee_count,
+            block.body.attestations.iter(),
+        );
+
+        // Sign the block root with the proposal key.
+        let block_root = block.hash_tree_root();
+        let Ok(proposer_signature) = self
+            .key_manager
+            .sign_block_root(validator_id, slot as u32, &block_root)
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
         else {
-            // Already logged inside `build_signed_block`
+            metrics::inc_block_building_failures();
             return;
         };
+
+        // Wrap the proposer's raw XMSS signature into a singleton Type-1 SNARK,
+        // then merge it with every attestation Type-1 into the single Type-2.
+        let head_state = self.store.head_state();
+        let validators = &head_state.validators;
+        let Some(proposer_validator) = validators.get(validator_id as usize) else {
+            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        // Decode the proposer's proposal pubkey once and reuse it both for the
+        // singleton Type-1 wrap and for the Type-2 merge inputs.
+        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let Ok(proposer_validator_signature) =
+            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
+                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
+            })
+        else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
+            vec![proposer_pubkey.clone()],
+            vec![proposer_validator_signature],
+            &block_root,
+            slot as u32,
+        )
+        .inspect_err(
+            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
+        ) else {
+            metrics::inc_block_building_failures();
+            return;
+        };
+
+        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
+            Vec::with_capacity(type_one_proofs.len() + 1);
+        let mut resolve_failed = false;
+        for t1 in &type_one_proofs {
+            let mut pubkeys = Vec::new();
+            for vid in t1.participant_indices() {
+                let Some(validator) = validators.get(vid as usize) else {
+                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
+                    resolve_failed = true;
+                    break;
+                };
+                match validator.get_attestation_pubkey() {
+                    Ok(pk) => pubkeys.push(pk),
+                    Err(err) => {
+                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
+                        resolve_failed = true;
+                        break;
+                    }
+                }
+            }
+            if resolve_failed {
+                break;
+            }
+            merge_inputs.push((pubkeys, t1.proof.clone()));
+        }
+        if resolve_failed {
+            metrics::inc_block_building_failures();
+            return;
+        }
+        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+
+        // Merge yields raw lean-multisig Type-2 bytes. Per-component
+        // participants are rederived at verify time from
+        // `block.body.attestations[i].aggregation_bits` plus
+        // `block.proposer_index`, so nothing else needs persisting.
+        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
+            Ok(p) => p,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
+        let signed_block = SignedBlock {
+            message: block,
+            proof,
+        };
+
+        // Stop timing here: the build is done, and the alignment wait below must
+        // not count toward the block-building metric.
+        drop(_timing);
 
         let now_ms = unix_now_ms();
 
@@ -444,39 +566,6 @@ impl BlockChainServer {
         }
 
         self.process_and_publish_block(slot, validator_id, signed_block);
-    }
-
-    /// Build the block on `head_root` and assemble it into a `SignedBlock`.
-    ///
-    /// Returns the signed block and the justified slot it closed over, or `None`
-    /// on any build/sign failure (already logged and counted). Used by
-    /// `propose_block`, both for the initial build and the rebuild-on-moved-head.
-    fn build_signed_block(
-        &mut self,
-        slot: u64,
-        validator_id: u64,
-        head_root: H256,
-    ) -> Option<(SignedBlock, u64)> {
-        let _timing = metrics::time_block_building();
-        let (block, type_one_proofs, post_checkpoints) =
-            match store::produce_block_on_head(&mut self.store, slot, validator_id, head_root) {
-                Ok(built) => built,
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to build block");
-                    metrics::inc_block_building_failures();
-                    return None;
-                }
-            };
-
-        coverage::emit_proposal_coverage(
-            &self.store,
-            self.attestation_committee_count,
-            block.body.attestations.iter(),
-        );
-
-        let signed_block =
-            self.assemble_signed_block(slot, validator_id, block, type_one_proofs)?;
-        Some((signed_block, post_checkpoints.justified.slot))
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -537,130 +626,8 @@ impl BlockChainServer {
         }
     }
 
-    /// Build and publish a block for the given slot and validator.
-    /// Sign the block root and merge every Type-1 proof (attestations plus the
-    /// proposer's own signature) into the block's single Type-2 proof.
-    ///
-    /// Called from `build_signed_block`. Returns `None` on any
-    /// signing/aggregation failure (already logged and counted).
-    fn assemble_signed_block(
-        &mut self,
-        slot: u64,
-        validator_id: u64,
-        block: Block,
-        type_one_proofs: Vec<TypeOneMultiSignature>,
-    ) -> Option<SignedBlock> {
-        // Sign the block root with the proposal key.
-        let block_root = block.hash_tree_root();
-        let Ok(proposer_signature) = self
-            .key_manager
-            .sign_block_root(validator_id, slot as u32, &block_root)
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
-        else {
-            metrics::inc_block_building_failures();
-            return None;
-        };
-
-        // Wrap the proposer's raw XMSS signature into a singleton Type-1 SNARK,
-        // then merge it with every attestation Type-1 into the single Type-2.
-        let head_state = self.store.head_state();
-        let validators = &head_state.validators;
-        let Some(proposer_validator) = validators.get(validator_id as usize) else {
-            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
-            metrics::inc_block_building_failures();
-            return None;
-        };
-
-        // Decode the proposer's proposal pubkey once and reuse it both for the
-        // singleton Type-1 wrap and for the Type-2 merge inputs.
-        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return None;
-        };
-
-        let Ok(proposer_validator_signature) =
-            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
-                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
-            })
-        else {
-            metrics::inc_block_building_failures();
-            return None;
-        };
-        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
-            vec![proposer_pubkey.clone()],
-            vec![proposer_validator_signature],
-            &block_root,
-            slot as u32,
-        )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return None;
-        };
-
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-            Vec::with_capacity(type_one_proofs.len() + 1);
-        let mut resolve_failed = false;
-        for t1 in &type_one_proofs {
-            let mut pubkeys = Vec::new();
-            for vid in t1.participant_indices() {
-                let Some(validator) = validators.get(vid as usize) else {
-                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
-                    resolve_failed = true;
-                    break;
-                };
-                match validator.get_attestation_pubkey() {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(err) => {
-                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
-                        resolve_failed = true;
-                        break;
-                    }
-                }
-            }
-            if resolve_failed {
-                break;
-            }
-            merge_inputs.push((pubkeys, t1.proof.clone()));
-        }
-        if resolve_failed {
-            metrics::inc_block_building_failures();
-            return None;
-        }
-        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
-
-        // Merge yields raw lean-multisig Type-2 bytes. Per-component
-        // participants are rederived at verify time from
-        // `block.body.attestations[i].aggregation_bits` plus
-        // `block.proposer_index`, so nothing else needs persisting.
-        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
-                metrics::inc_block_building_failures();
-                return None;
-            }
-        };
-        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
-            Ok(p) => p,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
-                metrics::inc_block_building_failures();
-                return None;
-            }
-        };
-        Some(SignedBlock {
-            message: block,
-            proof,
-        })
-    }
-
-    /// Import a freshly built block locally, then publish it to gossip. Returns
-    /// `true` on successful import; on failure logs, counts it, and returns
-    /// `false` so the caller can fall back to a fresh build.
+    /// Import a freshly built block locally, then publish it to gossip. On
+    /// import failure, logs and counts it, and returns without publishing.
     fn process_and_publish_block(
         &mut self,
         slot: u64,
