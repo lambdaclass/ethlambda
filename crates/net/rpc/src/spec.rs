@@ -20,7 +20,7 @@ struct SpecResponse {
     #[serde(rename = "HISTORICAL_ROOTS_LIMIT")]
     historical_roots_limit: u64,
     #[serde(rename = "FORK_DIGEST")]
-    fork_digest: String,
+    fork_digest: &'static str,
 }
 
 async fn get_spec() -> impl IntoResponse {
@@ -29,7 +29,7 @@ async fn get_spec() -> impl IntoResponse {
         intervals_per_slot: INTERVALS_PER_SLOT,
         ms_per_interval: MILLISECONDS_PER_INTERVAL,
         historical_roots_limit: HISTORICAL_ROOTS_LIMIT as u64,
-        fork_digest: FORK_DIGEST.to_string(),
+        fork_digest: FORK_DIGEST,
     })
 }
 
@@ -49,6 +49,7 @@ mod tests {
         INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     };
     use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use ethlambda_types::state::HISTORICAL_ROOTS_LIMIT;
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -72,6 +73,10 @@ mod tests {
         assert_eq!(json["MILLISECONDS_PER_SLOT"], MILLISECONDS_PER_SLOT);
         assert_eq!(json["INTERVALS_PER_SLOT"], INTERVALS_PER_SLOT);
         assert_eq!(json["MILLISECONDS_PER_INTERVAL"], MILLISECONDS_PER_INTERVAL);
+        assert_eq!(
+            json["HISTORICAL_ROOTS_LIMIT"],
+            HISTORICAL_ROOTS_LIMIT as u64
+        );
         assert_eq!(json["FORK_DIGEST"], FORK_DIGEST);
     }
 }
