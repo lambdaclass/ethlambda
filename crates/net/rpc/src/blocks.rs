@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::rejection::QueryRejection,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
@@ -104,18 +105,34 @@ pub(crate) struct BlockRangeParams {
 /// Returns a JSON array of blocks. Slots with no canonical block (zero root) are silently
 /// skipped. `count` is capped at [`MAX_RANGE_COUNT`].
 pub(crate) async fn get_blocks_by_range(
-    Query(params): Query<BlockRangeParams>,
+    params: Result<Query<BlockRangeParams>, QueryRejection>,
     State(store): State<Store>,
 ) -> impl IntoResponse {
+    let Query(params) = match params {
+        Ok(p) => p,
+        Err(err) => {
+            let mut response =
+                json_response(json!({ "error": format!("invalid query parameters: {err}") }));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            return response;
+        }
+    };
+
     let count = params.count.min(MAX_RANGE_COUNT);
     let head_state = store.head_state();
     let mut blocks = Vec::new();
     for slot in params.start_slot..params.start_slot.saturating_add(count) {
-        if let Some(root) = head_state.historical_block_hashes.get(slot as usize)
-            && !root.is_zero()
-            && let Some(block) = store.get_block(root)
-        {
-            blocks.push(block);
+        let Some(root) = head_state.historical_block_hashes.get(slot as usize) else {
+            break;
+        };
+        if root.is_zero() {
+            continue;
+        }
+        match store.get_block(root) {
+            Some(block) => blocks.push(block),
+            None => {
+                tracing::warn!(%slot, %root, "block referenced by historical_block_hashes is missing from store");
+            }
         }
     }
     json_response(blocks)
@@ -180,5 +197,65 @@ mod range_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 1);
         assert_eq!(json[0]["slot"], 1);
+    }
+
+    /// `count` larger than MAX_RANGE_COUNT is silently clamped to 1024.
+    #[tokio::test]
+    async fn blocks_range_clamps_count_to_max() {
+        let app = crate::build_api_router(store_with_block_at_slot_1());
+        // count=9999 >> MAX_RANGE_COUNT=1024; only one block exists at slot 1
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks?start_slot=0&count=9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Clamped to 1024 slots starting at 0; only slot 1 has a block.
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    /// Missing or non-numeric query params return JSON 400.
+    #[tokio::test]
+    async fn blocks_range_missing_params_returns_json_400() {
+        let app = crate::build_api_router(store_with_block_at_slot_1());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks?start_slot=&count=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].is_string(), "expected JSON error field");
+    }
+
+    /// `start_slot` beyond the length of `historical_block_hashes` returns an empty array.
+    #[tokio::test]
+    async fn blocks_range_start_slot_beyond_history_returns_empty() {
+        let app = crate::build_api_router(store_with_block_at_slot_1());
+        // historical_block_hashes has length 2 (slots 0-1); slot 999 is out of range.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks?start_slot=999&count=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0);
     }
 }
