@@ -138,7 +138,7 @@ We wrote a [blogpost](https://blog.lambdaclass.com/ethlambda-devnet-5-and-beyond
 
 Some features we are looking to implement in the near future, in order of priority:
 
-- Optimize block building
+- [Optimize block building](https://github.com/lambdaclass/ethlambda/issues/465)
 - Store the state-diff in the database
 - Prototype Goldfish + RLMD GHOST + BFT — devnet-6
 - Integrate with execution clients, in particular [ethrex](https://github.com/lambdaclass/ethrex) — devnet-7
