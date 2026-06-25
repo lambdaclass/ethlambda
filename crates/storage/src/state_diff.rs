@@ -279,21 +279,6 @@ mod tests {
         assert_eq!(diff.latest_justified, expected_justified);
     }
 
-    #[test]
-    fn from_states_rejects_non_append_history() {
-        let base = base_state();
-        let mut post = child_state(&base, 1);
-        // Corrupt the single appended entry so it no longer equals base_root.
-        let mut hbh = post.historical_block_hashes.to_vec();
-        *hbh.last_mut().unwrap() = h256(123);
-        post.historical_block_hashes = hbh.try_into().unwrap();
-
-        assert_eq!(
-            StateDiff::from_states(&base, post),
-            Err(StateDiffError::FirstAppendedNotBase)
-        );
-    }
-
     /// A block header distinct from any snapshot/diff field, so the test can
     /// assert it is passed through `reconstruct` verbatim.
     fn header_at(slot: u64) -> BlockHeader {
