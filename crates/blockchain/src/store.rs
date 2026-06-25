@@ -58,7 +58,9 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         .get_state(&new_head)
         .map(|state| state.latest_finalized)
         .filter(|finalized| store.get_block_header(&finalized.root).is_some());
-    store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
+    store
+        .update_checkpoints(ForkCheckpoints::new(new_head, None, finalized))
+        .expect("update_checkpoints should succeed");
 
     if old_head != new_head {
         let old_slot = store
@@ -119,7 +121,9 @@ fn update_safe_target(store: &mut Store) {
         &attestations,
         min_target_score,
     );
-    store.set_safe_target(safe_target);
+    store
+        .set_safe_target(safe_target)
+        .expect("set_safe_target should succeed");
 }
 
 /// Return whether `ancestor` lies on `descendant`'s parent chain.
@@ -263,11 +267,15 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // If we're more than a slot behind, fast-forward to a slot before.
     // Operations are idempotent, so this should be fine.
     if time.saturating_sub(store.time()) > INTERVALS_PER_SLOT {
-        store.set_time(time - INTERVALS_PER_SLOT);
+        store
+            .set_time(time - INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
     }
 
     while store.time() < time {
-        store.set_time(store.time() + 1);
+        store
+            .set_time(store.time() + 1)
+            .expect("set_time should succeed");
 
         let slot = store.time() / INTERVALS_PER_SLOT;
         let interval = store.time() % INTERVALS_PER_SLOT;
@@ -573,12 +581,18 @@ fn on_block_core(
         .then_some(post_state.latest_justified);
 
     if let Some(justified) = justified {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
+        store
+            .update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None))
+            .expect("update_checkpoints should succeed");
     }
 
     // Store signed block and state
-    store.insert_signed_block(block_root, signed_block.clone());
-    store.insert_state(block_root, post_state);
+    store
+        .insert_signed_block(block_root, signed_block.clone())
+        .expect("DB insert should succeed");
+    store
+        .insert_state(block_root, post_state)
+        .expect("DB insert should succeed");
 
     for att in block.body.attestations.iter() {
         // Count each participating validator as a valid attestation.
@@ -1246,7 +1260,9 @@ mod tests {
             },
             proof: make_signed_block_proof(0, vec![]),
         };
-        store.insert_signed_block(root, signed_block);
+        store
+            .insert_signed_block(root, signed_block)
+            .expect("insert test block should succeed");
     }
 
     fn new_test_store() -> Store {
@@ -1277,7 +1293,9 @@ mod tests {
         let head_justified = Checkpoint { root: a, slot: 1 };
         let mut head_state = State::from_genesis(1000, vec![]);
         head_state.latest_justified = head_justified;
-        store.insert_state(b, head_state);
+        store
+            .insert_state(b, head_state)
+            .expect("insert head state should succeed");
 
         // Store's global justified latched onto a higher, off-head checkpoint,
         // as it would after a minority fork justified a slot the head never saw.
@@ -1285,8 +1303,12 @@ mod tests {
             root: H256([9u8; 32]),
             slot: 5,
         };
-        store.update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None));
-        store.set_time(2 * INTERVALS_PER_SLOT);
+        store
+            .update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None))
+            .expect("update_checkpoints should succeed");
+        store
+            .set_time(2 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         let data = produce_attestation_data(&store, 2);
 
@@ -1315,7 +1337,9 @@ mod tests {
         insert_test_block(&mut store, base, 1, genesis);
         insert_test_block(&mut store, fork_left, 2, base);
         insert_test_block(&mut store, fork_right, 3, base);
-        store.set_time(3 * INTERVALS_PER_SLOT);
+        store
+            .set_time(3 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         // source=base, target=fork_left, head=fork_right: target and head share a
         // parent (base) but neither is an ancestor of the other.
@@ -1357,7 +1381,9 @@ mod tests {
         insert_test_block(&mut store, fork_left, 2, base);
         insert_test_block(&mut store, fork_right, 3, base);
         insert_test_block(&mut store, fork_right_head, 4, fork_right);
-        store.set_time(4 * INTERVALS_PER_SLOT);
+        store
+            .set_time(4 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         // source=fork_left (abandoned branch), target=head=fork_right_head:
         // source precedes target in slot but lies off the target's chain.
@@ -1398,7 +1424,9 @@ mod tests {
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
         insert_test_block(&mut store, b3, 3, b2);
-        store.set_time(3 * INTERVALS_PER_SLOT);
+        store
+            .set_time(3 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         // head=b3 at slot 3, but the vote's own slot is 2: it claims to have seen
         // a head that did not yet exist when the vote was cast.
@@ -1438,7 +1466,9 @@ mod tests {
         let b2 = H256([2u8; 32]);
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
-        store.set_time(2 * INTERVALS_PER_SLOT);
+        store
+            .set_time(2 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         // A crafted gossip vote with a near-`u64::MAX` slot. The head-consistency
         // check passes (slot >= head.slot), so this exercises the time check.
@@ -1469,7 +1499,9 @@ mod tests {
         let b2 = H256([2u8; 32]);
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
-        store.set_time(2 * INTERVALS_PER_SLOT);
+        store
+            .set_time(2 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
 
         let data = AttestationData {
             slot: 2,
