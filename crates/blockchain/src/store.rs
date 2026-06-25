@@ -757,7 +757,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// `block.body.attestations`. The proposer resolves `head_root` from
 /// [`Store::head`] at the previous slot's interval 4 (read-only); the build
 /// must not tick the store, which would advance the clock an interval early.
-pub(crate) fn produce_block_on_head(
+pub(crate) fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,

@@ -486,15 +486,19 @@ impl BlockChainServer {
 
         // Build the block on the interval-0 head.
         let _timing = metrics::time_block_building();
-        let (block, type_one_proofs, _post_checkpoints) =
-            match store::produce_block_on_head(&mut self.store, slot, validator_id, parent_root) {
-                Ok(built) => built,
-                Err(err) => {
-                    error!(%slot, %validator_id, %err, "Failed to build block");
-                    metrics::inc_block_building_failures();
-                    return;
-                }
-            };
+        let (block, type_one_proofs, _post_checkpoints) = match store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            parent_root,
+        ) {
+            Ok(built) => built,
+            Err(err) => {
+                error!(%slot, %validator_id, %err, "Failed to build block");
+                metrics::inc_block_building_failures();
+                return;
+            }
+        };
 
         coverage::emit_proposal_coverage(
             &self.store,
