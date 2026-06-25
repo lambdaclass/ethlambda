@@ -1254,7 +1254,7 @@ impl Store {
         // Memoize the post-state for fast reads, then move it into the diff so
         // its multi-MB justification fields are not cloned again.
         self.state_cache.lock().unwrap().put(root, state.clone());
-        let diff_bytes = StateDiff::from_states(parent_root, &parent_state, state).to_ssz();
+        let diff_bytes = StateDiff::from_states(&parent_state, state).to_ssz();
 
         let key = root.to_ssz();
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -1751,19 +1751,19 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        // Genesis snapshot at slot 0.
+        // Genesis snapshot at slot 0; its block root is its header's hash.
         let s0 = sample_state(0, H256::ZERO, vec![]);
-        let r0 = root(0);
+        let r0 = s0.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
-        // Child at slot 1: appends one historical root, sets a checkpoint.
-        let r1 = root(1);
+        // Child at slot 1 (parent r0): appends one historical root, sets a checkpoint.
         let mut s1 = sample_state(1, r0, vec![root(42)]);
         s1.latest_justified = Checkpoint {
             root: root(7),
             slot: 0,
         };
+        let r1 = s1.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r1, 1, r0);
         store.insert_state(r1, s1.clone()).expect("insert state");
 
@@ -1785,19 +1785,20 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        // Snapshot s0, then two chained diffs s1 -> s2.
+        // Snapshot s0, then two chained diffs s1 -> s2; each block root is the
+        // hash of its header, as in production.
         let s0 = sample_state(0, H256::ZERO, vec![]);
-        let r0 = root(0);
+        let r0 = s0.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
-        let r1 = root(1);
         let s1 = sample_state(1, r0, vec![root(42)]);
+        let r1 = s1.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r1, 1, r0);
         store.insert_state(r1, s1.clone()).expect("insert state");
 
-        let r2 = root(2);
         let s2 = sample_state(2, r1, vec![root(42), root(43)]);
+        let r2 = s2.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r2, 2, r1);
         store.insert_state(r2, s2.clone()).expect("insert state");
 

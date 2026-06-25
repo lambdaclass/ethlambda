@@ -15,7 +15,7 @@
 use ethlambda_types::{
     block::BlockHeader,
     checkpoint::Checkpoint,
-    primitives::H256,
+    primitives::{H256, HashTreeRoot},
     state::{
         HISTORICAL_ROOTS_LIMIT, JustificationRoots, JustificationValidators, JustifiedSlots, State,
     },
@@ -52,13 +52,18 @@ pub struct StateDiff {
 }
 
 impl StateDiff {
-    /// Build a diff from a base (parent) state and the consumed target state.
+    /// Build a diff from the pre-state (the parent block's post-state) and the
+    /// consumed post-state.
     ///
-    /// Takes `target` by value so its multi-MB justification fields are moved
-    /// into the diff rather than cloned; `base` is read only to find the length
-    /// of its `historical_block_hashes` (the diff stores just the tail `target`
-    /// appended on top). `base_root` is the parent block root the diff is
-    /// relative to.
+    /// Takes `post_state` by value so its multi-MB justification fields are moved
+    /// into the diff rather than cloned; `pre_state` is read to derive `base_root`
+    /// and the length of its `historical_block_hashes` (the diff stores just the
+    /// tail `post_state` appended on top).
+    ///
+    /// `base_root` is the parent block root, computed as the `hash_tree_root` of
+    /// the pre-state's `latest_block_header`. A `Block` and its `BlockHeader`
+    /// share a hash tree root (the header's `body_root` is the body's root), so
+    /// this equals the key under which the parent's snapshot/diff is stored.
     ///
     /// # Assumptions about how the base is modified into the target
     ///
@@ -87,10 +92,11 @@ impl StateDiff {
     ///
     /// # Panics
     ///
-    /// Panics if `target.historical_block_hashes` is shorter than the base's,
-    /// i.e. the append-only assumption above was violated.
-    pub fn from_states(base_root: H256, base: &State, target: State) -> Self {
-        let base_hbh_len = base.historical_block_hashes.len();
+    /// Panics if `post_state.historical_block_hashes` is shorter than the
+    /// pre-state's, i.e. the append-only assumption above was violated.
+    pub fn from_states(pre_state: &State, post_state: State) -> Self {
+        let base_root = pre_state.latest_block_header.hash_tree_root();
+        let base_hbh_len = pre_state.historical_block_hashes.len();
         let State {
             slot,
             latest_justified,
@@ -100,7 +106,7 @@ impl StateDiff {
             justifications_roots,
             justifications_validators,
             ..
-        } = target;
+        } = post_state;
 
         let hbh = historical_block_hashes.into_inner();
         assert!(
@@ -209,9 +215,9 @@ mod tests {
         hbh.extend([h256(9), H256::ZERO, H256::ZERO]);
         target.historical_block_hashes = hbh.try_into().unwrap();
 
-        let diff = StateDiff::from_states(h256(1), &base, target);
+        let diff = StateDiff::from_states(&base, target);
 
-        assert_eq!(diff.base_root, h256(1));
+        assert_eq!(diff.base_root, base.latest_block_header.hash_tree_root());
         assert_eq!(diff.slot, 5);
         assert_eq!(diff.latest_justified, expected_justified);
         assert_eq!(diff.hbh_appended.len(), 3);
