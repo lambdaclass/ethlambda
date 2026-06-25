@@ -736,7 +736,10 @@ async fn fetch_initial_state(
     let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
-    store.insert_signed_block(anchor_root, signed_block);
+    store
+        .insert_signed_block(anchor_root, signed_block)
+        .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))
+        .map_err(|_| checkpoint_sync::CheckpointSyncError::StoreInsertSignedBlock)?;
     Ok(store)
 }
 
