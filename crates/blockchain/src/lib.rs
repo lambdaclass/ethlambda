@@ -499,7 +499,7 @@ impl BlockChainServer {
             block.body.attestations.iter(),
         );
 
-        // Sign the block root with the proposal key.
+        // Sign the block root with the proposal key
         let block_root = block.hash_tree_root();
         let Ok(proposer_signature) = self
             .key_manager
