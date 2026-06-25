@@ -783,8 +783,7 @@ pub fn produce_block_with_signatures(
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
-        })?
-        .clone();
+        })?;
 
     // Validate proposer authorization for this slot
     let num_validators = head_state.validators.len() as u64;
