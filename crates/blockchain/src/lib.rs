@@ -398,6 +398,64 @@ impl BlockChainServer {
         });
     }
 
+    /// Returns the validator ID if any of our validators is the proposer for this slot.
+    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
+        let head_state = self.store.head_state();
+        let num_validators = head_state.validators.len() as u64;
+
+        self.key_manager
+            .validator_ids()
+            .into_iter()
+            .find(|&vid| is_proposer(vid, slot, num_validators))
+    }
+
+    fn produce_attestations(&mut self, slot: u64, is_aggregator: bool) {
+        let _timing = metrics::time_attestations_production();
+
+        // Produce attestation data once for all validators
+        let attestation_data = store::produce_attestation_data(&self.store, slot);
+
+        // For each registered validator, produce and publish attestation
+        for validator_id in self.key_manager.validator_ids() {
+            // Sign the attestation
+            let Ok(signature) = self
+                .key_manager
+                .sign_attestation(validator_id, &attestation_data)
+                .inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
+                )
+            else {
+                continue;
+            };
+
+            // Create signed attestation
+            let signed_attestation = SignedAttestation {
+                validator_id,
+                data: attestation_data.clone(),
+                signature,
+            };
+
+            // Self-deliver: store our own attestation locally for aggregation.
+            // Gossipsub does not deliver messages back to the sender, so without
+            // this the aggregator never sees its own validator's signature in
+            // gossip_signatures and it is excluded from aggregated proofs.
+            if is_aggregator {
+                let _ = store::on_gossip_attestation(&mut self.store, &signed_attestation, true)
+                    .inspect_err(|err| {
+                        warn!(%slot, %validator_id, %err, "Self-delivery of attestation failed")
+                    });
+            }
+
+            // Publish to gossip network
+            if let Some(ref p2p) = self.p2p {
+                let _ = p2p.publish_attestation(signed_attestation).inspect_err(
+                    |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
+                );
+                info!(%slot, %validator_id, "Published attestation");
+            }
+        }
+    }
+
     /// Build the target slot's block and publish it, one interval early.
     ///
     /// Runs at the previous slot's interval 4, blocking the actor for the build
@@ -566,64 +624,6 @@ impl BlockChainServer {
         }
 
         self.process_and_publish_block(slot, validator_id, signed_block);
-    }
-
-    /// Returns the validator ID if any of our validators is the proposer for this slot.
-    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = self.store.head_state();
-        let num_validators = head_state.validators.len() as u64;
-
-        self.key_manager
-            .validator_ids()
-            .into_iter()
-            .find(|&vid| is_proposer(vid, slot, num_validators))
-    }
-
-    fn produce_attestations(&mut self, slot: u64, is_aggregator: bool) {
-        let _timing = metrics::time_attestations_production();
-
-        // Produce attestation data once for all validators
-        let attestation_data = store::produce_attestation_data(&self.store, slot);
-
-        // For each registered validator, produce and publish attestation
-        for validator_id in self.key_manager.validator_ids() {
-            // Sign the attestation
-            let Ok(signature) = self
-                .key_manager
-                .sign_attestation(validator_id, &attestation_data)
-                .inspect_err(
-                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
-                )
-            else {
-                continue;
-            };
-
-            // Create signed attestation
-            let signed_attestation = SignedAttestation {
-                validator_id,
-                data: attestation_data.clone(),
-                signature,
-            };
-
-            // Self-deliver: store our own attestation locally for aggregation.
-            // Gossipsub does not deliver messages back to the sender, so without
-            // this the aggregator never sees its own validator's signature in
-            // gossip_signatures and it is excluded from aggregated proofs.
-            if is_aggregator {
-                let _ = store::on_gossip_attestation(&mut self.store, &signed_attestation, true)
-                    .inspect_err(|err| {
-                        warn!(%slot, %validator_id, %err, "Self-delivery of attestation failed")
-                    });
-            }
-
-            // Publish to gossip network
-            if let Some(ref p2p) = self.p2p {
-                let _ = p2p.publish_attestation(signed_attestation).inspect_err(
-                    |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
-                );
-                info!(%slot, %validator_id, "Published attestation");
-            }
-        }
     }
 
     /// Import a freshly built block locally, then publish it to gossip. On
