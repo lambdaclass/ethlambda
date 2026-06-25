@@ -1265,13 +1265,20 @@ mod tests {
 
         // Head state justified `a` (slot 1), which lies on the head's chain.
         let head_justified = Checkpoint { root: a, slot: 1 };
-        let mut head_state = State::from_genesis(1000, vec![]);
+        // Persist `b`'s post-state via the diff API, diffed against the genesis
+        // anchor. Build it as a valid direct child of genesis (the STF appends the
+        // parent block root to historical_block_hashes), with the head's justified
+        // checkpoint set; `insert_state` reads the base from
+        // `latest_block_header.parent_root`, and `get_state(b)` then returns it
+        // from the cache.
+        let genesis_state = store.get_state(&genesis).expect("genesis state");
+        let mut head_state = genesis_state.clone();
+        head_state.slot = genesis_state.slot + 1;
         head_state.latest_justified = head_justified;
-        // Persist `b`'s post-state via the diff API. `insert_state` reads the base
-        // to diff against from the post-state's own `latest_block_header.parent_root`;
-        // point it at the genesis anchor already in the store, so `get_state(b)`
-        // resolves via the cache or by replaying this diff onto the genesis snapshot.
         head_state.latest_block_header.parent_root = genesis;
+        let mut hbh = genesis_state.historical_block_hashes.to_vec();
+        hbh.push(genesis);
+        head_state.historical_block_hashes = hbh.try_into().expect("within limit");
         store
             .insert_state(b, head_state)
             .expect("insert head state should succeed");

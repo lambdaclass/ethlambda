@@ -1757,8 +1757,8 @@ mod tests {
         insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
-        // Child at slot 1 (parent r0): appends one historical root, sets a checkpoint.
-        let mut s1 = sample_state(1, r0, vec![root(42)]);
+        // Child at slot 1 (parent r0): appends r0 (slot 0's block root), sets a checkpoint.
+        let mut s1 = sample_state(1, r0, vec![r0]);
         s1.latest_justified = Checkpoint {
             root: root(7),
             slot: 0,
@@ -1792,12 +1792,12 @@ mod tests {
         insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
-        let s1 = sample_state(1, r0, vec![root(42)]);
+        let s1 = sample_state(1, r0, vec![r0]);
         let r1 = s1.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r1, 1, r0);
         store.insert_state(r1, s1.clone()).expect("insert state");
 
-        let s2 = sample_state(2, r1, vec![root(42), root(43)]);
+        let s2 = sample_state(2, r1, vec![r0, r1]);
         let r2 = s2.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r2, 2, r1);
         store.insert_state(r2, s2.clone()).expect("insert state");
@@ -1817,20 +1817,20 @@ mod tests {
         let mut store = Store::test_store_with_backend(backend.clone());
 
         let s0 = sample_state(SNAPSHOT_ANCHOR_INTERVAL - 1, H256::ZERO, vec![]);
-        let r0 = root(0);
+        let r0 = s0.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r0, s0.slot, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
         // Crossing the interval boundary records an anchor.
-        let r1 = root(1);
-        let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, r0, vec![root(42)]);
+        let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, r0, vec![r0]);
+        let r1 = s1.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r1, s1.slot, r0);
         store.insert_state(r1, s1.clone()).expect("insert state");
         assert!(has_key(backend.as_ref(), Table::States, &r1));
 
         // A non-crossing child does not.
-        let r2 = root(2);
-        let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, r1, vec![root(42), root(43)]);
+        let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, r1, vec![r0, r1]);
+        let r2 = s2.latest_block_header.hash_tree_root();
         insert_header(backend.as_ref(), r2, s2.slot, r1);
         store.insert_state(r2, s2.clone()).expect("insert state");
         assert!(!has_key(backend.as_ref(), Table::States, &r2));
