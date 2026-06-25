@@ -312,14 +312,16 @@ mod tests {
     fn select_skips_target_at_or_below_justified() {
         let mut store = empty_store();
         // Justified at slot 5; an attestation with target.slot = 5 must be skipped.
-        store.update_checkpoints(ethlambda_storage::ForkCheckpoints::new(
-            store.head(),
-            Some(Checkpoint {
-                root: H256::ZERO,
-                slot: 5,
-            }),
-            None,
-        ));
+        store
+            .update_checkpoints(ethlambda_storage::ForkCheckpoints::new(
+                store.head(),
+                Some(Checkpoint {
+                    root: H256::ZERO,
+                    slot: 5,
+                }),
+                None,
+            ))
+            .expect("update_checkpoints should succeed");
         let candidates = select_candidates(&store, &[make_att(6, 5, &[0, 1])]);
         assert!(candidates.is_empty());
     }
