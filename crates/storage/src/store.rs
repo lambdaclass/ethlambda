@@ -736,12 +736,13 @@ impl Store {
         T::from_ssz_bytes(&bytes).expect("valid encoding")
     }
 
-    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
+    fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
             .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
             .expect("put metadata");
         batch.commit().expect("commit");
+        Ok(())
     }
 
     // ============ Time ============
@@ -756,8 +757,8 @@ impl Store {
     }
 
     /// Sets the current store time.
-    pub fn set_time(&mut self, time: u64) {
-        self.set_metadata(KEY_TIME, &time);
+    pub fn set_time(&mut self, time: u64) -> Result<(), Error> {
+        self.set_metadata(KEY_TIME, &time)
     }
 
     // ============ Config ============
@@ -782,8 +783,8 @@ impl Store {
     }
 
     /// Sets the safe target block root.
-    pub fn set_safe_target(&mut self, safe_target: H256) {
-        self.set_metadata(KEY_SAFE_TARGET, &safe_target);
+    pub fn set_safe_target(&mut self, safe_target: H256) -> Result<(), Error> {
+        self.set_metadata(KEY_SAFE_TARGET, &safe_target)
     }
 
     // ============ Checkpoints ============
@@ -807,7 +808,7 @@ impl Store {
     /// - Finalized is updated if provided.
     ///
     /// When finalization advances, prunes the LiveChain index.
-    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
+    pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) -> Result<(), Error> {
         // Read old finalized slot before updating metadata
         let old_finalized_slot = self.latest_finalized().slot;
 
@@ -832,8 +833,11 @@ impl Store {
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self.prune_live_chain(finalized.slot);
+            let pruned_chain = self
+                .prune_live_chain(finalized.slot)
+                .expect("prune live chain");
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
             if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
@@ -843,6 +847,7 @@ impl Store {
                 );
             }
         }
+        Ok(())
     }
 
     /// Bound storage by evicting old state snapshots and finalized signatures.
@@ -860,7 +865,9 @@ impl Store {
         let tip_slot = self
             .get_block_header(&self.head())
             .map_or(finalized_slot, |header| header.slot);
-        let pruned_signatures = self.prune_old_block_signatures(finalized_slot, tip_slot);
+        let pruned_signatures = self
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune old block signatures");
         if pruned_signatures > 0 {
             info!(pruned_signatures, "Pruned old finalized block signatures");
         }
@@ -916,7 +923,7 @@ impl Store {
     /// LiveChain index is pruned.
     ///
     /// Returns the number of entries pruned.
-    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> usize {
+    pub fn prune_live_chain(&mut self, finalized_slot: u64) -> Result<usize, Error> {
         let view = self.backend.begin_read().expect("read view");
 
         // Collect keys to delete - stop once we hit finalized_slot
@@ -935,7 +942,7 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -943,7 +950,7 @@ impl Store {
             .delete_batch(Table::LiveChain, keys_to_delete)
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
-        count
+        Ok(count)
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
@@ -982,12 +989,16 @@ impl Store {
     /// safety, or re-aggregation once outside the window.
     ///
     /// Returns the number of signatures pruned.
-    pub fn prune_old_block_signatures(&mut self, finalized_slot: u64, tip_slot: u64) -> usize {
+    pub fn prune_old_block_signatures(
+        &mut self,
+        finalized_slot: u64,
+        tip_slot: u64,
+    ) -> Result<usize, Error> {
         let cutoff = tip_slot.saturating_sub(SIGNATURE_PRUNING_RANGE);
         // Only prune when the whole window is finalized; never touch
         // non-finalized signatures.
         if cutoff > finalized_slot {
-            return 0;
+            return Ok(0);
         }
 
         let view = self.backend.begin_read().expect("read view");
@@ -1011,7 +1022,7 @@ impl Store {
                 .expect("delete finalized block signatures");
             batch.commit().expect("commit");
         }
-        count
+        Ok(count)
     }
 
     /// Get the block header by root.
@@ -1030,10 +1041,15 @@ impl Store {
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
-    pub fn insert_pending_block(&mut self, root: H256, signed_block: SignedBlock) {
+    pub fn insert_pending_block(
+        &mut self,
+        root: H256,
+        signed_block: SignedBlock,
+    ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Insert a signed block, storing the block and signatures separately.
@@ -1043,7 +1059,11 @@ impl Store {
     /// only storing signatures for non-genesis blocks.
     ///
     /// Takes ownership to avoid cloning large signature data.
-    pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) {
+    pub fn insert_signed_block(
+        &mut self,
+        root: H256,
+        signed_block: SignedBlock,
+    ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
         let block = write_signed_block(batch.as_mut(), &root, signed_block);
 
@@ -1056,6 +1076,7 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Get a block (header + body, no signatures) by root.
@@ -1210,7 +1231,12 @@ impl Store {
     /// `base` describes the parent state the diff is built against (see
     /// [`DiffBase`]); its fields are captured before the parent is consumed into
     /// `state`.
-    pub fn insert_state_with_diff(&mut self, root: H256, base: DiffBase, state: State) {
+    pub fn insert_state_with_diff(
+        &mut self,
+        root: H256,
+        base: DiffBase,
+        state: State,
+    ) -> Result<(), Error> {
         let slot = state.slot;
         let is_anchor = slot / SNAPSHOT_ANCHOR_INTERVAL > base.slot / SNAPSHOT_ANCHOR_INTERVAL;
 
@@ -1232,6 +1258,7 @@ impl Store {
                 .expect("put state snapshot");
         }
         batch.commit().expect("commit");
+        Ok(())
     }
 
     // ============ Attestation Extraction ============
@@ -1628,7 +1655,9 @@ mod tests {
         // tip = range + 10, finalized = range + 5, so cutoff = tip - range = 10.
         let tip_slot = SIGNATURE_PRUNING_RANGE + 10;
         let finalized_slot = SIGNATURE_PRUNING_RANGE + 5;
-        let pruned = store.prune_old_block_signatures(finalized_slot, tip_slot);
+        let pruned = store
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune");
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
@@ -1657,7 +1686,9 @@ mod tests {
         // cutoff = tip - range > finalized → prune nothing.
         let tip_slot = SIGNATURE_PRUNING_RANGE + 100;
         let finalized_slot = 5;
-        let pruned = store.prune_old_block_signatures(finalized_slot, tip_slot);
+        let pruned = store
+            .prune_old_block_signatures(finalized_slot, tip_slot)
+            .expect("prune");
         assert_eq!(pruned, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
     }
@@ -1673,7 +1704,7 @@ mod tests {
 
         // Early chain: tip < SIGNATURE_PRUNING_RANGE → cutoff saturates to 0,
         // so nothing is old enough to prune even though slots are finalized.
-        let pruned = store.prune_old_block_signatures(9, 9);
+        let pruned = store.prune_old_block_signatures(9, 9).expect("prune");
         assert_eq!(pruned, 0);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
     }
@@ -1728,7 +1759,9 @@ mod tests {
         };
         insert_header(backend.as_ref(), r1, 1);
         let base = DiffBase::from_state(r0, &s0);
-        store.insert_state_with_diff(r1, base, s1.clone());
+        store
+            .insert_state_with_diff(r1, base, s1.clone())
+            .expect("insert state");
 
         // Not an anchor, so no snapshot was written; only the diff.
         assert!(!has_key(backend.as_ref(), Table::States, &r1));
@@ -1758,13 +1791,17 @@ mod tests {
         let s1 = sample_state(1, vec![root(42)]);
         insert_header(backend.as_ref(), r1, 1);
         let base = DiffBase::from_state(r0, &s0);
-        store.insert_state_with_diff(r1, base, s1.clone());
+        store
+            .insert_state_with_diff(r1, base, s1.clone())
+            .expect("insert state");
 
         let r2 = root(2);
         let s2 = sample_state(2, vec![root(42), root(43)]);
         insert_header(backend.as_ref(), r2, 2);
         let base = DiffBase::from_state(r1, &s1);
-        store.insert_state_with_diff(r2, base, s2.clone());
+        store
+            .insert_state_with_diff(r2, base, s2.clone())
+            .expect("insert state");
 
         // Neither child is an anchor, so a cold store reconstructs s2 by walking
         // the diff chain back to the s0 snapshot.
@@ -1790,7 +1827,9 @@ mod tests {
         let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, vec![root(42)]);
         insert_header(backend.as_ref(), r1, s1.slot);
         let base = DiffBase::from_state(r0, &s0);
-        store.insert_state_with_diff(r1, base, s1.clone());
+        store
+            .insert_state_with_diff(r1, base, s1.clone())
+            .expect("insert state");
         assert!(has_key(backend.as_ref(), Table::States, &r1));
 
         // A non-crossing child does not.
@@ -1798,7 +1837,9 @@ mod tests {
         let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, vec![root(42), root(43)]);
         insert_header(backend.as_ref(), r2, s2.slot);
         let base = DiffBase::from_state(r1, &s1);
-        store.insert_state_with_diff(r2, base, s2.clone());
+        store
+            .insert_state_with_diff(r2, base, s2.clone())
+            .expect("insert state");
         assert!(!has_key(backend.as_ref(), Table::States, &r2));
     }
 

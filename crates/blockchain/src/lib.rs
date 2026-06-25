@@ -681,7 +681,9 @@ impl BlockChainServer {
             self.pending_block_parents.insert(block_root, missing_root);
 
             // Persist block data to DB (no LiveChain entry — invisible to fork choice)
-            self.store.insert_pending_block(block_root, signed_block);
+            self.store
+                .insert_pending_block(block_root, signed_block)
+                .expect("DB insert should succeed");
 
             // Store only the H256 reference in memory
             self.pending_blocks
