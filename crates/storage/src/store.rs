@@ -1254,7 +1254,9 @@ impl Store {
         // Memoize the post-state for fast reads, then move it into the diff so
         // its multi-MB justification fields are not cloned again.
         self.state_cache.lock().unwrap().put(root, state.clone());
-        let diff_bytes = StateDiff::from_states(&parent_state, state).to_ssz();
+        let diff_bytes = StateDiff::from_states(&parent_state, state)
+            .expect("state transition produced a non-append historical_block_hashes")
+            .to_ssz();
 
         let key = root.to_ssz();
         let mut batch = self.backend.begin_write().expect("write batch");

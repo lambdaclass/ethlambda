@@ -43,6 +43,32 @@ pub struct StateDiff {
     pub justifications_validators: JustificationValidators,
 }
 
+/// Why a post-state could not be reduced to a [`StateDiff`].
+///
+/// Every variant means the state transition mutated `historical_block_hashes`
+/// in a way the diff layer does not model: the diff stores no history and
+/// [`reconstruct`] regenerates the append from `base_root` plus the slot gap, so
+/// a mismatch here would corrupt later reads. These are state-transition
+/// invariants, not recoverable conditions, so the production caller `expect`s on
+/// them.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StateDiffError {
+    /// The post-state's history is shorter than the pre-state's: the STF removed
+    /// entries instead of appending.
+    #[error("post-state historical_block_hashes ({actual}) is shorter than pre-state ({base})")]
+    HistoryShrank { actual: usize, base: usize },
+    /// The number of appended entries does not equal the slot gap (one entry per
+    /// slot from the parent exclusive to the target inclusive).
+    #[error("appended historical_block_hashes length ({appended}) does not match slot gap ({gap})")]
+    AppendLengthMismatch { appended: usize, gap: usize },
+    /// The first appended entry is not the base (parent) block root.
+    #[error("first appended historical_block_hash is not the base (parent) root")]
+    FirstAppendedNotBase,
+    /// A skipped-slot entry is non-zero (skipped slots must be zero-filled).
+    #[error("skipped-slot historical_block_hashes are not zero-filled")]
+    SkippedSlotsNotZero,
+}
+
 impl StateDiff {
     /// Build a diff from the pre-state (the parent block's post-state) and the
     /// consumed post-state.
@@ -72,8 +98,9 @@ impl StateDiff {
     ///   root, then one zero per skipped slot.** (`process_block` pushes the
     ///   parent root and zero-fills skipped slots, leaving the existing prefix
     ///   intact.) Nothing is stored for it: `reconstruct` regenerates the tail
-    ///   from `base_root` and the slot gap. This function asserts the invariant,
-    ///   so a future STF that broke it fails loudly instead of corrupting reads.
+    ///   from `base_root` and the slot gap. This function validates the invariant
+    ///   and returns a [`StateDiffError`] if a future STF breaks it, instead of
+    ///   corrupting reads.
     /// - **`latest_block_header` is not stored here.** It is read back from the
     ///   `BlockHeaders` table during reconstruction; the persisted post-state
     ///   caches the real `state_root` there, so the two are byte-identical.
@@ -82,13 +109,14 @@ impl StateDiff {
     /// justification fields) are captured verbatim, so the diff makes no
     /// assumption about how those change.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the `historical_block_hashes` append does not match the
-    /// assumption above: a length that disagrees with the slot gap, a first
-    /// appended entry other than `base_root`, or a non-zero entry for a skipped
-    /// slot.
-    pub fn from_states(pre_state: &State, post_state: State) -> Self {
+    /// Returns [`StateDiffError`] if the `historical_block_hashes` append does
+    /// not match the assumption above: a length that disagrees with the slot
+    /// gap, a first appended entry other than `base_root`, or a non-zero entry
+    /// for a skipped slot. These are state-transition invariants, so the
+    /// production caller treats a failure as a bug and `expect`s on it.
+    pub fn from_states(pre_state: &State, post_state: State) -> Result<Self, StateDiffError> {
         let base_root = pre_state.latest_block_header.hash_tree_root();
         let base_hbh_len = pre_state.historical_block_hashes.len();
         let State {
@@ -103,31 +131,14 @@ impl StateDiff {
         } = post_state;
 
         // The diff stores no historical_block_hashes; reconstruct regenerates the
-        // appended tail from base_root and the slot gap. Assert the append matched
-        // that shape so a future STF that broke it fails here, not silently later.
+        // appended tail from base_root and the slot gap. Validate the append
+        // matched that shape so a future STF that broke it fails here, not
+        // silently later.
         let hbh = historical_block_hashes.into_inner();
-        assert!(
-            hbh.len() >= base_hbh_len,
-            "post-state historical_block_hashes shorter than pre-state: {} < {base_hbh_len}",
-            hbh.len()
-        );
-        let appended = &hbh[base_hbh_len..];
-        assert_eq!(
-            appended.len(),
-            (slot - pre_state.slot) as usize,
-            "appended historical_block_hashes length does not match the slot gap"
-        );
-        assert_eq!(
-            appended.first().copied(),
-            Some(base_root),
-            "first appended historical_block_hash is not the base (parent) root"
-        );
-        assert!(
-            appended[1..].iter().all(|h| *h == H256::ZERO),
-            "skipped-slot historical_block_hashes are not zero-filled"
-        );
+        let slot_gap = (slot - pre_state.slot) as usize;
+        validate_history_append(&hbh, base_hbh_len, base_root, slot_gap)?;
 
-        Self {
+        Ok(Self {
             base_root,
             slot,
             latest_justified,
@@ -135,8 +146,41 @@ impl StateDiff {
             justified_slots,
             justifications_roots,
             justifications_validators,
-        }
+        })
     }
+}
+
+/// Validate that the post-state's `historical_block_hashes` extends the
+/// pre-state's by exactly the tail the STF appends: the base (parent) block
+/// root, then one zero per skipped slot. This is the invariant that lets a diff
+/// store no history (see [`StateDiff::from_states`]); `reconstruct` relies on it
+/// to regenerate the tail from `base_root` and the slot gap.
+fn validate_history_append(
+    hbh: &[H256],
+    base_hbh_len: usize,
+    base_root: H256,
+    slot_gap: usize,
+) -> Result<(), StateDiffError> {
+    if hbh.len() < base_hbh_len {
+        return Err(StateDiffError::HistoryShrank {
+            actual: hbh.len(),
+            base: base_hbh_len,
+        });
+    }
+    let appended = &hbh[base_hbh_len..];
+    if appended.len() != slot_gap {
+        return Err(StateDiffError::AppendLengthMismatch {
+            appended: appended.len(),
+            gap: slot_gap,
+        });
+    }
+    if appended.first().copied() != Some(base_root) {
+        return Err(StateDiffError::FirstAppendedNotBase);
+    }
+    if !appended[1..].iter().all(|h| *h == H256::ZERO) {
+        return Err(StateDiffError::SkippedSlotsNotZero);
+    }
+    Ok(())
 }
 
 /// Rebuild a state from a base snapshot and the diffs leading to the target.
@@ -228,7 +272,7 @@ mod tests {
         };
         post.latest_justified = expected_justified;
 
-        let diff = StateDiff::from_states(&base, post);
+        let diff = StateDiff::from_states(&base, post).expect("valid append");
 
         assert_eq!(diff.base_root, base.latest_block_header.hash_tree_root());
         assert_eq!(diff.slot, 5);
@@ -236,7 +280,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "first appended historical_block_hash")]
     fn from_states_rejects_non_append_history() {
         let base = base_state();
         let mut post = child_state(&base, 1);
@@ -245,7 +288,10 @@ mod tests {
         *hbh.last_mut().unwrap() = h256(123);
         post.historical_block_hashes = hbh.try_into().unwrap();
 
-        let _ = StateDiff::from_states(&base, post);
+        assert_eq!(
+            StateDiff::from_states(&base, post),
+            Err(StateDiffError::FirstAppendedNotBase)
+        );
     }
 
     /// A block header distinct from any snapshot/diff field, so the test can
@@ -313,8 +359,8 @@ mod tests {
         s2.justifications_validators = JustificationValidators::try_from(vec![true]).unwrap();
 
         // Diffs are built the production way, from each (pre, post) pair.
-        let diff1 = StateDiff::from_states(&snapshot, s1.clone());
-        let diff2 = StateDiff::from_states(&s1, s2.clone());
+        let diff1 = StateDiff::from_states(&snapshot, s1.clone()).expect("valid append");
+        let diff2 = StateDiff::from_states(&s1, s2.clone()).expect("valid append");
 
         let reconstructed = reconstruct(snapshot, &[diff1, diff2], s2.latest_block_header.clone());
 
@@ -336,7 +382,7 @@ mod tests {
             slot: 7,
         };
 
-        let diff = StateDiff::from_states(&snapshot, child.clone());
+        let diff = StateDiff::from_states(&snapshot, child.clone()).expect("valid append");
         let reconstructed = reconstruct(snapshot, &[diff], child.latest_block_header.clone());
 
         assert_eq!(reconstructed.to_ssz(), child.to_ssz());
