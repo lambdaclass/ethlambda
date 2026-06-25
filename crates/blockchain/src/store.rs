@@ -18,7 +18,7 @@ use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     block_builder::{PostBlockCheckpoints, build_block},
     metrics,
 };
@@ -750,25 +750,41 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     }
 }
 
-/// Produce a block and per-aggregated-attestation signature payloads on top of
-/// `head_root`, without moving the store clock.
+/// Get the head for block proposal at the given slot.
 ///
-/// Returns the block and attestation signature payloads aligned with
-/// `block.body.attestations`. The proposer resolves `head_root` from
-/// [`Store::head`] at the previous slot's interval 4 (read-only); the build
-/// must not tick the store, which would advance the clock an interval early.
-pub(crate) fn produce_block_with_signatures(
+/// Ensures store is up-to-date and processes any pending attestations
+/// before returning the canonical head.
+fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
+    // Calculate time corresponding to this slot
+    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+
+    // Advance time to current slot (ticking intervals)
+    on_tick(store, slot_time_ms, true);
+
+    // Process any pending attestations before proposal
+    accept_new_attestations(store, false);
+
+    store.head()
+}
+
+/// Produce a block and per-aggregated-attestation signature payloads for the target slot.
+///
+/// Returns the finalized block and attestation signature payloads aligned
+/// with `block.body.attestations`.
+pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
-    head_root: H256,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+    // Get parent block and state to build upon
+    let head_root = get_proposal_head(store, slot);
     let head_state = store
         .get_state(&head_root)
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
-        })?;
+        })?
+        .clone();
 
     // Validate proposer authorization for this slot
     let num_validators = head_state.validators.len() as u64;

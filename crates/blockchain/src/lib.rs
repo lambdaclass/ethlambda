@@ -474,31 +474,24 @@ impl BlockChainServer {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
         let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
 
-        // Advance the store to this slot's interval 0 — one interval ahead of the
-        // interval-4 tick we are running in — accepting attestations exactly as
-        // the real interval-0 tick would, so the block is built on the interval-0
-        // state rather than the previous slot's end state. Building early is safe
-        // because we publish below (nothing is stashed for a later tick), and the
-        // real interval-0 tick is then skipped by the idempotency guard in
-        // `on_tick`, since the store clock is already here.
-        store::on_tick(&mut self.store, slot_start_ms, true);
-        let parent_root = self.store.head();
-
-        // Build the block on the interval-0 head.
+        // Build the block. `produce_block_with_signatures` advances the store to
+        // this slot's interval 0 (accepting attestations) before building — one
+        // interval ahead of the interval-4 tick we are running in — so the block
+        // is built on the interval-0 state rather than the previous slot's end
+        // state. Building early is safe because we publish below (nothing is
+        // stashed for a later tick), and the real interval-0 tick is then skipped
+        // by the idempotency guard in `on_tick`, since the store clock is already
+        // here.
         let _timing = metrics::time_block_building();
-        let (block, type_one_proofs, _post_checkpoints) = match store::produce_block_with_signatures(
-            &mut self.store,
-            slot,
-            validator_id,
-            parent_root,
-        ) {
-            Ok(built) => built,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to build block");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
+        let (block, type_one_proofs, _post_checkpoints) =
+            match store::produce_block_with_signatures(&mut self.store, slot, validator_id) {
+                Ok(built) => built,
+                Err(err) => {
+                    error!(%slot, %validator_id, %err, "Failed to build block");
+                    metrics::inc_block_building_failures();
+                    return;
+                }
+            };
 
         coverage::emit_proposal_coverage(
             &self.store,
