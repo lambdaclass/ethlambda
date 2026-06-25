@@ -366,23 +366,32 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
   finalized boundary, signatures are pruned (`prune_old_block_signatures`) while
   headers and bodies are kept forever. `get_signed_block` returns `None` for a
   pruned finalized block
+- States are stored as parent-linked diffs (`StateDiffs`, never pruned) plus
+  full-state snapshots (`States`) written only at 1024-slot anchors (and the
+  bootstrap). Neither is ever pruned. `get_state` returns an anchor snapshot or
+  reconstructs by walking diffs back to the nearest anchor; results are memoized
+  in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (10)
+### Storage Tables (7)
+
+These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
 
 | Table | Key → Value | Purpose |
 |-------|-------------|---------|
 | `BlockHeaders` | H256 → BlockHeader | Block headers by root |
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
-| `BlockSignatures` | H256 → BlockSignatures | Signatures (absent for genesis) |
-| `States` | H256 → State | Beacon states by root |
-| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
-| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
-| `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
-| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
+| `BlockSignatures` | (slot\|\|root) → BlockSignatures | Type-2 proof blob; keyed slot\|\|root so pruning scans in slot order and stops early; absent for genesis, pruned below finalized |
+| `States` | H256 → State | Full-state snapshots; bootstrap + 1024-slot anchors only; never pruned |
+| `StateDiffs` | H256 → StateDiff | Parent-linked state diff per non-genesis state; never pruned |
 | `Metadata` | string → various | Store state (head, config, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
+
+Attestations and gossip signatures are **not** persisted tables; they live in
+in-memory `Store` buffers (`new_payloads`, `known_payloads`, `gossip_signatures`)
+and are consumed during the tick pipeline (promotion at intervals 0/4,
+aggregation at interval 2).
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition
