@@ -5,5 +5,4 @@ mod state_diff;
 mod store;
 
 pub use api::{ALL_TABLES, StorageBackend, StorageReadView, StorageWriteBatch, Table};
-pub use state_diff::DiffBase;
 pub use store::{ForkCheckpoints, GetForkchoiceStoreError, MAX_RESUMABLE_DB_STATE_AGE, Store};

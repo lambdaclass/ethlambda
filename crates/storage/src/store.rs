@@ -19,7 +19,7 @@ use ethlambda_types::{
 };
 use libssz::{SszDecode, SszEncode};
 
-use crate::state_diff::{DiffBase, StateDiff};
+use crate::state_diff::StateDiff;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -857,9 +857,7 @@ impl Store {
     /// of finalized blocks older than the pruning window are removed.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
-    /// pruning until after a batch of blocks has been fully processed. Running
-    /// this mid-cascade would delete snapshots that pending children still need,
-    /// causing infinite re-processing loops when fallback pruning is active.
+    /// pruning until after a batch of blocks has been fully processed.
     pub fn prune_old_data(&mut self) {
         let finalized_slot = self.latest_finalized().slot;
         let tip_slot = self
@@ -1228,24 +1226,33 @@ impl Store {
     /// also inserted into the in-memory cache so the immediate next read (e.g. as
     /// a child block's parent state) is hot without reconstruction.
     ///
-    /// `base` describes the parent state the diff is built against (see
-    /// [`DiffBase`]); its fields are captured before the parent is consumed into
-    /// `state`.
-    pub fn insert_state_with_diff(
-        &mut self,
-        root: H256,
-        base: DiffBase,
-        state: State,
-    ) -> Result<(), Error> {
-        let slot = state.slot;
-        let is_anchor = slot / SNAPSHOT_ANCHOR_INTERVAL > base.slot / SNAPSHOT_ANCHOR_INTERVAL;
+    /// The diff is built against the parent state, identified by the post-state's
+    /// own `latest_block_header.parent_root` (the state transition sets it to the
+    /// block's parent) and fetched via [`get_state`](Self::get_state). The parent
+    /// was persisted when its own block was imported, so this read is normally a
+    /// cache hit; a cold cache falls back to a snapshot read or a diff-chain
+    /// reconstruction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no state exists for the parent root: a child state can only be
+    /// inserted after its parent's state has been persisted.
+    pub fn insert_state(&mut self, root: H256, state: State) -> Result<(), Error> {
+        // The post-state's latest_block_header is the block's own header, so its
+        // parent_root identifies the parent (base) state to diff against.
+        let parent_root = state.latest_block_header.parent_root;
+        let parent_state = self
+            .get_state(&parent_root)
+            .expect("parent state must exist to diff against");
+        let is_anchor =
+            state.slot / SNAPSHOT_ANCHOR_INTERVAL > parent_state.slot / SNAPSHOT_ANCHOR_INTERVAL;
 
         // Snapshot only at anchors; serialize before `state` is consumed.
         let snapshot_bytes = is_anchor.then(|| state.to_ssz());
         // Memoize the post-state for fast reads, then move it into the diff so
         // its multi-MB justification fields are not cloned again.
         self.state_cache.lock().unwrap().put(root, state.clone());
-        let diff_bytes = StateDiff::from_base(base.root, base.hbh_len, state).to_ssz();
+        let diff_bytes = StateDiff::from_states(parent_root, &parent_state, state).to_ssz();
 
         let key = root.to_ssz();
         let mut batch = self.backend.begin_write().expect("write batch");
@@ -1544,15 +1551,11 @@ mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
 
-    /// Insert a block header (and dummy body + signature) for a given root and slot.
-    fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64) {
-        let header = BlockHeader {
-            slot,
-            proposer_index: 0,
-            parent_root: H256::ZERO,
-            state_root: H256::ZERO,
-            body_root: H256::ZERO,
-        };
+    /// Insert a block header (and dummy body + signature) for a given root, slot,
+    /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
+    /// state built from the same `(slot, parent_root)` reconstructs byte-identically.
+    fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64, parent_root: H256) {
+        let header = header_at(slot, parent_root);
         let mut batch = backend.begin_write().expect("write batch");
         let key = root.to_ssz();
         batch
@@ -1648,7 +1651,7 @@ mod tests {
 
         // Blocks at slots 0..12, each with header + body + signature.
         for i in 0..13u64 {
-            insert_header(backend.as_ref(), root(i), i);
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
         // Healthy finality: non-finalized gap (5) < SIGNATURE_PRUNING_RANGE.
@@ -1679,7 +1682,7 @@ mod tests {
         let mut store = Store::test_store_with_backend(backend.clone());
 
         for i in 0..10u64 {
-            insert_header(backend.as_ref(), root(i), i);
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
         // Deep non-finality: gap (tip - finalized) > SIGNATURE_PRUNING_RANGE, so
@@ -1699,7 +1702,7 @@ mod tests {
         let mut store = Store::test_store_with_backend(backend.clone());
 
         for i in 0..10u64 {
-            insert_header(backend.as_ref(), root(i), i);
+            insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
         // Early chain: tip < SIGNATURE_PRUNING_RANGE → cutoff saturates to 0,
@@ -1713,20 +1716,22 @@ mod tests {
 
     use ethlambda_types::state::Validator;
 
-    /// The header `insert_header` writes for a given slot.
-    fn header_at(slot: u64) -> BlockHeader {
+    /// The header `insert_header` writes for a given slot and parent.
+    fn header_at(slot: u64, parent_root: H256) -> BlockHeader {
         BlockHeader {
             slot,
             proposer_index: 0,
-            parent_root: H256::ZERO,
+            parent_root,
             state_root: H256::ZERO,
             body_root: H256::ZERO,
         }
     }
 
-    /// A real `State` at `slot` with the given historical_block_hashes and a
-    /// `latest_block_header` matching what `insert_header` stores.
-    fn sample_state(slot: u64, hbh: Vec<H256>) -> State {
+    /// A real `State` at `slot` whose `latest_block_header` matches what
+    /// `insert_header` stores for `(slot, parent_root)`; `parent_root` is also the
+    /// base the diff is built against (`insert_state` reads it back from the
+    /// post-state's `latest_block_header`).
+    fn sample_state(slot: u64, parent_root: H256, hbh: Vec<H256>) -> State {
         let validators = vec![Validator {
             attestation_pubkey: [7u8; 52],
             proposal_pubkey: [9u8; 52],
@@ -1734,7 +1739,7 @@ mod tests {
         }];
         let mut state = State::from_genesis(1_000, validators);
         state.slot = slot;
-        state.latest_block_header = header_at(slot);
+        state.latest_block_header = header_at(slot, parent_root);
         state.historical_block_hashes = hbh.try_into().unwrap();
         state
     }
@@ -1745,23 +1750,20 @@ mod tests {
         let mut store = Store::test_store_with_backend(backend.clone());
 
         // Genesis snapshot at slot 0.
-        let s0 = sample_state(0, vec![]);
+        let s0 = sample_state(0, H256::ZERO, vec![]);
         let r0 = root(0);
-        insert_header(backend.as_ref(), r0, 0);
+        insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
         // Child at slot 1: appends one historical root, sets a checkpoint.
         let r1 = root(1);
-        let mut s1 = sample_state(1, vec![root(42)]);
+        let mut s1 = sample_state(1, r0, vec![root(42)]);
         s1.latest_justified = Checkpoint {
             root: root(7),
             slot: 0,
         };
-        insert_header(backend.as_ref(), r1, 1);
-        let base = DiffBase::from_state(r0, &s0);
-        store
-            .insert_state_with_diff(r1, base, s1.clone())
-            .expect("insert state");
+        insert_header(backend.as_ref(), r1, 1, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
 
         // Not an anchor, so no snapshot was written; only the diff.
         assert!(!has_key(backend.as_ref(), Table::States, &r1));
@@ -1782,26 +1784,20 @@ mod tests {
         let mut store = Store::test_store_with_backend(backend.clone());
 
         // Snapshot s0, then two chained diffs s1 -> s2.
-        let s0 = sample_state(0, vec![]);
+        let s0 = sample_state(0, H256::ZERO, vec![]);
         let r0 = root(0);
-        insert_header(backend.as_ref(), r0, 0);
+        insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
         let r1 = root(1);
-        let s1 = sample_state(1, vec![root(42)]);
-        insert_header(backend.as_ref(), r1, 1);
-        let base = DiffBase::from_state(r0, &s0);
-        store
-            .insert_state_with_diff(r1, base, s1.clone())
-            .expect("insert state");
+        let s1 = sample_state(1, r0, vec![root(42)]);
+        insert_header(backend.as_ref(), r1, 1, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
 
         let r2 = root(2);
-        let s2 = sample_state(2, vec![root(42), root(43)]);
-        insert_header(backend.as_ref(), r2, 2);
-        let base = DiffBase::from_state(r1, &s1);
-        store
-            .insert_state_with_diff(r2, base, s2.clone())
-            .expect("insert state");
+        let s2 = sample_state(2, r1, vec![root(42), root(43)]);
+        insert_header(backend.as_ref(), r2, 2, r1);
+        store.insert_state(r2, s2.clone()).expect("insert state");
 
         // Neither child is an anchor, so a cold store reconstructs s2 by walking
         // the diff chain back to the s0 snapshot.
@@ -1813,33 +1809,27 @@ mod tests {
     }
 
     #[test]
-    fn insert_state_with_diff_snapshots_only_on_boundary_crossing() {
+    fn insert_state_snapshots_only_on_boundary_crossing() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        let s0 = sample_state(SNAPSHOT_ANCHOR_INTERVAL - 1, vec![]);
+        let s0 = sample_state(SNAPSHOT_ANCHOR_INTERVAL - 1, H256::ZERO, vec![]);
         let r0 = root(0);
-        insert_header(backend.as_ref(), r0, s0.slot);
+        insert_header(backend.as_ref(), r0, s0.slot, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
         // Crossing the interval boundary records an anchor.
         let r1 = root(1);
-        let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, vec![root(42)]);
-        insert_header(backend.as_ref(), r1, s1.slot);
-        let base = DiffBase::from_state(r0, &s0);
-        store
-            .insert_state_with_diff(r1, base, s1.clone())
-            .expect("insert state");
+        let s1 = sample_state(SNAPSHOT_ANCHOR_INTERVAL, r0, vec![root(42)]);
+        insert_header(backend.as_ref(), r1, s1.slot, r0);
+        store.insert_state(r1, s1.clone()).expect("insert state");
         assert!(has_key(backend.as_ref(), Table::States, &r1));
 
         // A non-crossing child does not.
         let r2 = root(2);
-        let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, vec![root(42), root(43)]);
-        insert_header(backend.as_ref(), r2, s2.slot);
-        let base = DiffBase::from_state(r1, &s1);
-        store
-            .insert_state_with_diff(r2, base, s2.clone())
-            .expect("insert state");
+        let s2 = sample_state(SNAPSHOT_ANCHOR_INTERVAL + 1, r1, vec![root(42), root(43)]);
+        insert_header(backend.as_ref(), r2, s2.slot, r1);
+        store.insert_state(r2, s2.clone()).expect("insert state");
         assert!(!has_key(backend.as_ref(), Table::States, &r2));
     }
 

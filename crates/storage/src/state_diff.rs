@@ -27,35 +27,6 @@ use libssz_types::SszList;
 /// full list.
 pub type HistoricalBlockHashesTail = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
-/// Describes the parent state a new state's diff is built against.
-///
-/// Captured by the caller before the parent is consumed into the post-state, so
-/// the store can build the diff and decide anchoring without re-reading it.
-/// Construct via [`DiffBase::from_state`]; fields are crate-internal.
-pub struct DiffBase {
-    /// Block root of the parent state (the diff's `base_root`).
-    pub(crate) root: H256,
-    /// Parent state's `historical_block_hashes` length.
-    pub(crate) hbh_len: usize,
-    /// Parent state's slot (used for the anchor-boundary check).
-    pub(crate) slot: u64,
-}
-
-impl DiffBase {
-    /// Build the diff base from the parent state and its block root.
-    ///
-    /// `root` is the parent block root (the child's `parent_root`), passed in
-    /// since the caller already has it; `hbh_len` and `slot` are read from
-    /// `state`. Call this before the parent is consumed into the child.
-    pub fn from_state(root: H256, state: &State) -> Self {
-        Self {
-            root,
-            hbh_len: state.historical_block_hashes.len(),
-            slot: state.slot,
-        }
-    }
-}
-
 /// The change from a base (parent) state to a target state.
 ///
 /// Reconstruct the target with [`StateDiff`] applied against the nearest
@@ -81,13 +52,13 @@ pub struct StateDiff {
 }
 
 impl StateDiff {
-    /// Build a diff from a consumed target state against a base identified by its
-    /// `historical_block_hashes` length.
+    /// Build a diff from a base (parent) state and the consumed target state.
     ///
-    /// Takes `target` by value so the multi-MB justification fields are moved
-    /// into the diff rather than cloned. On the block-import path the base state
-    /// has already been consumed into `target`, so only its length is retained;
-    /// `base_hbh_len` is that length.
+    /// Takes `target` by value so its multi-MB justification fields are moved
+    /// into the diff rather than cloned; `base` is read only to find the length
+    /// of its `historical_block_hashes` (the diff stores just the tail `target`
+    /// appended on top). `base_root` is the parent block root the diff is
+    /// relative to.
     ///
     /// # Assumptions about how the base is modified into the target
     ///
@@ -102,10 +73,10 @@ impl StateDiff {
     ///   fixed at genesis and `config` is static.)
     /// - **`historical_block_hashes` only grows by appending.** The base's list
     ///   is a prefix of the target's, so only the appended tail
-    ///   (`target[base_hbh_len..]`) is stored and the earlier entries are never
+    ///   (`target[base_len..]`) is stored and the earlier entries are never
     ///   reordered or rewritten. (`process_slots` pushes the parent root and
     ///   zero-fills skipped slots, leaving the existing prefix intact.) This is
-    ///   why `base_hbh_len` alone is enough to identify the base's contribution.
+    ///   why the base's length alone is enough to identify its contribution.
     /// - **`latest_block_header` is not stored here.** It is read back from the
     ///   `BlockHeaders` table during reconstruction; the persisted post-state
     ///   caches the real `state_root` there, so the two are byte-identical.
@@ -116,9 +87,10 @@ impl StateDiff {
     ///
     /// # Panics
     ///
-    /// Panics if `target.historical_block_hashes` is shorter than `base_hbh_len`,
+    /// Panics if `target.historical_block_hashes` is shorter than the base's,
     /// i.e. the append-only assumption above was violated.
-    pub fn from_base(base_root: H256, base_hbh_len: usize, target: State) -> Self {
+    pub fn from_states(base_root: H256, base: &State, target: State) -> Self {
+        let base_hbh_len = base.historical_block_hashes.len();
         let State {
             slot,
             latest_justified,
@@ -224,7 +196,6 @@ mod tests {
     #[test]
     fn from_base_captures_appended_tail_and_absolute_fields() {
         let base = base_state();
-        let base_len = base.historical_block_hashes.len();
 
         let mut target = base.clone();
         target.slot = 5;
@@ -238,7 +209,7 @@ mod tests {
         hbh.extend([h256(9), H256::ZERO, H256::ZERO]);
         target.historical_block_hashes = hbh.try_into().unwrap();
 
-        let diff = StateDiff::from_base(h256(1), base_len, target);
+        let diff = StateDiff::from_states(h256(1), &base, target);
 
         assert_eq!(diff.base_root, h256(1));
         assert_eq!(diff.slot, 5);

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
-use ethlambda_storage::{DiffBase, ForkCheckpoints, Store};
+use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
     attestation::{
@@ -564,10 +564,6 @@ fn on_block_core(
 
     let block = signed_block.message.clone();
 
-    // Capture the diff base before the parent is consumed into the post-state
-    // (avoids cloning the multi-MB historical_block_hashes list).
-    let diff_base = DiffBase::from_state(block.parent_root, &parent_state);
-
     // Execute state transition function to compute post-block state
     let state_transition_start = std::time::Instant::now();
     let mut post_state = parent_state;
@@ -595,7 +591,7 @@ fn on_block_core(
         .insert_signed_block(block_root, signed_block.clone())
         .expect("DB insert should succeed");
     store
-        .insert_state_with_diff(block_root, diff_base, post_state)
+        .insert_state(block_root, post_state)
         .expect("DB insert should succeed");
 
     for att in block.body.attestations.iter() {
@@ -1271,14 +1267,13 @@ mod tests {
         let head_justified = Checkpoint { root: a, slot: 1 };
         let mut head_state = State::from_genesis(1000, vec![]);
         head_state.latest_justified = head_justified;
-        // Persist `b`'s post-state via the diff API, diffed against the genesis
-        // anchor that already lives in the store. The base must describe the
-        // parent (genesis) state, not the target; `get_state(b)` then resolves
-        // via the cache or by replaying this diff onto the genesis snapshot.
-        let genesis_state = store.get_state(&genesis).expect("genesis state");
-        let diff_base = DiffBase::from_state(genesis, &genesis_state);
+        // Persist `b`'s post-state via the diff API. `insert_state` reads the base
+        // to diff against from the post-state's own `latest_block_header.parent_root`;
+        // point it at the genesis anchor already in the store, so `get_state(b)`
+        // resolves via the cache or by replaying this diff onto the genesis snapshot.
+        head_state.latest_block_header.parent_root = genesis;
         store
-            .insert_state_with_diff(b, diff_base, head_state)
+            .insert_state(b, head_state)
             .expect("insert head state should succeed");
 
         // Store's global justified latched onto a higher, off-head checkpoint,
