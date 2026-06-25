@@ -175,6 +175,7 @@ pub(crate) fn reconstruct(
 #[cfg(test)]
 mod tests {
     use ethlambda_types::state::{State, Validator};
+    use libssz::SszEncode;
 
     use super::*;
 
@@ -237,99 +238,85 @@ mod tests {
         }
     }
 
-    /// Build a diff against `base_root` that appends `appended` to
-    /// `historical_block_hashes`. Absolute fields default; tests override the
-    /// ones they assert on.
-    fn diff_at(base_root: H256, slot: u64, appended: Vec<H256>) -> StateDiff {
-        StateDiff {
-            base_root,
+    /// Build the post-state of a block at `slot` whose parent post-state is
+    /// `parent`, mirroring the STF: append the parent block root (the hash of
+    /// `parent`'s `latest_block_header`), zero-fill skipped slots, and set the
+    /// child's own header. Absolute fields are inherited; callers override what
+    /// they assert on. Feeds realistic states into the production `from_states`,
+    /// so the tests exercise diff creation rather than fabricating diffs by hand.
+    fn child_state(parent: &State, slot: u64) -> State {
+        let parent_root = parent.latest_block_header.hash_tree_root();
+        let empty_slots = (slot - parent.slot - 1) as usize;
+
+        let mut hbh = parent.historical_block_hashes.to_vec();
+        hbh.push(parent_root);
+        hbh.extend(std::iter::repeat_n(H256::ZERO, empty_slots));
+
+        let mut child = parent.clone();
+        child.slot = slot;
+        child.historical_block_hashes = hbh.try_into().unwrap();
+        child.latest_block_header = BlockHeader {
             slot,
-            latest_justified: Checkpoint::default(),
-            latest_finalized: Checkpoint::default(),
-            justified_slots: JustifiedSlots::new(),
-            justifications_roots: JustificationRoots::default(),
-            justifications_validators: JustificationValidators::new(),
-            hbh_appended: HistoricalBlockHashesTail::try_from(appended).unwrap(),
-        }
+            proposer_index: 0,
+            parent_root,
+            state_root: H256::ZERO,
+            body_root: H256::ZERO,
+        };
+        child
     }
 
     #[test]
-    fn reconstruct_merges_snapshot_with_diff_chain() {
-        // Snapshot: distinctive config + validators, plus one pre-existing root.
+    fn reconstruct_round_trips_a_diff_chain() {
+        // Snapshot at slot 100 with one pre-existing historical root.
         let mut snapshot = base_state();
         snapshot.slot = 100;
+        snapshot.latest_block_header = header_at(100);
         snapshot.historical_block_hashes = vec![h256(1)].try_into().unwrap();
 
-        // Intermediate diff (snapshot's child): appends one root, default fields.
-        let intermediate = diff_at(h256(50), 101, vec![h256(2)]);
-
-        // Target diff (last): appends two roots and carries the absolute fields
-        // the reconstructed state must adopt, all different from the intermediate.
-        let mut target = diff_at(h256(51), 102, vec![h256(3), h256(4)]);
-        target.latest_justified = Checkpoint {
+        // s1 is the snapshot's child (consecutive slot); s2 is s1's child three
+        // slots later, so slots 102 and 103 are skipped and zero-filled. s2 also
+        // carries distinctive absolute fields the reconstruction must adopt.
+        let s1 = child_state(&snapshot, 101);
+        let mut s2 = child_state(&s1, 104);
+        s2.latest_justified = Checkpoint {
             root: h256(7),
             slot: 101,
         };
-        target.latest_finalized = Checkpoint {
+        s2.latest_finalized = Checkpoint {
             root: h256(8),
             slot: 100,
         };
-        target.justified_slots = JustifiedSlots::try_from(vec![true, false, true]).unwrap();
-        target.justifications_roots = JustificationRoots::try_from(vec![h256(9)]).unwrap();
-        target.justifications_validators = JustificationValidators::try_from(vec![true]).unwrap();
+        s2.justified_slots = JustifiedSlots::try_from(vec![true, false, true]).unwrap();
+        s2.justifications_roots = JustificationRoots::try_from(vec![h256(9)]).unwrap();
+        s2.justifications_validators = JustificationValidators::try_from(vec![true]).unwrap();
 
-        let header = header_at(102);
-        let state = reconstruct(snapshot, &[intermediate, target.clone()], header.clone());
+        // Diffs are built the production way, from each (pre, post) pair.
+        let diff1 = StateDiff::from_states(&snapshot, s1.clone());
+        let diff2 = StateDiff::from_states(&s1, s2.clone());
 
-        // Structural fields come from the snapshot (diffs never carry them).
-        assert_eq!(state.config.genesis_time, 1_000);
-        assert_eq!(state.validators.len(), 2);
-        assert_eq!(state.validators[0].attestation_pubkey, [1u8; 52]);
-        assert_eq!(state.validators[1].index, 1);
+        let reconstructed = reconstruct(snapshot, &[diff1, diff2], s2.latest_block_header.clone());
 
-        // latest_block_header is the argument, passed through verbatim.
-        assert_eq!(state.latest_block_header, header);
-
-        // Absolute fields come from the LAST diff, not the intermediate one.
-        assert_eq!(state.slot, 102);
-        assert_eq!(state.latest_justified, target.latest_justified);
-        assert_eq!(state.latest_finalized, target.latest_finalized);
-        assert_eq!(state.justified_slots, target.justified_slots);
-        assert_eq!(state.justifications_roots, target.justifications_roots);
-        assert_eq!(
-            state.justifications_validators,
-            target.justifications_validators
-        );
-
-        // historical_block_hashes = snapshot tail ++ each diff's appended tail,
-        // replayed in order.
-        assert_eq!(
-            state.historical_block_hashes.to_vec(),
-            vec![h256(1), h256(2), h256(3), h256(4)],
-        );
+        // Full round-trip: structural fields (config/validators) from the snapshot,
+        // absolute fields from the last diff, and the appended-with-gaps history.
+        assert_eq!(reconstructed.to_ssz(), s2.to_ssz());
     }
 
     #[test]
-    fn reconstruct_with_single_diff_uses_it_as_target() {
+    fn reconstruct_with_single_diff_round_trips() {
         let mut snapshot = base_state();
         snapshot.slot = 7;
+        snapshot.latest_block_header = header_at(7);
         snapshot.historical_block_hashes = vec![h256(1)].try_into().unwrap();
 
-        let mut diff = diff_at(h256(50), 8, vec![h256(2)]);
-        diff.latest_justified = Checkpoint {
+        let mut child = child_state(&snapshot, 8);
+        child.latest_justified = Checkpoint {
             root: h256(7),
             slot: 7,
         };
 
-        let header = header_at(8);
-        let state = reconstruct(snapshot, &[diff.clone()], header.clone());
+        let diff = StateDiff::from_states(&snapshot, child.clone());
+        let reconstructed = reconstruct(snapshot, &[diff], child.latest_block_header.clone());
 
-        assert_eq!(state.slot, 8);
-        assert_eq!(state.latest_justified, diff.latest_justified);
-        assert_eq!(state.latest_block_header, header);
-        assert_eq!(
-            state.historical_block_hashes.to_vec(),
-            vec![h256(1), h256(2)],
-        );
+        assert_eq!(reconstructed.to_ssz(), child.to_ssz());
     }
 }
