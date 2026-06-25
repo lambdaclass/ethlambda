@@ -2231,7 +2231,6 @@ dependencies = [
 [[package]]
 name = "ethp2p-broadcast"
 version = "0.0.0"
-source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=ba3ed8b490a853a54343741f5d1def158e1bb82c#ba3ed8b490a853a54343741f5d1def158e1bb82c"
 dependencies = [
  "bytes",
  "ethp2p-protocol",
@@ -2248,7 +2247,6 @@ dependencies = [
 [[package]]
 name = "ethp2p-protocol"
 version = "0.0.0"
-source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=ba3ed8b490a853a54343741f5d1def158e1bb82c#ba3ed8b490a853a54343741f5d1def158e1bb82c"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -2257,7 +2255,6 @@ dependencies = [
 [[package]]
 name = "ethp2p-transport"
 version = "0.0.0"
-source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=ba3ed8b490a853a54343741f5d1def158e1bb82c#ba3ed8b490a853a54343741f5d1def158e1bb82c"
 dependencies = [
  "ethp2p-broadcast",
  "futures",

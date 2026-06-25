@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install cargo-chef and system dependencies
 RUN cargo install cargo-chef
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
+RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config protobuf-compiler
 
 # Builds a cargo-chef plan
 FROM chef AS planner
@@ -37,6 +37,11 @@ ENV NO_DEFAULT_FEATURES=$NO_DEFAULT_FEATURES
 # is absent from the committed lockfile, so it must build unlocked: set LOCKED= .
 ARG LOCKED="--locked"
 ENV LOCKED=$LOCKED
+
+# Local-only: the vendored ethp2p-rs is an out-of-workspace path dep, so
+# cargo-chef cook needs its manifests present to resolve. Copying it here
+# (before cook) keeps it in the cached dependency layer.
+COPY ethp2p-rs ethp2p-rs
 
 RUN cargo chef cook --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" --recipe-path recipe.json
 

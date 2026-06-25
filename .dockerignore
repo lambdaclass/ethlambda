@@ -10,3 +10,6 @@
 !.git/
 !.cargo/
 !shadow/
+# Local-only: vendored ethp2p-rs path dep (gitignored), needed in the build
+# context to build with the `ethp2p` feature.
+!ethp2p-rs/

@@ -40,7 +40,7 @@ use prost::Message as _;
 use sha2::{Digest, Sha256};
 use spawned_concurrency::tasks::ActorRef;
 use tokio::sync::mpsc;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::gossipsub::decompress_message;
 use crate::{P2PServer, WrappedEthp2pDelivery};
@@ -300,10 +300,13 @@ pub(crate) async fn run_engine_task(
             cmd = publish_rx.recv() => {
                 match cmd {
                     Some(cmd) => {
-                        if let Err(e) =
-                            broadcast.publish_bytes(&cmd.channel, &cmd.message_id, &cmd.payload)
-                        {
-                            warn!(%e, channel = %cmd.channel, "ethp2p: publish failed");
+                        match broadcast.publish_bytes(&cmd.channel, &cmd.message_id, &cmd.payload) {
+                            Ok(()) => debug!(
+                                channel = %cmd.channel,
+                                bytes = cmd.payload.len(),
+                                "ethp2p: published message"
+                            ),
+                            Err(e) => warn!(%e, channel = %cmd.channel, "ethp2p: publish failed"),
                         }
                     }
                     // Publish sender dropped (the P2P actor stopped). The
@@ -347,6 +350,15 @@ pub(crate) fn dispatch_delivered(blockchain: &P2PToBlockChainRef, channel: &str,
             return;
         }
     };
+    // Success-path visibility: a payload was reconstructed from the
+    // erasure-coded mesh and is about to enter the consensus pipeline
+    // (the same one gossipsub feeds). Proof that ethp2p carried gossip.
+    info!(
+        channel,
+        wire_bytes = payload.len(),
+        ssz_bytes = uncompressed.len(),
+        "ethp2p: delivered message"
+    );
     match channel {
         CHANNEL_BLOCK => match SignedBlock::from_ssz_bytes(&uncompressed) {
             Ok(block) => {
