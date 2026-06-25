@@ -1,9 +1,15 @@
-use axum::{http::HeaderValue, http::header, response::IntoResponse};
+use axum::{Router, http::HeaderValue, http::header, response::IntoResponse, routing::get};
 use ethlambda_storage::Store;
 use ethlambda_types::{checkpoint::Checkpoint, primitives::H256};
 use serde::Serialize;
 
 use crate::json_response;
+
+pub(crate) fn routes() -> Router<Store> {
+    Router::new()
+        .route("/lean/v0/fork_choice", get(get_fork_choice))
+        .route("/lean/v0/fork_choice/ui", get(get_fork_choice_ui))
+}
 
 const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 const FORK_CHOICE_HTML: &str = include_str!("../static/fork_choice.html");
@@ -27,7 +33,7 @@ pub struct ForkChoiceNode {
     weight: u64,
 }
 
-pub async fn get_fork_choice(
+pub(crate) async fn get_fork_choice(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let blocks = store.get_live_chain();
@@ -75,7 +81,7 @@ pub async fn get_fork_choice(
     json_response(response)
 }
 
-pub async fn get_fork_choice_ui() -> impl IntoResponse {
+pub(crate) async fn get_fork_choice_ui() -> impl IntoResponse {
     let mut response = FORK_CHOICE_HTML.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -87,7 +93,7 @@ pub async fn get_fork_choice_ui() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, http::StatusCode, routing::get};
+    use axum::{Router, body::Body, http::Request, http::StatusCode};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -96,10 +102,7 @@ mod tests {
     use crate::test_utils::create_test_state;
 
     fn build_test_router(store: Store) -> Router {
-        Router::new()
-            .route("/lean/v0/fork_choice", get(get_fork_choice))
-            .route("/lean/v0/fork_choice/ui", get(get_fork_choice_ui))
-            .with_state(store)
+        routes().with_state(store)
     }
 
     #[tokio::test]

@@ -427,6 +427,7 @@ fn validate_attestation_check(
     let attestations: HashMap<u64, AttestationData> = match location {
         "new" => st.extract_latest_new_attestations(),
         "known" => st.extract_latest_known_attestations(),
+        "signatures" => st.extract_latest_signature_attestations(),
         other => {
             return Err(
                 format!("Step {}: unknown attestation location: {}", step_idx, other).into(),
