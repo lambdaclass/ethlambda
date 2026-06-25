@@ -58,7 +58,9 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         .get_state(&new_head)
         .map(|state| state.latest_finalized)
         .filter(|finalized| store.get_block_header(&finalized.root).is_some());
-    store.update_checkpoints(ForkCheckpoints::new(new_head, None, finalized));
+    store
+        .update_checkpoints(ForkCheckpoints::new(new_head, None, finalized))
+        .expect("update_checkpoints should succeed");
 
     if old_head != new_head {
         let old_slot = store
@@ -573,12 +575,18 @@ fn on_block_core(
         .then_some(post_state.latest_justified);
 
     if let Some(justified) = justified {
-        store.update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None));
+        store
+            .update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None))
+            .expect("update_checkpoints should succeed");
     }
 
     // Store signed block and state
-    store.insert_signed_block(block_root, signed_block.clone());
-    store.insert_state(block_root, post_state);
+    store
+        .insert_signed_block(block_root, signed_block.clone())
+        .expect("DB insert should succeed");
+    store
+        .insert_state(block_root, post_state)
+        .expect("DB insert should succeed");
 
     for att in block.body.attestations.iter() {
         // Count each participating validator as a valid attestation.
@@ -1220,7 +1228,9 @@ mod tests {
             },
             proof: make_signed_block_proof(0, vec![]),
         };
-        store.insert_signed_block(root, signed_block);
+        store
+            .insert_signed_block(root, signed_block)
+            .expect("insert test block should succeed");
     }
 
     fn new_test_store() -> Store {
@@ -1251,7 +1261,9 @@ mod tests {
         let head_justified = Checkpoint { root: a, slot: 1 };
         let mut head_state = State::from_genesis(1000, vec![]);
         head_state.latest_justified = head_justified;
-        store.insert_state(b, head_state);
+        store
+            .insert_state(b, head_state)
+            .expect("insert head state should succeed");
 
         // Store's global justified latched onto a higher, off-head checkpoint,
         // as it would after a minority fork justified a slot the head never saw.
@@ -1259,7 +1271,9 @@ mod tests {
             root: H256([9u8; 32]),
             slot: 5,
         };
-        store.update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None));
+        store
+            .update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None))
+            .expect("update_checkpoints should succeed");
         store.set_time(2 * INTERVALS_PER_SLOT);
 
         let data = produce_attestation_data(&store, 2);
