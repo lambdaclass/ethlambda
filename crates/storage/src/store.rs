@@ -850,11 +850,11 @@ impl Store {
         Ok(())
     }
 
-    /// Bound storage by evicting old state snapshots and finalized signatures.
+    /// Prune finalized block signatures to keep signature storage bounded.
     ///
-    /// State diffs, block headers, and block bodies are retained for the full
-    /// history; only full-state snapshots outside the hot window (diffs remain)
-    /// and signatures of finalized blocks are removed.
+    /// State diffs, block headers, block bodies, and full-state snapshots are
+    /// all retained for the full history and are never pruned. Only signatures
+    /// of finalized blocks older than the pruning window are removed.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
     /// pruning until after a batch of blocks has been fully processed. Running
