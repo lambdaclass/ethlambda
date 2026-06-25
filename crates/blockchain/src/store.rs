@@ -586,7 +586,7 @@ fn on_block_core(
             .expect("update_checkpoints should succeed");
     }
 
-    // Store signed block and state (as a parent-linked diff + snapshot)
+    // Store signed block and state
     store
         .insert_signed_block(block_root, signed_block.clone())
         .expect("DB insert should succeed");
