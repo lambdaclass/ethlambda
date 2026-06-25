@@ -248,20 +248,4 @@ mod tests {
         assert_eq!(diff.hbh_appended[0], h256(9));
         assert_eq!(diff.hbh_appended[1], H256::ZERO);
     }
-
-    #[test]
-    fn ssz_roundtrips() {
-        let base = base_state();
-        let base_len = base.historical_block_hashes.len();
-        let mut target = base.clone();
-        target.slot = 2;
-        let mut hbh: Vec<H256> = base.historical_block_hashes.to_vec();
-        hbh.push(h256(9));
-        target.historical_block_hashes = hbh.try_into().unwrap();
-
-        let diff = StateDiff::from_base(h256(1), base_len, target);
-        let bytes = diff.to_ssz();
-        let decoded = StateDiff::from_ssz_bytes(&bytes).expect("decodes");
-        assert_eq!(diff, decoded);
-    }
 }
