@@ -252,71 +252,96 @@ impl BlockChainServer {
             self.pre_merge_coverage = Some(snapshot);
         }
 
-        let scheduled_proposer = (interval == 0 && slot > 0)
+        // Whether one of our validators proposes this slot. Drives the store's
+        // interval-0 attestation acceptance.
+        let is_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
-            .flatten();
-        let is_proposer = scheduled_proposer.is_some();
+            .flatten()
+            .is_some();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
         store::on_tick(&mut self.store, timestamp_ms, is_proposer);
 
-        // ==== interval 0 ====
+        // Per-interval duties for this tick. Intervals 0 (block publish) and 3
+        // (safe-target update) are driven inside `store::on_tick` above, so they
+        // carry only a note below.
+        match interval {
+            // ==== interval 0 ====
+            //
+            // No actor work at interval 0. The block is published here
+            // conceptually (at the slot boundary), but the build+publish code
+            // path runs at interval 4 of the previous slot — where it also
+            // advances the store to this slot's interval 0 before building (see
+            // `propose_block`). The real interval-0 tick is then skipped by the
+            // idempotency guard above, since the store clock is already here.
+            0 => {}
 
-        // Now build and publish the block (after attestations have been accepted)
-        if let Some(validator_id) = scheduled_proposer {
-            if self.sync_status.duties_allowed() {
-                self.propose_block(slot, validator_id);
-            } else {
-                info!(%slot, %validator_id, "Skipping block proposal while syncing");
+            // ==== interval 1 ====
+            //
+            // Produce attestations at interval 1 (all validators including
+            // proposer). Reuse the same snapshot so self-delivery decisions
+            // match the rest of the tick.
+            1 => {
+                // Emit the post-block coverage report for the previous slot.
+                // Fired at interval 1 (not 0) so the block carrying `slot - 1`'s
+                // votes — proposed at interval 0 of this slot — has typically
+                // been received and processed, letting the `block` section see
+                // the same round.
+                if slot > 0 {
+                    coverage::emit_post_block_coverage(
+                        &self.store,
+                        self.pre_merge_coverage.as_ref(),
+                        self.attestation_committee_count,
+                        slot - 1,
+                    );
+                }
+                if self.sync_status.duties_allowed() {
+                    self.produce_attestations(slot, is_aggregator);
+                } else if !self.key_manager.validator_ids().is_empty() {
+                    info!(%slot, "Skipping attestations while syncing");
+                }
             }
+
+            // ==== interval 2 ====
+            2 => {
+                if is_aggregator {
+                    coverage::emit_agg_start_new_coverage(
+                        &self.store,
+                        self.attestation_committee_count,
+                    );
+                    self.start_aggregation_session(slot, ctx).await;
+                } else {
+                    metrics::inc_aggregator_skipped_not_aggregator();
+                }
+            }
+
+            // ==== interval 3 ====
+            //
+            // Safe-target update is handled inside `store::on_tick`.
+            3 => {}
+
+            // ==== interval 4 ====
+            //
+            // Build and publish the NEXT slot's block here, one interval early,
+            // so the heavy leanVM work happens during this otherwise-idle
+            // interval. `propose_block` blocks the actor for the build and aligns
+            // publication to the slot boundary. Doing the whole proposal here —
+            // rather than stashing it for the interval-0 tick — keeps it robust:
+            // `on_tick` skips the interval-0 tick whenever this build overruns
+            // its interval.
+            4 => {
+                let next_slot = slot + 1;
+                let next_proposer = self
+                    .get_our_proposer(next_slot)
+                    .filter(|_| self.sync_status.duties_allowed());
+
+                if let Some(validator_id) = next_proposer {
+                    self.propose_block(next_slot, validator_id).await;
+                }
+            }
+
+            _ => {}
         }
-
-        // ==== interval 1 ====
-
-        // Produce attestations at interval 1 (all validators including proposer).
-        // Reuse the same snapshot so self-delivery decisions match the rest
-        // of the tick.
-        if interval == 1 {
-            // Emit the post-block coverage report for the previous slot. Fired
-            // at interval 1 (not 0) so the block carrying `slot - 1`'s votes —
-            // proposed at interval 0 of this slot — has typically been received
-            // and processed, letting the `block` section see the same round.
-            if slot > 0 {
-                coverage::emit_post_block_coverage(
-                    &self.store,
-                    self.pre_merge_coverage.as_ref(),
-                    self.attestation_committee_count,
-                    slot - 1,
-                );
-            }
-            if self.sync_status.duties_allowed() {
-                self.produce_attestations(slot, is_aggregator);
-            } else if !self.key_manager.validator_ids().is_empty() {
-                info!(%slot, "Skipping attestations while syncing");
-            }
-        }
-
-        // ==== interval 2 ====
-
-        if interval == 2 {
-            if is_aggregator {
-                coverage::emit_agg_start_new_coverage(
-                    &self.store,
-                    self.attestation_committee_count,
-                );
-                self.start_aggregation_session(slot, ctx).await;
-            } else {
-                metrics::inc_aggregator_skipped_not_aggregator();
-            }
-        }
-
-        // ==== interval 3 ====
-
-        // Interval 3 (safe-target update) is handled inside `store::on_tick`.
-
-        // ==== interval 4 ====
-
-        // Handled by the pre-tick snapshot above.
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
@@ -441,13 +466,33 @@ impl BlockChainServer {
         }
     }
 
-    /// Build and publish a block for the given slot and validator.
-    fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    /// Build the target slot's block and publish it, one interval early.
+    ///
+    /// Runs at the previous slot's interval 4, blocking the actor for the build
+    /// (the expensive part is the leanVM Type-1 → Type-2 merge). It first
+    /// advances the store to the target slot's interval 0 (accepting
+    /// attestations) so the block is built on exactly the interval-0 state a
+    /// non-prebuilding proposer would see, then builds and publishes — aligned
+    /// to the slot boundary: if the build finishes before the slot opens we wait
+    /// out the remainder so the block is not published early; if it overran (the
+    /// common case under load) we publish at once. The whole proposal is
+    /// self-contained here, so it never depends on the interval-0 tick — which
+    /// `handle_tick` skips whenever this build overruns its interval.
+    async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        let _timing = metrics::time_block_building();
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
 
-        // Build the block with attestation signatures
+        // Build the block. `produce_block_with_signatures` advances the store to
+        // this slot's interval 0 (accepting attestations) before building — one
+        // interval ahead of the interval-4 tick we are running in — so the block
+        // is built on the interval-0 state rather than the previous slot's end
+        // state. Building early is safe because we publish below (nothing is
+        // stashed for a later tick), and the real interval-0 tick is then skipped
+        // by the idempotency guard in `on_tick`, since the store clock is already
+        // here.
+        let timing = metrics::time_block_building();
         let Ok((block, type_one_proofs, _post_checkpoints)) =
             store::produce_block_with_signatures(&mut self.store, slot, validator_id)
                 .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
@@ -473,9 +518,8 @@ impl BlockChainServer {
             return;
         };
 
-        // Assemble SignedBlock: wrap the proposer's raw XMSS signature into a
-        // singleton Type-1 SNARK, then merge it with every attestation Type-1
-        // into the block's single Type-2 proof.
+        // Wrap the proposer's raw XMSS signature into a singleton Type-1 SNARK,
+        // then merge it with every attestation Type-1 into the single Type-2.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         let Some(proposer_validator) = validators.get(validator_id as usize) else {
@@ -565,23 +609,44 @@ impl BlockChainServer {
                 return;
             }
         };
-        // `type_one_proofs` is no longer needed past this point.
-        drop(type_one_proofs);
         let signed_block = SignedBlock {
             message: block,
             proof,
         };
 
-        // Process the block locally before publishing
+        // Stop timing here: the build is done, and the alignment wait below must
+        // not count toward the block-building metric.
+        drop(timing);
+
+        let now_ms = unix_now_ms();
+
+        // Align publication to the slot boundary. If the build finished before
+        // the slot opened, wait out the remainder so the block is not published
+        // early; if it overran, publish immediately.
+        if now_ms < genesis_time_ms + slot * crate::MILLISECONDS_PER_SLOT {
+            let wait_ms = slot_start_ms.saturating_sub(now_ms);
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        }
+
+        self.process_and_publish_block(slot, validator_id, signed_block);
+    }
+
+    /// Import a freshly built block locally, then publish it to gossip. On
+    /// import failure, logs and counts it, and returns without publishing.
+    fn process_and_publish_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        signed_block: SignedBlock,
+    ) {
         if let Err(err) = self.process_block(signed_block.clone()) {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
             return;
-        };
+        }
 
         metrics::inc_block_building_success();
 
-        // Publish to gossip network
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
                 .publish_block(signed_block)
