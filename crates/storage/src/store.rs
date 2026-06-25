@@ -1025,7 +1025,10 @@ impl Store {
 
     /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Option<BlockHeader> {
-        self.get_ssz(Table::BlockHeaders, root)
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::BlockHeaders, &root.to_ssz())
+            .expect("get")
+            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
     }
 
     // ============ Signed Blocks ============
@@ -1160,19 +1163,15 @@ impl Store {
             return Some(state.clone());
         }
         // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
-        let state = self
-            .get_ssz::<State>(Table::States, root)
-            .or_else(|| self.reconstruct_state(root))?;
+        let snapshot = {
+            let view = self.backend.begin_read().expect("read view");
+            view.get(Table::States, &root.to_ssz())
+                .expect("get")
+                .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+        };
+        let state = snapshot.or_else(|| self.reconstruct_state(root))?;
         self.state_cache.lock().unwrap().put(*root, state.clone());
         Some(state)
-    }
-
-    /// Read and SSZ-decode a value keyed by block root from `table`.
-    fn get_ssz<T: SszDecode>(&self, table: Table, root: &H256) -> Option<T> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(table, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| T::from_ssz_bytes(&bytes).expect("valid encoding"))
     }
 
     /// Reconstruct a state from diffs and the nearest ancestor snapshot.
@@ -1182,16 +1181,19 @@ impl Store {
     /// [`state_diff::reconstruct`](crate::state_diff::reconstruct).
     fn reconstruct_state(&self, root: &H256) -> Option<State> {
         // Walk back collecting diffs until we reach a snapshot.
+        let view = self.backend.begin_read().expect("read view");
         let mut diffs: Vec<StateDiff> = Vec::new();
         let mut cursor = *root;
         let snapshot = loop {
-            if let Some(snapshot) = self.get_ssz::<State>(Table::States, &cursor) {
-                break snapshot;
+            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
+                break State::from_ssz_bytes(&bytes).expect("valid state");
             }
-            let diff = self.get_ssz::<StateDiff>(Table::StateDiffs, &cursor)?;
+            let diff_bytes = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")?;
+            let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
             cursor = diff.base_root;
             diffs.push(diff);
         };
+        drop(view);
 
         // `diffs` runs target -> snapshot child; reverse to snapshot child -> target.
         diffs.reverse();
