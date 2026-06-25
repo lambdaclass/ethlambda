@@ -1188,7 +1188,9 @@ impl Store {
             if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
                 break State::from_ssz_bytes(&bytes).expect("valid state");
             }
-            let diff_bytes = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")?;
+            let diff_bytes = view
+                .get(Table::StateDiffs, &cursor.to_ssz())
+                .expect("get")?;
             let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
             cursor = diff.base_root;
             diffs.push(diff);
