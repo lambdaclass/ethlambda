@@ -468,15 +468,23 @@ fn encode_live_chain_key(slot: u64, root: &H256) -> Vec<u8> {
     result
 }
 
+#[derive(Debug, Error)]
+enum DecodeLiveChainKeyError {
+    #[error("invalid LiveChain key length: expected 40 bytes, got {actual}")]
+    InvalidLength { actual: usize },
+}
+
 /// Decode a LiveChain key from bytes.
-fn decode_live_chain_key(bytes: &[u8]) -> Option<(u64, H256)> {
+fn decode_live_chain_key(bytes: &[u8]) -> Result<(u64, H256), DecodeLiveChainKeyError> {
     if bytes.len() != 40 {
-        return None;
+        return Err(DecodeLiveChainKeyError::InvalidLength {
+            actual: bytes.len(),
+        });
     }
 
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
-    Some((slot, root))
+    Ok((slot, root))
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -823,10 +831,15 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .filter_map(|(k, v)| {
-                let (slot, root) = decode_live_chain_key(&k)?;
-                let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
-                Some((root, (slot, parent_root)))
+            .filter_map(|(k, v)| match decode_live_chain_key(&k) {
+                Ok((slot, root)) => {
+                    let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
+                    Some((root, (slot, parent_root)))
+                }
+                Err(error) => {
+                    warn!(%error, "Skipping malformed LiveChain key");
+                    None
+                }
             })
             .collect()
     }
@@ -837,7 +850,13 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(Result::ok)
-            .filter_map(|(key, _)| decode_live_chain_key(&key).map(|(slot, _)| slot))
+            .filter_map(|(key, _)| match decode_live_chain_key(&key) {
+                Ok((slot, _)) => Some(slot),
+                Err(error) => {
+                    warn!(%error, "Skipping malformed LiveChain key");
+                    None
+                }
+            })
             .max()
     }
 
@@ -849,7 +868,13 @@ impl Store {
         view.prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .filter_map(|(k, _)| decode_live_chain_key(&k).map(|(_, root)| root))
+            .filter_map(|(k, _)| match decode_live_chain_key(&k) {
+                Ok((_, root)) => Some(root),
+                Err(error) => {
+                    warn!(%error, "Skipping malformed LiveChain key");
+                    None
+                }
+            })
             .collect()
     }
 
@@ -868,10 +893,12 @@ impl Store {
             .prefix_iterator(Table::LiveChain, &[])
             .expect("iterator")
             .filter_map(|res| res.ok())
-            .take_while(|(k, _)| {
-                decode_live_chain_key(k)
-                    .map(|(slot, _)| slot < finalized_slot)
-                    .unwrap_or(true)
+            .take_while(|(k, _)| match decode_live_chain_key(k) {
+                Ok((slot, _)) => slot < finalized_slot,
+                Err(error) => {
+                    warn!(%error, "Pruning malformed LiveChain key");
+                    true
+                }
             })
             .map(|(k, _)| k.to_vec())
             .collect();
