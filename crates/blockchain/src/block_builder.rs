@@ -1,4 +1,4 @@
-//! Block building: select attestations, compact, and seal state root.
+//! Block building: select attestations and seal state root.
 //!
 //! The selection algorithm is a tiered greedy modeled on Prysm's
 //! `sortByProfitability`. Each round scores remaining candidates against a
@@ -8,6 +8,10 @@
 //! incrementally so dependent attestations become eligible on the next round
 //! without re-running the STF. The final STF runs once after selection to
 //! seal `state_root`.
+//!
+//! Compaction is disabled: each `AttestationData` is packed with a single
+//! proof (the best one, see `select_best_proof`), so no recursive proof merge
+//! runs during block building.
 
 use std::{
     cmp::Reverse,
@@ -15,14 +19,13 @@ use std::{
     time::Instant,
 };
 
-use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
     slot_is_justifiable_after,
 };
 use ethlambda_types::{
     ShortRoot,
-    attestation::{AggregatedAttestation, AggregationBits, AttestationData},
+    attestation::{AggregatedAttestation, AttestationData},
     block::{AggregatedAttestations, Block, BlockBody, TypeOneMultiSignature},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -45,9 +48,9 @@ pub struct PostBlockCheckpoints {
 
 /// Build a valid block on top of this state.
 ///
-/// Selects attestations via `select_attestations`, compacts duplicate
-/// `AttestationData` entries, and runs the STF once to seal the state root.
-/// The proposer signature is NOT included; it is appended by the caller.
+/// Selects attestations via `select_attestations` (one proof per
+/// `AttestationData`, no compaction) and runs the STF once to seal the state
+/// root. The proposer signature is NOT included; it is appended by the caller.
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
@@ -70,14 +73,11 @@ pub(crate) fn build_block(
 
     let child_payloads_consumed = selected.len();
 
-    // Compact: merge proofs sharing the same AttestationData via recursive
-    // aggregation so each AttestationData appears at most once (leanSpec #510).
-    let compact_start = Instant::now();
-    let compacted = compact_attestations(selected, head_state)?;
-    metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
-
+    // Compaction disabled: `select_attestations` packs exactly one proof per
+    // AttestationData, so each appears at most once and no recursive proof
+    // merge (`aggregate_proofs`) is needed.
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
-        compacted.into_iter().unzip();
+        selected.into_iter().unzip();
 
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
@@ -121,7 +121,7 @@ pub(crate) fn build_block(
 ///
 /// Stops at `MAX_ATTESTATIONS_DATA` distinct data entries or when no
 /// remaining candidate has a positive score. Within-entry proof selection is
-/// delegated to `extend_proofs_greedily`.
+/// delegated to `select_best_proof` (one proof per entry, no compaction).
 fn select_attestations(
     head_state: &State,
     slot: u64,
@@ -163,7 +163,7 @@ fn select_attestations(
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
     for _round in 0..MAX_ATTESTATIONS_DATA {
-        let Some((data_root, score, new_voters)) =
+        let Some((data_root, score)) =
             pick_best_candidate(&chain, &processed_data_roots, &projected)
         else {
             trace!(
@@ -178,18 +178,24 @@ fn select_attestations(
         metrics::inc_block_proposal_attestation_builds();
 
         let before = selected.len();
-        extend_proofs_greedily(proofs, &mut selected, att_data);
-
         let target_root = att_data.target.root;
+        let prior_voters = projected.current_votes.get(&target_root);
+        // Compaction disabled: pack only the single best proof for this data.
+        // `covered` is exactly what landed in the block, so the projection below
+        // stays consistent with the STF.
+        let covered = select_best_proof(proofs, &mut selected, att_data, prior_voters);
+
+        let packed_voters = covered.len();
         projected
             .current_votes
             .entry(target_root)
             .or_default()
-            .extend(new_voters);
+            .extend(covered);
 
         trace!(
             tier = ?score.tier,
-            new_voters = score.new_voters,
+            candidate_new_voters = score.new_voters,
+            packed_voters,
             target_slot = score.target_slot,
             target_root = %ShortRoot(&target_root.0),
             data_root = %ShortRoot(&data_root.0),
@@ -229,15 +235,15 @@ fn select_attestations(
 ///
 /// Skips entries already processed, those failing `entry_passes_filters`
 /// (logging the reason), and those with zero new voters. Among remaining
-/// entries, returns `(data_root, score, new_voters)` for the entry with the
-/// best `EntryScore::ordering_key` (lower is better). Caller re-indexes
+/// entries, returns `(data_root, score)` for the entry with the best
+/// `EntryScore::ordering_key` (lower is better). Caller re-indexes
 /// `chain.aggregated_payloads[&data_root]` for `att_data` and `proofs`.
 fn pick_best_candidate(
     chain: &ChainContext<'_>,
     processed_data_roots: &HashSet<H256>,
     projected: &ProjectedState,
-) -> Option<(H256, EntryScore, HashSet<u64>)> {
-    let mut best: Option<(H256, EntryScore, HashSet<u64>)> = None;
+) -> Option<(H256, EntryScore)> {
+    let mut best: Option<(H256, EntryScore)> = None;
     let mut best_key: Option<OrderingKey> = None;
 
     for (data_root, (att_data, proofs)) in chain.aggregated_payloads {
@@ -255,7 +261,7 @@ fn pick_best_candidate(
             continue;
         }
 
-        let Some((score, new_voters)) = score_entry(
+        let Some(score) = score_entry(
             att_data,
             proofs,
             &projected.current_votes,
@@ -268,7 +274,7 @@ fn pick_best_candidate(
 
         let candidate_key = score.ordering_key(*data_root);
         if best_key.as_ref().is_none_or(|k| candidate_key < *k) {
-            best = Some((*data_root, score, new_voters));
+            best = Some((*data_root, score));
             best_key = Some(candidate_key);
         }
     }
@@ -349,26 +355,25 @@ fn entry_passes_filters(
 /// Score a single candidate entry under the current projected state.
 ///
 /// Returns `None` if the entry has zero new validators relative to the
-/// running voter set for its `target.root` (no marginal value, drop). On
-/// `Some`, the returned `HashSet` is the set of new voters contributed by
-/// this entry (caller uses it to update the running voter map without
-/// re-scanning aggregation bits). A genesis self-vote cannot justify or
-/// finalize and is always scored as tier 3.
+/// running voter set for its `target.root` (no marginal value, drop). A
+/// genesis self-vote cannot justify or finalize and is always scored as tier 3.
+///
+/// Only the score is returned; the voters packed into the block are chosen
+/// later by `select_best_proof` (a single proof), so the caller updates its
+/// projection from that function's return value rather than from this scan.
 fn score_entry(
     att_data: &AttestationData,
     proofs: &[TypeOneMultiSignature],
     current_votes: &HashMap<H256, HashSet<u64>>,
     projected_finalized_slot: u64,
     validator_count: usize,
-) -> Option<(EntryScore, HashSet<u64>)> {
+) -> Option<EntryScore> {
     let prior_voters = current_votes.get(&att_data.target.root);
     let prior_count = prior_voters.map_or(0, HashSet::len);
 
     // Collect voters that this entry adds on top of prior_voters. Avoids
     // cloning prior_voters; the inner contains() makes this O(participants)
-    // per candidate per round. `extend_proofs_greedily` selects proofs until
-    // none contribute new voters, so its final coverage equals this set
-    // unioned with prior_voters.
+    // per candidate per round.
     let mut new_voters: HashSet<u64> = HashSet::new();
     for proof in proofs {
         for vid in proof.participant_indices() {
@@ -403,15 +408,12 @@ fn score_entry(
         Tier::Justify
     };
 
-    Some((
-        EntryScore {
-            tier,
-            new_voters: new_voters.len(),
-            target_slot: att_data.target.slot,
-            att_slot: att_data.slot,
-        },
-        new_voters,
-    ))
+    Some(EntryScore {
+        tier,
+        new_voters: new_voters.len(),
+        target_slot: att_data.target.slot,
+        att_slot: att_data.slot,
+    })
 }
 
 /// Selection tier for a candidate `AttestationData` entry.
@@ -508,181 +510,56 @@ fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
     votes
 }
 
-/// Compact attestations so each AttestationData appears at most once.
+/// Select the single best proof for an attestation data entry.
 ///
-/// For each group of entries sharing the same AttestationData:
-/// - Single entry: kept as-is.
-/// - Multiple entries: merged into one using recursive proof aggregation
-///   (leanSpec PR #510).
-fn compact_attestations(
-    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
-    head_state: &State,
-) -> Result<Vec<(AggregatedAttestation, TypeOneMultiSignature)>, StoreError> {
-    if entries.len() <= 1 {
-        return Ok(entries);
-    }
-
-    // Group indices by AttestationData, preserving first-occurrence order
-    let mut order: Vec<AttestationData> = Vec::new();
-    let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
-    for (i, (att, _)) in entries.iter().enumerate() {
-        match groups.entry(att.data.clone()) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                order.push(e.key().clone());
-                e.insert(vec![i]);
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.get_mut().push(i);
-            }
-        }
-    }
-
-    // Fast path: no duplicates
-    if order.len() == entries.len() {
-        return Ok(entries);
-    }
-
-    // Wrap in Option so we can .take() items by index without cloning
-    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
-        entries.into_iter().map(Some).collect();
-
-    let mut compacted = Vec::with_capacity(order.len());
-
-    for data in order {
-        let indices = &groups[&data];
-        if indices.len() == 1 {
-            let item = items[indices[0]].take().expect("index used once");
-            compacted.push(item);
-            continue;
-        }
-
-        // Collect all entries for this AttestationData
-        let group_items: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = indices
-            .iter()
-            .map(|&idx| items[idx].take().expect("index used once"))
-            .collect();
-
-        // Union participant bitfields
-        let merged_bits = group_items.iter().skip(1).fold(
-            group_items[0].0.aggregation_bits.clone(),
-            |acc, (att, _)| union_aggregation_bits(&acc, &att.aggregation_bits),
-        );
-
-        // Recursively aggregate child proofs into one (leanSpec #510).
-        let data_root = data.hash_tree_root();
-        let children: Vec<(Vec<_>, _)> = group_items
-            .iter()
-            .map(|(_, proof)| {
-                let pubkeys = proof
-                    .participant_indices()
-                    .map(|vid| {
-                        head_state
-                            .validators
-                            .get(vid as usize)
-                            .ok_or(StoreError::InvalidValidatorIndex)?
-                            .get_attestation_pubkey()
-                            .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((pubkeys, proof.proof.clone()))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-
-        let slot: u32 = data.slot.try_into().expect("slot exceeds u32");
-        let merged_proof_data = aggregate_proofs(children, &data_root, slot)
-            .map_err(StoreError::SignatureAggregationFailed)?;
-
-        let merged_proof = TypeOneMultiSignature::new(merged_bits.clone(), merged_proof_data);
-        let merged_att = AggregatedAttestation {
-            aggregation_bits: merged_bits,
-            data,
-        };
-        compacted.push((merged_att, merged_proof));
-    }
-
-    Ok(compacted)
-}
-
-/// Greedily select proofs maximizing new validator coverage.
+/// Compaction is disabled, so each AttestationData is packed with exactly one
+/// proof and block building never runs a recursive proof merge. The "best"
+/// proof is the one adding the most validators not already counted for this
+/// target (`prior_voters`): that maximizes the union toward the 2/3
+/// justification threshold and the votes recorded for future blocks.
 ///
-/// For a single attestation data entry, picks proofs that cover the most
-/// uncovered validators. A proof is selected as long as it adds at least
-/// one previously-uncovered validator; partially-overlapping participants
-/// between selected proofs are allowed. `compact_attestations` later feeds
-/// these proofs as children to `aggregate_proofs`, which delegates to
-/// `xmss_aggregate` — that function tracks duplicate pubkeys across
-/// children via its `dup_pub_keys` machinery, so overlap is supported by
-/// the underlying aggregation scheme.
-///
-/// Each selected proof is appended to `selected` paired with its
-/// corresponding AggregatedAttestation.
-fn extend_proofs_greedily(
+/// Candidates are ranked over `proofs` in slice order, so ties resolve
+/// deterministically (last max wins). The chosen proof is appended to
+/// `selected` with its AggregatedAttestation. Returns the validators it newly
+/// covers (excluding `prior_voters`) so the caller keeps its vote projection
+/// consistent with the block; returns an empty set, packing nothing, if no
+/// proof adds a new voter.
+fn select_best_proof(
     proofs: &[TypeOneMultiSignature],
     selected: &mut Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
     att_data: &AttestationData,
-) {
-    if proofs.is_empty() {
-        return;
-    }
-
-    let mut covered: HashSet<u64> = HashSet::new();
-    let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
-
-    while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators (count only, no allocation)
-        let best = remaining_indices
-            .iter()
-            .map(|&idx| {
-                let count = proofs[idx]
-                    .participant_indices()
-                    .filter(|vid| !covered.contains(vid))
-                    .count();
-                (idx, count)
-            })
-            .max_by_key(|&(_, count)| count);
-
-        let Some((best_idx, best_count)) = best else {
-            break;
-        };
-        if best_count == 0 {
-            break;
-        }
-
-        let proof = &proofs[best_idx];
-
-        // Collect coverage only for the winning proof
-        let new_covered: Vec<u64> = proof
+    prior_voters: Option<&HashSet<u64>>,
+) -> HashSet<u64> {
+    let Some(proof) = proofs.iter().max_by_key(|proof| {
+        proof
             .participant_indices()
-            .filter(|vid| !covered.contains(vid))
-            .collect();
+            .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+            .count()
+    }) else {
+        return HashSet::new();
+    };
 
-        let att = AggregatedAttestation {
-            aggregation_bits: proof.participants.clone(),
-            data: att_data.clone(),
-        };
+    let covered_new: HashSet<u64> = proof
+        .participant_indices()
+        .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+        .collect();
 
-        metrics::inc_pq_sig_aggregated_signatures();
-        metrics::inc_pq_sig_attestations_in_aggregated_signatures(new_covered.len() as u64);
-
-        covered.extend(new_covered);
-        selected.push((att, proof.clone()));
-        remaining_indices.remove(&best_idx);
+    // `score_entry` guarantees the entry has at least one new voter, so the best
+    // proof adds at least one; guard defensively against packing a useless proof.
+    if covered_new.is_empty() {
+        return covered_new;
     }
-}
 
-/// Compute the bitwise union (OR) of two AggregationBits bitfields.
-fn union_aggregation_bits(a: &AggregationBits, b: &AggregationBits) -> AggregationBits {
-    let max_len = a.len().max(b.len());
-    if max_len == 0 {
-        return AggregationBits::with_length(0).expect("zero-length bitlist");
-    }
-    let mut result = AggregationBits::with_length(max_len).expect("union exceeds bitlist capacity");
-    for i in 0..max_len {
-        if a.get(i).unwrap_or(false) || b.get(i).unwrap_or(false) {
-            result.set(i, true).expect("index within capacity");
-        }
-    }
-    result
+    let att = AggregatedAttestation {
+        aggregation_bits: proof.participants.clone(),
+        data: att_data.clone(),
+    };
+
+    metrics::inc_pq_sig_aggregated_signatures();
+    metrics::inc_pq_sig_attestations_in_aggregated_signatures(covered_new.len() as u64);
+    selected.push((att, proof.clone()));
+
+    covered_new
 }
 
 /// Genesis self-votes (source == target == slot 0) are allowed in blocks for
@@ -711,7 +588,7 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData},
+        attestation::{AggregationBits, AttestationData},
         block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature},
         checkpoint::Checkpoint,
         state::State,
@@ -765,7 +642,7 @@ mod tests {
         // Supermajority (3 of 4) so the entry crosses 2/3.
         let proofs = vec![TypeOneMultiSignature::empty(make_bits(&[0, 1, 2]))];
 
-        let (score, _) = score_entry(
+        let score = score_entry(
             &att_data,
             &proofs,
             &HashMap::new(),
@@ -1202,137 +1079,198 @@ mod tests {
         assert_eq!(post_checkpoints.justified.slot, 2);
     }
 
+    /// Compaction is disabled: exactly one proof is packed per AttestationData,
+    /// the one covering the most validators. No proof is merged.
     #[test]
-    fn compact_attestations_no_duplicates() {
-        let data_a = make_att_data(1);
-        let data_b = make_att_data(2);
-        let bits_a = make_bits(&[0]);
-        let bits_b = make_bits(&[1]);
-
-        let entries = vec![
-            (
-                AggregatedAttestation {
-                    aggregation_bits: bits_a.clone(),
-                    data: data_a.clone(),
-                },
-                TypeOneMultiSignature::empty(bits_a),
-            ),
-            (
-                AggregatedAttestation {
-                    aggregation_bits: bits_b.clone(),
-                    data: data_b.clone(),
-                },
-                TypeOneMultiSignature::empty(bits_b),
-            ),
-        ];
-
-        let state = State::from_genesis(1000, vec![]);
-        let out = compact_attestations(entries, &state).unwrap();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].0.data, data_a);
-        assert_eq!(out[1].0.data, data_b);
-    }
-
-    #[test]
-    fn compact_attestations_preserves_order_no_duplicates() {
-        let data_a = make_att_data(1);
-        let data_b = make_att_data(2);
-        let data_c = make_att_data(3);
-
-        let bits_0 = make_bits(&[0]);
-        let bits_1 = make_bits(&[1]);
-        let bits_2 = make_bits(&[2]);
-
-        let entries = vec![
-            (
-                AggregatedAttestation {
-                    aggregation_bits: bits_0.clone(),
-                    data: data_a.clone(),
-                },
-                TypeOneMultiSignature::empty(bits_0),
-            ),
-            (
-                AggregatedAttestation {
-                    aggregation_bits: bits_1.clone(),
-                    data: data_b.clone(),
-                },
-                TypeOneMultiSignature::empty(bits_1),
-            ),
-            (
-                AggregatedAttestation {
-                    aggregation_bits: bits_2.clone(),
-                    data: data_c.clone(),
-                },
-                TypeOneMultiSignature::empty(bits_2),
-            ),
-        ];
-
-        let state = State::from_genesis(1000, vec![]);
-        let out = compact_attestations(entries, &state).unwrap();
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].0.data, data_a);
-        assert_eq!(out[1].0.data, data_b);
-        assert_eq!(out[2].0.data, data_c);
-    }
-
-    /// A partially-overlapping proof is still selected as long as it adds at
-    /// least one previously-uncovered validator. The greedy prefers the
-    /// largest proof first, then picks additional proofs whose coverage
-    /// extends `covered`. The resulting overlap is handled downstream by
-    /// `aggregate_proofs` → `xmss_aggregate` (which tracks duplicate pubkeys
-    /// across children via its `dup_pub_keys` machinery).
-    #[test]
-    fn extend_proofs_greedily_allows_overlap_when_it_adds_coverage() {
+    fn select_best_proof_packs_single_largest() {
         let data = make_att_data(1);
 
-        // Distinct sizes to avoid tie-breaking ambiguity (HashSet iteration
-        // order differs between debug/release):
-        //   A = {0, 1, 2, 3}  (4 validators — largest, picked first)
-        //   B = {2, 3, 4}     (overlaps A on {2,3} but adds validator 4)
-        //   C = {1, 2}        (subset of A — adds nothing, must be skipped)
+        // Distinct sizes keep the choice unambiguous: B is the largest.
         let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[2, 3, 4]));
-        let proof_c = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        let proof_b = TypeOneMultiSignature::empty(make_bits(&[2, 3, 4, 5, 6]));
+        let proof_c = TypeOneMultiSignature::empty(make_bits(&[0]));
 
         let mut selected = Vec::new();
-        extend_proofs_greedily(&[proof_a, proof_b, proof_c], &mut selected, &data);
+        let covered_new =
+            select_best_proof(&[proof_a, proof_b, proof_c], &mut selected, &data, None);
 
-        assert_eq!(
-            selected.len(),
-            2,
-            "A and B selected (B adds validator 4); C adds nothing and is skipped"
-        );
+        assert_eq!(selected.len(), 1, "exactly one proof packed, no merge");
+        let packed: HashSet<u64> = selected[0].1.participant_indices().collect();
+        assert_eq!(packed, HashSet::from([2, 3, 4, 5, 6]), "the largest proof");
+        assert_eq!(covered_new, HashSet::from([2, 3, 4, 5, 6]));
 
-        let covered: HashSet<u64> = selected
-            .iter()
-            .flat_map(|(_, p)| p.participant_indices())
-            .collect();
-        assert_eq!(covered, HashSet::from([0, 1, 2, 3, 4]));
-
-        // Attestation bits mirror the proof's participants for each entry.
-        for (att, proof) in &selected {
-            assert_eq!(att.aggregation_bits, proof.participants);
-            assert_eq!(att.data, data);
-        }
+        // Attestation bits mirror the packed proof's participants.
+        assert_eq!(selected[0].0.aggregation_bits, selected[0].1.participants);
+        assert_eq!(selected[0].0.data, data);
     }
 
-    /// When no proof contributes new coverage (subset of a previously selected
-    /// proof), greedy terminates without selecting it.
+    /// "Best" is measured by validators NOT already counted for the target
+    /// (`prior_voters`), not by raw participant count: a proof that is mostly
+    /// prior voters must lose to one that is all-new.
     #[test]
-    fn extend_proofs_greedily_stops_when_no_new_coverage() {
+    fn select_best_proof_ranks_by_net_new_over_prior() {
         let data = make_att_data(1);
 
-        // B's participants are a subset of A's. After picking A, B offers zero
-        // new coverage and must not be selected (its inclusion would also
-        // violate the disjoint invariant).
-        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        // Prior voters {0,1,2,3}.
+        //   A = {0,1,2,3,4}  (5 participants, only validator 4 is net-new)
+        //   B = {5,6,7,8}    (4 participants, all net-new)
+        // Raw count would pick A; net-new picks B.
+        let prior: HashSet<u64> = HashSet::from([0, 1, 2, 3]);
+        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3, 4]));
+        let proof_b = TypeOneMultiSignature::empty(make_bits(&[5, 6, 7, 8]));
 
         let mut selected = Vec::new();
-        extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data);
+        let covered_new =
+            select_best_proof(&[proof_a, proof_b], &mut selected, &data, Some(&prior));
 
         assert_eq!(selected.len(), 1);
-        let covered: HashSet<u64> = selected[0].1.participant_indices().collect();
-        assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+        let packed: HashSet<u64> = selected[0].1.participant_indices().collect();
+        assert_eq!(packed, HashSet::from([5, 6, 7, 8]), "the all-new proof B");
+        // Returned set excludes prior voters.
+        assert_eq!(covered_new, HashSet::from([5, 6, 7, 8]));
+    }
+
+    /// When every proof is entirely prior voters, nothing is packed (the entry
+    /// adds no new votes). Defensive: `score_entry` already drops such entries.
+    #[test]
+    fn select_best_proof_packs_nothing_when_no_new_voters() {
+        let data = make_att_data(1);
+
+        let prior: HashSet<u64> = HashSet::from([0, 1]);
+        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0]));
+        let proof_b = TypeOneMultiSignature::empty(make_bits(&[1]));
+
+        let mut selected = Vec::new();
+        let covered_new =
+            select_best_proof(&[proof_a, proof_b], &mut selected, &data, Some(&prior));
+
+        assert!(selected.is_empty(), "no proof adds a new voter");
+        assert!(covered_new.is_empty());
+    }
+
+    /// End-to-end through `build_block`: an entry with several proofs is packed
+    /// with only the single best one (no compaction), and the block still
+    /// justifies the target through the real state transition.
+    #[test]
+    fn build_block_packs_single_best_proof_and_justifies() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const SUPERMAJORITY: usize = 34; // ceil(2 * 50 / 3)
+        const HEAD_SLOT: u64 = 5;
+        const TARGET_SLOT: u64 = 1;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        let att_data = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let data_root = att_data.hash_tree_root();
+
+        // A supermajority proof (34/50) plus a smaller one. Only the best (the
+        // supermajority proof) is packed; the small proof is dropped.
+        let mut big_bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        for i in 0..SUPERMAJORITY {
+            big_bits.set(i, true).unwrap();
+        }
+        let big = TypeOneMultiSignature::new(big_bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+
+        let mut small_bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        small_bits.set(SUPERMAJORITY, true).unwrap();
+        small_bits.set(SUPERMAJORITY + 1, true).unwrap();
+        let small =
+            TypeOneMultiSignature::new(small_bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(data_root, (att_data.clone(), vec![big, small]));
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let (block, _signatures, post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        // One attestation carrying only the best proof's bits.
+        assert_eq!(block.body.attestations.len(), 1);
+        let packed = &block
+            .body
+            .attestations
+            .iter()
+            .next()
+            .unwrap()
+            .aggregation_bits;
+        let packed_count = (0..NUM_VALIDATORS)
+            .filter(|&i| packed.get(i).unwrap_or(false))
+            .count();
+        assert_eq!(
+            packed_count, SUPERMAJORITY,
+            "only the best (supermajority) proof is packed, not the extra voters"
+        );
+
+        // The single-proof block still justifies the target through the STF.
+        assert_eq!(post_checkpoints.justified.slot, TARGET_SLOT);
+        assert_eq!(
+            post_checkpoints.justified.root,
+            hashes[TARGET_SLOT as usize]
+        );
     }
 }
