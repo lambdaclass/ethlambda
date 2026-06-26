@@ -190,6 +190,9 @@ fn select_attestations(
             chain.validator_count,
         );
 
+        // `packed_voters` is what actually landed in the block (capped at the
+        // cutoff); `candidate_new_voters` is the full-coverage count scoring saw.
+        let packed_voters = covered.len();
         projected
             .current_votes
             .entry(target_root)
@@ -198,7 +201,8 @@ fn select_attestations(
 
         trace!(
             tier = ?score.tier,
-            new_voters = score.new_voters,
+            candidate_new_voters = score.new_voters,
+            packed_voters,
             target_slot = score.target_slot,
             target_root = %ShortRoot(&target_root.0),
             data_root = %ShortRoot(&data_root.0),
@@ -424,7 +428,11 @@ fn score_entry(
 ///
 /// This is the consensus threshold for justifying a target. Block building uses
 /// it both to tier candidate entries (`score_entry`) and to stop packing proofs
-/// for an entry once the target crosses it (`extend_proofs_greedily`).
+/// for an entry once the target crosses it (`extend_proofs_greedily`). It must
+/// match the state transition's own justification check exactly.
+///
+/// `validator_count` is bounded by the validator registry, so `3 * count`
+/// cannot overflow `usize`.
 fn is_supermajority(count: usize, validator_count: usize) -> bool {
     3 * count >= 2 * validator_count
 }
@@ -621,10 +629,13 @@ fn compact_attestations(
 /// Greedily select proofs maximizing new validator coverage, stopping at the
 /// 2/3 supermajority.
 ///
-/// For a single attestation data entry, picks proofs that cover the most
-/// uncovered validators. A proof is selected as long as it adds at least one
-/// previously-uncovered validator; partially-overlapping participants between
-/// selected proofs are allowed.
+/// For a single attestation data entry, picks the proof adding the most
+/// validators to the target's voter union (`prior_voters` plus everything
+/// packed so far). A proof is selected as long as it adds at least one new
+/// validator; partially-overlapping participants between selected proofs are
+/// allowed. Ranking against the full union (rather than only previously-packed
+/// proofs) avoids packing a proof whose voters are mostly already counted,
+/// which would be a redundant child in the merge below.
 ///
 /// Selection stops early once the target crosses a 2/3 supermajority: counting
 /// `prior_voters` (validators that already voted for this target in the
@@ -650,28 +661,31 @@ fn extend_proofs_greedily(
     prior_voters: Option<&HashSet<u64>>,
     validator_count: usize,
 ) -> HashSet<u64> {
-    // Validators packed here that did not already vote for this target. Counts
-    // toward the supermajority union exactly once and is returned to the caller.
+    // Validators newly packed here (excluding prior_voters); returned to the
+    // caller so it can keep its vote projection consistent with the block.
     let mut covered_new: HashSet<u64> = HashSet::new();
     if proofs.is_empty() {
         return covered_new;
     }
-    let prior_count = prior_voters.map_or(0, HashSet::len);
 
-    // All validators covered by selected proofs (including those already in
-    // prior_voters), used to score each candidate by its uncovered additions.
-    let mut covered: HashSet<u64> = HashSet::new();
+    // Running union of validators counted toward this target: prior voters plus
+    // everything packed so far. Candidates are ranked by what they add to THIS
+    // union (not just to previously-packed proofs), so a proof whose voters are
+    // mostly already counted -- e.g. prior voters -- doesn't look large and is
+    // not packed for a redundant merge.
+    let mut union: HashSet<u64> = prior_voters.cloned().unwrap_or_default();
     let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
     let mut cutoff_reached = false;
 
     while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators (count only, no allocation)
+        // Pick the proof adding the most validators to the union (count only, no
+        // allocation).
         let best = remaining_indices
             .iter()
             .map(|&idx| {
                 let count = proofs[idx]
                     .participant_indices()
-                    .filter(|vid| !covered.contains(vid))
+                    .filter(|vid| !union.contains(vid))
                     .count();
                 (idx, count)
             })
@@ -686,10 +700,11 @@ fn extend_proofs_greedily(
 
         let proof = &proofs[best_idx];
 
-        // Collect coverage only for the winning proof
+        // Validators this proof adds to the union (all genuinely new: not prior,
+        // not already packed).
         let new_covered: Vec<u64> = proof
             .participant_indices()
-            .filter(|vid| !covered.contains(vid))
+            .filter(|vid| !union.contains(vid))
             .collect();
 
         let att = AggregatedAttestation {
@@ -701,29 +716,29 @@ fn extend_proofs_greedily(
         metrics::inc_pq_sig_attestations_in_aggregated_signatures(new_covered.len() as u64);
 
         for &vid in &new_covered {
-            if prior_voters.is_none_or(|prior| !prior.contains(&vid)) {
-                covered_new.insert(vid);
-            }
+            covered_new.insert(vid);
+            union.insert(vid);
         }
-        covered.extend(new_covered);
         selected.push((att, proof.clone()));
         remaining_indices.remove(&best_idx);
 
-        if is_supermajority(prior_count + covered_new.len(), validator_count) {
+        // union.len() == prior_voters.len() + covered_new.len(): the total
+        // validators voting for this target in the projected post-state.
+        if is_supermajority(union.len(), validator_count) {
             cutoff_reached = true;
             break;
         }
     }
 
-    // Trace any proof we did not select, distinguishing the supermajority cutoff
-    // (proof still had coverage to add) from ordinary exhaustion (its voters are
-    // already covered).
-    if !remaining_indices.is_empty() {
+    // Trace any proof we did not pack, distinguishing the supermajority cutoff
+    // (proof still had net-new voters) from ordinary exhaustion (already
+    // covered). Gated so the per-proof recount is skipped when trace is off.
+    if !remaining_indices.is_empty() && tracing::enabled!(tracing::Level::TRACE) {
         let data_root = att_data.hash_tree_root();
         for &idx in &remaining_indices {
             let new_for_proof = proofs[idx]
                 .participant_indices()
-                .filter(|vid| !covered.contains(vid))
+                .filter(|vid| !union.contains(vid))
                 .count();
             let reason = if cutoff_reached && new_for_proof > 0 {
                 "supermajority_reached"
@@ -1519,5 +1534,166 @@ mod tests {
         assert_eq!(selected.len(), 1, "prior voters push the union over 2/3");
         // Returned set excludes prior voters; it is only what this call added.
         assert_eq!(covered_new, HashSet::from([2, 3, 4]));
+    }
+
+    /// Proofs are ranked by what they add to the target's voter union (which
+    /// includes `prior_voters`), not just by raw participant count. A proof that
+    /// is mostly prior voters must lose to one that is all-new, otherwise the
+    /// greedy packs a redundant extra proof before the cutoff fires.
+    #[test]
+    fn extend_proofs_greedily_ranks_by_net_new_over_prior() {
+        let data = make_att_data(1);
+
+        // 9 validators; supermajority = 6. Prior voters {0,1,2,3}.
+        //   A = {0,1,2,3,4}  (5 participants, but only validator 4 is net-new)
+        //   B = {5,6,7,8}    (4 participants, all net-new)
+        // Ranking by raw count would pick A first (5 > 4) and then need B too.
+        // Ranking by net-new picks B first (4 > 1); union = {0,1,2,3,5,6,7,8} = 8
+        // >= 6, so the cutoff fires and A is never packed.
+        let prior: HashSet<u64> = HashSet::from([0, 1, 2, 3]);
+        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3, 4]));
+        let proof_b = TypeOneMultiSignature::empty(make_bits(&[5, 6, 7, 8]));
+
+        let mut selected = Vec::new();
+        let covered_new =
+            extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data, Some(&prior), 9);
+
+        assert_eq!(selected.len(), 1, "only the all-new proof is needed");
+        let packed: HashSet<u64> = selected[0].1.participant_indices().collect();
+        assert_eq!(
+            packed,
+            HashSet::from([5, 6, 7, 8]),
+            "the all-new proof B was packed, not A"
+        );
+        assert_eq!(covered_new, HashSet::from([5, 6, 7, 8]));
+    }
+
+    /// End-to-end through `build_block`: an entry whose proofs together exceed
+    /// 2/3 must pack only the supermajority proof (cutoff drops the extra), so
+    /// `compact_attestations` stays on its single-proof fast path (no recursive
+    /// aggregation), and the capped block still justifies the target when run
+    /// through the real state transition.
+    #[test]
+    fn build_block_cutoff_packs_minimum_and_still_justifies() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const SUPERMAJORITY: usize = 34; // ceil(2 * 50 / 3)
+        const HEAD_SLOT: u64 = 5;
+        const TARGET_SLOT: u64 = 1;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        let att_data = AttestationData {
+            slot,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let data_root = att_data.hash_tree_root();
+
+        // A supermajority proof (34/50) plus a small extra. The cutoff packs only
+        // the supermajority proof, so compaction never calls aggregate_proofs.
+        let mut big_bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        for i in 0..SUPERMAJORITY {
+            big_bits.set(i, true).unwrap();
+        }
+        let big = TypeOneMultiSignature::new(big_bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+
+        let mut small_bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        small_bits.set(SUPERMAJORITY, true).unwrap();
+        small_bits.set(SUPERMAJORITY + 1, true).unwrap();
+        let small =
+            TypeOneMultiSignature::new(small_bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+
+        let mut aggregated_payloads = HashMap::new();
+        aggregated_payloads.insert(data_root, (att_data.clone(), vec![big, small]));
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let (block, _signatures, post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+        )
+        .expect("build_block should succeed");
+
+        // One attestation for the data, carrying only the supermajority proof's
+        // bits -- the extra proof was dropped by the cutoff.
+        assert_eq!(block.body.attestations.len(), 1);
+        let packed = &block
+            .body
+            .attestations
+            .iter()
+            .next()
+            .unwrap()
+            .aggregation_bits;
+        let packed_count = (0..NUM_VALIDATORS)
+            .filter(|&i| packed.get(i).unwrap_or(false))
+            .count();
+        assert_eq!(
+            packed_count, SUPERMAJORITY,
+            "cutoff should pack only the supermajority proof, not the extra voters"
+        );
+
+        // The capped block still justifies the target through the real STF.
+        assert_eq!(post_checkpoints.justified.slot, TARGET_SLOT);
+        assert_eq!(
+            post_checkpoints.justified.root,
+            hashes[TARGET_SLOT as usize]
+        );
     }
 }
