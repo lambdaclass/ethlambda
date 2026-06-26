@@ -602,6 +602,8 @@ impl BlockChainServer {
         // not count toward the block-building metric.
         drop(timing);
 
+        info!(%slot, %validator_id, "Finished building block");
+
         let now_ms = unix_now_ms();
 
         // Align publication to the slot boundary. If the build finished before
