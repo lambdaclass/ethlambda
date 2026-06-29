@@ -91,10 +91,26 @@ pub(crate) fn build_block(
     // AttestationData are merged via recursive Type-1 aggregation into a
     // union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
     // work and keep only the single best-coverage proof per data.
+    let entries = selected.len();
+    let distinct_data = selected
+        .iter()
+        .map(|(att, _)| &att.data)
+        .collect::<HashSet<_>>()
+        .len();
+    let duplicates = entries - distinct_data;
+
     let compact_start = Instant::now();
     let compacted = if enable_proposer_aggregation {
-        compact_attestations(selected, head_state)?
+        info!(slot, entries, duplicates, "Compacting attestations");
+        let compacted = compact_attestations(selected, head_state)?;
+        info!(
+            slot,
+            entries = compacted.len(),
+            "Finished compacting attestations"
+        );
+        compacted
     } else {
+        info!(slot, entries, duplicates, "Skipping attestation compaction");
         keep_best_proof_per_data(selected)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
