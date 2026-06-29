@@ -710,8 +710,8 @@ mod tests {
     /// unconditional `state.latest_justified = target` assignment caused the
     /// post-state to end at `latest_justified.slot = 27974`. Because the
     /// store had already latched `latest_justified = 27978` from importing a
-    /// fork block, every subsequent proposal produced a block whose justified
-    /// slot lagged the store and the chain froze.
+    /// fork block, every subsequent proposal failed
+    /// `JustifiedDivergenceNotClosed` and the chain froze.
     ///
     /// Compressed setup: finalized=0, source=3 (justified), targets in body
     /// order 4 / 9 / 6 — all justifiable from finalized=0 (Δ=4 ≤ 5, Δ=9=3²,
