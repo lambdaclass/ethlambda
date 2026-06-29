@@ -90,28 +90,13 @@ pub(crate) fn build_block(
     // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
     // AttestationData are merged via recursive Type-1 aggregation into a
     // union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
-    // work and keep only the single best-coverage proof per data.
-    let entries = selected.len();
-    let distinct_data = selected
-        .iter()
-        .map(|(att, _)| &att.data)
-        .collect::<HashSet<_>>()
-        .len();
-    let duplicates = entries - distinct_data;
-
+    // work and keep only the single best-coverage proof per data. Both paths
+    // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
     let compacted = if enable_proposer_aggregation {
-        info!(slot, entries, duplicates, "Compacting attestations");
-        let compacted = compact_attestations(selected, head_state)?;
-        info!(
-            slot,
-            entries = compacted.len(),
-            "Finished compacting attestations"
-        );
-        compacted
+        compact_attestations(selected, head_state, slot)?
     } else {
-        info!(slot, entries, duplicates, "Skipping attestation compaction");
-        keep_best_proof_per_data(selected)
+        keep_best_proof_per_data(selected, slot)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
@@ -556,11 +541,8 @@ fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
 fn compact_attestations(
     entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
     head_state: &State,
+    block_slot: u64,
 ) -> Result<Vec<(AggregatedAttestation, TypeOneMultiSignature)>, StoreError> {
-    if entries.len() <= 1 {
-        return Ok(entries);
-    }
-
     // Group indices by AttestationData, preserving first-occurrence order
     let mut order: Vec<AttestationData> = Vec::new();
     let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
@@ -576,8 +558,16 @@ fn compact_attestations(
         }
     }
 
-    // Fast path: no duplicates
+    info!(
+        slot = block_slot,
+        entries = entries.len(),
+        unique = order.len(),
+        "Compacting attestations"
+    );
+
+    // Fast path: every AttestationData already appears once (covers ≤1 entry).
     if order.len() == entries.len() {
+        info!(slot = block_slot, "Finished compacting attestations");
         return Ok(entries);
     }
 
@@ -639,6 +629,7 @@ fn compact_attestations(
         compacted.push((merged_att, merged_proof));
     }
 
+    info!(slot = block_slot, "Finished compacting attestations");
     Ok(compacted)
 }
 
@@ -653,11 +644,8 @@ fn compact_attestations(
 /// individual proof already had, which is the cost of skipping aggregation.
 fn keep_best_proof_per_data(
     entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    block_slot: u64,
 ) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
-    if entries.len() <= 1 {
-        return entries;
-    }
-
     // Preserve first-occurrence order of distinct AttestationData; for each,
     // track the index of the best (most participants) entry seen so far.
     let mut order: Vec<AttestationData> = Vec::new();
@@ -677,7 +665,15 @@ fn keep_best_proof_per_data(
         }
     }
 
-    // Fast path: every AttestationData already appeared exactly once.
+    info!(
+        slot = block_slot,
+        entries = entries.len(),
+        unique = order.len(),
+        "Skipping attestation compaction"
+    );
+
+    // Fast path: every AttestationData already appeared exactly once (covers
+    // ≤1 entry).
     if order.len() == entries.len() {
         return entries;
     }
@@ -1450,7 +1446,7 @@ mod tests {
         ];
 
         let state = State::from_genesis(1000, vec![]);
-        let out = compact_attestations(entries, &state).unwrap();
+        let out = compact_attestations(entries, &state, 0).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0.data, data_a);
         assert_eq!(out[1].0.data, data_b);
@@ -1491,7 +1487,7 @@ mod tests {
         ];
 
         let state = State::from_genesis(1000, vec![]);
-        let out = compact_attestations(entries, &state).unwrap();
+        let out = compact_attestations(entries, &state, 0).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].0.data, data_a);
         assert_eq!(out[1].0.data, data_b);
