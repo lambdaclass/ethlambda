@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Fork Choice Visualization - ethlambda</title>
+        <title>HTTP API - ethlambda</title>
 
 
         <!-- Custom HTML head -->
@@ -146,7 +146,7 @@
                         <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/fork_choice_visualization.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/rpc.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -180,112 +180,161 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="fork-choice-visualization"><a class="header" href="#fork-choice-visualization">Fork Choice Visualization</a></h1>
-<p>A browser-based real-time visualization of the LMD GHOST fork choice tree, served from the existing RPC server with no additional dependencies.</p>
-<h2 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h2>
+                        <h1 id="http-api"><a class="header" href="#http-api">HTTP API</a></h1>
+<p>ethlambda exposes HTTP over <strong>two independent <a href="https://github.com/tokio-rs/axum">Axum</a> servers</strong> on separate ports, so the API and the metrics/debug surface can have different network policies:</p>
+<ul>
+<li><strong>API server</strong> — consensus data (blocks, states, checkpoints, fork choice) and admin controls.</li>
+<li><strong>Metrics &amp; debug server</strong> — Prometheus metrics and heap-profiling endpoints. No store access.</li>
+</ul>
+<p>All consensus API paths are versioned under the <code>/lean/v0</code> prefix. Roots are serialized as <code>0x</code>-prefixed hex strings.</p>
+<h2 id="servers--ports"><a class="header" href="#servers--ports">Servers &amp; Ports</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Endpoint</th><th>Description</th></tr>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>GET /lean/v0/fork_choice/ui</code></td><td>Interactive D3.js visualization page</td></tr>
-<tr><td><code>GET /lean/v0/fork_choice</code></td><td>JSON snapshot of the fork choice tree</td></tr>
+<tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address shared by both servers</td></tr>
+<tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port</td></tr>
+<tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics &amp; debug server port</td></tr>
 </tbody>
 </table>
 </div>
-<p>Both endpoints are served on the API port (<code>--api-port</code>, default <code>5052</code>).</p>
-<h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
-<h3 id="local-devnet"><a class="header" href="#local-devnet">Local devnet</a></h3>
-<pre><code class="language-bash">make run-devnet
-</code></pre>
-<p>The local devnet runs 3 ethlambda nodes with metrics ports 8085, 8086, and 8087. Open any of them:</p>
-<ul>
-<li>http://localhost:8085/lean/v0/fork_choice/ui</li>
-<li>http://localhost:8086/lean/v0/fork_choice/ui</li>
-<li>http://localhost:8087/lean/v0/fork_choice/ui</li>
-</ul>
-<h3 id="standalone-node"><a class="header" href="#standalone-node">Standalone node</a></h3>
-<pre><code class="language-bash">cargo run --release -- \
-  --genesis ./config/config.yaml \
-  --validators ./config/annotated_validators.yaml \
-  --bootnodes ./config/nodes.yaml \
-  --validator-config ./config/validator-config.yaml \
-  --hash-sig-keys-dir ./config/hash-sig-keys \
-  --node-key ./keys/node.key \
-  --node-id 0 \
-  --api-port 5052
-</code></pre>
-<p>Then open http://localhost:5052/lean/v0/fork_choice/ui.</p>
-<h2 id="visualization-guide"><a class="header" href="#visualization-guide">Visualization Guide</a></h2>
-<h3 id="color-coding"><a class="header" href="#color-coding">Color coding</a></h3>
+<p>If <code>--api-port</code> and <code>--metrics-port</code> are equal, all routers are merged onto a single port.</p>
+<h2 id="api-server-5052"><a class="header" href="#api-server-5052">API Server (<code>:5052</code>)</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Color</th><th>Meaning</th></tr>
+<tr><th>Method</th><th>Path</th><th>Response</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Green</td><td>Finalized block</td></tr>
-<tr><td>Blue</td><td>Justified block</td></tr>
-<tr><td>Yellow</td><td>Safe target block</td></tr>
-<tr><td>Orange</td><td>Current head</td></tr>
-<tr><td>Gray</td><td>Default (no special status)</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON</td><td>Liveness check</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/checkpoints/justified</code></td><td>JSON</td><td>Latest justified <code>Checkpoint</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}</code></td><td>JSON</td><td>Block by root or slot</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}/header</code></td><td>JSON</td><td>Block header by root or slot</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice</code></td><td>JSON</td><td>Fork-choice tree with per-block weights</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice/ui</code></td><td>HTML</td><td>Interactive D3.js visualization</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Current aggregator role</td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Toggle aggregator role at runtime</td></tr>
 </tbody>
 </table>
 </div>
-<h3 id="layout"><a class="header" href="#layout">Layout</a></h3>
-<ul>
-<li><strong>Y axis</strong>: slot number (time flows downward)</li>
-<li><strong>X axis</strong>: fork spreading — branches appear when competing chains exist</li>
-<li><strong>Circle size</strong>: scaled by <code>weight / validator_count</code> — larger circles have more attestation support</li>
-</ul>
-<h3 id="interactive-features"><a class="header" href="#interactive-features">Interactive features</a></h3>
-<ul>
-<li><strong>Tooltips</strong>: hover any block to see root hash, slot, proposer index, and weight</li>
-<li><strong>Auto-polling</strong>: the page fetches fresh data every 2 seconds</li>
-<li><strong>Auto-scroll</strong>: the view follows the head as the chain progresses</li>
-</ul>
-<h3 id="what-to-look-for"><a class="header" href="#what-to-look-for">What to look for</a></h3>
-<ul>
-<li><strong>Single vertical chain</strong>: healthy consensus, no forks</li>
-<li><strong>Horizontal branching</strong>: competing chains — check attestation weights to see which branch validators prefer</li>
-<li><strong>Color transitions</strong>: blocks turning green as finalization advances</li>
-<li><strong>Stalled finalization</strong>: if justified/finalized slots stop advancing, check validator attestation activity</li>
-</ul>
-<h2 id="json-api"><a class="header" href="#json-api">JSON API</a></h2>
-<pre><code class="language-bash">curl -s http://localhost:5052/lean/v0/fork_choice | jq .
+<h3 id="get-leanv0health"><a class="header" href="#get-leanv0health"><code>GET /lean/v0/health</code></a></h3>
+<p>The handler emits a fixed, compact body (no whitespace):</p>
+<pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
 </code></pre>
-<p>Response schema:</p>
+<h3 id="get-leanv0statesfinalized"><a class="header" href="#get-leanv0statesfinalized"><code>GET /lean/v0/states/finalized</code></a></h3>
+<p>SSZ-encoded <code>State</code> at the latest finalized checkpoint (<code>Content-Type: application/octet-stream</code>). The served state has its <code>latest_block_header.state_root</code> zeroed to match the canonical post-state representation the state transition produces, so checkpoint-sync peers reconstruct an identical state root. See <a href="./checkpoint_sync.html">Checkpoint Sync</a>.</p>
+<h3 id="get-leanv0blocksfinalized"><a class="header" href="#get-leanv0blocksfinalized"><code>GET /lean/v0/blocks/finalized</code></a></h3>
+<p>SSZ-encoded <code>SignedBlock</code> at the latest finalized checkpoint. The genesis/anchor block has no stored signature, so a placeholder blank proof is synthesized and the endpoint still returns <code>200</code>. Returns <code>404</code> only in the rare case where a non-genesis finalized block’s signature has been pruned below the finalized boundary and can no longer be served.</p>
+<h3 id="get-leanv0checkpointsjustified"><a class="header" href="#get-leanv0checkpointsjustified"><code>GET /lean/v0/checkpoints/justified</code></a></h3>
+<pre><code class="language-json">{ "slot": 128, "root": "0x1a2b…" }
+</code></pre>
+<h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
+<p><code>block_id</code> is either:</p>
+<ul>
+<li>a <code>0x</code>-prefixed <strong>32-byte hex root</strong>, or</li>
+<li>a <strong>decimal slot</strong>.</li>
+</ul>
+<p>Slot lookups resolve through the head state’s <code>historical_block_hashes</code>, so <strong>only canonical blocks are reachable by slot</strong>; blocks on side forks must be addressed by their root. The <code>/header</code> variant returns just the <code>BlockHeader</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Condition</th></tr>
+</thead>
+<tbody>
+<tr><td><code>200</code></td><td>Block (or header) found, returned as JSON</td></tr>
+<tr><td><code>400</code></td><td><code>block_id</code> is neither a valid <code>0x</code> root nor a decimal slot</td></tr>
+<tr><td><code>404</code></td><td>No block at that root, or the slot is empty / out of range</td></tr>
+</tbody>
+</table>
+</div>
+<p>Error bodies are JSON: <code>{ "error": "invalid block_id" }</code> / <code>{ "error": "block not found" }</code>.</p>
+<h3 id="get-leanv0fork_choice"><a class="header" href="#get-leanv0fork_choice"><code>GET /lean/v0/fork_choice</code></a></h3>
+<p>The fork-choice tree from the finalized root, with LMD-GHOST weights computed over the live chain and currently known attestations.</p>
 <pre><code class="language-json">{
   "nodes": [
-    {
-      "root": "0x...",
-      "slot": 42,
-      "parent_root": "0x...",
-      "proposer_index": 3,
-      "weight": 5
-    }
+    { "root": "0x…", "slot": 128, "parent_root": "0x…", "proposer_index": 3, "weight": 12 }
   ],
-  "head": "0x...",
-  "justified": { "root": "0x...", "slot": 10 },
-  "finalized": { "root": "0x...", "slot": 5 },
-  "safe_target": "0x...",
-  "validator_count": 8
+  "head": "0x…",
+  "justified": { "slot": 128, "root": "0x…" },
+  "finalized": { "slot": 96,  "root": "0x…" },
+  "safe_target": "0x…",
+  "validator_count": 16
 }
+</code></pre>
+<p><code>/lean/v0/fork_choice/ui</code> serves an interactive D3.js page rendering this data. See <a href="./fork_choice_visualization.html">Fork Choice Visualization</a>.</p>
+<h3 id="get--post-leanv0adminaggregator"><a class="header" href="#get--post-leanv0adminaggregator"><code>GET</code> / <code>POST /lean/v0/admin/aggregator</code></a></h3>
+<p>Toggle the aggregator role at runtime without restarting the node (hot-standby model, ported from leanSpec PR #636).</p>
+<pre><code class="language-bash"># Read current role
+curl http://127.0.0.1:5052/lean/v0/admin/aggregator
+# → {"is_aggregator": true}
+
+# Toggle role; body must be a JSON boolean
+curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
+  -H 'content-type: application/json' -d '{"enabled": false}'
+# → {"is_aggregator": false, "previous": true}
 </code></pre>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Field</th><th>Description</th></tr>
+<tr><th>Status</th><th>Condition</th></tr>
 </thead>
 <tbody>
-<tr><td><code>nodes</code></td><td>All blocks in the live chain (from finalized slot onward)</td></tr>
-<tr><td><code>nodes[].weight</code></td><td>Number of latest-message attestations whose target is this block or a descendant</td></tr>
-<tr><td><code>head</code></td><td>Current fork choice head root</td></tr>
-<tr><td><code>justified</code></td><td>Latest justified checkpoint</td></tr>
-<tr><td><code>finalized</code></td><td>Latest finalized checkpoint</td></tr>
-<tr><td><code>safe_target</code></td><td>Block root selected with a 2/3 validator threshold</td></tr>
-<tr><td><code>validator_count</code></td><td>Total validators in the head state</td></tr>
+<tr><td><code>200</code></td><td>Role read / set</td></tr>
+<tr><td><code>400</code></td><td>Missing/malformed body, missing <code>enabled</code>, or <code>enabled</code> not a JSON boolean (integers <code>0</code>/<code>1</code> and strings are rejected)</td></tr>
+<tr><td><code>503</code></td><td>Aggregator controller not wired (does not occur in normal <code>main.rs</code> boot)</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>Note:</strong> Runtime toggles do <strong>not</strong> resubscribe gossip subnets, which are frozen at startup. A standby aggregator should boot with <code>--is-aggregator=true</code> (so subscriptions are in place), then use this endpoint to rotate duties. See the CLAUDE.md “Runtime Aggregator Toggle” notes for the operational model.</p>
+</blockquote>
+<h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/metrics</code></td><td>text</td><td>Prometheus-format metrics</td></tr>
+<tr><td><code>GET</code></td><td><code>/health</code></td><td>JSON</td><td>Liveness check (same payload as the API health endpoint)</td></tr>
+<tr><td><code>GET</code></td><td><code>/debug/pprof/allocs</code></td><td>pprof</td><td>jemalloc heap profile</td></tr>
+<tr><td><code>GET</code></td><td><code>/debug/pprof/allocs/flamegraph</code></td><td>SVG</td><td>jemalloc heap flamegraph</td></tr>
+</tbody>
+</table>
+</div>
+<p>The metrics endpoint reads from the global Prometheus registry and needs no store access. See <a href="./metrics.html">Metrics</a> for the full list of exposed series.</p>
+<p>Heap-profiling endpoints are backed by jemalloc’s built-in profiler and are <strong>only functional on Linux</strong>; other platforms return <code>501 Not Implemented</code>. On Linux they return <code>500</code> if profiling was not enabled at startup.</p>
+<h2 id="test-driver-endpoints-hive"><a class="header" href="#test-driver-endpoints-hive">Test-Driver Endpoints (Hive)</a></h2>
+<p>When the binary boots with <code>HIVE_LEAN_TEST_DRIVER=1</code> (any of <code>1</code>/<code>true</code>/<code>yes</code>), it runs in <strong>test-driver mode</strong> instead of the normal API server. The <a href="https://github.com/ethereum/hive">ethereum/hive</a> lean simulator drives these endpoints to replay leanSpec fixtures over HTTP. The driver swaps its in-process <code>Store</code> on every <code>fork_choice/init</code>, so one container can replay many fixtures without restart.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON liveness (for the hive port check)</td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/fork_choice/init</code></td><td><code>204</code> / <code>400</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/fork_choice/step</code></td><td><code>StepResponse</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/state_transition/run</code></td><td><code>StateTransitionResponse</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/verify_signatures/run</code></td><td><code>VerifySignaturesResponse</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="content-types"><a class="header" href="#content-types">Content Types</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Kind</th><th><code>Content-Type</code></th></tr>
+</thead>
+<tbody>
+<tr><td>JSON</td><td><code>application/json; charset=utf-8</code></td></tr>
+<tr><td>SSZ</td><td><code>application/octet-stream</code></td></tr>
+<tr><td>Prometheus metrics</td><td><code>text/plain; version=0.0.4; charset=utf-8</code></td></tr>
+<tr><td>HTML</td><td><code>text/html; charset=utf-8</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -294,10 +343,13 @@
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="checkpoint_sync.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="lmd_ghost.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="metrics.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -305,10 +357,13 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="checkpoint_sync.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="lmd_ghost.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="metrics.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>

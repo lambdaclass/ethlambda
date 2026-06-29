@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-f7745e2b.js";
+            window.path_to_searchindex_js = "searchindex-c54f2e7a.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-031b865e.js"></script>
+        <script src="toc-294cc887.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1417,6 +1417,165 @@ forks. ethlambda does not implement this in its fork choice.</p>
 all operations complete in sub-millisecond time. The <code>// TODO: add proto-array implementation</code> comment in the source indicates a future optimization path:
 proto-array is an O(1) amortized fork choice algorithm used by most Beacon Chain
 clients.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="http-api"><a class="header" href="#http-api">HTTP API</a></h1>
+<p>ethlambda exposes HTTP over <strong>two independent <a href="https://github.com/tokio-rs/axum">Axum</a> servers</strong> on separate ports, so the API and the metrics/debug surface can have different network policies:</p>
+<ul>
+<li><strong>API server</strong> — consensus data (blocks, states, checkpoints, fork choice) and admin controls.</li>
+<li><strong>Metrics &amp; debug server</strong> — Prometheus metrics and heap-profiling endpoints. No store access.</li>
+</ul>
+<p>All consensus API paths are versioned under the <code>/lean/v0</code> prefix. Roots are serialized as <code>0x</code>-prefixed hex strings.</p>
+<h2 id="servers--ports"><a class="header" href="#servers--ports">Servers &amp; Ports</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address shared by both servers</td></tr>
+<tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port</td></tr>
+<tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics &amp; debug server port</td></tr>
+</tbody>
+</table>
+</div>
+<p>If <code>--api-port</code> and <code>--metrics-port</code> are equal, all routers are merged onto a single port.</p>
+<h2 id="api-server-5052"><a class="header" href="#api-server-5052">API Server (<code>:5052</code>)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON</td><td>Liveness check</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/checkpoints/justified</code></td><td>JSON</td><td>Latest justified <code>Checkpoint</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}</code></td><td>JSON</td><td>Block by root or slot</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}/header</code></td><td>JSON</td><td>Block header by root or slot</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice</code></td><td>JSON</td><td>Fork-choice tree with per-block weights</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice/ui</code></td><td>HTML</td><td>Interactive D3.js visualization</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Current aggregator role</td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Toggle aggregator role at runtime</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="get-leanv0health"><a class="header" href="#get-leanv0health"><code>GET /lean/v0/health</code></a></h3>
+<p>The handler emits a fixed, compact body (no whitespace):</p>
+<pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
+</code></pre>
+<h3 id="get-leanv0statesfinalized"><a class="header" href="#get-leanv0statesfinalized"><code>GET /lean/v0/states/finalized</code></a></h3>
+<p>SSZ-encoded <code>State</code> at the latest finalized checkpoint (<code>Content-Type: application/octet-stream</code>). The served state has its <code>latest_block_header.state_root</code> zeroed to match the canonical post-state representation the state transition produces, so checkpoint-sync peers reconstruct an identical state root. See <a href="#checkpoint-sync">Checkpoint Sync</a>.</p>
+<h3 id="get-leanv0blocksfinalized"><a class="header" href="#get-leanv0blocksfinalized"><code>GET /lean/v0/blocks/finalized</code></a></h3>
+<p>SSZ-encoded <code>SignedBlock</code> at the latest finalized checkpoint. The genesis/anchor block has no stored signature, so a placeholder blank proof is synthesized and the endpoint still returns <code>200</code>. Returns <code>404</code> only in the rare case where a non-genesis finalized block’s signature has been pruned below the finalized boundary and can no longer be served.</p>
+<h3 id="get-leanv0checkpointsjustified"><a class="header" href="#get-leanv0checkpointsjustified"><code>GET /lean/v0/checkpoints/justified</code></a></h3>
+<pre><code class="language-json">{ "slot": 128, "root": "0x1a2b…" }
+</code></pre>
+<h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
+<p><code>block_id</code> is either:</p>
+<ul>
+<li>a <code>0x</code>-prefixed <strong>32-byte hex root</strong>, or</li>
+<li>a <strong>decimal slot</strong>.</li>
+</ul>
+<p>Slot lookups resolve through the head state’s <code>historical_block_hashes</code>, so <strong>only canonical blocks are reachable by slot</strong>; blocks on side forks must be addressed by their root. The <code>/header</code> variant returns just the <code>BlockHeader</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Condition</th></tr>
+</thead>
+<tbody>
+<tr><td><code>200</code></td><td>Block (or header) found, returned as JSON</td></tr>
+<tr><td><code>400</code></td><td><code>block_id</code> is neither a valid <code>0x</code> root nor a decimal slot</td></tr>
+<tr><td><code>404</code></td><td>No block at that root, or the slot is empty / out of range</td></tr>
+</tbody>
+</table>
+</div>
+<p>Error bodies are JSON: <code>{ "error": "invalid block_id" }</code> / <code>{ "error": "block not found" }</code>.</p>
+<h3 id="get-leanv0fork_choice"><a class="header" href="#get-leanv0fork_choice"><code>GET /lean/v0/fork_choice</code></a></h3>
+<p>The fork-choice tree from the finalized root, with LMD-GHOST weights computed over the live chain and currently known attestations.</p>
+<pre><code class="language-json">{
+  "nodes": [
+    { "root": "0x…", "slot": 128, "parent_root": "0x…", "proposer_index": 3, "weight": 12 }
+  ],
+  "head": "0x…",
+  "justified": { "slot": 128, "root": "0x…" },
+  "finalized": { "slot": 96,  "root": "0x…" },
+  "safe_target": "0x…",
+  "validator_count": 16
+}
+</code></pre>
+<p><code>/lean/v0/fork_choice/ui</code> serves an interactive D3.js page rendering this data. See <a href="#fork-choice-visualization">Fork Choice Visualization</a>.</p>
+<h3 id="get--post-leanv0adminaggregator"><a class="header" href="#get--post-leanv0adminaggregator"><code>GET</code> / <code>POST /lean/v0/admin/aggregator</code></a></h3>
+<p>Toggle the aggregator role at runtime without restarting the node (hot-standby model, ported from leanSpec PR #636).</p>
+<pre><code class="language-bash"># Read current role
+curl http://127.0.0.1:5052/lean/v0/admin/aggregator
+# → {"is_aggregator": true}
+
+# Toggle role; body must be a JSON boolean
+curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
+  -H 'content-type: application/json' -d '{"enabled": false}'
+# → {"is_aggregator": false, "previous": true}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Condition</th></tr>
+</thead>
+<tbody>
+<tr><td><code>200</code></td><td>Role read / set</td></tr>
+<tr><td><code>400</code></td><td>Missing/malformed body, missing <code>enabled</code>, or <code>enabled</code> not a JSON boolean (integers <code>0</code>/<code>1</code> and strings are rejected)</td></tr>
+<tr><td><code>503</code></td><td>Aggregator controller not wired (does not occur in normal <code>main.rs</code> boot)</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>Note:</strong> Runtime toggles do <strong>not</strong> resubscribe gossip subnets, which are frozen at startup. A standby aggregator should boot with <code>--is-aggregator=true</code> (so subscriptions are in place), then use this endpoint to rotate duties. See the CLAUDE.md “Runtime Aggregator Toggle” notes for the operational model.</p>
+</blockquote>
+<h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/metrics</code></td><td>text</td><td>Prometheus-format metrics</td></tr>
+<tr><td><code>GET</code></td><td><code>/health</code></td><td>JSON</td><td>Liveness check (same payload as the API health endpoint)</td></tr>
+<tr><td><code>GET</code></td><td><code>/debug/pprof/allocs</code></td><td>pprof</td><td>jemalloc heap profile</td></tr>
+<tr><td><code>GET</code></td><td><code>/debug/pprof/allocs/flamegraph</code></td><td>SVG</td><td>jemalloc heap flamegraph</td></tr>
+</tbody>
+</table>
+</div>
+<p>The metrics endpoint reads from the global Prometheus registry and needs no store access. See <a href="#metrics">Metrics</a> for the full list of exposed series.</p>
+<p>Heap-profiling endpoints are backed by jemalloc’s built-in profiler and are <strong>only functional on Linux</strong>; other platforms return <code>501 Not Implemented</code>. On Linux they return <code>500</code> if profiling was not enabled at startup.</p>
+<h2 id="test-driver-endpoints-hive"><a class="header" href="#test-driver-endpoints-hive">Test-Driver Endpoints (Hive)</a></h2>
+<p>When the binary boots with <code>HIVE_LEAN_TEST_DRIVER=1</code> (any of <code>1</code>/<code>true</code>/<code>yes</code>), it runs in <strong>test-driver mode</strong> instead of the normal API server. The <a href="https://github.com/ethereum/hive">ethereum/hive</a> lean simulator drives these endpoints to replay leanSpec fixtures over HTTP. The driver swaps its in-process <code>Store</code> on every <code>fork_choice/init</code>, so one container can replay many fixtures without restart.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON liveness (for the hive port check)</td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/fork_choice/init</code></td><td><code>204</code> / <code>400</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/fork_choice/step</code></td><td><code>StepResponse</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/state_transition/run</code></td><td><code>StateTransitionResponse</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/lean/v0/test_driver/verify_signatures/run</code></td><td><code>VerifySignaturesResponse</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="content-types"><a class="header" href="#content-types">Content Types</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Kind</th><th><code>Content-Type</code></th></tr>
+</thead>
+<tbody>
+<tr><td>JSON</td><td><code>application/json; charset=utf-8</code></td></tr>
+<tr><td>SSZ</td><td><code>application/octet-stream</code></td></tr>
+<tr><td>Prometheus metrics</td><td><code>text/plain; version=0.0.4; charset=utf-8</code></td></tr>
+<tr><td>HTML</td><td><code>text/html; charset=utf-8</code></td></tr>
+</tbody>
+</table>
+</div>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="metrics"><a class="header" href="#metrics">Metrics</a></h1>
 <p>We collect various metrics and serve them via a Prometheus-compatible HTTP endpoint at <code>http://&lt;http_address&gt;:&lt;metrics_port&gt;/metrics</code> (default: <code>http://127.0.0.1:5054/metrics</code>).</p>
