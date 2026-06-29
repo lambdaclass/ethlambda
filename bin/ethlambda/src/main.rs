@@ -215,6 +215,7 @@ async fn main() -> eyre::Result<()> {
         aggregator.clone(),
         attestation_committee_count,
         !options.disable_duty_sync_gate,
+        options.enable_proposer_aggregation,
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the

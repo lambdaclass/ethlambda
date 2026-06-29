@@ -82,6 +82,7 @@ impl BlockChain {
         aggregator: AggregatorController,
         attestation_committee_count: u64,
         gate_duties: bool,
+        enable_proposer_aggregation: bool,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -106,6 +107,7 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
+            enable_proposer_aggregation,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
         }
@@ -165,6 +167,13 @@ pub struct BlockChainServer {
     /// Number of attestation committees (= subnet count). Used by the
     /// attestation aggregate coverage emission.
     attestation_committee_count: u64,
+
+    /// Whether to compact same-data attestations during block building by
+    /// recursively aggregating their Type-1 proofs (leanSpec #510). Seeded
+    /// from the CLI `--enable-proposer-aggregation` flag at spawn. When false
+    /// (the default) the proposer leaves duplicate-data entries unmerged,
+    /// skipping the per-data leanVM aggregation.
+    enable_proposer_aggregation: bool,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
     /// report. Captured at the end-of-slot promote (interval 4), read at the
@@ -493,10 +502,13 @@ impl BlockChainServer {
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
         let timing = metrics::time_block_building();
-        let Ok((block, type_one_proofs, _post_checkpoints)) =
-            store::produce_block_with_signatures(&mut self.store, slot, validator_id)
-                .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let Ok((block, type_one_proofs, _post_checkpoints)) = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            self.enable_proposer_aggregation,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
             metrics::inc_block_building_failures();
             return;
         };

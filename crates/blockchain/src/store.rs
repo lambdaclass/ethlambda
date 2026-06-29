@@ -789,6 +789,7 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
+    enable_proposer_aggregation: bool,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
@@ -822,6 +823,7 @@ pub fn produce_block_with_signatures(
             head_root,
             &known_block_roots,
             &aggregated_payloads,
+            enable_proposer_aggregation,
         )?
     };
 

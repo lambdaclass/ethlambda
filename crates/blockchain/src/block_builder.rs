@@ -45,9 +45,18 @@ pub struct PostBlockCheckpoints {
 
 /// Build a valid block on top of this state.
 ///
-/// Selects attestations via `select_attestations`, compacts duplicate
-/// `AttestationData` entries, and runs the STF once to seal the state root.
-/// The proposer signature is NOT included; it is appended by the caller.
+/// Selects attestations via `select_attestations`, optionally compacts
+/// duplicate `AttestationData` entries (see `enable_proposer_aggregation`),
+/// and runs the STF once to seal the state root. The proposer signature is NOT
+/// included; it is appended by the caller.
+///
+/// When `enable_proposer_aggregation` is set, entries sharing the same
+/// `AttestationData` are merged into one via recursive Type-1 aggregation
+/// (leanSpec #510), shrinking the block at the cost of a leanVM aggregation
+/// per duplicated data entry. When unset, duplicate-data entries are left
+/// as-is: the block carries more attestation entries but skips that work.
+/// Both forms are valid; the state transition unions votes by target root and
+/// the attestation-to-proof correspondence stays 1:1 either way.
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
@@ -55,6 +64,7 @@ pub(crate) fn build_block(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+    enable_proposer_aggregation: bool,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
@@ -72,8 +82,14 @@ pub(crate) fn build_block(
 
     // Compact: merge proofs sharing the same AttestationData via recursive
     // aggregation so each AttestationData appears at most once (leanSpec #510).
+    // Gated by `enable_proposer_aggregation`: when disabled, the selected
+    // entries are used unmerged (each carries its own Type-1 proof).
     let compact_start = Instant::now();
-    let compacted = compact_attestations(selected, head_state)?;
+    let compacted = if enable_proposer_aggregation {
+        compact_attestations(selected, head_state)?
+    } else {
+        selected
+    };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
@@ -905,6 +921,7 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
+            true,
         )
         .expect("build_block should succeed");
 
@@ -938,6 +955,131 @@ mod tests {
             signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
+        );
+    }
+
+    /// With proposer aggregation disabled, `build_block` must leave entries
+    /// sharing the same `AttestationData` unmerged: each selected proof stays
+    /// its own attestation entry with its own Type-1 signature (1:1), rather
+    /// than being compacted into a single recursively-aggregated proof. This
+    /// path performs no leanVM aggregation, so empty proof blobs suffice.
+    #[test]
+    fn build_block_without_proposer_aggregation_keeps_duplicate_data_unmerged() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 4;
+        const HEAD_SLOT: u64 = 11;
+        const TARGET_SLOT: u64 = 5;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let historical_block_hashes = SszList::try_from(hashes.clone()).unwrap();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes,
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        let source = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+        let target = Checkpoint {
+            root: hashes[TARGET_SLOT as usize],
+            slot: TARGET_SLOT,
+        };
+        let head = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        // A single AttestationData carrying two disjoint-coverage proofs (one
+        // for validator 0, one for validator 1). Both are selected by
+        // `extend_proofs_greedily` since each adds a new voter.
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head,
+            target,
+            source,
+        };
+        let data_root = att_data.hash_tree_root();
+        let proofs = vec![
+            TypeOneMultiSignature::empty(make_bits(&[0])),
+            TypeOneMultiSignature::empty(make_bits(&[1])),
+        ];
+
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+            HashMap::new();
+        aggregated_payloads.insert(data_root, (att_data.clone(), proofs));
+
+        let (block, signatures, _post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+            false,
+        )
+        .expect("build_block should succeed");
+
+        // Both proofs survive as separate entries (no compaction merge), and
+        // the attestation-to-signature correspondence stays 1:1.
+        assert_eq!(
+            block.body.attestations.len(),
+            2,
+            "duplicate-data entries must not be merged when aggregation is disabled"
+        );
+        assert_eq!(
+            signatures.len(),
+            2,
+            "one Type-1 proof per attestation entry"
+        );
+        assert!(
+            block
+                .body
+                .attestations
+                .iter()
+                .all(|att| att.data == att_data),
+            "both entries should carry the shared AttestationData"
         );
     }
 
@@ -1048,6 +1190,7 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
+            true,
         )
         .expect("build_block should succeed");
 
@@ -1180,6 +1323,7 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
+            true,
         )
         .expect("build_block should succeed");
 
