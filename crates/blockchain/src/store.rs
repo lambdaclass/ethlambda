@@ -825,17 +825,23 @@ pub fn produce_block_with_signatures(
         )?
     };
 
-    // Invariant (leanSpec #595): the produced block must not lag the store's
-    // justified checkpoint. Otherwise peers processing this block would never
-    // see justification advance, degrading liveness: the fixed-point loop in
-    // `build_block` is expected to incorporate pool attestations that close
-    // any divergence inherited from a minority fork.
+    // leanSpec #595: ideally the produced block should not lag the store's
+    // justified checkpoint, since peers processing it would not see
+    // justification advance, degrading liveness. The fixed-point loop in
+    // `build_block` is expected to incorporate pool attestations that close any
+    // divergence inherited from a minority fork, but it may not always
+    // converge. We still publish the block in that case (halting block
+    // production freezes the chain, which is worse) and only log the divergence.
     let store_justified_slot = store.latest_justified().slot;
     if post_checkpoints.justified.slot < store_justified_slot {
-        return Err(StoreError::JustifiedDivergenceNotClosed {
-            block_justified_slot: post_checkpoints.justified.slot,
+        warn!(
+            %slot,
+            proposer = validator_index,
+            block_justified_slot = post_checkpoints.justified.slot,
             store_justified_slot,
-        });
+            "Produced block justified slot is behind store justified slot; \
+             fixed-point attestation loop did not converge"
+        );
     }
 
     metrics::observe_block_aggregated_payloads(signatures.len());
@@ -945,16 +951,6 @@ pub enum StoreError {
 
     #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
     TooManyAttestationData { count: usize, max: usize },
-
-    #[error(
-        "Produced block justified slot {block_justified_slot} \
-         is behind store justified slot {store_justified_slot}; \
-         fixed-point attestation loop did not converge"
-    )]
-    JustifiedDivergenceNotClosed {
-        block_justified_slot: u64,
-        store_justified_slot: u64,
-    },
 }
 
 /// Full verification of a signed block's proof.
