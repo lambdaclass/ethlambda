@@ -8,7 +8,7 @@ use ethlambda_types::{
         Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
         SignedAttestation, validator_indices,
     },
-    block::{Block, BlockHeader, SignedBlock, TypeOneMultiSignature},
+    block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
@@ -790,7 +790,7 @@ pub fn produce_block_with_signatures(
     slot: u64,
     validator_index: u64,
     enable_proposer_aggregation: bool,
-) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
     let head_state = store
@@ -952,7 +952,7 @@ pub enum StoreError {
     TooManyAttestationData { count: usize, max: usize },
 }
 
-/// Full verification of a signed block's merged Type-2 proof.
+/// Full verification of a signed block's merged multi-message aggregate proof.
 ///
 /// Structural pre-checks (fast fail) ensure the merged proof's `info` list lines
 /// up with the block body (one entry per attestation plus a trailing proposer
@@ -994,7 +994,7 @@ pub fn verify_block_signatures(
     let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
 
-    // Resolve pubkeys per Type-2 component for verify_type_2 and rederive the
+    // Resolve pubkeys per multi-message aggregate component for verify_type_2 and rederive the
     // expected (message, slot) bindings from the block body. Attestation
     // components use each participant's attestation_pubkey; the trailing
     // proposer component uses the proposal_pubkey of `block.proposer_index`.
@@ -1049,7 +1049,7 @@ pub fn verify_block_signatures(
         ?structural_elapsed,
         ?crypto_elapsed,
         ?total_elapsed,
-        "Block Type-2 proof verified"
+        "Block multi-message aggregate proof verified"
     );
 
     Ok(())
@@ -1108,7 +1108,7 @@ mod tests {
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{
             AggregatedAttestations, BlockBody, MultiMessageAggregate, SignedBlock,
-            TypeOneMultiSignature,
+            SingleMessageAggregate,
         },
         checkpoint::Checkpoint,
         state::State,
@@ -1122,7 +1122,7 @@ mod tests {
     /// `verify_block_signatures` use an empty blob.
     fn make_signed_block_proof(
         _proposer_index: u64,
-        _attestation_proofs: Vec<TypeOneMultiSignature>,
+        _attestation_proofs: Vec<SingleMessageAggregate>,
     ) -> MultiMessageAggregate {
         MultiMessageAggregate::default()
     }
@@ -1194,8 +1194,8 @@ mod tests {
         let proof = make_signed_block_proof(
             0,
             vec![
-                TypeOneMultiSignature::empty(bits_a),
-                TypeOneMultiSignature::empty(bits_b),
+                SingleMessageAggregate::empty(bits_a),
+                SingleMessageAggregate::empty(bits_b),
             ],
         );
         let signed_block = SignedBlock {

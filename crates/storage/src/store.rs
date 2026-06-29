@@ -10,7 +10,7 @@ use crate::error::Error;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
-        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature,
+        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -131,14 +131,14 @@ const GOSSIP_SIGNATURE_CAP: usize = 2048;
 #[derive(Clone)]
 struct PayloadEntry {
     data: AttestationData,
-    proofs: Vec<TypeOneMultiSignature>,
+    proofs: Vec<SingleMessageAggregate>,
 }
 
 /// Fixed-size circular buffer for aggregated payloads.
 ///
 /// Groups proofs by attestation data (via data_root). Each distinct
 /// attestation message stores the full `AttestationData` plus all
-/// `TypeOneMultiSignature`s covering that message.
+/// `SingleMessageAggregate`s covering that message.
 ///
 /// Entries are evicted FIFO (by insertion order of the data_root)
 /// when the buffer reaches capacity.
@@ -169,7 +169,7 @@ impl PayloadBuffer {
     ///   any existing proof, the incoming proof is redundant and skipped.
     /// - Otherwise, any existing proof whose participants are a strict subset
     ///   of the incoming proof's is removed before inserting.
-    fn push(&mut self, hashed: HashedAttestationData, proof: TypeOneMultiSignature) {
+    fn push(&mut self, hashed: HashedAttestationData, proof: SingleMessageAggregate) {
         let (data_root, att_data) = hashed.into_parts();
 
         if let Some(entry) = self.data.get_mut(&data_root) {
@@ -218,7 +218,7 @@ impl PayloadBuffer {
     }
 
     /// Insert a batch of (hashed_attestation_data, proof) entries.
-    fn push_batch(&mut self, entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>) {
+    fn push_batch(&mut self, entries: Vec<(HashedAttestationData, SingleMessageAggregate)>) {
         for (hashed, proof) in entries {
             self.push(hashed, proof);
         }
@@ -230,7 +230,7 @@ impl PayloadBuffer {
     /// like `promote_new_aggregated_payloads` re-insert into known_payloads
     /// deterministically. HashMap iteration would be RandomState-seeded and
     /// produce non-deterministic vote ordering for same-slot equivocation.
-    fn drain(&mut self) -> Vec<(HashedAttestationData, TypeOneMultiSignature)> {
+    fn drain(&mut self) -> Vec<(HashedAttestationData, SingleMessageAggregate)> {
         self.total_proofs = 0;
         let mut result = Vec::with_capacity(self.data.values().map(|e| e.proofs.len()).sum());
         while let Some(data_root) = self.order.pop_front() {
@@ -254,7 +254,7 @@ impl PayloadBuffer {
     }
 
     /// Return cloned proofs for a given data_root, or empty vec if none.
-    fn proofs_for_root(&self, data_root: &H256) -> Vec<TypeOneMultiSignature> {
+    fn proofs_for_root(&self, data_root: &H256) -> Vec<SingleMessageAggregate> {
         self.data
             .get(data_root)
             .map_or_else(Vec::new, |e| e.proofs.clone())
@@ -1313,7 +1313,7 @@ impl Store {
     /// Returns a snapshot of known payloads as (AttestationData, Vec<proof>) pairs.
     pub fn known_aggregated_payloads(
         &self,
-    ) -> HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> {
+    ) -> HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> {
         let buf = self.known_payloads.lock().unwrap();
         buf.data
             .iter()
@@ -1348,7 +1348,7 @@ impl Store {
     pub fn existing_proofs_for_data(
         &self,
         data_root: &H256,
-    ) -> (Vec<TypeOneMultiSignature>, Vec<TypeOneMultiSignature>) {
+    ) -> (Vec<SingleMessageAggregate>, Vec<SingleMessageAggregate>) {
         let new = self.new_payloads.lock().unwrap().proofs_for_root(data_root);
         let known = self
             .known_payloads
@@ -1370,7 +1370,7 @@ impl Store {
     pub fn insert_known_aggregated_payload(
         &mut self,
         hashed: HashedAttestationData,
-        proof: TypeOneMultiSignature,
+        proof: SingleMessageAggregate,
     ) {
         self.known_payloads.lock().unwrap().push(hashed, proof);
     }
@@ -1378,7 +1378,7 @@ impl Store {
     /// Batch-insert proofs into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>,
+        entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
         self.known_payloads.lock().unwrap().push_batch(entries);
     }
@@ -1392,7 +1392,7 @@ impl Store {
     pub fn insert_new_aggregated_payload(
         &mut self,
         hashed: HashedAttestationData,
-        proof: TypeOneMultiSignature,
+        proof: SingleMessageAggregate,
     ) {
         self.new_payloads.lock().unwrap().push(hashed, proof);
     }
@@ -1400,7 +1400,7 @@ impl Store {
     /// Batch-insert proofs into the new buffer.
     pub fn insert_new_aggregated_payloads_batch(
         &mut self,
-        entries: Vec<(HashedAttestationData, TypeOneMultiSignature)>,
+        entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
@@ -1541,7 +1541,7 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    // Store the merged Type-2 proof blob, keyed by slot||root so signature
+    // Store the merged multi-message aggregate proof blob, keyed by slot||root so signature
     // pruning can scan in slot order and stop early. Table name kept for the
     // column-family migration cost; renaming to `BlockProof` is a follow-up.
     let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
@@ -1842,28 +1842,28 @@ mod tests {
 
     // ============ PayloadBuffer Tests ============
 
-    fn make_proof() -> TypeOneMultiSignature {
+    fn make_proof() -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
-        TypeOneMultiSignature::empty(AggregationBits::new())
+        SingleMessageAggregate::empty(AggregationBits::new())
     }
 
     /// Create a proof with a specific validator bit set (distinct participants).
-    fn make_proof_for_validator(vid: usize) -> TypeOneMultiSignature {
+    fn make_proof_for_validator(vid: usize) -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
         let mut bits = AggregationBits::with_length(vid + 1).unwrap();
         bits.set(vid, true).unwrap();
-        TypeOneMultiSignature::empty(bits)
+        SingleMessageAggregate::empty(bits)
     }
 
     /// Create a proof with bits set for every validator in `vids`.
-    fn make_proof_for_validators(vids: &[u64]) -> TypeOneMultiSignature {
+    fn make_proof_for_validators(vids: &[u64]) -> SingleMessageAggregate {
         use ethlambda_types::attestation::AggregationBits;
         let max = vids.iter().copied().max().unwrap_or(0) as usize;
         let mut bits = AggregationBits::with_length(max + 1).unwrap();
         for &v in vids {
             bits.set(v as usize, true).unwrap();
         }
-        TypeOneMultiSignature::empty(bits)
+        SingleMessageAggregate::empty(bits)
     }
 
     fn make_att_data(slot: u64) -> AttestationData {

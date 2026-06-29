@@ -13,7 +13,7 @@ use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
-    block::{ByteList512KiB, TypeOneMultiSignature},
+    block::{ByteList512KiB, SingleMessageAggregate},
     primitives::H256,
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
@@ -65,7 +65,7 @@ pub struct AggregationSnapshot {
 /// as a message payload so the store can be updated and gossip publish fired.
 pub struct AggregatedGroupOutput {
     pub(crate) hashed: HashedAttestationData,
-    pub(crate) proof: TypeOneMultiSignature,
+    pub(crate) proof: SingleMessageAggregate,
     pub(crate) participants: Vec<u64>,
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
@@ -232,7 +232,7 @@ fn build_job(
 /// can't be fully resolved (passing fewer pubkeys than the proof expects would
 /// produce an invalid aggregate).
 fn resolve_child_pubkeys(
-    child_proofs: &[TypeOneMultiSignature],
+    child_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
 ) -> (Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>, Vec<u64>) {
     let mut children = Vec::with_capacity(child_proofs.len());
@@ -290,7 +290,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     participants.dedup();
 
     let aggregation_bits = aggregation_bits_from_validator_indices(&participants);
-    let proof = TypeOneMultiSignature::new(aggregation_bits, proof_data);
+    let proof = SingleMessageAggregate::new(aggregation_bits, proof_data);
     metrics::observe_aggregated_proof_size(proof.proof.len());
 
     Some(AggregatedGroupOutput {
@@ -328,14 +328,14 @@ pub fn finalize_aggregation_session(store: &Store) {
 /// no proof adds new coverage. This keeps the number of children minimal
 /// while maximizing the validators we can skip re-aggregating from scratch.
 fn select_proofs_greedily(
-    new_proofs: &[TypeOneMultiSignature],
-    known_proofs: &[TypeOneMultiSignature],
-) -> (Vec<TypeOneMultiSignature>, HashSet<u64>) {
-    let mut selected: Vec<TypeOneMultiSignature> = Vec::new();
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+) -> (Vec<SingleMessageAggregate>, HashSet<u64>) {
+    let mut selected: Vec<SingleMessageAggregate> = Vec::new();
     let mut covered: HashSet<u64> = HashSet::new();
 
     for proof_set in [new_proofs, known_proofs] {
-        let mut remaining: Vec<&TypeOneMultiSignature> = proof_set.iter().collect();
+        let mut remaining: Vec<&SingleMessageAggregate> = proof_set.iter().collect();
 
         while !remaining.is_empty() {
             let best_idx = remaining

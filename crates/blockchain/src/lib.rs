@@ -170,11 +170,11 @@ pub struct BlockChainServer {
 
     /// How the proposer collapses same-data attestations during block building
     /// (a block may carry at most one entry per `AttestationData`). When true,
-    /// same-data proofs are merged via recursive Type-1 aggregation into a
-    /// union-coverage proof (leanSpec #510); when false (the default), only the
-    /// single best-coverage proof per data is kept, skipping the per-data
-    /// leanVM aggregation. Seeded from the CLI `--enable-proposer-aggregation`
-    /// flag at spawn.
+    /// same-data proofs are merged via recursive single-message aggregation
+    /// into a union-coverage proof (leanSpec #510); when false (the default),
+    /// only the single best-coverage proof per data is kept, skipping the
+    /// per-data leanVM aggregation. Seeded from the CLI
+    /// `--enable-proposer-aggregation` flag at spawn.
     enable_proposer_aggregation: bool,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
@@ -480,7 +480,8 @@ impl BlockChainServer {
     /// Build the target slot's block and publish it, one interval early.
     ///
     /// Runs at the previous slot's interval 4, blocking the actor for the build
-    /// (the expensive part is the leanVM Type-1 → Type-2 merge). It first
+    /// (the expensive part is the leanVM single-message → multi-message
+    /// aggregate merge). It first
     /// advances the store to the target slot's interval 0 (accepting
     /// attestations) so the block is built on exactly the interval-0 state a
     /// non-prebuilding proposer would see, then builds and publishes — aligned
@@ -504,13 +505,15 @@ impl BlockChainServer {
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
         let timing = metrics::time_block_building();
-        let Ok((block, type_one_proofs, _post_checkpoints)) = store::produce_block_with_signatures(
-            &mut self.store,
-            slot,
-            validator_id,
-            self.enable_proposer_aggregation,
-        )
-        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
+        let Ok((block, single_message_aggregates, _post_checkpoints)) =
+            store::produce_block_with_signatures(
+                &mut self.store,
+                slot,
+                validator_id,
+                self.enable_proposer_aggregation,
+            )
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+        else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -532,8 +535,9 @@ impl BlockChainServer {
             return;
         };
 
-        // Wrap the proposer's raw XMSS signature into a singleton Type-1 SNARK,
-        // then merge it with every attestation Type-1 into the single Type-2.
+        // Wrap the proposer's raw XMSS signature into a singleton
+        // single-message aggregate SNARK, then merge it with every attestation
+        // single-message aggregate into the single multi-message aggregate.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         let Some(proposer_validator) = validators.get(validator_id as usize) else {
@@ -543,7 +547,8 @@ impl BlockChainServer {
         };
 
         // Decode the proposer's proposal pubkey once and reuse it both for the
-        // singleton Type-1 wrap and for the Type-2 merge inputs.
+        // singleton single-message aggregate wrap and for the multi-message
+        // aggregate merge inputs.
         let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
             |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
         ) else {
@@ -566,18 +571,18 @@ impl BlockChainServer {
             slot as u32,
         )
         .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as Type-1"),
+            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as single-message aggregate"),
         ) else {
             metrics::inc_block_building_failures();
             return;
         };
 
         let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-            Vec::with_capacity(type_one_proofs.len() + 1);
+            Vec::with_capacity(single_message_aggregates.len() + 1);
         let mut resolve_failed = false;
-        for t1 in &type_one_proofs {
+        for sma in &single_message_aggregates {
             let mut pubkeys = Vec::new();
-            for vid in t1.participant_indices() {
+            for vid in sma.participant_indices() {
                 let Some(validator) = validators.get(vid as usize) else {
                     error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
                     resolve_failed = true;
@@ -595,7 +600,7 @@ impl BlockChainServer {
             if resolve_failed {
                 break;
             }
-            merge_inputs.push((pubkeys, t1.proof.clone()));
+            merge_inputs.push((pubkeys, sma.proof.clone()));
         }
         if resolve_failed {
             metrics::inc_block_building_failures();
@@ -603,7 +608,7 @@ impl BlockChainServer {
         }
         merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
-        // Merge yields raw lean-multisig Type-2 bytes. Per-component
+        // Merge yields raw lean-multisig type-2 bytes. Per-component
         // participants are rederived at verify time from
         // `block.body.attestations[i].aggregation_bits` plus
         // `block.proposer_index`, so nothing else needs persisting.
@@ -817,8 +822,9 @@ impl BlockChainServer {
                     "Block imported successfully"
                 );
 
-                // Recover per-attestation Type-1 proofs from the block's
-                // merged Type-2 and fold them into the local pool. Only
+                // Recover per-attestation single-message aggregates from the
+                // block's merged multi-message aggregate and fold them into the
+                // local pool. Only
                 // run when the chain is in sync — backfilling nodes must
                 // not spam gossip with rederived aggregates.
                 if self.sync_status.duties_allowed() {
