@@ -84,4 +84,17 @@ pub(crate) struct CliOptions {
     /// but it no longer suppresses any duty: the gate becomes observe-only.
     #[arg(long, default_value = "false")]
     pub(crate) disable_duty_sync_gate: bool,
+    /// Enable proposer-side aggregation of attestation proofs when building a
+    /// block.
+    ///
+    /// A block may carry at most one entry per `AttestationData`, so the
+    /// proposer must collapse same-data proofs either way. When set,
+    /// `build_block` merges them via recursive Type-1 aggregation into a single
+    /// union-coverage proof per data (leanSpec #510), maximizing voter coverage
+    /// at the cost of a leanVM aggregation per duplicated data entry. When unset
+    /// (the default), it instead keeps only the single best-coverage proof per
+    /// data and drops the rest, skipping the leanVM work at the cost of lower
+    /// coverage.
+    #[arg(long, default_value = "false")]
+    pub(crate) enable_proposer_aggregation: bool,
 }
