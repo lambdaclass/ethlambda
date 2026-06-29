@@ -45,18 +45,23 @@ pub struct PostBlockCheckpoints {
 
 /// Build a valid block on top of this state.
 ///
-/// Selects attestations via `select_attestations`, optionally compacts
-/// duplicate `AttestationData` entries (see `enable_proposer_aggregation`),
-/// and runs the STF once to seal the state root. The proposer signature is NOT
-/// included; it is appended by the caller.
+/// Selects attestations via `select_attestations`, collapses entries sharing
+/// the same `AttestationData` down to one (a block may carry at most one entry
+/// per data; `on_block` rejects duplicates), and runs the STF once to seal the
+/// state root. The proposer signature is NOT included; it is appended by the
+/// caller.
 ///
-/// When `enable_proposer_aggregation` is set, entries sharing the same
-/// `AttestationData` are merged into one via recursive Type-1 aggregation
-/// (leanSpec #510), shrinking the block at the cost of a leanVM aggregation
-/// per duplicated data entry. When unset, duplicate-data entries are left
-/// as-is: the block carries more attestation entries but skips that work.
-/// Both forms are valid; the state transition unions votes by target root and
-/// the attestation-to-proof correspondence stays 1:1 either way.
+/// The collapse strategy is gated by `enable_proposer_aggregation`:
+/// - **enabled**: same-data proofs are merged via recursive Type-1 aggregation
+///   into a single union-coverage proof (leanSpec #510). Maximizes voter
+///   coverage per entry at the cost of a leanVM aggregation per duplicated
+///   data entry.
+/// - **disabled** (default): the single best-coverage proof per data is kept
+///   and the rest dropped. Skips the leanVM work; coverage is bounded by the
+///   best individual proof.
+///
+/// Either way the output has one entry per `AttestationData` and the
+/// attestation-to-proof correspondence stays 1:1.
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
@@ -80,15 +85,17 @@ pub(crate) fn build_block(
 
     let child_payloads_consumed = selected.len();
 
-    // Compact: merge proofs sharing the same AttestationData via recursive
-    // aggregation so each AttestationData appears at most once (leanSpec #510).
-    // Gated by `enable_proposer_aggregation`: when disabled, the selected
-    // entries are used unmerged (each carries its own Type-1 proof).
+    // Each AttestationData may appear at most once per block (`on_block`
+    // rejects duplicates), so same-data entries must be collapsed to one.
+    // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
+    // AttestationData are merged via recursive Type-1 aggregation into a
+    // union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
+    // work and keep only the single best-coverage proof per data.
     let compact_start = Instant::now();
     let compacted = if enable_proposer_aggregation {
         compact_attestations(selected, head_state)?
     } else {
-        selected
+        keep_best_proof_per_data(selected)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
@@ -619,6 +626,58 @@ fn compact_attestations(
     Ok(compacted)
 }
 
+/// Reduce same-data entries to a single best proof each, without aggregation.
+///
+/// The block format permits at most one entry per `AttestationData`: `on_block`
+/// rejects duplicates (`StoreError::DuplicateAttestationData`). When proposer
+/// aggregation is disabled we therefore cannot keep every selected proof, nor
+/// can we merge them. For each group sharing an `AttestationData` we keep the
+/// single proof covering the most validators (ties broken by first occurrence)
+/// and drop the rest. No leanVM aggregation runs; coverage is whatever the best
+/// individual proof already had, which is the cost of skipping aggregation.
+fn keep_best_proof_per_data(
+    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
+    if entries.len() <= 1 {
+        return entries;
+    }
+
+    // Preserve first-occurrence order of distinct AttestationData; for each,
+    // track the index of the best (most participants) entry seen so far.
+    let mut order: Vec<AttestationData> = Vec::new();
+    let mut best_index: HashMap<AttestationData, usize> = HashMap::new();
+    for (i, (att, _)) in entries.iter().enumerate() {
+        match best_index.entry(att.data.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                order.push(e.key().clone());
+                e.insert(i);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let current_best = entries[*e.get()].0.aggregation_bits.count_ones();
+                if att.aggregation_bits.count_ones() > current_best {
+                    e.insert(i);
+                }
+            }
+        }
+    }
+
+    // Fast path: every AttestationData already appeared exactly once.
+    if order.len() == entries.len() {
+        return entries;
+    }
+
+    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
+        entries.into_iter().map(Some).collect();
+    order
+        .iter()
+        .map(|data| {
+            items[best_index[data]]
+                .take()
+                .expect("best index taken once")
+        })
+        .collect()
+}
+
 /// Greedily select proofs maximizing new validator coverage.
 ///
 /// For a single attestation data entry, picks proofs that cover the most
@@ -958,13 +1017,13 @@ mod tests {
         );
     }
 
-    /// With proposer aggregation disabled, `build_block` must leave entries
-    /// sharing the same `AttestationData` unmerged: each selected proof stays
-    /// its own attestation entry with its own Type-1 signature (1:1), rather
-    /// than being compacted into a single recursively-aggregated proof. This
-    /// path performs no leanVM aggregation, so empty proof blobs suffice.
+    /// With proposer aggregation disabled, `build_block` must still emit at
+    /// most one entry per `AttestationData` (`on_block` rejects duplicates),
+    /// keeping the single best-coverage proof and dropping the rest rather than
+    /// recursively aggregating them. This path performs no leanVM aggregation,
+    /// so empty proof blobs suffice.
     #[test]
-    fn build_block_without_proposer_aggregation_keeps_duplicate_data_unmerged() {
+    fn build_block_without_proposer_aggregation_keeps_single_best_proof_per_data() {
         use ethlambda_types::{
             block::BlockHeader,
             state::{ChainConfig, JustificationValidators, JustifiedSlots},
@@ -1031,9 +1090,10 @@ mod tests {
         known_block_roots.insert(parent_root);
         known_block_roots.insert(hashes[0]);
 
-        // A single AttestationData carrying two disjoint-coverage proofs (one
-        // for validator 0, one for validator 1). Both are selected by
-        // `extend_proofs_greedily` since each adds a new voter.
+        // A single AttestationData carrying two proofs of different coverage:
+        // one for validator 0 (count 1) and one for validators {1, 2}
+        // (count 2). Both are selected by `extend_proofs_greedily` since each
+        // adds new voters, so the disabled path must reduce them to one.
         let att_data = AttestationData {
             slot: TARGET_SLOT,
             head,
@@ -1043,7 +1103,7 @@ mod tests {
         let data_root = att_data.hash_tree_root();
         let proofs = vec![
             TypeOneMultiSignature::empty(make_bits(&[0])),
-            TypeOneMultiSignature::empty(make_bits(&[1])),
+            TypeOneMultiSignature::empty(make_bits(&[1, 2])),
         ];
 
         let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
@@ -1061,25 +1121,28 @@ mod tests {
         )
         .expect("build_block should succeed");
 
-        // Both proofs survive as separate entries (no compaction merge), and
-        // the attestation-to-signature correspondence stays 1:1.
+        // Exactly one entry per AttestationData survives (no duplicate would
+        // pass `on_block`), the correspondence stays 1:1, and the entry kept is
+        // the higher-coverage proof ({1, 2}, two participants).
         assert_eq!(
             block.body.attestations.len(),
-            2,
-            "duplicate-data entries must not be merged when aggregation is disabled"
+            1,
+            "a block must carry at most one entry per AttestationData"
         );
         assert_eq!(
             signatures.len(),
-            2,
+            1,
             "one Type-1 proof per attestation entry"
         );
-        assert!(
-            block
-                .body
-                .attestations
-                .iter()
-                .all(|att| att.data == att_data),
-            "both entries should carry the shared AttestationData"
+        let kept = &block.body.attestations[0];
+        assert_eq!(
+            kept.data, att_data,
+            "the kept entry carries the shared data"
+        );
+        assert_eq!(
+            kept.aggregation_bits.count_ones(),
+            2,
+            "the best-coverage proof ({{1, 2}}) is kept over the smaller one ({{0}})"
         );
     }
 

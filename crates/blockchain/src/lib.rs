@@ -168,11 +168,13 @@ pub struct BlockChainServer {
     /// attestation aggregate coverage emission.
     attestation_committee_count: u64,
 
-    /// Whether to compact same-data attestations during block building by
-    /// recursively aggregating their Type-1 proofs (leanSpec #510). Seeded
-    /// from the CLI `--enable-proposer-aggregation` flag at spawn. When false
-    /// (the default) the proposer leaves duplicate-data entries unmerged,
-    /// skipping the per-data leanVM aggregation.
+    /// How the proposer collapses same-data attestations during block building
+    /// (a block may carry at most one entry per `AttestationData`). When true,
+    /// same-data proofs are merged via recursive Type-1 aggregation into a
+    /// union-coverage proof (leanSpec #510); when false (the default), only the
+    /// single best-coverage proof per data is kept, skipping the per-data
+    /// leanVM aggregation. Seeded from the CLI `--enable-proposer-aggregation`
+    /// flag at spawn.
     enable_proposer_aggregation: bool,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage

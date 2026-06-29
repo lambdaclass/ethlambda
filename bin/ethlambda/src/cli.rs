@@ -87,14 +87,14 @@ pub(crate) struct CliOptions {
     /// Enable proposer-side aggregation of attestation proofs when building a
     /// block.
     ///
-    /// When set, `build_block` compacts attestations sharing the same
-    /// `AttestationData` by recursively aggregating their Type-1
-    /// multi-signatures into a single proof per data entry (leanSpec #510).
-    /// This shrinks the block but costs a leanVM aggregation per duplicated
-    /// data entry. When unset (the default), duplicate-data entries are left
-    /// unmerged: the block carries more attestation entries but skips the
-    /// per-data aggregation work. Either form is valid; the state transition
-    /// unions votes by target root regardless.
+    /// A block may carry at most one entry per `AttestationData`, so the
+    /// proposer must collapse same-data proofs either way. When set,
+    /// `build_block` merges them via recursive Type-1 aggregation into a single
+    /// union-coverage proof per data (leanSpec #510), maximizing voter coverage
+    /// at the cost of a leanVM aggregation per duplicated data entry. When unset
+    /// (the default), it instead keeps only the single best-coverage proof per
+    /// data and drops the rest, skipping the leanVM work at the cost of lower
+    /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
 }
