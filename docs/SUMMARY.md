@@ -9,6 +9,7 @@
 
 # Operations
 
+- [HTTP API](./rpc.md)
 - [Metrics](./metrics.md)
 - [Checkpoint Sync](./checkpoint_sync.md)
 - [Fork Choice Visualization](./fork_choice_visualization.md)

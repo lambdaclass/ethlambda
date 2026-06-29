@@ -782,6 +782,7 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
+    enable_proposer_aggregation: bool,
 ) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
@@ -790,8 +791,7 @@ pub fn produce_block_with_signatures(
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
-        })?
-        .clone();
+        })?;
 
     // Validate proposer authorization for this slot
     let num_validators = head_state.validators.len() as u64;
@@ -816,20 +816,27 @@ pub fn produce_block_with_signatures(
             head_root,
             &known_block_roots,
             &aggregated_payloads,
+            enable_proposer_aggregation,
         )?
     };
 
-    // Invariant (leanSpec #595): the produced block must not lag the store's
-    // justified checkpoint. Otherwise peers processing this block would never
-    // see justification advance, degrading liveness: the fixed-point loop in
-    // `build_block` is expected to incorporate pool attestations that close
-    // any divergence inherited from a minority fork.
+    // leanSpec #595: ideally the produced block should not lag the store's
+    // justified checkpoint, since peers processing it would not see
+    // justification advance, degrading liveness. The fixed-point loop in
+    // `build_block` is expected to incorporate pool attestations that close any
+    // divergence inherited from a minority fork, but it may not always
+    // converge. We still publish the block in that case (halting block
+    // production freezes the chain, which is worse) and only log the divergence.
     let store_justified_slot = store.latest_justified().slot;
     if post_checkpoints.justified.slot < store_justified_slot {
-        return Err(StoreError::JustifiedDivergenceNotClosed {
-            block_justified_slot: post_checkpoints.justified.slot,
+        warn!(
+            %slot,
+            proposer = validator_index,
+            block_justified_slot = post_checkpoints.justified.slot,
             store_justified_slot,
-        });
+            "Produced block justified slot is behind store justified slot; \
+             fixed-point attestation loop did not converge"
+        );
     }
 
     metrics::observe_block_aggregated_payloads(signatures.len());
@@ -936,16 +943,6 @@ pub enum StoreError {
 
     #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
     TooManyAttestationData { count: usize, max: usize },
-
-    #[error(
-        "Produced block justified slot {block_justified_slot} \
-         is behind store justified slot {store_justified_slot}; \
-         fixed-point attestation loop did not converge"
-    )]
-    JustifiedDivergenceNotClosed {
-        block_justified_slot: u64,
-        store_justified_slot: u64,
-    },
 }
 
 /// Full verification of a signed block's merged Type-2 proof.
@@ -1258,8 +1255,20 @@ mod tests {
 
         // Head state justified `a` (slot 1), which lies on the head's chain.
         let head_justified = Checkpoint { root: a, slot: 1 };
-        let mut head_state = State::from_genesis(1000, vec![]);
+        // Persist `b`'s post-state via the diff API, diffed against the genesis
+        // anchor. Build it as a valid direct child of genesis (the STF appends the
+        // parent block root to historical_block_hashes), with the head's justified
+        // checkpoint set; `insert_state` reads the base from
+        // `latest_block_header.parent_root`, and `get_state(b)` then returns it
+        // from the cache.
+        let genesis_state = store.get_state(&genesis).expect("genesis state");
+        let mut head_state = genesis_state.clone();
+        head_state.slot = genesis_state.slot + 1;
         head_state.latest_justified = head_justified;
+        head_state.latest_block_header.parent_root = genesis;
+        let mut hbh = genesis_state.historical_block_hashes.to_vec();
+        hbh.push(genesis);
+        head_state.historical_block_hashes = hbh.try_into().expect("within limit");
         store
             .insert_state(b, head_state)
             .expect("insert head state should succeed");
