@@ -12,8 +12,11 @@
 //! the publish handlers tee gossip here, a background task drives the
 //! engine and forwards reconstructed messages back into the actor, and
 //! peers are derived from the static bootnode set. It has been validated
-//! by compilation + the isolated round-trip test below; end-to-end
-//! validation on a multi-node devnet is the remaining step.
+//! by compilation, the isolated round-trip test below, and an end-to-end
+//! run on a 3-node ethlambda devnet (blocks, aggregations, and attestations
+//! all carried over the parallel QUIC mesh while the chain finalized
+//! normally). Minimal transport hardening (Phase 6) gates any non-isolated
+//! use.
 //!
 //! ## Model
 //!
@@ -22,6 +25,21 @@
 //! endpoint, dials the known peers, and subscribes the gossip channels.
 //! Inbound peers register themselves via the QUIC transport's stream
 //! preface, so only one side needs to dial.
+//!
+//! ## Limitations (isolated devnet only)
+//!
+//! - **No peer authentication.** The demo QUIC transport binds no identity
+//!   to the connection, so a peer id can be spoofed. Acceptable only for an
+//!   isolated, off-by-default experiment.
+//! - **No live peer-health signal.** The transport never emits
+//!   `PeerDisconnected`, so runtime peer loss is invisible here. The only
+//!   ethlambda-side guard is a *startup* one: with fewer than
+//!   [`MIN_ETHP2P_PEERS`] configured mesh peers the engine isn't started
+//!   and the node relies solely on gossipsub. A true circuit-breaker that
+//!   reacts to peers dropping needs transport-side disconnect events
+//!   (deferred — see the integration plan's Phase 6).
+//! - **Fire-and-forget sends.** Chunks dropped under load are not retried;
+//!   gossipsub remains the authoritative path.
 
 use std::fmt;
 use std::io;
@@ -44,6 +62,15 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::gossipsub::decompress_message;
 use crate::{P2PServer, WrappedEthp2pDelivery};
+
+mod metrics;
+
+/// Minimum number of configured ethp2p mesh peers for the broadcast engine
+/// to be worth running. Below this the node tees nothing and relies solely
+/// on gossipsub — a *startup* guard, not a live circuit-breaker: the demo
+/// QUIC transport emits no disconnect events, so runtime peer loss is not
+/// observable on the ethlambda side (see the module-level Limitations).
+pub(crate) const MIN_ETHP2P_PEERS: usize = 1;
 
 /// ethp2p channel ids — mirror the gossipsub topic kinds.
 pub(crate) const CHANNEL_BLOCK: &str = "block";
@@ -283,6 +310,7 @@ pub(crate) async fn run_engine_task(
             return;
         }
     };
+    metrics::set_mesh_peers(params.peers.len());
     info!(
         local_peer = params.local_peer,
         peers = params.peers.len(),
@@ -301,11 +329,14 @@ pub(crate) async fn run_engine_task(
                 match cmd {
                     Some(cmd) => {
                         match broadcast.publish_bytes(&cmd.channel, &cmd.message_id, &cmd.payload) {
-                            Ok(()) => debug!(
-                                channel = %cmd.channel,
-                                bytes = cmd.payload.len(),
-                                "ethp2p: published message"
-                            ),
+                            Ok(()) => {
+                                metrics::inc_published(&cmd.channel);
+                                debug!(
+                                    channel = %cmd.channel,
+                                    bytes = cmd.payload.len(),
+                                    "ethp2p: published message"
+                                );
+                            }
                             Err(e) => warn!(%e, channel = %cmd.channel, "ethp2p: publish failed"),
                         }
                     }
@@ -350,6 +381,7 @@ pub(crate) fn dispatch_delivered(blockchain: &P2PToBlockChainRef, channel: &str,
             return;
         }
     };
+    metrics::inc_delivered(channel);
     // Success-path visibility: a payload was reconstructed from the
     // erasure-coded mesh and is about to enter the consensus pipeline
     // (the same one gossipsub feeds). Proof that ethp2p carried gossip.

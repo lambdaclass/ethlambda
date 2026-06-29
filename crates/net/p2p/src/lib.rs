@@ -408,9 +408,21 @@ impl P2P {
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
+        // ethp2p startup guard: only run the broadcast engine when enough
+        // mesh peers are configured; otherwise the node relies solely on
+        // gossipsub (no engine, no publish channel, no per-message tee).
         #[cfg(feature = "ethp2p")]
-        let (ethp2p_tx, ethp2p_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::ethp2p::PublishCmd>();
+        let (ethp2p_tx, ethp2p_rx) = if built.ethp2p.peers.len() >= crate::ethp2p::MIN_ETHP2P_PEERS
+        {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::ethp2p::PublishCmd>();
+            (Some(tx), Some(rx))
+        } else {
+            warn!(
+                peers = built.ethp2p.peers.len(),
+                "ethp2p: too few mesh peers configured; engine not started (gossipsub only)"
+            );
+            (None, None)
+        };
 
         let server = P2PServer {
             swarm_handle,
@@ -427,19 +439,22 @@ impl P2P {
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             #[cfg(feature = "ethp2p")]
-            ethp2p_publish: Some(ethp2p_tx),
+            ethp2p_publish: ethp2p_tx,
         };
         let handle = server.start();
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
 
-        // Spawn the experimental ethp2p broadcast engine task, forwarding
+        // Spawn the experimental ethp2p broadcast engine task (only when the
+        // startup guard above kept the publish channel), forwarding
         // reconstructed messages back into this actor.
         #[cfg(feature = "ethp2p")]
-        tokio::spawn(crate::ethp2p::run_engine_task(
-            built.ethp2p,
-            ethp2p_rx,
-            handle.clone(),
-        ));
+        if let Some(ethp2p_rx) = ethp2p_rx {
+            tokio::spawn(crate::ethp2p::run_engine_task(
+                built.ethp2p,
+                ethp2p_rx,
+                handle.clone(),
+            ));
+        }
 
         P2P { handle }
     }
