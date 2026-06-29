@@ -5,7 +5,6 @@ ethlambda exposes HTTP over **two independent [Axum](https://github.com/tokio-rs
 - **API server** — consensus data (blocks, states, checkpoints, fork choice) and admin controls.
 - **Metrics & debug server** — Prometheus metrics and heap-profiling endpoints. No store access.
 
-The RPC subsystem runs in a single `tokio::spawn` task from `main.rs`; `start_rpc_server` then drives the two servers concurrently (via `tokio::try_join!` when the ports differ, or one merged router when they're equal). A bind failure is logged via `error!()` but does not crash the node.
 
 All consensus API paths are versioned under the `/lean/v0` prefix. Roots are serialized as `0x`-prefixed hex strings.
 
