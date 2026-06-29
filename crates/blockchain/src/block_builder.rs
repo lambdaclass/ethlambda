@@ -558,18 +558,17 @@ fn compact_attestations(
         }
     }
 
+    // Fast path: every AttestationData already appears once (covers ≤1 entry).
+    if order.len() == entries.len() {
+        return Ok(entries);
+    }
+
     info!(
         slot = block_slot,
         entries = entries.len(),
         unique = order.len(),
         "Compacting attestations"
     );
-
-    // Fast path: every AttestationData already appears once (covers ≤1 entry).
-    if order.len() == entries.len() {
-        info!(slot = block_slot, "Finished compacting attestations");
-        return Ok(entries);
-    }
 
     // Wrap in Option so we can .take() items by index without cloning
     let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
@@ -665,18 +664,18 @@ fn keep_best_proof_per_data(
         }
     }
 
+    // Fast path: every AttestationData already appeared exactly once (covers
+    // ≤1 entry).
+    if order.len() == entries.len() {
+        return entries;
+    }
+
     info!(
         slot = block_slot,
         entries = entries.len(),
         unique = order.len(),
         "Skipping attestation compaction"
     );
-
-    // Fast path: every AttestationData already appeared exactly once (covers
-    // ≤1 entry).
-    if order.len() == entries.len() {
-        return entries;
-    }
 
     let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
         entries.into_iter().map(Some).collect();
