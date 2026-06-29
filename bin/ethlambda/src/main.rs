@@ -207,7 +207,7 @@ async fn main() -> eyre::Result<()> {
     // Shared, runtime-mutable aggregator flag. Seeded from the CLI and
     // threaded into both the blockchain actor (which reads on every tick)
     // and the API server (which exposes GET/POST admin endpoints).
-    let aggregator = AggregatorController::new(options.is_aggregator);
+    let aggregator = AggregatorController::new(options.aggregator.is_aggregator);
 
     let blockchain = BlockChain::spawn(
         store.clone(),
@@ -228,8 +228,8 @@ async fn main() -> eyre::Result<()> {
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        is_aggregator: options.is_aggregator,
-        aggregate_subnet_ids: options.aggregate_subnet_ids,
+        is_aggregator: options.aggregator.is_aggregator,
+        aggregate_subnet_ids: options.aggregator.aggregate_subnet_ids,
     })
     .wrap_err("failed to build swarm")?;
 

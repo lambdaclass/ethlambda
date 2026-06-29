@@ -50,17 +50,8 @@ pub(crate) struct CliOptions {
     /// over to the next URL. Startup only aborts if every URL fails.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
-    /// Whether this node acts as a committee aggregator.
-    ///
-    /// Seeds the initial value of the live aggregator flag shared by the
-    /// blockchain actor and the admin API. The flag can be toggled at
-    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
-    /// NOT persist across restarts and do NOT update gossip subnet
-    /// subscriptions, which are frozen at startup — standby aggregators
-    /// should boot with this flag enabled to establish subscriptions, then
-    /// use the admin endpoint to rotate duties (hot-standby model).
-    #[arg(long, default_value = "false")]
-    pub(crate) is_aggregator: bool,
+    #[command(flatten)]
+    pub(crate) aggregator: AggregatorOpts,
     /// Number of attestation committees (subnets) per slot.
     ///
     /// If unset, falls back to `config.attestation_committee_count` from
@@ -68,10 +59,6 @@ pub(crate) struct CliOptions {
     /// field is also absent.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) attestation_committee_count: Option<u64>,
-    /// Subnet IDs this aggregator should subscribe to (comma-separated).
-    /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
-    #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
-    pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
@@ -84,4 +71,27 @@ pub(crate) struct CliOptions {
     /// but it no longer suppresses any duty: the gate becomes observe-only.
     #[arg(long, default_value = "false")]
     pub(crate) disable_duty_sync_gate: bool,
+}
+
+/// Aggregator-related flags, grouped so the committee-aggregation knobs live
+/// together. Flattened into [`CliOptions`], so the flags stay top-level on the
+/// command line (`--is-aggregator`, `--aggregate-subnet-ids`) and the
+/// `requires` cross-reference still resolves within the parent command.
+#[derive(Debug, clap::Args)]
+pub(crate) struct AggregatorOpts {
+    /// Whether this node acts as a committee aggregator.
+    ///
+    /// Seeds the initial value of the live aggregator flag shared by the
+    /// blockchain actor and the admin API. The flag can be toggled at
+    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
+    /// NOT persist across restarts and do NOT update gossip subnet
+    /// subscriptions, which are frozen at startup — standby aggregators
+    /// should boot with this flag enabled to establish subscriptions, then
+    /// use the admin endpoint to rotate duties (hot-standby model).
+    #[arg(long, default_value = "false")]
+    pub(crate) is_aggregator: bool,
+    /// Subnet IDs this aggregator should subscribe to (comma-separated).
+    /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
+    pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
 }
