@@ -321,12 +321,22 @@ pub fn finalize_aggregation_session(store: &Store) {
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 }
 
+/// Maximum number of existing proofs reused as children in a single
+/// aggregation job. Caps each round at a pairwise (binary) merge instead of an
+/// N-way merge: leanVM's recursive verification cost (and recursion depth)
+/// scales with the child count, and uncapped greedy selection has previously
+/// driven debug builds to stack-overflow in `rec_aggregation`. Proofs left
+/// uncovered by the cap aren't lost — they remain in the new/known buffers and
+/// are picked up by `select_proofs_greedily` again in a later round.
+const MAX_AGGREGATION_CHILDREN: usize = 2;
+
 /// Greedy set-cover selection of proofs to maximize validator coverage.
 ///
 /// Processes proof sets in priority order (new before known). Within each set,
-/// repeatedly picks the proof covering the most uncovered validators until
-/// no proof adds new coverage. This keeps the number of children minimal
-/// while maximizing the validators we can skip re-aggregating from scratch.
+/// repeatedly picks the proof covering the most uncovered validators until no
+/// proof adds new coverage or [`MAX_AGGREGATION_CHILDREN`] children have been
+/// selected, whichever comes first — the cap applies to the combined total
+/// across both sets, not per set.
 fn select_proofs_greedily(
     new_proofs: &[TypeOneMultiSignature],
     known_proofs: &[TypeOneMultiSignature],
@@ -337,7 +347,7 @@ fn select_proofs_greedily(
     for proof_set in [new_proofs, known_proofs] {
         let mut remaining: Vec<&TypeOneMultiSignature> = proof_set.iter().collect();
 
-        while !remaining.is_empty() {
+        while selected.len() < MAX_AGGREGATION_CHILDREN && !remaining.is_empty() {
             let best_idx = remaining
                 .iter()
                 .enumerate()
@@ -360,6 +370,10 @@ fn select_proofs_greedily(
 
             selected.push(remaining.swap_remove(best_idx).clone());
             covered.extend(new_coverage);
+        }
+
+        if selected.len() >= MAX_AGGREGATION_CHILDREN {
+            break;
         }
     }
 
@@ -469,4 +483,59 @@ pub(crate) fn run_aggregation_worker(
         total_elapsed: start.elapsed(),
         cancelled: cancel.is_cancelled(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethlambda_types::attestation::AggregationBits;
+
+    /// Build a proof with a distinct, non-overlapping participant.
+    fn proof_for_validator(vid: u64) -> TypeOneMultiSignature {
+        let mut bits = AggregationBits::with_length(vid as usize + 1).unwrap();
+        bits.set(vid as usize, true).unwrap();
+        TypeOneMultiSignature::empty(bits)
+    }
+
+    #[test]
+    fn select_proofs_greedily_caps_at_max_children_within_one_set() {
+        // Three non-overlapping proofs all in `new_proofs`: every one of them
+        // adds new coverage, but only MAX_AGGREGATION_CHILDREN may be selected.
+        let new_proofs = vec![
+            proof_for_validator(0),
+            proof_for_validator(1),
+            proof_for_validator(2),
+        ];
+
+        let (selected, covered) = select_proofs_greedily(&new_proofs, &[]);
+
+        assert_eq!(selected.len(), MAX_AGGREGATION_CHILDREN);
+        assert_eq!(covered.len(), MAX_AGGREGATION_CHILDREN);
+    }
+
+    #[test]
+    fn select_proofs_greedily_caps_across_new_and_known_combined() {
+        // One proof already selected from `new_proofs` should leave room for
+        // exactly one more from `known_proofs`, not MAX_AGGREGATION_CHILDREN
+        // more — the cap is on the combined total, not per set.
+        let new_proofs = vec![proof_for_validator(0)];
+        let known_proofs = vec![proof_for_validator(1), proof_for_validator(2)];
+
+        let (selected, covered) = select_proofs_greedily(&new_proofs, &known_proofs);
+
+        assert_eq!(selected.len(), MAX_AGGREGATION_CHILDREN);
+        assert_eq!(covered.len(), MAX_AGGREGATION_CHILDREN);
+    }
+
+    #[test]
+    fn select_proofs_greedily_stops_early_when_no_new_coverage() {
+        // Fewer than the cap worth of useful proofs: selection should stop
+        // once no remaining proof adds coverage, same as before the cap.
+        let new_proofs = vec![proof_for_validator(0), proof_for_validator(0)];
+
+        let (selected, covered) = select_proofs_greedily(&new_proofs, &[]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(covered.len(), 1);
+    }
 }
