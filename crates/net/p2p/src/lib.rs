@@ -9,6 +9,7 @@ use ethlambda_network_api::{
     InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
         FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+        PublishHeartbeatAttestation,
     },
 };
 use ethlambda_storage::Store;
@@ -37,8 +38,9 @@ use tracing::{info, trace, warn};
 
 use crate::{
     gossipsub::{
-        aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_block,
+        aggregation_topic, attestation_subnet_topic, block_topic, heartbeat_topic,
+        publish_aggregated_attestation, publish_attestation, publish_block,
+        publish_heartbeat_attestation,
     },
     req_resp::{
         BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
@@ -178,6 +180,7 @@ pub struct BuiltSwarm {
     pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) heartbeat_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
@@ -293,6 +296,14 @@ pub fn build_swarm(
         .subscribe(&block_topic)
         .unwrap();
 
+    // Subscribe to heartbeat topic (all nodes)
+    let heartbeat_topic = heartbeat_topic();
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&heartbeat_topic)
+        .unwrap();
+
     // Subscribe to aggregation topic (all validators)
     let aggregation_topic = aggregation_topic();
     swarm
@@ -343,6 +354,7 @@ pub fn build_swarm(
         attestation_topics,
         attestation_committee_count: config.attestation_committee_count,
         block_topic,
+        heartbeat_topic,
         aggregation_topic,
         bootnode_addrs,
     })
@@ -368,6 +380,7 @@ impl P2P {
             attestation_topics: built.attestation_topics,
             attestation_committee_count: built.attestation_committee_count,
             block_topic: built.block_topic,
+            heartbeat_topic: built.heartbeat_topic,
             aggregation_topic: built.aggregation_topic,
             connected_peers: HashSet::new(),
             pending_root_requests: HashMap::new(),
@@ -404,6 +417,7 @@ pub struct P2PServer {
     pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) heartbeat_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
 
     pub(crate) connected_peers: HashSet<PeerId>,
@@ -495,6 +509,12 @@ impl Handler<PublishBlock> for P2PServer {
 impl Handler<PublishAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAttestation, _ctx: &Context<Self>) {
         publish_attestation(self, msg.attestation).await;
+    }
+}
+
+impl Handler<PublishHeartbeatAttestation> for P2PServer {
+    async fn handle(&mut self, msg: PublishHeartbeatAttestation, _ctx: &Context<Self>) {
+        publish_heartbeat_attestation(self, msg.attestation).await;
     }
 }
 

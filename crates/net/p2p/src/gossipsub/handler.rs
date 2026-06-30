@@ -15,7 +15,7 @@ use super::{
         attestation_subnet_topic,
     },
 };
-use crate::{P2PServer, metrics};
+use crate::{P2PServer, gossipsub::messages::HEARTBEAT_TOPIC_KIND, metrics};
 
 pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let Event::Message {
@@ -95,7 +95,10 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                     );
             }
         }
-        Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
+        Some(kind)
+            if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX)
+                || kind == HEARTBEAT_TOPIC_KIND =>
+        {
             info!(kind = "attestation", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
@@ -193,6 +196,27 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
         parent_root = %ShortRoot(&parent_root.0),
         attestation_count,
         "Published block to gossipsub"
+    );
+}
+
+pub async fn publish_heartbeat_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
+    let slot = attestation.data.slot;
+    let validator = attestation.validator_id;
+
+    // Encode to SSZ
+    let ssz_bytes = attestation.to_ssz();
+
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
+
+    // Publish to gossipsub
+    server
+        .swarm_handle
+        .publish(server.heartbeat_topic.clone(), compressed);
+    info!(
+        %slot,
+        validator,
+        "Published heartbeat attestation to gossipsub"
     );
 }
 

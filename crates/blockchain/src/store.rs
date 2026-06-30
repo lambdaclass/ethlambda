@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
+use ethlambda_state_transition::{is_heartbeat_committee_member, is_proposer};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -39,10 +39,10 @@ fn accept_new_attestations(store: &mut Store, log_tree: bool) {
 /// fork choice tree to the terminal.
 pub fn update_head(store: &mut Store, log_tree: bool) {
     let blocks = store.get_live_chain();
-    let attestations = store.extract_latest_known_attestations();
+    let attestations = store.get_last_slot_votes();
     let old_head = store.head();
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        store.safe_target(),
         &blocks,
         &attestations,
         0,
@@ -108,13 +108,11 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
-    let head_state = store.get_state(&store.head()).expect("head state exists");
-    let num_validators = head_state.validators.len() as u64;
-
-    let min_target_score = (num_validators * 2).div_ceil(3);
-
     let blocks = store.get_live_chain();
-    let attestations = store.extract_latest_new_attestations();
+    let attestations = store.get_last_period_votes();
+    // Use a 2/3 threshold of the number of voting validators
+    let min_target_score = (attestations.len() as u64 * 2).div_ceil(3);
+
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -363,6 +361,12 @@ pub fn on_gossip_attestation(
         return Err(StoreError::SignatureVerificationFailed);
     }
     metrics::inc_pq_sig_attestation_signatures_valid();
+
+    let num_validators = target_state.validators.len() as u64;
+    // If the validator is in the heartbeat committee, persist the vote for fork choice usage.
+    if is_heartbeat_committee_member(validator_id, attestation.data.slot, num_validators) {
+        store.insert_heartbeat_vote(validator_id, attestation.data.clone());
+    }
 
     // Only aggregators persist the signature for later aggregation at
     // interval 2. Non-aggregators drop the validated attestation — they
@@ -640,7 +644,10 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 pub fn get_attestation_target_with_checkpoints(
     store: &Store,
     justified: Checkpoint,
-    finalized: Checkpoint,
+    // Unused under the simple BFT finality condition (every slot is justifiable,
+    // so the target no longer needs a justifiability walk-back). Kept on the
+    // signature pending the finality redesign.
+    _finalized: Checkpoint,
 ) -> Checkpoint {
     // Start from current head
     let mut target_block_root = store.head();
@@ -668,20 +675,6 @@ pub fn get_attestation_target_with_checkpoints(
         }
     }
 
-    let finalized_slot = finalized.slot;
-
-    // Ensure target is in justifiable slot range
-    //
-    // Walk back until we find a slot that satisfies justifiability rules
-    // relative to the latest finalized checkpoint.
-    while target_header.slot > finalized_slot
-        && !slot_is_justifiable_after(target_header.slot, finalized_slot)
-    {
-        target_block_root = target_header.parent_root;
-        target_header = store
-            .get_block_header(&target_block_root)
-            .expect("parent block exists");
-    }
     // Guard: clamp target to justified (not in the spec).
     //
     // The spec's walk-back has no lower bound, so it can produce attestations
