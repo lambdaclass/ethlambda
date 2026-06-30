@@ -322,21 +322,17 @@ pub fn finalize_aggregation_session(store: &Store) {
 }
 
 /// Maximum number of existing proofs reused as children in a single
-/// aggregation job. Caps each round at a pairwise (binary) merge instead of an
-/// N-way merge: leanVM's recursive verification cost (and recursion depth)
-/// scales with the child count, and uncapped greedy selection has previously
-/// driven debug builds to stack-overflow in `rec_aggregation`. Proofs left
-/// uncovered by the cap aren't lost — they remain in the new/known buffers and
-/// are picked up by `select_proofs_greedily` again in a later round.
+/// aggregation job. Recursive aggregation is costly, so we limit the
+/// number of children to avoid unbounded aggregation times.
 const MAX_AGGREGATION_CHILDREN: usize = 2;
 
 /// Greedy set-cover selection of proofs to maximize validator coverage.
 ///
 /// Processes proof sets in priority order (new before known). Within each set,
 /// repeatedly picks the proof covering the most uncovered validators until no
-/// proof adds new coverage or [`MAX_AGGREGATION_CHILDREN`] children have been
-/// selected, whichever comes first — the cap applies to the combined total
-/// across both sets, not per set.
+/// proof adds new coverage.
+///
+/// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
 fn select_proofs_greedily(
     new_proofs: &[TypeOneMultiSignature],
     known_proofs: &[TypeOneMultiSignature],
