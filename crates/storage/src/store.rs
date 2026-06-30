@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use ethlambda_types::attestation::Attestation;
 use lru::LruCache;
 
 use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
@@ -554,7 +555,7 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
     /// List of votes observed in the last [`RLMD_LOOKBACK_LIMIT`] slots.
-    votes_per_slot: Arc<Mutex<BTreeMap<u64, HashMap<u64, AttestationData>>>>,
+    votes_per_slot: Arc<Mutex<BTreeMap<u64, HashMap<u64, (AttestationData, ValidatorSignature)>>>>,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
@@ -1476,11 +1477,11 @@ impl Store {
             .unwrap()
             .range(period_start_slot..current_slot)
             .flat_map(|(_, votes)| votes)
-            .map(|(x, y)| (*x, y.clone()))
+            .map(|(x, (y, _))| (*x, y.clone()))
             .collect()
     }
 
-    pub fn get_last_slot_votes(&self) -> HashMap<u64, AttestationData> {
+    pub fn get_last_slot_votes(&self) -> HashMap<u64, (AttestationData, ValidatorSignature)> {
         let current_slot = self.time().unwrap() / INTERVALS_PER_SLOT;
         self.votes_per_slot
             .lock()
@@ -1682,13 +1683,13 @@ impl Store {
         gossip.insert(hashed, validator_id, signature);
     }
 
-    pub fn insert_heartbeat_vote(&self, validator_id: u64, data: AttestationData) {
+    pub fn insert_heartbeat_vote(&self, attestation: Attestation, signature: ValidatorSignature) {
         self.votes_per_slot
             .lock()
             .unwrap()
-            .entry(data.slot)
+            .entry(attestation.data.slot)
             .or_default()
-            .insert(validator_id, data);
+            .insert(attestation.validator_id, (attestation.data, signature));
     }
 
     // ============ Derived Accessors ============

@@ -429,9 +429,10 @@ pub fn on_gossip_attestation(
     metrics::inc_pq_sig_attestation_signatures_valid();
 
     let num_validators = target_state.validators.len() as u64;
-    // If the validator is in the heartbeat committee, persist the vote for fork choice usage.
+    // If the validator is in the heartbeat committee, persist the vote and
+    // signature for fork choice usage.
     if is_heartbeat_committee_member(validator_id, attestation.data.slot, num_validators) {
-        store.insert_heartbeat_vote(validator_id, attestation.data.clone());
+        store.insert_heartbeat_vote(attestation, signature.clone());
     }
 
     // Only aggregators persist the signature for later aggregation at
@@ -889,7 +890,15 @@ pub fn produce_block_with_signatures(
     slot: u64,
     validator_index: u64,
     config: ProposerConfig,
-) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
+) -> Result<
+    (
+        Block,
+        Vec<ValidatorSignature>,
+        Vec<SingleMessageAggregate>,
+        PostBlockCheckpoints,
+    ),
+    StoreError,
+> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
     let head_state = store
@@ -911,10 +920,11 @@ pub fn produce_block_with_signatures(
 
     // Get known aggregated payloads: data_root -> (AttestationData, Vec<proof>)
     let aggregated_payloads = store.known_aggregated_payloads();
+    let heartbeat_votes = store.get_last_slot_votes();
 
     let known_block_roots = store.get_block_roots().unwrap();
 
-    let (block, signatures, post_checkpoints) = {
+    let (block, heartbeat_sigs, att_sigs, post_checkpoints) = {
         let _timing = metrics::time_block_building_payload_aggregation();
         build_block(
             &head_state,
@@ -923,6 +933,7 @@ pub fn produce_block_with_signatures(
             head_root,
             &known_block_roots,
             &aggregated_payloads,
+            heartbeat_votes,
             config,
         )?
     };
@@ -949,9 +960,9 @@ pub fn produce_block_with_signatures(
         );
     }
 
-    metrics::observe_block_aggregated_payloads(signatures.len());
+    metrics::observe_block_aggregated_payloads(att_sigs.len());
 
-    Ok((block, signatures, post_checkpoints))
+    Ok((block, heartbeat_sigs, att_sigs, post_checkpoints))
 }
 
 /// Errors that can occur during Store operations.

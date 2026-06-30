@@ -21,10 +21,11 @@ use ethlambda_state_transition::{
 };
 use ethlambda_types::{
     ShortRoot,
-    attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
+    attestation::{AggregatedAttestation, AggregationBits, Attestation, AttestationData},
+    block::{AggregatedAttestations, Block, BlockBody, HeartbeatVotes, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
+    signature::ValidatorSignature,
     state::{JustifiedSlots, State},
 };
 use tracing::{info, trace};
@@ -88,8 +89,17 @@ pub(crate) fn build_block(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    heartbeat_votes: HashMap<u64, (AttestationData, ValidatorSignature)>,
     config: ProposerConfig,
-) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
+) -> Result<
+    (
+        Block,
+        Vec<ValidatorSignature>,
+        Vec<SingleMessageAggregate>,
+        PostBlockCheckpoints,
+    ),
+    StoreError,
+> {
     info!(slot, proposer_index, "Building block");
 
     let select_start = Instant::now();
@@ -124,6 +134,21 @@ pub(crate) fn build_block(
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
 
+    let (heartbeat_data, heartbeat_signatures): (Vec<_>, Vec<_>) = heartbeat_votes
+        .into_iter()
+        .map(|(vid, (data, sig))| {
+            (
+                Attestation {
+                    validator_id: vid,
+                    data,
+                },
+                sig,
+            )
+        })
+        .unzip();
+
+    let heartbeat: HeartbeatVotes = heartbeat_data.try_into().expect("max committee size");
+
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
         .expect("attestation count exceeds limit");
@@ -132,7 +157,10 @@ pub(crate) fn build_block(
         proposer_index,
         parent_root,
         state_root: H256::ZERO,
-        body: BlockBody { attestations },
+        body: BlockBody {
+            heartbeat,
+            attestations,
+        },
     };
     let mut post_state = head_state.clone();
     // ethlambda runs the STF once after selection (it projects justification
@@ -153,7 +181,12 @@ pub(crate) fn build_block(
         finalized: post_state.latest_finalized,
     };
 
-    Ok((final_block, aggregated_signatures, post_checkpoints))
+    Ok((
+        final_block,
+        heartbeat_signatures,
+        aggregated_signatures,
+        post_checkpoints,
+    ))
 }
 
 /// Tiered greedy attestation selection for block proposal.

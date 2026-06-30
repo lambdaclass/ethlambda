@@ -5,7 +5,7 @@ use libssz_types::SszList;
 
 use crate::{
     attestation::{
-        AggregatedAttestation, AggregationBits, XmssSignature, blank_xmss_signature,
+        AggregatedAttestation, AggregationBits, Attestation, XmssSignature, blank_xmss_signature,
         validator_indices,
     },
     primitives::{self, ByteList, H256},
@@ -134,18 +134,25 @@ pub enum MultiMessageAggregateError {
 pub struct BlockProof {
     /// The proposer's raw XMSS signature over the block root.
     pub proposer_signature: XmssSignature,
+    /// The heartbeat committee signatures over their votes.
+    pub heartbeat_signatures: HeartbeatSignatures,
     /// Type-2 aggregate over the body attestations (empty if there are none).
     pub attestation_proof: MultiMessageAggregate,
 }
+
+/// List of heartbeat votes included in a block.
+pub type HeartbeatSignatures = SszList<XmssSignature, 4>;
 
 impl BlockProof {
     /// Build a proof from a proposer signature and an attestation aggregate.
     pub fn new(
         proposer_signature: XmssSignature,
+        heartbeat_signatures: HeartbeatSignatures,
         attestation_proof: MultiMessageAggregate,
     ) -> Self {
         Self {
             proposer_signature,
+            heartbeat_signatures,
             attestation_proof,
         }
     }
@@ -324,12 +331,31 @@ pub struct BlockBody {
     ///
     /// Individual signatures live in the aggregated block signature list, so
     /// these entries contain only attestation data without per-attestation signatures.
+    #[serde(serialize_with = "serialize_heartbeat")]
+    pub heartbeat: HeartbeatVotes,
+    /// Plain validator attestations carried in the block body.
+    ///
+    /// Individual signatures live in the aggregated block signature list, so
+    /// these entries contain only attestation data without per-attestation signatures.
     #[serde(serialize_with = "serialize_attestations")]
     pub attestations: AggregatedAttestations,
 }
 
+/// List of heartbeat votes included in a block.
+pub type HeartbeatVotes = SszList<Attestation, 4>;
 /// List of aggregated attestations included in a block.
 pub type AggregatedAttestations = SszList<AggregatedAttestation, 4096>;
+
+fn serialize_heartbeat<S>(attestations: &HeartbeatVotes, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(attestations.len()))?;
+    for attestation in attestations.iter() {
+        seq.serialize_element(attestation)?;
+    }
+    seq.end()
+}
 
 fn serialize_attestations<S>(
     attestations: &AggregatedAttestations,

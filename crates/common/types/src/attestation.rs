@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// Validator specific attestation wrapping shared attestation data.
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Attestation {
     /// The index of the validator making the attestation.
     pub validator_id: u64,

@@ -736,7 +736,7 @@ impl BlockChainServer {
         // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
         pre_build.diff_and_emit(&self.store, &self.events, slot);
 
-        let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
+        let Ok((block, signatures, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -832,12 +832,16 @@ impl BlockChainServer {
                 }
             }
         };
-
         // `single_message_aggregates` is no longer needed past this point.
         drop(single_message_aggregates);
+
+        let heartbeat_sigs = signatures
+            .try_into()
+            .expect("went over the committee limit");
+
         let signed_block = SignedBlock {
             message: block,
-            proof: BlockProof::new(proposer_signature, attestation_proof),
+            proof: BlockProof::new(proposer_signature, heartbeat_sigs, attestation_proof),
         };
 
         // Stop timing here: the build is done, and the alignment wait below must
