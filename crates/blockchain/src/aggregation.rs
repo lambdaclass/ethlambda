@@ -205,7 +205,12 @@ fn build_job(
 
     let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
 
+    // Skip aggregation when there's nothing to aggregate
     if raw_ids.is_empty() && children.len() < 2 {
+        return None;
+    }
+    // Skip aggregation when there's only a single raw signature to aggregate.
+    if children.is_empty() && raw_ids.len() <= 1 {
         return None;
     }
 
