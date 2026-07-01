@@ -41,11 +41,15 @@ impl core::fmt::Debug for SignedBlock {
     }
 }
 
-/// 512 KiB byte-list cap shared by every block-level / Type-1 proof field.
-/// Matches leanSpec PR #717's `ByteList512KiB` SSZ container.
+/// 512 KiB byte-list cap shared by every block-level / single-message
+/// aggregate proof field. Matches leanSpec PR #717's `ByteList512KiB` SSZ
+/// container.
 pub type ByteList512KiB = ByteList<524_288>;
 
 /// A merged proof covering multiple messages with a single proof blob.
+///
+/// Also known as a *type-2* proof: the lean-multisig term for an aggregate
+/// binding several distinct messages, each with its own participant set.
 ///
 /// The proof bytes use lean-multisig's compact public-key-free
 /// representation. SSZ encoding this container adds the offset required for
@@ -85,16 +89,16 @@ pub enum MultiMessageAggregateError {
 }
 
 // ============================================================================
-// Type-1 multi-signature
+// Single-message aggregate
 // ============================================================================
 //
-// Wire format mirrors leanSpec PR #717: `TypeOneMultiSignature` is a flat
+// Wire format mirrors leanSpec PR #717: `SingleMessageAggregate` is a flat
 // `{ participants, proof }` pair. The signed `message` and `slot` are NOT
 // carried on the envelope — verifiers rederive each component's binding
 // from the surrounding block body (attestation `data` + slot for body
 // components, block root + slot for the proposer component).
 //
-// `MultiMessageAggregate` carries the raw lean-multisig Type-2 bytes.
+// `MultiMessageAggregate` carries the raw lean-multisig type-2 bytes.
 // Component participant bitfields come from
 // `block.body.attestations[i].aggregation_bits` (and `block.proposer_index` for
 // the trailing proposer entry).
@@ -104,7 +108,10 @@ pub enum MultiMessageAggregateError {
 /// `ethlambda-test-fixtures`, and the wire types in this crate.
 pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
-/// A Type-1 single-message proof aggregating signatures from many validators.
+/// A single-message proof aggregating signatures from many validators.
+///
+/// Also known as a *type-1* proof: the lean-multisig term for an aggregate
+/// where every participant signs the same message for the same slot.
 ///
 /// Used:
 ///   - as a gossip-level `SignedAggregatedAttestation.proof`,
@@ -117,15 +124,16 @@ pub const MAX_ATTESTATIONS_DATA: usize = 8;
 /// the bitfield identifying which validators are bound by the proof. The
 /// verifier resolves pubkeys from `participants` at verify time.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
-pub struct TypeOneMultiSignature {
+pub struct SingleMessageAggregate {
     /// Bitfield identifying validators bound by this proof.
     pub participants: AggregationBits,
     /// Aggregated proof bytes in lean-multisig compact (no-pubkeys) form.
     pub proof: ByteList512KiB,
 }
 
-impl TypeOneMultiSignature {
-    /// Build a Type-1 proof carrying the given participants and proof bytes.
+impl SingleMessageAggregate {
+    /// Build a single-message aggregate carrying the given participants and
+    /// proof bytes.
     pub fn new(participants: AggregationBits, proof: ByteList512KiB) -> Self {
         Self {
             participants,
@@ -133,19 +141,20 @@ impl TypeOneMultiSignature {
         }
     }
 
-    /// Build a Type-1 proof carrying the given participants and EMPTY proof
-    /// bytes. Useful as a placeholder in fork-choice payload caches where only
-    /// the participant set is needed; cannot drive a real Type-2 merge or
-    /// pass cryptographic verification.
+    /// Build a single-message aggregate carrying the given participants and
+    /// EMPTY proof bytes. Useful as a placeholder in fork-choice payload caches
+    /// where only the participant set is needed; cannot drive a real
+    /// multi-message aggregate merge or pass cryptographic verification.
     pub fn empty(participants: AggregationBits) -> Self {
         Self::new(participants, SszList::new())
     }
 
-    /// Wrap a proposer's Type-1 proof bytes with the singleton participant set.
+    /// Wrap a proposer's single-message aggregate proof bytes with the
+    /// singleton participant set.
     ///
-    /// The bytes must be a real aggregated Type-1 over the proposer's XMSS
-    /// signature (e.g. from `ethlambda_crypto::aggregate_signatures`), not
-    /// raw XMSS bytes — `verify_type_2` rejects raw-XMSS placeholders.
+    /// The bytes must be a real aggregate over the proposer's XMSS signature
+    /// (e.g. from `ethlambda_crypto::aggregate_signatures`), not raw XMSS
+    /// bytes — `verify_type_2` rejects raw-XMSS placeholders.
     pub fn for_proposer(proposer_index: u64, proposer_proof_bytes: ByteList512KiB) -> Self {
         let mut participants = AggregationBits::with_length(proposer_index as usize + 1)
             .expect("validator index fits");
@@ -275,14 +284,14 @@ mod tests {
     }
 
     #[test]
-    fn type_one_multi_signature_ssz_round_trip() {
+    fn single_message_aggregate_ssz_round_trip() {
         let proof_bytes: Vec<u8> = (0..64).collect();
-        let sig = TypeOneMultiSignature {
+        let sig = SingleMessageAggregate {
             participants: sample_bits(8, &[0, 3, 7]),
             proof: ByteList512KiB::try_from(proof_bytes.clone()).unwrap(),
         };
         let bytes = sig.to_ssz();
-        let decoded = TypeOneMultiSignature::from_ssz_bytes(&bytes).expect("decode");
+        let decoded = SingleMessageAggregate::from_ssz_bytes(&bytes).expect("decode");
         assert_eq!(decoded.proof.to_vec(), proof_bytes);
         assert_eq!(decoded.participants.as_bytes(), sig.participants.as_bytes());
     }
