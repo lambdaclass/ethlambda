@@ -23,7 +23,7 @@ use spawned_concurrency::tasks::ActorRef;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::metrics;
+use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
 /// Soft deadline for committee-signature aggregation measured from the
 /// interval-2 tick. After this much wall time elapses, the actor signals the
@@ -35,6 +35,36 @@ pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(750);
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
 pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Width of the early-aggregation window: a session may start at most this
+/// long before the interval-2 boundary, provided the signature threshold is
+/// met (see `early_threshold_met`).
+pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 400;
+
+/// Wall-clock millisecond timestamp of `slot`'s interval-2 boundary (the
+/// normal aggregation start).
+pub(crate) fn interval2_boundary_ms(genesis_time_ms: u64, slot: u64) -> u64 {
+    genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL
+}
+
+/// If `now_ms` falls inside some slot's early-aggregation window
+/// (`[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)` with `T2` that slot's interval-2
+/// boundary), return that slot.
+pub(crate) fn early_aggregation_slot(now_ms: u64, genesis_time_ms: u64) -> Option<u64> {
+    let since_genesis = now_ms.checked_sub(genesis_time_ms)?;
+    let ms_into_slot = since_genesis % MILLISECONDS_PER_SLOT;
+    let t2_offset = 2 * MILLISECONDS_PER_INTERVAL;
+    let in_window =
+        ms_into_slot >= t2_offset - EARLY_AGGREGATION_WINDOW_MS && ms_into_slot < t2_offset;
+    in_window.then_some(since_genesis / MILLISECONDS_PER_SLOT)
+}
+
+/// Early-start threshold: a single attestation-data group holds at least 2/3
+/// of the signatures expected from this node's aggregation subnets. At most
+/// one group per slot can satisfy this (each validator signs once per slot).
+pub(crate) fn early_threshold_met(max_group_count: usize, expected: usize) -> bool {
+    expected > 0 && max_group_count * 3 >= expected * 2
+}
 
 /// A single pre-prepared aggregation group.
 ///
