@@ -448,15 +448,19 @@ mod tests {
         };
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
-        store.insert_signed_block(block_root, signed_block.clone());
-        store.update_checkpoints(ForkCheckpoints::new(
-            block_root,
-            None,
-            Some(Checkpoint {
-                root: block_root,
-                slot: 1,
-            }),
-        ));
+        store
+            .insert_signed_block(block_root, signed_block.clone())
+            .expect("insert_signed_block should succeed");
+        store
+            .update_checkpoints(ForkCheckpoints::new(
+                block_root,
+                None,
+                Some(Checkpoint {
+                    root: block_root,
+                    slot: 1,
+                }),
+            ))
+            .expect("update_checkpoints should succeed");
 
         let expected_ssz = signed_block.to_ssz();
 

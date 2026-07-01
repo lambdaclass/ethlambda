@@ -2,6 +2,8 @@
 
 Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust.
 
+🌐 Visit our website at [**ethlambda.xyz**](https://ethlambda.xyz) to learn more about the project.
+
 ## Getting started
 
 ### Prerequisites
