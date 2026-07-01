@@ -30,6 +30,8 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
 | `GET` | `/lean/v0/fork_choice/ui` | HTML | Interactive D3.js visualization |
+| `GET` | `/lean/v0/node/identity` | JSON | Client version |
+| `GET` | `/lean/v0/node/syncing` | JSON | Sync status relative to the wall clock |
 | `GET` | `/lean/v0/admin/aggregator` | JSON | Current aggregator role |
 | `POST` | `/lean/v0/admin/aggregator` | JSON | Toggle aggregator role at runtime |
 
@@ -90,6 +92,22 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 ```
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
+
+### `GET /lean/v0/node/identity`
+
+```json
+{ "version": "0.1.0" }
+```
+
+The crate version baked in at compile time (`CARGO_PKG_VERSION`).
+
+### `GET /lean/v0/node/syncing`
+
+```json
+{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
+```
+
+`sync_distance` is the number of slots between the node's current head and the current wall-clock slot; `is_syncing` is true when it exceeds `SYNC_LAG_THRESHOLD`. This is a stateless per-request snapshot: unlike the internal `SyncStatusTracker` it has no hysteresis or stall override, so it can disagree with the node's own duty gating around the threshold.
 
 ### `GET` / `POST /lean/v0/admin/aggregator`
 
