@@ -83,8 +83,7 @@ impl BlockChain {
         aggregator: AggregatorController,
         attestation_committee_count: u64,
         gate_duties: bool,
-        enable_proposer_aggregation: bool,
-        max_attestations_per_block: usize,
+        proposer_config: ProposerConfig,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -109,10 +108,7 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
-            proposer_config: ProposerConfig {
-                enable_proposer_aggregation,
-                max_attestations_per_block,
-            },
+            proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
         }
