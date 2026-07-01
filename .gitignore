@@ -39,3 +39,7 @@ devnet.log
 
 # mdbook build output
 book/
+
+# Local-only: vendored ethp2p-rs for building the devnet image with the
+# ethp2p feature (the PR uses a git dep). Do not commit.
+/ethp2p-rs/
