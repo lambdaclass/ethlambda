@@ -43,8 +43,11 @@ Aggregator-only, fires at most once per slot.
   from at least 2/3 of the expected validators:
   `group_count * 3 >= expected * 2`, with `expected > 0`. `group_count` is the
   number of stored gossip signatures in that group (one per validator).
-  `expected` = number of head-state validators whose
-  `vid % attestation_committee_count` is in this node's aggregation subnet set.
+  `expected` = number of validators whose
+  `vid % attestation_committee_count` is in this node's aggregation subnet set,
+  computed once at actor spawn (the validator registry is static, and
+  `Store::head_state()` clones the full state so per-check reads would be
+  needlessly expensive).
   Note that at most one group per slot can reach 2/3 (each validator signs once
   per slot), so the per-group condition can hold for at most one group.
 - **Check sites:**
@@ -110,12 +113,14 @@ pattern: build early, publish aligned to the boundary).
 ### Subnet-set plumbing
 
 The subscription-subnet computation is hoisted out of `build_swarm` into a
-shared pure helper (in the p2p crate, e.g.
-`compute_subscription_subnets(validator_ids, committee_count, is_aggregator, explicit_ids) -> HashSet<u64>`).
-`main.rs` calls it once and passes the resulting set to both:
+shared pure helper in the p2p crate:
+`compute_subscription_subnets(validator_ids, committee_count, is_aggregator, explicit_ids) -> HashSet<u64>`.
+Both call sites use it with the same startup inputs, keeping a single source of
+truth without churning `SwarmConfig`:
 
-- the p2p config (which subscribes to exactly this set, behavior unchanged), and
-- the `BlockChainServer` (new field, used for the `expected` count).
+- `build_swarm` (subscribes to exactly this set, behavior unchanged), and
+- `main.rs`, which passes the resulting set to `BlockChain::spawn` for the
+  `expected` count.
 
 The set is frozen at startup, matching the existing hot-standby aggregator
 model (runtime toggles do not resubscribe subnets).
