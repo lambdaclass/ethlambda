@@ -170,11 +170,11 @@ pub struct BlockChainServer {
 
     /// How the proposer collapses same-data attestations during block building
     /// (a block may carry at most one entry per `AttestationData`). When true,
-    /// same-data proofs are merged via recursive Type-1 aggregation into a
-    /// union-coverage proof (leanSpec #510); when false (the default), only the
-    /// single best-coverage proof per data is kept, skipping the per-data
-    /// leanVM aggregation. Seeded from the CLI `--enable-proposer-aggregation`
-    /// flag at spawn.
+    /// same-data proofs are merged via recursive single-message aggregation
+    /// into a union-coverage proof (leanSpec #510); when false (the default),
+    /// only the single best-coverage proof per data is kept, skipping the
+    /// per-data leanVM aggregation. Seeded from the CLI
+    /// `--enable-proposer-aggregation` flag at spawn.
     enable_proposer_aggregation: bool,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
@@ -480,7 +480,8 @@ impl BlockChainServer {
     /// Build the target slot's block and publish it, one interval early.
     ///
     /// Runs at the previous slot's interval 4, blocking the actor for the build
-    /// (the expensive part is the leanVM Type-1 → Type-2 merge). It first
+    /// (the expensive part is the leanVM single-message → multi-message
+    /// aggregate merge). It first
     /// advances the store to the target slot's interval 0 (accepting
     /// attestations) so the block is built on exactly the interval-0 state a
     /// non-prebuilding proposer would see, then builds and publishes — aligned
@@ -504,13 +505,15 @@ impl BlockChainServer {
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
         let timing = metrics::time_block_building();
-        let Ok((block, type_one_proofs, _post_checkpoints)) = store::produce_block_with_signatures(
-            &mut self.store,
-            slot,
-            validator_id,
-            self.enable_proposer_aggregation,
-        )
-        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block")) else {
+        let Ok((block, single_message_aggregates, _post_checkpoints)) =
+            store::produce_block_with_signatures(
+                &mut self.store,
+                slot,
+                validator_id,
+                self.enable_proposer_aggregation,
+            )
+            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
+        else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -533,10 +536,11 @@ impl BlockChainServer {
         };
 
         // Assemble SignedBlock: carry the proposer's raw XMSS signature as a
-        // standalone field, and aggregate the attestation Type-1s (only) into
-        // the block's attestation Type-2. The proposer no longer enters the
-        // aggregate, so a block with no attestations needs no prover work and
-        // the attestation Type-2 can be built independently of the block root.
+        // standalone field, and aggregate the attestation single-message
+        // aggregates (only) into the block's attestation multi-message
+        // aggregate. The proposer no longer enters the aggregate, so a block
+        // with no attestations needs no prover work and the attestation
+        // multi-message aggregate can be built independently of the block root.
         let head_state = self.store.head_state();
         let validators = &head_state.validators;
         if validators.get(validator_id as usize).is_none() {
@@ -548,18 +552,19 @@ impl BlockChainServer {
         // `sign_block_root` already returns an `XmssSignature`, so the proposer
         // signature is carried verbatim — no packing or prover work needed.
 
-        // Aggregate the attestation Type-1s into a single Type-2. With no
-        // attestations the aggregate is empty: the proposer signature stands
-        // alone, mirroring `(prop-sig, empty-proof)`.
-        let attestation_proof = if type_one_proofs.is_empty() {
+        // Aggregate the attestation single-message aggregates into a single
+        // multi-message aggregate. With no attestations the aggregate is empty:
+        // the proposer signature stands alone, mirroring `(prop-sig,
+        // empty-proof)`.
+        let attestation_proof = if single_message_aggregates.is_empty() {
             MultiMessageAggregate::default()
         } else {
             let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-                Vec::with_capacity(type_one_proofs.len());
+                Vec::with_capacity(single_message_aggregates.len());
             let mut resolve_failed = false;
-            for t1 in &type_one_proofs {
+            for sma in &single_message_aggregates {
                 let mut pubkeys = Vec::new();
-                for vid in t1.participant_indices() {
+                for vid in sma.participant_indices() {
                     let Some(validator) = validators.get(vid as usize) else {
                         error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
                         resolve_failed = true;
@@ -577,14 +582,14 @@ impl BlockChainServer {
                 if resolve_failed {
                     break;
                 }
-                merge_inputs.push((pubkeys, t1.proof.clone()));
+                merge_inputs.push((pubkeys, sma.proof.clone()));
             }
             if resolve_failed {
                 metrics::inc_block_building_failures();
                 return;
             }
 
-            // Merge yields raw lean-multisig Type-2 bytes. Per-component
+            // Merge yields raw lean-multisig type-2 bytes. Per-component
             // participants are rederived at verify time from
             // `block.body.attestations[i].aggregation_bits`, so nothing else
             // needs persisting.
@@ -605,8 +610,8 @@ impl BlockChainServer {
                 }
             }
         };
-        // `type_one_proofs` is no longer needed past this point.
-        drop(type_one_proofs);
+        // `single_message_aggregates` is no longer needed past this point.
+        drop(single_message_aggregates);
         let signed_block = SignedBlock {
             message: block,
             proof: BlockProof::new(proposer_signature, attestation_proof),
@@ -801,8 +806,9 @@ impl BlockChainServer {
                     "Block imported successfully"
                 );
 
-                // Recover per-attestation Type-1 proofs from the block's
-                // merged Type-2 and fold them into the local pool. Only
+                // Recover per-attestation single-message aggregates from the
+                // block's merged multi-message aggregate and fold them into the
+                // local pool. Only
                 // run when the chain is in sync — backfilling nodes must
                 // not spam gossip with rederived aggregates.
                 if self.sync_status.duties_allowed() {

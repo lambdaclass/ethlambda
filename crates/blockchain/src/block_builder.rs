@@ -23,7 +23,7 @@ use ethlambda_state_transition::{
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, Block, BlockBody, TypeOneMultiSignature},
+    block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
@@ -52,8 +52,8 @@ pub struct PostBlockCheckpoints {
 /// caller.
 ///
 /// The collapse strategy is gated by `enable_proposer_aggregation`:
-/// - **enabled**: same-data proofs are merged via recursive Type-1 aggregation
-///   into a single union-coverage proof (leanSpec #510). Maximizes voter
+/// - **enabled**: same-data proofs are merged via recursive single-message
+///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes voter
 ///   coverage per entry at the cost of a leanVM aggregation per duplicated
 ///   data entry.
 /// - **disabled** (default): the single best-coverage proof per data is kept
@@ -68,9 +68,9 @@ pub(crate) fn build_block(
     proposer_index: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     enable_proposer_aggregation: bool,
-) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
     let select_start = Instant::now();
@@ -88,8 +88,8 @@ pub(crate) fn build_block(
     // Each AttestationData may appear at most once per block (`on_block`
     // rejects duplicates), so same-data entries must be collapsed to one.
     // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
-    // AttestationData are merged via recursive Type-1 aggregation into a
-    // union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
+    // AttestationData are merged via recursive single-message aggregation into
+    // a union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
     // work and keep only the single best-coverage proof per data. Both paths
     // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
@@ -151,9 +151,9 @@ fn select_attestations(
     slot: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
-) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
-    let mut selected: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = Vec::new();
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
+    let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
     if aggregated_payloads.is_empty() {
         return selected;
     }
@@ -304,7 +304,7 @@ fn pick_best_candidate(
 /// the chain-level facts used to filter and score entries. Built once before
 /// the round loop in `select_attestations`.
 struct ChainContext<'a> {
-    aggregated_payloads: &'a HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+    aggregated_payloads: &'a HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     known_block_roots: &'a HashSet<H256>,
     extended_historical_block_hashes: &'a [H256],
     validator_count: usize,
@@ -380,7 +380,7 @@ fn entry_passes_filters(
 /// finalize and is always scored as tier 3.
 fn score_entry(
     att_data: &AttestationData,
-    proofs: &[TypeOneMultiSignature],
+    proofs: &[SingleMessageAggregate],
     current_votes: &HashMap<H256, HashSet<u64>>,
     projected_finalized_slot: u64,
     validator_count: usize,
@@ -539,10 +539,10 @@ fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
 /// - Multiple entries: merged into one using recursive proof aggregation
 ///   (leanSpec PR #510).
 fn compact_attestations(
-    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     head_state: &State,
     block_slot: u64,
-) -> Result<Vec<(AggregatedAttestation, TypeOneMultiSignature)>, StoreError> {
+) -> Result<Vec<(AggregatedAttestation, SingleMessageAggregate)>, StoreError> {
     // Group indices by AttestationData, preserving first-occurrence order
     let mut order: Vec<AttestationData> = Vec::new();
     let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
@@ -571,7 +571,7 @@ fn compact_attestations(
     );
 
     // Wrap in Option so we can .take() items by index without cloning
-    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
+    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
         entries.into_iter().map(Some).collect();
 
     let mut compacted = Vec::with_capacity(order.len());
@@ -585,7 +585,7 @@ fn compact_attestations(
         }
 
         // Collect all entries for this AttestationData
-        let group_items: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = indices
+        let group_items: Vec<(AggregatedAttestation, SingleMessageAggregate)> = indices
             .iter()
             .map(|&idx| items[idx].take().expect("index used once"))
             .collect();
@@ -620,7 +620,7 @@ fn compact_attestations(
         let merged_proof_data = aggregate_proofs(children, &data_root, slot)
             .map_err(StoreError::SignatureAggregationFailed)?;
 
-        let merged_proof = TypeOneMultiSignature::new(merged_bits.clone(), merged_proof_data);
+        let merged_proof = SingleMessageAggregate::new(merged_bits.clone(), merged_proof_data);
         let merged_att = AggregatedAttestation {
             aggregation_bits: merged_bits,
             data,
@@ -642,9 +642,9 @@ fn compact_attestations(
 /// and drop the rest. No leanVM aggregation runs; coverage is whatever the best
 /// individual proof already had, which is the cost of skipping aggregation.
 fn keep_best_proof_per_data(
-    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     block_slot: u64,
-) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
+) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
     // Preserve first-occurrence order of distinct AttestationData; for each,
     // track the index of the best (most participants) entry seen so far.
     let mut order: Vec<AttestationData> = Vec::new();
@@ -677,7 +677,7 @@ fn keep_best_proof_per_data(
         "Skipping attestation compaction"
     );
 
-    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
+    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
         entries.into_iter().map(Some).collect();
     order
         .iter()
@@ -703,8 +703,8 @@ fn keep_best_proof_per_data(
 /// Each selected proof is appended to `selected` paired with its
 /// corresponding AggregatedAttestation.
 fn extend_proofs_greedily(
-    proofs: &[TypeOneMultiSignature],
-    selected: &mut Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    proofs: &[SingleMessageAggregate],
+    selected: &mut Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     att_data: &AttestationData,
 ) {
     if proofs.is_empty() {
@@ -801,7 +801,7 @@ mod tests {
             AggregatedAttestation, AggregationBits, AttestationData, blank_xmss_signature,
         },
         block::{
-            BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature,
+            BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
         },
         checkpoint::Checkpoint,
         state::State,
@@ -853,7 +853,7 @@ mod tests {
         };
 
         // Supermajority (3 of 4) so the entry crosses 2/3.
-        let proofs = vec![TypeOneMultiSignature::empty(make_bits(&[0, 1, 2]))];
+        let proofs = vec![SingleMessageAggregate::empty(make_bits(&[0, 1, 2]))];
 
         let (score, _) = score_entry(
             &att_data,
@@ -961,7 +961,7 @@ mod tests {
 
         // Simulate a stall: populate the payload pool with many distinct entries.
         // Each has a unique attestation slot and a large proof payload.
-        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
             HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
@@ -982,7 +982,7 @@ mod tests {
 
             let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
             let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
-            let proof = TypeOneMultiSignature::new(bits, proof_data);
+            let proof = SingleMessageAggregate::new(bits, proof_data);
 
             aggregated_payloads.insert(data_root, (att_data, vec![proof]));
         }
@@ -1122,11 +1122,11 @@ mod tests {
         };
         let data_root = att_data.hash_tree_root();
         let proofs = vec![
-            TypeOneMultiSignature::empty(make_bits(&[0])),
-            TypeOneMultiSignature::empty(make_bits(&[1, 2])),
+            SingleMessageAggregate::empty(make_bits(&[0])),
+            SingleMessageAggregate::empty(make_bits(&[1, 2])),
         ];
 
-        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
             HashMap::new();
         aggregated_payloads.insert(data_root, (att_data.clone(), proofs));
 
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(
             signatures.len(),
             1,
-            "one Type-1 proof per attestation entry"
+            "one single-message aggregate per attestation entry"
         );
         let kept = &block.body.attestations[0];
         assert_eq!(
@@ -1257,7 +1257,7 @@ mod tests {
         for i in 0..SUPERMAJORITY {
             bits.set(i, true).unwrap();
         }
-        let proof = TypeOneMultiSignature::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof = SingleMessageAggregate::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
 
         let mut aggregated_payloads = HashMap::new();
         aggregated_payloads.insert(data_root, (att_data.clone(), vec![proof]));
@@ -1388,8 +1388,8 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         let proof_a =
-            TypeOneMultiSignature::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
-        let proof_b = TypeOneMultiSignature::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+            SingleMessageAggregate::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof_b = SingleMessageAggregate::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
 
         let mut aggregated_payloads = HashMap::new();
         aggregated_payloads.insert(att_a.hash_tree_root(), (att_a.clone(), vec![proof_a]));
@@ -1442,14 +1442,14 @@ mod tests {
                     aggregation_bits: bits_a.clone(),
                     data: data_a.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_a),
+                SingleMessageAggregate::empty(bits_a),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_b.clone(),
                     data: data_b.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_b),
+                SingleMessageAggregate::empty(bits_b),
             ),
         ];
 
@@ -1476,21 +1476,21 @@ mod tests {
                     aggregation_bits: bits_0.clone(),
                     data: data_a.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_0),
+                SingleMessageAggregate::empty(bits_0),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_1.clone(),
                     data: data_b.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_1),
+                SingleMessageAggregate::empty(bits_1),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_2.clone(),
                     data: data_c.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_2),
+                SingleMessageAggregate::empty(bits_2),
             ),
         ];
 
@@ -1517,9 +1517,9 @@ mod tests {
         //   A = {0, 1, 2, 3}  (4 validators — largest, picked first)
         //   B = {2, 3, 4}     (overlaps A on {2,3} but adds validator 4)
         //   C = {1, 2}        (subset of A — adds nothing, must be skipped)
-        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[2, 3, 4]));
-        let proof_c = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        let proof_a = SingleMessageAggregate::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = SingleMessageAggregate::empty(make_bits(&[2, 3, 4]));
+        let proof_c = SingleMessageAggregate::empty(make_bits(&[1, 2]));
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b, proof_c], &mut selected, &data);
@@ -1552,8 +1552,8 @@ mod tests {
         // B's participants are a subset of A's. After picking A, B offers zero
         // new coverage and must not be selected (its inclusion would also
         // violate the disjoint invariant).
-        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        let proof_a = SingleMessageAggregate::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = SingleMessageAggregate::empty(make_bits(&[1, 2]));
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data);

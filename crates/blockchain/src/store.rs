@@ -8,7 +8,7 @@ use ethlambda_types::{
         Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
         SignedAttestation, validator_indices,
     },
-    block::{Block, BlockHeader, SignedBlock, TypeOneMultiSignature},
+    block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
@@ -790,7 +790,7 @@ pub fn produce_block_with_signatures(
     slot: u64,
     validator_index: u64,
     enable_proposer_aggregation: bool,
-) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
     let head_state = store
@@ -1133,7 +1133,7 @@ mod tests {
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{
-            AggregatedAttestations, BlockBody, BlockProof, SignedBlock, TypeOneMultiSignature,
+            AggregatedAttestations, BlockBody, BlockProof, SignedBlock, SingleMessageAggregate,
         },
         checkpoint::Checkpoint,
         state::State,
@@ -1148,7 +1148,7 @@ mod tests {
     /// `verify_block_signatures` use an empty proof.
     fn make_signed_block_proof(
         _proposer_index: u64,
-        _attestation_proofs: Vec<TypeOneMultiSignature>,
+        _attestation_proofs: Vec<SingleMessageAggregate>,
     ) -> BlockProof {
         BlockProof::default()
     }
@@ -1220,8 +1220,8 @@ mod tests {
         let proof = make_signed_block_proof(
             0,
             vec![
-                TypeOneMultiSignature::empty(bits_a),
-                TypeOneMultiSignature::empty(bits_b),
+                SingleMessageAggregate::empty(bits_a),
+                SingleMessageAggregate::empty(bits_b),
             ],
         );
         let signed_block = SignedBlock {

@@ -1,6 +1,6 @@
-//! Reaggregate-from-block: recover per-attestation Type-1 proofs from a
-//! freshly imported block's merged Type-2 proof and fold them into the local
-//! aggregated-payload pool.
+//! Reaggregate-from-block: recover per-attestation single-message aggregates
+//! from a freshly imported block's merged multi-message aggregate proof and
+//! fold them into the local aggregated-payload pool.
 //!
 //! Mirrors leanSpec PR #717 `SyncService._deconstruct_block_into_store`.
 //! Required for catching-up nodes (and aggregators) to surface block-borne
@@ -30,18 +30,18 @@ use ethlambda_types::{
         AggregatedAttestation, HashedAttestationData, SignedAggregatedAttestation,
         validator_indices,
     },
-    block::{SignedBlock, TypeOneMultiSignature},
+    block::{SignedBlock, SingleMessageAggregate},
     primitives::{H256, HashTreeRoot as _},
     signature::ValidatorPublicKey,
 };
 use tracing::{debug, warn};
 
-/// Maximum number of attestations whose Type-1 we will SNARK-split out of
+/// Maximum number of attestations whose single-message aggregate we will SNARK-split out of
 /// any single imported block. Each split runs a fresh recursive SNARK
 /// (~hundreds of ms) so the cap keeps block-import latency predictable.
 pub const MAX_REAGGREGATIONS_PER_BLOCK: usize = 4;
 
-/// Recover per-attestation Type-1 proofs from a freshly imported block.
+/// Recover per-attestation single-message aggregates from a freshly imported block.
 ///
 /// Returns the combined aggregates that gained new validator coverage; the
 /// caller publishes them on gossip when this node acts as an aggregator.
@@ -58,8 +58,9 @@ pub fn reaggregate_from_block(
         return Vec::new();
     }
 
-    // The Type-2 proof was built against the parent state's validator set.
-    // Without it we cannot resolve the pubkey layout the SNARK was bound to.
+    // The multi-message aggregate proof was built against the parent state's
+    // validator set. Without it we cannot resolve the pubkey layout the SNARK
+    // was bound to.
     let Some(parent_state) = store.get_state(&block.parent_root) else {
         debug!(
             block_root = %ethlambda_types::ShortRoot(&block.hash_tree_root().0),
@@ -100,7 +101,7 @@ pub fn reaggregate_from_block(
     // Run the splits and merges. A failure on one attestation is logged
     // and skipped — partial progress still surfaces useful aggregates.
     let mut aggregates: Vec<SignedAggregatedAttestation> = Vec::with_capacity(candidates.len());
-    let mut store_inserts: Vec<(HashedAttestationData, TypeOneMultiSignature)> =
+    let mut store_inserts: Vec<(HashedAttestationData, SingleMessageAggregate)> =
         Vec::with_capacity(candidates.len());
 
     for candidate in candidates {
@@ -112,7 +113,7 @@ pub fn reaggregate_from_block(
         };
 
         // Step 1: SNARK-split this attestation's component out of the block's
-        // attestation Type-2 aggregate.
+        // attestation multi-message aggregate proof.
         let merged_bytes = signed_block.proof.attestation_proof.proof_bytes();
         let split_bytes = match ethlambda_crypto::split_type_2_by_message(
             merged_bytes,
@@ -126,15 +127,15 @@ pub fn reaggregate_from_block(
                 continue;
             }
         };
-        let block_t1 =
-            TypeOneMultiSignature::new(att.aggregation_bits.clone(), split_bytes.clone());
+        let block_single_message_aggregate =
+            SingleMessageAggregate::new(att.aggregation_bits.clone(), split_bytes.clone());
 
         // Step 2: merge the split with local partials covering the same
         // AttestationData so the combined proof binds every known signer.
         // A child-only merge needs ≥ 2 children; if we only have the
         // block proof, use it as-is.
         let combined = if candidate.local_partials.is_empty() {
-            block_t1
+            block_single_message_aggregate
         } else {
             let mut children: Vec<(Vec<ValidatorPublicKey>, _)> =
                 Vec::with_capacity(1 + candidate.local_partials.len());
@@ -144,7 +145,7 @@ pub fn reaggregate_from_block(
             let block_att_pubkeys = pubkeys_per_component[candidate.idx].clone();
             children.push((block_att_pubkeys, split_bytes));
 
-            // Remaining children: local partial Type-1s for the same data.
+            // Remaining children: local partial single-message aggregates for the same data.
             let mut bad = false;
             for partial in &candidate.local_partials {
                 let mut pubkeys = Vec::with_capacity(partial.participants.count_ones());
@@ -195,7 +196,7 @@ pub fn reaggregate_from_block(
                     .set(*vid as usize, true)
                     .expect("vid within union bitfield length");
             }
-            TypeOneMultiSignature::new(union_bits, merged_bytes)
+            SingleMessageAggregate::new(union_bits, merged_bytes)
         };
 
         let hashed = HashedAttestationData::new(att.data.clone());
@@ -220,7 +221,7 @@ struct Candidate {
     idx: usize,
     data_root: H256,
     new_validators: usize,
-    local_partials: Vec<TypeOneMultiSignature>,
+    local_partials: Vec<SingleMessageAggregate>,
 }
 
 /// Identify attestations from a freshly imported block worth SNARK-splitting.
@@ -247,7 +248,7 @@ fn select_candidates(store: &Store, attestations: &[AggregatedAttestation]) -> V
         if block_participants.is_subset(&local_union) {
             continue;
         }
-        let mut local: Vec<TypeOneMultiSignature> = new;
+        let mut local: Vec<SingleMessageAggregate> = new;
         local.extend(known);
         candidates.push(Candidate {
             idx,
@@ -324,8 +325,8 @@ mod tests {
         let mut store = empty_store();
         let att = make_att(2, 2, &[0, 1]);
         let hashed = HashedAttestationData::new(att.data.clone());
-        // Seed the new-payload pool with a Type-1 covering validators {0, 1}.
-        store.insert_new_aggregated_payload(hashed, TypeOneMultiSignature::empty(bits(&[0, 1])));
+        // Seed the new-payload pool with a single-message aggregate covering validators {0, 1}.
+        store.insert_new_aggregated_payload(hashed, SingleMessageAggregate::empty(bits(&[0, 1])));
         let candidates = select_candidates(&store, &[att]);
         assert!(candidates.is_empty());
     }
@@ -336,7 +337,7 @@ mod tests {
         let att = make_att(2, 2, &[0, 1, 2]);
         let hashed = HashedAttestationData::new(att.data.clone());
         // Local pool only covers validator 0.
-        store.insert_new_aggregated_payload(hashed, TypeOneMultiSignature::empty(bits(&[0])));
+        store.insert_new_aggregated_payload(hashed, SingleMessageAggregate::empty(bits(&[0])));
         let candidates = select_candidates(&store, &[att]);
         assert_eq!(candidates.len(), 1);
         // 1 and 2 are uncovered, so new_validators = 2.

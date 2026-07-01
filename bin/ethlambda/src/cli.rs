@@ -89,7 +89,7 @@ pub(crate) struct CliOptions {
     ///
     /// A block may carry at most one entry per `AttestationData`, so the
     /// proposer must collapse same-data proofs either way. When set,
-    /// `build_block` merges them via recursive Type-1 aggregation into a single
+    /// `build_block` merges them via recursive single-message aggregation into a single
     /// union-coverage proof per data (leanSpec #510), maximizing voter coverage
     /// at the cost of a leanVM aggregation per duplicated data entry. When unset
     /// (the default), it instead keeps only the single best-coverage proof per
