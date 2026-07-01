@@ -53,11 +53,13 @@ Aggregator-only, fires at most once per slot.
 - **Check sites:**
   1. After each gossip-signature insert in the `NewAttestation` handler, while
      the wall clock is inside the window.
-  2. A one-shot `EarlyAggregationCheck { slot }` self-message scheduled at the
-     interval-1 tick via `send_after(400 ms)` (interval-1 tick + 400 ms =
-     T2 - 400 ms), covering the case where the threshold was already met before
-     the window opened. If the interval-1 tick is skipped (overrun), the
-     per-insert checks still apply.
+  2. A one-shot `EarlyAggregationCheck` self-message (no payload — the slot is
+     recomputed from the wall clock at fire time, so a late-fired timer can
+     never act on a stale slot) scheduled at the interval-1 tick via
+     `send_after(400 ms)` (interval-1 tick + 400 ms = T2 - 400 ms), covering
+     the case where the threshold was already met before the window opened. If
+     the interval-1 tick is skipped (overrun), the per-insert checks still
+     apply.
 - **Once-per-slot guard:** a session with `session_id == slot` already exists in
   `current_aggregation` (the field persists after the worker finishes; it is
   only replaced at the next session start).
@@ -97,7 +99,11 @@ pattern: build early, publish aligned to the boundary).
   buffer is a no-op).
 - The buffer is bounded in practice by the number of data groups in one slot.
   Entries are never carried across slots: the flush timer fires at T2 of the
-  same slot that buffered them.
+  same slot that buffered them, and as a backstop `start_aggregation_session`
+  drains (drops, with a warning) any leftovers before installing a new session
+  — covering a backwards wall-clock step or a flush timer delayed past the
+  next session. Late aggregates are dropped, the same policy as signatures
+  that miss the snapshot.
 
 ### Deadline change
 
@@ -127,10 +133,14 @@ model (runtime toggles do not resubscribe subnets).
 
 ## Failure modes and edge cases
 
-- **Snapshot returns `None` after trigger** (should not happen — the trigger
-  requires signatures to be present): no session is created,
-  `current_aggregation` keeps the prior slot's id, and interval 2 retries
-  normally. No signatures are lost.
+- **Snapshot returns `None` after trigger**: unreachable in practice — the
+  trigger requires stored signatures, and `on_gossip_attestation` only stores
+  signatures whose pubkeys resolved during verification, so the snapshot
+  always yields at least one job for them. If it did happen, no session is
+  created and `current_aggregation` is left `None` (the prior session was
+  already taken), so the once-per-slot guard would not hold and per-insert
+  checks would retry; interval 2 remains the fallback. No signatures are
+  lost.
 - **Threshold never met:** interval 2 starts the session exactly as today.
 - **Signatures arriving after the early snapshot:** never aggregated that slot.
   Accepted trade-off (explicitly chosen over a top-up session).

@@ -72,7 +72,7 @@ pub fn max_gossip_group_count_for_slot(&self, slot: u64) -> usize {
 - [ ] **Step 2: Build**
 
 Run: `cargo build -p ethlambda-storage`
-Expected: clean build (a dead-code warning on the buffer method is possible until Task 7 wires the caller; plain `cargo build` does not deny warnings).
+Expected: clean build, no warnings (the `pub` Store method keeps the private buffer method alive).
 
 - [ ] **Step 3: Commit**
 
@@ -264,9 +264,10 @@ Inside `spawn`, before the `let handle = BlockChainServer {` block (~line 101), 
         };
 ```
 
-Add to the `BlockChainServer` struct literal in `spawn`:
+Add to the `BlockChainServer` struct literal in `spawn` (`genesis_time` is already computed at ~line 90):
 
 ```rust
+            genesis_time_ms: genesis_time * 1000,
             early_aggregation_expected_sigs,
             pending_aggregate_publishes: Vec::new(),
 ```
@@ -274,6 +275,11 @@ Add to the `BlockChainServer` struct literal in `spawn`:
 Add the fields to the `BlockChainServer` struct definition (after `attestation_committee_count`, ~line 170):
 
 ```rust
+    /// Genesis time in milliseconds, cached at spawn. `store.config()` is an
+    /// uncached backend read, too heavy for the per-gossip-insert early
+    /// checks that need this.
+    genesis_time_ms: u64,
+
     /// Number of validators whose subnet is one this node aggregates — the
     /// denominator of the early-aggregation 2/3 threshold. Computed once at
     /// spawn (the validator registry is static).
@@ -285,7 +291,7 @@ Add the fields to the `BlockChainServer` struct definition (after `attestation_c
     pending_aggregate_publishes: Vec<SignedAggregatedAttestation>,
 ```
 
-(`HashSet` and `SignedAggregatedAttestation` are already imported in `lib.rs`.)
+(`HashSet` and `SignedAggregatedAttestation` are already imported in `lib.rs`. Existing `config().genesis_time * 1000` call sites in `on_tick`/`handle_tick` stay as they are — only the new code paths use the cached field.)
 
 - [ ] **Step 2: Update `main.rs`**
 
@@ -439,8 +445,18 @@ Replace the tail of the function (from `let session_id = slot;` through the fina
 
 ```rust
         let session_id = slot;
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, slot);
+        // Any leftovers from a prior slot mean its flush never fired (a
+        // backwards wall-clock step, or a flush timer delayed past the next
+        // session). Drop them — late aggregates are dropped, same policy as
+        // signatures that miss the snapshot.
+        let stale = std::mem::take(&mut self.pending_aggregate_publishes);
+        if !stale.is_empty() {
+            warn!(
+                count = stale.len(),
+                "Dropping stale pending aggregate publishes"
+            );
+        }
+        let t2_ms = aggregation::interval2_boundary_ms(self.genesis_time_ms, slot);
         let now_ms = unix_now_ms();
         let early = now_ms < t2_ms;
         if early {
@@ -529,8 +545,7 @@ Rewrite the body of `impl Handler<AggregateProduced>` (~line 1050) — the sessi
         // Publish alignment: hold back aggregates produced before this slot's
         // interval-2 boundary; `FlushAggregatePublishes` publishes them at T2.
         // (`session_id` is the session's slot.)
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, msg.session_id);
+        let t2_ms = aggregation::interval2_boundary_ms(self.genesis_time_ms, msg.session_id);
         if unix_now_ms() < t2_ms {
             self.pending_aggregate_publishes.push(aggregate);
             return;
@@ -654,8 +669,7 @@ Extend the `use crate::aggregation::{...}` import with `EarlyAggregationCheck` a
         if !self.aggregator.is_enabled() {
             return;
         }
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let Some(slot) = aggregation::early_aggregation_slot(unix_now_ms(), genesis_time_ms)
+        let Some(slot) = aggregation::early_aggregation_slot(unix_now_ms(), self.genesis_time_ms)
         else {
             return;
         };
@@ -804,7 +818,7 @@ Check the aggregator node's logs and metrics:
 2. `"Publishing aggregates held back until the interval-2 boundary"` appears with `count >= 1`.
 3. `lean_aggregation_early_starts_total` grows (metrics port, default `:5054`, path `/metrics`).
 4. `lean_aggregation_early_start_lead_seconds` observations sit in `(0, 0.4]`.
-5. `"Committee signatures aggregated"` logs show `early=true` sessions and no `"Prior aggregation worker still running"` warnings.
+5. `"Committee signatures aggregated"` logs show `early=true` sessions. `"Prior aggregation worker still running"` warnings must be rare (the early start shrinks the worst-case gap to the previous slot's worker from 3250 ms to 2800 ms, so occasional joins under slow proofs are expected — every slot would be a bug).
 6. No aggregate publish happens before its slot's interval-2 boundary: spot-check a few `"Starting aggregation session early"` slots and confirm the corresponding aggregated-attestation publish log lands at or after T2 (per-slot offset = `(log_epoch - GENESIS_TIME) mod 4 >= 1.6`).
 
 - [ ] **Step 3: Verify chain health**
