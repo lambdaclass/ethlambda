@@ -130,4 +130,13 @@ pub(crate) struct ShadowOptions {
     /// Unset or <= 0 disables.
     #[arg(long)]
     pub(crate) shadow_xmss_merge_rate: Option<f64>,
+
+    /// Shadow sim only: byte length of each fake stub proof. Defaults to 32
+    /// KiB; capped at the 512 KiB on-wire proof limit.
+    #[arg(
+        long,
+        default_value_t = ethlambda_crypto::shadow_cost::DEFAULT_FAKE_PROOF_SIZE as u64,
+        value_parser = clap::value_parser!(u64).range(1..=524_288)
+    )]
+    pub(crate) shadow_xmss_fake_proof_size: u64,
 }

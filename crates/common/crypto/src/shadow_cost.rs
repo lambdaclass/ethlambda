@@ -1,7 +1,7 @@
 //! Shadow-simulator sim-cost + fake-proof backend. Compiled only under the
 //! `shadow-integration` feature. Ported from zeam's shadow_cost.zig.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ethlambda_types::block::ByteList512KiB;
@@ -19,6 +19,8 @@ static FAKE_ENABLED: AtomicBool = AtomicBool::new(false);
 static AGG_RATE: AtomicU64 = AtomicU64::new(0);
 static VERIFY_RATE: AtomicU64 = AtomicU64::new(0);
 static MERGE_RATE: AtomicU64 = AtomicU64::new(0);
+/// Byte length of each fake stub proof; see `DEFAULT_FAKE_PROOF_SIZE`.
+static FAKE_PROOF_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_FAKE_PROOF_SIZE);
 
 /// Convert an optional rate into the bit pattern stored in the atomic.
 ///
@@ -39,12 +41,21 @@ fn rate_bits(v: Option<f64>) -> u64 {
 /// `fake` switches the prover/verifier to the deterministic stub backend.
 /// `agg`/`verify`/`merge` are the modeled operation rates (units per
 /// second) used to compute sim-cost sleeps; `None` (or a non-finite /
-/// non-positive value) disables the sleep for that operation.
-pub fn init(fake: bool, agg: Option<f64>, verify: Option<f64>, merge: Option<f64>) {
+/// non-positive value) disables the sleep for that operation. `proof_size`
+/// is the byte length of each fake stub proof (callers must keep it within
+/// the `ByteList512KiB` cap).
+pub fn init(
+    fake: bool,
+    agg: Option<f64>,
+    verify: Option<f64>,
+    merge: Option<f64>,
+    proof_size: usize,
+) {
     FAKE_ENABLED.store(fake, Ordering::Relaxed);
     AGG_RATE.store(rate_bits(agg), Ordering::Relaxed);
     VERIFY_RATE.store(rate_bits(verify), Ordering::Relaxed);
     MERGE_RATE.store(rate_bits(merge), Ordering::Relaxed);
+    FAKE_PROOF_SIZE.store(proof_size, Ordering::Relaxed);
 }
 
 /// Whether the fake-XMSS stub backend is active.
@@ -97,9 +108,16 @@ pub fn sleep(delay: Duration) {
     }
 }
 
-/// Fixed size of every fake stub proof; well under the 512 KiB
-/// `ByteList512KiB` wire cap.
-pub const FAKE_PROOF_SIZE: usize = 32 * 1024;
+/// Default byte length of each fake stub proof (32 KiB); overridable at
+/// startup via `init`. Well under the 512 KiB `ByteList512KiB` wire cap.
+pub const DEFAULT_FAKE_PROOF_SIZE: usize = 32 * 1024;
+
+/// The configured fake stub proof size in bytes. Defaults to
+/// `DEFAULT_FAKE_PROOF_SIZE`; set once via `init` and bounded by the CLI to the
+/// `ByteList512KiB` cap.
+pub fn fake_proof_size() -> usize {
+    FAKE_PROOF_SIZE.load(Ordering::Relaxed)
+}
 
 /// Produce a deterministic `len`-byte stub proof derived only from
 /// `seed_parts`.
@@ -140,5 +158,5 @@ pub fn fill_fake_proof(len: usize, seed_parts: &[&[u8]]) -> ByteList512KiB {
         bytes.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
     }
 
-    ByteList512KiB::try_from(bytes).expect("FAKE_PROOF_SIZE fits ByteList512KiB cap")
+    ByteList512KiB::try_from(bytes).expect("fake proof size must not exceed the ByteList512KiB cap")
 }

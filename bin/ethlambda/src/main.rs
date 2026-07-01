@@ -312,6 +312,7 @@ fn init_shadow_cost(shadow: &cli::ShadowOptions) {
         aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
         verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
         merge_rate = ?shadow.shadow_xmss_merge_rate,
+        fake_proof_size = shadow.shadow_xmss_fake_proof_size,
         "Applying Shadow XMSS sim-cost / fake-XMSS config"
     );
     ethlambda_crypto::shadow_cost::init(
@@ -319,6 +320,7 @@ fn init_shadow_cost(shadow: &cli::ShadowOptions) {
         shadow.shadow_xmss_aggregate_signatures_rate,
         shadow.shadow_xmss_verify_aggregated_signatures_rate,
         shadow.shadow_xmss_merge_rate,
+        shadow.shadow_xmss_fake_proof_size as usize,
     );
 }
 

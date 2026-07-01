@@ -174,7 +174,7 @@ pub fn aggregate_signatures(
         let count_bytes = public_keys.len().to_le_bytes();
         let slot_bytes = slot.to_le_bytes();
         let dummy = crate::shadow_cost::fill_fake_proof(
-            crate::shadow_cost::FAKE_PROOF_SIZE,
+            crate::shadow_cost::fake_proof_size(),
             &[&message.0, &slot_bytes, &count_bytes],
         );
         crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
@@ -235,7 +235,7 @@ pub fn aggregate_mixed(
         }
         parts.push(&count_bytes);
         let dummy =
-            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
         crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
         return Ok(dummy);
     }
@@ -293,7 +293,7 @@ pub fn aggregate_proofs(
             parts.push(proof.iter().as_slice());
         }
         let dummy =
-            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
         crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
         return Ok(dummy);
     }
@@ -401,7 +401,7 @@ pub fn merge_type_1s_into_type_2(
         }
         parts.push(&count_bytes);
         let dummy =
-            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
         crate::shadow_cost::sleep(crate::shadow_cost::merge_delay(merge_n));
         return Ok(dummy);
     }
@@ -498,7 +498,7 @@ pub fn split_type_2_by_message(
     #[cfg(feature = "shadow-integration")]
     if crate::shadow_cost::fake_xmss() {
         return Ok(crate::shadow_cost::fill_fake_proof(
-            crate::shadow_cost::FAKE_PROOF_SIZE,
+            crate::shadow_cost::fake_proof_size(),
             &[proof_data, &message.0],
         ));
     }
