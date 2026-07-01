@@ -45,7 +45,7 @@ pub struct PostBlockCheckpoints {
 
 /// Proposer-side block-building policy, seeded from the CLI at spawn.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ProposerConfig {
+pub struct ProposerConfig {
     /// How the proposer collapses same-`AttestationData` proofs (a block may
     /// carry at most one entry per data). When true, they are merged via
     /// recursive single-message aggregation into a union-coverage proof

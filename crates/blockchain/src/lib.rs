@@ -26,6 +26,7 @@ use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::block_builder::ProposerConfig;
 use crate::store::StoreError;
 
 pub mod aggregation;
@@ -108,8 +109,10 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
-            enable_proposer_aggregation,
-            max_attestations_per_block,
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation,
+                max_attestations_per_block,
+            },
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
         }
@@ -170,21 +173,11 @@ pub struct BlockChainServer {
     /// attestation aggregate coverage emission.
     attestation_committee_count: u64,
 
-    /// How the proposer collapses same-data attestations during block building
-    /// (a block may carry at most one entry per `AttestationData`). When true,
-    /// same-data proofs are merged via recursive single-message aggregation
-    /// into a union-coverage proof (leanSpec #510); when false (the default),
-    /// only the single best-coverage proof per data is kept, skipping the
-    /// per-data leanVM aggregation. Seeded from the CLI
-    /// `--enable-proposer-aggregation` flag at spawn.
-    enable_proposer_aggregation: bool,
-
-    /// Maximum number of distinct attestations the proposer packs into a block
-    /// it builds. Proposer-side self-limit only; it does not affect the cap for
-    /// accepting peers' blocks (`MAX_ATTESTATIONS_DATA`). Clamped to
-    /// `MAX_ATTESTATIONS_DATA` during selection. Seeded from the CLI
-    /// `--max-attestations-per-block` flag at spawn.
-    max_attestations_per_block: usize,
+    /// Proposer-side block-building policy (how same-data attestations are
+    /// collapsed, and how many distinct attestations to pack). Seeded from the
+    /// CLI `--enable-proposer-aggregation` and `--max-attestations-per-block`
+    /// flags at spawn and read when this node proposes a block.
+    proposer_config: ProposerConfig,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
     /// report. Captured at the end-of-slot promote (interval 4), read at the
@@ -519,8 +512,7 @@ impl BlockChainServer {
                 &mut self.store,
                 slot,
                 validator_id,
-                self.enable_proposer_aggregation,
-                self.max_attestations_per_block,
+                self.proposer_config,
             )
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {
