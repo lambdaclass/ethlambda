@@ -26,6 +26,8 @@ serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true
 jemalloc_pprof.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
 
 [dev-dependencies]
 ethlambda-types.workspace = true

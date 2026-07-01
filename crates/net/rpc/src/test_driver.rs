@@ -347,7 +347,12 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 }
                 (None, None) => return Err("tick step missing time and interval".to_string()),
             };
-            store::on_tick(store, timestamp_ms, step.has_proposal.unwrap_or(false));
+            store::on_tick(
+                store,
+                timestamp_ms,
+                step.has_proposal.unwrap_or(false),
+                None,
+            );
             Ok(())
         }
         "block" => {
@@ -361,7 +366,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             if step.tick_to_slot {
                 let block_time_ms = store.config().genesis_time * 1000
                     + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-                store::on_tick(store, block_time_ms, true);
+                store::on_tick(store, block_time_ms, true, None);
             }
             store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
         }

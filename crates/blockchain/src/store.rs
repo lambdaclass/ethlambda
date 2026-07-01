@@ -20,27 +20,33 @@ use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
     MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
+    events::{ChainEvent, ChainEventTx},
     metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store, log_tree: bool, events: Option<&ChainEventTx>) {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    update_head(store, log_tree, events);
 }
 
 /// Update the head based on the fork choice rule.
 ///
 /// When `log_tree` is true, also computes block weights and logs an ASCII
 /// fork choice tree to the terminal.
-pub fn update_head(store: &mut Store, log_tree: bool) {
+///
+/// When `events` is `Some`, emits a [`ChainEvent::Head`] whenever the head
+/// changes and a [`ChainEvent::FinalizedCheckpoint`] whenever finalization
+/// advances. Send errors (no subscribers) are ignored.
+pub fn update_head(store: &mut Store, log_tree: bool, events: Option<&ChainEventTx>) {
     let blocks = store.get_live_chain();
     let attestations = store.extract_latest_known_attestations();
     let old_head = store.head();
+    let old_finalized = store.latest_finalized();
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store.latest_justified().root,
         &blocks,
@@ -61,6 +67,31 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
     store
         .update_checkpoints(ForkCheckpoints::new(new_head, None, finalized))
         .expect("update_checkpoints should succeed");
+
+    if let Some(events) = events {
+        // Emit the new head whenever fork choice moved it. Read the header once
+        // and reuse it for slot and parent_root so they stay consistent.
+        if old_head != new_head {
+            if let Some(new_header) = store.get_block_header(&new_head) {
+                let _ = events.send(ChainEvent::Head {
+                    slot: new_header.slot,
+                    root: new_head,
+                    parent_root: new_header.parent_root,
+                });
+            } else {
+                tracing::warn!("head header missing while emitting Head event; skipping");
+            }
+        }
+
+        // Emit a finalized-checkpoint event only when finalization advanced.
+        let new_finalized = store.latest_finalized();
+        if new_finalized.slot > old_finalized.slot || new_finalized.root != old_finalized.root {
+            let _ = events.send(ChainEvent::FinalizedCheckpoint {
+                slot: new_finalized.slot,
+                root: new_finalized.root,
+            });
+        }
+    }
 
     if old_head != new_head {
         let old_slot = store
@@ -258,7 +289,12 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// 800ms interval. Slot and interval-within-slot are derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
-pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
+pub fn on_tick(
+    store: &mut Store,
+    timestamp_ms: u64,
+    has_proposal: bool,
+    events: Option<&ChainEventTx>,
+) {
     // Convert UNIX timestamp (ms) to interval count since genesis
     let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
@@ -295,7 +331,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             0 => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false);
+                    accept_new_attestations(store, false, events);
                 }
             }
             1 => {
@@ -310,7 +346,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             }
             4 => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true);
+                accept_new_attestations(store, true, events);
             }
             _ => unreachable!("slots only have 5 intervals"),
         }
@@ -489,8 +525,12 @@ fn on_gossip_aggregated_attestation_core(
 ///
 /// This is the safe default: it always verifies cryptographic signatures
 /// and stores them for future block building. Use this for all production paths.
-pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, true)
+pub fn on_block(
+    store: &mut Store,
+    signed_block: SignedBlock,
+    events: Option<&ChainEventTx>,
+) -> Result<(), StoreError> {
+    on_block_core(store, signed_block, true, events)
 }
 
 /// Process a new block without signature verification.
@@ -501,7 +541,7 @@ pub fn on_block_without_verification(
     store: &mut Store,
     signed_block: SignedBlock,
 ) -> Result<(), StoreError> {
-    on_block_core(store, signed_block, false)
+    on_block_core(store, signed_block, false, None)
 }
 
 /// Core block processing logic.
@@ -512,6 +552,7 @@ fn on_block_core(
     store: &mut Store,
     signed_block: SignedBlock,
     verify: bool,
+    events: Option<&ChainEventTx>,
 ) -> Result<(), StoreError> {
     let _timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
@@ -600,8 +641,17 @@ fn on_block_core(
         metrics::inc_attestations_valid(count);
     }
 
+    // Emit the imported block before fork choice runs, so subscribers see the
+    // `block` event ahead of any `head` move it triggers.
+    if let Some(events) = events {
+        let _ = events.send(ChainEvent::Block {
+            slot,
+            root: block_root,
+        });
+    }
+
     // Update forkchoice head based on new block and attestations
-    update_head(store, false);
+    update_head(store, false, events);
 
     let block_total = block_start.elapsed();
     info!(
@@ -772,11 +822,16 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
     let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
-    // Advance time to current slot (ticking intervals)
-    on_tick(store, slot_time_ms, true);
+    // Advance time to current slot (ticking intervals).
+    //
+    // No event sender here: this is the proposer's pre-build catch-up, and the
+    // block it produces is imported via `on_block` (which emits the resulting
+    // `Block`/`Head`). Emitting from here would surface a head move before the
+    // block exists.
+    on_tick(store, slot_time_ms, true, None);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false);
+    accept_new_attestations(store, false, None);
 
     store.head()
 }

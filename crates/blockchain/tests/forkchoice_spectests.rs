@@ -103,7 +103,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     if step.tick_to_slot {
                         let block_time_ms =
                             genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-                        store::on_tick(&mut store, block_time_ms, true);
+                        store::on_tick(&mut store, block_time_ms, true, None);
                     }
                     let result = store::on_block_without_verification(&mut store, signed_block);
                     let import_ok = result.is_ok();
@@ -138,7 +138,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         // on_block already ran the head update before these votes
                         // existed; recompute so the head reflects the block's own
                         // attestations, matching the proposer-view store.
-                        store::update_head(&mut store, false);
+                        store::update_head(&mut store, false, None);
                     }
                 }
                 "tick" => {
@@ -153,7 +153,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         (None, None) => panic!("tick step missing both time and interval"),
                     };
                     let has_proposal = step.has_proposal.unwrap_or(false);
-                    store::on_tick(&mut store, timestamp_ms, has_proposal);
+                    store::on_tick(&mut store, timestamp_ms, has_proposal, None);
                 }
                 "attestation" => {
                     let att_data = step

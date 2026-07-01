@@ -29,9 +29,12 @@ use tracing::{debug, error, info, trace, warn};
 use crate::block_builder::ProposerConfig;
 use crate::store::StoreError;
 
+pub use events::{CHAIN_EVENT_CHANNEL_CAPACITY, ChainEvent, ChainEventTx};
+
 pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
+pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -84,6 +87,7 @@ impl BlockChain {
         attestation_committee_count: u64,
         gate_duties: bool,
         proposer_config: ProposerConfig,
+        chain_events: ChainEventTx,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -111,6 +115,7 @@ impl BlockChain {
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
+            chain_events,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -183,6 +188,11 @@ pub struct BlockChainServer {
     /// validator duties while syncing, unless that gating was disabled at
     /// startup via `--disable-duty-sync-gate` (then it is metric-only).
     sync_status: SyncStatusTracker,
+
+    /// Broadcast sender for chain events streamed to SSE subscribers
+    /// (`GET /lean/v0/events`). The actor is the sole publisher; the RPC
+    /// handler only subscribes, preserving the one-directional write flow.
+    chain_events: ChainEventTx,
 }
 
 impl BlockChainServer {
@@ -266,7 +276,12 @@ impl BlockChainServer {
             .is_some();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal
-        store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+        store::on_tick(
+            &mut self.store,
+            timestamp_ms,
+            is_proposer,
+            Some(&self.chain_events),
+        );
 
         // Per-interval duties for this tick. Intervals 0 (block publish) and 3
         // (safe-target update) are driven inside `store::on_tick` above, so they
@@ -676,7 +691,7 @@ impl BlockChainServer {
 
     /// Run block import and refresh metrics.
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
-        store::on_block(&mut self.store, signed_block)?;
+        store::on_block(&mut self.store, signed_block, Some(&self.chain_events))?;
         metrics::update_head_slot(self.store.head_slot());
         metrics::update_latest_justified_slot(self.store.latest_justified().slot);
         metrics::update_latest_finalized_slot(self.store.latest_finalized().slot);
