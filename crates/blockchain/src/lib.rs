@@ -173,10 +173,7 @@ pub struct BlockChainServer {
     /// attestation aggregate coverage emission.
     attestation_committee_count: u64,
 
-    /// Proposer-side block-building policy (how same-data attestations are
-    /// collapsed, and how many distinct attestations to pack). Seeded from the
-    /// CLI `--enable-proposer-aggregation` and `--max-attestations-per-block`
-    /// flags at spawn and read when this node proposes a block.
+    /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
