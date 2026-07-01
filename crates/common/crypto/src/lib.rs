@@ -14,6 +14,9 @@ use lean_multisig::{
 use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
 
+#[cfg(feature = "shadow-integration")]
+pub mod shadow_cost;
+
 /// log(1/rate) for the WHIR commitment scheme used inside lean-multisig.
 const LOG_INV_RATE: usize = 2;
 
@@ -163,6 +166,21 @@ pub fn aggregate_signatures(
         return Err(AggregationError::EmptyInput);
     }
 
+    #[cfg(feature = "shadow-integration")]
+    let agg_n = public_keys.len();
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let count_bytes = public_keys.len().to_le_bytes();
+        let slot_bytes = slot.to_le_bytes();
+        let dummy = crate::shadow_cost::fill_fake_proof(
+            crate::shadow_cost::FAKE_PROOF_SIZE,
+            &[&message.0, &slot_bytes, &count_bytes],
+        );
+        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
@@ -174,7 +192,10 @@ pub fn aggregate_signatures(
     let proof = aggregate_single_message_signatures(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    #[cfg(feature = "shadow-integration")]
+    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+    Ok(result)
 }
 
 /// Aggregate both existing Type-1 proofs (children) and raw XMSS signatures.
@@ -201,6 +222,24 @@ pub fn aggregate_mixed(
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
 
+    #[cfg(feature = "shadow-integration")]
+    let agg_n = raw_public_keys.len();
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let count_bytes = raw_public_keys.len().to_le_bytes();
+        let slot_bytes = slot.to_le_bytes();
+        let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
+        for (_, proof) in &children {
+            parts.push(proof.iter().as_slice());
+        }
+        parts.push(&count_bytes);
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let children_native: Vec<LMType1> = children
@@ -224,7 +263,10 @@ pub fn aggregate_mixed(
     )
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    #[cfg(feature = "shadow-integration")]
+    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+    Ok(result)
 }
 
 /// Recursively aggregate two or more already-aggregated Type-1 proofs into one.
@@ -238,6 +280,22 @@ pub fn aggregate_proofs(
 ) -> Result<ByteList512KiB, AggregationError> {
     if children.len() < 2 {
         return Err(AggregationError::InsufficientChildren(children.len()));
+    }
+
+    #[cfg(feature = "shadow-integration")]
+    let agg_n = children.len();
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let slot_bytes = slot.to_le_bytes();
+        let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
+        for (_, proof) in &children {
+            parts.push(proof.iter().as_slice());
+        }
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
     }
 
     ensure_prover_ready();
@@ -257,7 +315,10 @@ pub fn aggregate_proofs(
     )
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    #[cfg(feature = "shadow-integration")]
+    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+    Ok(result)
 }
 
 /// Verify a Type-1 aggregated signature proof.
@@ -272,6 +333,15 @@ pub fn verify_aggregated_signature(
     message: &H256,
     slot: u32,
 ) -> Result<(), VerificationError> {
+    #[cfg(feature = "shadow-integration")]
+    let verify_n = public_keys.len();
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        std::thread::sleep(crate::shadow_cost::verify_delay(verify_n));
+        return Ok(());
+    }
+
     ensure_verifier_ready();
 
     let lean_pubkeys = into_lean_pubkeys(public_keys);
@@ -288,6 +358,8 @@ pub fn verify_aggregated_signature(
     }
 
     verify_single_message_aggregate(&sig)?;
+    #[cfg(feature = "shadow-integration")]
+    std::thread::sleep(crate::shadow_cost::verify_delay(verify_n));
     Ok(())
 }
 
@@ -310,6 +382,23 @@ pub fn merge_type_1s_into_type_2(
         return Err(AggregationError::EmptyInput);
     }
 
+    #[cfg(feature = "shadow-integration")]
+    let merge_n = type_1s.len();
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let count_bytes = type_1s.len().to_le_bytes();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(type_1s.len() + 1);
+        for (_, proof) in &type_1s {
+            parts.push(proof.iter().as_slice());
+        }
+        parts.push(&count_bytes);
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
+        std::thread::sleep(crate::shadow_cost::merge_delay(merge_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let type_1s_native: Vec<LMType1> = type_1s
@@ -321,7 +410,10 @@ pub fn merge_type_1s_into_type_2(
     let merged = merge_single_message_aggregates(type_1s_native, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type2_to_byte_list(&merged)
+    let result = compress_type2_to_byte_list(&merged)?;
+    #[cfg(feature = "shadow-integration")]
+    std::thread::sleep(crate::shadow_cost::merge_delay(merge_n));
+    Ok(result)
 }
 
 /// Verify a Type-2 merged proof against the per-component expected bindings.
@@ -339,6 +431,11 @@ pub fn verify_type_2_signature(
             components: expected_bindings.len(),
             pubkey_sets: pubkeys_per_component.len(),
         });
+    }
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        return Ok(());
     }
 
     ensure_verifier_ready();
@@ -391,6 +488,14 @@ pub fn split_type_2_by_message(
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
 ) -> Result<ByteList512KiB, AggregationError> {
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        return Ok(crate::shadow_cost::fill_fake_proof(
+            crate::shadow_cost::FAKE_PROOF_SIZE,
+            &[proof_data, &message.0],
+        ));
+    }
+
     ensure_prover_ready();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
@@ -604,5 +709,145 @@ mod tests {
 
         verify_aggregated_signature(&split, vec![pk_a.clone()], &msg_a, slot_a)
             .expect("verify split");
+    }
+}
+
+/// Tests for the `shadow-integration` fake-XMSS interception paths in the 7
+/// aggregation/verify functions above. These never build real XMSS keys —
+/// the fake path never dereferences pubkeys/sigs, only cheap dummy bytes.
+///
+/// `aggregate_signatures` has no dedicated fake test: unlike the others it
+/// takes `Vec<ValidatorPublicKey>`/`Vec<ValidatorSignature>` (opaque leansig
+/// wrappers that `from_bytes` deserializes structurally, so they can't be
+/// constructed from arbitrary bytes cheaply), and its non-empty guard is hit
+/// before the fake branch. Its fake seed shape matches `aggregate_mixed`'s
+/// with no children, so it is covered transitively.
+#[cfg(all(test, feature = "shadow-integration"))]
+mod fake_interception_tests {
+    use super::*;
+    use crate::shadow_cost::{FAKE_PROOF_SIZE, TEST_LOCK, init, reset_for_test};
+
+    fn dummy_proof(byte: u8) -> ByteList512KiB {
+        ByteList512KiB::try_from(vec![byte; 100]).unwrap()
+    }
+
+    #[test]
+    fn aggregate_mixed_fake_returns_dummy_of_expected_size() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let message = H256::from([1u8; 32]);
+        let children = vec![(vec![], dummy_proof(0xAA)), (vec![], dummy_proof(0xBB))];
+
+        let result = aggregate_mixed(children, vec![], vec![], &message, 7);
+        let proof = result.expect("fake aggregate_mixed should succeed");
+        assert_eq!(proof.len(), FAKE_PROOF_SIZE);
+        assert!(proof.len() < 512 * 1024);
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn aggregate_mixed_fake_is_deterministic_and_message_sensitive() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let message = H256::from([2u8; 32]);
+        let other_message = H256::from([3u8; 32]);
+        let children = || vec![(vec![], dummy_proof(0xAA)), (vec![], dummy_proof(0xBB))];
+
+        let a = aggregate_mixed(children(), vec![], vec![], &message, 7).unwrap();
+        let b = aggregate_mixed(children(), vec![], vec![], &message, 7).unwrap();
+        assert_eq!(a.iter().as_slice(), b.iter().as_slice());
+
+        let c = aggregate_mixed(children(), vec![], vec![], &other_message, 7).unwrap();
+        assert_ne!(a.iter().as_slice(), c.iter().as_slice());
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn aggregate_proofs_fake_returns_dummy_of_expected_size() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let message = H256::from([4u8; 32]);
+        let children = vec![(vec![], dummy_proof(0xCC)), (vec![], dummy_proof(0xDD))];
+
+        let result = aggregate_proofs(children, &message, 9);
+        let proof = result.expect("fake aggregate_proofs should succeed");
+        assert_eq!(proof.len(), FAKE_PROOF_SIZE);
+        assert!(proof.len() < 512 * 1024);
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn merge_and_verify_type_2_fake_round_trip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let a = dummy_proof(0x11);
+        let b = dummy_proof(0x22);
+        let type_1s = vec![(vec![], a), (vec![], b)];
+
+        let merged = merge_type_1s_into_type_2(type_1s).expect("fake merge should succeed");
+        assert_eq!(merged.len(), FAKE_PROOF_SIZE);
+        assert!(merged.len() < 512 * 1024);
+
+        let message = H256::from([5u8; 32]);
+        let slot = 12u32;
+        let verify_result =
+            verify_type_2_signature(merged.iter().as_slice(), vec![vec![]], &[(message, slot)]);
+        assert!(
+            verify_result.is_ok(),
+            "fake verify_type_2_signature should accept: {:?}",
+            verify_result.err()
+        );
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn split_type_2_by_message_fake_returns_dummy_of_expected_size() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let a = dummy_proof(0x33);
+        let b = dummy_proof(0x44);
+        let merged = merge_type_1s_into_type_2(vec![(vec![], a), (vec![], b)])
+            .expect("fake merge should succeed");
+
+        let message = H256::from([6u8; 32]);
+        let split = split_type_2_by_message(merged.iter().as_slice(), vec![vec![]], &message)
+            .expect("fake split should succeed");
+        assert_eq!(split.len(), FAKE_PROOF_SIZE);
+        assert!(split.len() < 512 * 1024);
+
+        reset_for_test();
+    }
+
+    #[test]
+    fn verify_aggregated_signature_fake_accepts_dummy_input() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        init(true, None, None, None);
+
+        let proof = dummy_proof(0x55);
+        let message = H256::from([7u8; 32]);
+
+        let result = verify_aggregated_signature(&proof, vec![], &message, 3);
+        assert!(
+            result.is_ok(),
+            "fake verify_aggregated_signature should accept: {:?}",
+            result.err()
+        );
+
+        reset_for_test();
     }
 }

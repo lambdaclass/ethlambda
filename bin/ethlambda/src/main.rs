@@ -79,6 +79,24 @@ async fn main() -> eyre::Result<()> {
 
     let options = CliOptions::parse();
 
+    #[cfg(feature = "shadow-integration")]
+    {
+        let shadow = &options.shadow;
+        info!(
+            fake = shadow.shadow_xmss_fake,
+            aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
+            verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
+            merge_rate = ?shadow.shadow_xmss_merge_rate,
+            "Applying Shadow XMSS sim-cost / fake-XMSS config"
+        );
+        ethlambda_crypto::shadow_cost::init(
+            shadow.shadow_xmss_fake,
+            shadow.shadow_xmss_aggregate_signatures_rate,
+            shadow.shadow_xmss_verify_aggregated_signatures_rate,
+            shadow.shadow_xmss_merge_rate,
+        );
+    }
+
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
