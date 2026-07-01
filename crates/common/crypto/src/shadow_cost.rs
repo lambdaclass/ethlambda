@@ -87,6 +87,16 @@ pub fn merge_delay(n: usize) -> Duration {
     compute_delay(&MERGE_RATE, n)
 }
 
+/// Sleep for a modeled sim-cost `delay`, skipping the sleep entirely when it is
+/// zero (rate unset/disabled). Mirrors zeam's `if (delay_ns != 0) sleepNs(...)`
+/// guard, so a disabled rate costs nothing — not even a `nanosleep(0)` event on
+/// Shadow's virtual clock.
+pub fn sleep(delay: Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
 /// Fixed size of every fake stub proof; well under the 512 KiB
 /// `ByteList512KiB` wire cap.
 pub const FAKE_PROOF_SIZE: usize = 32 * 1024;

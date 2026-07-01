@@ -177,7 +177,7 @@ pub fn aggregate_signatures(
             crate::shadow_cost::FAKE_PROOF_SIZE,
             &[&message.0, &slot_bytes, &count_bytes],
         );
-        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
         return Ok(dummy);
     }
 
@@ -236,7 +236,7 @@ pub fn aggregate_mixed(
         parts.push(&count_bytes);
         let dummy =
             crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
-        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
         return Ok(dummy);
     }
 
@@ -294,7 +294,7 @@ pub fn aggregate_proofs(
         }
         let dummy =
             crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
-        std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
         return Ok(dummy);
     }
 
@@ -336,30 +336,37 @@ pub fn verify_aggregated_signature(
     #[cfg(feature = "shadow-integration")]
     let verify_n = public_keys.len();
 
+    // Skip the real verifier under fake-XMSS; otherwise verify for real. In a
+    // stock build `fake` is always false, so the real path always runs.
     #[cfg(feature = "shadow-integration")]
-    if crate::shadow_cost::fake_xmss() {
-        std::thread::sleep(crate::shadow_cost::verify_delay(verify_n));
-        return Ok(());
+    let fake = crate::shadow_cost::fake_xmss();
+    #[cfg(not(feature = "shadow-integration"))]
+    let fake = false;
+
+    if !fake {
+        ensure_verifier_ready();
+
+        let lean_pubkeys = into_lean_pubkeys(public_keys);
+        let sig = LMType1::decompress_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
+            .ok_or(VerificationError::DeserializationFailed)?;
+
+        if sig.info.without_pubkeys.message != message.0 || sig.info.without_pubkeys.slot != slot {
+            return Err(VerificationError::BindingMismatch {
+                expected_msg: *message,
+                expected_slot: slot,
+                got_msg: H256(sig.info.without_pubkeys.message),
+                got_slot: sig.info.without_pubkeys.slot,
+            });
+        }
+
+        verify_single_message_aggregate(&sig)?;
     }
 
-    ensure_verifier_ready();
-
-    let lean_pubkeys = into_lean_pubkeys(public_keys);
-    let sig = LMType1::decompress_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
-        .ok_or(VerificationError::DeserializationFailed)?;
-
-    if sig.info.without_pubkeys.message != message.0 || sig.info.without_pubkeys.slot != slot {
-        return Err(VerificationError::BindingMismatch {
-            expected_msg: *message,
-            expected_slot: slot,
-            got_msg: H256(sig.info.without_pubkeys.message),
-            got_slot: sig.info.without_pubkeys.slot,
-        });
-    }
-
-    verify_single_message_aggregate(&sig)?;
+    // Model verify cost on the virtual clock (no-op unless a rate is set),
+    // whether or not the real verifier ran. Mirrors zeam's single fall-through
+    // sleep in verifyType1.
     #[cfg(feature = "shadow-integration")]
-    std::thread::sleep(crate::shadow_cost::verify_delay(verify_n));
+    crate::shadow_cost::sleep(crate::shadow_cost::verify_delay(verify_n));
     Ok(())
 }
 
@@ -395,7 +402,7 @@ pub fn merge_type_1s_into_type_2(
         parts.push(&count_bytes);
         let dummy =
             crate::shadow_cost::fill_fake_proof(crate::shadow_cost::FAKE_PROOF_SIZE, &parts);
-        std::thread::sleep(crate::shadow_cost::merge_delay(merge_n));
+        crate::shadow_cost::sleep(crate::shadow_cost::merge_delay(merge_n));
         return Ok(dummy);
     }
 
