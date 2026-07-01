@@ -205,7 +205,12 @@ fn build_job(
 
     let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
 
+    // Skip aggregation when there's nothing to aggregate
     if raw_ids.is_empty() && children.len() < 2 {
+        return None;
+    }
+    // Skip aggregation when there's only a single raw signature to aggregate.
+    if children.is_empty() && raw_ids.len() <= 1 {
         return None;
     }
 
@@ -321,12 +326,18 @@ pub fn finalize_aggregation_session(store: &Store) {
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 }
 
+/// Maximum number of existing proofs reused as children in a single
+/// aggregation job. Recursive aggregation is costly, so we limit the
+/// number of children to avoid unbounded aggregation times.
+const MAX_AGGREGATION_CHILDREN: usize = 2;
+
 /// Greedy set-cover selection of proofs to maximize validator coverage.
 ///
 /// Processes proof sets in priority order (new before known). Within each set,
-/// repeatedly picks the proof covering the most uncovered validators until
-/// no proof adds new coverage. This keeps the number of children minimal
-/// while maximizing the validators we can skip re-aggregating from scratch.
+/// repeatedly picks the proof covering the most uncovered validators until no
+/// proof adds new coverage.
+///
+/// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
 fn select_proofs_greedily(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
@@ -337,7 +348,7 @@ fn select_proofs_greedily(
     for proof_set in [new_proofs, known_proofs] {
         let mut remaining: Vec<&SingleMessageAggregate> = proof_set.iter().collect();
 
-        while !remaining.is_empty() {
+        while selected.len() < MAX_AGGREGATION_CHILDREN && !remaining.is_empty() {
             let best_idx = remaining
                 .iter()
                 .enumerate()
@@ -360,6 +371,10 @@ fn select_proofs_greedily(
 
             selected.push(remaining.swap_remove(best_idx).clone());
             covered.extend(new_coverage);
+        }
+
+        if selected.len() >= MAX_AGGREGATION_CHILDREN {
+            break;
         }
     }
 
