@@ -464,6 +464,16 @@ impl GossipSignatureBuffer {
             .collect()
     }
 
+    /// Largest signature count among data groups whose attestation slot is `slot`.
+    fn max_group_count_for_slot(&self, slot: u64) -> usize {
+        self.data
+            .values()
+            .filter(|entry| entry.data.slot == slot)
+            .map(|entry| entry.signatures.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Extract per-validator latest attestations from the raw signature pool.
     ///
     /// Mirrors `PayloadBuffer::extract_latest_attestations`: iterate data_roots
@@ -1451,6 +1461,15 @@ impl Store {
     pub fn gossip_signatures_count(&self) -> usize {
         let gossip = self.gossip_signatures.lock().unwrap();
         gossip.total_signatures()
+    }
+
+    /// Largest per-group signature count among gossip groups voting for `slot`.
+    ///
+    /// One lock, no signature clones — cheap enough to call per gossip insert.
+    /// Drives the early-aggregation threshold check.
+    pub fn max_gossip_group_count_for_slot(&self, slot: u64) -> usize {
+        let gossip = self.gossip_signatures.lock().unwrap();
+        gossip.max_group_count_for_slot(slot)
     }
 
     /// Estimated live data size in bytes for a table, as reported by the backend.
