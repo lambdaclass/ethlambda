@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use clap::Parser;
 use cli::CliOptions;
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
+use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
@@ -215,7 +216,10 @@ async fn main() -> eyre::Result<()> {
         aggregator.clone(),
         attestation_committee_count,
         !options.disable_duty_sync_gate,
-        options.enable_proposer_aggregation,
+        ProposerConfig {
+            enable_proposer_aggregation: options.enable_proposer_aggregation,
+            max_attestations_per_block: options.max_attestations_per_block,
+        },
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
