@@ -131,4 +131,4 @@ impl From<SignedAttestation> for DomainSignedAttestation {
 // for `SignedBlock`, `BlockSignatures`, `AggregatedSignatureProof`, and
 // `SignedAggregatedAttestation` are intentionally skipped in
 // `ssz_spectests.rs::run_ssz_test` until the fixture commit is bumped to the
-// Type-1/Type-2 schema.
+// single-message / multi-message aggregate schema.

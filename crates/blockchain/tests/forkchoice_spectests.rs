@@ -10,7 +10,7 @@ use ethlambda_types::{
     attestation::{
         AttestationData, HashedAttestationData, SignedAggregatedAttestation, SignedAttestation,
     },
-    block::{Block, TypeOneMultiSignature},
+    block::{Block, SingleMessageAggregate},
     primitives::{ByteList, H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
@@ -109,10 +109,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     let import_ok = result.is_ok();
                     assert_step_outcome(step_idx, step.valid, result)?;
 
-                    // Deconstruct the imported block into per-attestation Type-1s,
-                    // mirroring the node's post-import reaggregation. The real node
-                    // SNARK-splits the block's merged Type-2 proof and folds the
-                    // recovered Type-1s into the pool so block-borne votes carry
+                    // Deconstruct the imported block into per-attestation
+                    // single-message aggregates, mirroring the node's post-import
+                    // reaggregation. The real node SNARK-splits the block's merged
+                    // multi-message aggregate proof and folds the recovered
+                    // single-message aggregates into the pool so block-borne votes carry
                     // fork-choice weight; leanSpec's fork-choice harness gets the
                     // same effect by simulating the proposer build. Fixture blocks
                     // are blank (no real proof to split), so reconstruct structurally
@@ -122,14 +123,14 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     // the fixtures encode.
                     if import_ok {
                         let block = block_data.to_block();
-                        let entries: Vec<(HashedAttestationData, TypeOneMultiSignature)> = block
+                        let entries: Vec<(HashedAttestationData, SingleMessageAggregate)> = block
                             .body
                             .attestations
                             .iter()
                             .map(|att| {
                                 (
                                     HashedAttestationData::new(att.data.clone()),
-                                    TypeOneMultiSignature::empty(att.aggregation_bits.clone()),
+                                    SingleMessageAggregate::empty(att.aggregation_bits.clone()),
                                 )
                             })
                             .collect();
@@ -188,7 +189,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         .expect("aggregated proof data fits in ByteList512KiB");
                     let data: AttestationData = att_data.data.into();
                     let proof =
-                        TypeOneMultiSignature::new(proof_fixture.participants.into(), proof_data);
+                        SingleMessageAggregate::new(proof_fixture.participants.into(), proof_data);
                     let aggregated = SignedAggregatedAttestation { data, proof };
 
                     let result = if proofs_are_mocked {
