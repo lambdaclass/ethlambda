@@ -97,6 +97,16 @@ pub(crate) struct CliOptions {
     /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
+    /// Maximum number of distinct attestations to pack when building a block.
+    ///
+    /// Bounds how many distinct `AttestationData` entries the proposer includes
+    /// in a block it builds. This is a proposer-side self-limit only: it does
+    /// NOT change the consensus cap for accepting blocks from peers, which
+    /// stays at `MAX_ATTESTATIONS_DATA`. Values above `MAX_ATTESTATIONS_DATA`
+    /// are clamped to it, since a block carrying more would be rejected by
+    /// `on_block`.
+    #[arg(long, default_value = "3")]
+    pub(crate) max_attestations_per_block: usize,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]

@@ -19,7 +19,7 @@ use tracing::{info, trace, warn};
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
     MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    block_builder::{PostBlockCheckpoints, build_block},
+    block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
 
@@ -789,7 +789,7 @@ pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
-    enable_proposer_aggregation: bool,
+    config: ProposerConfig,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
@@ -823,7 +823,7 @@ pub fn produce_block_with_signatures(
             head_root,
             &known_block_roots,
             &aggregated_payloads,
-            enable_proposer_aggregation,
+            config,
         )?
     };
 
