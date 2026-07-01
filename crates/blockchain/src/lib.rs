@@ -83,6 +83,7 @@ impl BlockChain {
         attestation_committee_count: u64,
         gate_duties: bool,
         enable_proposer_aggregation: bool,
+        max_attestations_per_block: usize,
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
@@ -108,6 +109,7 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             enable_proposer_aggregation,
+            max_attestations_per_block,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
         }
@@ -176,6 +178,13 @@ pub struct BlockChainServer {
     /// per-data leanVM aggregation. Seeded from the CLI
     /// `--enable-proposer-aggregation` flag at spawn.
     enable_proposer_aggregation: bool,
+
+    /// Maximum number of distinct attestations the proposer packs into a block
+    /// it builds. Proposer-side self-limit only; it does not affect the cap for
+    /// accepting peers' blocks (`MAX_ATTESTATIONS_DATA`). Clamped to
+    /// `MAX_ATTESTATIONS_DATA` during selection. Seeded from the CLI
+    /// `--max-attestations-per-block` flag at spawn.
+    max_attestations_per_block: usize,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
     /// report. Captured at the end-of-slot promote (interval 4), read at the
@@ -511,6 +520,7 @@ impl BlockChainServer {
                 slot,
                 validator_id,
                 self.enable_proposer_aggregation,
+                self.max_attestations_per_block,
             )
             .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
         else {

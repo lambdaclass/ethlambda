@@ -43,6 +43,21 @@ pub struct PostBlockCheckpoints {
     pub finalized: Checkpoint,
 }
 
+/// Proposer-side block-building policy, seeded from the CLI at spawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProposerConfig {
+    /// How the proposer collapses same-`AttestationData` proofs (a block may
+    /// carry at most one entry per data). When true, they are merged via
+    /// recursive single-message aggregation into a union-coverage proof
+    /// (leanSpec #510); when false, only the single best-coverage proof per
+    /// data is kept, skipping the leanVM work.
+    pub enable_proposer_aggregation: bool,
+    /// Maximum number of distinct attestations to pack into a built block.
+    /// Proposer-side self-limit only; clamped to `MAX_ATTESTATIONS_DATA` during
+    /// selection so the block never exceeds the cap `on_block` enforces.
+    pub max_attestations_per_block: usize,
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Selects attestations via `select_attestations`, collapses entries sharing
@@ -62,6 +77,11 @@ pub struct PostBlockCheckpoints {
 ///
 /// Either way the output has one entry per `AttestationData` and the
 /// attestation-to-proof correspondence stays 1:1.
+///
+/// `config.max_attestations_per_block` bounds how many distinct
+/// `AttestationData` entries are packed (a proposer-side self-limit). It is
+/// clamped to `MAX_ATTESTATIONS_DATA` so the block never exceeds the cap
+/// `on_block` enforces on incoming blocks.
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
@@ -69,7 +89,7 @@ pub(crate) fn build_block(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
-    enable_proposer_aggregation: bool,
+    config: ProposerConfig,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
@@ -80,6 +100,7 @@ pub(crate) fn build_block(
         parent_root,
         known_block_roots,
         aggregated_payloads,
+        config.max_attestations_per_block,
     );
     metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
 
@@ -93,7 +114,7 @@ pub(crate) fn build_block(
     // work and keep only the single best-coverage proof per data. Both paths
     // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
-    let compacted = if enable_proposer_aggregation {
+    let compacted = if config.enable_proposer_aggregation {
         compact_attestations(selected, head_state, slot)?
     } else {
         keep_best_proof_per_data(selected, slot)
@@ -143,15 +164,16 @@ pub(crate) fn build_block(
 /// finalization are projected incrementally so dependent attestations become
 /// eligible on the next round without re-running the STF.
 ///
-/// Stops at `MAX_ATTESTATIONS_DATA` distinct data entries or when no
-/// remaining candidate has a positive score. Within-entry proof selection is
-/// delegated to `extend_proofs_greedily`.
+/// Stops at `max_attestations_per_block` distinct data entries (clamped to
+/// `MAX_ATTESTATIONS_DATA`) or when no remaining candidate has a positive
+/// score. Within-entry proof selection is delegated to `extend_proofs_greedily`.
 fn select_attestations(
     head_state: &State,
     slot: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    max_attestations_per_block: usize,
 ) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
     let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
     if aggregated_payloads.is_empty() {
@@ -186,7 +208,10 @@ fn select_attestations(
     };
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
-    for _round in 0..MAX_ATTESTATIONS_DATA {
+    // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
+    // (`on_block` rejects more), so the proposer-side limit never exceeds it.
+    let max_rounds = max_attestations_per_block.min(MAX_ATTESTATIONS_DATA);
+    for _round in 0..max_rounds {
         let Some((data_root, score, new_voters)) =
             pick_best_candidate(&chain, &processed_data_roots, &projected)
         else {
@@ -991,7 +1016,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1025,6 +1053,138 @@ mod tests {
             signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
+        );
+    }
+
+    /// A proposer-side `max_attestations_per_block` below `MAX_ATTESTATIONS_DATA`
+    /// must cap how many distinct `AttestationData` entries the built block
+    /// carries. The pool holds more selectable entries than the limit, so the
+    /// limit (not candidate exhaustion) is the binding constraint: building the
+    /// same pool at `MAX_ATTESTATIONS_DATA` packs strictly more.
+    #[test]
+    fn build_block_respects_configured_attestation_limit() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const NUM_PAYLOAD_ENTRIES: usize = 10;
+        const CONFIGURED_LIMIT: usize = 3;
+
+        const HEAD_SLOT: u64 = 51;
+        const TARGET_SLOT: u64 = 5;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let historical_block_hashes = SszList::try_from(hashes.clone()).unwrap();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes,
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // Common source / target / head so every payload passes the chain-match
+        // filter; distinct attestation slots give distinct data_roots, and one
+        // fresh validator per entry keeps each candidate scoring (adds a voter).
+        let source = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+        let target = Checkpoint {
+            root: hashes[TARGET_SLOT as usize],
+            slot: TARGET_SLOT,
+        };
+        let head = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
+            HashMap::new();
+        for i in 0..NUM_PAYLOAD_ENTRIES {
+            let att_data = AttestationData {
+                slot: (i + 1) as u64,
+                head,
+                target,
+                source,
+            };
+            let data_root = att_data.hash_tree_root();
+
+            let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+            bits.set(i % NUM_VALIDATORS, true).unwrap();
+            let proof_data = SszList::try_from(vec![0xABu8; 8]).expect("proof fits in ByteListMiB");
+            let proof = SingleMessageAggregate::new(bits, proof_data);
+
+            aggregated_payloads.insert(data_root, (att_data, vec![proof]));
+        }
+
+        let build = |limit: usize| {
+            build_block(
+                &head_state,
+                slot,
+                proposer_index,
+                parent_root,
+                &known_block_roots,
+                &aggregated_payloads,
+                ProposerConfig {
+                    enable_proposer_aggregation: false,
+                    max_attestations_per_block: limit,
+                },
+            )
+            .expect("build_block should succeed")
+            .0
+            .body
+            .attestations
+            .len()
+        };
+
+        let limited = build(CONFIGURED_LIMIT);
+        let unlimited = build(MAX_ATTESTATIONS_DATA);
+
+        assert!(
+            (1..=CONFIGURED_LIMIT).contains(&limited),
+            "configured limit should cap attestations to {CONFIGURED_LIMIT}: got {limited}"
+        );
+        assert!(
+            unlimited > CONFIGURED_LIMIT,
+            "the pool must offer more than {CONFIGURED_LIMIT} selectable entries so the limit \
+             is the binding constraint: MAX_ATTESTATIONS_DATA build packed {unlimited}"
         );
     }
 
@@ -1128,7 +1288,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            false,
+            ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1264,7 +1427,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1397,7 +1563,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
