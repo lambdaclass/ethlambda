@@ -71,11 +71,12 @@ pub fn reaggregate_from_block(
     let validators = &parent_state.validators;
     let num_validators = validators.len() as u64;
 
-    // Per-component pubkeys: one entry per body attestation in order, then
-    // the proposer entry. Layout is invariant per block, so it's resolved
-    // once and reused for every split call below.
+    // Per-component pubkeys: one entry per body attestation in order. The
+    // attestation aggregate no longer carries a proposer component (the
+    // proposer signature lives outside it), so the layout is attestations
+    // only. Resolved once and reused for every split call below.
     let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(attestations.len() + 1);
+        Vec::with_capacity(attestations.len());
     for att in &attestations {
         let mut pubkeys = Vec::new();
         for vid in validator_indices(&att.aggregation_bits) {
@@ -91,14 +92,6 @@ pub fn reaggregate_from_block(
         }
         pubkeys_per_component.push(pubkeys);
     }
-    if block.proposer_index >= num_validators {
-        return Vec::new();
-    }
-    let Ok(proposer_pubkey) = validators[block.proposer_index as usize].get_proposal_pubkey()
-    else {
-        return Vec::new();
-    };
-    pubkeys_per_component.push(vec![proposer_pubkey]);
 
     let candidates = select_candidates(store, &attestations);
     if candidates.is_empty() {
@@ -120,8 +113,8 @@ pub fn reaggregate_from_block(
         };
 
         // Step 1: SNARK-split this attestation's component out of the block's
-        // merged multi-message aggregate proof.
-        let merged_bytes = signed_block.proof.proof_bytes();
+        // attestation multi-message aggregate proof.
+        let merged_bytes = signed_block.proof.attestation_proof.proof_bytes();
         let split_bytes = match ethlambda_crypto::split_type_2_by_message(
             merged_bytes,
             pubkeys_per_component.clone(),

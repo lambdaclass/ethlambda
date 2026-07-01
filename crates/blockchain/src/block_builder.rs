@@ -822,8 +822,12 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
 mod tests {
     use super::*;
     use ethlambda_types::{
-        attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
+        attestation::{
+            AggregatedAttestation, AggregationBits, AttestationData, blank_xmss_signature,
+        },
+        block::{
+            BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
+        },
         checkpoint::Checkpoint,
         state::State,
     };
@@ -1032,11 +1036,16 @@ mod tests {
         );
 
         // Substitute a worst-case-size proof to model what `propose_block`
-        // would attach. The actual SNARK can't be built without lean-multisig,
-        // but the size cap (`ByteList512KiB`) bounds the worst case.
+        // would attach: a 512 KiB attestation aggregate plus the fixed-size
+        // proposer signature. The actual SNARK can't be built without
+        // lean-multisig, but the size cap bounds the worst case.
         let _ = signatures;
-        let proof = MultiMessageAggregate::new(
-            ByteList512KiB::try_from(vec![0xAB; 512 * 1024]).expect("worst-case proof fits in cap"),
+        let proof = BlockProof::new(
+            blank_xmss_signature(),
+            MultiMessageAggregate::new(
+                ByteList512KiB::try_from(vec![0xAB; 512 * 1024])
+                    .expect("worst-case proof fits in cap"),
+            ),
         );
         let signed_block = SignedBlock {
             message: block,
