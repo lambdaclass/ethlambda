@@ -67,6 +67,8 @@ pub enum CheckpointSyncError {
     AnchorPairingMismatch,
     #[error("no checkpoint urls configured")]
     NoCheckpointUrls,
+    #[error("failed to insert anchor signed block into store")]
+    StoreInsertSignedBlock,
 }
 
 /// Build the HTTP client used for checkpoint sync fetches.
