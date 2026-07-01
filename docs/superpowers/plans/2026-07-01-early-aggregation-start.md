@@ -8,14 +8,16 @@
 
 **Tech Stack:** Rust (edition 2024), spawned-concurrency actors (`send_after` self-messages), prometheus metrics via `ethlambda_metrics`.
 
+**Verification policy (per user):** No new unit tests. Each task verifies by compiling (plus existing test suites where they already exist); final validation is a local 4-node devnet run (Task 9).
+
 **Spec:** `docs/superpowers/specs/2026-07-01-early-aggregation-start-design.md`
 
 **Key existing code:**
 - `crates/blockchain/src/lib.rs` — actor, tick loop (`on_tick`), `start_aggregation_session` (~line 366), handlers (`NewAttestation` ~line 1034, `AggregateProduced` ~line 1050, `AggregationDone` ~line 1079, `AggregationDeadline` ~line 1099)
 - `crates/blockchain/src/aggregation.rs` — session types, snapshot builders, worker, `AGGREGATION_DEADLINE`
 - `crates/blockchain/src/metrics.rs` — prometheus registration patterns
-- `crates/storage/src/store.rs` — `GossipSignatureBuffer` (~line 348), `Store` methods (~line 1451), test mod (~line 1555) with `make_att_data(slot)`, `make_att_data_for_target(slot, root)`, `make_dummy_sig()` helpers
-- `crates/net/p2p/src/lib.rs` — `build_swarm` subnet subscription (~lines 304–337), test mod (~line 790)
+- `crates/storage/src/store.rs` — `GossipSignatureBuffer` (~line 348), `Store` methods (~line 1451)
+- `crates/net/p2p/src/lib.rs` — `build_swarm` subnet subscription (~lines 304–337)
 - `bin/ethlambda/src/main.rs` — `BlockChain::spawn` (~line 213), `build_swarm(SwarmConfig {...})` (~line 230)
 
 **Timing model (4 s slots, 5 × 800 ms intervals):**
@@ -36,48 +38,9 @@ slot start   T1=+800ms    T2=+1600ms   T3=+2400ms   T4=+3200ms
 The early threshold needs "largest signature count among current-slot data groups" without cloning signatures (the existing `iter_gossip_signatures` snapshot clones every signature; signatures are ~3 KB each).
 
 **Files:**
-- Modify: `crates/storage/src/store.rs` (buffer method after `snapshot()` ~line 465; `Store` method next to `gossip_signatures_count()` ~line 1451; test in existing `mod tests`)
+- Modify: `crates/storage/src/store.rs` (buffer method after `snapshot()` ~line 465; `Store` method next to `gossip_signatures_count()` ~line 1451)
 
-- [ ] **Step 1: Write the failing test**
-
-Add to the `// ============ GossipSignatureBuffer Tests ============` section of `mod tests` in `crates/storage/src/store.rs` (near `gossip_buffer_fifo_eviction`, ~line 2423):
-
-```rust
-#[test]
-fn gossip_buffer_max_group_count_for_slot() {
-    let mut buf = GossipSignatureBuffer::new(100);
-    assert_eq!(buf.max_group_count_for_slot(1), 0);
-
-    // Slot 1, group A: 3 validators.
-    for vid in 0..3 {
-        let data = make_att_data(1);
-        buf.insert(HashedAttestationData::new(data), vid, make_dummy_sig());
-    }
-    // Slot 1, group B (same slot, different target root): 2 validators.
-    for vid in 3..5 {
-        let data = make_att_data_for_target(1, root(99));
-        buf.insert(HashedAttestationData::new(data), vid, make_dummy_sig());
-    }
-    // Slot 2: 5 validators.
-    for vid in 0..5 {
-        let data = make_att_data(2);
-        buf.insert(HashedAttestationData::new(data), vid, make_dummy_sig());
-    }
-
-    assert_eq!(buf.max_group_count_for_slot(1), 3);
-    assert_eq!(buf.max_group_count_for_slot(2), 5);
-    assert_eq!(buf.max_group_count_for_slot(3), 0);
-}
-```
-
-Note: `make_att_data_for_target` is defined further down in the test mod (~line 2319); Rust test mods don't care about definition order.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p ethlambda-storage max_group_count_for_slot`
-Expected: FAIL to compile with "no method named `max_group_count_for_slot`"
-
-- [ ] **Step 3: Implement the buffer method and Store wrapper**
+- [ ] **Step 1: Implement the buffer method and Store wrapper**
 
 In `impl GossipSignatureBuffer`, after `snapshot()` (~line 465):
 
@@ -106,12 +69,12 @@ pub fn max_gossip_group_count_for_slot(&self, slot: u64) -> usize {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 2: Build**
 
-Run: `cargo test -p ethlambda-storage max_group_count_for_slot`
-Expected: PASS (1 test)
+Run: `cargo build -p ethlambda-storage`
+Expected: clean build (a dead-code warning on the buffer method is possible until Task 7 wires the caller; plain `cargo build` does not deny warnings).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/storage/src/store.rs
@@ -125,45 +88,9 @@ git commit -m "feat(storage): add max gossip group count query for early aggrega
 Single source of truth for the subnet set, callable from `main.rs` (Task 4) without touching `SwarmConfig`.
 
 **Files:**
-- Modify: `crates/net/p2p/src/lib.rs` (subnet logic in `build_swarm` ~lines 304–337; tests in existing `mod tests` ~line 790)
+- Modify: `crates/net/p2p/src/lib.rs` (subnet logic in `build_swarm` ~lines 304–337)
 
-- [ ] **Step 1: Write the failing tests**
-
-Add to `mod tests` in `crates/net/p2p/src/lib.rs` (if the test mod doesn't already have `HashSet` in scope via `use super::*;`, add `use std::collections::HashSet;`):
-
-```rust
-#[test]
-fn subscription_subnets_validators_only() {
-    // 3 % 4 = 3, 7 % 4 = 3, 10 % 4 = 2
-    let subnets = compute_subscription_subnets(&[3, 7, 10], 4, false, None);
-    assert_eq!(subnets, HashSet::from([3, 2]));
-}
-
-#[test]
-fn subscription_subnets_aggregator_unions_explicit_ids() {
-    let subnets = compute_subscription_subnets(&[1], 4, true, Some(&[0, 2]));
-    assert_eq!(subnets, HashSet::from([1, 0, 2]));
-}
-
-#[test]
-fn subscription_subnets_validatorless_aggregator_falls_back_to_zero() {
-    let subnets = compute_subscription_subnets(&[], 4, true, None);
-    assert_eq!(subnets, HashSet::from([0]));
-}
-
-#[test]
-fn subscription_subnets_validatorless_non_aggregator_is_empty() {
-    let subnets = compute_subscription_subnets(&[], 4, false, None);
-    assert!(subnets.is_empty());
-}
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `cargo test -p ethlambda-p2p subscription_subnets`
-Expected: FAIL to compile with "cannot find function `compute_subscription_subnets`"
-
-- [ ] **Step 3: Implement the helper and use it in `build_swarm`**
+- [ ] **Step 1: Implement the helper and use it in `build_swarm`**
 
 Add near `build_swarm` (above it, ~line 185):
 
@@ -223,15 +150,12 @@ Then replace the inline logic in `build_swarm` (~lines 304–329). The metric mu
 
 (The `let mut attestation_topics ...` loop over `&subscription_subnets` at ~line 331 stays unchanged.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 2: Build and run existing p2p tests**
 
-Run: `cargo test -p ethlambda-p2p subscription_subnets`
-Expected: PASS (4 tests)
+Run: `cargo build -p ethlambda-p2p && cargo test -p ethlambda-p2p --lib`
+Expected: clean build, existing tests pass (behavior of `build_swarm` is unchanged — same set, same subscriptions).
 
-Run: `cargo build -p ethlambda-p2p`
-Expected: clean build (no unused warnings; the old inline block is fully replaced)
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/net/p2p/src/lib.rs
@@ -242,76 +166,12 @@ git commit -m "refactor(p2p): extract subscription subnet computation into pure 
 
 ### Task 3: Blockchain — pure early-aggregation helpers
 
-Window math and threshold predicate, unit-testable without an actor.
+Window math and threshold predicate.
 
 **Files:**
-- Modify: `crates/blockchain/src/aggregation.rs` (new consts + functions after `PRIOR_WORKER_JOIN_TIMEOUT` ~line 37; new `#[cfg(test)] mod tests` at end of file)
+- Modify: `crates/blockchain/src/aggregation.rs` (new consts + functions after `PRIOR_WORKER_JOIN_TIMEOUT` ~line 37)
 
-- [ ] **Step 1: Write the failing tests**
-
-`crates/blockchain/src/aggregation.rs` has no test mod yet. Add at the end of the file:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT};
-
-    const GENESIS_MS: u64 = 1_000_000;
-
-    /// Interval-2 boundary of `slot`, relative to the test genesis.
-    fn t2(slot: u64) -> u64 {
-        GENESIS_MS + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL
-    }
-
-    #[test]
-    fn interval2_boundary_matches_slot_layout() {
-        assert_eq!(interval2_boundary_ms(GENESIS_MS, 0), GENESIS_MS + 1_600);
-        assert_eq!(interval2_boundary_ms(GENESIS_MS, 5), GENESIS_MS + 5 * 4_000 + 1_600);
-    }
-
-    #[test]
-    fn early_window_bounds() {
-        // Window is [T2 - EARLY_AGGREGATION_WINDOW_MS, T2).
-        let before_window = t2(5) - EARLY_AGGREGATION_WINDOW_MS - 1;
-        assert_eq!(early_aggregation_slot(before_window, GENESIS_MS), None);
-        let window_open = t2(5) - EARLY_AGGREGATION_WINDOW_MS;
-        assert_eq!(early_aggregation_slot(window_open, GENESIS_MS), Some(5));
-        assert_eq!(early_aggregation_slot(t2(5) - 1, GENESIS_MS), Some(5));
-        assert_eq!(early_aggregation_slot(t2(5), GENESIS_MS), None);
-        // Slot 0 has a window too.
-        assert_eq!(early_aggregation_slot(t2(0) - 1, GENESIS_MS), Some(0));
-    }
-
-    #[test]
-    fn early_window_before_genesis_is_none() {
-        assert_eq!(early_aggregation_slot(GENESIS_MS - 1, GENESIS_MS), None);
-    }
-
-    #[test]
-    fn threshold_is_two_thirds_of_expected() {
-        // Zero expected: never trigger (validator-less edge, div-by-zero guard).
-        assert!(!early_threshold_met(0, 0));
-        assert!(!early_threshold_met(5, 0));
-        // Exact 2/3 triggers.
-        assert!(early_threshold_met(2, 3));
-        assert!(!early_threshold_met(1, 3));
-        // Ceiling behavior when expected isn't divisible by 3.
-        assert!(early_threshold_met(3, 4)); // 9 >= 8
-        assert!(!early_threshold_met(2, 4)); // 6 < 8
-        // Devnet-scale sanity: 33 validators, one subnet.
-        assert!(early_threshold_met(22, 33));
-        assert!(!early_threshold_met(21, 33));
-    }
-}
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `cargo test -p ethlambda-blockchain --lib aggregation::tests`
-Expected: FAIL to compile with "cannot find function `early_aggregation_slot`" (and the others)
-
-- [ ] **Step 3: Implement consts and functions**
+- [ ] **Step 1: Implement consts and functions**
 
 In `crates/blockchain/src/aggregation.rs`, after `PRIOR_WORKER_JOIN_TIMEOUT` (~line 37). Also add `use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT};` to the file's imports (both constants are `pub` in `lib.rs`).
 
@@ -347,12 +207,12 @@ pub(crate) fn early_threshold_met(max_group_count: usize, expected: usize) -> bo
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 2: Build**
 
-Run: `cargo test -p ethlambda-blockchain --lib aggregation::tests`
-Expected: PASS (4 tests). Dead-code warnings for the not-yet-used functions are acceptable at this step only if the compiler emits them (`pub(crate)` items used from tests usually don't warn); they get consumed in Tasks 6–7.
+Run: `cargo build -p ethlambda-blockchain`
+Expected: clean build (dead-code warnings possible until Tasks 6–7 wire the callers).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/blockchain/src/aggregation.rs
@@ -467,9 +327,7 @@ Before `BlockChain::spawn` (~line 213), compute the set with the same startup in
 - [ ] **Step 3: Build the workspace**
 
 Run: `cargo build --workspace`
-Expected: clean build. If `pending_aggregate_publishes` / `early_aggregation_expected_sigs` trigger dead-code warnings, silence is NOT needed — they are read in Tasks 6–7; if the build fails on `-D warnings` locally, proceed (only `make lint` enforces it) or add the fields in the task where they're first read. Do not annotate with `#[allow(dead_code)]`.
-
-Note: plain `cargo build` does not deny warnings, so this passes; the fields become live two tasks later, before `make lint` runs in Task 8.
+Expected: clean build. Dead-code warnings on the two new fields are acceptable here (plain `cargo build` does not deny warnings); they become live in Tasks 6–7, before `make lint` runs in Task 8. Do not annotate with `#[allow(dead_code)]`.
 
 - [ ] **Step 4: Commit**
 
@@ -484,6 +342,7 @@ git commit -m "feat(blockchain): plumb aggregation subnet set and expected-signa
 
 **Files:**
 - Modify: `crates/blockchain/src/aggregation.rs:28-33`
+- Modify: `crates/blockchain/src/lib.rs` (stale `+750 ms` doc-comment reference on `start_aggregation_session`, ~line 365)
 
 - [ ] **Step 1: Change the constant and its comment**
 
@@ -530,6 +389,7 @@ git commit -m "feat(blockchain): extend aggregation deadline to a full interval"
 **Files:**
 - Modify: `crates/blockchain/src/aggregation.rs` (`AggregationSession` struct ~line 75, new message)
 - Modify: `crates/blockchain/src/lib.rs` (imports ~line 16, `start_aggregation_session` ~line 366, `AggregateProduced` handler ~line 1050, `AggregationDone` handler ~line 1079, interval-2 tick arm ~line 312, new handler + helper)
+- Modify: `crates/blockchain/src/metrics.rs` (new counter + histogram)
 
 - [ ] **Step 1: Add the `early` flag and the flush message in `aggregation.rs`**
 
@@ -567,7 +427,7 @@ impl Message for FlushAggregatePublishes {
 
 - [ ] **Step 2: Rework `start_aggregation_session` in `lib.rs`**
 
-Extend the `use crate::aggregation::{...}` import (~line 16) with `FlushAggregatePublishes` (and, for Task 7, `EarlyAggregationCheck` will join it).
+Extend the `use crate::aggregation::{...}` import (~line 16) with `FlushAggregatePublishes`.
 
 In `start_aggregation_session` (~line 366): move the coverage emission here from the tick arm, and compute `early` + schedule the flush. After the prior-session join block and before the snapshot:
 
@@ -747,7 +607,7 @@ pub fn observe_aggregation_early_start_lead(lead: Duration) {
 - [ ] **Step 5: Build and run existing tests**
 
 Run: `cargo build -p ethlambda-blockchain && cargo test -p ethlambda-blockchain --lib`
-Expected: clean build, all unit tests pass. Behavior so far is identical for normal sessions (`early` is always false when started at interval 2, so no buffering, no flush timer, no metric increments).
+Expected: clean build, existing unit tests pass. Behavior so far is identical for normal sessions (`early` is always false when started at interval 2, so no buffering, no flush timer, no metric increments).
 
 - [ ] **Step 6: Commit**
 
@@ -886,10 +746,10 @@ The `2 => { ... }` arm becomes:
             }
 ```
 
-- [ ] **Step 5: Build and run all blockchain tests**
+- [ ] **Step 5: Build and run existing blockchain tests**
 
 Run: `cargo build --workspace && cargo test -p ethlambda-blockchain --lib`
-Expected: clean build, all tests pass.
+Expected: clean build, existing tests pass.
 
 - [ ] **Step 6: Commit**
 
@@ -900,19 +760,19 @@ git commit -m "feat(blockchain): start aggregation early when 2/3 of subnet sign
 
 ---
 
-### Task 8: Full verification
+### Task 8: Lint and existing test suites
 
 **Files:** none (verification only)
 
 - [ ] **Step 1: Format and lint**
 
 Run: `make fmt && make lint`
-Expected: no diffs from fmt; clippy clean with `-D warnings` (this is where any dead-code stragglers from Task 4 would surface — fix by ensuring both new fields are read, which Tasks 6–7 guarantee).
+Expected: no diffs from fmt; clippy clean with `-D warnings` (this is where any dead-code stragglers from Tasks 1–4 would surface — by now every added item has a caller).
 
-- [ ] **Step 2: Run the full test suite**
+- [ ] **Step 2: Run the existing test suites**
 
 Run: `make test`
-Expected: all workspace tests + forkchoice spec tests pass. The spec tests exercise `on_block_without_verification` and the STF — untouched by this change. If fixtures are missing: `rm -rf leanSpec && make leanSpec/fixtures`.
+Expected: all workspace tests + forkchoice spec tests pass (no new tests were added; this guards against regressions in the touched paths). If fixtures are missing: `rm -rf leanSpec && make leanSpec/fixtures`.
 
 - [ ] **Step 3: Commit any fmt fallout**
 
@@ -922,11 +782,37 @@ git add -u && git commit -m "chore: fmt" || true
 
 (Skip the commit if the tree is clean.)
 
-- [ ] **Step 4: Devnet validation (manual, out of band)**
+---
 
-Not part of the automated plan — run `.claude/skills/test-pr-devnet/scripts/test-branch.sh` on this branch and check:
-- `lean_aggregation_early_starts_total` grows on aggregator nodes
-- `lean_aggregation_early_start_lead_seconds` distribution sits in (0, 0.4]
-- "Publishing aggregates held back until the interval-2 boundary" appears with count ≥ 1
-- Aggregate publish offsets (per-slot duty timing method) do not move earlier than interval 2
-- Finalization rate is not worse than the base image
+### Task 9: Local 4-node devnet validation
+
+Run a local 4-node devnet on this branch and verify the early-start behavior end to end. Use the `devnet-runner` skill (`.claude/skills/devnet-runner/`) for the exact workflow; constraints that matter here:
+
+- **Release build only** — debug binaries stack-overflow in leanVM `rec_aggregation`.
+- **Exactly one node with `--is-aggregator`** — multiple co-located aggregators stall finality via leanVM CPU contention.
+- If using Docker Desktop, the VM needs 16+ GiB (leanVM peaks ~4–5 GiB per node); binary mode avoids this.
+
+- [ ] **Step 1: Start the devnet**
+
+4 nodes, fresh genesis, one aggregator. Let it run at least ~50 slots (~4 minutes).
+
+- [ ] **Step 2: Verify early-start behavior on the aggregator node**
+
+Check the aggregator node's logs and metrics:
+
+1. `"Early-aggregation threshold met"` and `"Starting aggregation session early"` appear for most slots (local gossip is fast; signatures land well inside the window). `lead_ms` values must be in `(0, 400]`.
+2. `"Publishing aggregates held back until the interval-2 boundary"` appears with `count >= 1`.
+3. `lean_aggregation_early_starts_total` grows (metrics port, default `:5054`, path `/metrics`).
+4. `lean_aggregation_early_start_lead_seconds` observations sit in `(0, 0.4]`.
+5. `"Committee signatures aggregated"` logs show `early=true` sessions and no `"Prior aggregation worker still running"` warnings.
+6. No aggregate publish happens before its slot's interval-2 boundary: spot-check a few `"Starting aggregation session early"` slots and confirm the corresponding aggregated-attestation publish log lands at or after T2 (per-slot offset = `(log_epoch - GENESIS_TIME) mod 4 >= 1.6`).
+
+- [ ] **Step 3: Verify chain health**
+
+1. `lean_latest_finalized_slot` advances steadily on all 4 nodes (fresh local devnet should finalize nearly every justifiable slot).
+2. Blocks carry attestations (`attestation_count > 0` in block logs).
+3. No stalls, no panic/error-level logs attributable to aggregation.
+
+- [ ] **Step 4: Stop the devnet and report**
+
+Stop the nodes; summarize observed early-start rate (early sessions / slots), lead-time distribution, and finalization progress.
