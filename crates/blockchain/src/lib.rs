@@ -82,6 +82,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        aggregation_subnets: HashSet<u64>,
         gate_duties: bool,
         proposer_config: ProposerConfig,
     ) -> BlockChain {
@@ -98,6 +99,19 @@ impl BlockChain {
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
 
+        // Denominator of the early-aggregation 2/3 threshold: how many
+        // validators attest on subnets this node aggregates. Computed once —
+        // the validator registry is static and `head_state()` clones the full
+        // state, so this must not run per gossip insert.
+        let validator_count = store.head_state().validators.len() as u64;
+        let early_aggregation_expected_sigs = if attestation_committee_count == 0 {
+            0
+        } else {
+            (0..validator_count)
+                .filter(|vid| aggregation_subnets.contains(&(vid % attestation_committee_count)))
+                .count()
+        };
+
         let handle = BlockChainServer {
             store,
             p2p: None,
@@ -108,6 +122,9 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
+            genesis_time_ms: genesis_time * 1000,
+            early_aggregation_expected_sigs,
+            pending_aggregate_publishes: Vec::new(),
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -168,6 +185,21 @@ pub struct BlockChainServer {
     /// Number of attestation committees (= subnet count). Used by the
     /// attestation aggregate coverage emission.
     attestation_committee_count: u64,
+
+    /// Genesis time in milliseconds, cached at spawn. `store.config()` is an
+    /// uncached backend read, too heavy for the per-gossip-insert early
+    /// checks that need this.
+    genesis_time_ms: u64,
+
+    /// Number of validators whose subnet is one this node aggregates — the
+    /// denominator of the early-aggregation 2/3 threshold. Computed once at
+    /// spawn (the validator registry is static).
+    early_aggregation_expected_sigs: usize,
+
+    /// Aggregates produced before the interval-2 boundary, held back so they
+    /// are not gossiped early. Flushed by `FlushAggregatePublishes` at the
+    /// boundary; only ever holds the current slot's aggregates.
+    pending_aggregate_publishes: Vec<SignedAggregatedAttestation>,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
