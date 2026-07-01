@@ -23,6 +23,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | Method | Path | Response | Description |
 |--------|------|----------|-------------|
 | `GET` | `/lean/v0/health` | JSON | Liveness check |
+| `GET` | `/lean/v0/genesis` | JSON | Genesis time and validator count |
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
@@ -40,6 +41,14 @@ The handler emits a fixed, compact body (no whitespace):
 ```json
 {"status":"healthy","service":"lean-rpc-api"}
 ```
+
+### `GET /lean/v0/genesis`
+
+```json
+{ "genesis_time": 1770407233, "validator_count": 16 }
+```
+
+`validator_count` is read from the head state's validator registry. Lean validators are fixed at genesis (no churn), so it always equals the size of the genesis registry.
 
 ### `GET /lean/v0/states/finalized`
 
