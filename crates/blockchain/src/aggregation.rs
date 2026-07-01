@@ -172,6 +172,51 @@ pub fn snapshot_aggregation_inputs(store: &Store) -> Option<AggregationSnapshot>
     })
 }
 
+/// Build a snapshot that aggregates *only* the current slot's raw gossip
+/// signatures.
+///
+/// Unlike [`snapshot_aggregation_inputs`], this deliberately ignores existing
+/// proofs and payload-only groups: every job is a pure raw-signature
+/// aggregation over the gossip signatures whose `data.slot` matches
+/// `current_slot`. Stale-slot gossip groups are left untouched so the
+/// interval-2 deadline is never spent re-aggregating past slots.
+///
+/// Returns `None` when there is nothing to aggregate for `current_slot` so
+/// callers can avoid spawning an empty worker.
+pub fn snapshot_current_slot_aggregation_inputs(
+    store: &Store,
+    current_slot: u64,
+) -> Option<AggregationSnapshot> {
+    let gossip_groups = store.iter_gossip_signatures();
+    if gossip_groups.is_empty() {
+        return None;
+    }
+
+    let head_state = store.head_state();
+    let validators = &head_state.validators;
+
+    let mut jobs = Vec::new();
+    let mut groups_considered = 0usize;
+    for (hashed, validator_sigs) in &gossip_groups {
+        if hashed.data().slot != current_slot {
+            continue;
+        }
+        groups_considered += 1;
+        if let Some(job) = build_raw_signature_job(validators, hashed.clone(), validator_sigs) {
+            jobs.push(job);
+        }
+    }
+
+    if jobs.is_empty() {
+        return None;
+    }
+
+    Some(AggregationSnapshot {
+        jobs,
+        groups_considered,
+    })
+}
+
 /// Build one `AggregationJob` for a given attestation data. Returns `None` when
 /// there is not enough material for a viable aggregation (no raw sigs and fewer
 /// than two children). `validator_sigs` is `None` for Pass 2 (payload-only).
@@ -221,6 +266,55 @@ fn build_job(
         slot,
         children,
         accepted_child_ids,
+        raw_pubkeys,
+        raw_sigs,
+        raw_ids,
+        keys_to_delete,
+    })
+}
+
+/// Build a raw-signature-only `AggregationJob`: no existing-proof reuse and no
+/// children. Every resolvable gossip signature in the group becomes a raw
+/// participant. Returns `None` when no signature resolves to a pubkey.
+fn build_raw_signature_job(
+    validators: &[Validator],
+    hashed: HashedAttestationData,
+    validator_sigs: &[(u64, ValidatorSignature)],
+) -> Option<AggregationJob> {
+    let data_root = hashed.root();
+
+    let mut raw_sigs = Vec::with_capacity(validator_sigs.len());
+    let mut raw_pubkeys = Vec::with_capacity(validator_sigs.len());
+    let mut raw_ids = Vec::with_capacity(validator_sigs.len());
+    for (vid, sig) in validator_sigs {
+        let Some(validator) = validators.get(*vid as usize) else {
+            continue;
+        };
+        let Ok(pubkey) = validator.get_attestation_pubkey() else {
+            continue;
+        };
+        raw_sigs.push(sig.clone());
+        raw_pubkeys.push(pubkey);
+        raw_ids.push(*vid);
+    }
+
+    if raw_ids.is_empty() {
+        return None;
+    }
+
+    // Consume the whole group's gossip signatures on successful aggregation,
+    // mirroring `build_job`.
+    let keys_to_delete: Vec<(u64, H256)> = validator_sigs
+        .iter()
+        .map(|(vid, _)| (*vid, data_root))
+        .collect();
+
+    let slot = hashed.data().slot;
+    Some(AggregationJob {
+        hashed,
+        slot,
+        children: Vec::new(),
+        accepted_child_ids: Vec::new(),
         raw_pubkeys,
         raw_sigs,
         raw_ids,
