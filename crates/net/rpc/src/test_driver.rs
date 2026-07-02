@@ -40,7 +40,8 @@ use ethlambda_test_fixtures::{
 };
 use ethlambda_types::{
     attestation::{
-        AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
+        AggregationBits as EthAggregationBits, HashedAttestationData, SignedAggregatedAttestation,
+        SignedAttestation,
     },
     block::{Block, ByteList512KiB, SingleMessageAggregate},
     checkpoint::Checkpoint,
@@ -363,7 +364,30 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                     + signed_block.message.slot * MILLISECONDS_PER_SLOT;
                 store::on_tick(store, block_time_ms, true);
             }
-            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
+            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())?;
+
+            // Fold the block's attestations into the fork-choice known pool so
+            // block-borne votes carry weight. The production node SNARK-splits
+            // the block's merged proof and folds the recovered single-message
+            // aggregates; fixture blocks are blank, so reconstruct structurally
+            // from aggregation_bits (fork choice reads only the participant set,
+            // not the proof bytes). Mirrors the same fold in
+            // crates/blockchain/tests/forkchoice_spectests.rs.
+            let block = block_data.to_block();
+            let entries: Vec<(HashedAttestationData, SingleMessageAggregate)> = block
+                .body
+                .attestations
+                .iter()
+                .map(|att| {
+                    (
+                        HashedAttestationData::new(att.data.clone()),
+                        SingleMessageAggregate::empty(att.aggregation_bits.clone()),
+                    )
+                })
+                .collect();
+            store.insert_known_aggregated_payloads_batch(entries);
+            store::update_head(store, false);
+            Ok(())
         }
         "attestation" => {
             let att = step
