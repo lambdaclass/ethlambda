@@ -9,7 +9,7 @@
 //! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::aggregate_mixed;
 use ethlambda_storage::Store;
@@ -561,17 +561,17 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// Emits [`AggregationDone`] when the loop exits (completion or cancellation).
 ///
 /// Publish alignment: aggregates must not reach the actor (and thus gossip)
-/// before the interval-2 boundary. `publish_at_ms` is that boundary as a UNIX
-/// millisecond timestamp; a produced aggregate whose wall clock is still before
-/// it is delivered via [`send_after`] timed to land at the boundary, otherwise
-/// it is sent immediately. A normal interval-2 session starts at the boundary,
-/// so its aggregates are always past it and sent without delay.
+/// before the interval-2 boundary. `publish_at` is that boundary as a wall-clock
+/// instant; a produced aggregate still ahead of it is delivered via
+/// [`send_after`] timed to land at the boundary, otherwise it is sent
+/// immediately. A normal interval-2 session starts at the boundary, so its
+/// aggregates are always past it and sent without delay.
 pub(crate) fn run_aggregation_worker(
     snapshot: AggregationSnapshot,
     actor: ActorRef<crate::BlockChainServer>,
     cancel: CancellationToken,
     session_id: u64,
-    publish_at_ms: u64,
+    publish_at: SystemTime,
 ) {
     let start = Instant::now();
     let groups_considered = snapshot.groups_considered;
@@ -623,22 +623,25 @@ pub(crate) fn run_aggregation_worker(
         // send now if already past it. `send_after` is fire-and-forget: it
         // spawns a timer that delivers the message and is cancelled only if the
         // actor stops, so the produced aggregate is not lost when the worker's
-        // own loop ends.
-        let now_ms = crate::unix_now_ms();
-        if now_ms >= publish_at_ms {
-            if actor
-                .send(AggregateProduced { session_id, output })
-                .is_err()
-            {
-                // Actor is gone; no point producing more.
-                break;
+        // own loop ends. `duration_since` errs once the boundary has passed,
+        // which is exactly the send-immediately case.
+        match publish_at.duration_since(SystemTime::now()) {
+            Ok(delay) if !delay.is_zero() => {
+                send_after(
+                    delay,
+                    Context::from_ref(&actor),
+                    AggregateProduced { session_id, output },
+                );
             }
-        } else {
-            send_after(
-                Duration::from_millis(publish_at_ms - now_ms),
-                Context::from_ref(&actor),
-                AggregateProduced { session_id, output },
-            );
+            _ => {
+                if actor
+                    .send(AggregateProduced { session_id, output })
+                    .is_err()
+                {
+                    // Actor is gone; no point producing more.
+                    break;
+                }
+            }
         }
     }
 

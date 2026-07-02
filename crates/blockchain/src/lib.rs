@@ -417,12 +417,13 @@ impl BlockChainServer {
         let session_id = slot;
         let genesis_time_ms = self.store.config().genesis_time * 1000;
         let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, slot);
+        // Interval-2 boundary as a wall-clock instant; the worker holds each
+        // produced aggregate until this before sending it back, so nothing
+        // reaches gossip early.
+        let publish_at = SystemTime::UNIX_EPOCH + Duration::from_millis(t2_ms);
         let now_ms = unix_now_ms();
         let early = now_ms < t2_ms;
         if early {
-            // Publish alignment lives in the worker: it holds each produced
-            // aggregate until `t2_ms` (the interval-2 boundary) before sending
-            // it back, so nothing reaches gossip early.
             let lead = Duration::from_millis(t2_ms - now_ms);
             metrics::inc_aggregation_early_starts();
             metrics::observe_aggregation_early_start_lead(lead);
@@ -442,7 +443,13 @@ impl BlockChainServer {
         let worker_cancel = cancel.clone();
         let worker_actor = actor_ref.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id, t2_ms);
+            run_aggregation_worker(
+                snapshot,
+                worker_actor,
+                worker_cancel,
+                session_id,
+                publish_at,
+            );
         });
 
         let _deadline_timer = send_after(
