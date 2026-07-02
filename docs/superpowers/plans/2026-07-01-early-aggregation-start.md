@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Start the committee-signature aggregation session up to 400 ms before the interval-2 boundary when a single attestation-data group already holds 2/3 of the signatures expected from this node's aggregation subnets, while holding back any early-produced aggregates from gossip until the boundary.
+**Goal:** Start the committee-signature aggregation session up to 200 ms before the interval-2 boundary when a single attestation-data group already holds 2/3 of the signatures expected from this node's aggregation subnets, while holding back any early-produced aggregates from gossip until the boundary.
 
-**Architecture:** The blockchain actor (`BlockChainServer`, GenServer pattern) gains an early-trigger check invoked from two sites: after every stored gossip signature (`NewAttestation` handler) and once via a timer fired at the window opening (`T2 − 400 ms`). The trigger calls the existing `start_aggregation_session`, which becomes the single session-start path for both early and normal (interval-2 tick) starts; the tick skips if the slot's session already exists. Aggregates produced before T2 are buffered on the actor and flushed by a `send_after` timer at T2.
+**Architecture:** The blockchain actor (`BlockChainServer`, GenServer pattern) gains an early-trigger check invoked from two sites: after every stored gossip signature (`NewAttestation` handler) and once via a timer fired at the window opening (`T2 − 200 ms`). The trigger calls the existing `start_aggregation_session`, which becomes the single session-start path for both early and normal (interval-2 tick) starts; the tick skips if the slot's session already exists. Aggregates produced before T2 are buffered on the actor and flushed by a `send_after` timer at T2.
 
 **Tech Stack:** Rust (edition 2024), spawned-concurrency actors (`send_after` self-messages), prometheus metrics via `ethlambda_metrics`.
 
@@ -26,8 +26,8 @@
 slot start   T1=+800ms    T2=+1600ms   T3=+2400ms   T4=+3200ms
   |------------|------------|------------|------------|
                ^ attest     ^ aggregate  ^ safe tgt   ^ accept/build
-                     [T2-400, T2) = early window
-                     ^ timer check       (scheduled at T1 + 400ms)
+                     [T2-200, T2) = early window
+                     ^ timer check       (scheduled at T1 + 600ms)
                      ^..^..^ per-insert checks as gossip sigs arrive
 ```
 
@@ -179,7 +179,7 @@ In `crates/blockchain/src/aggregation.rs`, after `PRIOR_WORKER_JOIN_TIMEOUT` (~l
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
 /// met (see `early_threshold_met`).
-pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 400;
+pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 200;
 
 /// Wall-clock millisecond timestamp of `slot`'s interval-2 boundary (the
 /// normal aggregation start).
@@ -814,7 +814,7 @@ Run a local 4-node devnet on this branch and verify the early-start behavior end
 
 Check the aggregator node's logs and metrics:
 
-1. `"Early-aggregation threshold met"` and `"Starting aggregation session early"` appear for most slots (local gossip is fast; signatures land well inside the window). `lead_ms` values must be in `(0, 400]`.
+1. `"Early-aggregation threshold met"` and `"Starting aggregation session early"` appear for most slots (local gossip is fast; signatures land well inside the window). `lead_ms` values must be in `(0, 200]`.
 2. `"Publishing aggregates held back until the interval-2 boundary"` appears with `count >= 1`.
 3. `lean_aggregation_early_starts_total` grows (metrics port, default `:5054`, path `/metrics`).
 4. `lean_aggregation_early_start_lead_seconds` observations sit in `(0, 0.4]`.

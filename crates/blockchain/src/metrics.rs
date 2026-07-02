@@ -388,7 +388,7 @@ static LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS: std::sync::LazyLock<Histogram>
         register_histogram!(
             "lean_aggregation_early_start_lead_seconds",
             "How far before the interval-2 boundary an early aggregation session started",
-            vec![0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+            vec![0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2]
         )
         .unwrap()
     });

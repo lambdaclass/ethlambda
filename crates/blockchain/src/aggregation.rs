@@ -43,7 +43,7 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
 /// met (see `early_threshold_met`).
-pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 400;
+pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 200;
 
 // The window must fit within one interval: `early_aggregation_slot` subtracts
 // it from the interval-2 offset, and the interval-1 tick schedules the check

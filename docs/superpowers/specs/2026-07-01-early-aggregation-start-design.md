@@ -8,7 +8,7 @@
 Committee-signature aggregation (leanVM XMSS proofs) is the dominant cost in the
 attestation pipeline. Today the aggregation session starts exactly at the
 interval-2 tick, even when all expected signatures arrived earlier. Starting the
-session up to 400 ms early, when enough signatures are already present, gives the
+session up to 200 ms early, when enough signatures are already present, gives the
 expensive proofs more wall-clock runway before block building consumes them at
 interval 4.
 
@@ -36,7 +36,7 @@ interval 4.
 
 Aggregator-only, fires at most once per slot.
 
-- **Window:** wall clock in `[T2 - 400 ms, T2)`, where
+- **Window:** wall clock in `[T2 - 200 ms, T2)`, where
   `T2 = genesis_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL`
   is the current slot's interval-2 boundary.
 - **Condition:** some current-slot attestation-data group has gossip signatures
@@ -56,7 +56,7 @@ Aggregator-only, fires at most once per slot.
   2. A one-shot `EarlyAggregationCheck` self-message (no payload — the slot is
      recomputed from the wall clock at fire time, so a late-fired timer can
      never act on a stale slot) scheduled at the interval-1 tick via
-     `send_after(400 ms)` (interval-1 tick + 400 ms = T2 - 400 ms), covering
+     `send_after(200 ms)` (interval-1 tick + 600 ms = T2 - 200 ms), covering
      the case where the threshold was already met before the window opened. If
      the interval-1 tick is skipped (overrun), the per-insert checks still
      apply.
@@ -109,10 +109,10 @@ pattern: build early, publish aligned to the boundary).
 
 `AGGREGATION_DEADLINE`: 750 ms → 800 ms, still measured from session start.
 
-- Early session started at `T2 - x` (x ≤ 400): deadline at `T2 - x + 800`,
-  i.e. at most `T2 + 400`.
+- Early session started at `T2 - x` (0 < x ≤ 200): deadline at `T2 - x + 800`,
+  i.e. no earlier than `T2 + 600` (200 ms before the interval-3 boundary).
 - Normal session started at `T2`: deadline lands exactly on the interval-3
-  boundary. This removes the previous 50 ms publish/propagation margin —
+  boundary. This removes the previous 50 ms publish/propagation margin;
   accepted trade-off (the deadline only stops *new* jobs from starting; a job
   mid-proof finishes and publishes slightly after).
 
@@ -156,7 +156,7 @@ model (runtime toggles do not resubscribe subnets).
 
 - Counter `lean_aggregation_early_starts_total`: early sessions started.
 - Histogram for early-start lead time (`T2 - start`, seconds, buckets covering
-  0–400 ms).
+  0–200 ms).
 - Existing session logs gain an `early: bool` field so devnet log analysis can
   attribute publish-time shifts.
 
