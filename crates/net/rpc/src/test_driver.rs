@@ -374,7 +374,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             // not the proof bytes). Mirrors the same fold in
             // crates/blockchain/tests/forkchoice_spectests.rs.
             let block = block_data.to_block();
-            let entries: Vec<(HashedAttestationData, SingleMessageAggregate)> = block
+            let entries: Vec<_> = block
                 .body
                 .attestations
                 .iter()
