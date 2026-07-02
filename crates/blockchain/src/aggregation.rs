@@ -25,12 +25,14 @@ use tracing::{info, warn};
 
 use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
-/// Soft deadline for committee-signature aggregation measured from the
-/// interval-2 tick. After this much wall time elapses, the actor signals the
-/// worker to stop via its cancellation token. The 50 ms budget before the next
-/// interval (interval 3 at +800 ms) is reserved for publishing any late-arriving
-/// aggregates and for gossip propagation margin.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(750);
+/// Soft deadline for committee-signature aggregation measured from session
+/// start. After this much wall time elapses, the actor signals the worker to
+/// stop via its cancellation token. A session started exactly at interval 2
+/// gets the full interval (interval 3 is one interval later); a session
+/// started early (see `early_aggregation_slot`) ends correspondingly earlier.
+/// The deadline only stops new jobs from starting — a job mid-proof finishes
+/// and publishes right after.
+pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.

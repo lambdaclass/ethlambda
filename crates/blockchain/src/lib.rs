@@ -396,7 +396,7 @@ impl BlockChainServer {
     /// 1. If a prior session is still running (pathological), warn and join it.
     /// 2. Snapshot the aggregation inputs from the store.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
-    /// 4. Schedule the `AggregationDeadline` self-message at +750 ms.
+    /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.current_aggregation.take() {
             prior.cancel.cancel();
