@@ -42,7 +42,7 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
-/// met (see `early_threshold_met`).
+/// met (see the check in `maybe_start_early_aggregation`).
 pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 600;
 
 // The window must fit within one interval: `early_aggregation_slot` subtracts
@@ -55,12 +55,6 @@ const _: () = assert!(
     "EARLY_AGGREGATION_WINDOW_MS must not exceed one interval"
 );
 
-/// Wall-clock millisecond timestamp of `slot`'s interval-2 boundary (the
-/// normal aggregation start).
-pub(crate) fn interval2_boundary_ms(genesis_time_ms: u64, slot: u64) -> u64 {
-    genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL
-}
-
 /// If `now_ms` falls inside some slot's early-aggregation window
 /// (`[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)` with `T2` that slot's interval-2
 /// boundary), return that slot.
@@ -71,15 +65,6 @@ pub(crate) fn early_aggregation_slot(now_ms: u64, genesis_time_ms: u64) -> Optio
     let in_window =
         ms_into_slot >= t2_offset - EARLY_AGGREGATION_WINDOW_MS && ms_into_slot < t2_offset;
     in_window.then_some(since_genesis / MILLISECONDS_PER_SLOT)
-}
-
-/// Early-start threshold: the largest single attestation-data group already
-/// holds at least `min_group_sigs` signatures. `min_group_sigs` is the
-/// precomputed two-thirds-of-a-committee count (see `BlockChain::spawn`), so
-/// the 2/3 fraction is not re-applied here. At most one group per slot can
-/// satisfy this (each validator signs once per slot).
-pub(crate) fn early_threshold_met(max_group_count: usize, min_group_sigs: usize) -> bool {
-    min_group_sigs > 0 && max_group_count >= min_group_sigs
 }
 
 /// A single pre-prepared aggregation group.
@@ -620,28 +605,28 @@ pub(crate) fn run_aggregation_worker(
         total_children += children;
 
         // Hold the aggregate until the interval-2 boundary (early session), or
-        // send now if already past it. `send_after` is fire-and-forget: it
+        // send now if already at/past it. `send_after` is fire-and-forget: it
         // spawns a timer that delivers the message and is cancelled only if the
         // actor stops, so the produced aggregate is not lost when the worker's
         // own loop ends. `duration_since` errs once the boundary has passed,
-        // which is exactly the send-immediately case.
-        match publish_at.duration_since(SystemTime::now()) {
-            Ok(delay) if !delay.is_zero() => {
-                send_after(
-                    delay,
-                    Context::from_ref(&actor),
-                    AggregateProduced { session_id, output },
-                );
+        // which collapses to a zero delay here.
+        let delay = publish_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        if delay.is_zero() {
+            if actor
+                .send(AggregateProduced { session_id, output })
+                .is_err()
+            {
+                // Actor is gone; no point producing more.
+                break;
             }
-            _ => {
-                if actor
-                    .send(AggregateProduced { session_id, output })
-                    .is_err()
-                {
-                    // Actor is gone; no point producing more.
-                    break;
-                }
-            }
+        } else {
+            send_after(
+                delay,
+                Context::from_ref(&actor),
+                AggregateProduced { session_id, output },
+            );
         }
     }
 

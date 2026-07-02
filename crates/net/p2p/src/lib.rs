@@ -182,43 +182,6 @@ pub struct BuiltSwarm {
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
 
-/// Compute the set of attestation subnets this node subscribes to, per
-/// leanSpec (`src/lean_spec/__main__.py`): every validator subscribes to its
-/// own subnet (`vid % committee_count`) for mesh health; aggregators
-/// additionally subscribe to explicit `aggregate_subnet_ids` and fall back to
-/// subnet 0 when the set would otherwise be empty.
-///
-/// Evaluated once at startup — runtime aggregator toggles do not resubscribe
-/// (hot-standby model); see the invariant note on [`SwarmConfig`].
-///
-/// A zero `attestation_committee_count` yields no validator subnets (rather
-/// than dividing by zero); callers enforce `>= 1`, so this is a defensive
-/// guard, not a reachable path in the binary.
-pub(crate) fn compute_subscription_subnets(
-    validator_ids: &[u64],
-    attestation_committee_count: u64,
-    is_aggregator: bool,
-    aggregate_subnet_ids: Option<&[u64]>,
-) -> HashSet<u64> {
-    let mut subnets: HashSet<u64> = if attestation_committee_count == 0 {
-        HashSet::new()
-    } else {
-        validator_ids
-            .iter()
-            .map(|vid| vid % attestation_committee_count)
-            .collect()
-    };
-    if is_aggregator {
-        if let Some(explicit_ids) = aggregate_subnet_ids {
-            subnets.extend(explicit_ids);
-        }
-        if subnets.is_empty() {
-            subnets.insert(0);
-        }
-    }
-    subnets
-}
-
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
 pub fn build_swarm(
     config: SwarmConfig,
@@ -338,8 +301,14 @@ pub fn build_swarm(
         .subscribe(&aggregation_topic)
         .unwrap();
 
-    // Subscribe to attestation subnets — see `compute_subscription_subnets`.
-    // The committee metric should reflect validator membership only, not
+    // Subscribe to attestation subnets per leanSpec (`src/lean_spec/__main__.py`):
+    // every validator subscribes to its own subnet (`vid % committee_count`)
+    // for mesh health; aggregators additionally subscribe to explicit
+    // `aggregate_subnet_ids` and fall back to subnet 0 when they have no
+    // validators of their own. Frozen at startup — runtime aggregator toggles
+    // do not resubscribe (hot-standby model); see the invariant on `SwarmConfig`.
+    //
+    // The committee metric reflects validator membership only, not
     // aggregator-only subscriptions.
     let metric_subnet = config
         .validator_ids
@@ -349,12 +318,19 @@ pub fn build_swarm(
         .unwrap_or(0);
     metrics::set_attestation_committee_subnet(metric_subnet);
 
-    let subscription_subnets = compute_subscription_subnets(
-        &config.validator_ids,
-        config.attestation_committee_count,
-        config.is_aggregator,
-        config.aggregate_subnet_ids.as_deref(),
-    );
+    let mut subscription_subnets: HashSet<u64> = config
+        .validator_ids
+        .iter()
+        .map(|vid| vid % config.attestation_committee_count)
+        .collect();
+    if config.is_aggregator {
+        if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
+            subscription_subnets.extend(explicit_ids);
+        }
+        if subscription_subnets.is_empty() {
+            subscription_subnets.insert(0);
+        }
+    }
 
     let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
     for &subnet_id in &subscription_subnets {

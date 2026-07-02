@@ -416,7 +416,7 @@ impl BlockChainServer {
 
         let session_id = slot;
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, slot);
+        let t2_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL;
         // Interval-2 boundary as a wall-clock instant; the worker holds each
         // produced aggregate until this before sending it back, so nothing
         // reaches gossip early.
@@ -493,8 +493,18 @@ impl BlockChainServer {
             return;
         }
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
-        let min_group_sigs = self.early_aggregation_min_group_sigs();
-        if !aggregation::early_threshold_met(max_group, min_group_sigs) {
+        // Trigger once the largest current-slot group holds two-thirds of one
+        // committee's expected votes, `2 * N / (3 * C)` (0 when there is no
+        // committee, which never triggers). The head-state read is memoized on
+        // the stable head root and only runs inside the window until a session
+        // starts, so it costs a handful of reads per slot at most.
+        let min_group_sigs = if self.attestation_committee_count == 0 {
+            0
+        } else {
+            let validator_count = self.store.head_state().validators.len() as u64;
+            (2 * validator_count / (3 * self.attestation_committee_count)) as usize
+        };
+        if min_group_sigs == 0 || max_group < min_group_sigs {
             return;
         }
         info!(
@@ -504,20 +514,6 @@ impl BlockChainServer {
             "Early-aggregation threshold met"
         );
         self.start_aggregation_session(slot, ctx).await;
-    }
-
-    /// Minimum signatures in one attestation-data group that trigger early
-    /// aggregation: two-thirds of one committee's expected votes,
-    /// `2 * validator_count / (3 * committee_count)`. Computed on demand rather
-    /// than cached; only reached inside the early-aggregation window and only
-    /// until a session starts, so the `head_state` read (memoized on the
-    /// stable head root) runs a handful of times per slot at most.
-    fn early_aggregation_min_group_sigs(&self) -> usize {
-        if self.attestation_committee_count == 0 {
-            return 0;
-        }
-        let validator_count = self.store.head_state().validators.len() as u64;
-        (2 * validator_count / (3 * self.attestation_committee_count)) as usize
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -1030,15 +1026,6 @@ impl BlockChainServer {
         }
     }
 
-    /// Publish an aggregated attestation to the aggregation gossip topic.
-    fn publish_aggregate(&self, aggregate: SignedAggregatedAttestation) {
-        if let Some(ref p2p) = self.p2p {
-            let _ = p2p
-                .publish_aggregated_attestation(aggregate)
-                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
-        }
-    }
-
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
         // Read fresh here too: a gossip event can arrive between ticks, and
         // if the admin API just toggled, the first gossip after the toggle
@@ -1181,11 +1168,15 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
 
-        let aggregate = SignedAggregatedAttestation {
-            data: msg.output.hashed.data().clone(),
-            proof: msg.output.proof,
-        };
-        self.publish_aggregate(aggregate);
+        if let Some(ref p2p) = self.p2p {
+            let aggregate = SignedAggregatedAttestation {
+                data: msg.output.hashed.data().clone(),
+                proof: msg.output.proof,
+            };
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        }
     }
 }
 
