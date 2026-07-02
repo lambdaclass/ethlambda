@@ -379,10 +379,9 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .attestations
                 .iter()
                 .map(|att| {
-                    (
-                        HashedAttestationData::new(att.data.clone()),
-                        SingleMessageAggregate::empty(att.aggregation_bits.clone()),
-                    )
+                    let hashed_attestation = HashedAttestationData::new(att.data.clone());
+                    let aggregate = SingleMessageAggregate::empty(att.aggregation_bits.clone());
+                    (hashed_attestation, aggregate)
                 })
                 .collect();
             store.insert_known_aggregated_payloads_batch(entries);
