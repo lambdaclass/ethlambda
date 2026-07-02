@@ -509,7 +509,10 @@ impl BlockChainServer {
     /// stored gossip signature and once at the window opening via
     /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started
     /// session stays in `current_aggregation` (running or finished) until the
-    /// next session replaces it.
+    /// next session replaces it. The latch has one hole: if the snapshot
+    /// yields no jobs (possible only when no signer's pubkey resolves, i.e. a
+    /// corrupted validator registry), no session is installed and the check
+    /// retries on later inserts — each retry is a no-op session attempt.
     async fn maybe_start_early_aggregation(&mut self, ctx: &Context<Self>) {
         if !self.aggregator.is_enabled() {
             return;
