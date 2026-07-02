@@ -25,15 +25,15 @@ use spawned_concurrency::tasks::{ActorRef, Context, send_after};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
+use crate::{MILLISECONDS_PER_INTERVAL, metrics};
 
 /// Soft deadline for committee-signature aggregation measured from session
 /// start. After this much wall time elapses, the actor signals the worker to
 /// stop via its cancellation token. A session started exactly at interval 2
 /// gets the full interval (interval 3 is one interval later); a session
-/// started early (see `early_aggregation_slot`) ends correspondingly earlier.
-/// The deadline only stops new jobs from starting — a job mid-proof finishes
-/// and publishes right after.
+/// started early (see `maybe_start_early_aggregation`) ends correspondingly
+/// earlier. The deadline only stops new jobs from starting — a job mid-proof
+/// finishes and publishes right after.
 pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
@@ -45,27 +45,15 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// met (see the check in `maybe_start_early_aggregation`).
 pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 600;
 
-// The window must fit within one interval: `early_aggregation_slot` subtracts
-// it from the interval-2 offset, and the interval-1 tick schedules the check
-// at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW_MS`. Keep this
-// invariant self-enforcing so a future bump to the window can't silently
+// The window must fit within one interval: `maybe_start_early_aggregation`
+// subtracts it from the interval-2 offset, and the interval-1 tick schedules
+// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW_MS`. Keep
+// this invariant self-enforcing so a future bump to the window can't silently
 // underflow either subtraction.
 const _: () = assert!(
     EARLY_AGGREGATION_WINDOW_MS <= MILLISECONDS_PER_INTERVAL,
     "EARLY_AGGREGATION_WINDOW_MS must not exceed one interval"
 );
-
-/// If `now_ms` falls inside some slot's early-aggregation window
-/// (`[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)` with `T2` that slot's interval-2
-/// boundary), return that slot.
-pub(crate) fn early_aggregation_slot(now_ms: u64, genesis_time_ms: u64) -> Option<u64> {
-    let since_genesis = now_ms.checked_sub(genesis_time_ms)?;
-    let ms_into_slot = since_genesis % MILLISECONDS_PER_SLOT;
-    let t2_offset = 2 * MILLISECONDS_PER_INTERVAL;
-    let in_window =
-        ms_into_slot >= t2_offset - EARLY_AGGREGATION_WINDOW_MS && ms_into_slot < t2_offset;
-    in_window.then_some(since_genesis / MILLISECONDS_PER_SLOT)
-}
 
 /// A single pre-prepared aggregation group.
 ///

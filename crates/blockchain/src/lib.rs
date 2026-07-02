@@ -481,10 +481,19 @@ impl BlockChainServer {
         if !self.aggregator.is_enabled() {
             return;
         }
+        // Only fire inside the early-aggregation window
+        // `[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)`, where T2 is the current
+        // slot's interval-2 boundary; the slot is derived from the wall clock.
         let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let Some(slot) = aggregation::early_aggregation_slot(unix_now_ms(), genesis_time_ms) else {
+        let Some(ms_since_genesis) = unix_now_ms().checked_sub(genesis_time_ms) else {
             return;
         };
+        let ms_into_slot = ms_since_genesis % MILLISECONDS_PER_SLOT;
+        let t2_offset = 2 * MILLISECONDS_PER_INTERVAL;
+        if ms_into_slot < t2_offset - EARLY_AGGREGATION_WINDOW_MS || ms_into_slot >= t2_offset {
+            return;
+        }
+        let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
         if self
             .current_aggregation
             .as_ref()
@@ -495,9 +504,7 @@ impl BlockChainServer {
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
         // Trigger once the largest current-slot group holds two-thirds of one
         // committee's expected votes, `2 * N / (3 * C)` (0 when there is no
-        // committee, which never triggers). The head-state read is memoized on
-        // the stable head root and only runs inside the window until a session
-        // starts, so it costs a handful of reads per slot at most.
+        // committee, which never triggers).
         let min_group_sigs = if self.attestation_committee_count == 0 {
             0
         } else {
