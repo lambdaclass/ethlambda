@@ -21,5 +21,8 @@ leansig.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 
+[features]
+shadow-integration = []
+
 [dev-dependencies]
 hex.workspace = true
