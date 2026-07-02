@@ -21,7 +21,7 @@ use ethlambda_types::{
     state::Validator,
 };
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::ActorRef;
+use spawned_concurrency::tasks::{ActorRef, Context, send_after};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -162,19 +162,6 @@ pub(crate) struct AggregationDeadline {
     pub(crate) session_id: u64,
 }
 impl Message for AggregationDeadline {
-    type Result = ();
-}
-
-/// Self-message scheduled when a session starts early; fires at the
-/// interval-2 boundary and publishes any aggregates held back by the
-/// publish-alignment rule (aggregates must not reach gossip before
-/// interval 2). Carries the session slot so a timer delayed past the next
-/// session start is fenced (like [`AggregationDeadline`]) and cannot flush
-/// the newer session's buffer before its own boundary.
-pub(crate) struct FlushAggregatePublishes {
-    pub(crate) slot: u64,
-}
-impl Message for FlushAggregatePublishes {
     type Result = ();
 }
 
@@ -572,11 +559,19 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and streams
 /// successful aggregates back to the actor as [`AggregateProduced`] messages.
 /// Emits [`AggregationDone`] when the loop exits (completion or cancellation).
+///
+/// Publish alignment: aggregates must not reach the actor (and thus gossip)
+/// before the interval-2 boundary. `publish_at_ms` is that boundary as a UNIX
+/// millisecond timestamp; a produced aggregate whose wall clock is still before
+/// it is delivered via [`send_after`] timed to land at the boundary, otherwise
+/// it is sent immediately. A normal interval-2 session starts at the boundary,
+/// so its aggregates are always past it and sent without delay.
 pub(crate) fn run_aggregation_worker(
     snapshot: AggregationSnapshot,
     actor: ActorRef<crate::BlockChainServer>,
     cancel: CancellationToken,
     session_id: u64,
+    publish_at_ms: u64,
 ) {
     let start = Instant::now();
     let groups_considered = snapshot.groups_considered;
@@ -624,12 +619,26 @@ pub(crate) fn run_aggregation_worker(
         total_raw_sigs += raw_sigs;
         total_children += children;
 
-        if actor
-            .send(AggregateProduced { session_id, output })
-            .is_err()
-        {
-            // Actor is gone; no point producing more.
-            break;
+        // Hold the aggregate until the interval-2 boundary (early session), or
+        // send now if already past it. `send_after` is fire-and-forget: it
+        // spawns a timer that delivers the message and is cancelled only if the
+        // actor stops, so the produced aggregate is not lost when the worker's
+        // own loop ends.
+        let now_ms = crate::unix_now_ms();
+        if now_ms >= publish_at_ms {
+            if actor
+                .send(AggregateProduced { session_id, output })
+                .is_err()
+            {
+                // Actor is gone; no point producing more.
+                break;
+            }
+        } else {
+            send_after(
+                Duration::from_millis(publish_at_ms - now_ms),
+                Context::from_ref(&actor),
+                AggregateProduced { session_id, output },
+            );
         }
     }
 

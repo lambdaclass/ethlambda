@@ -16,7 +16,7 @@ use ethlambda_types::{
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, EARLY_AGGREGATION_WINDOW_MS, EarlyAggregationCheck,
-    FlushAggregatePublishes, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -109,7 +109,6 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
-            pending_aggregate_publishes: Vec::new(),
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -173,11 +172,6 @@ pub struct BlockChainServer {
     /// attestation aggregate coverage emission and the early-aggregation
     /// threshold.
     attestation_committee_count: u64,
-
-    /// Aggregates produced before the interval-2 boundary, held back so they
-    /// are not gossiped early. Flushed by `FlushAggregatePublishes` at the
-    /// boundary; only ever holds the current slot's aggregates.
-    pending_aggregate_publishes: Vec<SignedAggregatedAttestation>,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -421,26 +415,14 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
-        // Any leftovers from a prior slot mean its flush never fired (a
-        // backwards wall-clock step, or a flush timer delayed past the next
-        // session). Drop them — late aggregates are dropped, same policy as
-        // signatures that miss the snapshot.
-        let stale = std::mem::take(&mut self.pending_aggregate_publishes);
-        if !stale.is_empty() {
-            warn!(
-                %slot,
-                count = stale.len(),
-                "Dropping stale pending aggregate publishes"
-            );
-        }
         let genesis_time_ms = self.store.config().genesis_time * 1000;
         let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, slot);
         let now_ms = unix_now_ms();
         let early = now_ms < t2_ms;
         if early {
-            // Publish alignment: aggregates must not reach gossip before the
-            // interval-2 boundary. Aggregates produced before T2 are buffered
-            // in `pending_aggregate_publishes`; this timer flushes them at T2.
+            // Publish alignment lives in the worker: it holds each produced
+            // aggregate until `t2_ms` (the interval-2 boundary) before sending
+            // it back, so nothing reaches gossip early.
             let lead = Duration::from_millis(t2_ms - now_ms);
             metrics::inc_aggregation_early_starts();
             metrics::observe_aggregation_early_start_lead(lead);
@@ -449,7 +431,6 @@ impl BlockChainServer {
                 lead_ms = lead.as_millis() as u64,
                 "Starting aggregation session early"
             );
-            send_after(lead, ctx.clone(), FlushAggregatePublishes { slot });
         }
 
         // Independent token per session. Shutdown propagates via our
@@ -461,7 +442,7 @@ impl BlockChainServer {
         let worker_cancel = cancel.clone();
         let worker_actor = actor_ref.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id);
+            run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id, t2_ms);
         });
 
         let _deadline_timer = send_after(
@@ -1188,53 +1169,16 @@ impl Handler<AggregateProduced> for BlockChainServer {
             return;
         }
 
+        // Publish alignment is enforced upstream: the worker delays delivery of
+        // this message until the interval-2 boundary, so by the time it lands
+        // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
 
         let aggregate = SignedAggregatedAttestation {
             data: msg.output.hashed.data().clone(),
             proof: msg.output.proof,
         };
-
-        // Publish alignment: hold back aggregates produced before this slot's
-        // interval-2 boundary; `FlushAggregatePublishes` publishes them at T2.
-        // (`session_id` is the session's slot.)
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let t2_ms = aggregation::interval2_boundary_ms(genesis_time_ms, msg.session_id);
-        if unix_now_ms() < t2_ms {
-            self.pending_aggregate_publishes.push(aggregate);
-            return;
-        }
         self.publish_aggregate(aggregate);
-    }
-}
-
-impl Handler<FlushAggregatePublishes> for BlockChainServer {
-    async fn handle(&mut self, msg: FlushAggregatePublishes, _ctx: &Context<Self>) {
-        // Fence like `AggregationDeadline`: only the current session's flush
-        // drains the buffer. A flush timer delayed past the next session start
-        // would otherwise publish that newer session's buffered aggregates
-        // before its own interval-2 boundary, breaking publish alignment. The
-        // superseded session's own aggregates were already dropped by the
-        // stale-drain in `start_aggregation_session`.
-        let is_current = self
-            .current_aggregation
-            .as_ref()
-            .is_some_and(|session| session.session_id == msg.slot);
-        if !is_current {
-            return;
-        }
-        let pending = std::mem::take(&mut self.pending_aggregate_publishes);
-        if pending.is_empty() {
-            return;
-        }
-        info!(
-            slot = msg.slot,
-            count = pending.len(),
-            "Publishing aggregates held back until the interval-2 boundary"
-        );
-        for aggregate in pending {
-            self.publish_aggregate(aggregate);
-        }
     }
 }
 
