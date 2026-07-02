@@ -160,6 +160,15 @@ impl Message for FlushAggregatePublishes {
     type Result = ();
 }
 
+/// One-shot self-message scheduled at the interval-1 tick; fires when the
+/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW_MS) to run
+/// the threshold check for signatures that all arrived before the window.
+/// Arrivals inside the window are checked per insert instead.
+pub(crate) struct EarlyAggregationCheck;
+impl Message for EarlyAggregationCheck {
+    type Result = ();
+}
+
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
 /// thread, touches the store, does no heavy cryptography. Returns `None` when
 /// there is nothing to aggregate so callers can avoid spawning an empty worker.

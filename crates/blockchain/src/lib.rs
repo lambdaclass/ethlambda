@@ -15,7 +15,8 @@ use ethlambda_types::{
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, FlushAggregatePublishes, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    AggregationSession, EARLY_AGGREGATION_WINDOW_MS, EarlyAggregationCheck,
+    FlushAggregatePublishes, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -340,12 +341,34 @@ impl BlockChainServer {
                 } else if !self.key_manager.validator_ids().is_empty() {
                     info!(%slot, "Skipping attestations while syncing");
                 }
+
+                // Schedule the early-aggregation window check. This tick is
+                // one interval before T2, so the timer fires right as the
+                // window opens at T2 - EARLY_AGGREGATION_WINDOW_MS.
+                if is_aggregator {
+                    send_after(
+                        Duration::from_millis(
+                            MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW_MS,
+                        ),
+                        ctx.clone(),
+                        EarlyAggregationCheck,
+                    );
+                }
             }
 
             // ==== interval 2 ====
             2 => {
                 if is_aggregator {
-                    self.start_aggregation_session(slot, ctx).await;
+                    // The early trigger may have already started this slot's
+                    // session (running or finished) — it IS the slot's session,
+                    // so don't start a second one.
+                    let already_started = self
+                        .current_aggregation
+                        .as_ref()
+                        .is_some_and(|session| session.session_id == slot);
+                    if !already_started {
+                        self.start_aggregation_session(slot, ctx).await;
+                    }
                 } else {
                     metrics::inc_aggregator_skipped_not_aggregator();
                 }
@@ -477,6 +500,42 @@ impl BlockChainServer {
             cancel,
             worker,
         });
+    }
+
+    /// Early-aggregation trigger: start the slot's session ahead of the
+    /// interval-2 tick when, inside the window `[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)`,
+    /// a single attestation-data group already holds 2/3 of the signatures
+    /// expected from this node's aggregation subnets. Called after every
+    /// stored gossip signature and once at the window opening via
+    /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started
+    /// session stays in `current_aggregation` (running or finished) until the
+    /// next session replaces it.
+    async fn maybe_start_early_aggregation(&mut self, ctx: &Context<Self>) {
+        if !self.aggregator.is_enabled() {
+            return;
+        }
+        let Some(slot) = aggregation::early_aggregation_slot(unix_now_ms(), self.genesis_time_ms)
+        else {
+            return;
+        };
+        if self
+            .current_aggregation
+            .as_ref()
+            .is_some_and(|session| session.session_id == slot)
+        {
+            return;
+        }
+        let max_group = self.store.max_gossip_group_count_for_slot(slot);
+        if !aggregation::early_threshold_met(max_group, self.early_aggregation_expected_sigs) {
+            return;
+        }
+        info!(
+            %slot,
+            max_group,
+            expected = self.early_aggregation_expected_sigs,
+            "Early-aggregation threshold met"
+        );
+        self.start_aggregation_session(slot, ctx).await;
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -1104,8 +1163,9 @@ impl Handler<NewBlock> for BlockChainServer {
 }
 
 impl Handler<NewAttestation> for BlockChainServer {
-    async fn handle(&mut self, msg: NewAttestation, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         self.on_gossip_attestation(&msg.attestation);
+        self.maybe_start_early_aggregation(ctx).await;
     }
 }
 
@@ -1168,6 +1228,12 @@ impl Handler<FlushAggregatePublishes> for BlockChainServer {
         for aggregate in pending {
             self.publish_aggregate(aggregate);
         }
+    }
+}
+
+impl Handler<EarlyAggregationCheck> for BlockChainServer {
+    async fn handle(&mut self, _msg: EarlyAggregationCheck, ctx: &Context<Self>) {
+        self.maybe_start_early_aggregation(ctx).await;
     }
 }
 
