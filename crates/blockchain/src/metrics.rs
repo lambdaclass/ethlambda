@@ -263,6 +263,19 @@ static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<Int
         .unwrap()
     });
 
+static LEAN_AGGREGATION_EARLY_STARTS_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_early_starts_total",
+            "Aggregation sessions started before the interval-2 boundary"
+        )
+        .unwrap()
+    });
+
+pub fn inc_aggregation_early_starts() {
+    LEAN_AGGREGATION_EARLY_STARTS_TOTAL.inc();
+}
+
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -373,6 +386,20 @@ static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
         )
         .unwrap()
     });
+
+static LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_aggregation_early_start_lead_seconds",
+            "How far before the interval-2 boundary an early aggregation session started",
+            vec![0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+        )
+        .unwrap()
+    });
+
+pub fn observe_aggregation_early_start_lead(lead: Duration) {
+    LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS.observe(lead.as_secs_f64());
+}
 
 static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
@@ -590,6 +617,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_STARTS_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
@@ -601,6 +629,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS);
     std::sync::LazyLock::force(&LEAN_TICK_INTERVAL_DURATION_SECONDS);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);

@@ -108,6 +108,9 @@ pub(crate) struct AggregationSession {
     /// Slot at which this session was started; used as a fencing id so we can
     /// drop late-arriving messages from a prior session.
     pub(crate) session_id: u64,
+    /// Whether the session started before the slot's interval-2 boundary via
+    /// the early-aggregation trigger.
+    pub(crate) early: bool,
     /// Child of the actor cancellation token; fires either at the deadline or
     /// when the actor itself is stopping.
     pub(crate) cancel: CancellationToken,
@@ -145,6 +148,15 @@ pub(crate) struct AggregationDeadline {
     pub(crate) session_id: u64,
 }
 impl Message for AggregationDeadline {
+    type Result = ();
+}
+
+/// Self-message scheduled when a session starts early; fires at the
+/// interval-2 boundary and publishes any aggregates held back by the
+/// publish-alignment rule (aggregates must not reach gossip before
+/// interval 2).
+pub(crate) struct FlushAggregatePublishes;
+impl Message for FlushAggregatePublishes {
     type Result = ();
 }
 

@@ -15,7 +15,7 @@ use ethlambda_types::{
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    AggregationSession, FlushAggregatePublishes, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -345,10 +345,6 @@ impl BlockChainServer {
             // ==== interval 2 ====
             2 => {
                 if is_aggregator {
-                    coverage::emit_agg_start_new_coverage(
-                        &self.store,
-                        self.attestation_committee_count,
-                    );
                     self.start_aggregation_session(slot, ctx).await;
                 } else {
                     metrics::inc_aggregator_skipped_not_aggregator();
@@ -417,6 +413,8 @@ impl BlockChainServer {
             }
         }
 
+        coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
+
         let Some(snapshot) =
             aggregation::snapshot_current_slot_aggregation_inputs(&self.store, slot)
         else {
@@ -425,6 +423,35 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
+        // Any leftovers from a prior slot mean its flush never fired (a
+        // backwards wall-clock step, or a flush timer delayed past the next
+        // session). Drop them — late aggregates are dropped, same policy as
+        // signatures that miss the snapshot.
+        let stale = std::mem::take(&mut self.pending_aggregate_publishes);
+        if !stale.is_empty() {
+            warn!(
+                count = stale.len(),
+                "Dropping stale pending aggregate publishes"
+            );
+        }
+        let t2_ms = aggregation::interval2_boundary_ms(self.genesis_time_ms, slot);
+        let now_ms = unix_now_ms();
+        let early = now_ms < t2_ms;
+        if early {
+            // Publish alignment: aggregates must not reach gossip before the
+            // interval-2 boundary. Aggregates produced before T2 are buffered
+            // in `pending_aggregate_publishes`; this timer flushes them at T2.
+            let lead = Duration::from_millis(t2_ms - now_ms);
+            metrics::inc_aggregation_early_starts();
+            metrics::observe_aggregation_early_start_lead(lead);
+            info!(
+                %slot,
+                lead_ms = lead.as_millis() as u64,
+                "Starting aggregation session early"
+            );
+            send_after(lead, ctx.clone(), FlushAggregatePublishes);
+        }
+
         // Independent token per session. Shutdown propagates via our
         // #[stopped] hook which cancels any current session; the deadline
         // timer cancels this specific session at +AGGREGATION_DEADLINE.
@@ -445,6 +472,7 @@ impl BlockChainServer {
 
         self.current_aggregation = Some(AggregationSession {
             session_id,
+            early,
             cancel,
             worker,
         });
@@ -960,6 +988,15 @@ impl BlockChainServer {
         }
     }
 
+    /// Publish an aggregated attestation to the aggregation gossip topic.
+    fn publish_aggregate(&self, aggregate: SignedAggregatedAttestation) {
+        if let Some(ref p2p) = self.p2p {
+            let _ = p2p
+                .publish_aggregated_attestation(aggregate)
+                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        }
+    }
+
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
         // Read fresh here too: a gossip event can arrive between ticks, and
         // if the admin API just toggled, the first gossip after the toggle
@@ -1098,14 +1135,35 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
 
-        if let Some(ref p2p) = self.p2p {
-            let aggregate = SignedAggregatedAttestation {
-                data: msg.output.hashed.data().clone(),
-                proof: msg.output.proof,
-            };
-            let _ = p2p
-                .publish_aggregated_attestation(aggregate)
-                .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
+        let aggregate = SignedAggregatedAttestation {
+            data: msg.output.hashed.data().clone(),
+            proof: msg.output.proof,
+        };
+
+        // Publish alignment: hold back aggregates produced before this slot's
+        // interval-2 boundary; `FlushAggregatePublishes` publishes them at T2.
+        // (`session_id` is the session's slot.)
+        let t2_ms = aggregation::interval2_boundary_ms(self.genesis_time_ms, msg.session_id);
+        if unix_now_ms() < t2_ms {
+            self.pending_aggregate_publishes.push(aggregate);
+            return;
+        }
+        self.publish_aggregate(aggregate);
+    }
+}
+
+impl Handler<FlushAggregatePublishes> for BlockChainServer {
+    async fn handle(&mut self, _msg: FlushAggregatePublishes, _ctx: &Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_aggregate_publishes);
+        if pending.is_empty() {
+            return;
+        }
+        info!(
+            count = pending.len(),
+            "Publishing aggregates held back until the interval-2 boundary"
+        );
+        for aggregate in pending {
+            self.publish_aggregate(aggregate);
         }
     }
 }
@@ -1116,6 +1174,10 @@ impl Handler<AggregationDone> for BlockChainServer {
         metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
 
         let aggregation_elapsed = msg.total_elapsed;
+        let early = self
+            .current_aggregation
+            .as_ref()
+            .is_some_and(|s| s.session_id == msg.session_id && s.early);
         info!(
             ?aggregation_elapsed,
             session_id = msg.session_id,
@@ -1124,6 +1186,7 @@ impl Handler<AggregationDone> for BlockChainServer {
             total_raw_sigs = msg.total_raw_sigs,
             total_children = msg.total_children,
             cancelled = msg.cancelled,
+            early,
             aggregation_deadline_ms = AGGREGATION_DEADLINE.as_millis() as u64,
             "Committee signatures aggregated"
         );
