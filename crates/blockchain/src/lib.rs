@@ -175,9 +175,11 @@ pub struct BlockChainServer {
     /// `--is-aggregator` flag at spawn.
     aggregator: AggregatorController,
 
-    /// In-flight committee-signature aggregation, if any. Present only while a
-    /// worker started at the most recent interval 2 is still running or until
-    /// the next interval 2 takes over.
+    /// The slot's one committee-signature aggregation session (started at
+    /// interval 2, or early via the 2/3 trigger). Deliberately persists after
+    /// the worker finishes — that persistence is the once-per-slot latch the
+    /// early trigger and the interval-2 skip both check — until the next
+    /// session start replaces it.
     current_aggregation: Option<AggregationSession>,
 
     /// Last tick instant for measuring interval duration.

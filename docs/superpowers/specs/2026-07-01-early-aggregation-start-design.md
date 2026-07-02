@@ -162,15 +162,14 @@ model (runtime toggles do not resubscribe subnets).
 
 ## Testing
 
-- Unit tests for the pure trigger decision (window bounds, threshold math,
-  `expected` derivation from subnet set + validator count, once-per-slot guard).
-- Unit tests for `compute_subscription_subnets` (validator subnets, explicit
-  ids, fallback-to-0, non-aggregator).
-- Unit test for the publish-delay decision (before/after T2).
-- Existing aggregation tests must pass unchanged (normal interval-2 path is the
-  fallback and keeps its semantics; only the deadline constant changes).
-- Devnet validation via `test-branch.sh`: compare aggregate publish offsets
-  (per-slot duty timing method) and `lean_aggregation_early_starts_total`.
+Per user decision, no new unit tests. Validation is:
+
+- Existing suites pass unchanged (normal interval-2 path is the fallback and
+  keeps its semantics; only the deadline constant changes).
+- Local 4-node devnet run (1 aggregator, binary mode): early-start rate and
+  lead-time distribution from logs, held-back publish flushes landing at or
+  after the interval-2 boundary (per-slot offset), lockstep finalization, no
+  aggregation warnings/errors.
 
 ## Non-goals
 

@@ -1,7 +1,9 @@
 //! Committee-signature aggregation: off-thread worker orchestration and the
 //! pure functions it runs.
 //!
-//! The blockchain actor fires one aggregation session per interval 2 via
+//! The blockchain actor fires one aggregation session per slot — at interval 2,
+//! or up to [`EARLY_AGGREGATION_WINDOW_MS`] early when the 2/3 signature
+//! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
 //! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
@@ -142,7 +144,7 @@ impl Message for AggregationDone {
     type Result = ();
 }
 
-/// Self-message scheduled via `send_after` at interval-2 start. Cancels the
+/// Self-message scheduled via `send_after` at session start. Cancels the
 /// session's token so the worker stops starting new aggregations.
 pub(crate) struct AggregationDeadline {
     pub(crate) session_id: u64,
