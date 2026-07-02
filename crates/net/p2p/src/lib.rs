@@ -302,31 +302,27 @@ pub fn build_swarm(
         .unwrap();
 
     // Subscribe to attestation subnets per leanSpec (`src/lean_spec/__main__.py`):
-    // every validator subscribes to its own subnet (`vid % committee_count`)
-    // for mesh health; aggregators additionally subscribe to explicit
-    // `aggregate_subnet_ids` and fall back to subnet 0 when they have no
-    // validators of their own. Frozen at startup — runtime aggregator toggles
-    // do not resubscribe (hot-standby model); see the invariant on `SwarmConfig`.
-    //
-    // The committee metric reflects validator membership only, not
-    // aggregator-only subscriptions.
-    let metric_subnet = config
-        .validator_ids
-        .iter()
-        .map(|vid| vid % config.attestation_committee_count)
-        .min()
-        .unwrap_or(0);
-    metrics::set_attestation_committee_subnet(metric_subnet);
-
-    let mut subscription_subnets: HashSet<u64> = config
+    // every validator subscribes to its own subnet for mesh health; aggregators
+    // additionally subscribe to explicit `aggregate_subnet_ids` and fall back to
+    // subnet 0 when they have no validators of their own.
+    let validator_subnets: HashSet<u64> = config
         .validator_ids
         .iter()
         .map(|vid| vid % config.attestation_committee_count)
         .collect();
+
+    // The committee metric should reflect validator membership only, not
+    // aggregator-only subscriptions.
+    let metric_subnet = validator_subnets.iter().copied().min().unwrap_or(0);
+    metrics::set_attestation_committee_subnet(metric_subnet);
+
+    let mut subscription_subnets = validator_subnets;
     if config.is_aggregator {
         if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
             subscription_subnets.extend(explicit_ids);
         }
+        // Fall back to subnet 0 only when the aggregator has no validators
+        // and no explicit subnets — otherwise leave the set as configured.
         if subscription_subnets.is_empty() {
             subscription_subnets.insert(0);
         }
