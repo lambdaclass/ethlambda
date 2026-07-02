@@ -191,16 +191,24 @@ pub struct BuiltSwarm {
 ///
 /// Evaluated once at startup — runtime aggregator toggles do not resubscribe
 /// (hot-standby model); see the invariant note on [`SwarmConfig`].
+///
+/// A zero `attestation_committee_count` yields no validator subnets (rather
+/// than dividing by zero); callers enforce `>= 1`, so this is a defensive
+/// guard on the public API, not a reachable path in the binary.
 pub fn compute_subscription_subnets(
     validator_ids: &[u64],
     attestation_committee_count: u64,
     is_aggregator: bool,
     aggregate_subnet_ids: Option<&[u64]>,
 ) -> HashSet<u64> {
-    let mut subnets: HashSet<u64> = validator_ids
-        .iter()
-        .map(|vid| vid % attestation_committee_count)
-        .collect();
+    let mut subnets: HashSet<u64> = if attestation_committee_count == 0 {
+        HashSet::new()
+    } else {
+        validator_ids
+            .iter()
+            .map(|vid| vid % attestation_committee_count)
+            .collect()
+    };
     if is_aggregator {
         if let Some(explicit_ids) = aggregate_subnet_ids {
             subnets.extend(explicit_ids);

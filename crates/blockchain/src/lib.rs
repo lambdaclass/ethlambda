@@ -475,7 +475,7 @@ impl BlockChainServer {
                 lead_ms = lead.as_millis() as u64,
                 "Starting aggregation session early"
             );
-            send_after(lead, ctx.clone(), FlushAggregatePublishes);
+            send_after(lead, ctx.clone(), FlushAggregatePublishes { slot });
         }
 
         // Independent token per session. Shutdown propagates via our
@@ -1219,14 +1219,26 @@ impl Handler<AggregateProduced> for BlockChainServer {
 }
 
 impl Handler<FlushAggregatePublishes> for BlockChainServer {
-    async fn handle(&mut self, _msg: FlushAggregatePublishes, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: FlushAggregatePublishes, _ctx: &Context<Self>) {
+        // Fence like `AggregationDeadline`: only the current session's flush
+        // drains the buffer. A flush timer delayed past the next session start
+        // would otherwise publish that newer session's buffered aggregates
+        // before its own interval-2 boundary, breaking publish alignment. The
+        // superseded session's own aggregates were already dropped by the
+        // stale-drain in `start_aggregation_session`.
+        let is_current = self
+            .current_aggregation
+            .as_ref()
+            .is_some_and(|session| session.session_id == msg.slot);
+        if !is_current {
+            return;
+        }
         let pending = std::mem::take(&mut self.pending_aggregate_publishes);
         if pending.is_empty() {
             return;
         }
-        let session_id = self.current_aggregation.as_ref().map(|s| s.session_id);
         info!(
-            session_id,
+            slot = msg.slot,
             count = pending.len(),
             "Publishing aggregates held back until the interval-2 boundary"
         );

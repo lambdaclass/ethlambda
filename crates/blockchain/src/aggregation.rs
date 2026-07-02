@@ -45,6 +45,16 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// met (see `early_threshold_met`).
 pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 400;
 
+// The window must fit within one interval: `early_aggregation_slot` subtracts
+// it from the interval-2 offset, and the interval-1 tick schedules the check
+// at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW_MS`. Keep this
+// invariant self-enforcing so a future bump to the window can't silently
+// underflow either subtraction.
+const _: () = assert!(
+    EARLY_AGGREGATION_WINDOW_MS <= MILLISECONDS_PER_INTERVAL,
+    "EARLY_AGGREGATION_WINDOW_MS must not exceed one interval"
+);
+
 /// Wall-clock millisecond timestamp of `slot`'s interval-2 boundary (the
 /// normal aggregation start).
 pub(crate) fn interval2_boundary_ms(genesis_time_ms: u64, slot: u64) -> u64 {
@@ -156,8 +166,12 @@ impl Message for AggregationDeadline {
 /// Self-message scheduled when a session starts early; fires at the
 /// interval-2 boundary and publishes any aggregates held back by the
 /// publish-alignment rule (aggregates must not reach gossip before
-/// interval 2).
-pub(crate) struct FlushAggregatePublishes;
+/// interval 2). Carries the session slot so a timer delayed past the next
+/// session start is fenced (like [`AggregationDeadline`]) and cannot flush
+/// the newer session's buffer before its own boundary.
+pub(crate) struct FlushAggregatePublishes {
+    pub(crate) slot: u64,
+}
 impl Message for FlushAggregatePublishes {
     type Result = ();
 }
