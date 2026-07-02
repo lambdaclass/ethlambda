@@ -73,11 +73,13 @@ pub(crate) fn early_aggregation_slot(now_ms: u64, genesis_time_ms: u64) -> Optio
     in_window.then_some(since_genesis / MILLISECONDS_PER_SLOT)
 }
 
-/// Early-start threshold: a single attestation-data group holds at least 2/3
-/// of the signatures expected from this node's aggregation subnets. At most
-/// one group per slot can satisfy this (each validator signs once per slot).
-pub(crate) fn early_threshold_met(max_group_count: usize, expected: usize) -> bool {
-    expected > 0 && max_group_count * 3 >= expected * 2
+/// Early-start threshold: the largest single attestation-data group already
+/// holds at least `min_group_sigs` signatures. `min_group_sigs` is the
+/// precomputed two-thirds-of-a-committee count (see `BlockChain::spawn`), so
+/// the 2/3 fraction is not re-applied here. At most one group per slot can
+/// satisfy this (each validator signs once per slot).
+pub(crate) fn early_threshold_met(max_group_count: usize, min_group_sigs: usize) -> bool {
+    min_group_sigs > 0 && max_group_count >= min_group_sigs
 }
 
 /// A single pre-prepared aggregation group.

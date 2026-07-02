@@ -182,20 +182,19 @@ pub struct BuiltSwarm {
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
 
-/// Compute the set of attestation subnets this node subscribes to (and, when
-/// aggregating, aggregates over), per leanSpec (`src/lean_spec/__main__.py`):
-/// every validator subscribes to its own subnet (`vid % committee_count`) for
-/// mesh health; aggregators additionally subscribe to explicit
-/// `aggregate_subnet_ids` and fall back to subnet 0 when the set would
-/// otherwise be empty.
+/// Compute the set of attestation subnets this node subscribes to, per
+/// leanSpec (`src/lean_spec/__main__.py`): every validator subscribes to its
+/// own subnet (`vid % committee_count`) for mesh health; aggregators
+/// additionally subscribe to explicit `aggregate_subnet_ids` and fall back to
+/// subnet 0 when the set would otherwise be empty.
 ///
 /// Evaluated once at startup — runtime aggregator toggles do not resubscribe
 /// (hot-standby model); see the invariant note on [`SwarmConfig`].
 ///
 /// A zero `attestation_committee_count` yields no validator subnets (rather
 /// than dividing by zero); callers enforce `>= 1`, so this is a defensive
-/// guard on the public API, not a reachable path in the binary.
-pub fn compute_subscription_subnets(
+/// guard, not a reachable path in the binary.
+pub(crate) fn compute_subscription_subnets(
     validator_ids: &[u64],
     attestation_committee_count: u64,
     is_aggregator: bool,

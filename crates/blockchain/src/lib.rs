@@ -83,7 +83,6 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
-        aggregation_subnets: HashSet<u64>,
         gate_duties: bool,
         proposer_config: ProposerConfig,
     ) -> BlockChain {
@@ -100,17 +99,16 @@ impl BlockChain {
             (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
         key_manager.advance_keys_to(current_slot);
 
-        // Denominator of the early-aggregation 2/3 threshold: how many
-        // validators attest on subnets this node aggregates. Computed once —
-        // the validator registry is static and `head_state()` clones the full
-        // state, so this must not run per gossip insert.
+        // Minimum single-group signature count that triggers early
+        // aggregation: two-thirds of one committee's expected votes,
+        // `2 * N / (3 * C)`. Closed form (no per-validator subnet scan),
+        // computed once; assumes an even committee split and one committee's
+        // worth of votes per group.
         let validator_count = store.head_state().validators.len() as u64;
-        let early_aggregation_expected_sigs = if attestation_committee_count == 0 {
+        let early_aggregation_min_group_sigs = if attestation_committee_count == 0 {
             0
         } else {
-            (0..validator_count)
-                .filter(|vid| aggregation_subnets.contains(&(vid % attestation_committee_count)))
-                .count()
+            (2 * validator_count / (3 * attestation_committee_count)) as usize
         };
 
         let handle = BlockChainServer {
@@ -124,7 +122,7 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             genesis_time_ms: genesis_time * 1000,
-            early_aggregation_expected_sigs,
+            early_aggregation_min_group_sigs,
             pending_aggregate_publishes: Vec::new(),
             proposer_config,
             pre_merge_coverage: None,
@@ -196,10 +194,11 @@ pub struct BlockChainServer {
     /// code.
     genesis_time_ms: u64,
 
-    /// Number of validators whose subnet is one this node aggregates — the
-    /// denominator of the early-aggregation 2/3 threshold. Computed once at
-    /// spawn (the validator registry is static).
-    early_aggregation_expected_sigs: usize,
+    /// Minimum signatures in one attestation-data group that trigger early
+    /// aggregation: two-thirds of a committee's expected votes,
+    /// `2 * validator_count / (3 * committee_count)`. Computed once at spawn
+    /// (the validator registry is static).
+    early_aggregation_min_group_sigs: usize,
 
     /// Aggregates produced before the interval-2 boundary, held back so they
     /// are not gossiped early. Flushed by `FlushAggregatePublishes` at the
@@ -531,13 +530,13 @@ impl BlockChainServer {
             return;
         }
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
-        if !aggregation::early_threshold_met(max_group, self.early_aggregation_expected_sigs) {
+        if !aggregation::early_threshold_met(max_group, self.early_aggregation_min_group_sigs) {
             return;
         }
         info!(
             %slot,
             max_group,
-            expected = self.early_aggregation_expected_sigs,
+            min_group_sigs = self.early_aggregation_min_group_sigs,
             "Early-aggregation threshold met"
         );
         self.start_aggregation_session(slot, ctx).await;

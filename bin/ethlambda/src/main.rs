@@ -37,9 +37,7 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{
-    Bootnode, P2P, PeerId, SwarmConfig, build_swarm, compute_subscription_subnets, parse_enrs,
-};
+use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -212,22 +210,11 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    // Same startup inputs build_swarm uses — single source of truth is the
-    // shared helper. Frozen at startup like the gossip subscriptions
-    // themselves (hot-standby model).
-    let aggregation_subnets = compute_subscription_subnets(
-        &validator_ids,
-        attestation_committee_count,
-        options.is_aggregator,
-        options.aggregate_subnet_ids.as_deref(),
-    );
-
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
-        aggregation_subnets,
         !options.disable_duty_sync_gate,
         ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
