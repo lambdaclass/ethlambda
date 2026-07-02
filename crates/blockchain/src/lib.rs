@@ -470,7 +470,7 @@ impl BlockChainServer {
     /// interval-2 tick when, inside the window `[T2 - EARLY_AGGREGATION_WINDOW_MS, T2)`,
     /// a single attestation-data group already holds 2/3 of the signatures
     /// expected from this node's aggregation subnets. Called after every
-    /// stored gossip signature and once at the window opening via
+    /// stored current-slot gossip signature and once at the window opening via
     /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started
     /// session stays in `current_aggregation` (running or finished) until the
     /// next session replaces it. The latch has one hole: if the snapshot
@@ -1141,7 +1141,13 @@ impl Handler<NewBlock> for BlockChainServer {
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         self.on_gossip_attestation(&msg.attestation);
-        self.maybe_start_early_aggregation(ctx).await;
+        // Early aggregation only advances the current slot's group counts, so a
+        // late- or future-slot attestation can never cross the threshold; skip
+        // the check unless this attestation is for the store's current slot.
+        let current_slot = self.store.time() / INTERVALS_PER_SLOT;
+        if msg.attestation.data.slot == current_slot {
+            self.maybe_start_early_aggregation(ctx).await;
+        }
     }
 }
 
