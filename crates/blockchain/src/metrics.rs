@@ -272,10 +272,6 @@ static LEAN_AGGREGATION_EARLY_STARTS_TOTAL: std::sync::LazyLock<IntCounter> =
         .unwrap()
     });
 
-pub fn inc_aggregation_early_starts() {
-    LEAN_AGGREGATION_EARLY_STARTS_TOTAL.inc();
-}
-
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -396,10 +392,6 @@ static LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS: std::sync::LazyLock<Histogram>
         )
         .unwrap()
     });
-
-pub fn observe_aggregation_early_start_lead(lead: Duration) {
-    LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS.observe(lead.as_secs_f64());
-}
 
 static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
@@ -655,6 +647,14 @@ pub fn init() {
 }
 
 // --- Public API ---
+
+pub fn inc_aggregation_early_starts() {
+    LEAN_AGGREGATION_EARLY_STARTS_TOTAL.inc();
+}
+
+pub fn observe_aggregation_early_start_lead(lead: Duration) {
+    LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS.observe(lead.as_secs_f64());
+}
 
 pub fn update_head_slot(slot: u64) {
     LEAN_HEAD_SLOT.set(slot.try_into().unwrap());

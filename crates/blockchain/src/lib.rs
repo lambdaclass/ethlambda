@@ -430,6 +430,7 @@ impl BlockChainServer {
         let stale = std::mem::take(&mut self.pending_aggregate_publishes);
         if !stale.is_empty() {
             warn!(
+                %slot,
                 count = stale.len(),
                 "Dropping stale pending aggregate publishes"
             );
@@ -1158,7 +1159,9 @@ impl Handler<FlushAggregatePublishes> for BlockChainServer {
         if pending.is_empty() {
             return;
         }
+        let session_id = self.current_aggregation.as_ref().map(|s| s.session_id);
         info!(
+            session_id,
             count = pending.len(),
             "Publishing aggregates held back until the interval-2 boundary"
         );
