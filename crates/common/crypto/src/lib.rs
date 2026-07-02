@@ -167,10 +167,8 @@ pub fn aggregate_signatures(
     }
 
     #[cfg(feature = "shadow-integration")]
-    let agg_n = public_keys.len();
-
-    #[cfg(feature = "shadow-integration")]
     if crate::shadow_cost::fake_xmss() {
+        let agg_n = public_keys.len();
         let count_bytes = public_keys.len().to_le_bytes();
         let slot_bytes = slot.to_le_bytes();
         let dummy = crate::shadow_cost::fill_fake_proof(
@@ -193,8 +191,6 @@ pub fn aggregate_signatures(
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     let result = compress_type1_to_byte_list(&proof)?;
-    #[cfg(feature = "shadow-integration")]
-    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
     Ok(result)
 }
 
@@ -223,10 +219,8 @@ pub fn aggregate_mixed(
     }
 
     #[cfg(feature = "shadow-integration")]
-    let agg_n = raw_public_keys.len();
-
-    #[cfg(feature = "shadow-integration")]
     if crate::shadow_cost::fake_xmss() {
+        let agg_n = raw_public_keys.len();
         let count_bytes = raw_public_keys.len().to_le_bytes();
         let slot_bytes = slot.to_le_bytes();
         let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
@@ -264,8 +258,6 @@ pub fn aggregate_mixed(
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     let result = compress_type1_to_byte_list(&proof)?;
-    #[cfg(feature = "shadow-integration")]
-    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
     Ok(result)
 }
 
@@ -283,10 +275,8 @@ pub fn aggregate_proofs(
     }
 
     #[cfg(feature = "shadow-integration")]
-    let agg_n = children.len();
-
-    #[cfg(feature = "shadow-integration")]
     if crate::shadow_cost::fake_xmss() {
+        let agg_n = children.len();
         let slot_bytes = slot.to_le_bytes();
         let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
         for (_, proof) in &children {
@@ -316,8 +306,6 @@ pub fn aggregate_proofs(
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     let result = compress_type1_to_byte_list(&proof)?;
-    #[cfg(feature = "shadow-integration")]
-    std::thread::sleep(crate::shadow_cost::aggregate_delay(agg_n));
     Ok(result)
 }
 
@@ -333,40 +321,30 @@ pub fn verify_aggregated_signature(
     message: &H256,
     slot: u32,
 ) -> Result<(), VerificationError> {
+    // Skip the real verifier under fake-XMSS; otherwise verify for real.
     #[cfg(feature = "shadow-integration")]
-    let verify_n = public_keys.len();
+    if crate::shadow_cost::fake_xmss() {
+        let verify_n = public_keys.len();
+        // Model verify cost on the virtual clock (no-op unless a rate is set).
+        crate::shadow_cost::sleep(crate::shadow_cost::verify_delay(verify_n));
+        return Ok(());
+    }
+    ensure_verifier_ready();
 
-    // Skip the real verifier under fake-XMSS; otherwise verify for real. In a
-    // stock build `fake` is always false, so the real path always runs.
-    #[cfg(feature = "shadow-integration")]
-    let fake = crate::shadow_cost::fake_xmss();
-    #[cfg(not(feature = "shadow-integration"))]
-    let fake = false;
+    let lean_pubkeys = into_lean_pubkeys(public_keys);
+    let sig = LMType1::decompress_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
+        .ok_or(VerificationError::DeserializationFailed)?;
 
-    if !fake {
-        ensure_verifier_ready();
-
-        let lean_pubkeys = into_lean_pubkeys(public_keys);
-        let sig = LMType1::decompress_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
-            .ok_or(VerificationError::DeserializationFailed)?;
-
-        if sig.info.without_pubkeys.message != message.0 || sig.info.without_pubkeys.slot != slot {
-            return Err(VerificationError::BindingMismatch {
-                expected_msg: *message,
-                expected_slot: slot,
-                got_msg: H256(sig.info.without_pubkeys.message),
-                got_slot: sig.info.without_pubkeys.slot,
-            });
-        }
-
-        verify_single_message_aggregate(&sig)?;
+    if sig.info.without_pubkeys.message != message.0 || sig.info.without_pubkeys.slot != slot {
+        return Err(VerificationError::BindingMismatch {
+            expected_msg: *message,
+            expected_slot: slot,
+            got_msg: H256(sig.info.without_pubkeys.message),
+            got_slot: sig.info.without_pubkeys.slot,
+        });
     }
 
-    // Model verify cost on the virtual clock (no-op unless a rate is set),
-    // whether or not the real verifier ran. Mirrors zeam's single fall-through
-    // sleep in verifyType1.
-    #[cfg(feature = "shadow-integration")]
-    crate::shadow_cost::sleep(crate::shadow_cost::verify_delay(verify_n));
+    verify_single_message_aggregate(&sig)?;
     Ok(())
 }
 
@@ -390,10 +368,8 @@ pub fn merge_type_1s_into_type_2(
     }
 
     #[cfg(feature = "shadow-integration")]
-    let merge_n = type_1s.len();
-
-    #[cfg(feature = "shadow-integration")]
     if crate::shadow_cost::fake_xmss() {
+        let merge_n = type_1s.len();
         let count_bytes = type_1s.len().to_le_bytes();
         let mut parts: Vec<&[u8]> = Vec::with_capacity(type_1s.len() + 1);
         for (_, proof) in &type_1s {
@@ -418,8 +394,6 @@ pub fn merge_type_1s_into_type_2(
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
     let result = compress_type2_to_byte_list(&merged)?;
-    #[cfg(feature = "shadow-integration")]
-    std::thread::sleep(crate::shadow_cost::merge_delay(merge_n));
     Ok(result)
 }
 
