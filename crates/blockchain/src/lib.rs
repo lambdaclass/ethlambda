@@ -188,7 +188,9 @@ pub struct BlockChainServer {
 
     /// Genesis time in milliseconds, cached at spawn. `store.config()` is an
     /// uncached backend read, too heavy for the per-gossip-insert early
-    /// checks that need this.
+    /// checks that need this. The tick paths still recompute it from
+    /// `store.config()` — deliberately left alone; prefer this field in new
+    /// code.
     genesis_time_ms: u64,
 
     /// Number of validators whose subnet is one this node aggregates — the
