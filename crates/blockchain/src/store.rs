@@ -18,7 +18,7 @@ use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
@@ -278,7 +278,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             .expect("set_time should succeed");
 
         let slot = store.time() / INTERVALS_PER_SLOT;
-        let interval = SlotInterval::from_slot_index(store.time() % INTERVALS_PER_SLOT);
+        let interval = store.time() % INTERVALS_PER_SLOT;
 
         trace!(%slot, %interval, "processing tick");
 
@@ -292,26 +292,27 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         // the actor's message loop stays unblocked during the expensive XMSS
         // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
         match interval {
-            SlotInterval::BlockPublication => {
+            0 => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
                     accept_new_attestations(store, false);
                 }
             }
-            SlotInterval::AttestationProduction => {
+            1 => {
                 // Vote propagation — no action
             }
-            SlotInterval::Aggregation => {
+            2 => {
                 // Aggregation is driven by the actor (off-thread); nothing to do here.
             }
-            SlotInterval::SafeTargetUpdate => {
+            3 => {
                 // Update safe target for validators
                 update_safe_target(store);
             }
-            SlotInterval::EndOfSlot => {
+            4 => {
                 // End of slot - accept accumulated attestations and log tree
                 accept_new_attestations(store, true);
             }
+            _ => unreachable!("slots only have 5 intervals"),
         }
     }
 }

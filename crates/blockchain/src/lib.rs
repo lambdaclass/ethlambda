@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
@@ -59,44 +58,6 @@ pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SlotInterval {
-    BlockPublication,
-    AttestationProduction,
-    Aggregation,
-    SafeTargetUpdate,
-    EndOfSlot,
-}
-
-impl SlotInterval {
-    pub(crate) fn from_slot_index(index: u64) -> Self {
-        match index {
-            0 => Self::BlockPublication,
-            1 => Self::AttestationProduction,
-            2 => Self::Aggregation,
-            3 => Self::SafeTargetUpdate,
-            4 => Self::EndOfSlot,
-            _ => unreachable!("slots only have 5 intervals"),
-        }
-    }
-
-    fn as_slot_index(self) -> u64 {
-        match self {
-            Self::BlockPublication => 0,
-            Self::AttestationProduction => 1,
-            Self::Aggregation => 2,
-            Self::SafeTargetUpdate => 3,
-            Self::EndOfSlot => 4,
-        }
-    }
-}
-
-impl fmt::Display for SlotInterval {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slot_index().fmt(f)
-    }
-}
 
 /// Milliseconds until the next interval boundary, measured relative to genesis.
 fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
@@ -231,9 +192,7 @@ impl BlockChainServer {
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
-        let interval = SlotInterval::from_slot_index(
-            (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL,
-        );
+        let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
 
         // Idempotency guard
         //
@@ -293,7 +252,7 @@ impl BlockChainServer {
         // needs (those stragglers surface in the `late` section instead). Skip
         // empty snapshots so a missed round keeps the last set we saw. Pure
         // observability.
-        if interval == SlotInterval::EndOfSlot
+        if interval == 4
             && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
         {
             self.pre_merge_coverage = Some(snapshot);
@@ -301,7 +260,7 @@ impl BlockChainServer {
 
         // Whether one of our validators proposes this slot. Drives the store's
         // interval-0 attestation acceptance.
-        let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
+        let is_proposer = (interval == 0 && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten()
             .is_some();
@@ -321,14 +280,14 @@ impl BlockChainServer {
             // advances the store to this slot's interval 0 before building (see
             // `propose_block`). The real interval-0 tick is then skipped by the
             // idempotency guard above, since the store clock is already here.
-            SlotInterval::BlockPublication => {}
+            0 => {}
 
             // ==== interval 1 ====
             //
             // Produce attestations at interval 1 (all validators including
             // proposer). Reuse the same snapshot so self-delivery decisions
             // match the rest of the tick.
-            SlotInterval::AttestationProduction => {
+            1 => {
                 // Emit the post-block coverage report for the previous slot.
                 // Fired at interval 1 (not 0) so the block carrying `slot - 1`'s
                 // votes — proposed at interval 0 of this slot — has typically
@@ -350,7 +309,7 @@ impl BlockChainServer {
             }
 
             // ==== interval 2 ====
-            SlotInterval::Aggregation => {
+            2 => {
                 if is_aggregator {
                     coverage::emit_agg_start_new_coverage(
                         &self.store,
@@ -365,7 +324,7 @@ impl BlockChainServer {
             // ==== interval 3 ====
             //
             // Safe-target update is handled inside `store::on_tick`.
-            SlotInterval::SafeTargetUpdate => {}
+            3 => {}
 
             // ==== interval 4 ====
             //
@@ -376,7 +335,7 @@ impl BlockChainServer {
             // rather than stashing it for the interval-0 tick — keeps it robust:
             // `on_tick` skips the interval-0 tick whenever this build overruns
             // its interval.
-            SlotInterval::EndOfSlot => {
+            4 => {
                 let next_slot = slot + 1;
                 let next_proposer = self
                     .get_our_proposer(next_slot)
@@ -386,6 +345,8 @@ impl BlockChainServer {
                     self.propose_block(next_slot, validator_id).await;
                 }
             }
+
+            _ => {}
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
