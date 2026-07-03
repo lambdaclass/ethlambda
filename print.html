@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-c54f2e7a.js";
+            window.path_to_searchindex_js = "searchindex-60b0072f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-294cc887.js"></script>
@@ -1447,6 +1447,7 @@ clients.</p>
 </thead>
 <tbody>
 <tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON</td><td>Liveness check</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/genesis</code></td><td>JSON</td><td>Genesis time and validator count</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/checkpoints/justified</code></td><td>JSON</td><td>Latest justified <code>Checkpoint</code></td></tr>
@@ -1463,6 +1464,10 @@ clients.</p>
 <p>The handler emits a fixed, compact body (no whitespace):</p>
 <pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
 </code></pre>
+<h3 id="get-leanv0genesis"><a class="header" href="#get-leanv0genesis"><code>GET /lean/v0/genesis</code></a></h3>
+<pre><code class="language-json">{ "genesis_time": 1770407233, "validator_count": 16 }
+</code></pre>
+<p><code>validator_count</code> is read from the head state’s validator registry. Lean validators are fixed at genesis (no churn), so it always equals the size of the genesis registry.</p>
 <h3 id="get-leanv0statesfinalized"><a class="header" href="#get-leanv0statesfinalized"><code>GET /lean/v0/states/finalized</code></a></h3>
 <p>SSZ-encoded <code>State</code> at the latest finalized checkpoint (<code>Content-Type: application/octet-stream</code>). The served state has its <code>latest_block_header.state_root</code> zeroed to match the canonical post-state representation the state transition produces, so checkpoint-sync peers reconstruct an identical state root. See <a href="#checkpoint-sync">Checkpoint Sync</a>.</p>
 <h3 id="get-leanv0blocksfinalized"><a class="header" href="#get-leanv0blocksfinalized"><code>GET /lean/v0/blocks/finalized</code></a></h3>
