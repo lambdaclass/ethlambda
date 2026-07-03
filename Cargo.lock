@@ -2011,6 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ethlambda-blockchain",
+ "ethlambda-metrics",
  "ethlambda-network-api",
  "ethlambda-p2p",
  "ethlambda-rpc",
@@ -2023,6 +2024,7 @@ dependencies = [
  "libssz-types",
  "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.18",
  "tikv-jemallocator",

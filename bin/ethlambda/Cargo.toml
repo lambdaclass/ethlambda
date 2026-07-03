@@ -20,6 +20,7 @@ shadow-integration = []
 
 [dependencies]
 ethlambda-blockchain.workspace = true
+ethlambda-metrics.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-p2p.workspace = true
 ethlambda-types.workspace = true
@@ -36,6 +37,7 @@ tracing.workspace = true
 tracing-subscriber = "0.3"
 
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml_ng.workspace = true
 hex.workspace = true
 

@@ -1,3 +1,4 @@
+mod benchmark;
 mod checkpoint_sync;
 mod cli;
 mod fd_limit;
@@ -71,19 +72,39 @@ const ASCII_ART: &str = r#"
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn main() -> eyre::Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
-    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
-    tracing::subscriber::set_global_default(subscriber)
-        .wrap_err("failed to set global tracing subscriber")?;
-
     let options = CliOptions::parse();
+
+    // Benchmark mode logs to stderr (default WARN) so the report on stdout
+    // stays pipe-clean; the node path keeps its stdout INFO logging.
+    if options.command.is_some() {
+        let filter = EnvFilter::builder()
+            .with_default_directive(tracing::Level::WARN.into())
+            .from_env_lossy();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        );
+        tracing::subscriber::set_global_default(subscriber)
+            .wrap_err("failed to set global tracing subscriber")?;
+    } else {
+        let filter = EnvFilter::builder()
+            .with_default_directive(tracing::Level::INFO.into())
+            .from_env_lossy();
+        let subscriber =
+            Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
+        tracing::subscriber::set_global_default(subscriber)
+            .wrap_err("failed to set global tracing subscriber")?;
+    }
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
+
+    if let Some(cli::Command::Benchmark(benchmark_options)) = options.command {
+        return benchmark::run(benchmark_options);
+    }
 
     let rpc_config = RpcConfig {
         http_address: options.http_address,
@@ -114,12 +135,19 @@ async fn main() -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key).wrap_err_with(|| {
-        format!(
-            "failed to load node key from {}",
-            options.node_key.display()
-        )
-    })?;
+    // clap enforces the node-required arguments when no sub-command is given
+    // (`subcommand_negates_reqs` only lifts them for sub-commands, which
+    // returned above), so these unwraps cannot fail on the node path.
+    let config_path = require_arg(options.genesis, "--genesis")?;
+    let validators_path = require_arg(options.validators, "--validators")?;
+    let bootnodes_path = require_arg(options.bootnodes, "--bootnodes")?;
+    let validator_config = require_arg(options.validator_config, "--validator-config")?;
+    let validator_keys_dir = require_arg(options.hash_sig_keys_dir, "--hash-sig-keys-dir")?;
+    let node_key_path = require_arg(options.node_key, "--node-key")?;
+    let node_id = require_arg(options.node_id, "--node-id")?;
+
+    let node_p2p_key = read_hex_file_bytes(&node_key_path)
+        .wrap_err_with(|| format!("failed to load node key from {}", node_key_path.display()))?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
 
     #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
@@ -127,13 +155,7 @@ async fn main() -> eyre::Result<()> {
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
 
-    info!(node_key=?options.node_key, "got node key");
-
-    let config_path = options.genesis;
-    let bootnodes_path = options.bootnodes;
-    let validators_path = options.validators;
-    let validator_config = options.validator_config;
-    let validator_keys_dir = options.hash_sig_keys_dir;
+    info!(node_key=?node_key_path, "got node key");
 
     let config_yaml = std::fs::read_to_string(&config_path).wrap_err_with(|| {
         format!(
@@ -177,9 +199,8 @@ async fn main() -> eyre::Result<()> {
 
     let bootnodes = read_bootnodes(&bootnodes_path)?;
 
-    let validator_keys =
-        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
-            .wrap_err("failed to load validator keys")?;
+    let validator_keys = read_validator_keys(&validators_path, &validator_keys_dir, &node_id)
+        .wrap_err("failed to load validator keys")?;
 
     let data_dir =
         std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
@@ -560,6 +581,14 @@ fn read_validator_keys(
     );
 
     Ok(validator_keys)
+}
+
+/// Unwrap a node-required CLI argument.
+///
+/// clap's `required = true` guarantees presence whenever no sub-command is
+/// given, so a failure here means the CLI definition and the node path drifted.
+fn require_arg<T>(value: Option<T>, flag: &str) -> eyre::Result<T> {
+    value.ok_or_else(|| eyre::eyre!("missing required argument {flag}"))
 }
 
 fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
