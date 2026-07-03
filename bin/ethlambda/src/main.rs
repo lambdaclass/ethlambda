@@ -97,6 +97,9 @@ async fn main() -> eyre::Result<()> {
             .wrap_err("failed to set global tracing subscriber")?;
     }
 
+    #[cfg(feature = "shadow-integration")]
+    init_shadow_cost(&options.shadow);
+
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
@@ -320,6 +323,30 @@ async fn main() -> eyre::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
+///
+/// Compiled only under the `shadow-integration` feature. Call once at startup,
+/// before any consensus/aggregation work, so the fake-proof and sim-cost hooks
+/// are installed before the first signing or aggregation path runs.
+#[cfg(feature = "shadow-integration")]
+fn init_shadow_cost(shadow: &cli::ShadowOptions) {
+    info!(
+        fake = shadow.shadow_xmss_fake,
+        aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
+        verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        merge_rate = ?shadow.shadow_xmss_merge_rate,
+        fake_proof_size = shadow.shadow_xmss_fake_proof_size,
+        "Applying Shadow XMSS sim-cost / fake-XMSS config"
+    );
+    ethlambda_crypto::shadow_cost::init(
+        shadow.shadow_xmss_fake,
+        shadow.shadow_xmss_aggregate_signatures_rate,
+        shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        shadow.shadow_xmss_merge_rate,
+        shadow.shadow_xmss_fake_proof_size as usize,
+    );
 }
 
 /// Boot the binary in Hive test-driver mode.

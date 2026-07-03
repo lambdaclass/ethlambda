@@ -129,6 +129,48 @@ pub(crate) struct CliOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
+    /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
+    /// `shadow-integration` feature).
+    #[cfg(feature = "shadow-integration")]
+    #[command(flatten)]
+    pub(crate) shadow: ShadowOptions,
+}
+
+/// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
+/// `shadow-integration` feature.
+#[cfg(feature = "shadow-integration")]
+#[derive(Debug, clap::Args)]
+pub(crate) struct ShadowOptions {
+    /// Shadow sim only: replace the XMSS aggregation prover/verifier with a
+    /// deterministic stub (no leanVM proving/verifying). Off by default.
+    #[arg(long, default_value = "false")]
+    pub(crate) shadow_xmss_fake: bool,
+
+    /// Shadow sim only: signatures aggregated per second. Injects a sleep of
+    /// n/rate seconds into aggregation so its CPU cost shows up on Shadow's
+    /// virtual clock. Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_aggregate_signatures_rate: Option<f64>,
+
+    /// Shadow sim only: signatures verified per aggregate per second; injects
+    /// a sleep of n/rate seconds into verification. Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_verify_aggregated_signatures_rate: Option<f64>,
+
+    /// Shadow sim only: Type-1 components merged into a Type-2 per second;
+    /// injects a sleep of n/rate seconds into the proposal Type-2 merge.
+    /// Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_merge_rate: Option<f64>,
+
+    /// Shadow sim only: byte length of each fake stub proof. Defaults to 32
+    /// KiB; capped at the 512 KiB on-wire proof limit.
+    #[arg(
+        long,
+        default_value_t = ethlambda_crypto::shadow_cost::DEFAULT_FAKE_PROOF_SIZE as u64,
+        value_parser = clap::value_parser!(u64).range(1..=524_288)
+    )]
+    pub(crate) shadow_xmss_fake_proof_size: u64,
 }
 
 #[derive(Debug, clap::Subcommand)]
