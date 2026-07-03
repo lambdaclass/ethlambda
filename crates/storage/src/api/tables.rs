@@ -10,6 +10,8 @@ pub enum Table {
     /// Stored separately from blocks because the genesis block has no signatures.
     /// All other blocks must have an entry in this table.
     BlockSignatures,
+    /// Canonical block index: slot -> block root
+    BlockRoots,
     /// State storage: H256 -> State
     States,
     /// Metadata: string keys -> various scalar values
@@ -23,10 +25,11 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 6] = [
+pub const ALL_TABLES: [Table; 7] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
+    Table::BlockRoots,
     Table::States,
     Table::Metadata,
     Table::LiveChain,
@@ -39,6 +42,7 @@ impl Table {
             Table::BlockHeaders => "block_headers",
             Table::BlockBodies => "block_bodies",
             Table::BlockSignatures => "block_signatures",
+            Table::BlockRoots => "block_roots",
             Table::States => "states",
             Table::Metadata => "metadata",
             Table::LiveChain => "live_chain",

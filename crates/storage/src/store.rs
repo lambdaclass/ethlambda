@@ -475,12 +475,17 @@ fn decode_live_chain_key(bytes: &[u8]) -> (u64, H256) {
     (slot, root)
 }
 
+fn encode_block_root_key(slot: u64) -> Vec<u8> {
+    slot.to_be_bytes().to_vec()
+}
+
 /// Fork choice store backed by a pluggable storage backend.
 ///
 /// The Store maintains all state required for fork choice and block processing:
 ///
 /// - **Metadata**: time, config, head, safe_target, justified/finalized checkpoints
 /// - **Blocks**: headers and bodies stored separately for efficient header-only queries
+/// - **BlockRoots**: canonical block roots indexed by slot
 /// - **States**: beacon states indexed by block root
 /// - **Attestations**: latest known and pending ("new") attestations per validator
 /// - **Signatures**: gossip signatures and aggregated proofs for signature verification
@@ -561,15 +566,19 @@ impl Store {
             );
             return None;
         }
-        info!("Loaded store from persisted DB state");
-        Some(Self {
+        let store = Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-        })
+        };
+        if store.get_block_root_by_slot(store.head_slot()) != Some(store.head()) {
+            store.rebuild_block_root_index();
+        }
+        info!("Loaded store from persisted DB state");
+        Some(store)
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -630,6 +639,16 @@ impl Store {
             batch
                 .put_batch(Table::BlockHeaders, header_entries)
                 .expect("put block header");
+
+            batch
+                .put_batch(
+                    Table::BlockRoots,
+                    vec![(
+                        encode_block_root_key(anchor_state.latest_block_header.slot),
+                        anchor_block_root.to_ssz(),
+                    )],
+                )
+                .expect("put block root index");
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
@@ -754,6 +773,9 @@ impl Store {
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) {
         // Read old finalized slot before updating metadata
         let old_finalized_slot = self.latest_finalized().slot;
+        let old_head = self.head();
+        let (block_root_deletes, block_root_entries) =
+            self.block_root_index_changes(old_head, checkpoints.head);
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
@@ -767,6 +789,12 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
+        batch
+            .delete_batch(Table::BlockRoots, block_root_deletes)
+            .expect("delete old canonical block roots");
+        batch
+            .put_batch(Table::BlockRoots, block_root_entries)
+            .expect("put canonical block roots");
         batch.commit().expect("commit");
 
         // Lightweight pruning that should happen immediately on finalization advance:
@@ -809,6 +837,98 @@ impl Store {
     }
 
     // ============ Blocks ============
+
+    fn block_root_index_changes(
+        &self,
+        mut old_root: H256,
+        mut new_root: H256,
+    ) -> (Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>) {
+        let mut deletes = Vec::new();
+        let mut entries = Vec::new();
+
+        while old_root != new_root {
+            if old_root.is_zero() {
+                let header = self
+                    .get_block_header(&new_root)
+                    .expect("new canonical block header exists");
+                entries.push((encode_block_root_key(header.slot), new_root.to_ssz()));
+                new_root = header.parent_root;
+                continue;
+            }
+            if new_root.is_zero() {
+                let header = self
+                    .get_block_header(&old_root)
+                    .expect("old canonical block header exists");
+                deletes.push(encode_block_root_key(header.slot));
+                old_root = header.parent_root;
+                continue;
+            }
+
+            let old_header = self
+                .get_block_header(&old_root)
+                .expect("old canonical block header exists");
+            let new_header = self
+                .get_block_header(&new_root)
+                .expect("new canonical block header exists");
+
+            match old_header.slot.cmp(&new_header.slot) {
+                std::cmp::Ordering::Greater => {
+                    deletes.push(encode_block_root_key(old_header.slot));
+                    old_root = old_header.parent_root;
+                }
+                std::cmp::Ordering::Less => {
+                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                    new_root = new_header.parent_root;
+                }
+                std::cmp::Ordering::Equal => {
+                    deletes.push(encode_block_root_key(old_header.slot));
+                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                    old_root = old_header.parent_root;
+                    new_root = new_header.parent_root;
+                }
+            }
+        }
+
+        (deletes, entries)
+    }
+
+    fn rebuild_block_root_index(&self) {
+        let view = self.backend.begin_read().expect("read view");
+        let old_keys = view
+            .prefix_iterator(Table::BlockRoots, &[])
+            .expect("iterator")
+            .filter_map(Result::ok)
+            .map(|(key, _)| key.to_vec())
+            .collect();
+        drop(view);
+
+        let mut entries = Vec::new();
+        let mut root = self.head();
+        while !root.is_zero() {
+            let Some(header) = self.get_block_header(&root) else {
+                break;
+            };
+            entries.push((encode_block_root_key(header.slot), root.to_ssz()));
+            root = header.parent_root;
+        }
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::BlockRoots, old_keys)
+            .expect("clear block root index");
+        batch
+            .put_batch(Table::BlockRoots, entries)
+            .expect("rebuild block root index");
+        batch.commit().expect("commit");
+    }
+
+    /// Return the canonical block root at `slot`.
+    pub fn get_block_root_by_slot(&self, slot: u64) -> Option<H256> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::BlockRoots, &encode_block_root_key(slot))
+            .expect("get block root")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+    }
 
     /// Get block data for fork choice: root -> (slot, parent_root).
     ///
@@ -987,15 +1107,27 @@ impl Store {
 
         let protected: HashSet<Vec<u8>> = protected_roots.iter().map(|r| r.to_ssz()).collect();
 
-        let keys_to_delete: Vec<Vec<u8>> = entries
+        let blocks_to_delete: Vec<(Vec<u8>, u64)> = entries
             .into_iter()
             .skip(BLOCKS_TO_KEEP)
             .filter(|(key, _)| !protected.contains(key))
-            .map(|(key, _)| key)
             .collect();
 
-        let count = keys_to_delete.len();
+        let count = blocks_to_delete.len();
         if count > 0 {
+            let view = self.backend.begin_read().expect("read view");
+            let block_root_keys: Vec<Vec<u8>> = blocks_to_delete
+                .iter()
+                .filter_map(|(root, slot)| {
+                    let slot_key = encode_block_root_key(*slot);
+                    (view.get(Table::BlockRoots, &slot_key).expect("get") == Some(root.clone()))
+                        .then_some(slot_key)
+                })
+                .collect();
+            drop(view);
+
+            let keys_to_delete: Vec<Vec<u8>> =
+                blocks_to_delete.into_iter().map(|(root, _)| root).collect();
             let mut batch = self.backend.begin_write().expect("write batch");
             batch
                 .delete_batch(Table::BlockHeaders, keys_to_delete.clone())
@@ -1006,6 +1138,9 @@ impl Store {
             batch
                 .delete_batch(Table::BlockSignatures, keys_to_delete)
                 .expect("delete old block signatures");
+            batch
+                .delete_batch(Table::BlockRoots, block_root_keys)
+                .expect("delete pruned block roots");
             batch.commit().expect("commit");
         }
         count
@@ -1440,6 +1575,12 @@ mod tests {
         batch
             .put_batch(Table::BlockSignatures, vec![(key, vec![0u8; 4])])
             .expect("put sigs");
+        batch
+            .put_batch(
+                Table::BlockRoots,
+                vec![(encode_block_root_key(slot), root.to_ssz())],
+            )
+            .expect("put block root");
         batch.commit().expect("commit");
     }
 
@@ -1475,6 +1616,19 @@ mod tests {
         H256::from(bytes)
     }
 
+    fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
     impl Store {
         /// Create a Store with an in-memory backend for tests.
         fn test_store() -> Self {
@@ -1504,6 +1658,71 @@ mod tests {
     }
 
     // ============ Block Pruning Tests ============
+
+    #[test]
+    fn block_root_index_tracks_canonical_chain_across_reorgs() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let anchor_root = store.head();
+
+        let block_1 = signed_block(1, anchor_root);
+        let root_1 = block_1.message.hash_tree_root();
+        store.insert_signed_block(root_1, block_1);
+
+        let block_3 = signed_block(3, root_1);
+        let root_3 = block_3.message.hash_tree_root();
+        store.insert_signed_block(root_3, block_3);
+        store.update_checkpoints(ForkCheckpoints::head_only(root_3));
+
+        assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
+        assert_eq!(store.get_block_root_by_slot(1), Some(root_1));
+        assert_eq!(store.get_block_root_by_slot(2), None);
+        assert_eq!(store.get_block_root_by_slot(3), Some(root_3));
+
+        let side_block_2 = signed_block(2, anchor_root);
+        let side_root_2 = side_block_2.message.hash_tree_root();
+        store.insert_signed_block(side_root_2, side_block_2);
+
+        let side_block_4 = signed_block(4, side_root_2);
+        let side_root_4 = side_block_4.message.hash_tree_root();
+        store.insert_signed_block(side_root_4, side_block_4);
+        store.update_checkpoints(ForkCheckpoints::head_only(side_root_4));
+
+        assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
+        assert_eq!(store.get_block_root_by_slot(1), None);
+        assert_eq!(store.get_block_root_by_slot(2), Some(side_root_2));
+        assert_eq!(store.get_block_root_by_slot(3), None);
+        assert_eq!(store.get_block_root_by_slot(4), Some(side_root_4));
+    }
+
+    #[test]
+    fn from_db_state_rebuilds_block_root_index() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store =
+            Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+
+        let block = signed_block(1, store.head());
+        let block_root = block.message.hash_tree_root();
+        store.insert_signed_block(block_root, block);
+        store.update_checkpoints(ForkCheckpoints::head_only(block_root));
+
+        let view = backend.begin_read().expect("read view");
+        let keys = view
+            .prefix_iterator(Table::BlockRoots, &[])
+            .expect("iterator")
+            .filter_map(Result::ok)
+            .map(|(key, _)| key.to_vec())
+            .collect();
+        drop(view);
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::BlockRoots, keys)
+            .expect("clear block roots");
+        batch.commit().expect("commit");
+
+        let restored = Store::from_db_state(backend, 12345).expect("restore store");
+        assert_eq!(restored.get_block_root_by_slot(1), Some(block_root));
+    }
 
     #[test]
     fn prune_old_blocks_within_retention() {
@@ -1550,6 +1769,10 @@ mod tests {
         );
         assert_eq!(
             count_entries(backend.as_ref(), Table::BlockSignatures),
+            BLOCKS_TO_KEEP
+        );
+        assert_eq!(
+            count_entries(backend.as_ref(), Table::BlockRoots),
             BLOCKS_TO_KEEP
         );
 
@@ -1682,6 +1905,7 @@ mod tests {
             .put_batch(
                 Table::Metadata,
                 vec![
+                    (KEY_HEAD.to_vec(), finalized.root.to_ssz()),
                     (KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()),
                     (KEY_LATEST_JUSTIFIED.to_vec(), justified.to_ssz()),
                 ],
