@@ -1,13 +1,10 @@
 use axum::{Router, response::IntoResponse, routing::get};
 use ethlambda_blockchain::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT};
 use ethlambda_storage::Store;
-use ethlambda_types::state::HISTORICAL_ROOTS_LIMIT;
+use ethlambda_types::{constants::FORK_DIGEST, state::HISTORICAL_ROOTS_LIMIT};
 use serde::Serialize;
 
 use crate::json_response;
-
-// Dummy fork digest; keep in sync with ethlambda_p2p::gossipsub::messages::FORK_DIGEST until it's centralized in a shared crate.
-const FORK_DIGEST: &str = "12345678";
 
 #[derive(Serialize)]
 struct SpecResponse {
