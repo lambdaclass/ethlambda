@@ -12,6 +12,7 @@ mod admin;
 mod base;
 mod blocks;
 mod fork_choice;
+mod genesis;
 mod heap_profiling;
 pub mod metrics;
 mod spec;
@@ -101,6 +102,7 @@ fn build_api_router(store: Store) -> Router {
         .merge(blocks::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
+        .merge(genesis::routes())
         .merge(spec::routes())
         .with_state(store)
 }
