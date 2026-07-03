@@ -2,7 +2,7 @@
 //! pure functions it runs.
 //!
 //! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`EARLY_AGGREGATION_WINDOW_MS`] early when the 2/3 signature
+//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
 //! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
@@ -43,16 +43,16 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
 /// met (see the check in `maybe_start_early_aggregation`).
-pub(crate) const EARLY_AGGREGATION_WINDOW_MS: u64 = 600;
+pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
 
 // The window must fit within one interval: `maybe_start_early_aggregation`
 // subtracts it from the interval-2 offset, and the interval-1 tick schedules
-// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW_MS`. Keep
+// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW`. Keep
 // this invariant self-enforcing so a future bump to the window can't silently
 // underflow either subtraction.
 const _: () = assert!(
-    EARLY_AGGREGATION_WINDOW_MS <= MILLISECONDS_PER_INTERVAL,
-    "EARLY_AGGREGATION_WINDOW_MS must not exceed one interval"
+    EARLY_AGGREGATION_WINDOW.as_millis() <= MILLISECONDS_PER_INTERVAL as u128,
+    "EARLY_AGGREGATION_WINDOW must not exceed one interval"
 );
 
 /// A single pre-prepared aggregation group.
@@ -139,7 +139,7 @@ impl Message for AggregationDeadline {
 }
 
 /// One-shot self-message scheduled at the interval-1 tick; fires when the
-/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW_MS) to run
+/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW) to run
 /// the threshold check for signatures that all arrived before the window.
 /// Arrivals inside the window are checked per insert instead.
 pub(crate) struct EarlyAggregationCheck;
