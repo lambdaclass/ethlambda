@@ -47,17 +47,17 @@ crates/
 
 ### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
 ```
-Interval 0: Block proposal → accept attestations if proposal exists
+Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
 Interval 2: Aggregation (aggregators create proofs from gossip signatures)
 Interval 3: Safe target update (fork choice)
-Interval 4: Accept accumulated attestations
+Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
 
 ### Attestation Pipeline
 ```
 Gossip → Signature verification → new_attestations (pending)
-  ↓ (intervals 0/4)
+  ↓ (interval 4)
 promote → known_attestations (fork choice active)
   ↓
 Fork choice head update
@@ -279,33 +279,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ## HTTP Servers (API + Metrics)
 
-The RPC crate runs **two independent Axum servers** on separate ports, allowing different network policies for API and metrics.
-
-### CLI Flags
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--http-address` | `127.0.0.1` | Bind address shared by both servers |
-| `--api-port` | `5052` | API server port |
-| `--metrics-port` | `5054` | Metrics server port |
-
-### API Server (`:5052`)
-- `GET /lean/v0/health` — health check
-- `GET /lean/v0/states/finalized` — latest finalized state (SSZ)
-- `GET /lean/v0/checkpoints/justified` — justified checkpoint (JSON)
-- `GET /lean/v0/fork_choice` — fork choice tree (JSON)
-- `GET /lean/v0/fork_choice/ui` — interactive D3.js visualization
-- `GET /lean/v0/blocks/{block_id}` — block as JSON; `block_id` is a `0x`-prefixed 32-byte hex root or a decimal slot
-- `GET /lean/v0/blocks/{block_id}/header` — block header as JSON
-- Requires `Store` access
-
-### Metrics Server (`:5054`)
-- `GET /metrics` — Prometheus-compatible metrics endpoint
-- `GET /debug/pprof/allocs` — heap profiling
-- `GET /debug/pprof/allocs/flamegraph` — heap flamegraph
-- No store access needed (reads from global prometheus registry)
-
-### Startup
-Both servers are spawned as independent `tokio::spawn` tasks from `main.rs`. Bind failures are logged via `error!()` but do not crash the node.
+The RPC crate runs two independent Axum servers (API on `:5052`, metrics/debug on `:5054`). See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Configuration Files
 
@@ -362,24 +336,36 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 - Blocks are split into three tables: `BlockHeaders`, `BlockBodies`, `BlockSignatures`
 - Genesis/anchor blocks have empty bodies (detected via `EMPTY_BODY_ROOT`) — no entry in `BlockBodies`
 - Genesis block has no signatures — no entry in `BlockSignatures`
-- All other blocks must have entries in all three tables
+- Non-genesis blocks have a `BlockSignatures` entry until finalized: once below the
+  finalized boundary, signatures are pruned (`prune_old_block_signatures`) while
+  headers and bodies are kept forever. `get_signed_block` returns `None` for a
+  pruned finalized block
+- States are stored as parent-linked diffs (`StateDiffs`, never pruned) plus
+  full-state snapshots (`States`) written only at 1024-slot anchors (and the
+  bootstrap). Neither is ever pruned. `get_state` returns an anchor snapshot or
+  reconstructs by walking diffs back to the nearest anchor; results are memoized
+  in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (10)
+### Storage Tables (7)
+
+These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
 
 | Table | Key → Value | Purpose |
 |-------|-------------|---------|
 | `BlockHeaders` | H256 → BlockHeader | Block headers by root |
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
-| `BlockSignatures` | H256 → BlockSignatures | Signatures (absent for genesis) |
-| `States` | H256 → State | Beacon states by root |
-| `LatestKnownAttestations` | u64 → AttestationData | Fork-choice-active attestations |
-| `LatestNewAttestations` | u64 → AttestationData | Pending (pre-promotion) attestations |
-| `GossipSignatures` | SignatureKey → ValidatorSignature | Individual validator signatures |
-| `AggregatedPayloads` | SignatureKey → Vec\<AggregatedSignatureProof\> | Aggregated proofs |
+| `BlockSignatures` | (slot\|\|root) → BlockSignatures | Type-2 proof blob; keyed slot\|\|root so pruning scans in slot order and stops early; absent for genesis, pruned below finalized |
+| `States` | H256 → State | Full-state snapshots; bootstrap + 1024-slot anchors only; never pruned |
+| `StateDiffs` | H256 → StateDiff | Parent-linked state diff per non-genesis state; never pruned |
 | `Metadata` | string → various | Store state (head, config, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
+
+Attestations and gossip signatures are **not** persisted tables; they live in
+in-memory `Store` buffers (`new_payloads`, `known_payloads`, `gossip_signatures`)
+and are consumed during the tick pipeline (promotion at intervals 0/4,
+aggregation at interval 2).
 
 ### State Root Computation
 - Always computed via `tree_hash_root()` after full state transition

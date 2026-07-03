@@ -2011,6 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ethlambda-blockchain",
+ "ethlambda-crypto",
  "ethlambda-network-api",
  "ethlambda-p2p",
  "ethlambda-rpc",
@@ -2170,6 +2171,8 @@ dependencies = [
  "leansig",
  "libssz",
  "libssz-derive",
+ "libssz-types",
+ "lru",
  "rand 0.10.1",
  "rocksdb",
  "tempfile",

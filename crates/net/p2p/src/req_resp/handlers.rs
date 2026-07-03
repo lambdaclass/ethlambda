@@ -608,20 +608,30 @@ mod tests {
 
         let block_1 = signed_block(1, store.head());
         let root_1 = block_1.message.hash_tree_root();
-        store.insert_signed_block(root_1, block_1);
+        store
+            .insert_signed_block(root_1, block_1)
+            .expect("insert test block should succeed");
 
         let block_2 = signed_block(2, root_1);
         let root_2 = block_2.message.hash_tree_root();
-        store.insert_signed_block(root_2, block_2);
+        store
+            .insert_signed_block(root_2, block_2)
+            .expect("insert test block should succeed");
 
         let side_block_3 = signed_block(3, root_1);
         let side_root_3 = side_block_3.message.hash_tree_root();
-        store.insert_signed_block(side_root_3, side_block_3);
+        store
+            .insert_signed_block(side_root_3, side_block_3)
+            .expect("insert test block should succeed");
 
         let block_4 = signed_block(4, root_2);
         let root_4 = block_4.message.hash_tree_root();
-        store.insert_signed_block(root_4, block_4);
-        store.update_checkpoints(ForkCheckpoints::head_only(root_4));
+        store
+            .insert_signed_block(root_4, block_4)
+            .expect("insert test block should succeed");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_4))
+            .expect("update_checkpoints should succeed");
 
         let blocks = canonical_blocks_by_range(&store, 1, 4);
         let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();

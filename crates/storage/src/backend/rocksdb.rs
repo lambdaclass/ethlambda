@@ -11,16 +11,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Returns the column family name for a table.
+///
+/// Delegates to [`Table::name`] so the CF name and the metrics label share a
+/// single source of truth (and a new table only needs one mapping).
 fn cf_name(table: Table) -> &'static str {
-    match table {
-        Table::BlockHeaders => "block_headers",
-        Table::BlockBodies => "block_bodies",
-        Table::BlockSignatures => "block_signatures",
-        Table::BlockRoots => "block_roots",
-        Table::States => "states",
-        Table::Metadata => "metadata",
-        Table::LiveChain => "live_chain",
-    }
+    table.name()
 }
 
 /// RocksDB storage backend.

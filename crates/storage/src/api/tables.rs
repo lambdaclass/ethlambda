@@ -13,7 +13,16 @@ pub enum Table {
     /// Canonical block index: slot -> block root
     BlockRoots,
     /// State storage: H256 -> State
+    ///
+    /// Holds full-state snapshots only: the bootstrap anchor plus one anchor per
+    /// 1024-slot window. Never pruned. Non-anchor states live in `StateDiffs` and
+    /// are reconstructed on demand (memoized by an in-memory cache).
     States,
+    /// State diffs: H256 -> StateDiff
+    ///
+    /// Parent-linked diff written for every non-genesis state. Never pruned, so
+    /// it preserves full state history. See `get_state` for reconstruction.
+    StateDiffs,
     /// Metadata: string keys -> various scalar values
     Metadata,
     /// Live chain index: (slot || root) -> parent_root
@@ -31,6 +40,7 @@ pub const ALL_TABLES: [Table; 7] = [
     Table::BlockSignatures,
     Table::BlockRoots,
     Table::States,
+    Table::StateDiffs,
     Table::Metadata,
     Table::LiveChain,
 ];
@@ -44,6 +54,7 @@ impl Table {
             Table::BlockSignatures => "block_signatures",
             Table::BlockRoots => "block_roots",
             Table::States => "states",
+            Table::StateDiffs => "state_diffs",
             Table::Metadata => "metadata",
             Table::LiveChain => "live_chain",
         }

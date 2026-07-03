@@ -18,6 +18,9 @@ thiserror.workspace = true
 
 libssz.workspace = true
 libssz-derive.workspace = true
+libssz-types.workspace = true
+
+lru.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
