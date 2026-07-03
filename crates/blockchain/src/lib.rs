@@ -503,13 +503,13 @@ impl BlockChainServer {
         }
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
         // Trigger once the largest current-slot group holds two-thirds of one
-        // committee's expected votes, `2 * N / (3 * C)` (0 when there is no
-        // committee, which never triggers).
+        // committee's expected votes, rounded up: `ceil(2 * N / (3 * C))`
+        // (0 only when there are no validators, which never triggers).
         let min_group_sigs = if self.attestation_committee_count == 0 {
             0
         } else {
             let validator_count = self.store.head_state().validators.len() as u64;
-            (2 * validator_count / (3 * self.attestation_committee_count)) as usize
+            (2 * validator_count).div_ceil(3 * self.attestation_committee_count) as usize
         };
         if min_group_sigs == 0 || max_group < min_group_sigs {
             return;
