@@ -34,7 +34,7 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 7] = [
+pub const ALL_TABLES: [Table; 8] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,

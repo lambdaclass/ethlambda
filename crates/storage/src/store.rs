@@ -337,6 +337,10 @@ struct GossipDataEntry {
 /// Gossip signatures snapshot: (hashed_attestation_data, Vec<(validator_id, signature)>).
 pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, ValidatorSignature)>)>;
 
+type StorageKey = Vec<u8>;
+type StorageEntry = (StorageKey, Vec<u8>);
+type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
+
 /// Bounded buffer for gossip signatures with FIFO eviction.
 ///
 /// Groups signatures by attestation data (via data_root). Each distinct
@@ -626,7 +630,12 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
-        })
+        };
+        if store.get_block_root_by_slot(store.head_slot()) != Some(store.head()) {
+            store.rebuild_block_root_index();
+        }
+        info!("Loaded store from persisted DB state");
+        Some(store)
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -900,7 +909,7 @@ impl Store {
         &self,
         mut old_root: H256,
         mut new_root: H256,
-    ) -> (Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>) {
+    ) -> BlockRootIndexChanges {
         let mut deletes = Vec::new();
         let mut entries = Vec::new();
 
@@ -1129,19 +1138,6 @@ impl Store {
 
         let count = keys_to_delete.len();
         if count > 0 {
-            let view = self.backend.begin_read().expect("read view");
-            let block_root_keys: Vec<Vec<u8>> = blocks_to_delete
-                .iter()
-                .filter_map(|(root, slot)| {
-                    let slot_key = encode_block_root_key(*slot);
-                    (view.get(Table::BlockRoots, &slot_key).expect("get") == Some(root.clone()))
-                        .then_some(slot_key)
-                })
-                .collect();
-            drop(view);
-
-            let keys_to_delete: Vec<Vec<u8>> =
-                blocks_to_delete.into_iter().map(|(root, _)| root).collect();
             let mut batch = self.backend.begin_write().expect("write batch");
             batch
                 .delete_batch(Table::BlockSignatures, keys_to_delete)
@@ -1805,12 +1801,18 @@ mod tests {
 
         let block_1 = signed_block(1, anchor_root);
         let root_1 = block_1.message.hash_tree_root();
-        store.insert_signed_block(root_1, block_1);
+        store
+            .insert_signed_block(root_1, block_1)
+            .expect("insert block 1");
 
         let block_3 = signed_block(3, root_1);
         let root_3 = block_3.message.hash_tree_root();
-        store.insert_signed_block(root_3, block_3);
-        store.update_checkpoints(ForkCheckpoints::head_only(root_3));
+        store
+            .insert_signed_block(root_3, block_3)
+            .expect("insert block 3");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_3))
+            .expect("update head to block 3");
 
         assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
         assert_eq!(store.get_block_root_by_slot(1), Some(root_1));
@@ -1819,12 +1821,18 @@ mod tests {
 
         let side_block_2 = signed_block(2, anchor_root);
         let side_root_2 = side_block_2.message.hash_tree_root();
-        store.insert_signed_block(side_root_2, side_block_2);
+        store
+            .insert_signed_block(side_root_2, side_block_2)
+            .expect("insert side block 2");
 
         let side_block_4 = signed_block(4, side_root_2);
         let side_root_4 = side_block_4.message.hash_tree_root();
-        store.insert_signed_block(side_root_4, side_block_4);
-        store.update_checkpoints(ForkCheckpoints::head_only(side_root_4));
+        store
+            .insert_signed_block(side_root_4, side_block_4)
+            .expect("insert side block 4");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(side_root_4))
+            .expect("update head to side block 4");
 
         assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
         assert_eq!(store.get_block_root_by_slot(1), None);
@@ -1841,8 +1849,12 @@ mod tests {
 
         let block = signed_block(1, store.head());
         let block_root = block.message.hash_tree_root();
-        store.insert_signed_block(block_root, block);
-        store.update_checkpoints(ForkCheckpoints::head_only(block_root));
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert block");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(block_root))
+            .expect("update head");
 
         let view = backend.begin_read().expect("read view");
         let keys = view
@@ -1882,24 +1894,9 @@ mod tests {
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockHeaders),
-            BLOCKS_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockBodies),
-            BLOCKS_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockSignatures),
-            BLOCKS_TO_KEEP
-        );
-        assert_eq!(
-            count_entries(backend.as_ref(), Table::BlockRoots),
-            BLOCKS_TO_KEEP
-        );
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
 
-        // Oldest blocks (slots 0..10) should be gone
+        // Oldest signatures are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
             assert!(!has_signature(backend.as_ref(), i, &root(i)));
         }
@@ -1910,6 +1907,7 @@ mod tests {
         // Headers and bodies are always retained for the whole history.
         assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), 13);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockBodies), 13);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockRoots), 13);
     }
 
     #[test]
@@ -2007,20 +2005,6 @@ mod tests {
         // Hot path: the just-imported state is memoized in the cache.
         assert_eq!(store.get_state(&r1).unwrap().to_ssz(), s1.to_ssz());
 
-    /// Set up finalized and justified checkpoints in metadata.
-    fn set_checkpoints(backend: &dyn StorageBackend, finalized: Checkpoint, justified: Checkpoint) {
-        let mut batch = backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::Metadata,
-                vec![
-                    (KEY_HEAD.to_vec(), finalized.root.to_ssz()),
-                    (KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()),
-                    (KEY_LATEST_JUSTIFIED.to_vec(), justified.to_ssz()),
-                ],
-            )
-            .expect("put checkpoints");
-        batch.commit().expect("commit");
         // A cold store (empty cache, shared backend) reconstructs from the diff,
         // byte-identically.
         let cold = Store::test_store_with_backend(backend.clone());
