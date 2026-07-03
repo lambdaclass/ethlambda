@@ -16,13 +16,14 @@ jemalloc = ["dep:tikv-jemallocator"]
 # Shadow simulator compatibility: single-threaded tokio runtime and no jemalloc.
 # The quinn-udp UDP fallback is a Cargo `[patch]` (which cannot be feature-gated),
 # injected at build time by `shadow/build.sh` / `make shadow-build`.
-shadow-integration = []
+shadow-integration = ["ethlambda-crypto/shadow-integration"]
 # Experimental: enable the ethp2p-rs erasure-coded broadcast path in the p2p
 # crate (parallel QUIC mesh alongside libp2p gossipsub). Off by default.
 ethp2p = ["ethlambda-p2p/ethp2p"]
 
 [dependencies]
 ethlambda-blockchain.workspace = true
+ethlambda-crypto.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-p2p.workspace = true
 ethlambda-types.workspace = true

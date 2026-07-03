@@ -8,7 +8,7 @@
 //!
 //!   signedBlock:
 //!     block:  {...standard block fields...}
-//!     proof:  { proof: { data: "0x<hex-encoded merged Type-2 bytes>" } }
+//!     proof:  { proof: { data: "0x<hex-encoded merged multi-message aggregate bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
 use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
@@ -54,7 +54,8 @@ pub struct VerifySignaturesTest {
     pub info: TestInfo,
 }
 
-/// Fixture-side signed block: a block plus its raw merged Type-2 proof bytes.
+/// Fixture-side signed block: a block plus its raw merged multi-message
+/// aggregate proof bytes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
@@ -62,7 +63,8 @@ pub struct TestSignedBlock {
     pub proof: MergedProof,
 }
 
-/// Merged Type-2 proof container for `SignedBlock.proof` (leanSpec PR #799).
+/// Merged multi-message aggregate proof container for `SignedBlock.proof`
+/// (leanSpec PR #799).
 ///
 /// The multi-signature container nests the raw lean-multisig wire one level
 /// deep: `{ "proof": { "data": "0x..." } }`.
@@ -124,7 +126,7 @@ impl From<TestSignedBlock> for SignedBlock {
 
 impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
-    /// Type-2 proof bytes verbatim.
+    /// multi-message aggregate proof bytes verbatim.
     ///
     /// The container carries the raw lean-multisig wire in the
     /// `MultiMessageAggregate` stored by `SignedBlock.proof`.

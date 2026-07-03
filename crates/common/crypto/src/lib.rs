@@ -14,6 +14,9 @@ use lean_multisig::{
 use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
 
+#[cfg(feature = "shadow-integration")]
+pub mod shadow_cost;
+
 /// log(1/rate) for the WHIR commitment scheme used inside lean-multisig.
 const LOG_INV_RATE: usize = 2;
 
@@ -163,6 +166,19 @@ pub fn aggregate_signatures(
         return Err(AggregationError::EmptyInput);
     }
 
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let agg_n = public_keys.len();
+        let count_bytes = public_keys.len().to_le_bytes();
+        let slot_bytes = slot.to_le_bytes();
+        let dummy = crate::shadow_cost::fill_fake_proof(
+            crate::shadow_cost::fake_proof_size(),
+            &[&message.0, &slot_bytes, &count_bytes],
+        );
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
@@ -174,7 +190,8 @@ pub fn aggregate_signatures(
     let proof = aggregate_single_message_signatures(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    Ok(result)
 }
 
 /// Aggregate both existing Type-1 proofs (children) and raw XMSS signatures.
@@ -201,6 +218,22 @@ pub fn aggregate_mixed(
         return Err(AggregationError::InsufficientChildren(children.len()));
     }
 
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let agg_n = raw_public_keys.len();
+        let count_bytes = raw_public_keys.len().to_le_bytes();
+        let slot_bytes = slot.to_le_bytes();
+        let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
+        for (_, proof) in &children {
+            parts.push(proof.iter().as_slice());
+        }
+        parts.push(&count_bytes);
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let children_native: Vec<LMType1> = children
@@ -224,7 +257,8 @@ pub fn aggregate_mixed(
     )
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    Ok(result)
 }
 
 /// Recursively aggregate two or more already-aggregated Type-1 proofs into one.
@@ -238,6 +272,20 @@ pub fn aggregate_proofs(
 ) -> Result<ByteList512KiB, AggregationError> {
     if children.len() < 2 {
         return Err(AggregationError::InsufficientChildren(children.len()));
+    }
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let agg_n = children.len();
+        let slot_bytes = slot.to_le_bytes();
+        let mut parts: Vec<&[u8]> = vec![&message.0, &slot_bytes];
+        for (_, proof) in &children {
+            parts.push(proof.iter().as_slice());
+        }
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
+        crate::shadow_cost::sleep(crate::shadow_cost::aggregate_delay(agg_n));
+        return Ok(dummy);
     }
 
     ensure_prover_ready();
@@ -257,7 +305,8 @@ pub fn aggregate_proofs(
     )
     .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type1_to_byte_list(&proof)
+    let result = compress_type1_to_byte_list(&proof)?;
+    Ok(result)
 }
 
 /// Verify a Type-1 aggregated signature proof.
@@ -272,6 +321,14 @@ pub fn verify_aggregated_signature(
     message: &H256,
     slot: u32,
 ) -> Result<(), VerificationError> {
+    // Skip the real verifier under fake-XMSS; otherwise verify for real.
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let verify_n = public_keys.len();
+        // Model verify cost on the virtual clock (no-op unless a rate is set).
+        crate::shadow_cost::sleep(crate::shadow_cost::verify_delay(verify_n));
+        return Ok(());
+    }
     ensure_verifier_ready();
 
     let lean_pubkeys = into_lean_pubkeys(public_keys);
@@ -310,6 +367,21 @@ pub fn merge_type_1s_into_type_2(
         return Err(AggregationError::EmptyInput);
     }
 
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        let merge_n = type_1s.len();
+        let count_bytes = type_1s.len().to_le_bytes();
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(type_1s.len() + 1);
+        for (_, proof) in &type_1s {
+            parts.push(proof.iter().as_slice());
+        }
+        parts.push(&count_bytes);
+        let dummy =
+            crate::shadow_cost::fill_fake_proof(crate::shadow_cost::fake_proof_size(), &parts);
+        crate::shadow_cost::sleep(crate::shadow_cost::merge_delay(merge_n));
+        return Ok(dummy);
+    }
+
     ensure_prover_ready();
 
     let type_1s_native: Vec<LMType1> = type_1s
@@ -321,7 +393,8 @@ pub fn merge_type_1s_into_type_2(
     let merged = merge_single_message_aggregates(type_1s_native, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
 
-    compress_type2_to_byte_list(&merged)
+    let result = compress_type2_to_byte_list(&merged)?;
+    Ok(result)
 }
 
 /// Verify a Type-2 merged proof against the per-component expected bindings.
@@ -339,6 +412,11 @@ pub fn verify_type_2_signature(
             components: expected_bindings.len(),
             pubkey_sets: pubkeys_per_component.len(),
         });
+    }
+
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        return Ok(());
     }
 
     ensure_verifier_ready();
@@ -391,6 +469,14 @@ pub fn split_type_2_by_message(
     pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
 ) -> Result<ByteList512KiB, AggregationError> {
+    #[cfg(feature = "shadow-integration")]
+    if crate::shadow_cost::fake_xmss() {
+        return Ok(crate::shadow_cost::fill_fake_proof(
+            crate::shadow_cost::fake_proof_size(),
+            &[proof_data, &message.0],
+        ));
+    }
+
     ensure_prover_ready();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
