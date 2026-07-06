@@ -23,7 +23,7 @@ parameter (e.g. `latest,devnet2`). We use the following tagging convention:
 
 - `unstable` - the latest image built from the `main` branch
 - `latest` - the latest stable image built for the current devnet (`devnet5` at the time of writing)
-- `devnetX` - the latest stable image built with `devnetX` support (e.g. `devnet3`, `devnet4`)
+- `devnetX` - the latest stable image built with `devnetX` support (e.g. `devnet4`, `devnet5`)
 
 Future devnets will introduce new tags, with previous ones left without updates.
 
