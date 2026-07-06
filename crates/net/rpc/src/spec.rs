@@ -54,7 +54,7 @@ mod tests {
     #[tokio::test]
     async fn spec_returns_lean_constants() {
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(store, "ethlambda/test", "test-peer".to_string());
+        let app = crate::test_utils::test_api_router(store);
         let resp = app
             .oneshot(
                 Request::builder()

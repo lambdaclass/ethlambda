@@ -136,7 +136,8 @@ fn build_debug_router() -> Router {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use ethlambda_storage::{StorageBackend, Table};
+    use axum::Router;
+    use ethlambda_storage::{StorageBackend, Store, Table};
     use ethlambda_types::{
         block::{Block, BlockBody, BlockHeader},
         checkpoint::Checkpoint,
@@ -144,6 +145,13 @@ pub(crate) mod test_utils {
         state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
     use libssz::SszEncode;
+
+    /// Build the API router the way tests do, with placeholder client version
+    /// and peer ID. Tests that assert on those identity values (e.g. the
+    /// `/lean/v0/node/identity` test) call `crate::build_api_router` directly.
+    pub(crate) fn test_api_router(store: Store) -> Router {
+        crate::build_api_router(store, "ethlambda/test", "test-peer".to_string())
+    }
 
     /// Create a minimal test state for testing.
     pub(crate) fn create_test_state() -> State {
@@ -229,7 +237,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
 
-        let app = build_api_router(store.clone(), "ethlambda/test", "test-peer".to_string());
+        let app = test_utils::test_api_router(store.clone());
 
         let response = app
             .oneshot(
@@ -271,7 +279,7 @@ mod tests {
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(
@@ -342,7 +350,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}")).await;
 
@@ -363,7 +371,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}/header")).await;
 
@@ -379,7 +387,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_by_slot_returns_json() {
             let (store, _target_root) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/1").await;
 
@@ -396,7 +404,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/not-a-valid-id").await;
 
@@ -408,7 +416,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let missing = format!("0x{}", "aa".repeat(32));
             let response = send(app, &format!("/lean/v0/blocks/{missing}")).await;
@@ -419,7 +427,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_missing_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/999").await;
 
@@ -429,7 +437,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_empty_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+            let app = test_utils::test_api_router(store);
 
             // Slot 0 in the test setup is H256::ZERO (empty).
             let response = send(app, "/lean/v0/blocks/0").await;
@@ -482,7 +490,7 @@ mod tests {
 
         let expected_ssz = signed_block.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(
@@ -529,7 +537,7 @@ mod tests {
         };
         let expected_ssz = expected.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
+        let app = test_utils::test_api_router(store);
 
         let response = app
             .oneshot(

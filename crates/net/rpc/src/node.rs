@@ -92,8 +92,7 @@ mod tests {
     /// Helper: GET /lean/v0/node/syncing (with the given sync controller) and
     /// parse the JSON body.
     async fn get_syncing_json(store: Store, sync: SyncStatusController) -> serde_json::Value {
-        let app = crate::build_api_router(store, "ethlambda/test", "test-peer".to_string())
-            .layer(Extension(sync));
+        let app = crate::test_utils::test_api_router(store).layer(Extension(sync));
         let resp = app
             .oneshot(
                 Request::builder()
