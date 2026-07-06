@@ -109,7 +109,9 @@ in at compile time from `CARGO_PKG_VERSION` plus the `vergen-git2` build metadat
 { "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
 ```
 
-`sync_distance` is the number of slots between the node's current head and the current wall-clock slot; `is_syncing` is true when it exceeds `SYNC_LAG_THRESHOLD`. This is a stateless per-request snapshot: unlike the internal `SyncStatusTracker` it has no hysteresis or stall override, so it can disagree with the node's own duty gating around the threshold.
+`is_syncing` mirrors the `lean_node_sync_status` metric: it is the node's own stateful sync decision (head-vs-wall-clock lag with hysteresis and a network-stall override, the same signal that gates validator duties), so the endpoint and the metric always agree.
+
+`sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
 ### `GET` / `POST /lean/v0/admin/aggregator`
 

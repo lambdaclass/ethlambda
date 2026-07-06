@@ -902,3 +902,35 @@ pub fn set_node_sync_status(status: SyncStatus) {
             .set(i64::from(*label == active));
     }
 }
+
+/// Read back the node sync status currently published by `lean_node_sync_status`.
+///
+/// Returns the variant whose gauge is set to 1, or [`SyncStatus::Idle`] if none
+/// is (e.g. before the first tick sets it). Reading the metric back lets code
+/// outside the blockchain actor — notably the RPC `/lean/v0/node/syncing`
+/// endpoint — report exactly the status the metric exposes, so the endpoint and
+/// the metric cannot disagree.
+pub fn node_sync_status() -> SyncStatus {
+    [SyncStatus::Syncing, SyncStatus::Synced, SyncStatus::Idle]
+        .into_iter()
+        .find(|status| {
+            LEAN_NODE_SYNC_STATUS
+                .with_label_values(&[status.as_str()])
+                .get()
+                == 1
+        })
+        .unwrap_or(SyncStatus::Idle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SyncStatus, node_sync_status, set_node_sync_status};
+
+    #[test]
+    fn node_sync_status_reads_back_what_was_set() {
+        for status in [SyncStatus::Syncing, SyncStatus::Synced, SyncStatus::Idle] {
+            set_node_sync_status(status);
+            assert_eq!(node_sync_status(), status);
+        }
+    }
+}
