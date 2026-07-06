@@ -21,9 +21,9 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # On push to main, inputs.tags is empty, so fall back to "latest" so the
-  # latest tag tracks main. Manual dispatch still honors custom tags.
-  TAGS_INPUT: ${{ inputs.tags || 'latest' }}
+  # On push to main, inputs.tags is empty, so fall back to "unstable" so it
+  # tracks main. Manual dispatch still honors custom tags.
+  TAGS_INPUT: ${{ inputs.tags || 'unstable' }}
 
 jobs:
   build-image:
