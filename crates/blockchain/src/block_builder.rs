@@ -117,7 +117,8 @@ pub(crate) fn build_block(
     let compacted = if config.enable_proposer_aggregation {
         compact_attestations(selected, head_state, slot)?
     } else {
-        keep_best_proof_per_data(selected, slot)
+        let running_votes = build_running_votes(head_state);
+        keep_best_proof_per_data(selected, &running_votes, slot)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
@@ -661,30 +662,40 @@ fn compact_attestations(
 ///
 /// The block format permits at most one entry per `AttestationData`: `on_block`
 /// rejects duplicates (`StoreError::DuplicateAttestationData`). When proposer
-/// aggregation is disabled we therefore cannot keep every selected proof, nor
-/// can we merge them. For each group sharing an `AttestationData` we keep the
-/// single proof covering the most validators (ties broken by first occurrence)
-/// and drop the rest. No leanVM aggregation runs; coverage is whatever the best
-/// individual proof already had, which is the cost of skipping aggregation.
+/// aggregation is disabled we can neither keep every selected proof nor merge
+/// them, so for each group sharing an `AttestationData` exactly one proof
+/// survives and the rest are dropped. No leanVM aggregation runs.
+///
+/// The surviving proof is the one adding the most NEW voters over the target's
+/// in-state voter set (`running_votes`, keyed by `target.root`), with ties
+/// broken by larger absolute participant count, then first occurrence. For a
+/// fresh target (no in-state voters) marginal coverage equals absolute count,
+/// so the densest proof wins, matching the previous behavior.
+///
+/// Scoring by marginal (rather than absolute) coverage keeps this collapse
+/// consistent with the union coverage `compact_attestations` reaches when
+/// aggregation is enabled, and with `select_attestations`, which already scored
+/// the entry on the same marginal coverage. Selecting by absolute participant
+/// count instead lets a larger subnet already fully counted in-state keep
+/// winning while adding nothing, starving a smaller subnet whose votes are the
+/// only ones still missing; the target's coverage then caps below 2/3 and never
+/// justifies.
 fn keep_best_proof_per_data(
     entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
+    running_votes: &HashMap<H256, HashSet<u64>>,
     block_slot: u64,
 ) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
-    // Preserve first-occurrence order of distinct AttestationData; for each,
-    // track the index of the best (most participants) entry seen so far.
+    // Group entry indices by AttestationData, preserving first-occurrence order.
     let mut order: Vec<AttestationData> = Vec::new();
-    let mut best_index: HashMap<AttestationData, usize> = HashMap::new();
+    let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
     for (i, (att, _)) in entries.iter().enumerate() {
-        match best_index.entry(att.data.clone()) {
+        match groups.entry(att.data.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 order.push(e.key().clone());
-                e.insert(i);
+                e.insert(vec![i]);
             }
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                let current_best = entries[*e.get()].0.aggregation_bits.count_ones();
-                if att.aggregation_bits.count_ones() > current_best {
-                    e.insert(i);
-                }
+                e.get_mut().push(i);
             }
         }
     }
@@ -702,15 +713,33 @@ fn keep_best_proof_per_data(
         "Skipping attestation compaction"
     );
 
-    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
-        entries.into_iter().map(Some).collect();
-    order
+    // Pick the surviving index per group: most new coverage over the target's
+    // in-state voters, then densest proof, then earliest occurrence. Computed
+    // over `entries` before it is moved into `items` for extraction.
+    let best_per_data: Vec<usize> = order
         .iter()
         .map(|data| {
-            items[best_index[data]]
-                .take()
-                .expect("best index taken once")
+            let indices = &groups[data];
+            let prior = running_votes.get(&data.target.root);
+            *indices
+                .iter()
+                .max_by_key(|&&idx| {
+                    let (att, proof) = &entries[idx];
+                    let marginal = proof
+                        .participant_indices()
+                        .filter(|vid| prior.is_none_or(|voted| !voted.contains(vid)))
+                        .count();
+                    (marginal, att.aggregation_bits.count_ones(), Reverse(idx))
+                })
+                .expect("group is non-empty")
         })
+        .collect();
+
+    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
+        entries.into_iter().map(Some).collect();
+    best_per_data
+        .into_iter()
+        .map(|idx| items[idx].take().expect("best index taken once"))
         .collect()
 }
 
@@ -1317,6 +1346,112 @@ mod tests {
             kept.aggregation_bits.count_ones(),
             2,
             "the best-coverage proof ({{1, 2}}) is kept over the smaller one ({{0}})"
+        );
+    }
+
+    /// When several proofs share one `AttestationData` but the proposer cannot
+    /// aggregate, only one may be kept. Selecting by absolute participant count
+    /// starves a small subnet whose votes are the only ones still missing from
+    /// the target's in-state coverage: a larger subnet already counted in-state
+    /// keeps winning yet adds nothing, so the target never reaches 2/3.
+    ///
+    /// This mirrors the union coverage `compact_attestations` achieves when
+    /// aggregation is enabled: the kept proof must be the one adding the most
+    /// NEW voters over the target's in-state voter set, not the largest one.
+    #[test]
+    fn keep_best_proof_per_data_prefers_marginal_coverage_over_absolute_size() {
+        let target_root = H256([9u8; 32]);
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                slot: 5,
+                root: target_root,
+            },
+            source: Checkpoint::default(),
+        };
+
+        // Two candidate proofs for the same data: a 3-validator subnet already
+        // fully counted in-state, and a 2-validator subnet {3, 7} that is the
+        // only remaining new coverage.
+        let large = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[0, 1, 2]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[0, 1, 2])),
+        );
+        let small = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[3, 7]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[3, 7])),
+        );
+        let entries = vec![large, small];
+
+        // In-state, validators {0, 1, 2} already voted for this target.
+        let mut running_votes: HashMap<H256, HashSet<u64>> = HashMap::new();
+        running_votes.insert(target_root, HashSet::from([0, 1, 2]));
+
+        let out = keep_best_proof_per_data(entries, &running_votes, att_data.slot);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "a block carries one entry per AttestationData"
+        );
+        let kept = &out[0].0;
+        assert_eq!(
+            kept.aggregation_bits.count_ones(),
+            2,
+            "marginal coverage, not absolute participant count, drives the choice"
+        );
+        assert!(
+            kept.aggregation_bits.get(3).unwrap_or(false)
+                && kept.aggregation_bits.get(7).unwrap_or(false),
+            "the small subnet {{3, 7}} adds the only new coverage and must be kept over the \
+             larger {{0, 1, 2}} subnet already counted in-state"
+        );
+    }
+
+    /// With no in-state votes for the target (a fresh target), marginal
+    /// coverage equals absolute count, so `keep_best_proof_per_data` keeps the
+    /// larger proof, preserving the pre-existing behavior.
+    #[test]
+    fn keep_best_proof_per_data_keeps_largest_when_target_is_fresh() {
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                slot: 5,
+                root: H256([9u8; 32]),
+            },
+            source: Checkpoint::default(),
+        };
+        let small = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[0]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[0])),
+        );
+        let large = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[1, 2]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[1, 2])),
+        );
+        let entries = vec![small, large];
+
+        let out = keep_best_proof_per_data(entries, &HashMap::new(), att_data.slot);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].0.aggregation_bits.count_ones(),
+            2,
+            "with an empty in-state voter set the larger proof wins on absolute count"
         );
     }
 
