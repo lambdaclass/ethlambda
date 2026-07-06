@@ -89,6 +89,7 @@ async fn main() -> eyre::Result<()> {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
+        version: version::CLIENT_VERSION,
     };
 
     println!("{ASCII_ART}");

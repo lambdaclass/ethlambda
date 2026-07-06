@@ -39,16 +39,18 @@ async fn get_syncing(State(store): State<Store>) -> impl IntoResponse {
     })
 }
 
-async fn get_identity() -> impl IntoResponse {
-    json_response(IdentityResponse {
-        version: env!("CARGO_PKG_VERSION"),
-    })
+/// Returns the full client version string, identical to `ethlambda --version`
+/// (e.g. `ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0`):
+/// semver, git branch and short SHA, target triple, and rustc version. Sourced
+/// from `RpcConfig::version` and captured by the route in `routes`.
+async fn get_identity(version: &'static str) -> impl IntoResponse {
+    json_response(IdentityResponse { version })
 }
 
-pub(crate) fn routes() -> Router<Store> {
+pub(crate) fn routes(version: &'static str) -> Router<Store> {
     Router::new()
         .route("/lean/v0/node/syncing", get(get_syncing))
-        .route("/lean/v0/node/identity", get(get_identity))
+        .route("/lean/v0/node/identity", get(move || get_identity(version)))
 }
 
 #[cfg(test)]
@@ -68,7 +70,7 @@ mod tests {
 
     /// Helper: GET /lean/v0/node/syncing and parse JSON body.
     async fn get_syncing_json(store: Store) -> serde_json::Value {
-        let app = crate::build_api_router(store);
+        let app = crate::build_api_router(store, "ethlambda/test");
         let resp = app
             .oneshot(
                 Request::builder()
@@ -117,8 +119,12 @@ mod tests {
 
     #[tokio::test]
     async fn node_identity_reports_version() {
+        // The binary injects the real `CLIENT_VERSION` via this Extension layer;
+        // here we inject a sentinel and assert it round-trips verbatim.
+        const VERSION: &str =
+            "ethlambda/v9.9.9-test-deadbeef/x86_64-unknown-linux-gnu/rustc-v1.92.0";
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(store);
+        let app = crate::build_api_router(store, VERSION);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -131,6 +137,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["version"].is_string());
+        assert_eq!(json["version"], VERSION);
     }
 }

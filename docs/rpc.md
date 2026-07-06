@@ -96,10 +96,12 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 ### `GET /lean/v0/node/identity`
 
 ```json
-{ "version": "0.1.0" }
+{ "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0" }
 ```
 
-The crate version baked in at compile time (`CARGO_PKG_VERSION`).
+The full client version string, identical to what `ethlambda --version` prints:
+crate semver, git branch and short SHA, target triple, and rustc version. Baked
+in at compile time from `CARGO_PKG_VERSION` plus the `vergen-git2` build metadata.
 
 ### `GET /lean/v0/node/syncing`
 
