@@ -231,9 +231,7 @@ impl BlockChainServer {
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
-        let interval = SlotInterval::from_slot_index(
-            (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL,
-        );
+        let interval = SlotInterval::from_ms_since_genesis(time_since_genesis_ms);
 
         // Idempotency guard
         //
