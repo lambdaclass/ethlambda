@@ -701,27 +701,38 @@ fn keep_best_proof_per_data(
         "Skipping attestation compaction"
     );
 
-    // Pick the surviving index per group: most new coverage over the target's
-    // in-state voters, then densest proof, then earliest occurrence. Computed
-    // over `entries` before it is moved into `items` for extraction.
-    let best_per_data: Vec<usize> = order
-        .iter()
-        .map(|data| {
-            let indices = &groups[data];
-            let prior = running_votes.get(&data.target.root);
-            *indices
-                .iter()
-                .max_by_key(|&&idx| {
-                    let (att, proof) = &entries[idx];
-                    let marginal = proof
-                        .participant_indices()
-                        .filter(|vid| prior.is_none_or(|voted| !voted.contains(vid)))
-                        .count();
-                    (marginal, att.aggregation_bits.count_ones(), Reverse(idx))
-                })
-                .expect("group is non-empty")
-        })
-        .collect();
+    // Pick the surviving index per group: most new coverage (over in-state
+    // voters plus those already claimed by earlier groups this block), then
+    // densest proof, then earliest occurrence. Computed over `entries` before
+    // it is moved into `items` for extraction.
+    let mut claimed: HashMap<H256, HashSet<u64>> = HashMap::new();
+    let mut best_per_data: Vec<usize> = Vec::with_capacity(order.len());
+    for data in &order {
+        let target_root = data.target.root;
+        let prior = running_votes.get(&target_root);
+        let block_claimed = claimed.get(&target_root);
+        let best = *groups[data]
+            .iter()
+            .max_by_key(|&&idx| {
+                let (att, proof) = &entries[idx];
+                let marginal = proof
+                    .participant_indices()
+                    .filter(|vid| {
+                        prior.is_none_or(|voted| !voted.contains(vid))
+                            && block_claimed.is_none_or(|voted| !voted.contains(vid))
+                    })
+                    .count();
+                (marginal, att.aggregation_bits.count_ones(), Reverse(idx))
+            })
+            .expect("group is non-empty");
+        // Record the winner's voters so a later group sharing this target root
+        // does not treat them as new coverage.
+        claimed
+            .entry(target_root)
+            .or_default()
+            .extend(entries[best].1.participant_indices());
+        best_per_data.push(best);
+    }
 
     let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
         entries.into_iter().map(Some).collect();
@@ -1440,6 +1451,67 @@ mod tests {
             out[0].0.aggregation_bits.count_ones(),
             2,
             "with an empty in-state voter set the larger proof wins on absolute count"
+        );
+    }
+
+    /// Two distinct `AttestationData` entries can share one `target.root`
+    /// (differing only in `slot`, `head`, or `source`). The STF unions all
+    /// their voters onto that target, so the collapse must score each group's
+    /// candidates against voters already claimed by earlier groups in this
+    /// block, not just the frozen in-state snapshot. Otherwise both groups keep
+    /// the same subnet and the block under-covers the target.
+    #[test]
+    fn keep_best_proof_per_data_accounts_for_voters_claimed_by_earlier_groups() {
+        let target_root = H256([9u8; 32]);
+        let target = Checkpoint {
+            slot: 5,
+            root: target_root,
+        };
+        // Same target root, different attestation slots -> distinct data roots.
+        let data_a = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target,
+            source: Checkpoint::default(),
+        };
+        let data_b = AttestationData {
+            slot: 6,
+            head: Checkpoint::default(),
+            target,
+            source: Checkpoint::default(),
+        };
+
+        // A has a single proof {3, 7}. B offers {3, 7} (already claimed by A)
+        // and {8, 9} (the only new coverage). B's {3, 7} is listed first, so
+        // absent claim-tracking the first-occurrence tiebreak would keep it.
+        let entry = |bits: &[usize], data: &AttestationData| {
+            (
+                AggregatedAttestation {
+                    aggregation_bits: make_bits(bits),
+                    data: data.clone(),
+                },
+                SingleMessageAggregate::empty(make_bits(bits)),
+            )
+        };
+        let entries = vec![
+            entry(&[3, 7], &data_a),
+            entry(&[3, 7], &data_b),
+            entry(&[8, 9], &data_b),
+        ];
+
+        let out = keep_best_proof_per_data(entries, &HashMap::new(), data_a.slot);
+
+        assert_eq!(out.len(), 2, "one entry per distinct AttestationData");
+        assert!(
+            out[0].0.aggregation_bits.get(3).unwrap_or(false)
+                && out[0].0.aggregation_bits.get(7).unwrap_or(false),
+            "group A keeps its only proof {{3, 7}}"
+        );
+        assert!(
+            out[1].0.aggregation_bits.get(8).unwrap_or(false)
+                && out[1].0.aggregation_bits.get(9).unwrap_or(false),
+            "group B must keep {{8, 9}}: {{3, 7}} was already claimed by group A for \
+             the same target root, so it adds no new coverage"
         );
     }
 
