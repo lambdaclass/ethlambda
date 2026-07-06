@@ -21,16 +21,16 @@ use ethlambda_state_transition::{
     slot_is_justifiable_after,
 };
 use ethlambda_types::{
-    ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
     block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
     checkpoint::Checkpoint,
-    primitives::{H256, HashTreeRoot as _},
+    primitives::{HashTreeRoot as _, H256},
     state::{JustifiedSlots, State},
+    ShortRoot,
 };
 use tracing::{info, trace};
 
-use crate::{MAX_ATTESTATIONS_DATA, metrics, store::StoreError};
+use crate::{metrics, store::StoreError, MAX_ATTESTATIONS_DATA};
 
 /// Post-block checkpoints extracted from the state transition in `build_block`.
 ///
@@ -666,20 +666,8 @@ fn compact_attestations(
 /// them, so for each group sharing an `AttestationData` exactly one proof
 /// survives and the rest are dropped. No leanVM aggregation runs.
 ///
-/// The surviving proof is the one adding the most NEW voters over the target's
-/// in-state voter set (`running_votes`, keyed by `target.root`), with ties
-/// broken by larger absolute participant count, then first occurrence. For a
-/// fresh target (no in-state voters) marginal coverage equals absolute count,
-/// so the densest proof wins, matching the previous behavior.
-///
-/// Scoring by marginal (rather than absolute) coverage keeps this collapse
-/// consistent with the union coverage `compact_attestations` reaches when
-/// aggregation is enabled, and with `select_attestations`, which already scored
-/// the entry on the same marginal coverage. Selecting by absolute participant
-/// count instead lets a larger subnet already fully counted in-state keep
-/// winning while adding nothing, starving a smaller subnet whose votes are the
-/// only ones still missing; the target's coverage then caps below 2/3 and never
-/// justifies.
+/// The surviving proof is the one adding the most NEW voters, with ties
+/// broken by larger absolute participant count, then first occurrence.
 fn keep_best_proof_per_data(
     entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     running_votes: &HashMap<H256, HashSet<u64>>,
