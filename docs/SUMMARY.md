@@ -13,3 +13,7 @@
 - [Metrics](./metrics.md)
 - [Checkpoint Sync](./checkpoint_sync.md)
 - [Fork Choice Visualization](./fork_choice_visualization.md)
+
+# Development
+
+- [Spec Deviations](./spec_deviations.md)
