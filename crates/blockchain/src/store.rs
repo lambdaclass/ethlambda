@@ -278,7 +278,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             .expect("set_time should succeed");
 
         let slot = store.time() / INTERVALS_PER_SLOT;
-        let interval = SlotInterval::from_slot_index(store.time() % INTERVALS_PER_SLOT);
+        let interval = SlotInterval::from_intervals_since_genesis(store.time());
 
         trace!(%slot, %interval, "processing tick");
 
