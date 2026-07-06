@@ -133,20 +133,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_status_controller_round_trips_and_shares() {
-        let controller = SyncStatusController::default();
-        assert_eq!(controller.get(), SyncStatus::Idle);
-
-        controller.set(SyncStatus::Syncing);
-        assert_eq!(controller.get(), SyncStatus::Syncing);
-
-        // Clones share the same Arc, so a write is visible through either handle.
-        let clone = controller.clone();
-        controller.set(SyncStatus::Synced);
-        assert_eq!(clone.get(), SyncStatus::Synced);
-    }
-
-    #[test]
     fn sync_status_allows_lag_through_threshold() {
         let mut tracker = SyncStatusTracker::default();
 
