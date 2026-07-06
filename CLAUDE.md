@@ -395,7 +395,7 @@ aggregation at interval 2).
 
 ## Resources
 
-**Specs:** `leanSpec/src/lean_spec/` (Python reference implementation)
+**Specs:** `leanSpec/src/lean_spec/spec/` (Python reference implementation; fork logic under `forks/<fork>/`, e.g. `forks/lstar/`)
 **Devnet:** `lean-quickstart` (github.com/blockblaz/lean-quickstart)
 **Releases:** See `RELEASE.md` for release process documentation
 
