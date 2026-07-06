@@ -1,0 +1,80 @@
+name: Daily CI Test
+
+on:
+  schedule:
+    # Every day at 12:00 UTC.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Slack channel to post to (test channel or prod)"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - prod
+
+# Allow one daily run at a time; don't cancel an in-progress run.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run fixture-based tests
+        uses: ./.github/actions/run-fixture-tests
+
+  notify:
+    name: Post result to Slack
+    needs: test
+    # Run even when the test job fails or is cancelled, so we always report.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build Slack payload
+        # Context values are passed through the environment (never interpolated
+        # directly into the script) and the JSON is assembled with `jq`, so a
+        # ref name containing `"`, `\`, or a newline can't break the payload.
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$TEST_RESULT" in
+            success)   emoji="✅"; status="passed";;
+            failure)   emoji="❌"; status="FAILED";;
+            cancelled) emoji="⚠️"; status="was cancelled";;
+            *)         emoji="❔"; status="finished with status \`$TEST_RESULT\`";;
+          esac
+          # The backticks below are literal Slack mrkdwn, not command
+          # substitution, so SC2016's single-quote warning is a false positive.
+          # shellcheck disable=SC2016
+          text=$(printf '%s *Daily CI Test* %s on `%s`\n<%s|View run #%s>' \
+            "$emoji" "$status" "$REF_NAME" "$RUN_URL" "$RUN_NUMBER")
+          jq -n --arg text "$text" \
+            '{blocks: [{type: "section", text: {type: "mrkdwn", text: $text}}]}' \
+            > ci_result_slack.json
+
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK: >-
+            ${{ (github.event_name == 'schedule' || inputs.target == 'prod')
+                && secrets.ETHLAMBDA_GENERAL_SLACK_WEBHOOK
+                || secrets.ETHLAMBDA_TEST_SLACK_WEBHOOK }}
+        run: bash .github/scripts/publish_slack.sh ci_result_slack.json

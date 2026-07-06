@@ -1,4 +1,5 @@
 mod checkpoint_sync;
+mod cli;
 mod fd_limit;
 mod version;
 
@@ -31,7 +32,9 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
+use cli::CliOptions;
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
+use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
@@ -61,78 +64,6 @@ const ASCII_ART: &str = r#"
  \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
 "#;
 
-#[derive(Debug, clap::Parser)]
-#[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
-struct CliOptions {
-    /// Path to the chain genesis config (e.g., config.yaml).
-    #[arg(long)]
-    genesis: PathBuf,
-    /// Path to the validator registry (e.g., annotated_validators.yaml).
-    #[arg(long)]
-    validators: PathBuf,
-    /// Path to the bootnode list (e.g., nodes.yaml).
-    #[arg(long)]
-    bootnodes: PathBuf,
-    /// Path to validator-config.yaml (validator name registry for metrics labels).
-    #[arg(long)]
-    validator_config: PathBuf,
-    /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
-    #[arg(long)]
-    hash_sig_keys_dir: PathBuf,
-    #[arg(long, default_value = "9000")]
-    gossipsub_port: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    http_address: IpAddr,
-    #[arg(long, default_value = "5052")]
-    api_port: u16,
-    #[arg(long, default_value = "5054")]
-    metrics_port: u16,
-    #[arg(long)]
-    node_key: PathBuf,
-    /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
-    #[arg(long)]
-    node_id: String,
-    /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
-    /// When set, skips genesis initialization and fetches the finalized state
-    /// and block from each peer's `/lean/v0/states/finalized` and
-    /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
-    /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
-    /// path is stripped.
-    ///
-    /// Multiple URLs may be supplied for redundancy, either comma-separated
-    /// (`--checkpoint-sync-url u1,u2`) or by repeating the flag
-    /// (`--checkpoint-sync-url u1 --checkpoint-sync-url u2`). URLs are tried
-    /// in order; the first one that succeeds is used and any failures fall
-    /// over to the next URL. Startup only aborts if every URL fails.
-    #[arg(long, value_delimiter = ',')]
-    checkpoint_sync_url: Vec<String>,
-    /// Whether this node acts as a committee aggregator.
-    ///
-    /// Seeds the initial value of the live aggregator flag shared by the
-    /// blockchain actor and the admin API. The flag can be toggled at
-    /// runtime via `POST /lean/v0/admin/aggregator`. Runtime toggles do
-    /// NOT persist across restarts and do NOT update gossip subnet
-    /// subscriptions, which are frozen at startup — standby aggregators
-    /// should boot with this flag enabled to establish subscriptions, then
-    /// use the admin endpoint to rotate duties (hot-standby model).
-    #[arg(long, default_value = "false")]
-    is_aggregator: bool,
-    /// Number of attestation committees (subnets) per slot.
-    ///
-    /// If unset, falls back to `config.attestation_committee_count` from
-    /// `validator-config.yaml` in the network config dir, or `1` if that
-    /// field is also absent.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    attestation_committee_count: Option<u64>,
-    /// Subnet IDs this aggregator should subscribe to (comma-separated).
-    /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
-    #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
-    aggregate_subnet_ids: Option<Vec<u64>>,
-    /// Directory for RocksDB storage
-    #[arg(long, default_value = "./data")]
-    data_dir: PathBuf,
-}
-
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
 // parallelism. Use a single-threaded runtime under Shadow. This is an
@@ -148,6 +79,9 @@ async fn main() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")?;
 
     let options = CliOptions::parse();
+
+    #[cfg(feature = "shadow-integration")]
+    init_shadow_cost(&options.shadow);
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -284,6 +218,11 @@ async fn main() -> eyre::Result<()> {
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
+        !options.disable_duty_sync_gate,
+        ProposerConfig {
+            enable_proposer_aggregation: options.enable_proposer_aggregation,
+            max_attestations_per_block: options.max_attestations_per_block,
+        },
     );
 
     // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
@@ -363,6 +302,30 @@ async fn main() -> eyre::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
+///
+/// Compiled only under the `shadow-integration` feature. Call once at startup,
+/// before any consensus/aggregation work, so the fake-proof and sim-cost hooks
+/// are installed before the first signing or aggregation path runs.
+#[cfg(feature = "shadow-integration")]
+fn init_shadow_cost(shadow: &cli::ShadowOptions) {
+    info!(
+        fake = shadow.shadow_xmss_fake,
+        aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
+        verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        merge_rate = ?shadow.shadow_xmss_merge_rate,
+        fake_proof_size = shadow.shadow_xmss_fake_proof_size,
+        "Applying Shadow XMSS sim-cost / fake-XMSS config"
+    );
+    ethlambda_crypto::shadow_cost::init(
+        shadow.shadow_xmss_fake,
+        shadow.shadow_xmss_aggregate_signatures_rate,
+        shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        shadow.shadow_xmss_merge_rate,
+        shadow.shadow_xmss_fake_proof_size as usize,
+    );
 }
 
 /// Boot the binary in Hive test-driver mode.
@@ -726,7 +689,10 @@ async fn fetch_initial_state(
     let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
-    store.insert_signed_block(anchor_root, signed_block);
+    store
+        .insert_signed_block(anchor_root, signed_block)
+        .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))
+        .map_err(|_| checkpoint_sync::CheckpointSyncError::StoreInsertSignedBlock)?;
     Ok(store)
 }
 
