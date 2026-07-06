@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-60b0072f.js";
+            window.path_to_searchindex_js = "searchindex-b5ef6fb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-294cc887.js"></script>
@@ -209,6 +209,7 @@
 </thead>
 <tbody>
 <tr><td><code>GET</code></td><td><code>/lean/v0/health</code></td><td>JSON</td><td>Liveness check</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/config/spec</code></td><td>JSON</td><td>Protocol constants the node runs with</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/genesis</code></td><td>JSON</td><td>Genesis time and validator count</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
@@ -226,6 +227,17 @@
 <p>The handler emits a fixed, compact body (no whitespace):</p>
 <pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
 </code></pre>
+<h3 id="get-leanv0configspec"><a class="header" href="#get-leanv0configspec"><code>GET /lean/v0/config/spec</code></a></h3>
+<p>Protocol constants the node was built with. Keys mirror the leanSpec constant names:</p>
+<pre><code class="language-json">{
+  "MILLISECONDS_PER_SLOT": 4000,
+  "INTERVALS_PER_SLOT": 5,
+  "MILLISECONDS_PER_INTERVAL": 800,
+  "HISTORICAL_ROOTS_LIMIT": 262144,
+  "FORK_DIGEST": "12345678"
+}
+</code></pre>
+<p><code>FORK_DIGEST</code> is the 4-byte hex string (no <code>0x</code> prefix) embedded in gossipsub topic names.</p>
 <h3 id="get-leanv0genesis"><a class="header" href="#get-leanv0genesis"><code>GET /lean/v0/genesis</code></a></h3>
 <pre><code class="language-json">{ "genesis_time": 1770407233, "validator_count": 16 }
 </code></pre>
