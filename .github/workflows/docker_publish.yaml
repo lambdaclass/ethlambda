@@ -1,6 +1,8 @@
 name: Publish Docker Image
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       tags:
@@ -12,9 +14,16 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # On push to main, inputs.tags is empty, so fall back to "unstable" so it
+  # tracks main. Manual dispatch still honors custom tags.
+  TAGS_INPUT: ${{ inputs.tags || 'unstable' }}
 
 jobs:
   build-image:
@@ -46,7 +55,7 @@ jobs:
         id: prep
         run: |
           TAGS=""
-          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
           for t in "${TAG_ARRAY[@]}"; do
             TAGS="${TAGS}${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-${{ matrix.arch }},"
           done
@@ -84,7 +93,7 @@ jobs:
         env:
           SHORT_SHA: ${{ github.sha }}
         run: |
-          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
           FIRST_TAG="${TAG_ARRAY[0]}"
 
           # Create manifest for first tag with SHA tag

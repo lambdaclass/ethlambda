@@ -15,6 +15,7 @@ mod fork_choice;
 mod genesis;
 mod heap_profiling;
 pub mod metrics;
+mod spec;
 pub mod test_driver;
 
 pub(crate) use base::json_response;
@@ -102,6 +103,7 @@ fn build_api_router(store: Store) -> Router {
         .merge(fork_choice::routes())
         .merge(admin::routes())
         .merge(genesis::routes())
+        .merge(spec::routes())
         .with_state(store)
 }
 
