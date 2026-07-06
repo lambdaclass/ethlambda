@@ -13,9 +13,11 @@ mod admin;
 mod base;
 mod blocks;
 mod fork_choice;
+mod genesis;
 mod heap_profiling;
 pub mod metrics;
 mod node;
+mod spec;
 pub mod test_driver;
 
 pub(crate) use base::json_response;
@@ -63,9 +65,6 @@ pub async fn start_rpc_server(
     sync_status: SyncStatusController,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    // `aggregator` and `sync_status` are shared runtime handles the blockchain
-    // actor writes; they reach handlers via `Extension` (see admin and node
-    // routes). `version` is static config threaded through `build_api_router`.
     let api_router = build_api_router(store, config.version)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status));
@@ -118,6 +117,8 @@ fn build_api_router(store: Store, version: &'static str) -> Router {
         .merge(fork_choice::routes())
         .merge(admin::routes())
         .merge(node::routes(version))
+        .merge(genesis::routes())
+        .merge(spec::routes())
         .with_state(store)
 }
 
