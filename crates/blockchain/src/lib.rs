@@ -52,6 +52,7 @@ pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 /// Slots of head-vs-wall-clock lag above which a node is considered syncing.
 pub use sync_status::SYNC_LAG_THRESHOLD;
+pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
@@ -83,6 +84,7 @@ impl BlockChain {
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
+        sync_status_controller: SyncStatusController,
         attestation_committee_count: u64,
         gate_duties: bool,
         proposer_config: ProposerConfig,
@@ -113,6 +115,7 @@ impl BlockChain {
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
+            sync_status_controller,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -185,6 +188,11 @@ pub struct BlockChainServer {
     /// validator duties while syncing, unless that gating was disabled at
     /// startup via `--disable-duty-sync-gate` (then it is metric-only).
     sync_status: SyncStatusTracker,
+
+    /// Shared, read-only mirror of `sync_status` for readers outside the actor
+    /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
+    /// `update_sync_status` with the same `SyncStatus` fed to the metric.
+    sync_status_controller: SyncStatusController,
 }
 
 impl BlockChainServer {
@@ -949,6 +957,7 @@ impl BlockChainServer {
             .sync_status
             .update(current_slot, head_slot, max_seen_slot);
         metrics::set_node_sync_status(status);
+        self.sync_status_controller.set(status);
     }
 }
 

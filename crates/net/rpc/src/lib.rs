@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{Extension, Router};
+use ethlambda_blockchain::SyncStatusController;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -59,9 +60,15 @@ pub async fn start_rpc_server(
     config: RpcConfig,
     store: Store,
     aggregator: AggregatorController,
+    sync_status: SyncStatusController,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store, config.version).layer(Extension(aggregator));
+    // `aggregator` and `sync_status` are shared runtime handles the blockchain
+    // actor writes; they reach handlers via `Extension` (see admin and node
+    // routes). `version` is static config threaded through `build_api_router`.
+    let api_router = build_api_router(store, config.version)
+        .layer(Extension(aggregator))
+        .layer(Extension(sync_status));
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 

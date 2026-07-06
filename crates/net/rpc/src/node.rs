@@ -1,6 +1,6 @@
-use axum::{Router, extract::State, response::IntoResponse, routing::get};
-use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
-use ethlambda_blockchain::metrics::{SyncStatus, node_sync_status};
+use axum::{Extension, Router, extract::State, response::IntoResponse, routing::get};
+use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, SyncStatusController};
 use ethlambda_storage::Store;
 use serde::Serialize;
 
@@ -21,17 +21,21 @@ struct IdentityResponse {
 
 /// Sync status for `/lean/v0/node/syncing`.
 ///
-/// `is_syncing` mirrors the `lean_node_sync_status` metric exactly: it is the
-/// blockchain actor's stateful sync decision (head-vs-wall-clock lag with
-/// hysteresis and a network-stall override, updated each tick), read back from
-/// the metric so the endpoint and the metric can never disagree.
+/// `is_syncing` reads the node's own sync decision from the shared
+/// [`SyncStatusController`]: head-vs-wall-clock lag with hysteresis and a
+/// network-stall override, updated each tick by the blockchain actor. It is the
+/// same signal that gates validator duties and drives the `lean_node_sync_status`
+/// metric, so the endpoint agrees with both.
 ///
 /// `head_slot`, `finalized_slot`, and `sync_distance` are a stateless
 /// per-request snapshot from the store. `sync_distance` is the raw
 /// head-vs-wall-clock slot gap; because `is_syncing` carries hysteresis /
 /// stall handling and is *not* recomputed from `sync_distance`, the two can
 /// point different ways near the threshold or during a network stall.
-async fn get_syncing(State(store): State<Store>) -> impl IntoResponse {
+async fn get_syncing(
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+) -> impl IntoResponse {
     let genesis_ms = store.config().genesis_time.saturating_mul(1000);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -42,7 +46,7 @@ async fn get_syncing(State(store): State<Store>) -> impl IntoResponse {
     let sync_distance = wall_slot.saturating_sub(head_slot);
     let finalized_slot = store.latest_finalized().slot;
     json_response(SyncingResponse {
-        is_syncing: node_sync_status() == SyncStatus::Syncing,
+        is_syncing: sync_status.get() == SyncStatus::Syncing,
         head_slot,
         sync_distance,
         finalized_slot,
@@ -66,10 +70,12 @@ pub(crate) fn routes(version: &'static str) -> Router<Store> {
 #[cfg(test)]
 mod tests {
     use axum::{
+        Extension,
         body::Body,
         http::{Request, StatusCode},
     };
-    use ethlambda_blockchain::SYNC_LAG_THRESHOLD;
+    use ethlambda_blockchain::metrics::SyncStatus;
+    use ethlambda_blockchain::{SYNC_LAG_THRESHOLD, SyncStatusController};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::state::ChainConfig;
     use http_body_util::BodyExt;
@@ -78,9 +84,10 @@ mod tests {
 
     use crate::test_utils::create_test_state;
 
-    /// Helper: GET /lean/v0/node/syncing and parse JSON body.
-    async fn get_syncing_json(store: Store) -> serde_json::Value {
-        let app = crate::build_api_router(store, "ethlambda/test");
+    /// Helper: GET /lean/v0/node/syncing (with the given sync controller) and
+    /// parse the JSON body.
+    async fn get_syncing_json(store: Store, sync: SyncStatusController) -> serde_json::Value {
+        let app = crate::build_api_router(store, "ethlambda/test").layer(Extension(sync));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -98,10 +105,10 @@ mod tests {
     #[tokio::test]
     async fn node_syncing_sync_distance_far_behind_wall_clock() {
         // create_test_state() has genesis_time=1000 (year 1970), so wall_slot is
-        // huge and head_slot=0 → sync_distance is large. (is_syncing is driven by
-        // the metric, not sync_distance; see node_syncing_is_syncing_mirrors_metric.)
+        // huge and head_slot=0 → sync_distance is large. (is_syncing comes from the
+        // controller, not sync_distance; see node_syncing_reflects_controller.)
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let json = get_syncing_json(store).await;
+        let json = get_syncing_json(store, SyncStatusController::default()).await;
         assert_eq!(json["head_slot"], 0);
         assert_eq!(json["finalized_slot"], 0);
         assert!(
@@ -120,28 +127,27 @@ mod tests {
             genesis_time: 4_102_444_800,
         };
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), state);
-        let json = get_syncing_json(store).await;
+        let json = get_syncing_json(store, SyncStatusController::default()).await;
         assert_eq!(json["head_slot"], 0);
         assert_eq!(json["finalized_slot"], 0);
         assert_eq!(json["sync_distance"], 0);
     }
 
     #[tokio::test]
-    async fn node_syncing_is_syncing_mirrors_metric() {
-        use ethlambda_blockchain::metrics::{SyncStatus, set_node_sync_status};
-
-        // is_syncing reflects the lean_node_sync_status metric (the actor's real
-        // sync decision), not the raw wall-clock sync_distance. Drive the metric
-        // and confirm the endpoint follows it. This is the only test in this
-        // binary that writes the process-global gauge, so the set→read sequence
-        // is race-free.
+    async fn node_syncing_reflects_controller() {
+        // is_syncing comes from the shared SyncStatusController (the actor's sync
+        // decision), not the raw wall-clock sync_distance. It follows the
+        // controller and updates through the shared handle without rebuilding it.
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
+        let sync = SyncStatusController::new(SyncStatus::Syncing);
 
-        set_node_sync_status(SyncStatus::Syncing);
-        assert_eq!(get_syncing_json(store.clone()).await["is_syncing"], true);
+        assert_eq!(
+            get_syncing_json(store.clone(), sync.clone()).await["is_syncing"],
+            true
+        );
 
-        set_node_sync_status(SyncStatus::Synced);
-        assert_eq!(get_syncing_json(store).await["is_syncing"], false);
+        sync.set(SyncStatus::Synced);
+        assert_eq!(get_syncing_json(store, sync).await["is_syncing"], false);
     }
 
     #[tokio::test]

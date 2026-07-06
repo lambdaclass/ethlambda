@@ -491,11 +491,15 @@ static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
 // --- Sync Status ---
 
 /// Node synchronization status.
+///
+/// The explicit discriminants are the wire encoding used by
+/// [`crate::SyncStatusController`] (`*self as u8` / [`SyncStatus::from_u8`]);
+/// keep them stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStatus {
-    Idle,
-    Syncing,
-    Synced,
+    Idle = 0,
+    Syncing = 1,
+    Synced = 2,
 }
 
 impl SyncStatus {
@@ -504,6 +508,16 @@ impl SyncStatus {
             SyncStatus::Idle => "idle",
             SyncStatus::Syncing => "syncing",
             SyncStatus::Synced => "synced",
+        }
+    }
+
+    /// Decode a discriminant produced by `*self as u8`. Unknown values fall
+    /// back to [`SyncStatus::Idle`].
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => SyncStatus::Syncing,
+            2 => SyncStatus::Synced,
+            _ => SyncStatus::Idle,
         }
     }
 
@@ -900,37 +914,5 @@ pub fn set_node_sync_status(status: SyncStatus) {
         LEAN_NODE_SYNC_STATUS
             .with_label_values(&[label])
             .set(i64::from(*label == active));
-    }
-}
-
-/// Read back the node sync status currently published by `lean_node_sync_status`.
-///
-/// Returns the variant whose gauge is set to 1, or [`SyncStatus::Idle`] if none
-/// is (e.g. before the first tick sets it). Reading the metric back lets code
-/// outside the blockchain actor — notably the RPC `/lean/v0/node/syncing`
-/// endpoint — report exactly the status the metric exposes, so the endpoint and
-/// the metric cannot disagree.
-pub fn node_sync_status() -> SyncStatus {
-    [SyncStatus::Syncing, SyncStatus::Synced, SyncStatus::Idle]
-        .into_iter()
-        .find(|status| {
-            LEAN_NODE_SYNC_STATUS
-                .with_label_values(&[status.as_str()])
-                .get()
-                == 1
-        })
-        .unwrap_or(SyncStatus::Idle)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SyncStatus, node_sync_status, set_node_sync_status};
-
-    #[test]
-    fn node_sync_status_reads_back_what_was_set() {
-        for status in [SyncStatus::Syncing, SyncStatus::Synced, SyncStatus::Idle] {
-            set_node_sync_status(status);
-            assert_eq!(node_sync_status(), status);
-        }
     }
 }

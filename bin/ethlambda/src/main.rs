@@ -50,7 +50,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::BlockChain;
+use ethlambda_blockchain::{BlockChain, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -211,10 +211,17 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    // Shared, runtime-readable sync status. The blockchain actor writes it each
+    // tick (alongside the `lean_node_sync_status` metric); the RPC
+    // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
+    // metric's startup value.
+    let sync_status = SyncStatusController::default();
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
+        sync_status.clone(),
         attestation_committee_count,
         !options.disable_duty_sync_gate,
         ProposerConfig {
@@ -260,9 +267,15 @@ async fn main() -> eyre::Result<()> {
     let rpc_shutdown = shutdown_token.clone();
 
     let rpc_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "RPC server failed"));
+        let _ = ethlambda_rpc::start_rpc_server(
+            rpc_config,
+            store,
+            aggregator,
+            sync_status,
+            rpc_shutdown,
+        )
+        .await
+        .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
