@@ -649,17 +649,17 @@ async fn fetch_initial_state(
             .as_millis() as u64;
         let current_slot =
             now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
-        let finalized_slot = store.latest_finalized().slot;
-        let gap = current_slot.saturating_sub(finalized_slot);
+        let head_slot = store.head_slot();
+        let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
             info!(
-                finalized_slot,
+                head_slot,
                 current_slot, gap, "Resuming from existing DB state"
             );
             return Ok(store);
         }
         warn!(
-            finalized_slot,
+            head_slot,
             current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
         );
     }
