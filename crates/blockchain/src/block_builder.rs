@@ -21,16 +21,16 @@ use ethlambda_state_transition::{
     slot_is_justifiable_after,
 };
 use ethlambda_types::{
+    ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
     block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
     checkpoint::Checkpoint,
-    primitives::{HashTreeRoot as _, H256},
+    primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
-    ShortRoot,
 };
 use tracing::{info, trace};
 
-use crate::{metrics, store::StoreError, MAX_ATTESTATIONS_DATA};
+use crate::{MAX_ATTESTATIONS_DATA, metrics, store::StoreError};
 
 /// Post-block checkpoints extracted from the state transition in `build_block`.
 ///
