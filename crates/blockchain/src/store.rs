@@ -43,11 +43,12 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         .expect("get_live_chain should succeed");
     let attestations = store.extract_latest_known_attestations();
     let old_head = store.head().expect("head block exists");
+    let latest_justified_root = store
+        .latest_justified()
+        .expect("latest justified checkpoint exists")
+        .root;
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store
-            .latest_justified()
-            .expect("latest justified checkpoint exists")
-            .root,
+        latest_justified_root,
         &blocks,
         &attestations,
         0,

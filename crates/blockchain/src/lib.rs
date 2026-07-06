@@ -113,7 +113,10 @@ impl BlockChain {
     ) -> BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
-        let genesis_time = store.config().expect("config exists").genesis_time;
+        let genesis_time = store
+            .config()
+            .expect("failed to load config: config missing or database error")
+            .genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Catch XMSS keys up to the current slot before the first tick
@@ -702,18 +705,18 @@ impl BlockChainServer {
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
         store::on_block(&mut self.store, signed_block)?;
         metrics::update_head_slot(self.store.head_slot());
-        metrics::update_latest_justified_slot(
-            self.store
-                .latest_justified()
-                .expect("Error: Latest justified checkpoint does not exist")
-                .slot,
-        );
-        metrics::update_latest_finalized_slot(
-            self.store
-                .latest_finalized()
-                .expect("Error: Latest finalized checkpoint does not exist")
-                .slot,
-        );
+        let latest_justified_slot = self
+            .store
+            .latest_justified()
+            .expect("Error: Latest justified checkpoint does not exist")
+            .slot;
+        metrics::update_latest_justified_slot(latest_justified_slot);
+        let latest_finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("Error: Latest finalized checkpoint does not exist")
+            .slot;
+        metrics::update_latest_finalized_slot(latest_finalized_slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
 
         for table in ALL_TABLES {
@@ -759,13 +762,12 @@ impl BlockChainServer {
         // already part of the canonical chain and cannot affect fork choice.
         // Discard any pending children: since we won't process this block,
         // children referencing it as parent would remain stuck indefinitely.
-        if slot
-            <= self
-                .store
-                .latest_finalized()
-                .expect("Error: Latest finalized checkpoint does not exist")
-                .slot
-        {
+        let latest_finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("Error: Latest finalized checkpoint does not exist")
+            .slot;
+        if slot <= latest_finalized_slot {
             self.discard_pending_subtree(block_root);
             return;
         }
