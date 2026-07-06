@@ -17,6 +17,8 @@ struct SyncingResponse {
 #[derive(Serialize)]
 struct IdentityResponse {
     version: &'static str,
+    /// This node's libp2p peer ID (base58), as it appears to peers on the wire.
+    peer_id: String,
 }
 
 /// Sync status for `/lean/v0/node/syncing`.
@@ -53,18 +55,21 @@ async fn get_syncing(
     })
 }
 
-/// Returns the full client version string, identical to `ethlambda --version`
-/// (e.g. `ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0`):
-/// semver, git branch and short SHA, target triple, and rustc version. Sourced
-/// from `RpcConfig::version` and captured by the route in `routes`.
-async fn get_identity(version: &'static str) -> impl IntoResponse {
-    json_response(IdentityResponse { version })
+/// Reports node identity: the full client version string (identical to
+/// `ethlambda --version`: semver, git branch and short SHA, target triple, and
+/// rustc version) and the node's libp2p peer ID. Both are fixed at startup and
+/// captured by the route in `routes`.
+async fn get_identity(version: &'static str, peer_id: String) -> impl IntoResponse {
+    json_response(IdentityResponse { version, peer_id })
 }
 
-pub(crate) fn routes(version: &'static str) -> Router<Store> {
+pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .route("/lean/v0/node/syncing", get(get_syncing))
-        .route("/lean/v0/node/identity", get(move || get_identity(version)))
+        .route(
+            "/lean/v0/node/identity",
+            get(move || get_identity(version, peer_id.clone())),
+        )
 }
 
 #[cfg(test)]
@@ -87,7 +92,8 @@ mod tests {
     /// Helper: GET /lean/v0/node/syncing (with the given sync controller) and
     /// parse the JSON body.
     async fn get_syncing_json(store: Store, sync: SyncStatusController) -> serde_json::Value {
-        let app = crate::build_api_router(store, "ethlambda/test").layer(Extension(sync));
+        let app = crate::build_api_router(store, "ethlambda/test", "test-peer".to_string())
+            .layer(Extension(sync));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -151,13 +157,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_identity_reports_version() {
-        // The binary injects the real `CLIENT_VERSION` via `RpcConfig::version`;
-        // here we inject a sentinel and assert it round-trips verbatim.
+    async fn node_identity_reports_version_and_peer_id() {
+        // The binary injects the real `CLIENT_VERSION` and local peer ID; here we
+        // inject sentinels and assert they round-trip verbatim.
         const VERSION: &str =
             "ethlambda/v9.9.9-test-deadbeef/x86_64-unknown-linux-gnu/rustc-v1.92.0";
+        const PEER_ID: &str = "16Uiu2HAmTestPeerIdSentinel";
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(store, VERSION);
+        let app = crate::build_api_router(store, VERSION, PEER_ID.to_string());
         let resp = app
             .oneshot(
                 Request::builder()
@@ -171,5 +178,6 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["version"], VERSION);
+        assert_eq!(json["peer_id"], PEER_ID);
     }
 }

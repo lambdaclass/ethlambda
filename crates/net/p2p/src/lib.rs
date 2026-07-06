@@ -174,6 +174,9 @@ pub struct SwarmConfig {
 
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
+    /// This node's libp2p peer ID, derived from the node key. Exposed so the
+    /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
+    pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
     pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
     pub(crate) attestation_committee_count: u64,
@@ -339,6 +342,7 @@ pub fn build_swarm(
     info!(socket=%config.listening_socket, "P2P node started");
 
     Ok(BuiltSwarm {
+        local_peer_id,
         swarm,
         attestation_topics,
         attestation_committee_count: config.attestation_committee_count,

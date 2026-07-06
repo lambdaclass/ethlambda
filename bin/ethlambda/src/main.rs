@@ -249,6 +249,10 @@ async fn main() -> eyre::Result<()> {
     })
     .wrap_err("failed to build swarm")?;
 
+    // Capture the local peer ID before `built` is moved into the P2P actor; the
+    // RPC `/lean/v0/node/identity` endpoint reports it.
+    let local_peer_id = built.local_peer_id.to_string();
+
     let p2p = P2P::spawn(built, store.clone(), node_names);
 
     // Wire actors together via protocol refs
@@ -275,6 +279,7 @@ async fn main() -> eyre::Result<()> {
             store,
             aggregator,
             sync_status,
+            local_peer_id,
             rpc_shutdown,
         )
         .await

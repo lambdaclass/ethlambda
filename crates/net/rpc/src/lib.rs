@@ -63,9 +63,10 @@ pub async fn start_rpc_server(
     store: Store,
     aggregator: AggregatorController,
     sync_status: SyncStatusController,
+    peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store, config.version)
+    let api_router = build_api_router(store, config.version, peer_id)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status));
     let metrics_router = metrics::start_prometheus_metrics_api();
@@ -103,20 +104,20 @@ pub async fn start_rpc_server(
     Ok(())
 }
 
-/// Build the API router with the given store and client version.
+/// Build the API router with the given store, client version, and peer ID.
 ///
-/// `version` is `RpcConfig::version`, captured by the `/lean/v0/node/identity`
-/// route so it can report it. The aggregator controller is threaded in
-/// separately via `Extension` by the caller (see `start_rpc_server`) so
-/// existing store-backed handlers don't need to know about it and admin
-/// handlers extract it independently.
-fn build_api_router(store: Store, version: &'static str) -> Router {
+/// `version` (`RpcConfig::version`) and `peer_id` (the node's libp2p peer ID)
+/// are captured by the `/lean/v0/node/identity` route so it can report them.
+/// The aggregator controller is threaded in separately via `Extension` by the
+/// caller (see `start_rpc_server`) so existing store-backed handlers don't need
+/// to know about it and admin handlers extract it independently.
+fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Router {
     Router::new()
         .merge(base::routes())
         .merge(blocks::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
-        .merge(node::routes(version))
+        .merge(node::routes(version, peer_id))
         .merge(genesis::routes())
         .merge(spec::routes())
         .with_state(store)
@@ -228,7 +229,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let store = Store::from_anchor_state(backend, state);
 
-        let app = build_api_router(store.clone(), "ethlambda/test");
+        let app = build_api_router(store.clone(), "ethlambda/test", "test-peer".to_string());
 
         let response = app
             .oneshot(
@@ -270,7 +271,7 @@ mod tests {
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test");
+        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
         let response = app
             .oneshot(
@@ -341,7 +342,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}")).await;
 
@@ -362,7 +363,7 @@ mod tests {
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}/header")).await;
 
@@ -378,7 +379,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_by_slot_returns_json() {
             let (store, _target_root) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let response = send(app, "/lean/v0/blocks/1").await;
 
@@ -395,7 +396,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let response = send(app, "/lean/v0/blocks/not-a-valid-id").await;
 
@@ -407,7 +408,7 @@ mod tests {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
             let store = Store::from_anchor_state(backend, state);
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let missing = format!("0x{}", "aa".repeat(32));
             let response = send(app, &format!("/lean/v0/blocks/{missing}")).await;
@@ -418,7 +419,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_missing_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             let response = send(app, "/lean/v0/blocks/999").await;
 
@@ -428,7 +429,7 @@ mod tests {
         #[tokio::test]
         async fn get_block_empty_slot_returns_404() {
             let (store, _) = store_with_historical_block();
-            let app = build_api_router(store, "ethlambda/test");
+            let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
             // Slot 0 in the test setup is H256::ZERO (empty).
             let response = send(app, "/lean/v0/blocks/0").await;
@@ -481,7 +482,7 @@ mod tests {
 
         let expected_ssz = signed_block.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test");
+        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
         let response = app
             .oneshot(
@@ -528,7 +529,7 @@ mod tests {
         };
         let expected_ssz = expected.to_ssz();
 
-        let app = build_api_router(store, "ethlambda/test");
+        let app = build_api_router(store, "ethlambda/test", "test-peer".to_string());
 
         let response = app
             .oneshot(
