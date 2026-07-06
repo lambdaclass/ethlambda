@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
@@ -70,8 +69,12 @@ pub(crate) enum SlotInterval {
 }
 
 impl SlotInterval {
-    pub(crate) fn from_slot_index(index: u64) -> Self {
-        match index {
+    pub(crate) fn from_ms_since_genesis(ms_since_genesis: u64) -> Self {
+        Self::from_intervals_since_genesis(ms_since_genesis / MILLISECONDS_PER_INTERVAL)
+    }
+
+    pub(crate) fn from_intervals_since_genesis(intervals_since_genesis: u64) -> Self {
+        match intervals_since_genesis % INTERVALS_PER_SLOT {
             0 => Self::BlockPublication,
             1 => Self::AttestationProduction,
             2 => Self::Aggregation,
@@ -79,22 +82,6 @@ impl SlotInterval {
             4 => Self::EndOfSlot,
             _ => unreachable!("slots only have 5 intervals"),
         }
-    }
-
-    fn as_slot_index(self) -> u64 {
-        match self {
-            Self::BlockPublication => 0,
-            Self::AttestationProduction => 1,
-            Self::Aggregation => 2,
-            Self::SafeTargetUpdate => 3,
-            Self::EndOfSlot => 4,
-        }
-    }
-}
-
-impl fmt::Display for SlotInterval {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.as_slot_index().fmt(f)
     }
 }
 
@@ -245,7 +232,7 @@ impl BlockChainServer {
         if store_time > 0 && tick_interval <= store_time {
             debug!(
                 %slot,
-                %interval,
+                ?interval,
                 tick_interval,
                 store_time,
                 "Skipping already-processed tick"
