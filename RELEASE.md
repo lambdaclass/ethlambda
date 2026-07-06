@@ -21,9 +21,9 @@ exact commit it was built from.
 On top of that, the workflow accepts a comma-separated list of custom tags as a
 parameter (e.g. `latest,devnet2`). We use the following tagging convention:
 
-- `unstable` - the latest image built from the `main` branch, without any devnet-specific features
-- `latest` - the latest image built for the current devnet (`devnet3` at the time of writing)
-- `devnetX` - the latest image built with `devnetX` support (e.g. `devnet3`, `devnet4`)
+- `unstable` - the latest image built from the `main` branch
+- `latest` - the latest stable image built for the current devnet (`devnet5` at the time of writing)
+- `devnetX` - the latest stable image built with `devnetX` support (e.g. `devnet3`, `devnet4`)
 
 Future devnets will introduce new tags, with previous ones left without updates.
 
@@ -31,7 +31,7 @@ Future devnets will introduce new tags, with previous ones left without updates.
 
 ```bash
 docker pull ghcr.io/lambdaclass/ethlambda:unstable       # latest from main
-docker pull ghcr.io/lambdaclass/ethlambda:devnet3        # devnet3-compatible
+docker pull ghcr.io/lambdaclass/ethlambda:devnet5        # devnet5-compatible
 docker pull ghcr.io/lambdaclass/ethlambda:sha-12f8377    # pinned to a specific commit
 ```
 
