@@ -594,7 +594,7 @@ fn on_block_core(
     // Horizon is the current slot plus one whole slot of margin, so an intended
     // early block still imports (mirrors the attestation future-slot guard, but
     // with a whole-slot rather than one-interval margin).
-    let current_slot = store.time() / INTERVALS_PER_SLOT;
+    let current_slot = store.time().expect("DB read should succeed") / INTERVALS_PER_SLOT;
     if slot > current_slot + 1 {
         return Err(StoreError::BlockTooFarInFuture {
             block_slot: slot,
@@ -1610,7 +1610,7 @@ mod tests {
         let block = Block {
             slot: 2,
             proposer_index: 0,
-            parent_root: store.head(),
+            parent_root: store.head().expect("store head exists"),
             state_root: H256::ZERO,
             body: BlockBody::default(),
         };
@@ -1651,7 +1651,7 @@ mod tests {
         let block = Block {
             slot: gap_slot,
             proposer_index: 0,
-            parent_root: store.head(),
+            parent_root: store.head().expect("store head exists"),
             state_root: H256::ZERO,
             body: BlockBody::default(),
         };
