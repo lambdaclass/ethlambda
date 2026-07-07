@@ -79,8 +79,8 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use ethlambda_blockchain::SyncStatusController;
     use ethlambda_blockchain::metrics::SyncStatus;
-    use ethlambda_blockchain::{SYNC_LAG_THRESHOLD, SyncStatusController};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::state::ChainConfig;
     use http_body_util::BodyExt;
@@ -110,14 +110,16 @@ mod tests {
     #[tokio::test]
     async fn node_syncing_sync_distance_far_behind_wall_clock() {
         // create_test_state() has genesis_time=1000 (year 1970), so wall_slot is
-        // huge and head_slot=0 → sync_distance is large. (is_syncing comes from the
-        // controller, not sync_distance; see node_syncing_reflects_controller.)
+        // huge and head_slot=0 → sync_distance is hundreds of millions of slots.
+        // Assert it's clearly far behind, not a small transient lag. (is_syncing
+        // comes from the controller, not sync_distance; see
+        // node_syncing_reflects_controller.)
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
         let json = get_syncing_json(store, SyncStatusController::default()).await;
         assert_eq!(json["head_slot"], 0);
         assert_eq!(json["finalized_slot"], 0);
         assert!(
-            json["sync_distance"].as_u64().unwrap() > SYNC_LAG_THRESHOLD,
+            json["sync_distance"].as_u64().unwrap() > 1_000_000,
             "expected large sync_distance, got {}",
             json["sync_distance"]
         );

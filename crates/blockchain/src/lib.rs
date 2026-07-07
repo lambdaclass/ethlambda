@@ -50,8 +50,6 @@ pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
-/// Slots of head-vs-wall-clock lag above which a node is considered syncing.
-pub use sync_status::SYNC_LAG_THRESHOLD;
 pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
