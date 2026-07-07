@@ -235,21 +235,19 @@ async fn main() -> eyre::Result<()> {
     // metric's startup value.
     let sync_status = SyncStatusController::default();
 
-    let blockchain = BlockChain::spawn(
-        store.clone(),
-        validator_keys,
-        BlockChainConfig {
-            aggregator: aggregator.clone(),
-            sync_status_controller: sync_status.clone(),
-            attestation_committee_count,
-            gate_duties: !options.disable_duty_sync_gate,
-            subscribed_subnets: subscribed_subnets.clone(),
-            proposer_config: ProposerConfig {
-                enable_proposer_aggregation: options.enable_proposer_aggregation,
-                max_attestations_per_block: options.max_attestations_per_block,
-            },
+    let blockchain_config = BlockChainConfig {
+        aggregator: aggregator.clone(),
+        sync_status_controller: sync_status.clone(),
+        attestation_committee_count,
+        gate_duties: !options.disable_duty_sync_gate,
+        subscribed_subnets: subscribed_subnets.clone(),
+        proposer_config: ProposerConfig {
+            enable_proposer_aggregation: options.enable_proposer_aggregation,
+            max_attestations_per_block: options.max_attestations_per_block,
         },
-    );
+    };
+
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config);
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
