@@ -175,17 +175,11 @@ pub struct SwarmConfig {
     pub subscription_subnets: HashSet<u64>,
 }
 
-/// The attestation subnets a node subscribes to, per leanSpec
-/// (`src/lean_spec/__main__.py`): every validator subscribes to its own
-/// committee subnet (`validator_id % attestation_committee_count`) for mesh
-/// health, and an aggregator additionally subscribes to any explicit
+/// The attestation subnets a node subscribes to: every validator subscribes
+/// to its own committee subnet (`validator_id % attestation_committee_count`)
+/// for mesh health, and an aggregator additionally subscribes to any explicit
 /// `aggregate_subnet_ids`, falling back to subnet 0 when it would otherwise
 /// subscribe to none.
-///
-/// Computed once at startup and shared by [`build_swarm`] (to open the gossip
-/// subscriptions) and the blockchain actor (to size the early-aggregation
-/// threshold), so both agree on exactly which subnets feed this node's gossip
-/// groups.
 pub fn attestation_subscription_subnets(
     validator_ids: &[u64],
     attestation_committee_count: u64,
@@ -340,11 +334,6 @@ pub fn build_swarm(
         .gossipsub
         .subscribe(&aggregation_topic)
         .unwrap();
-
-    // Subscribe to attestation subnets per leanSpec (`src/lean_spec/__main__.py`).
-    // `config.subscription_subnets` was precomputed by the caller via
-    // `attestation_subscription_subnets`; the blockchain actor is handed the
-    // same set so both agree on which subnets feed this node's gossip groups.
 
     // The committee metric should reflect validator membership only, not
     // aggregator-only subscriptions.

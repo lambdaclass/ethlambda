@@ -207,10 +207,7 @@ pub struct BlockChainServer {
     /// Attestation subnets this node subscribes to (its validators' own
     /// subnets plus any aggregator-only subnets), computed once at startup and
     /// shared with the P2P swarm via [`ethlambda_p2p::attestation_subscription_subnets`].
-    /// Sizes the early-aggregation threshold: gossip groups are keyed by
-    /// attestation data rather than subnet, so a single group gathers
-    /// signatures from every subscribed subnet at once, and the threshold must
-    /// scale with how many subnets feed it rather than assuming one.
+    /// Used to scale the early-aggregation threshold.
     subscribed_subnets: HashSet<u64>,
 
     /// Proposer-side block-building policy
