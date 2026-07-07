@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b5ef6fb2.js";
+            window.path_to_searchindex_js = "searchindex-beb77040.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-294cc887.js"></script>
@@ -218,6 +218,8 @@
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}/header</code></td><td>JSON</td><td>Block header by root or slot</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice</code></td><td>JSON</td><td>Fork-choice tree with per-block weights</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice/ui</code></td><td>HTML</td><td>Interactive D3.js visualization</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/node/identity</code></td><td>JSON</td><td>Client version and libp2p peer ID</td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/node/syncing</code></td><td>JSON</td><td>Sync status relative to the wall clock</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Current aggregator role</td></tr>
 <tr><td><code>POST</code></td><td><code>/lean/v0/admin/aggregator</code></td><td>JSON</td><td>Toggle aggregator role at runtime</td></tr>
 </tbody>
@@ -283,6 +285,19 @@
 }
 </code></pre>
 <p><code>/lean/v0/fork_choice/ui</code> serves an interactive D3.js page rendering this data. See <a href="./fork_choice_visualization.html">Fork Choice Visualization</a>.</p>
+<h3 id="get-leanv0nodeidentity"><a class="header" href="#get-leanv0nodeidentity"><code>GET /lean/v0/node/identity</code></a></h3>
+<pre><code class="language-json">{
+  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0",
+  "peer_id": "16Uiu2HAm7v1x…"
+}
+</code></pre>
+<p><code>version</code> is the full client version string, identical to what <code>ethlambda --version</code> prints: crate semver, git branch and short SHA, target triple, and rustc version. Baked in at compile time from <code>CARGO_PKG_VERSION</code> plus the <code>vergen-git2</code> build metadata.</p>
+<p><code>peer_id</code> is the node’s libp2p peer ID (base58), derived from the node key and fixed for the lifetime of the process; it matches the identity the node presents to peers on the wire.</p>
+<h3 id="get-leanv0nodesyncing"><a class="header" href="#get-leanv0nodesyncing"><code>GET /lean/v0/node/syncing</code></a></h3>
+<pre><code class="language-json">{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
+</code></pre>
+<p><code>is_syncing</code> is the node’s own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the <code>lean_node_sync_status</code> metric, so the endpoint, the gate, and the metric always agree.</p>
+<p><code>sync_distance</code> is the raw number of slots between the node’s current head and the current wall-clock slot, computed per request. Because <code>is_syncing</code> carries hysteresis and stall handling and is not recomputed from <code>sync_distance</code>, the two can point different ways near the threshold or during a network-wide stall.</p>
 <h3 id="get--post-leanv0adminaggregator"><a class="header" href="#get--post-leanv0adminaggregator"><code>GET</code> / <code>POST /lean/v0/admin/aggregator</code></a></h3>
 <p>Toggle the aggregator role at runtime without restarting the node (hot-standby model, ported from leanSpec PR #636).</p>
 <pre><code class="language-bash"># Read current role
