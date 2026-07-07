@@ -109,6 +109,7 @@ impl BlockChain {
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         aggregator: AggregatorController,
         attestation_committee_count: u64,
+        subscribed_subnets: HashSet<u64>,
         gate_duties: bool,
         proposer_config: ProposerConfig,
     ) -> BlockChain {
@@ -135,6 +136,7 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
+            subscribed_subnets,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -198,6 +200,15 @@ pub struct BlockChainServer {
     /// attestation aggregate coverage emission and the early-aggregation
     /// threshold.
     attestation_committee_count: u64,
+
+    /// Attestation subnets this node subscribes to (its validators' own
+    /// subnets plus any aggregator-only subnets), computed once at startup and
+    /// shared with the P2P swarm via [`ethlambda_p2p::attestation_subscription_subnets`].
+    /// Sizes the early-aggregation threshold: gossip groups are keyed by
+    /// attestation data rather than subnet, so a single group gathers
+    /// signatures from every subscribed subnet at once, and the threshold must
+    /// scale with how many subnets feed it rather than assuming one.
+    subscribed_subnets: HashSet<u64>,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -525,14 +536,30 @@ impl BlockChainServer {
             return;
         }
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
-        // Trigger once the largest current-slot group holds two-thirds of one
-        // committee's expected votes, rounded up: `ceil(2 * N / (3 * C))`
-        // (0 only when there are no validators, which never triggers).
+        // Trigger once the largest current-slot group holds two-thirds of the
+        // votes we expect it to collect, rounded up. Groups are keyed by
+        // attestation data (not by subnet), so one group gathers signatures
+        // from every subnet we subscribe to; the expected count is therefore
+        // the number of network validators whose committee subnet is one of
+        // ours, not a single committee's worth. With `N` validators across `C`
+        // committees, subnet `s` holds `N / C` validators, plus one more when
+        // `s < N % C`. (0 only when there are no such validators, which never
+        // triggers.)
         let min_group_sigs = if self.attestation_committee_count == 0 {
             0
         } else {
             let validator_count = self.store.head_state().validators.len() as u64;
-            (2 * validator_count).div_ceil(3 * self.attestation_committee_count) as usize
+            let committee_count = self.attestation_committee_count;
+            let expected_votes: u64 = self
+                .subscribed_subnets
+                .iter()
+                .filter(|&&subnet| subnet < committee_count)
+                .map(|&subnet| {
+                    validator_count / committee_count
+                        + u64::from(subnet < validator_count % committee_count)
+                })
+                .sum();
+            (2 * expected_votes).div_ceil(3) as usize
         };
         if min_group_sigs == 0 || max_group < min_group_sigs {
             return;

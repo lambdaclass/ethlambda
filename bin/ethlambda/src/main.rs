@@ -37,7 +37,9 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{
+    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
+};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -213,11 +215,25 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    // Attestation subnets this node subscribes to, computed once and shared by
+    // the P2P swarm (to open gossip subscriptions) and the blockchain actor
+    // (to size the early-aggregation threshold), so both agree on which subnets
+    // feed this node's gossip groups. Subscriptions are fixed at startup and
+    // are not re-evaluated when the aggregator role is toggled at runtime; see
+    // the hot-standby note on SwarmConfig.
+    let subscribed_subnets = attestation_subscription_subnets(
+        &validator_ids,
+        attestation_committee_count,
+        options.is_aggregator,
+        options.aggregate_subnet_ids.as_deref(),
+    );
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
         attestation_committee_count,
+        subscribed_subnets.clone(),
         !options.disable_duty_sync_gate,
         ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
@@ -225,19 +241,13 @@ async fn main() -> eyre::Result<()> {
         },
     );
 
-    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
-    // AggregatorController — subnet subscriptions are decided once here and
-    // are not re-evaluated at runtime. Toggling via the admin API affects
-    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
-    // for the invariant.
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        is_aggregator: options.is_aggregator,
-        aggregate_subnet_ids: options.aggregate_subnet_ids,
+        subscription_subnets: subscribed_subnets,
     })
     .wrap_err("failed to build swarm")?;
 
