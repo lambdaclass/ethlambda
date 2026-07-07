@@ -407,9 +407,7 @@ impl BlockChainServer {
             }
         }
 
-        let Some(snapshot) =
-            aggregation::snapshot_current_slot_aggregation_inputs(&self.store, slot)
-        else {
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot) else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
         };

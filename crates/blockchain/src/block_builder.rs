@@ -354,7 +354,7 @@ struct ProjectedState {
 /// slot 0) is exempt from the `target.slot > source.slot` and
 /// `target_already_justified` checks since fork-choice bootstrapping needs
 /// it; STF will silently drop it, but it carries fork-choice signal.
-fn entry_passes_filters(
+pub(crate) fn entry_passes_filters(
     att_data: &AttestationData,
     known_block_roots: &HashSet<H256>,
     extended_historical_block_hashes: &[H256],
@@ -403,6 +403,11 @@ fn entry_passes_filters(
 /// this entry (caller uses it to update the running voter map without
 /// re-scanning aggregation bits). A genesis self-vote cannot justify or
 /// finalize and is always scored as tier 3.
+///
+/// Thin wrapper over [`score_from_coverage`]: derives the entry's full
+/// coverage from `proofs` (the union of every proof's participants) and
+/// delegates the tiering logic. Kept for block-building call sites, which
+/// hold `proofs` rather than a pre-resolved coverage set.
 fn score_entry(
     att_data: &AttestationData,
     proofs: &[SingleMessageAggregate],
@@ -410,22 +415,48 @@ fn score_entry(
     projected_finalized_slot: u64,
     validator_count: usize,
 ) -> Option<(EntryScore, HashSet<u64>)> {
+    let coverage: HashSet<u64> = proofs
+        .iter()
+        .flat_map(|proof| proof.participant_indices())
+        .collect();
+    score_from_coverage(
+        att_data,
+        &coverage,
+        current_votes,
+        projected_finalized_slot,
+        validator_count,
+    )
+}
+
+/// Score a single candidate entry given its realized validator `coverage`,
+/// under the current projected state.
+///
+/// Returns `None` if `coverage` contributes zero validators relative to the
+/// running voter set for `att_data.target.root` (no marginal value, drop).
+/// On `Some`, the returned `HashSet` is the subset of `coverage` that is new
+/// (caller uses it to update the running voter map without re-scanning
+/// `coverage`). A genesis self-vote cannot justify or finalize and is always
+/// scored as tier 3.
+///
+/// Shared between block building (`score_entry`, coverage = union of a
+/// data's proofs) and committee-signature aggregation (`aggregation::
+/// pick_best_candidate`, coverage = a job's realized raw + child participants)
+/// so the two call sites can never drift on tiering.
+pub(crate) fn score_from_coverage(
+    att_data: &AttestationData,
+    coverage: &HashSet<u64>,
+    current_votes: &HashMap<H256, HashSet<u64>>,
+    projected_finalized_slot: u64,
+    validator_count: usize,
+) -> Option<(EntryScore, HashSet<u64>)> {
     let prior_voters = current_votes.get(&att_data.target.root);
     let prior_count = prior_voters.map_or(0, HashSet::len);
 
-    // Collect voters that this entry adds on top of prior_voters. Avoids
-    // cloning prior_voters; the inner contains() makes this O(participants)
-    // per candidate per round. `extend_proofs_greedily` selects proofs until
-    // none contribute new voters, so its final coverage equals this set
-    // unioned with prior_voters.
-    let mut new_voters: HashSet<u64> = HashSet::new();
-    for proof in proofs {
-        for vid in proof.participant_indices() {
-            if prior_voters.is_none_or(|prior| !prior.contains(&vid)) {
-                new_voters.insert(vid);
-            }
-        }
-    }
+    let new_voters: HashSet<u64> = coverage
+        .iter()
+        .copied()
+        .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+        .collect();
     if new_voters.is_empty() {
         return None;
     }
@@ -470,7 +501,7 @@ fn score_entry(
 /// output (`tier = Finalize` is clearer than `tier = 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-enum Tier {
+pub(crate) enum Tier {
     /// Applying the entry crosses 2/3 on target AND finalizes the source
     /// (no slot strictly between source.slot and target.slot is still
     /// justifiable given projected finalized_slot).
@@ -498,23 +529,28 @@ enum Tier {
 ///
 /// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EntryScore {
-    tier: Tier,
-    new_voters: usize,
+pub(crate) struct EntryScore {
+    pub(crate) tier: Tier,
+    pub(crate) new_voters: usize,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     target_slot: u64,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     att_slot: u64,
 }
 
 /// Total order over candidate entries; the smallest value is the best pick.
 /// `tier` leads, then three tier-dependent `Reverse`-encoded priorities, then
 /// `data_root` as the deterministic tiebreak. See [`EntryScore::ordering_key`].
-type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
+///
+/// Reused by `aggregation::pick_best_candidate`, which prefixes it with a
+/// current-slot-vs-stale bucket to rank groups across the whole gossip pool.
+pub(crate) type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
 
 impl EntryScore {
     /// Sort key where the smallest tuple is the best candidate. `tier` always
     /// leads; the remaining three slots carry tier-dependent priorities (see
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
-    fn ordering_key(&self, data_root: H256) -> OrderingKey {
+    pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
         let more_new_voters = Reverse(self.new_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
@@ -542,7 +578,7 @@ impl EntryScore {
 ///
 /// The state's flattened layout is `bit[i * N + j] = validator j voted for
 /// justifications_roots[i]` (see `serialize_justifications`).
-fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
+pub(crate) fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
     let validator_count = state.validators.len();
     let mut votes: HashMap<H256, HashSet<u64>> = HashMap::new();
     for (i, root) in state.justifications_roots.iter().enumerate() {
