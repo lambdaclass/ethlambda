@@ -510,11 +510,15 @@ static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
 // --- Sync Status ---
 
 /// Node synchronization status.
+///
+/// The explicit discriminants are the wire encoding used by
+/// [`crate::SyncStatusController`] (`*self as u8` / [`SyncStatus::from_u8`]);
+/// keep them stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStatus {
-    Idle,
-    Syncing,
-    Synced,
+    Idle = 0,
+    Syncing = 1,
+    Synced = 2,
 }
 
 impl SyncStatus {
@@ -523,6 +527,16 @@ impl SyncStatus {
             SyncStatus::Idle => "idle",
             SyncStatus::Syncing => "syncing",
             SyncStatus::Synced => "synced",
+        }
+    }
+
+    /// Decode a discriminant produced by `*self as u8`. Unknown values fall
+    /// back to [`SyncStatus::Idle`].
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            1 => SyncStatus::Syncing,
+            2 => SyncStatus::Synced,
+            _ => SyncStatus::Idle,
         }
     }
 

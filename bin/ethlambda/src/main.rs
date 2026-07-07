@@ -52,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::BlockChain;
+use ethlambda_blockchain::{BlockChain, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -94,6 +94,7 @@ async fn main() -> eyre::Result<()> {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
+        version: version::CLIENT_VERSION,
     };
 
     println!("{ASCII_ART}");
@@ -228,10 +229,17 @@ async fn main() -> eyre::Result<()> {
         options.aggregate_subnet_ids.as_deref(),
     );
 
+    // Shared, runtime-readable sync status. The blockchain actor writes it each
+    // tick (alongside the `lean_node_sync_status` metric); the RPC
+    // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
+    // metric's startup value.
+    let sync_status = SyncStatusController::default();
+
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
         aggregator.clone(),
+        sync_status.clone(),
         attestation_committee_count,
         subscribed_subnets.clone(),
         !options.disable_duty_sync_gate,
@@ -250,6 +258,10 @@ async fn main() -> eyre::Result<()> {
         subscription_subnets: subscribed_subnets,
     })
     .wrap_err("failed to build swarm")?;
+
+    // Capture the local peer ID before `built` is moved into the P2P actor; the
+    // RPC `/lean/v0/node/identity` endpoint reports it.
+    let local_peer_id = built.local_peer_id.to_string();
 
     let p2p = P2P::spawn(built, store.clone(), node_names);
 
@@ -272,9 +284,16 @@ async fn main() -> eyre::Result<()> {
     let rpc_shutdown = shutdown_token.clone();
 
     let rpc_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "RPC server failed"));
+        let _ = ethlambda_rpc::start_rpc_server(
+            rpc_config,
+            store,
+            aggregator,
+            sync_status,
+            local_peer_id,
+            rpc_shutdown,
+        )
+        .await
+        .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
@@ -659,17 +678,17 @@ async fn fetch_initial_state(
             .as_millis() as u64;
         let current_slot =
             now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
-        let finalized_slot = store.latest_finalized().slot;
-        let gap = current_slot.saturating_sub(finalized_slot);
+        let head_slot = store.head_slot();
+        let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
             info!(
-                finalized_slot,
+                head_slot,
                 current_slot, gap, "Resuming from existing DB state"
             );
             return Ok(store);
         }
         warn!(
-            finalized_slot,
+            head_slot,
             current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
         );
     }
