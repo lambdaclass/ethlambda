@@ -23,6 +23,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | Method | Path | Response | Description |
 |--------|------|----------|-------------|
 | `GET` | `/lean/v0/health` | JSON | Liveness check |
+| `GET` | `/lean/v0/config/spec` | JSON | Protocol constants the node runs with |
 | `GET` | `/lean/v0/genesis` | JSON | Genesis time and validator count |
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
@@ -41,6 +42,22 @@ The handler emits a fixed, compact body (no whitespace):
 ```json
 {"status":"healthy","service":"lean-rpc-api"}
 ```
+
+### `GET /lean/v0/config/spec`
+
+Protocol constants the node was built with. Keys mirror the leanSpec constant names:
+
+```json
+{
+  "MILLISECONDS_PER_SLOT": 4000,
+  "INTERVALS_PER_SLOT": 5,
+  "MILLISECONDS_PER_INTERVAL": 800,
+  "HISTORICAL_ROOTS_LIMIT": 262144,
+  "FORK_DIGEST": "12345678"
+}
+```
+
+`FORK_DIGEST` is the 4-byte hex string (no `0x` prefix) embedded in gossipsub topic names.
 
 ### `GET /lean/v0/genesis`
 
