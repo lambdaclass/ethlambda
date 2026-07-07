@@ -44,6 +44,25 @@ pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,
 }
 
+/// Startup configuration for the [`BlockChain`] actor: the distinct
+/// dependencies wired in once at spawn, grouped to keep the constructor's
+/// signature small.
+pub struct BlockChainConfig {
+    /// Committee-aggregator role, toggleable at runtime via the admin API.
+    pub aggregator: AggregatorController,
+    /// Runtime-readable sync status: written by the actor each tick and read
+    /// by the RPC `/lean/v0/node/syncing` endpoint.
+    pub sync_status_controller: SyncStatusController,
+    /// Number of attestation committees (= subnet count).
+    pub attestation_committee_count: u64,
+    /// Whether the sync-gate suppresses validator duties (vs observe-only).
+    pub gate_duties: bool,
+    /// Attestation subnets this node subscribes to.
+    pub subscribed_subnets: HashSet<u64>,
+    /// Proposer-side block-building policy.
+    pub proposer_config: ProposerConfig,
+}
+
 /// Milliseconds per interval (800ms ticks).
 pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 /// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
@@ -108,13 +127,17 @@ impl BlockChain {
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
-        aggregator: AggregatorController,
-        sync_status_controller: SyncStatusController,
-        attestation_committee_count: u64,
-        subscribed_subnets: HashSet<u64>,
-        gate_duties: bool,
-        proposer_config: ProposerConfig,
+        config: BlockChainConfig,
     ) -> BlockChain {
+        let BlockChainConfig {
+            aggregator,
+            sync_status_controller,
+            attestation_committee_count,
+            gate_duties,
+            subscribed_subnets,
+            proposer_config,
+        } = config;
+
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;

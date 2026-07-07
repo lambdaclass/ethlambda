@@ -52,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::{BlockChain, SyncStatusController};
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -238,14 +238,16 @@ async fn main() -> eyre::Result<()> {
     let blockchain = BlockChain::spawn(
         store.clone(),
         validator_keys,
-        aggregator.clone(),
-        sync_status.clone(),
-        attestation_committee_count,
-        subscribed_subnets.clone(),
-        !options.disable_duty_sync_gate,
-        ProposerConfig {
-            enable_proposer_aggregation: options.enable_proposer_aggregation,
-            max_attestations_per_block: options.max_attestations_per_block,
+        BlockChainConfig {
+            aggregator: aggregator.clone(),
+            sync_status_controller: sync_status.clone(),
+            attestation_committee_count,
+            gate_duties: !options.disable_duty_sync_gate,
+            subscribed_subnets: subscribed_subnets.clone(),
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: options.enable_proposer_aggregation,
+                max_attestations_per_block: options.max_attestations_per_block,
+            },
         },
     );
 
