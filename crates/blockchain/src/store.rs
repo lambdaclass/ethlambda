@@ -12,13 +12,13 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
-    state::State,
+    state::{HISTORICAL_ROOTS_LIMIT, State},
 };
 use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
@@ -278,9 +278,9 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             .expect("set_time should succeed");
 
         let slot = store.time() / INTERVALS_PER_SLOT;
-        let interval = store.time() % INTERVALS_PER_SLOT;
+        let interval = SlotInterval::from_intervals_since_genesis(store.time());
 
-        trace!(%slot, %interval, "processing tick");
+        trace!(%slot, ?interval, "processing tick");
 
         // has_proposal is only signaled for the final tick (matching Python spec behavior)
         let is_final_tick = store.time() == time;
@@ -292,27 +292,26 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         // the actor's message loop stays unblocked during the expensive XMSS
         // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
         match interval {
-            0 => {
+            SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
                     accept_new_attestations(store, false);
                 }
             }
-            1 => {
+            SlotInterval::AttestationProduction => {
                 // Vote propagation — no action
             }
-            2 => {
+            SlotInterval::Aggregation => {
                 // Aggregation is driven by the actor (off-thread); nothing to do here.
             }
-            3 => {
+            SlotInterval::SafeTargetUpdate => {
                 // Update safe target for validators
                 update_safe_target(store);
             }
-            4 => {
+            SlotInterval::EndOfSlot => {
                 // End of slot - accept accumulated attestations and log tree
                 accept_new_attestations(store, true);
             }
-            _ => unreachable!("slots only have 5 intervals"),
         }
     }
 }
@@ -535,6 +534,31 @@ fn on_block_core(
                 parent_root: block.parent_root,
                 slot,
             })?;
+
+    // Bound the block's slot before the state transition runs (leanSpec #1182).
+    //
+    // The transition advances the state one slot at a time from the parent up to
+    // `block.slot`, so a block far beyond its parent, or far in the future, would
+    // drive that walk unboundedly. Both guards live here at the untrusted-input
+    // boundary and run before the expensive signature verification, so a crafted
+    // block is rejected cheaply.
+    let slot_gap = slot.saturating_sub(parent_state.slot);
+    if slot_gap > HISTORICAL_ROOTS_LIMIT as u64 {
+        return Err(StoreError::BlockSlotGapTooLarge {
+            gap: slot_gap,
+            max: HISTORICAL_ROOTS_LIMIT as u64,
+        });
+    }
+    // Horizon is the current slot plus one whole slot of margin, so an intended
+    // early block still imports (mirrors the attestation future-slot guard, but
+    // with a whole-slot rather than one-interval margin).
+    let current_slot = store.time() / INTERVALS_PER_SLOT;
+    if slot > current_slot + 1 {
+        return Err(StoreError::BlockTooFarInFuture {
+            block_slot: slot,
+            current_slot,
+        });
+    }
 
     // Each unique AttestationData must appear at most once per block.
     let attestations = &signed_block.message.body.attestations;
@@ -950,6 +974,12 @@ pub enum StoreError {
 
     #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
     TooManyAttestationData { count: usize, max: usize },
+
+    #[error("Block slot gap {gap} beyond parent exceeds historical roots limit {max}")]
+    BlockSlotGapTooLarge { gap: u64, max: u64 },
+
+    #[error("Block slot {block_slot} is beyond the future horizon (current slot: {current_slot})")]
+    BlockTooFarInFuture { block_slot: u64, current_slot: u64 },
 }
 
 /// Full verification of a signed block's merged multi-message aggregate proof.
@@ -1499,6 +1529,84 @@ mod tests {
         assert!(
             validate_attestation_data(&store, &data).is_ok(),
             "fully canonical vote must validate"
+        );
+    }
+
+    /// leanSpec #1182: a block whose slot is more than one slot past the store
+    /// clock is rejected before the state transition (and before signature
+    /// verification), keeping far-future blocks out of the store.
+    #[test]
+    fn on_block_rejects_block_too_far_in_future() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, genesis_state);
+        store.set_time(0).expect("set_time should succeed");
+
+        // current_slot = 0, so the horizon is slot 1; a slot-2 block overshoots it.
+        let block = Block {
+            slot: 2,
+            proposer_index: 0,
+            parent_root: store.head(),
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let signed_block = SignedBlock {
+            message: block,
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::BlockTooFarInFuture {
+                    block_slot: 2,
+                    current_slot: 0,
+                })
+            ),
+            "Expected BlockTooFarInFuture, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1182: a block whose slot runs more than HISTORICAL_ROOTS_LIMIT
+    /// beyond its parent is rejected up front, so the transition never walks the
+    /// empty-slot loop over an unbounded range. The gap guard runs before the
+    /// future-horizon guard, so it fires even with the clock at genesis.
+    #[test]
+    fn on_block_rejects_block_slot_gap_too_large() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, genesis_state);
+        store.set_time(0).expect("set_time should succeed");
+
+        // Parent (genesis) sits at slot 0, so a slot one past the limit overshoots.
+        let gap_slot = HISTORICAL_ROOTS_LIMIT as u64 + 1;
+        let block = Block {
+            slot: gap_slot,
+            proposer_index: 0,
+            parent_root: store.head(),
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let signed_block = SignedBlock {
+            message: block,
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::BlockSlotGapTooLarge { gap, max })
+                    if gap == gap_slot && max == HISTORICAL_ROOTS_LIMIT as u64
+            ),
+            "Expected BlockSlotGapTooLarge, got: {result:?}"
         );
     }
 }

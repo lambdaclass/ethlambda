@@ -15,7 +15,8 @@ use ethlambda_types::{
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, PRIOR_WORKER_JOIN_TIMEOUT,
+    run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -43,6 +44,25 @@ pub struct BlockChain {
     handle: ActorRef<BlockChainServer>,
 }
 
+/// Startup configuration for the [`BlockChain`] actor: the distinct
+/// dependencies wired in once at spawn, grouped to keep the constructor's
+/// signature small.
+pub struct BlockChainConfig {
+    /// Committee-aggregator role, toggleable at runtime via the admin API.
+    pub aggregator: AggregatorController,
+    /// Runtime-readable sync status: written by the actor each tick and read
+    /// by the RPC `/lean/v0/node/syncing` endpoint.
+    pub sync_status_controller: SyncStatusController,
+    /// Number of attestation committees (= subnet count).
+    pub attestation_committee_count: u64,
+    /// Whether the sync-gate suppresses validator duties (vs observe-only).
+    pub gate_duties: bool,
+    /// Attestation subnets this node subscribes to.
+    pub subscribed_subnets: HashSet<u64>,
+    /// Proposer-side block-building policy.
+    pub proposer_config: ProposerConfig,
+}
+
 /// Milliseconds per interval (800ms ticks).
 pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
 /// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
@@ -50,6 +70,7 @@ pub const INTERVALS_PER_SLOT: u64 = 5;
 /// Milliseconds in a slot (derived from interval duration and count).
 pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
+pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
@@ -58,6 +79,32 @@ pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotInterval {
+    BlockPublication,
+    AttestationProduction,
+    Aggregation,
+    SafeTargetUpdate,
+    EndOfSlot,
+}
+
+impl SlotInterval {
+    pub(crate) fn from_ms_since_genesis(ms_since_genesis: u64) -> Self {
+        Self::from_intervals_since_genesis(ms_since_genesis / MILLISECONDS_PER_INTERVAL)
+    }
+
+    pub(crate) fn from_intervals_since_genesis(intervals_since_genesis: u64) -> Self {
+        match intervals_since_genesis % INTERVALS_PER_SLOT {
+            0 => Self::BlockPublication,
+            1 => Self::AttestationProduction,
+            2 => Self::Aggregation,
+            3 => Self::SafeTargetUpdate,
+            4 => Self::EndOfSlot,
+            _ => unreachable!("slots only have 5 intervals"),
+        }
+    }
+}
 
 /// Milliseconds until the next interval boundary, measured relative to genesis.
 fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
@@ -80,11 +127,17 @@ impl BlockChain {
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
-        aggregator: AggregatorController,
-        attestation_committee_count: u64,
-        gate_duties: bool,
-        proposer_config: ProposerConfig,
+        config: BlockChainConfig,
     ) -> BlockChain {
+        let BlockChainConfig {
+            aggregator,
+            sync_status_controller,
+            attestation_committee_count,
+            gate_duties,
+            subscribed_subnets,
+            proposer_config,
+        } = config;
+
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
@@ -108,9 +161,11 @@ impl BlockChain {
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
+            subscribed_subnets,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
+            sync_status_controller,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -157,17 +212,26 @@ pub struct BlockChainServer {
     /// `--is-aggregator` flag at spawn.
     aggregator: AggregatorController,
 
-    /// In-flight committee-signature aggregation, if any. Present only while a
-    /// worker started at the most recent interval 2 is still running or until
-    /// the next interval 2 takes over.
+    /// The slot's one committee-signature aggregation session (started at
+    /// interval 2, or early via the 2/3 trigger). Deliberately persists after
+    /// the worker finishes — that persistence is the once-per-slot latch the
+    /// early trigger and the interval-2 skip both check — until the next
+    /// session start replaces it.
     current_aggregation: Option<AggregationSession>,
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
 
     /// Number of attestation committees (= subnet count). Used by the
-    /// attestation aggregate coverage emission.
+    /// attestation aggregate coverage emission and the early-aggregation
+    /// threshold.
     attestation_committee_count: u64,
+
+    /// Attestation subnets this node subscribes to (its validators' own
+    /// subnets plus any aggregator-only subnets), computed once at startup and
+    /// shared with the P2P swarm via [`ethlambda_p2p::attestation_subscription_subnets`].
+    /// Used to scale the early-aggregation threshold.
+    subscribed_subnets: HashSet<u64>,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -183,6 +247,11 @@ pub struct BlockChainServer {
     /// validator duties while syncing, unless that gating was disabled at
     /// startup via `--disable-duty-sync-gate` (then it is metric-only).
     sync_status: SyncStatusTracker,
+
+    /// Shared, read-only mirror of `sync_status` for readers outside the actor
+    /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
+    /// `update_sync_status` with the same `SyncStatus` fed to the metric.
+    sync_status_controller: SyncStatusController,
 }
 
 impl BlockChainServer {
@@ -192,7 +261,7 @@ impl BlockChainServer {
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
         let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
-        let interval = (time_since_genesis_ms % MILLISECONDS_PER_SLOT) / MILLISECONDS_PER_INTERVAL;
+        let interval = SlotInterval::from_ms_since_genesis(time_since_genesis_ms);
 
         // Idempotency guard
         //
@@ -206,7 +275,7 @@ impl BlockChainServer {
         if store_time > 0 && tick_interval <= store_time {
             debug!(
                 %slot,
-                %interval,
+                ?interval,
                 tick_interval,
                 store_time,
                 "Skipping already-processed tick"
@@ -252,7 +321,7 @@ impl BlockChainServer {
         // needs (those stragglers surface in the `late` section instead). Skip
         // empty snapshots so a missed round keeps the last set we saw. Pure
         // observability.
-        if interval == 4
+        if interval == SlotInterval::EndOfSlot
             && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
         {
             self.pre_merge_coverage = Some(snapshot);
@@ -260,7 +329,7 @@ impl BlockChainServer {
 
         // Whether one of our validators proposes this slot. Drives the store's
         // interval-0 attestation acceptance.
-        let is_proposer = (interval == 0 && slot > 0)
+        let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten()
             .is_some();
@@ -280,14 +349,14 @@ impl BlockChainServer {
             // advances the store to this slot's interval 0 before building (see
             // `propose_block`). The real interval-0 tick is then skipped by the
             // idempotency guard above, since the store clock is already here.
-            0 => {}
+            SlotInterval::BlockPublication => {}
 
             // ==== interval 1 ====
             //
             // Produce attestations at interval 1 (all validators including
             // proposer). Reuse the same snapshot so self-delivery decisions
             // match the rest of the tick.
-            1 => {
+            SlotInterval::AttestationProduction => {
                 // Emit the post-block coverage report for the previous slot.
                 // Fired at interval 1 (not 0) so the block carrying `slot - 1`'s
                 // votes — proposed at interval 0 of this slot — has typically
@@ -306,16 +375,32 @@ impl BlockChainServer {
                 } else if !self.key_manager.validator_ids().is_empty() {
                     info!(%slot, "Skipping attestations while syncing");
                 }
+
+                // Schedule the early-aggregation window check. This tick is
+                // one interval before T2, so the timer fires right as the
+                // window opens at T2 - EARLY_AGGREGATION_WINDOW.
+                if is_aggregator {
+                    send_after(
+                        Duration::from_millis(MILLISECONDS_PER_INTERVAL) - EARLY_AGGREGATION_WINDOW,
+                        ctx.clone(),
+                        EarlyAggregationCheck,
+                    );
+                }
             }
 
             // ==== interval 2 ====
-            2 => {
+            SlotInterval::Aggregation => {
                 if is_aggregator {
-                    coverage::emit_agg_start_new_coverage(
-                        &self.store,
-                        self.attestation_committee_count,
-                    );
-                    self.start_aggregation_session(slot, ctx).await;
+                    // The early trigger may have already started this slot's
+                    // session (running or finished) — it IS the slot's session,
+                    // so don't start a second one.
+                    let already_started = self
+                        .current_aggregation
+                        .as_ref()
+                        .is_some_and(|session| session.session_id == slot);
+                    if !already_started {
+                        self.start_aggregation_session(slot, ctx).await;
+                    }
                 } else {
                     metrics::inc_aggregator_skipped_not_aggregator();
                 }
@@ -324,7 +409,7 @@ impl BlockChainServer {
             // ==== interval 3 ====
             //
             // Safe-target update is handled inside `store::on_tick`.
-            3 => {}
+            SlotInterval::SafeTargetUpdate => {}
 
             // ==== interval 4 ====
             //
@@ -335,7 +420,7 @@ impl BlockChainServer {
             // rather than stashing it for the interval-0 tick — keeps it robust:
             // `on_tick` skips the interval-0 tick whenever this build overruns
             // its interval.
-            4 => {
+            SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
                     .get_our_proposer(next_slot)
@@ -345,8 +430,6 @@ impl BlockChainServer {
                     self.propose_block(next_slot, validator_id).await;
                 }
             }
-
-            _ => {}
         }
 
         // Update safe target slot metric (updated by store.on_tick at interval 3)
@@ -362,7 +445,7 @@ impl BlockChainServer {
     /// 1. If a prior session is still running (pathological), warn and join it.
     /// 2. Snapshot the aggregation inputs from the store.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
-    /// 4. Schedule the `AggregationDeadline` self-message at +750 ms.
+    /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.current_aggregation.take() {
             prior.cancel.cancel();
@@ -383,6 +466,8 @@ impl BlockChainServer {
             }
         }
 
+        coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
+
         let Some(snapshot) =
             aggregation::snapshot_current_slot_aggregation_inputs(&self.store, slot)
         else {
@@ -391,6 +476,25 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let t2_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL;
+        // Interval-2 boundary as a wall-clock instant; the worker holds each
+        // produced aggregate until this before sending it back, so nothing
+        // reaches gossip early.
+        let publish_at = SystemTime::UNIX_EPOCH + Duration::from_millis(t2_ms);
+        let now_ms = unix_now_ms();
+        let early = now_ms < t2_ms;
+        if early {
+            let lead = Duration::from_millis(t2_ms - now_ms);
+            metrics::inc_aggregation_early_starts();
+            metrics::observe_aggregation_early_start_lead(lead);
+            info!(
+                %slot,
+                lead_ms = lead.as_millis() as u64,
+                "Starting aggregation session early"
+            );
+        }
+
         // Independent token per session. Shutdown propagates via our
         // #[stopped] hook which cancels any current session; the deadline
         // timer cancels this specific session at +AGGREGATION_DEADLINE.
@@ -400,7 +504,13 @@ impl BlockChainServer {
         let worker_cancel = cancel.clone();
         let worker_actor = actor_ref.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            run_aggregation_worker(snapshot, worker_actor, worker_cancel, session_id);
+            run_aggregation_worker(
+                snapshot,
+                worker_actor,
+                worker_cancel,
+                session_id,
+                publish_at,
+            );
         });
 
         let _deadline_timer = send_after(
@@ -411,9 +521,84 @@ impl BlockChainServer {
 
         self.current_aggregation = Some(AggregationSession {
             session_id,
+            early,
             cancel,
             worker,
         });
+    }
+
+    /// Early-aggregation trigger: start the slot's session ahead of the
+    /// interval-2 tick when, inside the window `[T2 - EARLY_AGGREGATION_WINDOW, T2)`,
+    /// a single attestation-data group already holds 2/3 of the signatures
+    /// expected from this node's aggregation subnets. Called after every
+    /// stored current-slot gossip signature and once at the window opening via
+    /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started
+    /// session stays in `current_aggregation` (running or finished) until the
+    /// next session replaces it. The latch has one hole: if the snapshot
+    /// yields no jobs (possible only when no signer's pubkey resolves, i.e. a
+    /// corrupted validator registry), no session is installed and the check
+    /// retries on later inserts — each retry is a no-op session attempt.
+    async fn maybe_start_early_aggregation(&mut self, ctx: &Context<Self>) {
+        if !self.aggregator.is_enabled() {
+            return;
+        }
+        // Only fire inside the early-aggregation window
+        // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
+        // slot's interval-2 boundary; the slot is derived from the wall clock.
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let Some(ms_since_genesis) = unix_now_ms().checked_sub(genesis_time_ms) else {
+            return;
+        };
+        let ms_into_slot = ms_since_genesis % MILLISECONDS_PER_SLOT;
+        let t2_offset = 2 * MILLISECONDS_PER_INTERVAL;
+        let window_ms = EARLY_AGGREGATION_WINDOW.as_millis() as u64;
+        if ms_into_slot < t2_offset - window_ms || ms_into_slot >= t2_offset {
+            return;
+        }
+        let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
+        if self
+            .current_aggregation
+            .as_ref()
+            .is_some_and(|session| session.session_id == slot)
+        {
+            return;
+        }
+        let max_group = self.store.max_gossip_group_count_for_slot(slot);
+        // Trigger once the largest current-slot group holds two-thirds of the
+        // votes we expect it to collect, rounded up. Groups are keyed by
+        // attestation data (not by subnet), so one group gathers signatures
+        // from every subnet we subscribe to; the expected count is therefore
+        // the number of network validators whose committee subnet is one of
+        // ours, not a single committee's worth. With `N` validators across `C`
+        // committees, subnet `s` holds `N / C` validators, plus one more when
+        // `s < N % C`. (0 only when there are no such validators, which never
+        // triggers.)
+        let min_group_sigs = if self.attestation_committee_count == 0 {
+            0
+        } else {
+            let validator_count = self.store.head_state().validators.len() as u64;
+            let committee_count = self.attestation_committee_count;
+            let expected_votes: u64 = self
+                .subscribed_subnets
+                .iter()
+                .filter(|&&subnet| subnet < committee_count)
+                .map(|&subnet| {
+                    validator_count / committee_count
+                        + u64::from(subnet < validator_count % committee_count)
+                })
+                .sum();
+            (2 * expected_votes).div_ceil(3) as usize
+        };
+        if min_group_sigs == 0 || max_group < min_group_sigs {
+            return;
+        }
+        info!(
+            %slot,
+            max_group,
+            min_group_sigs,
+            "Early-aggregation threshold met"
+        );
+        self.start_aggregation_session(slot, ctx).await;
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
@@ -947,6 +1132,7 @@ impl BlockChainServer {
             .sync_status
             .update(current_slot, head_slot, max_seen_slot);
         metrics::set_node_sync_status(status);
+        self.sync_status_controller.set(status);
     }
 }
 
@@ -1032,8 +1218,15 @@ impl Handler<NewBlock> for BlockChainServer {
 }
 
 impl Handler<NewAttestation> for BlockChainServer {
-    async fn handle(&mut self, msg: NewAttestation, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         self.on_gossip_attestation(&msg.attestation);
+        // Early aggregation only advances the current slot's group counts, so a
+        // late- or future-slot attestation can never cross the threshold; skip
+        // the check unless this attestation is for the store's current slot.
+        let current_slot = self.store.time() / INTERVALS_PER_SLOT;
+        if msg.attestation.data.slot == current_slot {
+            self.maybe_start_early_aggregation(ctx).await;
+        }
     }
 }
 
@@ -1062,6 +1255,9 @@ impl Handler<AggregateProduced> for BlockChainServer {
             return;
         }
 
+        // Publish alignment is enforced upstream: the worker delays delivery of
+        // this message until the interval-2 boundary, so by the time it lands
+        // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
 
         if let Some(ref p2p) = self.p2p {
@@ -1076,12 +1272,22 @@ impl Handler<AggregateProduced> for BlockChainServer {
     }
 }
 
+impl Handler<EarlyAggregationCheck> for BlockChainServer {
+    async fn handle(&mut self, _msg: EarlyAggregationCheck, ctx: &Context<Self>) {
+        self.maybe_start_early_aggregation(ctx).await;
+    }
+}
+
 impl Handler<AggregationDone> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
         aggregation::finalize_aggregation_session(&self.store);
         metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
 
         let aggregation_elapsed = msg.total_elapsed;
+        let early = self
+            .current_aggregation
+            .as_ref()
+            .is_some_and(|s| s.session_id == msg.session_id && s.early);
         info!(
             ?aggregation_elapsed,
             session_id = msg.session_id,
@@ -1090,6 +1296,7 @@ impl Handler<AggregationDone> for BlockChainServer {
             total_raw_sigs = msg.total_raw_sigs,
             total_children = msg.total_children,
             cancelled = msg.cancelled,
+            early,
             aggregation_deadline_ms = AGGREGATION_DEADLINE.as_millis() as u64,
             "Committee signatures aggregated"
         );
