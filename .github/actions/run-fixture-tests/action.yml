@@ -70,8 +70,8 @@ runs:
         fixtures_url="${{ steps.fixtures-release.outputs.url }}"
         sha_url="${{ steps.fixtures-release.outputs.sha_url }}"
         echo "Downloading fixtures from $fixtures_url"
-        curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
-        curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"
+        curl -L -f --retry 5 --retry-all-errors -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
+        curl -L -f --retry 5 --retry-all-errors -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"
         expected=$(cut -d' ' -f1 "$tmpdir/fixtures-prod-scheme.tar.gz.sha256")
         actual=$(sha256sum "$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $1}')
         if [ "$expected" != "$actual" ]; then
