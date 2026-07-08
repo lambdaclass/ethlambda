@@ -37,7 +37,11 @@ jobs:
             name: arm64
         # Each tag is published twice: once as the regular image and once as a
         # Shadow-simulator-compatible image (tag suffixed "-shadow"). The shadow
-        # build args mirror the `shadow-docker-build` Makefile target.
+        # build args mirror the `shadow-docker-build` Makefile target. LOCKED=
+        # builds the shadow variant unlocked (the quinn-udp [patch] is absent
+        # from Cargo.lock; see Dockerfile), so -shadow images are not
+        # reproducible and should not be treated as equivalent-security
+        # artifacts to the regular tags.
         variant:
           - name: default
             suffix: ""
@@ -116,6 +120,8 @@ jobs:
           SHORT="${SHORT_SHA::7}"
 
           # Publish each tag twice: the regular image and its "-shadow" twin.
+          # These suffixes must stay in sync with the `variant` matrix suffixes
+          # in the build-image job above: a new variant must be added in both.
           for suffix in "" "-shadow"; do
             # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \
