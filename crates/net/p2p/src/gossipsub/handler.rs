@@ -154,19 +154,17 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .cloned()
         .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
+    // Experimental: also tee the gossip payload onto the ethp2p broadcast
+    // engine (a no-op unless the `ethp2p` feature is built and running).
     #[cfg(feature = "ethp2p")]
-    let ethp2p_payload = compressed.clone();
+    crate::ethp2p::tee(
+        server.ethp2p_publish.as_ref(),
+        crate::ethp2p::CHANNEL_ATTESTATION,
+        &ssz_bytes,
+        &compressed,
+    );
 
     server.swarm_handle.publish(topic, compressed);
-
-    #[cfg(feature = "ethp2p")]
-    if let Some(tx) = server.ethp2p_publish.as_ref() {
-        let _ = tx.send(crate::ethp2p::PublishCmd {
-            channel: crate::ethp2p::CHANNEL_ATTESTATION.to_string(),
-            message_id: crate::ethp2p::message_id(&ssz_bytes),
-            payload: ethp2p_payload,
-        });
-    }
     info!(
         %slot,
         validator,
@@ -194,24 +192,20 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
 
     metrics::observe_gossip_block_size(ssz_bytes.len(), compressed.len());
 
-    // Experimental: also broadcast the same bytes via ethp2p (no-op
-    // unless the `ethp2p` feature is built and the engine is running).
+    // Experimental: also tee the gossip payload onto the ethp2p broadcast
+    // engine (a no-op unless the `ethp2p` feature is built and running).
     #[cfg(feature = "ethp2p")]
-    let ethp2p_payload = compressed.clone();
+    crate::ethp2p::tee(
+        server.ethp2p_publish.as_ref(),
+        crate::ethp2p::CHANNEL_BLOCK,
+        &ssz_bytes,
+        &compressed,
+    );
 
     // Publish to gossipsub
     server
         .swarm_handle
         .publish(server.block_topic.clone(), compressed);
-
-    #[cfg(feature = "ethp2p")]
-    if let Some(tx) = server.ethp2p_publish.as_ref() {
-        let _ = tx.send(crate::ethp2p::PublishCmd {
-            channel: crate::ethp2p::CHANNEL_BLOCK.to_string(),
-            message_id: crate::ethp2p::message_id(&ssz_bytes),
-            payload: ethp2p_payload,
-        });
-    }
     info!(
         %slot,
         proposer,
@@ -236,22 +230,20 @@ pub async fn publish_aggregated_attestation(
 
     metrics::observe_gossip_aggregation_size(ssz_bytes.len(), compressed.len());
 
+    // Experimental: also tee the gossip payload onto the ethp2p broadcast
+    // engine (a no-op unless the `ethp2p` feature is built and running).
     #[cfg(feature = "ethp2p")]
-    let ethp2p_payload = compressed.clone();
+    crate::ethp2p::tee(
+        server.ethp2p_publish.as_ref(),
+        crate::ethp2p::CHANNEL_AGGREGATION,
+        &ssz_bytes,
+        &compressed,
+    );
 
     // Publish to the aggregation topic
     server
         .swarm_handle
         .publish(server.aggregation_topic.clone(), compressed);
-
-    #[cfg(feature = "ethp2p")]
-    if let Some(tx) = server.ethp2p_publish.as_ref() {
-        let _ = tx.send(crate::ethp2p::PublishCmd {
-            channel: crate::ethp2p::CHANNEL_AGGREGATION.to_string(),
-            message_id: crate::ethp2p::message_id(&ssz_bytes),
-            payload: ethp2p_payload,
-        });
-    }
     info!(
         %slot,
         target_slot = attestation.data.target.slot,

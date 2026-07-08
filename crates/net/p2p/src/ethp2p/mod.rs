@@ -50,7 +50,6 @@ use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestatio
 use ethlambda_types::block::SignedBlock;
 use ethp2p_broadcast::engine::{DeliveredMessage, Engine, StepResult, rs_relay_factory};
 use ethp2p_broadcast::strategy::config::RsConfig;
-use ethp2p_broadcast::strategy::rs::encode::encode as rs_encode;
 use ethp2p_broadcast::strategy::rs::state::RsStrategy;
 use ethp2p_transport::QuicNet;
 use libssz::SszDecode;
@@ -71,6 +70,11 @@ mod metrics;
 /// QUIC transport emits no disconnect events, so runtime peer loss is not
 /// observable on the ethlambda side (see the module-level Limitations).
 pub(crate) const MIN_ETHP2P_PEERS: usize = 1;
+
+/// Offset added to a node's gossipsub QUIC port to derive its parallel
+/// ethp2p QUIC port. Applied identically to peers we dial and to our own
+/// bind port, so both ends agree on where the mesh lives.
+pub(crate) const ETHP2P_PORT_OFFSET: u16 = 1;
 
 /// ethp2p channel ids — mirror the gossipsub topic kinds.
 pub(crate) const CHANNEL_BLOCK: &str = "block";
@@ -212,14 +216,16 @@ impl Ethp2pBroadcast {
         message_id: &str,
         payload: &[u8],
     ) -> Result<(), Ethp2pError> {
-        let (preamble, _shards) =
-            rs_encode(payload, &self.config).map_err(|e| Ethp2pError::Encode(format!("{e:?}")))?;
+        // `new_origin` Reed-Solomon-encodes `payload` and retains the
+        // resulting preamble; serialize that rather than encoding a second
+        // time (the shards from a standalone encode would only be discarded).
+        let strategy = RsStrategy::new_origin(payload, self.config)
+            .map_err(|e| Ethp2pError::Encode(format!("{e:?}")))?;
+        let preamble = strategy.preamble();
         let mut preamble_bytes = Vec::with_capacity(preamble.encoded_len());
         preamble
             .encode(&mut preamble_bytes)
             .map_err(|e| Ethp2pError::Encode(e.to_string()))?;
-        let strategy = RsStrategy::new_origin(payload, self.config)
-            .map_err(|e| Ethp2pError::Encode(format!("{e:?}")))?;
         self.engine
             .publish(
                 &channel.to_string(),
@@ -282,8 +288,26 @@ pub(crate) struct PublishCmd {
 /// Stable per-message id for an ethp2p session: hex of the SSZ bytes'
 /// SHA-256. Unique per message and independent of the transport.
 pub(crate) fn message_id(ssz_bytes: &[u8]) -> String {
-    let digest = Sha256::digest(ssz_bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(Sha256::digest(ssz_bytes))
+}
+
+/// Tee a just-published gossip payload onto the ethp2p broadcast engine so
+/// it also travels the parallel QUIC mesh. A no-op when the engine isn't
+/// running (`sender` is `None`), and it copies `compressed` only when there
+/// is actually a consumer.
+pub(crate) fn tee(
+    sender: Option<&mpsc::UnboundedSender<PublishCmd>>,
+    channel: &str,
+    ssz_bytes: &[u8],
+    compressed: &[u8],
+) {
+    if let Some(tx) = sender {
+        let _ = tx.send(PublishCmd {
+            channel: channel.to_string(),
+            message_id: message_id(ssz_bytes),
+            payload: compressed.to_vec(),
+        });
+    }
 }
 
 /// Long-lived task that owns the broadcast engine: drives it forward,
@@ -328,17 +352,19 @@ pub(crate) async fn run_engine_task(
             cmd = publish_rx.recv() => {
                 match cmd {
                     Some(cmd) => {
-                        match broadcast.publish_bytes(&cmd.channel, &cmd.message_id, &cmd.payload) {
-                            Ok(()) => {
+                        let _ = broadcast
+                            .publish_bytes(&cmd.channel, &cmd.message_id, &cmd.payload)
+                            .inspect(|_| {
                                 metrics::inc_published(&cmd.channel);
                                 debug!(
                                     channel = %cmd.channel,
                                     bytes = cmd.payload.len(),
                                     "ethp2p: published message"
                                 );
-                            }
-                            Err(e) => warn!(%e, channel = %cmd.channel, "ethp2p: publish failed"),
-                        }
+                            })
+                            .inspect_err(|e| {
+                                warn!(%e, channel = %cmd.channel, "ethp2p: publish failed")
+                            });
                     }
                     // Publish sender dropped (the P2P actor stopped). The
                     // engine has no driver left; shut the task down rather

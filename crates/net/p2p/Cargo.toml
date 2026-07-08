@@ -55,12 +55,15 @@ ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d0
 # Needed to serialize the RS preamble (a prost message) before publishing.
 # Version-matched to ethp2p-broadcast's prost so cargo unifies them.
 prost = { version = "0.13", optional = true }
+# Hex-encodes ethp2p message ids. Feature-gated so the default build is
+# unaffected (also a dev-dependency, used by tests regardless of feature).
+hex = { workspace = true, optional = true }
 
 [features]
 # Experimental: also broadcast gossip via ethp2p-rs erasure-coded
 # broadcast over a parallel QUIC network, alongside libp2p gossipsub.
 # Off by default; ethlambda <-> ethlambda only. Requires `protoc` to build.
-ethp2p = ["dep:ethp2p-broadcast", "dep:ethp2p-transport", "dep:prost"]
+ethp2p = ["dep:ethp2p-broadcast", "dep:ethp2p-transport", "dep:prost", "dep:hex"]
 
 [dev-dependencies]
 hex.workspace = true

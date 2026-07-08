@@ -332,7 +332,9 @@ pub fn build_swarm(
                 crate::ethp2p::derive_peer_id(&pubkey),
                 Some(SocketAddr::new(
                     bootnode.ip,
-                    bootnode.quic_port.wrapping_add(1),
+                    bootnode
+                        .quic_port
+                        .wrapping_add(crate::ethp2p::ETHP2P_PORT_OFFSET),
                 )),
             ));
         }
@@ -395,7 +397,10 @@ pub fn build_swarm(
         ethp2p_local_peer,
         SocketAddr::new(
             config.listening_socket.ip(),
-            config.listening_socket.port().wrapping_add(1),
+            config
+                .listening_socket
+                .port()
+                .wrapping_add(crate::ethp2p::ETHP2P_PORT_OFFSET),
         ),
         ethp2p_peers,
     );
