@@ -10,12 +10,43 @@ runs:
     - name: Get leanSpec fixtures release info
       id: fixtures-release
       shell: bash
+      env:
+        # Authenticate the API call: unauthenticated requests share the runner
+        # IP's low rate-limit pool, which is the usual cause of transient failures.
+        GH_TOKEN: ${{ github.token }}
       run: |
+        set -euo pipefail
         api_url="https://api.github.com/repos/leanEthereum/leanSpec/releases/latest"
-        json=$(curl -sL "$api_url")
-        fixtures_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz'))")
-        sha_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz.sha256'))")
-        sha=$(curl -sL "$sha_url" | cut -d' ' -f1)
+
+        # -f fails on HTTP errors (so an error body is never captured as data) and
+        # --retry rides out transient network/5xx hiccups. Fail loudly, since a
+        # command substitution in an assignment does not trip `set -e` on its own.
+        json=$(curl -sSL -f --retry 5 --retry-all-errors \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          "$api_url") \
+          || { echo "::error::Failed to fetch leanSpec latest release metadata from $api_url"; exit 1; }
+
+        asset_url() {
+          echo "$json" | python3 -c \
+            "import sys,json; name=sys.argv[1]; j=json.load(sys.stdin); print(next(a['browser_download_url'] for a in j.get('assets',[]) if a.get('name')==name))" \
+            "$1"
+        }
+        fixtures_url=$(asset_url "fixtures-prod-scheme.tar.gz") \
+          || { echo "::error::Release is missing the fixtures-prod-scheme.tar.gz asset"; exit 1; }
+        sha_url=$(asset_url "fixtures-prod-scheme.tar.gz.sha256") \
+          || { echo "::error::Release is missing the fixtures-prod-scheme.tar.gz.sha256 asset"; exit 1; }
+
+        sha=$(curl -sSL -f --retry 5 --retry-all-errors "$sha_url" | cut -d' ' -f1) \
+          || { echo "::error::Failed to download the fixtures checksum from $sha_url"; exit 1; }
+
+        # Validate before writing: a transient HTML error page captured as $sha
+        # previously corrupted $GITHUB_OUTPUT ("Invalid format '<!--'").
+        if [[ ! "$sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          echo "::error::Expected a 64-char hex SHA256 for the fixtures archive, got: '$sha'"
+          exit 1
+        fi
+
         {
           echo "url=$fixtures_url"
           echo "sha_url=$sha_url"
