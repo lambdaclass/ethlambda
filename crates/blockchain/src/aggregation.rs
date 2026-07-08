@@ -1,7 +1,9 @@
 //! Committee-signature aggregation: off-thread worker orchestration and the
 //! pure functions it runs.
 //!
-//! The blockchain actor fires one aggregation session per interval 2 via
+//! The blockchain actor fires one aggregation session per slot — at interval 2,
+//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
+//! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
 //! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
@@ -15,7 +17,7 @@
 //! most [`MAX_AGGREGATION_JOBS`] jobs.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::aggregate_mixed;
 use ethlambda_state_transition::justified_slots_ops;
@@ -29,23 +31,40 @@ use ethlambda_types::{
     state::{JustifiedSlots, Validator},
 };
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::ActorRef;
+use spawned_concurrency::tasks::{ActorRef, Context, send_after};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore, Tier};
-use crate::metrics;
+use crate::{MILLISECONDS_PER_INTERVAL, metrics};
 
-/// Soft deadline for committee-signature aggregation measured from the
-/// interval-2 tick. After this much wall time elapses, the actor signals the
-/// worker to stop via its cancellation token. The 50 ms budget before the next
-/// interval (interval 3 at +800 ms) is reserved for publishing any late-arriving
-/// aggregates and for gossip propagation margin.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(750);
+/// Soft deadline for committee-signature aggregation measured from session
+/// start. After this much wall time elapses, the actor signals the worker to
+/// stop via its cancellation token. A session started exactly at interval 2
+/// gets the full interval (interval 3 is one interval later); a session
+/// started early (see `maybe_start_early_aggregation`) ends correspondingly
+/// earlier. The deadline only stops new jobs from starting — a job mid-proof
+/// finishes and publishes right after.
+pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
 pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Width of the early-aggregation window: a session may start at most this
+/// long before the interval-2 boundary, provided the signature threshold is
+/// met (see the check in `maybe_start_early_aggregation`).
+pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
+
+// The window must fit within one interval: `maybe_start_early_aggregation`
+// subtracts it from the interval-2 offset, and the interval-1 tick schedules
+// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW`. Keep
+// this invariant self-enforcing so a future bump to the window can't silently
+// underflow either subtraction.
+const _: () = assert!(
+    EARLY_AGGREGATION_WINDOW.as_millis() <= MILLISECONDS_PER_INTERVAL as u128,
+    "EARLY_AGGREGATION_WINDOW must not exceed one interval"
+);
 
 /// A single pre-prepared aggregation group.
 ///
@@ -87,6 +106,9 @@ pub(crate) struct AggregationSession {
     /// Slot at which this session was started; used as a fencing id so we can
     /// drop late-arriving messages from a prior session.
     pub(crate) session_id: u64,
+    /// Whether the session started before the slot's interval-2 boundary via
+    /// the early-aggregation trigger.
+    pub(crate) early: bool,
     /// Child of the actor cancellation token; fires either at the deadline or
     /// when the actor itself is stopping.
     pub(crate) cancel: CancellationToken,
@@ -118,12 +140,21 @@ impl Message for AggregationDone {
     type Result = ();
 }
 
-/// Self-message scheduled via `send_after` at interval-2 start. Cancels the
+/// Self-message scheduled via `send_after` at session start. Cancels the
 /// session's token so the worker stops starting new aggregations.
 pub(crate) struct AggregationDeadline {
     pub(crate) session_id: u64,
 }
 impl Message for AggregationDeadline {
+    type Result = ();
+}
+
+/// One-shot self-message scheduled at the interval-1 tick; fires when the
+/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW) to run
+/// the threshold check for signatures that all arrived before the window.
+/// Arrivals inside the window are checked per insert instead.
+pub(crate) struct EarlyAggregationCheck;
+impl Message for EarlyAggregationCheck {
     type Result = ();
 }
 
@@ -714,11 +745,19 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and streams
 /// successful aggregates back to the actor as [`AggregateProduced`] messages.
 /// Emits [`AggregationDone`] when the loop exits (completion or cancellation).
+///
+/// Publish alignment: aggregates must not reach the actor (and thus gossip)
+/// before the interval-2 boundary. `publish_at` is that boundary as a wall-clock
+/// instant; a produced aggregate still ahead of it is delivered via
+/// [`send_after`] timed to land at the boundary, otherwise it is sent
+/// immediately. A normal interval-2 session starts at the boundary, so its
+/// aggregates are always past it and sent without delay.
 pub(crate) fn run_aggregation_worker(
     snapshot: AggregationSnapshot,
     actor: ActorRef<crate::BlockChainServer>,
     cancel: CancellationToken,
     session_id: u64,
+    publish_at: SystemTime,
 ) {
     let start = Instant::now();
     let groups_considered = snapshot.groups_considered;
@@ -766,12 +805,29 @@ pub(crate) fn run_aggregation_worker(
         total_raw_sigs += raw_sigs;
         total_children += children;
 
-        if actor
-            .send(AggregateProduced { session_id, output })
-            .is_err()
-        {
-            // Actor is gone; no point producing more.
-            break;
+        // Hold the aggregate until the interval-2 boundary (early session), or
+        // send now if already at/past it. `send_after` is fire-and-forget: it
+        // spawns a timer that delivers the message and is cancelled only if the
+        // actor stops, so the produced aggregate is not lost when the worker's
+        // own loop ends. `duration_since` errs once the boundary has passed,
+        // which collapses to a zero delay here.
+        let delay = publish_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        if delay.is_zero() {
+            if actor
+                .send(AggregateProduced { session_id, output })
+                .is_err()
+            {
+                // Actor is gone; no point producing more.
+                break;
+            }
+        } else {
+            send_after(
+                delay,
+                Context::from_ref(&actor),
+                AggregateProduced { session_id, output },
+            );
         }
     }
 
