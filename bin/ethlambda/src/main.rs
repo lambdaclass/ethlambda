@@ -37,7 +37,9 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{
+    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
+};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -50,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::{BlockChain, SyncStatusController};
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -214,38 +216,46 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
+    // Attestation subnets this node subscribes to, computed once and shared by
+    // the P2P swarm (to open gossip subscriptions) and the blockchain actor
+    // (to size the early-aggregation threshold), so both agree on which subnets
+    // feed this node's gossip groups. Subscriptions are fixed at startup and
+    // are not re-evaluated when the aggregator role is toggled at runtime; see
+    // the hot-standby note on SwarmConfig.
+    let subscribed_subnets = attestation_subscription_subnets(
+        &validator_ids,
+        attestation_committee_count,
+        options.is_aggregator,
+        options.aggregate_subnet_ids.as_deref(),
+    );
+
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
     // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
     // metric's startup value.
     let sync_status = SyncStatusController::default();
 
-    let blockchain = BlockChain::spawn(
-        store.clone(),
-        validator_keys,
-        aggregator.clone(),
-        sync_status.clone(),
+    let blockchain_config = BlockChainConfig {
+        aggregator: aggregator.clone(),
+        sync_status_controller: sync_status.clone(),
         attestation_committee_count,
-        !options.disable_duty_sync_gate,
-        ProposerConfig {
+        gate_duties: !options.disable_duty_sync_gate,
+        subscribed_subnets: subscribed_subnets.clone(),
+        proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
         },
-    );
+    };
 
-    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
-    // AggregatorController — subnet subscriptions are decided once here and
-    // are not re-evaluated at runtime. Toggling via the admin API affects
-    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
-    // for the invariant.
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config);
+
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        is_aggregator: options.is_aggregator,
-        aggregate_subnet_ids: options.aggregate_subnet_ids,
+        subscription_subnets: subscribed_subnets,
     })
     .wrap_err("failed to build swarm")?;
 
