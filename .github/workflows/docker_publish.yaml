@@ -35,31 +35,29 @@ jobs:
             name: amd64
           - runner: ubuntu-22.04-arm
             name: arm64
-        # Each tag is published three times: the regular image, a
-        # Shadow-simulator-compatible image ("-shadow"), and an image with the
-        # experimental ethp2p erasure-coded broadcast feature ("-ethp2p"). The
-        # shadow build args mirror the `shadow-docker-build` Makefile target;
-        # LOCKED= builds the shadow variant unlocked (the quinn-udp [patch] is
+        # This (ethp2p adapter) branch publishes two images, BOTH compiled with
+        # the experimental ethp2p erasure-coded broadcast feature: a regular
+        # image and a Shadow-simulator-compatible one ("-shadow"). Dispatch with
+        # `-f tags=ethp2p` to get `:ethp2p` and `:ethp2p-shadow`.
+        #
+        # The shadow build args mirror the `shadow-docker-build` Makefile target
+        # plus ethp2p; LOCKED= builds it unlocked (the quinn-udp [patch] is
         # absent from Cargo.lock; see Dockerfile), so -shadow images are not
         # reproducible and should not be treated as equivalent-security
-        # artifacts to the regular tags. The ethp2p variant only adds
-        # FEATURES=ethp2p and builds locked (protoc is already installed in the
-        # build image; the ethp2p-rs git dep is public, so it needs no creds).
+        # artifacts. protoc is already in the build image and the ethp2p-rs git
+        # dep is public, so the regular variant only adds FEATURES=ethp2p.
         variant:
-          - name: default
+          - name: ethp2p
             suffix: ""
-            build_args: ""
-          - name: shadow
+            build_args: |
+              FEATURES=ethp2p
+          - name: ethp2p-shadow
             suffix: "-shadow"
             build_args: |
               SHADOW=1
-              FEATURES=shadow-integration
+              FEATURES=shadow-integration ethp2p
               NO_DEFAULT_FEATURES=--no-default-features
               LOCKED=
-          - name: ethp2p
-            suffix: "-ethp2p"
-            build_args: |
-              FEATURES=ethp2p
     runs-on: ${{ matrix.arch.runner }}
 
     steps:
@@ -126,11 +124,11 @@ jobs:
           FIRST_TAG="${TAG_ARRAY[0]}"
           SHORT="${SHORT_SHA::7}"
 
-          # Publish each tag once per variant: the regular image, its "-shadow"
-          # twin, and its "-ethp2p" twin. These suffixes must stay in sync with
-          # the `variant` matrix suffixes in the build-image job above: a new
-          # variant must be added in both.
-          for suffix in "" "-shadow" "-ethp2p"; do
+          # Publish each tag twice: the regular ethp2p image and its "-shadow"
+          # twin. These suffixes must stay in sync with the `variant` matrix
+          # suffixes in the build-image job above: a new variant must be added
+          # in both.
+          for suffix in "" "-shadow"; do
             # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \
               -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}${suffix} \
