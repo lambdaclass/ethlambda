@@ -2192,7 +2192,7 @@ dependencies = [
  "libssz",
  "libssz-derive",
  "libssz-types",
- "lru",
+ "lru 0.16.4",
  "rand 0.10.1",
  "rocksdb",
  "tempfile",
@@ -2234,6 +2234,7 @@ dependencies = [
 [[package]]
 name = "ethp2p-broadcast"
 version = "0.0.0"
+source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=d03d2ba6e8e96c836c701804ea3bdce7973802d2#d03d2ba6e8e96c836c701804ea3bdce7973802d2"
 dependencies = [
  "bytes",
  "ethp2p-protocol",
@@ -2250,6 +2251,7 @@ dependencies = [
 [[package]]
 name = "ethp2p-protocol"
 version = "0.0.0"
+source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=d03d2ba6e8e96c836c701804ea3bdce7973802d2#d03d2ba6e8e96c836c701804ea3bdce7973802d2"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -2258,6 +2260,7 @@ dependencies = [
 [[package]]
 name = "ethp2p-transport"
 version = "0.0.0"
+source = "git+https://github.com/lambdaclass/ethp2p-rs?rev=d03d2ba6e8e96c836c701804ea3bdce7973802d2#d03d2ba6e8e96c836c701804ea3bdce7973802d2"
 dependencies = [
  "ethp2p-broadcast",
  "futures",

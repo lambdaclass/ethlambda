@@ -46,13 +46,12 @@ libssz-types.workspace = true
 sha2 = "0.10"
 
 # ethp2p-rs erasure-coded broadcast (experimental, off by default).
-# Pinned to a github.com/lambdaclass/ethp2p-rs commit. ethp2p-rs is an
-# INTERNAL repo: building with the `ethp2p` feature requires git credentials
-# for it (CI already sets `CARGO_NET_GIT_FETCH_WITH_CLI=true`) plus `protoc`
-# on the build host (ethp2p-broadcast compiles its .proto via prost-build).
-# The default (feature-off) build needs neither.
-ethp2p-broadcast = { path = "../../../ethp2p-rs/crates/ethp2p-broadcast", optional = true }
-ethp2p-transport = { path = "../../../ethp2p-rs/crates/ethp2p-transport", optional = true }
+# Pinned to a github.com/lambdaclass/ethp2p-rs commit. The repo is public, so
+# resolution needs no credentials; building with the `ethp2p` feature also
+# needs `protoc` on the build host (ethp2p-broadcast compiles its .proto via
+# prost-build). The default (feature-off) build compiles neither crate.
+ethp2p-broadcast = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d03d2ba6e8e96c836c701804ea3bdce7973802d2", optional = true }
+ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d03d2ba6e8e96c836c701804ea3bdce7973802d2", optional = true }
 # Needed to serialize the RS preamble (a prost message) before publishing.
 # Version-matched to ethp2p-broadcast's prost so cargo unifies them.
 prost = { version = "0.13", optional = true }

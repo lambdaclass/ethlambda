@@ -15,9 +15,6 @@ members = [
     "crates/net/rpc",
     "crates/storage",
 ]
-# Local-only: the gitignored vendored ethp2p-rs is its own workspace; exclude
-# it so it isn't pulled into this one. Harmless when the dir is absent.
-exclude = ["ethp2p-rs"]
 
 [workspace.package]
 authors = ["LambdaClass"]

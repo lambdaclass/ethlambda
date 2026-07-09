@@ -38,11 +38,6 @@ ENV NO_DEFAULT_FEATURES=$NO_DEFAULT_FEATURES
 ARG LOCKED="--locked"
 ENV LOCKED=$LOCKED
 
-# Local-only: the vendored ethp2p-rs is an out-of-workspace path dep, so
-# cargo-chef cook needs its manifests present to resolve. Copying it here
-# (before cook) keeps it in the cached dependency layer.
-COPY ethp2p-rs ethp2p-rs
-
 RUN cargo chef cook --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" --recipe-path recipe.json
 
 # Build application
