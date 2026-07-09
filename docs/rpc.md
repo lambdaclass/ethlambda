@@ -32,6 +32,8 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
 | `GET` | `/lean/v0/fork_choice/ui` | HTML | Interactive D3.js visualization |
+| `GET` | `/lean/v0/node/identity` | JSON | Client version and libp2p peer ID |
+| `GET` | `/lean/v0/node/syncing` | JSON | Sync status relative to the wall clock |
 | `GET` | `/lean/v0/admin/aggregator` | JSON | Current aggregator role |
 | `POST` | `/lean/v0/admin/aggregator` | JSON | Toggle aggregator role at runtime |
 
@@ -116,6 +118,29 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 ```
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
+
+### `GET /lean/v0/node/identity`
+
+```json
+{
+  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0",
+  "peer_id": "16Uiu2HAm7v1x…"
+}
+```
+
+`version` is the full client version string, identical to what `ethlambda --version` prints: crate semver, git branch and short SHA, target triple, and rustc version. Baked in at compile time from `CARGO_PKG_VERSION` plus the `vergen-git2` build metadata.
+
+`peer_id` is the node's libp2p peer ID (base58), derived from the node key and fixed for the lifetime of the process; it matches the identity the node presents to peers on the wire.
+
+### `GET /lean/v0/node/syncing`
+
+```json
+{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
+```
+
+`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+
+`sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
 ### `GET` / `POST /lean/v0/admin/aggregator`
 
