@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -9,13 +9,16 @@ use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{
         AttestationData, HashedAttestationData, SignedAggregatedAttestation, SignedAttestation,
+        validator_indices,
     },
     block::{Block, SingleMessageAggregate},
     primitives::{ByteList, H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
 
-use ethlambda_test_fixtures::fork_choice::{AttestationCheck, ForkChoiceTestVector, StoreChecks};
+use ethlambda_test_fixtures::fork_choice::{
+    AttestationCheck, BlockAttestationCheck, ForkChoiceTestVector, StoreChecks,
+};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
 
@@ -75,15 +78,27 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             .into());
         }
 
+        // The anchor is always reachable under the label "genesis", matching
+        // leanSpec's harness which seeds `block_registry = {"genesis": anchor}`
+        // (true even for checkpoint-sync fixtures anchored past slot 0). Label
+        // checks such as `sourceRootLabel` and `labelsInStore` rely on it.
+        let anchor_root = anchor_block.hash_tree_root();
+
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block)
             .expect("anchor state and block must match");
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
+        block_registry.insert("genesis".to_string(), anchor_root);
 
         // Process steps
         for (step_idx, step) in test.steps.into_iter().enumerate() {
+            // Head before this step executes, for the `reorgDepth` check.
+            let old_head = store.head();
+            // Block built/imported this step, for the block-body checks. Mirrors
+            // leanSpec's per-step `filled_block` (only a block step sets it).
+            let mut filled_block: Option<Block> = None;
             match step.step_type.as_str() {
                 "block" => {
                     let block_data = step.block.expect("block step missing block data");
@@ -94,6 +109,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                         let root = block.hash_tree_root();
                         block_registry.insert(label.clone(), root);
                     }
+
+                    // The block this step delivers is the leanSpec `filled_block`.
+                    filled_block = Some(block_data.to_block());
 
                     let signed_block = block_data.to_blank_signed_block();
 
@@ -208,7 +226,14 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
             // Validate checks
             if let Some(checks) = step.checks {
-                validate_checks(&store, &checks, step_idx, &block_registry)?;
+                validate_checks(
+                    &store,
+                    &checks,
+                    step_idx,
+                    &block_registry,
+                    old_head,
+                    filled_block.as_ref(),
+                )?;
             }
         }
     }
@@ -234,6 +259,8 @@ fn validate_checks(
     checks: &StoreChecks,
     step_idx: usize,
     block_registry: &HashMap<String, H256>,
+    old_head: H256,
+    filled_block: Option<&Block>,
 ) -> datatest_stable::Result<()> {
     // Validate time check: fixtures encode the expected store time in intervals
     // since genesis (matching `Store::time()`).
@@ -402,16 +429,309 @@ fn validate_checks(
         }
     }
 
+    // Validate attestationTargetRootLabel: the attestation target root must
+    // resolve to the labeled block.
+    if let Some(ref label) = checks.attestation_target_root_label {
+        let expected = resolve_label(label, block_registry, step_idx)?;
+        let actual = store::get_attestation_target(st).root;
+        if actual != expected {
+            return Err(format!(
+                "Step {step_idx}: attestationTargetRootLabel mismatch (label '{label}'): \
+                 expected {expected:?}, got {actual:?}"
+            )
+            .into());
+        }
+    }
+
     // Validate attestationChecks
     if let Some(ref att_checks) = checks.attestation_checks {
         for att_check in att_checks {
-            validate_attestation_check(st, att_check, step_idx)?;
+            validate_attestation_check(st, att_check, step_idx, block_registry)?;
         }
+    }
+
+    // Validate the accepted (known) pool's target-slot set: the sorted-unique
+    // set of target slots keyed in the known aggregated pool must match.
+    // Mirrors leanSpec's `{data.target.slot for data in pool}` over all
+    // distinct pool entries.
+    if let Some(ref expected) = checks.latest_known_aggregated_target_slots {
+        let actual: Vec<u64> = sorted_unique(
+            st.known_aggregated_payloads()
+                .values()
+                .map(|(data, _)| data.target.slot),
+        );
+        check_target_slots(
+            "latestKnownAggregatedTargetSlots",
+            &actual,
+            expected,
+            step_idx,
+        )?;
+    }
+
+    // NOTE: `latestNewAggregatedTargetSlots`, `attestationSignatureTargetSlots`
+    // and `newPoolProofParticipants` are parsed but NOT asserted here. They
+    // read the pending (new) aggregated pool and the raw gossip-signature pool,
+    // which this offline runner does not drive the way leanSpec's harness does:
+    // it advances ticks without the aggregator role and folds block-borne votes
+    // straight into the known pool, so the new/signature pools do not track
+    // leanSpec's contents. The accepted (known) pool, which the runner does
+    // populate, is asserted above.
+    // TODO(leanSpec new/signature pools): assert these once the runner drives
+    // interval-2 aggregation with the aggregator role so the pending and raw
+    // signature pools mirror leanSpec's.
+
+    // Validate block-body checks against the block built this step.
+    if let Some(expected_count) = checks.block_attestation_count {
+        let block = filled_block.ok_or_else(|| {
+            format!("Step {step_idx}: blockAttestationCount set but no block was built this step")
+        })?;
+        let actual = block.body.attestations.len() as u64;
+        if actual != expected_count {
+            return Err(format!(
+                "Step {step_idx}: blockAttestationCount mismatch: expected {expected_count}, \
+                 got {actual}"
+            )
+            .into());
+        }
+    }
+    if let Some(ref block_checks) = checks.block_attestations {
+        let block = filled_block.ok_or_else(|| {
+            format!("Step {step_idx}: blockAttestations set but no block was built this step")
+        })?;
+        validate_block_attestations(block, block_checks, step_idx)?;
     }
 
     // Validate lexicographicHeadAmong
     if let Some(ref fork_labels) = checks.lexicographic_head_among {
         validate_lexicographic_head_among(st, fork_labels, step_idx, block_registry)?;
+    }
+
+    // Validate canonicalEquivocationHeadAmong (leanSpec #1189)
+    if let Some(ref fork_labels) = checks.canonical_equivocation_head_among {
+        validate_canonical_equivocation_head_among(st, fork_labels, step_idx, block_registry)?;
+    }
+
+    // Validate reorgDepth: blocks reachable from the old head but not the new.
+    if let Some(expected_depth) = checks.reorg_depth {
+        let blocks = st.get_live_chain();
+        let old_ancestors = ancestor_set(&blocks, old_head);
+        let new_ancestors = ancestor_set(&blocks, st.head());
+        let actual_depth = old_ancestors.difference(&new_ancestors).count() as u64;
+        if actual_depth != expected_depth {
+            return Err(format!(
+                "Step {step_idx}: reorgDepth mismatch: expected {expected_depth}, got {actual_depth}"
+            )
+            .into());
+        }
+    }
+
+    // Validate labelsInStore: each labeled block must still be in the block tree.
+    if let Some(ref labels) = checks.labels_in_store {
+        let blocks = st.get_live_chain();
+        for label in labels {
+            let root = resolve_label(label, block_registry, step_idx)?;
+            if !blocks.contains_key(&root) {
+                return Err(format!(
+                    "Step {step_idx}: labelsInStore: block '{label}' (root={root:?}) \
+                     not found in the store"
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a block label to its root via the step's block registry.
+fn resolve_label(
+    label: &str,
+    block_registry: &HashMap<String, H256>,
+    step_idx: usize,
+) -> datatest_stable::Result<H256> {
+    block_registry.get(label).copied().ok_or_else(|| {
+        format!(
+            "Step {step_idx}: label '{label}' not found in block registry. Available: {:?}",
+            block_registry.keys().collect::<Vec<_>>()
+        )
+        .into()
+    })
+}
+
+/// Collect an iterator of slots into a sorted, de-duplicated `Vec`.
+fn sorted_unique(slots: impl Iterator<Item = u64>) -> Vec<u64> {
+    let set: BTreeSet<u64> = slots.collect();
+    set.into_iter().collect()
+}
+
+/// Compare an actual sorted-unique target-slot set against the fixture's.
+fn check_target_slots(
+    name: &str,
+    actual: &[u64],
+    expected: &[u64],
+    step_idx: usize,
+) -> datatest_stable::Result<()> {
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort_unstable();
+    expected_sorted.dedup();
+    if actual != expected_sorted.as_slice() {
+        return Err(format!(
+            "Step {step_idx}: {name} mismatch: expected {expected_sorted:?}, got {actual:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Walk parent links from `head`, collecting every reachable block root.
+///
+/// Mirrors leanSpec's `_ancestor_set`: only roots present in the block tree are
+/// collected, so the walk stops at the anchor (whose parent is not in the tree).
+fn ancestor_set(blocks: &HashMap<H256, (u64, H256)>, head: H256) -> HashSet<H256> {
+    let mut seen = HashSet::new();
+    let mut root = head;
+    while let Some(&(_, parent_root)) = blocks.get(&root) {
+        seen.insert(root);
+        if parent_root == H256::ZERO {
+            break;
+        }
+        root = parent_root;
+    }
+    seen
+}
+
+/// Validate the detailed per-aggregate checks against a built block body.
+///
+/// Mirrors leanSpec's `_validate_block_attestations`: each expected check must
+/// match an aggregate whose participant set is exactly equal, then the matched
+/// aggregate's slot/target-slot are compared.
+fn validate_block_attestations(
+    block: &Block,
+    expected_checks: &[BlockAttestationCheck],
+    step_idx: usize,
+) -> datatest_stable::Result<()> {
+    let actual: Vec<(BTreeSet<u64>, &AttestationData)> = block
+        .body
+        .attestations
+        .iter()
+        .map(|att| {
+            (
+                validator_indices(&att.aggregation_bits).collect(),
+                &att.data,
+            )
+        })
+        .collect();
+
+    for check in expected_checks {
+        let expected_participants: BTreeSet<u64> = check.participants.iter().copied().collect();
+        let matched = actual
+            .iter()
+            .find(|(participants, _)| *participants == expected_participants);
+        let (_, data) = matched.ok_or_else(|| {
+            let available: Vec<_> = actual
+                .iter()
+                .map(|(p, _)| p.iter().collect::<Vec<_>>())
+                .collect();
+            format!(
+                "Step {step_idx}: blockAttestations: no aggregate with participants \
+                 {expected_participants:?}. Available: {available:?}"
+            )
+        })?;
+
+        if let Some(expected_slot) = check.attestation_slot
+            && data.slot != expected_slot
+        {
+            return Err(format!(
+                "Step {step_idx}: blockAttestations: aggregate {expected_participants:?} \
+                 attestationSlot mismatch: expected {expected_slot}, got {}",
+                data.slot
+            )
+            .into());
+        }
+        if let Some(expected_target) = check.target_slot
+            && data.target.slot != expected_target
+        {
+            return Err(format!(
+                "Step {step_idx}: blockAttestations: aggregate {expected_participants:?} \
+                 targetSlot mismatch: expected {expected_target}, got {}",
+                data.target.slot
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate the equal-slot equivocation tiebreak (leanSpec #1189).
+///
+/// Each listed fork must be targeted by an attestation in the accepted (known)
+/// aggregated pool; the head must sit on the fork whose targeting attestation
+/// carries the largest `hash_tree_root` (the pool key). Scheme-independent:
+/// roots are read from the store, never pinned by the fixture.
+fn validate_canonical_equivocation_head_among(
+    st: &Store,
+    fork_labels: &[String],
+    step_idx: usize,
+    block_registry: &HashMap<String, H256>,
+) -> datatest_stable::Result<()> {
+    if fork_labels.len() < 2 {
+        return Err(format!(
+            "Step {step_idx}: canonicalEquivocationHeadAmong requires at least 2 forks, got {}",
+            fork_labels.len()
+        )
+        .into());
+    }
+
+    // The known aggregated pool is keyed by hash_tree_root(AttestationData).
+    let known = st.known_aggregated_payloads();
+
+    // Per fork: block root, and the largest attestation-data root targeting it.
+    let mut fork_data: Vec<(&str, H256, H256)> = Vec::with_capacity(fork_labels.len());
+    for label in fork_labels {
+        let fork_root = resolve_label(label, block_registry, step_idx)?;
+        let max_att_root = known
+            .iter()
+            .filter(|(_, (data, _))| data.target.root == fork_root)
+            .map(|(data_root, _)| *data_root)
+            .max()
+            .ok_or_else(|| {
+                format!(
+                    "Step {step_idx}: canonicalEquivocationHeadAmong fork '{label}' \
+                     (block_root={fork_root:?}) has no attestation targeting it in the \
+                     accepted aggregated pool"
+                )
+            })?;
+        fork_data.push((label.as_str(), fork_root, max_att_root));
+    }
+
+    // Winner: the fork carrying the largest attestation-data root.
+    let (winning_label, winning_fork_root, _) = fork_data
+        .iter()
+        .max_by_key(|(_, _, att_root)| *att_root)
+        .expect("fork_data is non-empty");
+
+    let actual_head = st.head();
+    if actual_head != *winning_fork_root {
+        let actual_label = fork_data
+            .iter()
+            .find(|(_, root, _)| *root == actual_head)
+            .map(|(label, _, _)| *label)
+            .unwrap_or("unknown");
+        let fork_info: Vec<String> = fork_data
+            .iter()
+            .map(|(label, root, att_root)| {
+                format!("  {label}: block_root={root:?} attestation_data_root={att_root:?}")
+            })
+            .collect();
+        return Err(format!(
+            "Step {step_idx}: canonical equivocation tiebreak failed.\n\
+             The head must be the fork with the largest attestation-data root.\n\
+             Expected head: '{winning_label}' ({winning_fork_root:?})\n\
+             Actual head:   '{actual_label}' ({actual_head:?})\n\
+             Competing forks:\n{}",
+            fork_info.join("\n")
+        )
+        .into());
     }
 
     Ok(())
@@ -421,6 +741,7 @@ fn validate_attestation_check(
     st: &Store,
     check: &AttestationCheck,
     step_idx: usize,
+    block_registry: &HashMap<String, H256>,
 ) -> datatest_stable::Result<()> {
     let validator_id = check.validator;
     let location = check.location.as_str();
@@ -442,6 +763,19 @@ fn validate_attestation_check(
             step_idx, validator_id, location
         )
     })?;
+
+    // Validate source root by label if specified.
+    if let Some(ref label) = check.source_root_label {
+        let expected = resolve_label(label, block_registry, step_idx)?;
+        if attestation.source.root != expected {
+            return Err(format!(
+                "Step {step_idx}: attestation source root mismatch for validator {validator_id} \
+                 (label '{label}'): expected {expected:?}, got {:?}",
+                attestation.source.root
+            )
+            .into());
+        }
+    }
 
     // Validate attestation slot if specified
     if let Some(expected_slot) = check.attestation_slot
