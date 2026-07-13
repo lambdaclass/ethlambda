@@ -227,6 +227,22 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         return Err(StoreError::TargetNotAncestorOfHead);
     }
 
+    // Finalized-Ancestor Check - Fork choice only ever descends from the latest
+    // finalized block, so a vote whose head sits on a branch orphaned by
+    // finalization carries no weight. Rejecting it here stops a stale vote from
+    // re-entering the pools after finalization pruning has dropped it. This is
+    // sound because the store's finalized checkpoint is re-derived from the head
+    // on each update, so it is always an ancestor of the head. See leanSpec #1179.
+    let finalized = store.latest_finalized();
+    if !checkpoint_is_ancestor(store, &finalized, &data.head, &head_header) {
+        return Err(StoreError::HeadNotDescendantOfFinalized {
+            head_root: data.head.root,
+            head_slot: data.head.slot,
+            finalized_root: finalized.root,
+            finalized_slot: finalized.slot,
+        });
+    }
+
     // Head Consistency Check - A vote cannot have observed its head before that
     // head existed, so the vote's slot must not precede the head block's slot.
     if data.slot < data.head.slot {
@@ -938,6 +954,16 @@ pub enum StoreError {
     #[error("Target checkpoint must be ancestor of head")]
     TargetNotAncestorOfHead,
 
+    #[error(
+        "Head checkpoint {head_root} at slot {head_slot} does not descend from finalized block {finalized_root} at slot {finalized_slot}"
+    )]
+    HeadNotDescendantOfFinalized {
+        head_root: H256,
+        head_slot: u64,
+        finalized_root: H256,
+        finalized_slot: u64,
+    },
+
     #[error("Attestation slot {attestation_slot} precedes head block slot {head_slot}")]
     AttestationSlotBeforeHead {
         attestation_slot: u64,
@@ -1529,6 +1555,81 @@ mod tests {
         assert!(
             validate_attestation_data(&store, &data).is_ok(),
             "fully canonical vote must validate"
+        );
+    }
+
+    /// leanSpec #1179: a vote whose head sits on a branch orphaned by
+    /// finalization must be rejected. The vote is admissible while finalization
+    /// still sits below the fork point, but once a sibling block finalizes a slot
+    /// the orphaned head does not descend from, fork choice can no longer count
+    /// it: re-gossiping the same vote must be rejected, not re-admitted.
+    #[test]
+    fn validate_attestation_rejects_head_off_finalized_branch() {
+        let mut store = new_test_store();
+        let genesis = store.head();
+
+        // Canonical chain: genesis(0) <- block_1(1) <- block_2(2).
+        // Orphan branch off block_1: block_1(1) <- orph_2(2) <- orph_3(3).
+        let block_1 = H256([1u8; 32]);
+        let block_2 = H256([2u8; 32]);
+        let orph_2 = H256([3u8; 32]);
+        let orph_3 = H256([4u8; 32]);
+        insert_test_block(&mut store, block_1, 1, genesis);
+        insert_test_block(&mut store, block_2, 2, block_1);
+        insert_test_block(&mut store, orph_2, 2, block_1);
+        insert_test_block(&mut store, orph_3, 3, orph_2);
+        store
+            .set_time(3 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
+
+        // Vote entirely on the orphan branch: source=block_1, target=orph_2,
+        // head=orph_3. Source/target/head form one parent chain, so every
+        // topology and ancestry check below the finalized check passes.
+        let data = AttestationData {
+            slot: 3,
+            source: Checkpoint {
+                root: block_1,
+                slot: 1,
+            },
+            target: Checkpoint {
+                root: orph_2,
+                slot: 2,
+            },
+            head: Checkpoint {
+                root: orph_3,
+                slot: 3,
+            },
+        };
+
+        // While finalization still sits at genesis (below the block_1 fork point),
+        // the orphan head descends from finalized, so the vote is admissible.
+        assert!(
+            validate_attestation_data(&store, &data).is_ok(),
+            "vote must validate while finalized sits below the fork point"
+        );
+
+        // block_2 finalizes slot 2 on the canonical branch. orph_3 does not
+        // descend from block_2, so the vote must now be rejected.
+        let finalized = Checkpoint {
+            root: block_2,
+            slot: 2,
+        };
+        store
+            .update_checkpoints(ForkCheckpoints::new(block_2, None, Some(finalized)))
+            .expect("update_checkpoints should succeed");
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::HeadNotDescendantOfFinalized {
+                    head_root,
+                    head_slot: 3,
+                    finalized_root,
+                    finalized_slot: 2,
+                }) if head_root == orph_3 && finalized_root == block_2
+            ),
+            "Expected HeadNotDescendantOfFinalized, got: {result:?}"
         );
     }
 
