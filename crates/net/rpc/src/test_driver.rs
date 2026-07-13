@@ -45,7 +45,7 @@ use ethlambda_types::{
     },
     block::{Block, ByteList512KiB, SingleMessageAggregate},
     checkpoint::Checkpoint,
-    primitives::H256,
+    primitives::{H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,11 @@ struct StateTransitionPost {
     latest_block_header_slot: u64,
     latest_block_header_state_root: H256,
     historical_block_hashes_count: usize,
+    /// Full post-state `hash_tree_root`, mirroring the fixture's `postStateRoot`.
+    /// `latest_block_header_state_root` above is only the state's recorded
+    /// header field; this is the SSZ root of the entire post-state, so the hive
+    /// simulator can assert the whole state, not just the enumerated summary.
+    post_state_root: H256,
 }
 
 #[derive(Debug, Serialize)]
@@ -455,6 +460,7 @@ fn post_summary(state: &State) -> StateTransitionPost {
         latest_block_header_slot: state.latest_block_header.slot,
         latest_block_header_state_root: state.latest_block_header.state_root,
         historical_block_hashes_count: state.historical_block_hashes.len(),
+        post_state_root: state.hash_tree_root(),
     }
 }
 
