@@ -37,7 +37,9 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
-use ethlambda_p2p::{Bootnode, P2P, PeerId, SwarmConfig, build_swarm, parse_enrs};
+use ethlambda_p2p::{
+    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
+};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -50,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::BlockChain;
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -80,6 +82,9 @@ async fn main() -> eyre::Result<()> {
 
     let options = CliOptions::parse();
 
+    #[cfg(feature = "shadow-integration")]
+    init_shadow_cost(&options.shadow);
+
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
@@ -89,6 +94,7 @@ async fn main() -> eyre::Result<()> {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
+        version: version::CLIENT_VERSION,
     };
 
     println!("{ASCII_ART}");
@@ -210,33 +216,52 @@ async fn main() -> eyre::Result<()> {
     // and the API server (which exposes GET/POST admin endpoints).
     let aggregator = AggregatorController::new(options.is_aggregator);
 
-    let blockchain = BlockChain::spawn(
-        store.clone(),
-        validator_keys,
-        aggregator.clone(),
+    // Attestation subnets this node subscribes to, computed once and shared by
+    // the P2P swarm (to open gossip subscriptions) and the blockchain actor
+    // (to size the early-aggregation threshold), so both agree on which subnets
+    // feed this node's gossip groups. Subscriptions are fixed at startup and
+    // are not re-evaluated when the aggregator role is toggled at runtime; see
+    // the hot-standby note on SwarmConfig.
+    let subscribed_subnets = attestation_subscription_subnets(
+        &validator_ids,
         attestation_committee_count,
-        !options.disable_duty_sync_gate,
-        ProposerConfig {
+        options.is_aggregator,
+        options.aggregate_subnet_ids.as_deref(),
+    );
+
+    // Shared, runtime-readable sync status. The blockchain actor writes it each
+    // tick (alongside the `lean_node_sync_status` metric); the RPC
+    // `/lean/v0/node/syncing` endpoint reads it. Seeded to Idle, matching the
+    // metric's startup value.
+    let sync_status = SyncStatusController::default();
+
+    let blockchain_config = BlockChainConfig {
+        aggregator: aggregator.clone(),
+        sync_status_controller: sync_status.clone(),
+        attestation_committee_count,
+        gate_duties: !options.disable_duty_sync_gate,
+        subscribed_subnets: subscribed_subnets.clone(),
+        proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
         },
-    );
+    };
 
-    // Note: SwarmConfig.is_aggregator is intentionally a plain bool, not the
-    // AggregatorController — subnet subscriptions are decided once here and
-    // are not re-evaluated at runtime. Toggling via the admin API affects
-    // aggregation logic but not the gossip mesh. See crates/net/p2p/src/lib.rs
-    // for the invariant.
+    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config);
+
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        is_aggregator: options.is_aggregator,
-        aggregate_subnet_ids: options.aggregate_subnet_ids,
+        subscription_subnets: subscribed_subnets,
     })
     .wrap_err("failed to build swarm")?;
+
+    // Capture the local peer ID before `built` is moved into the P2P actor; the
+    // RPC `/lean/v0/node/identity` endpoint reports it.
+    let local_peer_id = built.local_peer_id.to_string();
 
     let p2p = P2P::spawn(built, store.clone(), node_names);
 
@@ -259,9 +284,16 @@ async fn main() -> eyre::Result<()> {
     let rpc_shutdown = shutdown_token.clone();
 
     let rpc_handle = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(rpc_config, store, aggregator, rpc_shutdown)
-            .await
-            .inspect_err(|err| error!(%err, "RPC server failed"));
+        let _ = ethlambda_rpc::start_rpc_server(
+            rpc_config,
+            store,
+            aggregator,
+            sync_status,
+            local_peer_id,
+            rpc_shutdown,
+        )
+        .await
+        .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     info!("Node initialized");
@@ -299,6 +331,30 @@ async fn main() -> eyre::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
+///
+/// Compiled only under the `shadow-integration` feature. Call once at startup,
+/// before any consensus/aggregation work, so the fake-proof and sim-cost hooks
+/// are installed before the first signing or aggregation path runs.
+#[cfg(feature = "shadow-integration")]
+fn init_shadow_cost(shadow: &cli::ShadowOptions) {
+    info!(
+        fake = shadow.shadow_xmss_fake,
+        aggregate_rate = ?shadow.shadow_xmss_aggregate_signatures_rate,
+        verify_rate = ?shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        merge_rate = ?shadow.shadow_xmss_merge_rate,
+        fake_proof_size = shadow.shadow_xmss_fake_proof_size,
+        "Applying Shadow XMSS sim-cost / fake-XMSS config"
+    );
+    ethlambda_crypto::shadow_cost::init(
+        shadow.shadow_xmss_fake,
+        shadow.shadow_xmss_aggregate_signatures_rate,
+        shadow.shadow_xmss_verify_aggregated_signatures_rate,
+        shadow.shadow_xmss_merge_rate,
+        shadow.shadow_xmss_fake_proof_size as usize,
+    );
 }
 
 /// Boot the binary in Hive test-driver mode.
@@ -615,24 +671,24 @@ async fn fetch_initial_state(
     // Checkpoint sync path
 
     // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
-    if let Some(store) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
+    if let Ok(Some(store)) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
             .as_millis() as u64;
         let current_slot =
             now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
-        let finalized_slot = store.latest_finalized().slot;
-        let gap = current_slot.saturating_sub(finalized_slot);
+        let head_slot = store.head_slot();
+        let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
             info!(
-                finalized_slot,
+                head_slot,
                 current_slot, gap, "Resuming from existing DB state"
             );
             return Ok(store);
         }
         warn!(
-            finalized_slot,
+            head_slot,
             current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
         );
     }

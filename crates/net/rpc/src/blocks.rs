@@ -35,8 +35,9 @@ pub(crate) async fn get_block(
     };
 
     match store.get_block(&root) {
-        Some(block) => json_response(block),
-        None => BlockIdError::NotFound.into_response(),
+        Ok(Some(block)) => json_response(block),
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -51,8 +52,9 @@ pub(crate) async fn get_block_header(
     };
 
     match store.get_block_header(&root) {
-        Some(header) => json_response(header),
-        None => BlockIdError::NotFound.into_response(),
+        Ok(Some(header)) => json_response(header),
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
