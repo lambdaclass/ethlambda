@@ -12,13 +12,13 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
-    state::State,
+    state::{HISTORICAL_ROOTS_LIMIT, State},
 };
 use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
@@ -38,11 +38,17 @@ fn accept_new_attestations(store: &mut Store, log_tree: bool) {
 /// When `log_tree` is true, also computes block weights and logs an ASCII
 /// fork choice tree to the terminal.
 pub fn update_head(store: &mut Store, log_tree: bool) {
-    let blocks = store.get_live_chain();
+    let blocks = store
+        .get_live_chain()
+        .expect("get_live_chain should succeed");
     let attestations = store.extract_latest_known_attestations();
-    let old_head = store.head();
+    let old_head = store.head().expect("head block exists");
+    let latest_justified_root = store
+        .latest_justified()
+        .expect("latest justified checkpoint exists")
+        .root;
     let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        latest_justified_root,
         &blocks,
         &attestations,
         0,
@@ -56,8 +62,14 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
     // Override the store's latest finalized with the head state's
     let finalized = store
         .get_state(&new_head)
+        .expect("head state exists")
         .map(|state| state.latest_finalized)
-        .filter(|finalized| store.get_block_header(&finalized.root).is_some());
+        .filter(|finalized| {
+            store
+                .get_block_header(&finalized.root)
+                .expect("block header exists")
+                .is_some()
+        });
     store
         .update_checkpoints(ForkCheckpoints::new(new_head, None, finalized))
         .expect("update_checkpoints should succeed");
@@ -65,14 +77,22 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
     if old_head != new_head {
         let old_slot = store
             .get_block_header(&old_head)
+            .expect("block header exists")
             .map(|h| h.slot)
             .unwrap_or(0);
         let new_slot = store
             .get_block_header(&new_head)
+            .expect("block header exists")
             .map(|h| h.slot)
             .unwrap_or(0);
-        let justified_slot = store.latest_justified().slot;
-        let finalized_slot = store.latest_finalized().slot;
+        let justified_slot = store
+            .latest_justified()
+            .expect("latest justified checkpoint exists")
+            .slot;
+        let finalized_slot = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists")
+            .slot;
         info!(
             head_slot = new_slot,
             head_root = %ShortRoot(&new_head.0),
@@ -89,8 +109,12 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
             &blocks,
             &weights,
             new_head,
-            store.latest_justified(),
-            store.latest_finalized(),
+            store
+                .latest_justified()
+                .expect("latest justified checkpoint exists"),
+            store
+                .latest_finalized()
+                .expect("latest finalized checkpoint exists"),
         );
         info!("\n{tree}");
     }
@@ -108,15 +132,22 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
-    let head_state = store.get_state(&store.head()).expect("head state exists");
-    let num_validators = head_state.validators.len() as u64;
+    let head_state = store
+        .get_state(&store.head().unwrap())
+        .expect("head state exists");
+    let num_validators = head_state.unwrap().validators.len() as u64;
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
-    let blocks = store.get_live_chain();
+    let blocks = store
+        .get_live_chain()
+        .expect("get_live_chain should succeed");
     let attestations = store.extract_latest_new_attestations();
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        store.latest_justified().root,
+        store
+            .latest_justified()
+            .expect("latest justified checkpoint exists")
+            .root,
         &blocks,
         &attestations,
         min_target_score,
@@ -146,7 +177,10 @@ fn checkpoint_is_ancestor(
 
     // The descendant header is already in hand, so begin the walk at its parent.
     let mut current_root = descendant_header.parent_root;
-    while let Some(current_header) = store.get_block_header(&current_root) {
+    while let Some(current_header) = store
+        .get_block_header(&current_root)
+        .expect("parent block exists")
+    {
         if current_header.slot == ancestor.slot {
             return current_root == ancestor.root;
         }
@@ -175,13 +209,16 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     // Availability Check - We cannot count a vote if we haven't seen the blocks involved.
     let source_header = store
         .get_block_header(&data.source.root)
+        .expect("source block exists")
         .ok_or(StoreError::UnknownSourceBlock(data.source.root))?;
     let target_header = store
         .get_block_header(&data.target.root)
+        .expect("target block exists")
         .ok_or(StoreError::UnknownTargetBlock(data.target.root))?;
 
     let head_header = store
         .get_block_header(&data.head.root)
+        .expect("head block exists")
         .ok_or(StoreError::UnknownHeadBlock(data.head.root))?;
 
     // Topology Check - Source must be older than Target, and Head must be at least as recent.
@@ -227,6 +264,24 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
         return Err(StoreError::TargetNotAncestorOfHead);
     }
 
+    // Finalized-Ancestor Check - Fork choice only ever descends from the latest
+    // finalized block, so a vote whose head sits on a branch orphaned by
+    // finalization carries no weight. Rejecting it here stops a stale vote from
+    // re-entering the pools after finalization pruning has dropped it. This is
+    // sound because the store's finalized checkpoint is re-derived from the head
+    // on each update, so it is always an ancestor of the head. See leanSpec #1179.
+    let finalized = store
+        .latest_finalized()
+        .expect("latest finalized checkpoint exists");
+    if !checkpoint_is_ancestor(store, &finalized, &data.head, &head_header) {
+        return Err(StoreError::HeadNotDescendantOfFinalized {
+            head_root: data.head.root,
+            head_slot: data.head.slot,
+            finalized_root: finalized.root,
+            finalized_slot: finalized.slot,
+        });
+    }
+
     // Head Consistency Check - A vote cannot have observed its head before that
     // head existed, so the vote's slot must not precede the head block's slot.
     if data.slot < data.head.slot {
@@ -242,10 +297,10 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     // The bound is in intervals, not slots: a whole-slot margin would let an
     // adversary pre-publish next-slot aggregates ahead of any honest validator.
     let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
-    if attestation_start_interval > store.time() + GOSSIP_DISPARITY_INTERVALS {
+    if attestation_start_interval > store.time().unwrap() + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            store_time: store.time(),
+            store_time: store.time().unwrap(),
         });
     }
 
@@ -260,30 +315,30 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let genesis_time_ms = store.config().genesis_time * 1000;
+    let genesis_time_ms = store.config().unwrap().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
     // If we're more than a slot behind, fast-forward to a slot before.
     // Operations are idempotent, so this should be fine.
-    if time.saturating_sub(store.time()) > INTERVALS_PER_SLOT {
+    if time.saturating_sub(store.time().unwrap()) > INTERVALS_PER_SLOT {
         store
             .set_time(time - INTERVALS_PER_SLOT)
             .expect("set_time should succeed");
     }
 
-    while store.time() < time {
+    while store.time().unwrap() < time {
         store
-            .set_time(store.time() + 1)
+            .set_time(store.time().unwrap() + 1)
             .expect("set_time should succeed");
 
-        let slot = store.time() / INTERVALS_PER_SLOT;
-        let interval = store.time() % INTERVALS_PER_SLOT;
+        let slot = store.time().unwrap() / INTERVALS_PER_SLOT;
+        let interval = SlotInterval::from_intervals_since_genesis(store.time().unwrap());
 
-        trace!(%slot, %interval, "processing tick");
+        trace!(%slot, ?interval, "processing tick");
 
         // has_proposal is only signaled for the final tick (matching Python spec behavior)
-        let is_final_tick = store.time() == time;
+        let is_final_tick = store.time().unwrap() == time;
         let should_signal_proposal = has_proposal && is_final_tick;
 
         // NOTE: here we assume on_tick never skips intervals.
@@ -292,27 +347,26 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         // the actor's message loop stays unblocked during the expensive XMSS
         // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
         match interval {
-            0 => {
+            SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
                     accept_new_attestations(store, false);
                 }
             }
-            1 => {
+            SlotInterval::AttestationProduction => {
                 // Vote propagation — no action
             }
-            2 => {
+            SlotInterval::Aggregation => {
                 // Aggregation is driven by the actor (off-thread); nothing to do here.
             }
-            3 => {
+            SlotInterval::SafeTargetUpdate => {
                 // Update safe target for validators
                 update_safe_target(store);
             }
-            4 => {
+            SlotInterval::EndOfSlot => {
                 // End of slot - accept accumulated attestations and log tree
                 accept_new_attestations(store, true);
             }
-            _ => unreachable!("slots only have 5 intervals"),
         }
     }
 }
@@ -342,6 +396,7 @@ pub fn on_gossip_attestation(
     let target = attestation.data.target;
     let target_state = store
         .get_state(&target.root)
+        .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(target.root))?;
     if validator_id >= target_state.validators.len() as u64 {
         return Err(StoreError::InvalidValidatorIndex);
@@ -425,6 +480,7 @@ fn on_gossip_aggregated_attestation_core(
 
     let target_state = store
         .get_state(&aggregated.data.target.root)
+        .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
     let validators = &target_state.validators;
     let num_validators = validators.len() as u64;
@@ -521,20 +577,48 @@ fn on_block_core(
     let slot = block.slot;
 
     // Skip duplicate blocks (idempotent operation)
-    if store.has_state(&block_root) {
+    if store
+        .has_state(&block_root)
+        .expect("DB read should succeed")
+    {
         return Ok(());
     }
 
     // Verify parent state is available
     // Note: Parent block existence is checked by the caller before calling this function.
     // This check ensures the state has been computed for the parent block.
-    let parent_state =
-        store
-            .get_state(&block.parent_root)
-            .ok_or(StoreError::MissingParentState {
-                parent_root: block.parent_root,
-                slot,
-            })?;
+    let parent_state = store
+        .get_state(&block.parent_root)
+        .expect("DB read should succeed")
+        .ok_or(StoreError::MissingParentState {
+            parent_root: block.parent_root,
+            slot,
+        })?;
+
+    // Bound the block's slot before the state transition runs (leanSpec #1182).
+    //
+    // The transition advances the state one slot at a time from the parent up to
+    // `block.slot`, so a block far beyond its parent, or far in the future, would
+    // drive that walk unboundedly. Both guards live here at the untrusted-input
+    // boundary and run before the expensive signature verification, so a crafted
+    // block is rejected cheaply.
+    let slot_gap = slot.saturating_sub(parent_state.slot);
+    if slot_gap > HISTORICAL_ROOTS_LIMIT as u64 {
+        return Err(StoreError::BlockSlotGapTooLarge {
+            gap: slot_gap,
+            max: HISTORICAL_ROOTS_LIMIT as u64,
+        });
+    }
+    // Horizon is the current slot plus one whole slot of margin, so an intended
+    // early block still imports (mirrors the attestation future-slot guard, but
+    // with a whole-slot rather than one-interval margin).
+    let current_slot = store.time().expect("DB read should succeed") / INTERVALS_PER_SLOT;
+    if slot > current_slot + 1 {
+        return Err(StoreError::BlockTooFarInFuture {
+            block_slot: slot,
+            current_slot,
+        });
+    }
 
     // Each unique AttestationData must appear at most once per block.
     let attestations = &signed_block.message.body.attestations;
@@ -577,12 +661,16 @@ fn on_block_core(
     // Advance the justified checkpoint when the post-state names a higher one
     // (leanSpec `advance_to`: monotonic by slot). Finalized is intentionally not
     // latched here; it is recomputed from the head's chain in `update_head`.
-    let justified = (post_state.latest_justified.slot > store.latest_justified().slot)
+    let justified = (post_state.latest_justified.slot > store.latest_justified().unwrap().slot)
         .then_some(post_state.latest_justified);
 
     if let Some(justified) = justified {
         store
-            .update_checkpoints(ForkCheckpoints::new(store.head(), Some(justified), None))
+            .update_checkpoints(ForkCheckpoints::new(
+                store.head().unwrap(),
+                Some(justified),
+                None,
+            ))
             .expect("update_checkpoints should succeed");
     }
 
@@ -622,8 +710,8 @@ fn on_block_core(
 pub fn get_attestation_target(store: &Store) -> Checkpoint {
     get_attestation_target_with_checkpoints(
         store,
-        store.latest_justified(),
-        store.latest_finalized(),
+        store.latest_justified().unwrap(),
+        store.latest_finalized().unwrap(),
     )
 }
 
@@ -643,14 +731,16 @@ pub fn get_attestation_target_with_checkpoints(
     finalized: Checkpoint,
 ) -> Checkpoint {
     // Start from current head
-    let mut target_block_root = store.head();
+    let mut target_block_root = store.head().unwrap();
     let mut target_header = store
         .get_block_header(&target_block_root)
-        .expect("head block exists");
+        .expect("head block exists")
+        .unwrap();
 
     let safe_target_block_slot = store
-        .get_block_header(&store.safe_target())
+        .get_block_header(&store.safe_target().unwrap())
         .expect("safe target exists")
+        .unwrap()
         .slot;
 
     // Walk back toward safe target (up to `JUSTIFICATION_LOOKBACK_SLOTS` steps)
@@ -662,7 +752,8 @@ pub fn get_attestation_target_with_checkpoints(
             target_block_root = target_header.parent_root;
             target_header = store
                 .get_block_header(&target_block_root)
-                .expect("parent block exists");
+                .expect("parent block exists")
+                .unwrap();
         } else {
             break;
         }
@@ -680,7 +771,8 @@ pub fn get_attestation_target_with_checkpoints(
         target_block_root = target_header.parent_root;
         target_header = store
             .get_block_header(&target_block_root)
-            .expect("parent block exists");
+            .expect("parent block exists")
+            .unwrap();
     }
     // Guard: clamp target to justified (not in the spec).
     //
@@ -733,10 +825,11 @@ pub fn get_attestation_target_with_checkpoints(
 /// always names a real block (otherwise `validate_attestation_data` rejects it
 /// with `UnknownSourceBlock`).
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
-    let head_root = store.head();
+    let head_root = store.head().unwrap();
     let mut source = store
         .get_state(&head_root)
         .expect("head state exists")
+        .unwrap()
         .latest_justified;
 
     // Replace the placeholder genesis root with the real (head) one. This only
@@ -751,6 +844,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
         slot: store
             .get_block_header(&head_root)
             .expect("head block exists")
+            .unwrap()
             .slot,
     };
 
@@ -770,7 +864,8 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+    let slot_time_ms =
+        store.config().expect("config exists").genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
@@ -778,7 +873,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Process any pending attestations before proposal
     accept_new_attestations(store, false);
 
-    store.head()
+    store.head().expect("store head exists")
 }
 
 /// Produce a block and per-aggregated-attestation signature payloads for the target slot.
@@ -795,6 +890,7 @@ pub fn produce_block_with_signatures(
     let head_root = get_proposal_head(store, slot);
     let head_state = store
         .get_state(&head_root)
+        .expect("head state exists")
         .ok_or(StoreError::MissingParentState {
             parent_root: head_root,
             slot,
@@ -812,7 +908,7 @@ pub fn produce_block_with_signatures(
     // Get known aggregated payloads: data_root -> (AttestationData, Vec<proof>)
     let aggregated_payloads = store.known_aggregated_payloads();
 
-    let known_block_roots = store.get_block_roots();
+    let known_block_roots = store.get_block_roots().unwrap();
 
     let (block, signatures, post_checkpoints) = {
         let _timing = metrics::time_block_building_payload_aggregation();
@@ -834,7 +930,10 @@ pub fn produce_block_with_signatures(
     // divergence inherited from a minority fork, but it may not always
     // converge. We still publish the block in that case (halting block
     // production freezes the chain, which is worse) and only log the divergence.
-    let store_justified_slot = store.latest_justified().slot;
+    let store_justified_slot = store
+        .latest_justified()
+        .expect("latest finalized checkpoint exists")
+        .slot;
     if post_checkpoints.justified.slot < store_justified_slot {
         warn!(
             %slot,
@@ -914,6 +1013,16 @@ pub enum StoreError {
     #[error("Target checkpoint must be ancestor of head")]
     TargetNotAncestorOfHead,
 
+    #[error(
+        "Head checkpoint {head_root} at slot {head_slot} does not descend from finalized block {finalized_root} at slot {finalized_slot}"
+    )]
+    HeadNotDescendantOfFinalized {
+        head_root: H256,
+        head_slot: u64,
+        finalized_root: H256,
+        finalized_slot: u64,
+    },
+
     #[error("Attestation slot {attestation_slot} precedes head block slot {head_slot}")]
     AttestationSlotBeforeHead {
         attestation_slot: u64,
@@ -950,6 +1059,12 @@ pub enum StoreError {
 
     #[error("Block contains {count} distinct AttestationData entries; maximum is {max}")]
     TooManyAttestationData { count: usize, max: usize },
+
+    #[error("Block slot gap {gap} beyond parent exceeds historical roots limit {max}")]
+    BlockSlotGapTooLarge { gap: u64, max: u64 },
+
+    #[error("Block slot {block_slot} is beyond the future horizon (current slot: {current_slot})")]
+    BlockTooFarInFuture { block_slot: u64, current_slot: u64 },
 }
 
 /// Full verification of a signed block's merged multi-message aggregate proof.
@@ -1066,8 +1181,12 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
         return None;
     }
 
-    let old_head_header = store.get_block_header(&old_head)?;
-    let new_head_header = store.get_block_header(&new_head)?;
+    let old_head_header = store
+        .get_block_header(&old_head)
+        .expect("old head header exists")?;
+    let new_head_header = store
+        .get_block_header(&new_head)
+        .expect("new head header exists")?;
 
     let old_slot = old_head_header.slot;
     let new_slot = new_head_header.slot;
@@ -1083,7 +1202,7 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     // Bounded to avoid unbounded walks in pathological cases.
     const MAX_REORG_DEPTH: u64 = 128;
     let mut depth: u64 = 0;
-    while let Some(current_header) = store.get_block_header(&current_root) {
+    while let Ok(Some(current_header)) = store.get_block_header(&current_root) {
         if current_header.slot <= target_slot {
             // We've reached the target slot - check if we're at the target block
             return (current_root != target_root).then_some(depth);
@@ -1148,7 +1267,7 @@ mod tests {
         // which a synthetic genesis block with zero state_root cannot satisfy.
         let mut store = Store::from_anchor_state(backend, genesis_state);
 
-        let head_root = store.head();
+        let head_root = store.head().expect("store head exists");
         let att_data = AttestationData {
             slot: 0,
             head: Checkpoint {
@@ -1252,7 +1371,7 @@ mod tests {
     #[test]
     fn produce_attestation_data_sources_from_head_state_not_store() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         // Head chain: genesis(0) <- a(1) <- b(2), with `b` as head.
         let a = H256([1u8; 32]);
@@ -1268,7 +1387,7 @@ mod tests {
         // checkpoint set; `insert_state` reads the base from
         // `latest_block_header.parent_root`, and `get_state(b)` then returns it
         // from the cache.
-        let genesis_state = store.get_state(&genesis).expect("genesis state");
+        let genesis_state = store.get_state(&genesis).expect("genesis state").unwrap();
         let mut head_state = genesis_state.clone();
         head_state.slot = genesis_state.slot + 1;
         head_state.latest_justified = head_justified;
@@ -1301,7 +1420,7 @@ mod tests {
         );
         assert_ne!(
             data.source,
-            store.latest_justified(),
+            store.latest_justified().expect("store has justified"),
             "source must not be the store's off-head global justified"
         );
     }
@@ -1312,7 +1431,7 @@ mod tests {
     #[test]
     fn validate_attestation_rejects_head_on_sibling_fork() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         let base = H256([1u8; 32]);
         let fork_left = H256([2u8; 32]);
@@ -1354,7 +1473,7 @@ mod tests {
     #[test]
     fn validate_attestation_rejects_source_on_sibling_fork() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         let base = H256([1u8; 32]);
         let fork_left = H256([2u8; 32]);
@@ -1399,7 +1518,7 @@ mod tests {
     #[test]
     fn validate_attestation_rejects_slot_before_head() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         let b1 = H256([1u8; 32]);
         let b2 = H256([2u8; 32]);
@@ -1443,7 +1562,7 @@ mod tests {
     #[test]
     fn validate_attestation_rejects_ceiling_slot_without_overflow() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         let b1 = H256([1u8; 32]);
         let b2 = H256([2u8; 32]);
@@ -1476,7 +1595,7 @@ mod tests {
     #[test]
     fn validate_attestation_accepts_proper_ancestor_chain() {
         let mut store = new_test_store();
-        let genesis = store.head();
+        let genesis = store.head().expect("store head exists");
 
         let b1 = H256([1u8; 32]);
         let b2 = H256([2u8; 32]);
@@ -1499,6 +1618,159 @@ mod tests {
         assert!(
             validate_attestation_data(&store, &data).is_ok(),
             "fully canonical vote must validate"
+        );
+    }
+
+    /// leanSpec #1179: a vote whose head sits on a branch orphaned by
+    /// finalization must be rejected. The vote is admissible while finalization
+    /// still sits below the fork point, but once a sibling block finalizes a slot
+    /// the orphaned head does not descend from, fork choice can no longer count
+    /// it: re-gossiping the same vote must be rejected, not re-admitted.
+    #[test]
+    fn validate_attestation_rejects_head_off_finalized_branch() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        // Canonical chain: genesis(0) <- block_1(1) <- block_2(2).
+        // Orphan branch off block_1: block_1(1) <- orph_2(2) <- orph_3(3).
+        let block_1 = H256([1u8; 32]);
+        let block_2 = H256([2u8; 32]);
+        let orph_2 = H256([3u8; 32]);
+        let orph_3 = H256([4u8; 32]);
+        insert_test_block(&mut store, block_1, 1, genesis);
+        insert_test_block(&mut store, block_2, 2, block_1);
+        insert_test_block(&mut store, orph_2, 2, block_1);
+        insert_test_block(&mut store, orph_3, 3, orph_2);
+        store
+            .set_time(3 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
+
+        // Vote entirely on the orphan branch: source=block_1, target=orph_2,
+        // head=orph_3. Source/target/head form one parent chain, so every
+        // topology and ancestry check below the finalized check passes.
+        let data = AttestationData {
+            slot: 3,
+            source: Checkpoint {
+                root: block_1,
+                slot: 1,
+            },
+            target: Checkpoint {
+                root: orph_2,
+                slot: 2,
+            },
+            head: Checkpoint {
+                root: orph_3,
+                slot: 3,
+            },
+        };
+
+        // While finalization still sits at genesis (below the block_1 fork point),
+        // the orphan head descends from finalized, so the vote is admissible.
+        assert!(
+            validate_attestation_data(&store, &data).is_ok(),
+            "vote must validate while finalized sits below the fork point"
+        );
+
+        // block_2 finalizes slot 2 on the canonical branch. orph_3 does not
+        // descend from block_2, so the vote must now be rejected.
+        let finalized = Checkpoint {
+            root: block_2,
+            slot: 2,
+        };
+        store
+            .update_checkpoints(ForkCheckpoints::new(block_2, None, Some(finalized)))
+            .expect("update_checkpoints should succeed");
+
+        let result = validate_attestation_data(&store, &data);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::HeadNotDescendantOfFinalized {
+                    head_root,
+                    head_slot: 3,
+                    finalized_root,
+                    finalized_slot: 2,
+                }) if head_root == orph_3 && finalized_root == block_2
+            ),
+            "Expected HeadNotDescendantOfFinalized, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1182: a block whose slot is more than one slot past the store
+    /// clock is rejected before the state transition (and before signature
+    /// verification), keeping far-future blocks out of the store.
+    #[test]
+    fn on_block_rejects_block_too_far_in_future() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, genesis_state);
+        store.set_time(0).expect("set_time should succeed");
+
+        // current_slot = 0, so the horizon is slot 1; a slot-2 block overshoots it.
+        let block = Block {
+            slot: 2,
+            proposer_index: 0,
+            parent_root: store.head().expect("store head exists"),
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let signed_block = SignedBlock {
+            message: block,
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::BlockTooFarInFuture {
+                    block_slot: 2,
+                    current_slot: 0,
+                })
+            ),
+            "Expected BlockTooFarInFuture, got: {result:?}"
+        );
+    }
+
+    /// leanSpec #1182: a block whose slot runs more than HISTORICAL_ROOTS_LIMIT
+    /// beyond its parent is rejected up front, so the transition never walks the
+    /// empty-slot loop over an unbounded range. The gap guard runs before the
+    /// future-horizon guard, so it fires even with the clock at genesis.
+    #[test]
+    fn on_block_rejects_block_slot_gap_too_large() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, genesis_state);
+        store.set_time(0).expect("set_time should succeed");
+
+        // Parent (genesis) sits at slot 0, so a slot one past the limit overshoots.
+        let gap_slot = HISTORICAL_ROOTS_LIMIT as u64 + 1;
+        let block = Block {
+            slot: gap_slot,
+            proposer_index: 0,
+            parent_root: store.head().expect("store head exists"),
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let signed_block = SignedBlock {
+            message: block,
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::BlockSlotGapTooLarge { gap, max })
+                    if gap == gap_slot && max == HISTORICAL_ROOTS_LIMIT as u64
+            ),
+            "Expected BlockSlotGapTooLarge, got: {result:?}"
         );
     }
 }

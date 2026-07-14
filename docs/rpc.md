@@ -23,6 +23,8 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | Method | Path | Response | Description |
 |--------|------|----------|-------------|
 | `GET` | `/lean/v0/health` | JSON | Liveness check |
+| `GET` | `/lean/v0/config/spec` | JSON | Protocol constants the node runs with |
+| `GET` | `/lean/v0/genesis` | JSON | Genesis time and validator count |
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
@@ -30,6 +32,8 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
 | `GET` | `/lean/v0/fork_choice/ui` | HTML | Interactive D3.js visualization |
+| `GET` | `/lean/v0/node/identity` | JSON | Client version and libp2p peer ID |
+| `GET` | `/lean/v0/node/syncing` | JSON | Sync status relative to the wall clock |
 | `GET` | `/lean/v0/admin/aggregator` | JSON | Current aggregator role |
 | `POST` | `/lean/v0/admin/aggregator` | JSON | Toggle aggregator role at runtime |
 
@@ -40,6 +44,30 @@ The handler emits a fixed, compact body (no whitespace):
 ```json
 {"status":"healthy","service":"lean-rpc-api"}
 ```
+
+### `GET /lean/v0/config/spec`
+
+Protocol constants the node was built with. Keys mirror the leanSpec constant names:
+
+```json
+{
+  "MILLISECONDS_PER_SLOT": 4000,
+  "INTERVALS_PER_SLOT": 5,
+  "MILLISECONDS_PER_INTERVAL": 800,
+  "HISTORICAL_ROOTS_LIMIT": 262144,
+  "FORK_DIGEST": "12345678"
+}
+```
+
+`FORK_DIGEST` is the 4-byte hex string (no `0x` prefix) embedded in gossipsub topic names.
+
+### `GET /lean/v0/genesis`
+
+```json
+{ "genesis_time": 1770407233, "validator_count": 16 }
+```
+
+`validator_count` is read from the head state's validator registry. Lean validators are fixed at genesis (no churn), so it always equals the size of the genesis registry.
 
 ### `GET /lean/v0/states/finalized`
 
@@ -90,6 +118,29 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 ```
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
+
+### `GET /lean/v0/node/identity`
+
+```json
+{
+  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0",
+  "peer_id": "16Uiu2HAm7v1x…"
+}
+```
+
+`version` is the full client version string, identical to what `ethlambda --version` prints: crate semver, git branch and short SHA, target triple, and rustc version. Baked in at compile time from `CARGO_PKG_VERSION` plus the `vergen-git2` build metadata.
+
+`peer_id` is the node's libp2p peer ID (base58), derived from the node key and fixed for the lifetime of the process; it matches the identity the node presents to peers on the wire.
+
+### `GET /lean/v0/node/syncing`
+
+```json
+{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
+```
+
+`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+
+`sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
 ### `GET` / `POST /lean/v0/admin/aggregator`
 

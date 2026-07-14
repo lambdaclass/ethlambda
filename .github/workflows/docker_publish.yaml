@@ -1,6 +1,8 @@
 name: Publish Docker Image
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       tags:
@@ -12,21 +14,46 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # On push to main, inputs.tags is empty, so fall back to "unstable" so it
+  # tracks main. Manual dispatch still honors custom tags.
+  TAGS_INPUT: ${{ inputs.tags || 'unstable' }}
 
 jobs:
   build-image:
-    name: Build Docker image (${{ matrix.arch }})
+    name: Build Docker image (${{ matrix.arch.name }}, ${{ matrix.variant.name }})
     strategy:
       matrix:
-        include:
+        arch:
           - runner: ubuntu-latest
-            arch: amd64
+            name: amd64
           - runner: ubuntu-22.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+            name: arm64
+        # Each tag is published twice: once as the regular image and once as a
+        # Shadow-simulator-compatible image (tag suffixed "-shadow"). The shadow
+        # build args mirror the `shadow-docker-build` Makefile target. LOCKED=
+        # builds the shadow variant unlocked (the quinn-udp [patch] is absent
+        # from Cargo.lock; see Dockerfile), so -shadow images are not
+        # reproducible and should not be treated as equivalent-security
+        # artifacts to the regular tags.
+        variant:
+          - name: default
+            suffix: ""
+            build_args: ""
+          - name: shadow
+            suffix: "-shadow"
+            build_args: |
+              SHADOW=1
+              FEATURES=shadow-integration
+              NO_DEFAULT_FEATURES=--no-default-features
+              LOCKED=
+    runs-on: ${{ matrix.arch.runner }}
 
     steps:
       - name: Checkout repository
@@ -44,11 +71,14 @@ jobs:
 
       - name: Prepare tags
         id: prep
+        env:
+          SUFFIX: ${{ matrix.variant.suffix }}
+          ARCH: ${{ matrix.arch.name }}
         run: |
           TAGS=""
-          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
           for t in "${TAG_ARRAY[@]}"; do
-            TAGS="${TAGS}${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-${{ matrix.arch }},"
+            TAGS="${TAGS}${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}${SUFFIX}-${ARCH},"
           done
           TAGS="${TAGS%,}"  # Remove trailing comma
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
@@ -61,11 +91,12 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
+            ${{ matrix.variant.build_args }}
           push: true
           tags: ${{ steps.prep.outputs.tags }}
-          platforms: linux/${{ matrix.arch }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          platforms: linux/${{ matrix.arch.name }}
+          cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant.name }}
+          cache-to: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant.name }},mode=max
 
   publish-manifest:
     name: Create and push multi-arch manifest
@@ -84,20 +115,26 @@ jobs:
         env:
           SHORT_SHA: ${{ github.sha }}
         run: |
-          IFS=',' read -ra TAG_ARRAY <<< "${{ inputs.tags }}"
+          IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
           FIRST_TAG="${TAG_ARRAY[0]}"
+          SHORT="${SHORT_SHA::7}"
 
-          # Create manifest for first tag with SHA tag
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT_SHA::7} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}-arm64
-
-          # Create manifests for remaining tags
-          for t in "${TAG_ARRAY[@]:1}"; do
+          # Publish each tag twice: the regular image and its "-shadow" twin.
+          # These suffixes must stay in sync with the `variant` matrix suffixes
+          # in the build-image job above: a new variant must be added in both.
+          for suffix in "" "-shadow"; do
+            # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \
-              -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t} \
-              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-amd64 \
-              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}-arm64
+              -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}${suffix} \
+              -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT}${suffix} \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}${suffix}-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${FIRST_TAG}${suffix}-arm64
+
+            # Remaining tags.
+            for t in "${TAG_ARRAY[@]:1}"; do
+              docker buildx imagetools create \
+                -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}${suffix} \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}${suffix}-amd64 \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}${suffix}-arm64
+            done
           done
