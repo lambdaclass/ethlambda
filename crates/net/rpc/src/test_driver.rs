@@ -40,7 +40,8 @@ use ethlambda_test_fixtures::{
 };
 use ethlambda_types::{
     attestation::{
-        AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
+        AggregationBits as EthAggregationBits, HashedAttestationData, SignedAggregatedAttestation,
+        SignedAttestation,
     },
     block::{Block, ByteList512KiB, SingleMessageAggregate},
     checkpoint::Checkpoint,
@@ -56,6 +57,13 @@ use tracing::debug;
 /// The hive simulator sets this to `"1"` for each spec-asset fixture run; any
 /// of `"1"`, `"true"`, or `"yes"` (case-insensitive) enables the driver.
 pub const TEST_DRIVER_ENV: &str = "HIVE_LEAN_TEST_DRIVER";
+
+/// Sentinel prefixing every placeholder proof leanSpec's mocked prover emits
+/// (`proofSetting: 0` fixtures). Matches `MOCK_PROOF_PREFIX` in leanSpec's
+/// `packages/testing/src/consensus_testing/crypto_mode.py`. Proofs carrying it
+/// are accepted without cryptographic verification, mirroring leanSpec's mocked
+/// verifier; genuine (`proofSetting: 1`) proofs still run the real verifier.
+const MOCK_PROOF_PREFIX: &[u8] = b"\x00MOCKED-AGGREGATION-PROOF\x00";
 
 /// Whether the supplied env-var value should activate the driver.
 fn parse_truthy_env_value(value: &str) -> bool {
@@ -339,7 +347,7 @@ async fn run_verify_signatures(
 fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
     match step.step_type.as_str() {
         "tick" => {
-            let genesis_time = store.config().genesis_time;
+            let genesis_time = store.config().expect("config exists").genesis_time;
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
@@ -364,11 +372,33 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             // before importing, unless the step delivers the block ahead of
             // the store clock.
             if step.tick_to_slot {
-                let block_time_ms = store.config().genesis_time * 1000
+                let block_time_ms = store.config().expect("config exists").genesis_time * 1000
                     + signed_block.message.slot * MILLISECONDS_PER_SLOT;
                 store::on_tick(store, block_time_ms, true, None);
             }
-            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
+            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())?;
+
+            // Fold the block's attestations into the fork-choice known pool so
+            // block-borne votes carry weight. The production node SNARK-splits
+            // the block's merged proof and folds the recovered single-message
+            // aggregates; fixture blocks are blank, so reconstruct structurally
+            // from aggregation_bits (fork choice reads only the participant set,
+            // not the proof bytes). Mirrors the same fold in
+            // crates/blockchain/tests/forkchoice_spectests.rs.
+            let block = block_data.to_block();
+            let entries: Vec<_> = block
+                .body
+                .attestations
+                .iter()
+                .map(|att| {
+                    let hashed_attestation = HashedAttestationData::new(att.data.clone());
+                    let aggregate = SingleMessageAggregate::empty(att.aggregation_bits.clone());
+                    (hashed_attestation, aggregate)
+                })
+                .collect();
+            store.insert_known_aggregated_payloads_batch(entries);
+            store::update_head(store, false, None);
+            Ok(())
         }
         "attestation" => {
             let att = step
@@ -395,6 +425,11 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
             let participants: EthAggregationBits = proof.participants.into();
             let proof_bytes: Vec<u8> = proof.proof.into();
+            // leanSpec's mocked prover (proofSetting=0) emits placeholder proofs
+            // prefixed with MOCK_PROOF_PREFIX and expects verifiers to accept them
+            // unchecked. Route those through the non-verifying path; genuine proofs
+            // still run the real verifier.
+            let is_mocked = proof_bytes.starts_with(MOCK_PROOF_PREFIX);
             let proof_data = ByteList512KiB::try_from(proof_bytes)
                 .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
             let data: ethlambda_types::attestation::AttestationData = att.data.into();
@@ -402,7 +437,13 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
                 proof: SingleMessageAggregate::new(participants, proof_data),
                 data,
             };
-            store::on_gossip_aggregated_attestation(store, aggregated).map_err(|e| e.to_string())
+            if is_mocked {
+                store::on_gossip_aggregated_attestation_without_verification(store, aggregated)
+                    .map_err(|e| e.to_string())
+            } else {
+                store::on_gossip_aggregated_attestation(store, aggregated)
+                    .map_err(|e| e.to_string())
+            }
         }
         // `checks`-only steps are no-ops here: the simulator validates them
         // against the snapshot returned alongside this response.
@@ -426,11 +467,15 @@ fn post_summary(state: &State) -> StateTransitionPost {
 fn snapshot_store(store: &Store) -> DriverSnapshot {
     DriverSnapshot {
         head_slot: store.head_slot(),
-        head_root: store.head(),
-        time: store.time(),
-        justified_checkpoint: store.latest_justified(),
-        finalized_checkpoint: store.latest_finalized(),
-        safe_target: store.safe_target(),
+        head_root: store.head().expect("head exists"),
+        time: store.time().expect("store time exists"),
+        justified_checkpoint: store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        finalized_checkpoint: store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+        safe_target: store.safe_target().expect("safe target exists"),
     }
 }
 
@@ -454,8 +499,8 @@ mod tests {
         // Head, time, checkpoints all read without panicking; that's the
         // contract `init_fork_choice` relies on before the first reset.
         let _ = store.head();
-        assert_eq!(store.time(), 0);
-        assert_eq!(store.latest_justified().slot, 0);
-        assert_eq!(store.latest_finalized().slot, 0);
+        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.latest_justified().unwrap().slot, 0);
+        assert_eq!(store.latest_finalized().unwrap().slot, 0);
     }
 }

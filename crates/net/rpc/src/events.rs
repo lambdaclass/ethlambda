@@ -67,7 +67,7 @@ mod tests {
     async fn events_streams_head() {
         let (tx, _) = broadcast::channel::<ChainEvent>(16);
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(store).layer(Extension(tx.clone()));
+        let app = crate::test_utils::test_api_router(store).layer(Extension(tx.clone()));
 
         // Issue the request first so the handler subscribes its receiver before
         // we publish — `broadcast::send` errors if there are no live receivers.
