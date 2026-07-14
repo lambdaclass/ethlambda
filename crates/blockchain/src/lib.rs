@@ -293,13 +293,6 @@ impl BlockChainServer {
             return;
         }
 
-        // Observe tick interval duration. Done after the idempotency guard so a
-        // skipped duplicate tick doesn't shorten the next real tick's sample.
-        if let Some(prev_instant) = self.last_tick_instant {
-            metrics::observe_tick_interval_duration(prev_instant.elapsed());
-        }
-        self.last_tick_instant = Some(Instant::now());
-
         // Update current slot metric
         metrics::update_current_slot(slot);
         self.update_sync_status(slot);
@@ -1186,6 +1179,24 @@ pub(crate) trait BlockChainProtocol: Send + Sync {
 impl BlockChainServer {
     #[send_handler]
     async fn handle_tick(&mut self, _msg: block_chain_protocol::Tick, ctx: &Context<Self>) {
+        // Observe the interval between tick-handler invocations here, at the
+        // scheduler level, so a sample is taken for *every* tick — including the
+        // ones `on_tick` drops via its idempotency guard. The main case is the
+        // interval-0 tick after a proposer builds the next block one interval
+        // early: the build advances the store clock to interval 0, so that tick
+        // is skipped. Recording only inside `on_tick` (after the guard) would
+        // miss it, so the following tick's sample would span two intervals and
+        // show a false ~1.6s spike in `lean_tick_interval_duration_seconds` even
+        // though ticks are firing on their ~800ms cadence.
+        //
+        // Ticks that fire early from wall-clock drift and are then guard-skipped
+        // are also sampled here; that only adds occasional sub-interval samples,
+        // which is acceptable for a metric meant to surface *late* ticks.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
+
         let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
 
