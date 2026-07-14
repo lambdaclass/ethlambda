@@ -92,6 +92,15 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let mut block_registry: HashMap<String, H256> = HashMap::new();
         block_registry.insert("genesis".to_string(), anchor_root);
 
+        // Cumulative block tree (root -> (slot, parent_root)), never pruned.
+        // Mirrors leanSpec's `store.blocks`, which only ever grows: the store's
+        // `LiveChain` index drops entries below the finalized slot, but the
+        // reference harness keeps every block it ever imported. `reorgDepth`
+        // and `labelsInStore` must resolve blocks that finalization has already
+        // pruned from `LiveChain`, so we accumulate live-chain snapshots here
+        // instead of re-reading the pruned index at check time.
+        let mut all_blocks: HashMap<H256, (u64, H256)> = store.get_live_chain()?;
+
         // Process steps
         for (step_idx, step) in test.steps.into_iter().enumerate() {
             // Head before this step executes, for the `reorgDepth` check.
@@ -224,6 +233,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 }
             }
 
+            // Fold this step's blocks into the cumulative tree before checks so
+            // ancestry walks see blocks finalization may have just pruned from
+            // the live-chain index (see `all_blocks` above).
+            all_blocks.extend(store.get_live_chain()?);
+
             // Validate checks
             if let Some(checks) = step.checks {
                 validate_checks(
@@ -233,6 +247,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                     &block_registry,
                     old_head,
                     filled_block.as_ref(),
+                    &all_blocks,
                 )?;
             }
         }
@@ -261,6 +276,7 @@ fn validate_checks(
     block_registry: &HashMap<String, H256>,
     old_head: H256,
     filled_block: Option<&Block>,
+    all_blocks: &HashMap<H256, (u64, H256)>,
 ) -> datatest_stable::Result<()> {
     // Validate time check: fixtures encode the expected store time in intervals
     // since genesis (matching `Store::time()`).
@@ -520,10 +536,13 @@ fn validate_checks(
     }
 
     // Validate reorgDepth: blocks reachable from the old head but not the new.
+    // Walk the cumulative block tree, not the live-chain index: a reorg that
+    // also advanced finalization may have pruned the abandoned branch from
+    // `LiveChain`, which would undercount the depth. leanSpec walks its
+    // never-pruned `store.blocks` here for the same reason.
     if let Some(expected_depth) = checks.reorg_depth {
-        let blocks = st.get_live_chain()?;
-        let old_ancestors = ancestor_set(&blocks, old_head);
-        let new_ancestors = ancestor_set(&blocks, st.head()?);
+        let old_ancestors = ancestor_set(all_blocks, old_head);
+        let new_ancestors = ancestor_set(all_blocks, st.head()?);
         let actual_depth = old_ancestors.difference(&new_ancestors).count() as u64;
         if actual_depth != expected_depth {
             return Err(format!(
@@ -533,12 +552,13 @@ fn validate_checks(
         }
     }
 
-    // Validate labelsInStore: each labeled block must still be in the block tree.
+    // Validate labelsInStore: each labeled block must still be in the block
+    // tree. Mirrors leanSpec's `root in store.blocks` against the never-pruned
+    // tree, so a finalized block pruned from the live-chain index still counts.
     if let Some(ref labels) = checks.labels_in_store {
-        let blocks = st.get_live_chain()?;
         for label in labels {
             let root = resolve_label(label, block_registry, step_idx)?;
-            if !blocks.contains_key(&root) {
+            if !all_blocks.contains_key(&root) {
                 return Err(format!(
                     "Step {step_idx}: labelsInStore: block '{label}' (root={root:?}) \
                      not found in the store"
