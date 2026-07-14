@@ -95,7 +95,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Process steps
         for (step_idx, step) in test.steps.into_iter().enumerate() {
             // Head before this step executes, for the `reorgDepth` check.
-            let old_head = store.head();
+            let old_head = store.head()?;
             // Block built/imported this step, for the block-body checks. Mirrors
             // leanSpec's per-step `filled_block` (only a block step sets it).
             let mut filled_block: Option<Block> = None;
@@ -521,9 +521,9 @@ fn validate_checks(
 
     // Validate reorgDepth: blocks reachable from the old head but not the new.
     if let Some(expected_depth) = checks.reorg_depth {
-        let blocks = st.get_live_chain();
+        let blocks = st.get_live_chain()?;
         let old_ancestors = ancestor_set(&blocks, old_head);
-        let new_ancestors = ancestor_set(&blocks, st.head());
+        let new_ancestors = ancestor_set(&blocks, st.head()?);
         let actual_depth = old_ancestors.difference(&new_ancestors).count() as u64;
         if actual_depth != expected_depth {
             return Err(format!(
@@ -535,7 +535,7 @@ fn validate_checks(
 
     // Validate labelsInStore: each labeled block must still be in the block tree.
     if let Some(ref labels) = checks.labels_in_store {
-        let blocks = st.get_live_chain();
+        let blocks = st.get_live_chain()?;
         for label in labels {
             let root = resolve_label(label, block_registry, step_idx)?;
             if !blocks.contains_key(&root) {
@@ -693,7 +693,7 @@ fn validate_canonical_equivocation_head_among(
         .max_by_key(|(_, _, att_root)| *att_root)
         .expect("fork_data is non-empty");
 
-    let actual_head = st.head();
+    let actual_head = st.head()?;
     if actual_head != *winning_fork_root {
         let actual_label = fork_data
             .iter()
