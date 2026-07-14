@@ -38,7 +38,11 @@ async fn get_syncing(
     State(store): State<Store>,
     Extension(sync_status): Extension<SyncStatusController>,
 ) -> impl IntoResponse {
-    let genesis_ms = store.config().genesis_time.saturating_mul(1000);
+    let genesis_ms = store
+        .config()
+        .expect("config exists")
+        .genesis_time
+        .saturating_mul(1000);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -46,7 +50,10 @@ async fn get_syncing(
     let wall_slot = now_ms.saturating_sub(genesis_ms) / MILLISECONDS_PER_SLOT;
     let head_slot = store.head_slot();
     let sync_distance = wall_slot.saturating_sub(head_slot);
-    let finalized_slot = store.latest_finalized().slot;
+    let finalized_slot = store
+        .latest_finalized()
+        .expect("finalized block exists")
+        .slot;
     json_response(SyncingResponse {
         is_syncing: sync_status.get() == SyncStatus::Syncing,
         head_slot,

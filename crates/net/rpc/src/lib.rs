@@ -255,7 +255,9 @@ mod tests {
         let checkpoint: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // The justified checkpoint should match the store's latest justified
-        let expected = store.latest_justified();
+        let expected = store
+            .latest_justified()
+            .expect("latest justified checkpoint exists");
         assert_eq!(
             checkpoint,
             json!({
@@ -274,8 +276,13 @@ mod tests {
         let store = Store::from_anchor_state(backend, state);
 
         // Build expected SSZ with zeroed state_root (canonical post-state form)
-        let finalized = store.latest_finalized();
-        let mut expected_state = store.get_state(&finalized.root).unwrap();
+        let finalized = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists");
+        let mut expected_state = store
+            .get_state(&finalized.root)
+            .expect("expected state")
+            .unwrap();
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
@@ -463,7 +470,10 @@ mod tests {
         let block = Block {
             slot: 1,
             proposer_index: 0,
-            parent_root: store.latest_finalized().root,
+            parent_root: store
+                .latest_finalized()
+                .expect("latest finalized checkpoint exists")
+                .root,
             state_root: H256::ZERO,
             body: BlockBody::default(),
         };
@@ -529,8 +539,14 @@ mod tests {
         // matching the genesis header paired with the synthetic blank proof —
         // same shape `get_signed_block` builds in storage.
         let genesis_block = store
-            .get_signed_block(&store.latest_finalized().root)
-            .expect("genesis served via get_signed_block");
+            .get_signed_block(
+                &store
+                    .latest_finalized()
+                    .expect("latest finalized checkpoint exists")
+                    .root,
+            )
+            .expect("genesis served via get_signed_block")
+            .unwrap();
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
             proof: MultiMessageAggregate::default(),
