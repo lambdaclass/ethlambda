@@ -834,6 +834,23 @@ impl BlockChainServer {
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
 
+        // Record the tick-interval sample here, from inside the proposal path.
+        //
+        // Building the block above advanced the store clock to this slot's
+        // interval 0 (one interval past the interval-4 tick we are running in),
+        // so `on_tick` skips the real interval-0 tick via its idempotency guard.
+        // A skipped tick records nothing and does not advance `last_tick_instant`,
+        // so without this the next tick (interval 1) would measure the gap all the
+        // way back to the interval-4 tick — two intervals, a false ~1.6s spike in
+        // `lean_tick_interval_duration_seconds` even though ticks are firing on
+        // cadence. Recording here (after the alignment sleep, i.e. at ~the
+        // interval-0 boundary) stands in for the skipped tick and keeps samples at
+        // ~one interval.
+        if let Some(prev_instant) = self.last_tick_instant {
+            metrics::observe_tick_interval_duration(prev_instant.elapsed());
+        }
+        self.last_tick_instant = Some(Instant::now());
+
         self.process_and_publish_block(slot, validator_id, signed_block);
     }
 
