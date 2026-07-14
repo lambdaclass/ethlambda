@@ -671,7 +671,7 @@ async fn fetch_initial_state(
     // Checkpoint sync path
 
     // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
-    if let Some(store) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
+    if let Ok(Some(store)) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
