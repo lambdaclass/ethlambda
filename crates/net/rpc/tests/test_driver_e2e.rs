@@ -110,7 +110,7 @@ async fn init_with_genesis_anchor_returns_204_and_resets_store() {
 
     // The driver's store should now reflect the supplied genesis time.
     let guard = driver.read().await;
-    assert_eq!(guard.config().genesis_time, 1234);
+    assert_eq!(guard.config().expect("config exists").genesis_time, 1234);
 }
 
 #[tokio::test]
