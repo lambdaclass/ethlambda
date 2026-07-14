@@ -455,17 +455,24 @@ fn validate_checks(
     // Mirrors leanSpec's `{data.target.slot for data in pool}` over all
     // distinct pool entries.
     if let Some(ref expected) = checks.latest_known_aggregated_target_slots {
-        let actual: Vec<u64> = sorted_unique(
-            st.known_aggregated_payloads()
-                .values()
-                .map(|(data, _)| data.target.slot),
-        );
-        check_target_slots(
-            "latestKnownAggregatedTargetSlots",
-            &actual,
-            expected,
-            step_idx,
-        )?;
+        // Sorted, de-duplicated set of target slots keyed in the known pool.
+        let actual: Vec<u64> = st
+            .known_aggregated_payloads()
+            .values()
+            .map(|(data, _)| data.target.slot)
+            .collect::<BTreeSet<u64>>()
+            .into_iter()
+            .collect();
+        let mut expected_sorted = expected.to_vec();
+        expected_sorted.sort_unstable();
+        expected_sorted.dedup();
+        if actual != expected_sorted.as_slice() {
+            return Err(format!(
+                "Step {step_idx}: latestKnownAggregatedTargetSlots mismatch: \
+                 expected {expected_sorted:?}, got {actual:?}"
+            )
+            .into());
+        }
     }
 
     // NOTE: `latestNewAggregatedTargetSlots`, `attestationSignatureTargetSlots`
@@ -556,31 +563,6 @@ fn resolve_label(
         )
         .into()
     })
-}
-
-/// Collect an iterator of slots into a sorted, de-duplicated `Vec`.
-fn sorted_unique(slots: impl Iterator<Item = u64>) -> Vec<u64> {
-    let set: BTreeSet<u64> = slots.collect();
-    set.into_iter().collect()
-}
-
-/// Compare an actual sorted-unique target-slot set against the fixture's.
-fn check_target_slots(
-    name: &str,
-    actual: &[u64],
-    expected: &[u64],
-    step_idx: usize,
-) -> datatest_stable::Result<()> {
-    let mut expected_sorted = expected.to_vec();
-    expected_sorted.sort_unstable();
-    expected_sorted.dedup();
-    if actual != expected_sorted.as_slice() {
-        return Err(format!(
-            "Step {step_idx}: {name} mismatch: expected {expected_sorted:?}, got {actual:?}"
-        )
-        .into());
-    }
-    Ok(())
 }
 
 /// Walk parent links from `head`, collecting every reachable block root.
