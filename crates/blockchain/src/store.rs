@@ -576,11 +576,7 @@ fn on_block_core(
     let block_root = block.hash_tree_root();
     let slot = block.slot;
 
-    // Skip duplicate blocks (idempotent operation). The block hashing above is
-    // real work and stays inside the timed span, but a duplicate does no block
-    // processing, so discard the sample instead of recording a near-zero
-    // duration that would skew `lean_fork_choice_block_processing_time_seconds`
-    // low (duplicates are common during range sync).
+    // Skip duplicate blocks (idempotent operation)
     if store
         .has_state(&block_root)
         .expect("DB read should succeed")
