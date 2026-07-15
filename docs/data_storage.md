@@ -311,9 +311,9 @@ a deferred heavy phase.
 
 **Immediately, when finalization advances** (inside `update_checkpoints`):
 
-- `prune_live_chain`: deletes `LiveChain` entries with `slot <
-finalized_slot`, keeping the finalized block itself. This keeps the fork
-  choice working set bounded to the non-finalized chain.
+- `prune_live_chain`: deletes `LiveChain` entries below the finalized slot,
+  keeping the finalized block itself. This keeps the fork choice working set
+  bounded to the non-finalized chain.
 - `prune_gossip_signatures`: drops buffered in-memory gossip signatures at or
   below the finalized slot.
 - `prune_stale_aggregated_payloads`: drops in-memory aggregated payloads
