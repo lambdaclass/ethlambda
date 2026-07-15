@@ -28,6 +28,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
+| `GET` | `/lean/v0/events` | SSE | Live stream of chain events |
 | `GET` | `/lean/v0/blocks/{block_id}` | JSON | Block by root or slot |
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
@@ -82,6 +83,26 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 ```json
 { "slot": 128, "root": "0x1a2b…" }
 ```
+
+### `GET /lean/v0/events`
+
+Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Four event types:
+
+| Event | Payload | Emitted when |
+|-------|---------|--------------|
+| `head` | `{ "slot": 128, "root": "0x…", "parent_root": "0x…" }` | Fork choice selects a new head within `HEAD_EVENT_RECENCY_SLOTS` (32 slots) of the wall clock; no head events fire during catch-up |
+| `block` | `{ "slot": 128, "root": "0x…" }` | A block is imported into the store |
+| `justified_checkpoint` | `{ "slot": 120, "root": "0x…" }` | The justified checkpoint advances |
+| `finalized_checkpoint` | `{ "slot": 96, "root": "0x…" }` | The finalized checkpoint advances |
+
+The topic name travels only on the SSE `event:` line; the `data:` line carries the flat JSON payload. Example frame:
+
+```
+event: head
+data: {"slot":128,"root":"0x1a2b…","parent_root":"0x3c4d…"}
+```
+
+Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. Keep-alive comments are sent periodically to hold idle connections open.
 
 ### `GET /lean/v0/blocks/{block_id}` and `/header`
 
@@ -195,6 +216,7 @@ When the binary boots with `HIVE_LEAN_TEST_DRIVER=1` (any of `1`/`true`/`yes`), 
 | Kind | `Content-Type` |
 |------|----------------|
 | JSON | `application/json; charset=utf-8` |
+| SSE | `text/event-stream` |
 | SSZ | `application/octet-stream` |
 | Prometheus metrics | `text/plain; version=0.0.4; charset=utf-8` |
 | HTML | `text/html; charset=utf-8` |
