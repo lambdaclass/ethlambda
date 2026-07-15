@@ -299,10 +299,16 @@ sequence of independent write batches:
 ```
 
 Each numbered step is atomic on its own, but the import as a whole is **not**
-one transaction. A crash mid-import can leave a block and state persisted
-without an updated head. This is safe: block import is idempotent (a
-re-imported block is skipped via `has_state`), and on restart fork choice
-recomputes the head from what is on disk.
+one transaction. The commit order keeps the on-disk store consistent after any
+prefix of these steps: the justified checkpoint written in step 1 always names
+an already-persisted **ancestor** of the imported block (the state transition
+only counts attestations whose roots match the state's own
+`historical_block_hashes`, and every ancestor was fully persisted when it was
+imported), and the head only advances in step 4, after the block and state are
+durable. A crash mid-import can therefore lose the tail of the import — e.g. a
+persisted block and state the head does not point to yet — but never leave
+metadata referencing missing data. Re-importing the block is idempotent (a
+duplicate is skipped via `has_state`).
 
 ## Pruning
 
