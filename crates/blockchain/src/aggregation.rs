@@ -317,10 +317,10 @@ pub fn snapshot_aggregation_inputs(
     // against the current chain: aggregated attestations only reference
     // existing blocks (head.slot / target.slot <= head_slot), so no
     // empty-slot padding beyond the tip is needed.
-    let known_block_roots = store.get_block_roots();
+    let known_block_roots = store.get_block_roots().expect("block roots read works");
     let mut extended_historical_block_hashes: Vec<H256> =
         head_state.historical_block_hashes.iter().copied().collect();
-    extended_historical_block_hashes.push(store.head());
+    extended_historical_block_hashes.push(store.head().expect("head read works"));
 
     let mut projected = ProjectedState {
         justified_slots: head_state.justified_slots.clone(),
@@ -1370,7 +1370,7 @@ mod tests {
 
         // The canonical tip: `head_state` is the state at this block, and it
         // sits at index HEAD_SLOT once the chain view is extended.
-        let head_root = store.head();
+        let head_root = store.head().expect("head read works");
 
         // Vote whose head AND target are the current head at HEAD_SLOT, with a
         // genesis (implicitly justified) source. Justifiable: delta 4 <= 5.
