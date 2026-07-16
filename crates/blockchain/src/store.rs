@@ -569,7 +569,7 @@ fn on_block_core(
     signed_block: SignedBlock,
     verify: bool,
 ) -> Result<(), StoreError> {
-    let _timing = metrics::time_fork_choice_block_processing();
+    let timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
     let block = &signed_block.message;
@@ -581,6 +581,7 @@ fn on_block_core(
         .has_state(&block_root)
         .expect("DB read should succeed")
     {
+        timing.discard();
         return Ok(());
     }
 
