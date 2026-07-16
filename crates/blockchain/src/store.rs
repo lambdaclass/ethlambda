@@ -569,7 +569,7 @@ fn on_block_core(
     signed_block: SignedBlock,
     verify: bool,
 ) -> Result<(), StoreError> {
-    let mut timing = metrics::time_fork_choice_block_processing();
+    let timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
     let block = &signed_block.message;
