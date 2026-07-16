@@ -706,9 +706,13 @@ pub fn set_node_start_time() {
     LEAN_NODE_START_TIME_SECONDS.set(timestamp as i64);
 }
 
-/// Increment the valid attestations counter.
-pub fn inc_attestations_valid(count: u64) {
-    LEAN_ATTESTATIONS_VALID_TOTAL.inc_by(count);
+/// Increment the valid attestations counter by one.
+///
+/// Counts one per gossip attestation (single or aggregated) that passes all
+/// validation checks, symmetric with [`inc_attestations_invalid`]. Matches
+/// leanSpec's `lean_attestations_valid_total`, a validation-pipeline counter.
+pub fn inc_attestations_valid() {
+    LEAN_ATTESTATIONS_VALID_TOTAL.inc();
 }
 
 /// Increment the invalid attestations counter.
