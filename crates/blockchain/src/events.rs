@@ -99,11 +99,6 @@ impl EventBus {
         Self { tx }
     }
 
-    /// Dormant bus: emits go nowhere. For tests and eventless call paths.
-    pub fn disabled() -> Self {
-        Self::new(1)
-    }
-
     /// Publish an event to all current subscribers.
     ///
     /// Never blocks, never fails: without subscribers this is a no-op, and a
@@ -261,16 +256,6 @@ mod tests {
         let bus = EventBus::default();
         // No subscriber attached: must neither error nor panic.
         bus.emit(head_event(1));
-    }
-
-    #[test]
-    fn disabled_bus_accepts_emits() {
-        let bus = EventBus::disabled();
-        bus.emit(head_event(1));
-        bus.emit(ChainEvent::Block {
-            slot: 2,
-            root: H256::ZERO,
-        });
     }
 
     #[test]
