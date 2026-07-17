@@ -702,16 +702,33 @@ impl BlockChainServer {
         // stashed for a later tick), and the real interval-0 tick is then skipped
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
+        //
+        // That interval-0 catch-up can move head/justified/finalized (it is the
+        // same attestation-acceptance step a non-proposing node runs at its
+        // interval-0 tick). Snapshot around the build so those moves surface as
+        // chain events here, matching an observer node; otherwise they would
+        // land outside every snapshot window and be silently absorbed into the
+        // later block-import diff's baseline.
+        let pre_build = ChainEventSnapshot::capture(&self.store);
         let timing = metrics::time_block_building();
-        let Ok((block, single_message_aggregates, _post_checkpoints)) =
-            store::produce_block_with_signatures(
-                &mut self.store,
-                slot,
-                validator_id,
-                self.proposer_config,
-            )
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let build_result = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            self.proposer_config,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"));
+
+        // `get_proposal_head` advances the store (interval-0 catch-up) inside
+        // `produce_block_with_signatures` *before* the build can fail, so emit
+        // the resulting head/checkpoint moves on both paths — a build failure
+        // must not strand a real finalization move outside every snapshot
+        // window. Ordered before the freshly built block's own import (which
+        // emits its `block` + head/checkpoint events). The catch-up advanced
+        // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
+        pre_build.diff_and_emit(&self.store, &self.events, slot);
+
+        let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -894,7 +911,7 @@ impl BlockChainServer {
         if is_new {
             self.events.emit(ChainEvent::Block {
                 slot,
-                root: block_root,
+                block: block_root,
             });
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
