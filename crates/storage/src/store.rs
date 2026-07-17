@@ -635,8 +635,6 @@ impl Store {
             return Ok(None);
         }
         let store = Self {
-        info!("Loaded store from persisted DB state");
-        Ok(Some(Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
@@ -645,12 +643,12 @@ impl Store {
             ))),
             state_cache: new_state_cache(),
         };
-        if store.get_block_root_by_slot(store.head_slot()) != Some(store.head()) {
-            store.rebuild_block_root_index();
+        let head = store.head()?;
+        if store.get_block_root_by_slot(store.head_slot()) != Some(head) {
+            store.rebuild_block_root_index()?;
         }
         info!("Loaded store from persisted DB state");
-        Some(store)
-        }))
+        Ok(Some(store))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -848,14 +846,10 @@ impl Store {
     /// When finalization advances, prunes the LiveChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) -> Result<(), Error> {
         // Read old finalized slot before updating metadata
-        let old_finalized_slot = self.latest_finalized().slot;
-        let old_head = self.head();
+        let old_finalized_slot = self.latest_finalized()?.slot;
+        let old_head = self.head()?;
         let (block_root_deletes, block_root_entries) =
-            self.block_root_index_changes(old_head, checkpoints.head);
-        let old_finalized_slot = self
-            .latest_finalized()
-            .expect("Failed to get latest finalized checkpoint")
-            .slot;
+            self.block_root_index_changes(old_head, checkpoints.head)?;
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
@@ -934,14 +928,14 @@ impl Store {
         &self,
         mut old_root: H256,
         mut new_root: H256,
-    ) -> BlockRootIndexChanges {
+    ) -> Result<BlockRootIndexChanges, Error> {
         let mut deletes = Vec::new();
         let mut entries = Vec::new();
 
         while old_root != new_root {
             if old_root.is_zero() {
                 let header = self
-                    .get_block_header(&new_root)
+                    .get_block_header(&new_root)?
                     .expect("new canonical block header exists");
                 entries.push((encode_block_root_key(header.slot), new_root.to_ssz()));
                 new_root = header.parent_root;
@@ -949,7 +943,7 @@ impl Store {
             }
             if new_root.is_zero() {
                 let header = self
-                    .get_block_header(&old_root)
+                    .get_block_header(&old_root)?
                     .expect("old canonical block header exists");
                 deletes.push(encode_block_root_key(header.slot));
                 old_root = header.parent_root;
@@ -957,10 +951,10 @@ impl Store {
             }
 
             let old_header = self
-                .get_block_header(&old_root)
+                .get_block_header(&old_root)?
                 .expect("old canonical block header exists");
             let new_header = self
-                .get_block_header(&new_root)
+                .get_block_header(&new_root)?
                 .expect("new canonical block header exists");
 
             match old_header.slot.cmp(&new_header.slot) {
@@ -981,10 +975,10 @@ impl Store {
             }
         }
 
-        (deletes, entries)
+        Ok((deletes, entries))
     }
 
-    fn rebuild_block_root_index(&self) {
+    fn rebuild_block_root_index(&self) -> Result<(), Error> {
         let view = self.backend.begin_read().expect("read view");
         let old_keys = view
             .prefix_iterator(Table::BlockRoots, &[])
@@ -995,9 +989,9 @@ impl Store {
         drop(view);
 
         let mut entries = Vec::new();
-        let mut root = self.head();
+        let mut root = self.head()?;
         while !root.is_zero() {
-            let Some(header) = self.get_block_header(&root) else {
+            let Some(header) = self.get_block_header(&root)? else {
                 break;
             };
             entries.push((encode_block_root_key(header.slot), root.to_ssz()));
@@ -1012,6 +1006,7 @@ impl Store {
             .put_batch(Table::BlockRoots, entries)
             .expect("rebuild block root index");
         batch.commit().expect("commit");
+        Ok(())
     }
 
     /// Return the canonical block root at `slot`.
@@ -1860,7 +1855,7 @@ mod tests {
     fn block_root_index_tracks_canonical_chain_across_reorgs() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
-        let anchor_root = store.head();
+        let anchor_root = store.head().expect("head root");
 
         let block_1 = signed_block(1, anchor_root);
         let root_1 = block_1.message.hash_tree_root();
@@ -1910,7 +1905,7 @@ mod tests {
         let mut store =
             Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
 
-        let block = signed_block(1, store.head());
+        let block = signed_block(1, store.head().expect("head root"));
         let block_root = block.message.hash_tree_root();
         store
             .insert_signed_block(block_root, block)
@@ -1933,7 +1928,9 @@ mod tests {
             .expect("clear block roots");
         batch.commit().expect("commit");
 
-        let restored = Store::from_db_state(backend, 12345).expect("restore store");
+        let restored = Store::from_db_state(backend, 12345)
+            .expect("restore store")
+            .expect("store exists");
         assert_eq!(restored.get_block_root_by_slot(1), Some(block_root));
     }
 

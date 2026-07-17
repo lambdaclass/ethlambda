@@ -272,30 +272,7 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
     (start_slot..=end_slot)
         .filter_map(|slot| {
             let root = store.get_block_root_by_slot(slot)?;
-            store.get_signed_block(&root)
-    let mut roots_by_slot = HashMap::new();
-    let mut current_root = store.head().expect("head block exists");
-
-    while !current_root.is_zero() {
-        let Ok(Some(header)) = store.get_block_header(&current_root) else {
-            break;
-        };
-
-        if header.slot < start_slot {
-            break;
-        }
-
-        if header.slot <= end_slot {
-            roots_by_slot.insert(header.slot, current_root);
-        }
-
-        current_root = header.parent_root;
-    }
-
-    (start_slot..=end_slot)
-        .filter_map(|slot| {
-            let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root).ok().flatten()
+            store.get_signed_block(&root).ok().flatten()
         })
         .collect()
 }
