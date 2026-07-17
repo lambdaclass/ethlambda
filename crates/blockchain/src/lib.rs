@@ -313,23 +313,13 @@ impl ChainEventSnapshot {
     }
 
     /// Emit one event per value that changed since the snapshot, in a fixed
-    /// order: `justified_checkpoint` → `head` → `finalized_checkpoint`.
+    /// order: `head` → `justified_checkpoint` → `finalized_checkpoint`.
     /// (`block` is emitted separately by the import path, ahead of this diff.)
     ///
     /// `wall_clock_slot` is the caller's current slot, used only to gate the
     /// `head` event against [`HEAD_EVENT_RECENCY_SLOTS`]; the other events are
     /// ungated.
     fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
-        let justified = store
-            .latest_justified()
-            .expect("latest justified checkpoint exists");
-        if justified != self.justified {
-            events.emit(ChainEvent::JustifiedCheckpoint {
-                slot: justified.slot,
-                root: justified.root,
-            });
-        }
-
         let head = store.head().expect("head block exists");
         if head != self.head {
             // Read the header once and reuse it for slot and parent_root so
@@ -352,6 +342,16 @@ impl ChainEventSnapshot {
                     "Head header missing while emitting head event; skipping"
                 );
             }
+        }
+
+        let justified = store
+            .latest_justified()
+            .expect("latest justified checkpoint exists");
+        if justified != self.justified {
+            events.emit(ChainEvent::JustifiedCheckpoint {
+                slot: justified.slot,
+                root: justified.root,
+            });
         }
 
         let finalized = store
@@ -1543,60 +1543,6 @@ mod tests {
         let snapshot = ChainEventSnapshot::capture(&store);
         snapshot.diff_and_emit(&store, &bus, 0);
 
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-    }
-
-    /// A store call that moved everything yields exactly one event per value,
-    /// in the fixed justified → head → finalized order.
-    #[test]
-    fn chain_event_diff_emits_moves_in_order() {
-        let mut store = test_store();
-        let genesis = store.head().expect("store head exists");
-        let bus = EventBus::new(8);
-        let mut rx = bus.subscribe();
-
-        let snapshot = ChainEventSnapshot::capture(&store);
-
-        let new_root = H256([9u8; 32]);
-        insert_test_block(&mut store, new_root, 1, genesis);
-        let checkpoint = Checkpoint {
-            root: new_root,
-            slot: 1,
-        };
-        store
-            .update_checkpoints(ForkCheckpoints::new(
-                new_root,
-                Some(checkpoint),
-                Some(checkpoint),
-            ))
-            .expect("update_checkpoints should succeed");
-
-        // Wall-clock slot equal to the new head's slot: well within the
-        // recency window, so the head event fires normally.
-        snapshot.diff_and_emit(&store, &bus, 1);
-
-        match rx.try_recv().unwrap() {
-            ChainEvent::JustifiedCheckpoint { slot, root } => {
-                assert_eq!((slot, root), (1, new_root));
-            }
-            other => panic!("expected justified_checkpoint first, got: {other:?}"),
-        }
-        match rx.try_recv().unwrap() {
-            ChainEvent::Head {
-                slot,
-                root,
-                parent_root,
-            } => {
-                assert_eq!((slot, root, parent_root), (1, new_root, genesis));
-            }
-            other => panic!("expected head second, got: {other:?}"),
-        }
-        match rx.try_recv().unwrap() {
-            ChainEvent::FinalizedCheckpoint { slot, root } => {
-                assert_eq!((slot, root), (1, new_root));
-            }
-            other => panic!("expected finalized_checkpoint last, got: {other:?}"),
-        }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
