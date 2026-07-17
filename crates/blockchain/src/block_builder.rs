@@ -262,12 +262,10 @@ fn pick_best_candidate(
         if processed_data_roots.contains(data_root) {
             continue;
         }
-        if let Err(reason) = entry_passes_filters(
+        if let Err(reason) = projected.entry_passes_filters(
             att_data,
             chain.known_block_roots,
             chain.extended_historical_block_hashes,
-            &projected.justified_slots,
-            projected.finalized_slot,
         ) {
             trace_skipped_attestation(reason, att_data, data_root);
             continue;
@@ -437,57 +435,58 @@ impl ProjectedState {
         };
         Some((score, new_voters))
     }
-}
 
-/// Validate a candidate entry against the projected chain view.
-///
-/// Mirrors `state_transition::is_valid_vote`: the entry's head must be known,
-/// its source must be justified, its (source, target) must match the
-/// candidate-block chain view, `target.slot > source.slot`, target must not
-/// already be justified, and target must be a justifiable slot relative to
-/// the projected finalized slot. The genesis self-vote (source == target ==
-/// slot 0) is exempt from the `target.slot > source.slot` and
-/// `target_already_justified` checks since fork-choice bootstrapping needs
-/// it; STF will silently drop it, but it carries fork-choice signal.
-pub(crate) fn entry_passes_filters(
-    att_data: &AttestationData,
-    known_block_roots: &HashSet<H256>,
-    extended_historical_block_hashes: &[H256],
-    projected_justified_slots: &JustifiedSlots,
-    projected_finalized_slot: u64,
-) -> Result<(), &'static str> {
-    if !known_block_roots.contains(&att_data.head.root) {
-        return Err("head_root_unknown");
+    /// Validate a candidate entry against the projection and the given chain
+    /// view.
+    ///
+    /// Mirrors `state_transition::is_valid_vote`: the entry's head must be
+    /// known, its source must be justified, its (source, target) must match
+    /// the candidate-block chain view, `target.slot > source.slot`, target
+    /// must not already be justified, and target must be a justifiable slot
+    /// relative to the projected finalized slot. The genesis self-vote
+    /// (source == target == slot 0) is exempt from the `target.slot >
+    /// source.slot` and `target_already_justified` checks since fork-choice
+    /// bootstrapping needs it; STF will silently drop it, but it carries
+    /// fork-choice signal.
+    pub(crate) fn entry_passes_filters(
+        &self,
+        att_data: &AttestationData,
+        known_block_roots: &HashSet<H256>,
+        extended_historical_block_hashes: &[H256],
+    ) -> Result<(), &'static str> {
+        if !known_block_roots.contains(&att_data.head.root) {
+            return Err("head_root_unknown");
+        }
+        if !justified_slots_ops::is_slot_justified(
+            &self.justified_slots,
+            self.finalized_slot,
+            att_data.source.slot,
+        ) {
+            return Err("source_not_justified");
+        }
+        if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
+            return Err("chain_mismatch");
+        }
+        let is_genesis_self_vote = is_genesis_self_vote(att_data);
+        if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
+            return Err("target_not_after_source");
+        }
+        if !is_genesis_self_vote
+            && justified_slots_ops::is_slot_justified(
+                &self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            )
+        {
+            return Err("target_already_justified");
+        }
+        if !is_genesis_self_vote
+            && !slot_is_justifiable_after(att_data.target.slot, self.finalized_slot)
+        {
+            return Err("target_not_justifiable");
+        }
+        Ok(())
     }
-    if !justified_slots_ops::is_slot_justified(
-        projected_justified_slots,
-        projected_finalized_slot,
-        att_data.source.slot,
-    ) {
-        return Err("source_not_justified");
-    }
-    if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
-        return Err("chain_mismatch");
-    }
-    let is_genesis_self_vote = is_genesis_self_vote(att_data);
-    if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
-        return Err("target_not_after_source");
-    }
-    if !is_genesis_self_vote
-        && justified_slots_ops::is_slot_justified(
-            projected_justified_slots,
-            projected_finalized_slot,
-            att_data.target.slot,
-        )
-    {
-        return Err("target_already_justified");
-    }
-    if !is_genesis_self_vote
-        && !slot_is_justifiable_after(att_data.target.slot, projected_finalized_slot)
-    {
-        return Err("target_not_justifiable");
-    }
-    Ok(())
 }
 
 /// Selection tier for a candidate `AttestationData` entry.
