@@ -429,15 +429,13 @@ impl ProjectedState {
             Tier::Justify
         };
 
-        Some((
-            EntryScore {
-                tier,
-                new_voters: new_voters.len(),
-                target_slot: att_data.target.slot,
-                att_slot: att_data.slot,
-            },
-            new_voters,
-        ))
+        let score = EntryScore {
+            tier,
+            new_voters: new_voters.len(),
+            target_slot: att_data.target.slot,
+            att_slot: att_data.slot,
+        };
+        Some((score, new_voters))
     }
 }
 
