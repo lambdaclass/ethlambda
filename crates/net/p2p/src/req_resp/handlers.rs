@@ -208,7 +208,7 @@ async fn handle_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        if let Some(signed_block) = server.store.get_signed_block(root) {
+        if let Ok(Some(signed_block)) = server.store.get_signed_block(root) {
             blocks.push(signed_block);
         }
         // Missing blocks are silently skipped (per spec)
@@ -273,6 +273,29 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         .filter_map(|slot| {
             let root = store.get_block_root_by_slot(slot)?;
             store.get_signed_block(&root)
+    let mut roots_by_slot = HashMap::new();
+    let mut current_root = store.head().expect("head block exists");
+
+    while !current_root.is_zero() {
+        let Ok(Some(header)) = store.get_block_header(&current_root) else {
+            break;
+        };
+
+        if header.slot < start_slot {
+            break;
+        }
+
+        if header.slot <= end_slot {
+            roots_by_slot.insert(header.slot, current_root);
+        }
+
+        current_root = header.parent_root;
+    }
+
+    (start_slot..=end_slot)
+        .filter_map(|slot| {
+            let root = roots_by_slot.get(&slot)?;
+            store.get_signed_block(root).ok().flatten()
         })
         .collect()
 }
@@ -374,11 +397,12 @@ async fn handle_blocks_by_range_response(
 
 /// Build a Status message from the current Store state.
 pub fn build_status(store: &Store) -> Status {
-    let finalized = store.latest_finalized();
-    let head_root = store.head();
+    let finalized = store.latest_finalized().expect("finalized block exists");
+    let head_root = store.head().expect("head block exists");
     let head_slot = store
         .get_block_header(&head_root)
         .expect("head block exists")
+        .unwrap()
         .slot;
     Status {
         finalized,
@@ -606,7 +630,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
 
-        let block_1 = signed_block(1, store.head());
+        let block_1 = signed_block(1, store.head().expect("head block exists"));
         let root_1 = block_1.message.hash_tree_root();
         store
             .insert_signed_block(root_1, block_1)

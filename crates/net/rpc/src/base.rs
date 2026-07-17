@@ -22,10 +22,11 @@ pub(crate) fn routes() -> Router<Store> {
 pub(crate) async fn get_latest_finalized_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
+    let finalized = store.latest_finalized().expect("finalized block exists");
     let mut state = store
         .get_state(&finalized.root)
-        .expect("finalized state exists");
+        .expect("finalized state exists")
+        .unwrap();
 
     // Zero state_root to match the canonical post-state representation.
     // The spec's state_transition sets state_root to zero during process_block_header,
@@ -39,19 +40,22 @@ pub(crate) async fn get_latest_finalized_state(
 pub(crate) async fn get_latest_finalized_block(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let finalized = store.latest_finalized();
+    let finalized = store.latest_finalized().expect("finalized block exists");
     // Genesis has no stored signature; `get_signed_block` synthesizes a
     // placeholder blank proof so this always returns 200.
     match store.get_signed_block(&finalized.root) {
-        Some(block) => ssz_response(block.to_ssz()),
-        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(block)) => ssz_response(block.to_ssz()),
+        Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
 pub(crate) async fn get_latest_justified_checkpoint(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let checkpoint = store.latest_justified();
+    let checkpoint = store
+        .latest_justified()
+        .expect("justified checkpoint exists");
     json_response(checkpoint)
 }
 

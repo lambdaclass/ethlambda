@@ -347,7 +347,7 @@ async fn run_verify_signatures(
 fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
     match step.step_type.as_str() {
         "tick" => {
-            let genesis_time = store.config().genesis_time;
+            let genesis_time = store.config().expect("config exists").genesis_time;
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
@@ -367,7 +367,7 @@ fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
             // before importing, unless the step delivers the block ahead of
             // the store clock.
             if step.tick_to_slot {
-                let block_time_ms = store.config().genesis_time * 1000
+                let block_time_ms = store.config().expect("config exists").genesis_time * 1000
                     + signed_block.message.slot * MILLISECONDS_PER_SLOT;
                 store::on_tick(store, block_time_ms, true);
             }
@@ -462,11 +462,15 @@ fn post_summary(state: &State) -> StateTransitionPost {
 fn snapshot_store(store: &Store) -> DriverSnapshot {
     DriverSnapshot {
         head_slot: store.head_slot(),
-        head_root: store.head(),
-        time: store.time(),
-        justified_checkpoint: store.latest_justified(),
-        finalized_checkpoint: store.latest_finalized(),
-        safe_target: store.safe_target(),
+        head_root: store.head().expect("head exists"),
+        time: store.time().expect("store time exists"),
+        justified_checkpoint: store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        finalized_checkpoint: store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+        safe_target: store.safe_target().expect("safe target exists"),
     }
 }
 
@@ -490,8 +494,8 @@ mod tests {
         // Head, time, checkpoints all read without panicking; that's the
         // contract `init_fork_choice` relies on before the first reset.
         let _ = store.head();
-        assert_eq!(store.time(), 0);
-        assert_eq!(store.latest_justified().slot, 0);
-        assert_eq!(store.latest_finalized().slot, 0);
+        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.latest_justified().unwrap().slot, 0);
+        assert_eq!(store.latest_finalized().unwrap().slot, 0);
     }
 }

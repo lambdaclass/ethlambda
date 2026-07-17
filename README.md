@@ -114,8 +114,8 @@ Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the followin
 | Tag | Description |
 |-----|-------------|
 | `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
-| `latest` | Alias for the stable image of the currently running devnet |
-| `unstable` | Development builds; promoted to `devnetX`/`latest` once tested |
+| `latest` | Alias for the latest stable image of the currently running devnet |
+| `unstable` | Built from the latest main commit; promoted to `devnetX`/`latest` once tested |
 | `sha-XXXXXXX` | Specific commit |
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.

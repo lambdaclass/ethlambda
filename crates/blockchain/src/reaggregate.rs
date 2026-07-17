@@ -61,7 +61,7 @@ pub fn reaggregate_from_block(
     // The multi-message aggregate proof was built against the parent state's
     // validator set. Without it we cannot resolve the pubkey layout the SNARK
     // was bound to.
-    let Some(parent_state) = store.get_state(&block.parent_root) else {
+    let Ok(Some(parent_state)) = store.get_state(&block.parent_root) else {
         debug!(
             block_root = %ethlambda_types::ShortRoot(&block.hash_tree_root().0),
             "Skipping reaggregation: parent state missing"
@@ -239,7 +239,10 @@ struct Candidate {
 /// capped at [`MAX_REAGGREGATIONS_PER_BLOCK`] so an attacker-shaped block
 /// cannot blow past the slot budget.
 fn select_candidates(store: &Store, attestations: &[AggregatedAttestation]) -> Vec<Candidate> {
-    let justified_slot = store.latest_justified().slot;
+    let justified_slot = store
+        .latest_justified()
+        .expect("latest justified checkpoint exists")
+        .slot;
     let mut candidates: Vec<Candidate> = Vec::new();
     for (idx, att) in attestations.iter().enumerate() {
         if att.data.target.slot <= justified_slot {
@@ -315,7 +318,7 @@ mod tests {
         // Justified at slot 5; an attestation with target.slot = 5 must be skipped.
         store
             .update_checkpoints(ethlambda_storage::ForkCheckpoints::new(
-                store.head(),
+                store.head().expect("head exists"),
                 Some(Checkpoint {
                     root: H256::ZERO,
                     slot: 5,
