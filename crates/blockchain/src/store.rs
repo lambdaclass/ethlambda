@@ -427,7 +427,7 @@ pub fn on_gossip_attestation(
         metrics::update_gossip_signatures(store.gossip_signatures_count());
     }
 
-    metrics::inc_attestations_valid(1);
+    metrics::inc_attestations_valid();
 
     let slot = attestation.data.slot;
     let target_slot = attestation.data.target.slot;
@@ -536,7 +536,7 @@ fn on_gossip_aggregated_attestation_core(
         "Aggregated attestation processed"
     );
 
-    metrics::inc_attestations_valid(1);
+    metrics::inc_attestations_valid();
 
     Ok(())
 }
@@ -569,7 +569,7 @@ fn on_block_core(
     signed_block: SignedBlock,
     verify: bool,
 ) -> Result<(), StoreError> {
-    let _timing = metrics::time_fork_choice_block_processing();
+    let timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
     let block = &signed_block.message;
@@ -581,6 +581,7 @@ fn on_block_core(
         .has_state(&block_root)
         .expect("DB read should succeed")
     {
+        timing.discard();
         return Ok(());
     }
 
@@ -682,11 +683,11 @@ fn on_block_core(
         .insert_state(block_root, post_state)
         .expect("DB insert should succeed");
 
-    for att in block.body.attestations.iter() {
-        // Count each participating validator as a valid attestation.
-        let count = validator_indices(&att.aggregation_bits).count() as u64;
-        metrics::inc_attestations_valid(count);
-    }
+    // Block-included attestations are intentionally not counted here.
+    // `lean_attestations_valid_total` tracks the gossip validation pipeline
+    // (symmetric with `inc_attestations_invalid`), matching leanSpec. Votes
+    // arriving inside a block are counted by
+    // `lean_state_transition_attestations_processed_total` instead.
 
     // Update forkchoice head based on new block and attestations
     update_head(store, false);

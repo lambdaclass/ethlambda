@@ -4,15 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{spec_test_runner::apply_fork_choice_step, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
-    attestation::{
-        AttestationData, HashedAttestationData, SignedAggregatedAttestation, SignedAttestation,
-        validator_indices,
-    },
-    block::{Block, SingleMessageAggregate},
-    primitives::{ByteList, H256, HashTreeRoot as _},
+    attestation::{AttestationData, validator_indices},
+    block::Block,
+    primitives::{H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
 
@@ -57,8 +54,6 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // `get_forkchoice_store`'s assert! panic out of the test harness.
         let mut anchor_state: State = test.anchor_state.into();
         let anchor_block: Block = test.anchor_block.into();
-        let genesis_time = anchor_state.config.genesis_time;
-
         let pair_ok = anchor_pair_is_consistent(&mut anchor_state, &anchor_block);
         if test.steps.is_empty() {
             if pair_ok {
@@ -107,131 +102,15 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             let old_head = store.head()?;
             // Block built/imported this step, for the block-body checks. Mirrors
             // leanSpec's per-step `filled_block` (only a block step sets it).
-            let mut filled_block: Option<Block> = None;
-            match step.step_type.as_str() {
-                "block" => {
-                    let block_data = step.block.expect("block step missing block data");
-
-                    // Register block label if present
-                    if let Some(ref label) = block_data.block_root_label {
-                        let block: Block = block_data.to_block();
-                        let root = block.hash_tree_root();
-                        block_registry.insert(label.clone(), root);
-                    }
-
-                    // The block this step delivers is the leanSpec `filled_block`.
-                    filled_block = Some(block_data.to_block());
-
-                    let signed_block = block_data.to_blank_signed_block();
-
-                    // Advance time to the block's slot unless the test delivers
-                    // the block ahead of the store clock.
-                    // NOTE: the has_proposal argument is set to true, following the spec
-                    if step.tick_to_slot {
-                        let block_time_ms =
-                            genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-                        store::on_tick(&mut store, block_time_ms, true);
-                    }
-                    let result = store::on_block_without_verification(&mut store, signed_block);
-                    let import_ok = result.is_ok();
-                    assert_step_outcome(step_idx, step.valid, result)?;
-
-                    // Deconstruct the imported block into per-attestation
-                    // single-message aggregates, mirroring the node's post-import
-                    // reaggregation. The real node SNARK-splits the block's merged
-                    // multi-message aggregate proof and folds the recovered
-                    // single-message aggregates into the pool so block-borne votes carry
-                    // fork-choice weight; leanSpec's fork-choice harness gets the
-                    // same effect by simulating the proposer build. Fixture blocks
-                    // are blank (no real proof to split), so reconstruct structurally
-                    // from the body's aggregation_bits — fork choice reads only the
-                    // participant set, not the proof bytes. The recovered entries go
-                    // straight into the known pool to match the proposer-view store
-                    // the fixtures encode.
-                    if import_ok {
-                        let block = block_data.to_block();
-                        let entries: Vec<(HashedAttestationData, SingleMessageAggregate)> = block
-                            .body
-                            .attestations
-                            .iter()
-                            .map(|att| {
-                                (
-                                    HashedAttestationData::new(att.data.clone()),
-                                    SingleMessageAggregate::empty(att.aggregation_bits.clone()),
-                                )
-                            })
-                            .collect();
-                        store.insert_known_aggregated_payloads_batch(entries);
-                        // on_block already ran the head update before these votes
-                        // existed; recompute so the head reflects the block's own
-                        // attestations, matching the proposer-view store.
-                        store::update_head(&mut store, false);
-                    }
-                }
-                "tick" => {
-                    // Fixtures use either `time` (UNIX seconds) or `interval`
-                    // (absolute interval count since genesis). Interval fixtures
-                    // encode `genesis_time_ms + interval * MILLISECONDS_PER_INTERVAL`.
-                    let timestamp_ms = match (step.time, step.interval) {
-                        (Some(time_s), _) => time_s * 1000,
-                        (None, Some(interval)) => {
-                            genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
-                        }
-                        (None, None) => panic!("tick step missing both time and interval"),
-                    };
-                    let has_proposal = step.has_proposal.unwrap_or(false);
-                    store::on_tick(&mut store, timestamp_ms, has_proposal);
-                }
-                "attestation" => {
-                    let att_data = step
-                        .attestation
-                        .expect("attestation step missing attestation data");
-                    let signed_attestation = SignedAttestation {
-                        validator_id: att_data
-                            .validator_id
-                            .expect("attestation step missing validator_id"),
-                        data: att_data.data.into(),
-                        signature: att_data
-                            .signature
-                            .expect("attestation step missing signature"),
-                    };
-                    let is_aggregator = step.is_aggregator.unwrap_or(false);
-
-                    let result = store::on_gossip_attestation(
-                        &mut store,
-                        &signed_attestation,
-                        is_aggregator,
-                    );
-                    assert_step_outcome(step_idx, step.valid, result)?;
-                }
-                "gossipAggregatedAttestation" => {
-                    let att_data = step
-                        .attestation
-                        .expect("gossipAggregatedAttestation step missing attestation data");
-                    let proof_fixture = att_data
-                        .proof
-                        .expect("gossipAggregatedAttestation step missing proof");
-                    let proof_bytes: Vec<u8> = proof_fixture.proof.into();
-                    let proof_data = ByteList::try_from(proof_bytes)
-                        .expect("aggregated proof data fits in ByteList512KiB");
-                    let data: AttestationData = att_data.data.into();
-                    let proof =
-                        SingleMessageAggregate::new(proof_fixture.participants.into(), proof_data);
-                    let aggregated = SignedAggregatedAttestation { data, proof };
-
-                    let result = if proofs_are_mocked {
-                        store::on_gossip_aggregated_attestation_without_verification(
-                            &mut store, aggregated,
-                        )
-                    } else {
-                        store::on_gossip_aggregated_attestation(&mut store, aggregated)
-                    };
-                    assert_step_outcome(step_idx, step.valid, result)?;
-                }
-                other => {
-                    return Err(format!("Unsupported step type '{other}'").into());
-                }
+            let filled_block = step.block.as_ref().map(|block_data| block_data.to_block());
+            if let Some(block_data) = step.block.as_ref()
+                && let Some(label) = block_data.block_root_label.as_ref()
+            {
+                block_registry.insert(label.clone(), block_data.to_block().hash_tree_root());
             }
+
+            let result = apply_fork_choice_step(&mut store, &step, Some(proofs_are_mocked));
+            assert_step_outcome(step_idx, step.valid, result)?;
 
             // Fold this step's blocks into the cumulative tree before checks so
             // ancestry walks see blocks finalization may have just pruned from

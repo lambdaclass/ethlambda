@@ -9,15 +9,21 @@
 //! a slow subscriber loses events (the bounded broadcast channel overwrites
 //! its backlog) rather than back-pressuring consensus.
 
+use ethlambda_storage::Store;
+use ethlambda_types::ShortRoot;
+use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
-use serde::Serialize;
 use tokio::sync::broadcast;
+use tracing::warn;
 
 /// Wire-visible topic names for chain events.
 ///
 /// These are the names consumers address events by (the SSE `event:` line and,
 /// later, `?topics=` filtering), kept separate from [`ChainEvent`] so the
-/// payloads stay flat JSON with the topic travelling out-of-band.
+/// payload stays flat with the topic travelling out-of-band. The names match
+/// the Ethereum beacon-API eventstream topics (`head`, `block`,
+/// `finalized_checkpoint`); `justified_checkpoint` is an ethlambda extension
+/// with no beacon analog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
     Head,
@@ -39,24 +45,27 @@ impl Topic {
 
 /// A consensus event published by the blockchain actor.
 ///
-/// `untagged`: serializing yields only the variant's fields. The topic name
-/// travels out-of-band (via [`ChainEvent::topic`], e.g. on the SSE `event:`
-/// line), so the JSON body stays flat with no `event`/`data` wrapper.
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
+/// Fields mirror the Ethereum beacon-API eventstream payloads so a future SSE
+/// endpoint can render a beacon-compatible stream: `block` is the block root,
+/// `state` the state root, and `slot` stands in for the beacon `epoch`.
+/// [`ChainEvent::JustifiedCheckpoint`] has no beacon analog; it mirrors
+/// [`ChainEvent::FinalizedCheckpoint`]'s shape as an ethlambda extension.
+///
+/// No `Serialize` is derived: the wire encoding (decimal-string integers,
+/// `0x`-hex roots, and the out-of-band topic on the SSE `event:` line) lands
+/// with the SSE endpoint in a follow-up PR. Until then this type is
+/// internal-only, so there is no risk of an untagged shape being deserialized
+/// ambiguously (the `{slot, block, state}` variants are structurally identical).
+#[derive(Clone, Debug)]
 pub enum ChainEvent {
     /// Fork choice selected a new head.
-    Head {
-        slot: u64,
-        root: H256,
-        parent_root: H256,
-    },
+    Head { slot: u64, block: H256, state: H256 },
     /// A block was imported into the store.
-    Block { slot: u64, root: H256 },
+    Block { slot: u64, block: H256 },
     /// The justified checkpoint advanced.
-    JustifiedCheckpoint { slot: u64, root: H256 },
+    JustifiedCheckpoint { slot: u64, block: H256, state: H256 },
     /// The finalized checkpoint advanced.
-    FinalizedCheckpoint { slot: u64, root: H256 },
+    FinalizedCheckpoint { slot: u64, block: H256, state: H256 },
 }
 
 impl ChainEvent {
@@ -95,11 +104,6 @@ impl EventBus {
         Self { tx }
     }
 
-    /// Dormant bus: emits go nowhere. For tests and eventless call paths.
-    pub fn disabled() -> Self {
-        Self::new(1)
-    }
-
     /// Publish an event to all current subscribers.
     ///
     /// Never blocks, never fails: without subscribers this is a no-op, and a
@@ -125,15 +129,147 @@ impl Default for EventBus {
     }
 }
 
+/// Suppresses `head` events whose slot has fallen too far behind the wall
+/// clock: during startup catch-up or backfill, fork choice can walk through
+/// many historical heads on its way to the tip, and none of those are
+/// interesting to a live subscriber. Consumers that need to track sync
+/// progress should watch `block` events instead, which are never gated on
+/// recency. Mirrors Lighthouse's recency filter on its head SSE event
+/// (`EARLY_ATTESTER_CACHE_HISTORIC_SLOTS`), but with a wider window since a
+/// lagging head is far more common here during multi-slot catch-up ticks.
+const HEAD_EVENT_RECENCY_SLOTS: u64 = 32;
+
+/// Pre-call snapshot of the store values the chain-event bus reports on.
+///
+/// The actor — not the store — publishes chain events: it captures this
+/// snapshot before a store call (`store::on_tick`, `store::on_block`) and
+/// diffs the store against it afterwards, so `store.rs` needs no event
+/// plumbing.
+///
+/// Multiple head moves within one store call coalesce into a single `head`
+/// event; subscribers only care about the latest.
+///
+/// The proposer's pre-build catch-up (`get_proposal_head`) advances the store
+/// too, so `propose_block` wraps that call in its own snapshot: the
+/// head/justified/finalized moves it triggers surface exactly as they would on
+/// a non-proposing node's interval-0 tick, rather than being silently folded
+/// into the later block-import diff's baseline.
+pub(crate) struct ChainEventSnapshot {
+    head: H256,
+    justified: Checkpoint,
+    finalized: Checkpoint,
+}
+
+impl ChainEventSnapshot {
+    pub(crate) fn capture(store: &Store) -> Self {
+        Self {
+            head: store.head().expect("head block exists"),
+            justified: store
+                .latest_justified()
+                .expect("latest justified checkpoint exists"),
+            finalized: store
+                .latest_finalized()
+                .expect("latest finalized checkpoint exists"),
+        }
+    }
+
+    /// Emit one event per value that changed since the snapshot, in a fixed
+    /// order: `head` → `justified_checkpoint` → `finalized_checkpoint`.
+    /// (`block` is emitted separately by the import path, ahead of this diff.)
+    ///
+    /// `wall_clock_slot` is the caller's current slot, used only to gate the
+    /// `head` event against [`HEAD_EVENT_RECENCY_SLOTS`]; the other events are
+    /// ungated.
+    pub(crate) fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
+        let head = store.head().expect("head block exists");
+        if head != self.head {
+            // Read the header once and reuse it for slot and state root so they
+            // stay consistent.
+            if let Some(header) = store
+                .get_block_header(&head)
+                .expect("block header read should succeed")
+            {
+                // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
+                if header.slot + HEAD_EVENT_RECENCY_SLOTS >= wall_clock_slot {
+                    events.emit(ChainEvent::Head {
+                        slot: header.slot,
+                        block: head,
+                        state: header.state_root,
+                    });
+                }
+            } else {
+                warn!(
+                    head_root = %ShortRoot(&head.0),
+                    "Head header missing while emitting head event; skipping"
+                );
+            }
+        }
+
+        let justified = store
+            .latest_justified()
+            .expect("latest justified checkpoint exists");
+        if justified != self.justified {
+            if let Some(state) = checkpoint_state_root(store, justified.root) {
+                events.emit(ChainEvent::JustifiedCheckpoint {
+                    slot: justified.slot,
+                    block: justified.root,
+                    state,
+                });
+            } else {
+                warn!(
+                    justified_root = %ShortRoot(&justified.root.0),
+                    "Justified block header missing while emitting event; skipping"
+                );
+            }
+        }
+
+        let finalized = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists");
+        if finalized != self.finalized {
+            if let Some(state) = checkpoint_state_root(store, finalized.root) {
+                events.emit(ChainEvent::FinalizedCheckpoint {
+                    slot: finalized.slot,
+                    block: finalized.root,
+                    state,
+                });
+            } else {
+                warn!(
+                    finalized_root = %ShortRoot(&finalized.root.0),
+                    "Finalized block header missing while emitting event; skipping"
+                );
+            }
+        }
+    }
+}
+
+/// Look up the state root of a checkpoint's block for the `{block, state}`
+/// event shape. Returns `None` if the header is absent so the caller can skip
+/// emission; finalized/justified block headers are never pruned, so this only
+/// fails on genuine store inconsistency.
+fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
+    store
+        .get_block_header(&root)
+        .expect("block header read should succeed")
+        .map(|header| header.state_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::{
+        block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
+        state::State,
+    };
+    use std::sync::Arc;
+    use tokio::sync::broadcast::error::TryRecvError;
 
     fn head_event(slot: u64) -> ChainEvent {
         ChainEvent::Head {
             slot,
-            root: H256([1u8; 32]),
-            parent_root: H256([2u8; 32]),
+            block: H256([1u8; 32]),
+            state: H256([2u8; 32]),
         }
     }
 
@@ -158,27 +294,26 @@ mod tests {
     }
 
     #[test]
-    fn disabled_bus_accepts_emits() {
-        let bus = EventBus::disabled();
-        bus.emit(head_event(1));
-        bus.emit(ChainEvent::Block {
-            slot: 2,
-            root: H256::ZERO,
-        });
-    }
-
-    #[test]
     fn topic_maps_every_variant() {
-        let root = H256::ZERO;
+        let block = H256::ZERO;
+        let state = H256::ZERO;
         let cases = [
             (head_event(1), Topic::Head),
-            (ChainEvent::Block { slot: 1, root }, Topic::Block),
+            (ChainEvent::Block { slot: 1, block }, Topic::Block),
             (
-                ChainEvent::JustifiedCheckpoint { slot: 1, root },
+                ChainEvent::JustifiedCheckpoint {
+                    slot: 1,
+                    block,
+                    state,
+                },
                 Topic::JustifiedCheckpoint,
             ),
             (
-                ChainEvent::FinalizedCheckpoint { slot: 1, root },
+                ChainEvent::FinalizedCheckpoint {
+                    slot: 1,
+                    block,
+                    state,
+                },
                 Topic::FinalizedCheckpoint,
             ),
         ];
@@ -188,17 +323,157 @@ mod tests {
         }
     }
 
-    /// The JSON body must be the variant's fields only: the topic name travels
-    /// out-of-band, so no `event`/`data` wrapper keys may appear (the #460
-    /// double-tag bug).
-    #[test]
-    fn serialization_is_flat_untagged_json() {
-        let json = serde_json::to_value(head_event(3)).unwrap();
+    fn test_store() -> Store {
+        let genesis_state = State::from_genesis(1000, vec![]);
+        Store::from_anchor_state(Arc::new(InMemoryBackend::new()), genesis_state)
+    }
 
-        assert_eq!(json["slot"], 3);
-        assert!(json["root"].is_string());
-        assert!(json["parent_root"].is_string());
-        assert!(json.get("event").is_none());
-        assert!(json.get("data").is_none());
+    /// Insert a header-only block at `root` so header reads (block root, slot,
+    /// state root) resolve for the event payloads.
+    fn insert_test_block(
+        store: &mut Store,
+        root: H256,
+        slot: u64,
+        parent_root: H256,
+        state_root: H256,
+    ) {
+        let signed_block = SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        store
+            .insert_signed_block(root, signed_block)
+            .expect("insert test block should succeed");
+    }
+
+    #[test]
+    fn chain_event_diff_emits_nothing_when_unchanged() {
+        let store = test_store();
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+
+        let snapshot = ChainEventSnapshot::capture(&store);
+        snapshot.diff_and_emit(&store, &bus, 0);
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A head whose header cannot be read is skipped (warn), while checkpoint
+    /// moves still emit.
+    #[test]
+    fn chain_event_diff_skips_head_with_missing_header() {
+        let mut store = test_store();
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+
+        let snapshot = ChainEventSnapshot::capture(&store);
+
+        // Point the head at a root with no stored header; advance finalized to
+        // a real block so its event still fires.
+        let orphan_head = H256([7u8; 32]);
+        let genesis = store.head().expect("store head exists");
+        let finalized_root = H256([8u8; 32]);
+        let finalized_state = H256([88u8; 32]);
+        insert_test_block(&mut store, finalized_root, 1, genesis, finalized_state);
+        let finalized = Checkpoint {
+            root: finalized_root,
+            slot: 1,
+        };
+        store
+            .update_checkpoints(ForkCheckpoints::new(orphan_head, None, Some(finalized)))
+            .expect("update_checkpoints should succeed");
+
+        snapshot.diff_and_emit(&store, &bus, 1);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::FinalizedCheckpoint { slot, block, state } => {
+                assert_eq!((slot, block, state), (1, finalized_root, finalized_state));
+            }
+            other => panic!("expected finalized_checkpoint only, got: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A head far below the wall-clock slot (catch-up/backfill) emits no
+    /// `head` event, but `justified_checkpoint`/`finalized_checkpoint` still
+    /// fire since only `head` is gated.
+    #[test]
+    fn chain_event_diff_gates_stale_head() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+
+        let snapshot = ChainEventSnapshot::capture(&store);
+
+        let new_root = H256([9u8; 32]);
+        let new_state = H256([99u8; 32]);
+        insert_test_block(&mut store, new_root, 1, genesis, new_state);
+        let checkpoint = Checkpoint {
+            root: new_root,
+            slot: 1,
+        };
+        store
+            .update_checkpoints(ForkCheckpoints::new(
+                new_root,
+                Some(checkpoint),
+                Some(checkpoint),
+            ))
+            .expect("update_checkpoints should succeed");
+
+        // Wall clock far ahead of the new head's slot (1): well past
+        // HEAD_EVENT_RECENCY_SLOTS, so the head event must be suppressed.
+        let wall_clock_slot = 1 + HEAD_EVENT_RECENCY_SLOTS + 100;
+        snapshot.diff_and_emit(&store, &bus, wall_clock_slot);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::JustifiedCheckpoint { slot, block, state } => {
+                assert_eq!((slot, block, state), (1, new_root, new_state));
+            }
+            other => panic!("expected justified_checkpoint first, got: {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            ChainEvent::FinalizedCheckpoint { slot, block, state } => {
+                assert_eq!((slot, block, state), (1, new_root, new_state));
+            }
+            other => panic!("expected finalized_checkpoint second (head gated), got: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A head within the recency window emits normally, stated explicitly
+    /// against the gate for clarity.
+    #[test]
+    fn chain_event_diff_emits_recent_head() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+
+        let snapshot = ChainEventSnapshot::capture(&store);
+
+        let new_root = H256([9u8; 32]);
+        let new_state = H256([99u8; 32]);
+        insert_test_block(&mut store, new_root, 1, genesis, new_state);
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(new_root))
+            .expect("update_checkpoints should succeed");
+
+        // Wall clock equal to the head's own slot: as recent as it gets.
+        snapshot.diff_and_emit(&store, &bus, 1);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::Head { slot, block, state } => {
+                assert_eq!((slot, block, state), (1, new_root, new_state));
+            }
+            other => panic!("expected head event, got: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }
