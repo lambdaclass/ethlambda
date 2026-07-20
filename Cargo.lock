@@ -2095,6 +2095,9 @@ dependencies = [
  "ethrex-blockchain 15.0.0",
  "ethrex-common 15.0.0",
  "ethrex-storage 15.0.0",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

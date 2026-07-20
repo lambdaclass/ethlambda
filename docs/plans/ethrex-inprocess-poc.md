@@ -71,6 +71,15 @@ standalone PR off `main` on branch `feat/ethrex-inprocess-poc`. Phase 1 onward r
 on `engine-api-integration` (#367) to reuse its `ExecutionEngine` trait + payload types.
 
 ### Phase 1 — New crate `crates/net/ethrex-engine` (in-process impl)
+
+**Status:** the #367-independent core landed on `feat/ethrex-inprocess-poc` (PR #530):
+`EthrexEngine` bootstraps an in-memory ethrex store from an EL genesis and exposes
+`build_block` / `import_block` / `set_forkchoice` / `head_hash` / `head_number` over
+ethrex-native types, proven by the `roundtrip` integration test (genesis → build →
+execute → fork-choice → head advances to block 1). Deferred to the #367 re-stack:
+the ethlambda `ExecutionPayloadV3` ⇄ ethrex `Block` conversion, the `ExecutionEngine`
+trait impl, and the payload-id (`get_payload`) cache path.
+
 1. `EthrexEngine { blockchain: Arc<Blockchain>, store: Store }`.
 2. Constructor: build a `Store` from the EL genesis (`genesis-el.json`), wrap in
    `Blockchain`. In-memory store for the PoC (simplest); rocksdb path optional later.
