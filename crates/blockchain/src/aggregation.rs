@@ -84,6 +84,21 @@ pub struct AggregationJob {
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
+impl AggregationJob {
+    /// Realized coverage (`raw_ids ∪ accepted_child_ids`): the exact validator
+    /// set the produced proof will attest to. Used for scoring during
+    /// selection so scores stay consistent with the job actually emitted,
+    /// instead of the full union of every proof considered. Derived on demand:
+    /// the fields it unions are already carried by the job.
+    fn coverage(&self) -> HashSet<u64> {
+        self.raw_ids
+            .iter()
+            .copied()
+            .chain(self.accepted_child_ids.iter().copied())
+            .collect()
+    }
+}
+
 /// All input needed to run a session of committee-signature aggregation off-thread.
 pub struct AggregationSnapshot {
     pub(crate) jobs: Vec<AggregationJob>,
@@ -163,66 +178,24 @@ impl Message for EarlyAggregationCheck {
 /// scoring candidates remain.
 const MAX_AGGREGATION_JOBS: usize = 3;
 
-/// One candidate `AttestationData` group with its aggregation material
-/// already resolved from the store (see [`resolve_job`]). Built once per
-/// session by the up-front store pass in [`snapshot_aggregation_inputs`]; the
-/// greedy loop scores and orders these without further store access.
-struct Candidate {
-    hashed: HashedAttestationData,
-    resolved: ResolvedMaterial,
-}
-
-/// Aggregation material resolved for one candidate, raw-first with redundant
-/// raw signatures trimmed (see [`resolve_job`]). Store-free once built; a
-/// selected candidate is converted into an [`AggregationJob`] as-is via
-/// [`ResolvedMaterial::into_job`].
-struct ResolvedMaterial {
-    children: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
-    accepted_child_ids: Vec<u64>,
-    raw_pubkeys: Vec<ValidatorPublicKey>,
-    raw_sigs: Vec<ValidatorSignature>,
-    raw_ids: Vec<u64>,
-    keys_to_delete: Vec<(u64, H256)>,
-    /// Realized coverage (`raw_ids ∪ accepted_child_ids`): the exact
-    /// validator set the produced proof will attest to. Used for scoring so
-    /// scores stay consistent with the job actually emitted, instead of the
-    /// full union of every proof considered.
-    coverage: HashSet<u64>,
-}
-
-impl ResolvedMaterial {
-    fn into_job(self, hashed: HashedAttestationData) -> AggregationJob {
-        let slot = hashed.data().slot;
-        AggregationJob {
-            hashed,
-            slot,
-            children: self.children,
-            accepted_child_ids: self.accepted_child_ids,
-            raw_pubkeys: self.raw_pubkeys,
-            raw_sigs: self.raw_sigs,
-            raw_ids: self.raw_ids,
-            keys_to_delete: self.keys_to_delete,
-        }
-    }
-}
-
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
 /// thread, touches the store, does no heavy cryptography. Returns `None` when
 /// there is nothing to aggregate so callers can avoid spawning an empty worker.
 ///
 /// A tiered greedy selector modeled on `block_builder::select_attestations`:
 ///
-/// 1. **Up-front store pass**: resolves every candidate `AttestationData`'s
-///    aggregation material once via [`resolve_job`] (raw-first + trim).
-///    Candidates come from gossip groups (`store.iter_gossip_signatures()`)
-///    and payload-only groups (`store.new_payload_keys()` not already a
-///    gossip candidate, requiring at least two existing proofs to merge).
+/// 1. **Up-front store pass**: resolves every candidate `AttestationData`
+///    into a store-free [`AggregationJob`] once via [`resolve_job`]
+///    (raw-first, then trim). Candidates come from gossip groups
+///    (`store.iter_gossip_signatures()`) and payload-only groups
+///    (`store.new_payload_keys()` not already a gossip candidate, requiring
+///    at least two existing proofs to merge).
 /// 2. **Greedy loop**, at most [`MAX_AGGREGATION_JOBS`] rounds: each round
-///    scores every unprocessed candidate against the projected state and
+///    scores every unselected candidate against the projected state and
 ///    keeps the lowest ordering key (current-slot before stale, then
-///    Finalize > Justify > Build, mirroring the block builder). The winner's
-///    pre-resolved material becomes an [`AggregationJob`]; the projection is
-///    updated with its realized coverage.
+///    Finalize > Justify > Build, mirroring the block builder). The winning
+///    [`AggregationJob`] is emitted as-is; the projection is updated with its
+///    realized coverage.
 ///
 /// Stops early when no remaining candidate scores (converged).
 pub fn snapshot_aggregation_inputs(
@@ -239,25 +212,19 @@ pub fn snapshot_aggregation_inputs(
     let head_state = store.head_state();
     let validators = &head_state.validators;
 
-    let mut candidates: HashMap<H256, Candidate> = HashMap::new();
+    let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
 
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
-        if let Some(resolved) = resolve_job(
-            data_root,
+        if let Some(job) = resolve_job(
+            hashed.clone(),
             validator_sigs,
             &new_proofs,
             &known_proofs,
             validators,
         ) {
-            candidates.insert(
-                data_root,
-                Candidate {
-                    hashed: hashed.clone(),
-                    resolved,
-                },
-            );
+            candidates.insert(data_root, job);
         }
     }
 
@@ -271,10 +238,9 @@ pub fn snapshot_aggregation_inputs(
             continue;
         }
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
-        if let Some(resolved) = resolve_job(*data_root, &[], &new_proofs, &known_proofs, validators)
-        {
-            let hashed = HashedAttestationData::new(att_data.clone());
-            candidates.insert(*data_root, Candidate { hashed, resolved });
+        let hashed = HashedAttestationData::new(att_data.clone());
+        if let Some(job) = resolve_job(hashed, &[], &new_proofs, &known_proofs, validators) {
+            candidates.insert(*data_root, job);
         }
     }
 
@@ -321,10 +287,11 @@ pub fn snapshot_aggregation_inputs(
             break;
         };
 
-        let Candidate { hashed, resolved } = candidates
+        let job = candidates
             .remove(&data_root)
             .expect("picked candidate exists in pool");
-        let att_data = hashed.data();
+        let coverage = job.coverage();
+        let att_data = job.hashed.data();
         let target_root = att_data.target.root;
         let target_slot = att_data.target.slot;
 
@@ -340,9 +307,9 @@ pub fn snapshot_aggregation_inputs(
         // Fold the job's realized coverage into the shared projection so
         // same-target candidates re-tier across rounds exactly as the block
         // builder's post-state would.
-        projected.advance(score.tier, att_data, resolved.coverage.iter().copied());
+        projected.advance(score.tier, att_data, coverage.iter().copied());
 
-        jobs.push(resolved.into_job(hashed));
+        jobs.push(job);
     }
 
     if jobs.is_empty() {
@@ -359,13 +326,13 @@ pub fn snapshot_aggregation_inputs(
 ///
 /// Mirrors `block_builder::pick_best_candidate`: skips entries failing
 /// `entry_passes_filters` (logging the reason) and those scoring zero new
-/// voters (relative to `candidate.resolved.coverage`, not the full proof
-/// union — see [`resolve_job`]). Among the rest, returns `(data_root, score)`
-/// for the entry with the lowest composite key: current-slot groups precede
-/// stale ones, then `EntryScore::ordering_key` (tier, then tier-dependent
-/// dims, then `data_root`) decides.
+/// voters (relative to the candidate's realized [`AggregationJob::coverage`],
+/// not the full proof union — see [`resolve_job`]). Among the rest, returns
+/// `(data_root, score)` for the entry with the lowest composite key:
+/// current-slot groups precede stale ones, then `EntryScore::ordering_key`
+/// (tier, then tier-dependent dims, then `data_root`) decides.
 fn pick_best_candidate(
-    candidates: &HashMap<H256, Candidate>,
+    candidates: &HashMap<H256, AggregationJob>,
     projected: &block_builder::ProjectedState,
     known_block_roots: &HashSet<H256>,
     extended_historical_block_hashes: &[H256],
@@ -387,7 +354,7 @@ fn pick_best_candidate(
         }
 
         let Some((score, _new_voters)) =
-            projected.score_entry(att_data, &candidate.resolved.coverage, validator_count)
+            projected.score_entry(att_data, &candidate.coverage(), validator_count)
         else {
             trace_skipped_candidate("zero_new_voters", att_data, data_root);
             continue;
@@ -446,12 +413,13 @@ fn trace_skipped_candidate(reason: &'static str, att_data: &AttestationData, dat
 /// Returns `None` when the resulting material is non-viable: no raw sigs and
 /// fewer than two children, or a lone raw sig with no children.
 fn resolve_job(
-    data_root: H256,
+    hashed: HashedAttestationData,
     validator_sigs: &[(u64, ValidatorSignature)],
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
-) -> Option<ResolvedMaterial> {
+) -> Option<AggregationJob> {
+    let data_root = hashed.root();
     let mut raw_by_id: HashMap<u64, (ValidatorPublicKey, ValidatorSignature)> = HashMap::new();
     for (vid, sig) in validator_sigs {
         let Some(validator) = validators.get(*vid as usize) else {
@@ -489,9 +457,6 @@ fn resolve_job(
         return None;
     }
 
-    let mut coverage: HashSet<u64> = raw_ids.iter().copied().collect();
-    coverage.extend(accepted_child_ids.iter().copied());
-
     // Consume the whole group's gossip signatures on successful aggregation,
     // including any trimmed in step 3: their vote is now represented via the
     // child that covers them.
@@ -500,14 +465,16 @@ fn resolve_job(
         .map(|(vid, _)| (*vid, data_root))
         .collect();
 
-    Some(ResolvedMaterial {
+    let slot = hashed.data().slot;
+    Some(AggregationJob {
+        hashed,
+        slot,
         children,
         accepted_child_ids,
         raw_pubkeys,
         raw_sigs,
         raw_ids,
         keys_to_delete,
-        coverage,
     })
 }
 
@@ -844,6 +811,18 @@ mod tests {
         ValidatorSignature::from_bytes(&CACHED_SIG).expect("cached test signature")
     }
 
+    /// A `HashedAttestationData` over default (all-zero) data for `resolve_job`
+    /// tests, which never inspect the attestation data itself — only the raw
+    /// sigs / children / coverage the resulting job carries.
+    fn dummy_hashed() -> HashedAttestationData {
+        HashedAttestationData::new(AttestationData {
+            slot: 0,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        })
+    }
+
     fn make_head_state(head_slot: u64, num_validators: usize, hashes: &[H256]) -> State {
         let head_header = BlockHeader {
             slot: head_slot,
@@ -901,10 +880,15 @@ mod tests {
         let sig = dummy_sig();
         let validator_sigs = vec![(0u64, sig.clone()), (1u64, sig)];
         let proof_c = SingleMessageAggregate::empty(make_bits(&[2]));
-        let data_root = H256([9u8; 32]);
 
-        let resolved = resolve_job(data_root, &validator_sigs, &[proof_c], &[], &validators)
-            .expect("raw {0,1} plus a filling child for {2} should be viable");
+        let resolved = resolve_job(
+            dummy_hashed(),
+            &validator_sigs,
+            &[proof_c],
+            &[],
+            &validators,
+        )
+        .expect("raw {0,1} plus a filling child for {2} should be viable");
 
         let raw_id_set: HashSet<u64> = resolved.raw_ids.iter().copied().collect();
         assert_eq!(raw_id_set, HashSet::from([0, 1]), "both raw sigs kept");
@@ -914,7 +898,7 @@ mod tests {
             "the proof for {{c}} is reused as a child"
         );
         assert_eq!(resolved.accepted_child_ids, vec![2]);
-        assert_eq!(resolved.coverage, HashSet::from([0, 1, 2]));
+        assert_eq!(resolved.coverage(), HashSet::from([0, 1, 2]));
     }
 
     /// Given gossip sigs for {a,b,c} and a proof covering {c,d,e} (chosen for
@@ -927,10 +911,15 @@ mod tests {
         let sig = dummy_sig();
         let validator_sigs = vec![(0u64, sig.clone()), (1u64, sig.clone()), (2u64, sig)];
         let proof_cde = SingleMessageAggregate::empty(make_bits(&[2, 3, 4]));
-        let data_root = H256([9u8; 32]);
 
-        let resolved = resolve_job(data_root, &validator_sigs, &[proof_cde], &[], &validators)
-            .expect("raw {0,1,2} plus a child for {2,3,4} should be viable");
+        let resolved = resolve_job(
+            dummy_hashed(),
+            &validator_sigs,
+            &[proof_cde],
+            &[],
+            &validators,
+        )
+        .expect("raw {0,1,2} plus a child for {2,3,4} should be viable");
 
         let raw_id_set: HashSet<u64> = resolved.raw_ids.iter().copied().collect();
         assert_eq!(
@@ -939,7 +928,7 @@ mod tests {
             "id 2 is trimmed: it is covered by the chosen child"
         );
         assert_eq!(resolved.children.len(), 1);
-        assert_eq!(resolved.coverage, HashSet::from([0, 1, 2, 3, 4]));
+        assert_eq!(resolved.coverage(), HashSet::from([0, 1, 2, 3, 4]));
         // The whole gossip group (including the trimmed raw sig) is consumed.
         assert_eq!(resolved.keys_to_delete.len(), 3);
     }
@@ -950,7 +939,7 @@ mod tests {
     fn resolve_job_rejects_lone_raw_signature_with_no_children() {
         let validators = make_validators(5);
         let validator_sigs = vec![(0u64, dummy_sig())];
-        let resolved = resolve_job(H256([9u8; 32]), &validator_sigs, &[], &[], &validators);
+        let resolved = resolve_job(dummy_hashed(), &validator_sigs, &[], &[], &validators);
         assert!(resolved.is_none());
     }
 
@@ -962,12 +951,12 @@ mod tests {
         let proof_a = SingleMessageAggregate::empty(make_bits(&[0]));
         let proof_b = SingleMessageAggregate::empty(make_bits(&[1]));
 
-        let resolved = resolve_job(H256([9u8; 32]), &[], &[proof_a, proof_b], &[], &validators)
+        let resolved = resolve_job(dummy_hashed(), &[], &[proof_a, proof_b], &[], &validators)
             .expect("two children with no raw sigs should be viable");
 
         assert!(resolved.raw_ids.is_empty());
         assert_eq!(resolved.children.len(), 2);
-        assert_eq!(resolved.coverage, HashSet::from([0, 1]));
+        assert_eq!(resolved.coverage(), HashSet::from([0, 1]));
         assert!(
             resolved.keys_to_delete.is_empty(),
             "nothing to delete from gossip: this candidate has no gossip sigs"
@@ -1027,30 +1016,25 @@ mod tests {
         let root_current = hashed_current.root();
         let root_stale = hashed_stale.root();
 
-        let make_resolved = |coverage: HashSet<u64>| ResolvedMaterial {
-            children: Vec::new(),
-            accepted_child_ids: Vec::new(),
-            raw_pubkeys: Vec::new(),
-            raw_sigs: Vec::new(),
-            raw_ids: coverage.iter().copied().collect(),
-            keys_to_delete: Vec::new(),
-            coverage,
+        let make_job = |hashed: HashedAttestationData, coverage: HashSet<u64>| {
+            let slot = hashed.data().slot;
+            AggregationJob {
+                hashed,
+                slot,
+                children: Vec::new(),
+                accepted_child_ids: Vec::new(),
+                raw_pubkeys: Vec::new(),
+                raw_sigs: Vec::new(),
+                raw_ids: coverage.into_iter().collect(),
+                keys_to_delete: Vec::new(),
+            }
         };
 
-        let mut candidates: HashMap<H256, Candidate> = HashMap::new();
-        candidates.insert(
-            root_current,
-            Candidate {
-                hashed: hashed_current,
-                resolved: make_resolved(HashSet::from([0])),
-            },
-        );
+        let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
+        candidates.insert(root_current, make_job(hashed_current, HashSet::from([0])));
         candidates.insert(
             root_stale,
-            Candidate {
-                hashed: hashed_stale,
-                resolved: make_resolved(HashSet::from([1, 2, 3, 4, 5])),
-            },
+            make_job(hashed_stale, HashSet::from([1, 2, 3, 4, 5])),
         );
 
         let known_block_roots: HashSet<H256> = HashSet::from([genesis_root]);
@@ -1125,31 +1109,26 @@ mod tests {
         let root_a = hashed_a.root();
         let root_b = hashed_b.root();
 
-        let make_resolved = |coverage: HashSet<u64>| ResolvedMaterial {
-            children: Vec::new(),
-            accepted_child_ids: Vec::new(),
-            raw_pubkeys: Vec::new(),
-            raw_sigs: Vec::new(),
-            raw_ids: coverage.iter().copied().collect(),
-            keys_to_delete: Vec::new(),
-            coverage,
+        let make_job = |hashed: HashedAttestationData, coverage: HashSet<u64>| {
+            let slot = hashed.data().slot;
+            AggregationJob {
+                hashed,
+                slot,
+                children: Vec::new(),
+                accepted_child_ids: Vec::new(),
+                raw_pubkeys: Vec::new(),
+                raw_sigs: Vec::new(),
+                raw_ids: coverage.into_iter().collect(),
+                keys_to_delete: Vec::new(),
+            }
         };
 
-        let mut candidates: HashMap<H256, Candidate> = HashMap::new();
+        let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
         candidates.insert(
             root_a,
-            Candidate {
-                hashed: hashed_a,
-                resolved: make_resolved(HashSet::from([0, 1, 2, 3, 4, 5])),
-            },
+            make_job(hashed_a, HashSet::from([0, 1, 2, 3, 4, 5])),
         );
-        candidates.insert(
-            root_b,
-            Candidate {
-                hashed: hashed_b,
-                resolved: make_resolved(HashSet::from([6, 7])),
-            },
-        );
+        candidates.insert(root_b, make_job(hashed_b, HashSet::from([6, 7])));
 
         let known_block_roots: HashSet<H256> = HashSet::from([genesis_root]);
         // Index 0 = genesis (head/source), index 3 = target.
@@ -1180,7 +1159,7 @@ mod tests {
             .current_votes
             .entry(target_root)
             .or_default()
-            .extend(winner.resolved.coverage.iter().copied());
+            .extend(winner.coverage());
 
         // Round 2: only B remains. Combined with A's now-recorded 6 voters,
         // B's 2 new voters cross 2/3 of 10 — B is re-tiered from what would
