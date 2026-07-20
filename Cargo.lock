@@ -852,6 +852,19 @@ dependencies = [
 [[package]]
 name = "bls12_381"
 version = "0.8.0"
+source = "git+https://github.com/lambdaclass/bls12_381?branch=expose-affine-constructors#78cad0378b17fc3157b83f514be192bf46edf9a1"
+dependencies = [
+ "digest 0.10.7",
+ "ff",
+ "group",
+ "pairing",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "bls12_381"
+version = "0.8.0"
 source = "git+https://github.com/lambdaclass/bls12_381?branch=expose-fp-struct#219174187bd78154cec35b0809799fc2c991a579"
 dependencies = [
  "digest 0.10.7",
@@ -2076,6 +2089,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-ethrex-engine"
+version = "0.1.0"
+dependencies = [
+ "ethrex-blockchain 15.0.0",
+ "ethrex-common 15.0.0",
+ "ethrex-storage 15.0.0",
+]
+
+[[package]]
 name = "ethlambda-fork-choice"
 version = "0.1.0"
 dependencies = [
@@ -2106,9 +2128,9 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-storage",
  "ethlambda-types",
- "ethrex-common",
+ "ethrex-common 8.0.0",
  "ethrex-p2p",
- "ethrex-rlp",
+ "ethrex-rlp 8.0.0",
  "futures",
  "hex",
  "libp2p",
@@ -2219,14 +2241,36 @@ version = "8.0.0"
 source = "git+https://github.com/lambdaclass/ethrex?rev=1af63a4de7c93eb7413b9b003df1be82e1484c69#1af63a4de7c93eb7413b9b003df1be82e1484c69"
 dependencies = [
  "bytes",
- "ethrex-common",
- "ethrex-crypto",
- "ethrex-metrics",
- "ethrex-rlp",
- "ethrex-storage",
- "ethrex-trie",
- "ethrex-vm",
+ "ethrex-common 8.0.0",
+ "ethrex-crypto 8.0.0",
+ "ethrex-metrics 8.0.0",
+ "ethrex-rlp 8.0.0",
+ "ethrex-storage 8.0.0",
+ "ethrex-trie 8.0.0",
+ "ethrex-vm 8.0.0",
  "hex",
+ "rustc-hash",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ethrex-blockchain"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "bytes",
+ "crossbeam 0.8.4",
+ "ethrex-common 15.0.0",
+ "ethrex-crypto 15.0.0",
+ "ethrex-metrics 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "ethrex-storage 15.0.0",
+ "ethrex-trie 15.0.0",
+ "ethrex-vm 15.0.0",
+ "rayon",
  "rustc-hash",
  "thiserror 2.0.18",
  "tokio",
@@ -2242,9 +2286,9 @@ dependencies = [
  "bytes",
  "crc32fast",
  "ethereum-types",
- "ethrex-crypto",
- "ethrex-rlp",
- "ethrex-trie",
+ "ethrex-crypto 8.0.0",
+ "ethrex-rlp 8.0.0",
+ "ethrex-trie 8.0.0",
  "hex",
  "hex-literal",
  "k256",
@@ -2267,12 +2311,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethrex-common"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "ethereum-types",
+ "ethrex-crypto 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "ethrex-trie 15.0.0",
+ "hex",
+ "hex-literal",
+ "hex-simd",
+ "indexmap",
+ "lazy_static",
+ "libc",
+ "lru",
+ "once_cell",
+ "rayon",
+ "rkyv",
+ "rustc-hash",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ethrex-crypto"
 version = "8.0.0"
 source = "git+https://github.com/lambdaclass/ethrex?rev=1af63a4de7c93eb7413b9b003df1be82e1484c69#1af63a4de7c93eb7413b9b003df1be82e1484c69"
 dependencies = [
  "c-kzg",
  "kzg-rs",
+ "thiserror 2.0.18",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "ethrex-crypto"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "bls12_381 0.8.0 (git+https://github.com/lambdaclass/bls12_381?branch=expose-affine-constructors)",
+ "ethereum-types",
+ "ff",
+ "hex-literal",
+ "k256",
+ "malachite",
+ "num-bigint 0.4.6",
+ "p256",
+ "ripemd",
+ "secp256k1 0.30.0",
+ "sha2",
  "thiserror 2.0.18",
  "tiny-keccak",
 ]
@@ -2286,13 +2383,13 @@ dependencies = [
  "ark-ec",
  "ark-ff 0.5.0",
  "bitvec",
- "bls12_381",
+ "bls12_381 0.8.0 (git+https://github.com/lambdaclass/bls12_381?branch=expose-fp-struct)",
  "bytes",
  "datatest-stable 0.2.10",
  "derive_more 1.0.0",
- "ethrex-common",
- "ethrex-crypto",
- "ethrex-rlp",
+ "ethrex-common 8.0.0",
+ "ethrex-crypto 8.0.0",
+ "ethrex-rlp 8.0.0",
  "k256",
  "lambdaworks-math",
  "lazy_static",
@@ -2310,11 +2407,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethrex-levm"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "bytes",
+ "derive_more 1.0.0",
+ "ethrex-common 15.0.0",
+ "ethrex-crypto 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "malachite",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "strum",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ethrex-metrics"
 version = "8.0.0"
 source = "git+https://github.com/lambdaclass/ethrex?rev=1af63a4de7c93eb7413b9b003df1be82e1484c69#1af63a4de7c93eb7413b9b003df1be82e1484c69"
 dependencies = [
- "ethrex-common",
+ "ethrex-common 8.0.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ethrex-metrics"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "ethrex-common 15.0.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2333,13 +2460,13 @@ dependencies = [
  "crossbeam 0.8.4",
  "ctr",
  "ethereum-types",
- "ethrex-blockchain",
- "ethrex-common",
- "ethrex-crypto",
- "ethrex-rlp",
- "ethrex-storage",
+ "ethrex-blockchain 8.0.0",
+ "ethrex-common 8.0.0",
+ "ethrex-crypto 8.0.0",
+ "ethrex-rlp 8.0.0",
+ "ethrex-storage 8.0.0",
  "ethrex-threadpool",
- "ethrex-trie",
+ "ethrex-trie 8.0.0",
  "futures",
  "hex",
  "hmac",
@@ -2378,6 +2505,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethrex-rlp"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "bytes",
+ "ethereum-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ethrex-storage"
 version = "8.0.0"
 source = "git+https://github.com/lambdaclass/ethrex?rev=1af63a4de7c93eb7413b9b003df1be82e1484c69#1af63a4de7c93eb7413b9b003df1be82e1484c69"
@@ -2386,13 +2523,35 @@ dependencies = [
  "async-trait",
  "bytes",
  "ethereum-types",
- "ethrex-common",
- "ethrex-crypto",
- "ethrex-rlp",
- "ethrex-trie",
+ "ethrex-common 8.0.0",
+ "ethrex-crypto 8.0.0",
+ "ethrex-rlp 8.0.0",
+ "ethrex-trie 8.0.0",
  "hex",
  "lru",
  "qfilter",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ethrex-storage"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "ethrex-common 15.0.0",
+ "ethrex-crypto 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "ethrex-trie 15.0.0",
+ "fastbloom",
+ "lru",
  "rayon",
  "rustc-hash",
  "serde",
@@ -2420,8 +2579,8 @@ dependencies = [
  "crossbeam 0.8.4",
  "digest 0.10.7",
  "ethereum-types",
- "ethrex-crypto",
- "ethrex-rlp",
+ "ethrex-crypto 8.0.0",
+ "ethrex-rlp 8.0.0",
  "ethrex-threadpool",
  "hex",
  "lazy_static",
@@ -2435,6 +2594,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethrex-trie"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "crossbeam 0.8.4",
+ "ethereum-types",
+ "ethrex-crypto 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "lazy_static",
+ "rayon",
+ "rkyv",
+ "rustc-hash",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ethrex-vm"
 version = "8.0.0"
 source = "git+https://github.com/lambdaclass/ethrex?rev=1af63a4de7c93eb7413b9b003df1be82e1484c69#1af63a4de7c93eb7413b9b003df1be82e1484c69"
@@ -2444,13 +2622,32 @@ dependencies = [
  "derive_more 1.0.0",
  "dyn-clone",
  "ethereum-types",
- "ethrex-common",
- "ethrex-crypto",
- "ethrex-levm",
- "ethrex-rlp",
- "ethrex-trie",
+ "ethrex-common 8.0.0",
+ "ethrex-crypto 8.0.0",
+ "ethrex-levm 8.0.0",
+ "ethrex-rlp 8.0.0",
+ "ethrex-trie 8.0.0",
  "lazy_static",
  "rkyv",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "ethrex-vm"
+version = "15.0.0"
+source = "git+https://github.com/lambdaclass/ethrex?rev=de9b249baa8451290b06021c17756ccdd4031da4#de9b249baa8451290b06021c17756ccdd4031da4"
+dependencies = [
+ "bytes",
+ "derive_more 1.0.0",
+ "dyn-clone",
+ "ethrex-common 15.0.0",
+ "ethrex-crypto 15.0.0",
+ "ethrex-levm 15.0.0",
+ "ethrex-rlp 15.0.0",
+ "rayon",
+ "rustc-hash",
  "serde",
  "thiserror 2.0.18",
  "tracing",
@@ -2496,6 +2693,18 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fastbloom"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
+dependencies = [
+ "getrandom 0.3.4",
+ "libm",
+ "rand 0.9.4",
+ "siphasher",
 ]
 
 [[package]]
@@ -2998,6 +3207,16 @@ name = "hex-literal"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
+
+[[package]]
+name = "hex-simd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f7685beb53fc20efc2605f32f5d51e9ba18b8ef237961d1760169d2290d3bee"
+dependencies = [
+ "outref",
+ "vsimd",
+]
 
 [[package]]
 name = "hex_fmt"
@@ -5299,6 +5518,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "outref"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7098,6 +7323,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8164,6 +8395,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vsimd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "wait-timeout"
