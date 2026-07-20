@@ -88,18 +88,20 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 
 Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Four event types:
 
+Payload fields mirror the Ethereum beacon-API eventstream: `block` is the block root, `state` the state root, and `slot` stands in for the beacon `epoch`.
+
 | Event | Payload | Emitted when |
 |-------|---------|--------------|
-| `head` | `{ "slot": 128, "root": "0x…", "parent_root": "0x…" }` | Fork choice selects a new head within `HEAD_EVENT_RECENCY_SLOTS` (32 slots) of the wall clock; no head events fire during catch-up |
-| `block` | `{ "slot": 128, "root": "0x…" }` | A block is imported into the store |
-| `justified_checkpoint` | `{ "slot": 120, "root": "0x…" }` | The justified checkpoint advances |
-| `finalized_checkpoint` | `{ "slot": 96, "root": "0x…" }` | The finalized checkpoint advances |
+| `head` | `{ "slot": 128, "block": "0x…", "state": "0x…" }` | Fork choice selects a new head within `HEAD_EVENT_RECENCY_SLOTS` (32 slots) of the wall clock; no head events fire during catch-up |
+| `block` | `{ "slot": 128, "block": "0x…" }` | A block is imported into the store |
+| `justified_checkpoint` | `{ "slot": 120, "block": "0x…", "state": "0x…" }` | The justified checkpoint advances |
+| `finalized_checkpoint` | `{ "slot": 96, "block": "0x…", "state": "0x…" }` | The finalized checkpoint advances |
 
 The topic name travels only on the SSE `event:` line; the `data:` line carries the flat JSON payload. Example frame:
 
 ```
 event: head
-data: {"slot":128,"root":"0x1a2b…","parent_root":"0x3c4d…"}
+data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 ```
 
 Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. Keep-alive comments are sent periodically to hold idle connections open.

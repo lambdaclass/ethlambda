@@ -17,13 +17,50 @@ use axum::{
     response::{Sse, sse::Event},
     routing::get,
 };
-use ethlambda_blockchain::EventBus;
+use ethlambda_blockchain::{ChainEvent, EventBus};
 use ethlambda_storage::Store;
+use ethlambda_types::primitives::H256;
 use futures_core::Stream;
+use serde::Serialize;
 use tokio_stream::{
     StreamExt,
     wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
 };
+
+/// Wire form of a [`ChainEvent`] for the SSE `data:` line.
+///
+/// [`ChainEvent`] is intentionally serialization-agnostic (see #516): the wire
+/// encoding lives here in the RPC crate. The body is flat, with the topic name
+/// carried out-of-band on the SSE `event:` line ([`ChainEvent::topic`]), so no
+/// `event`/`data` wrapper keys ever appear inside the JSON. `slot` is a plain
+/// JSON number (matching every other ethlambda RPC payload); roots are
+/// `0x`-hex via [`H256`]'s serializer.
+///
+/// `untagged` yields only the variant's fields; the two variants are
+/// serialize-only, so their structural overlap is never a deserialization
+/// hazard.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ChainEventPayload {
+    /// `head` / `justified_checkpoint` / `finalized_checkpoint`: block root
+    /// plus state root.
+    WithState { slot: u64, block: H256, state: H256 },
+    /// `block`: block root only.
+    BlockOnly { slot: u64, block: H256 },
+}
+
+impl From<&ChainEvent> for ChainEventPayload {
+    fn from(event: &ChainEvent) -> Self {
+        match *event {
+            ChainEvent::Head { slot, block, state }
+            | ChainEvent::JustifiedCheckpoint { slot, block, state }
+            | ChainEvent::FinalizedCheckpoint { slot, block, state } => {
+                Self::WithState { slot, block, state }
+            }
+            ChainEvent::Block { slot, block } => Self::BlockOnly { slot, block },
+        }
+    }
+}
 
 async fn get_events(
     Extension(events): Extension<EventBus>,
@@ -42,7 +79,7 @@ async fn get_events(
         };
         Some(Ok(Event::default()
             .event(ev.topic().as_str())
-            .json_data(&ev)
+            .json_data(ChainEventPayload::from(&ev))
             .inspect_err(|err| tracing::warn!(%err, "Failed to serialize SSE chain event"))
             .ok()?))
     });
@@ -84,8 +121,8 @@ mod tests {
 
         events.emit(ChainEvent::Head {
             slot: 3,
-            root: Default::default(),
-            parent_root: Default::default(),
+            block: Default::default(),
+            state: Default::default(),
         });
 
         let mut body = resp.into_body().into_data_stream();
@@ -100,11 +137,17 @@ mod tests {
             text.contains("event:head") || text.contains("event: head"),
             "missing head event name in frame: {text}"
         );
-        // ...and a flat payload: fields at the top level, no `event`/`data`
-        // wrapper keys inside the JSON body (the #460 double-tag bug).
+        // ...and a flat payload: the variant's own fields (`slot`, `block`,
+        // `state`) at the top level, `slot` as a plain number, with no
+        // `event`/`data` wrapper keys inside the JSON body (the #460
+        // double-tag bug).
         assert!(
             text.contains("\"slot\":3"),
             "missing top-level slot in frame: {text}"
+        );
+        assert!(
+            text.contains("\"block\":") && text.contains("\"state\":"),
+            "missing beacon-aligned block/state fields in frame: {text}"
         );
         assert!(
             !text.contains("\"data\":") && !text.contains("\"event\":"),
