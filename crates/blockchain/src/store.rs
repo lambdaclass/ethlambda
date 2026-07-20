@@ -1177,7 +1177,10 @@ pub fn verify_block_signatures(
 /// slot head to the lower slot head's slot, we don't arrive at the lower slot head.
 /// Returns `Some(depth)` where depth is the number of blocks walked back, or `None`
 /// if no reorg occurred.
-fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
+///
+/// `pub(crate)` so the actor-layer chain-event diff can reuse the same
+/// detection for the `chain_reorg` event, keeping one definition of "reorg".
+pub(crate) fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
     if new_head == old_head {
         return None;
     }

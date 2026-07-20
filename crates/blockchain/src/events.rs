@@ -11,6 +11,7 @@
 
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
+use ethlambda_types::attestation::AttestationData;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
 use serde::Serialize;
@@ -22,16 +23,27 @@ use tracing::warn;
 ///
 /// These are the names consumers address events by (the SSE `event:` line and,
 /// later, `?topics=` filtering), kept separate from [`ChainEvent`] so the
-/// payload stays flat with the topic travelling out-of-band. The names match
-/// the Ethereum beacon-API eventstream topics (`head`, `block`,
-/// `finalized_checkpoint`); `justified_checkpoint` is an ethlambda extension
-/// with no beacon analog.
+/// payload stays flat with the topic travelling out-of-band. Names match the
+/// Ethereum beacon-API eventstream topics where an analog exists (`head`,
+/// `block`, `finalized_checkpoint`, `chain_reorg`, `attestation`,
+/// `block_gossip`); `justified_checkpoint`, `safe_target`, and `aggregate` are
+/// ethlambda extensions with no direct beacon topic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
     Head,
     Block,
     JustifiedCheckpoint,
     FinalizedCheckpoint,
+    /// Fork choice switched to a head that is not a descendant of the old one.
+    ChainReorg,
+    /// The interval-3 fork-choice safe attestation target advanced.
+    SafeTarget,
+    /// A single validator vote seen on gossip.
+    Attestation,
+    /// A committee-signature aggregate (produced locally or seen on gossip).
+    Aggregate,
+    /// A block seen on gossip, before import (analog of beacon `block_gossip`).
+    BlockGossip,
 }
 
 impl Topic {
@@ -41,6 +53,11 @@ impl Topic {
             Topic::Block => "block",
             Topic::JustifiedCheckpoint => "justified_checkpoint",
             Topic::FinalizedCheckpoint => "finalized_checkpoint",
+            Topic::ChainReorg => "chain_reorg",
+            Topic::SafeTarget => "safe_target",
+            Topic::Attestation => "attestation",
+            Topic::Aggregate => "aggregate",
+            Topic::BlockGossip => "block_gossip",
         }
     }
 }
@@ -60,6 +77,11 @@ impl FromStr for Topic {
             "block" => Ok(Topic::Block),
             "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
             "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            "chain_reorg" => Ok(Topic::ChainReorg),
+            "safe_target" => Ok(Topic::SafeTarget),
+            "attestation" => Ok(Topic::Attestation),
+            "aggregate" => Ok(Topic::Aggregate),
+            "block_gossip" => Ok(Topic::BlockGossip),
             other => Err(UnknownTopic(other.to_string())),
         }
     }
@@ -90,6 +112,35 @@ pub enum ChainEvent {
     JustifiedCheckpoint { slot: u64, block: H256, state: H256 },
     /// The finalized checkpoint advanced.
     FinalizedCheckpoint { slot: u64, block: H256, state: H256 },
+    /// Fork choice switched to a head off the old head's chain. `slot` is the
+    /// new head's slot; `depth` the number of blocks rolled back. Mirrors the
+    /// beacon `chain_reorg` payload minus `epoch`/`execution_optimistic`.
+    ChainReorg {
+        slot: u64,
+        depth: u64,
+        old_head_block: H256,
+        old_head_state: H256,
+        new_head_block: H256,
+        new_head_state: H256,
+    },
+    /// The interval-3 safe attestation target advanced (ethlambda-specific).
+    SafeTarget { slot: u64, block: H256 },
+    /// A single validator vote seen on gossip. Carries the vote's
+    /// [`AttestationData`] and the attester's validator id; the ~3 KB XMSS
+    /// signature is deliberately omitted (too heavy for a high-rate stream).
+    Attestation {
+        validator_id: u64,
+        data: AttestationData,
+    },
+    /// A committee-signature aggregate: its [`AttestationData`] and the
+    /// participating validator ids. The SNARK proof bytes are omitted.
+    Aggregate {
+        participants: Vec<u64>,
+        data: AttestationData,
+    },
+    /// A block seen on gossip, before import. Analog of beacon `block_gossip`;
+    /// `block` is imported later once its parent chain is available.
+    BlockGossip { slot: u64, block: H256 },
 }
 
 impl ChainEvent {
@@ -99,6 +150,11 @@ impl ChainEvent {
             ChainEvent::Block { .. } => Topic::Block,
             ChainEvent::JustifiedCheckpoint { .. } => Topic::JustifiedCheckpoint,
             ChainEvent::FinalizedCheckpoint { .. } => Topic::FinalizedCheckpoint,
+            ChainEvent::ChainReorg { .. } => Topic::ChainReorg,
+            ChainEvent::SafeTarget { .. } => Topic::SafeTarget,
+            ChainEvent::Attestation { .. } => Topic::Attestation,
+            ChainEvent::Aggregate { .. } => Topic::Aggregate,
+            ChainEvent::BlockGossip { .. } => Topic::BlockGossip,
         }
     }
 }
@@ -108,7 +164,14 @@ impl ChainEvent {
 /// Chosen so a briefly-stalled subscriber is skipped past (lagged) rather than
 /// back-pressuring the actor. Lagged subscribers re-sync via the blocks
 /// endpoints.
-const CHAIN_EVENT_CHANNEL_CAPACITY: usize = 256;
+///
+/// All topics share this one ring buffer, so the high-rate `attestation` and
+/// `aggregate` events (roughly one per validator per slot) dominate its
+/// occupancy: the window a slow subscriber can tolerate is
+/// `capacity / total_event_rate`, not per-topic. Sized for a few minutes of
+/// history at devnet validator counts; a per-topic split behind the
+/// [`EventBus`] facade is the escape hatch if the shared window bites.
+const CHAIN_EVENT_CHANNEL_CAPACITY: usize = 8192;
 
 /// Cloneable handle to the chain-event broadcast channel.
 ///
@@ -137,6 +200,18 @@ impl EventBus {
             return;
         }
         let _ = self.tx.send(event);
+    }
+
+    /// Publish an event whose payload is only worth building when someone is
+    /// listening. The closure runs (and any clone/allocation it does) only past
+    /// the no-subscriber guard, so high-rate emitters (`attestation`,
+    /// `aggregate`) pay nothing on an idle node. Same best-effort delivery as
+    /// [`EventBus::emit`].
+    pub fn emit_with(&self, event: impl FnOnce() -> ChainEvent) {
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
+        let _ = self.tx.send(event());
     }
 
     /// Subscribe a new receiver observing every event emitted from now on.
@@ -182,6 +257,7 @@ pub(crate) struct ChainEventSnapshot {
     head: H256,
     justified: Checkpoint,
     finalized: Checkpoint,
+    safe_target: H256,
 }
 
 impl ChainEventSnapshot {
@@ -194,16 +270,20 @@ impl ChainEventSnapshot {
             finalized: store
                 .latest_finalized()
                 .expect("latest finalized checkpoint exists"),
+            safe_target: store.safe_target().expect("safe target exists"),
         }
     }
 
     /// Emit one event per value that changed since the snapshot, in a fixed
-    /// order: `head` → `justified_checkpoint` → `finalized_checkpoint`.
-    /// (`block` is emitted separately by the import path, ahead of this diff.)
+    /// order: `chain_reorg` → `head` → `justified_checkpoint` →
+    /// `finalized_checkpoint` → `safe_target`. (`block` is emitted separately by
+    /// the import path, ahead of this diff.)
     ///
-    /// `wall_clock_slot` is the caller's current slot, used only to gate the
-    /// `head` event against [`HEAD_EVENT_RECENCY_SLOTS`]; the other events are
-    /// ungated.
+    /// `wall_clock_slot` is the caller's current slot, used to gate the `head`
+    /// and `chain_reorg` events against [`HEAD_EVENT_RECENCY_SLOTS`] (catch-up
+    /// head walks are noise); `justified_checkpoint`, `finalized_checkpoint`,
+    /// and `safe_target` are ungated (they coalesce to the latest value, which
+    /// is the only one that matters).
     pub(crate) fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
         let head = store.head().expect("head block exists");
         if head != self.head {
@@ -215,6 +295,29 @@ impl ChainEventSnapshot {
             {
                 // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
                 if header.slot + HEAD_EVENT_RECENCY_SLOTS >= wall_clock_slot {
+                    // A head change that leaves the old head's chain is a reorg;
+                    // surface it just before the `head` event (beacon ordering).
+                    // `reorg_depth` returns None for a plain extension. Reading
+                    // the old-head header can fail only on genuine store
+                    // inconsistency; that just drops the reorg detail, never the
+                    // head event. Note: during a multi-move catch-up tick the
+                    // diff sees only net (pre, post) heads, so a transient reorg
+                    // that reverts within one call is invisible here (store
+                    // metrics still count it).
+                    if let Some(depth) = crate::store::reorg_depth(self.head, head, store)
+                        && let Some(old_header) = store
+                            .get_block_header(&self.head)
+                            .expect("block header read should succeed")
+                    {
+                        events.emit(ChainEvent::ChainReorg {
+                            slot: header.slot,
+                            depth,
+                            old_head_block: self.head,
+                            old_head_state: old_header.state_root,
+                            new_head_block: head,
+                            new_head_state: header.state_root,
+                        });
+                    }
                     events.emit(ChainEvent::Head {
                         slot: header.slot,
                         block: head,
@@ -264,6 +367,27 @@ impl ChainEventSnapshot {
                 );
             }
         }
+
+        // Safe target is a fork-choice block root (not a checkpoint), advanced
+        // at interval 3. Report its slot from the header; a missing header only
+        // drops this event.
+        let safe_target = store.safe_target().expect("safe target exists");
+        if safe_target != self.safe_target {
+            if let Some(header) = store
+                .get_block_header(&safe_target)
+                .expect("block header read should succeed")
+            {
+                events.emit(ChainEvent::SafeTarget {
+                    slot: header.slot,
+                    block: safe_target,
+                });
+            } else {
+                warn!(
+                    safe_target_root = %ShortRoot(&safe_target.0),
+                    "Safe target header missing while emitting event; skipping"
+                );
+            }
+        }
     }
 }
 
@@ -297,12 +421,26 @@ mod tests {
         }
     }
 
-    const ALL_TOPICS: [Topic; 4] = [
+    const ALL_TOPICS: [Topic; 9] = [
         Topic::Head,
         Topic::Block,
         Topic::JustifiedCheckpoint,
         Topic::FinalizedCheckpoint,
+        Topic::ChainReorg,
+        Topic::SafeTarget,
+        Topic::Attestation,
+        Topic::Aggregate,
+        Topic::BlockGossip,
     ];
+
+    fn test_attestation_data(slot: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
 
     #[tokio::test]
     async fn subscriber_receives_emitted_event() {
@@ -355,6 +493,36 @@ mod tests {
                     state,
                 },
                 Topic::FinalizedCheckpoint,
+            ),
+            (
+                ChainEvent::ChainReorg {
+                    slot: 1,
+                    depth: 1,
+                    old_head_block: block,
+                    old_head_state: state,
+                    new_head_block: block,
+                    new_head_state: state,
+                },
+                Topic::ChainReorg,
+            ),
+            (ChainEvent::SafeTarget { slot: 1, block }, Topic::SafeTarget),
+            (
+                ChainEvent::Attestation {
+                    validator_id: 0,
+                    data: test_attestation_data(1),
+                },
+                Topic::Attestation,
+            ),
+            (
+                ChainEvent::Aggregate {
+                    participants: vec![0, 1],
+                    data: test_attestation_data(1),
+                },
+                Topic::Aggregate,
+            ),
+            (
+                ChainEvent::BlockGossip { slot: 1, block },
+                Topic::BlockGossip,
             ),
         ];
         for (event, topic) in cases {
@@ -515,5 +683,105 @@ mod tests {
             other => panic!("expected head event, got: {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// Swinging the head onto a sibling chain fires `chain_reorg` ahead of the
+    /// `head` event, with the rolled-back depth. (A plain extension is covered
+    /// by `chain_event_diff_emits_recent_head`, which sees no reorg.)
+    #[test]
+    fn chain_event_diff_emits_chain_reorg_before_head() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        // Two forks off genesis: A(1) ← A2(2), and B(1) on its own.
+        let a = H256([1u8; 32]);
+        let a2 = H256([2u8; 32]);
+        let b = H256([3u8; 32]);
+        insert_test_block(&mut store, a, 1, genesis, H256([11u8; 32]));
+        insert_test_block(&mut store, a2, 2, a, H256([22u8; 32]));
+        insert_test_block(&mut store, b, 1, genesis, H256([33u8; 32]));
+
+        // Head starts on A2; snapshot; then fork choice picks B, off A2's chain.
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(a2))
+            .expect("head A2");
+        let snapshot = ChainEventSnapshot::capture(&store);
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(b))
+            .expect("head B");
+
+        // Wall clock at B's slot so the recency gate lets both events through.
+        snapshot.diff_and_emit(&store, &bus, 1);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::ChainReorg {
+                slot,
+                depth,
+                old_head_block,
+                new_head_block,
+                ..
+            } => {
+                assert_eq!(slot, 1, "reorg slot is the new head's slot");
+                assert_eq!(depth, 1, "A2 rolls back one block to the A/B fork point");
+                assert_eq!(old_head_block, a2);
+                assert_eq!(new_head_block, b);
+            }
+            other => panic!("expected chain_reorg first, got: {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            ChainEvent::Head { block, .. } => assert_eq!(block, b),
+            other => panic!("expected head after reorg, got: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A safe-target move (interval-3 output) emits `safe_target` and nothing
+    /// else when head/justified/finalized are unchanged.
+    #[test]
+    fn chain_event_diff_emits_safe_target() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        let target = H256([6u8; 32]);
+        insert_test_block(&mut store, target, 2, genesis, H256([66u8; 32]));
+        let snapshot = ChainEventSnapshot::capture(&store);
+        store.set_safe_target(target).expect("set safe target");
+
+        snapshot.diff_and_emit(&store, &bus, 2);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::SafeTarget { slot, block } => assert_eq!((slot, block), (2, target)),
+            other => panic!("expected safe_target, got: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// `emit_with` never runs its payload closure when there are no subscribers,
+    /// so high-rate emitters pay nothing on an idle node.
+    #[test]
+    fn emit_with_skips_closure_without_subscribers() {
+        let bus = EventBus::default();
+        let mut built = false;
+        bus.emit_with(|| {
+            built = true;
+            head_event(1)
+        });
+        assert!(!built, "payload closure ran despite no subscribers");
+    }
+
+    /// With a live subscriber, `emit_with` builds and delivers the event.
+    #[tokio::test]
+    async fn emit_with_delivers_when_subscribed() {
+        let bus = EventBus::default();
+        let mut sub = bus.subscribe();
+        bus.emit_with(|| head_event(9));
+        match sub.recv().await.unwrap() {
+            ChainEvent::Head { slot, .. } => assert_eq!(slot, 9),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
