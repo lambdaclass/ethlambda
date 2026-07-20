@@ -2051,6 +2051,7 @@ dependencies = [
  "libssz",
  "libssz-types",
  "rayon",
+ "serde",
  "spawned-concurrency 0.5.0",
  "thiserror 2.0.18",
  "tokio",
