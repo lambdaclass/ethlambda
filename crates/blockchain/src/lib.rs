@@ -41,6 +41,7 @@ pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
 pub mod reaggregate;
+pub mod spec_test_runner;
 pub mod store;
 mod sync_status;
 
