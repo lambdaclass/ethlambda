@@ -28,6 +28,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
+| `GET` | `/lean/v0/blocks?start_slot={n}&count={n}` | JSON | Canonical blocks in a slot range |
 | `GET` | `/lean/v0/blocks/{block_id}` | JSON | Block by root or slot |
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
@@ -82,6 +83,25 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 ```json
 { "slot": 128, "root": "0x1a2b…" }
 ```
+
+### `GET /lean/v0/blocks?start_slot={start_slot}&count={count}`
+
+Canonical blocks in the slot range `[start_slot, start_slot + count)`, returned as a JSON array. Intended for explorer/backfill use.
+
+Both query parameters are required. `count` is capped at `MAX_RANGE_COUNT`; larger values are silently clamped, not rejected.
+
+Slots resolve through the head state's `historical_block_hashes`, so only canonical blocks are returned:
+
+- empty slots (zero root) are skipped, not represented in the array;
+- the range is truncated where recorded history ends (past the head);
+- side-fork blocks are never included — fetch those by root via `/lean/v0/blocks/{block_id}`.
+
+| Status | Condition |
+|--------|-----------|
+| `200` | JSON array of blocks (possibly empty) |
+| `400` | Missing or non-numeric `start_slot`/`count` |
+
+Error bodies are JSON: `{ "error": "invalid query parameters: …" }`.
 
 ### `GET /lean/v0/blocks/{block_id}` and `/header`
 
