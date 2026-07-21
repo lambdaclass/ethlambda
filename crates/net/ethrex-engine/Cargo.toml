@@ -1,0 +1,16 @@
+[package]
+name = "ethlambda-ethrex-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ethrex-common.workspace = true
+ethrex-storage.workspace = true
+ethrex-blockchain.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true

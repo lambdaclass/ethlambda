@@ -11,6 +11,7 @@ members = [
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
+    "crates/net/ethrex-engine",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
@@ -38,6 +39,11 @@ ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+
+# ethrex — in-process execution layer (pinned git rev)
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 
 tracing = "0.1"
 thiserror = "2.0.9"
