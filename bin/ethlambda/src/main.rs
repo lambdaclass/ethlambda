@@ -32,10 +32,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
-use cli::CliOptions;
+use cli::{CliOptions, ExecutionMode};
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_ethrex_engine::EthrexEngine;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
@@ -262,14 +263,20 @@ async fn main() -> eyre::Result<()> {
         options.aggregate_subnet_ids.as_deref(),
     );
 
-    // Optional execution-layer engine. Today this is the out-of-process
-    // Engine-API client; the in-process ethrex engine is selected via
-    // `--execution-mode` in a follow-up. Threaded into `BlockChainConfig`.
-    let execution_client = build_execution_client(
-        options.execution_endpoint.as_deref(),
-        options.execution_jwt_secret.as_deref(),
-    )
-    .await;
+    // Optional execution-layer engine, selected by `--execution-mode`:
+    // `external` drives a separate EL over the Engine API; `inprocess` runs an
+    // embedded ethrex engine via direct library calls. Both implement
+    // `ExecutionEngine`, so downstream call sites are identical.
+    let execution_client = match options.execution_mode {
+        ExecutionMode::External => {
+            build_execution_client(
+                options.execution_endpoint.as_deref(),
+                options.execution_jwt_secret.as_deref(),
+            )
+            .await
+        }
+        ExecutionMode::InProcess => build_inprocess_engine(options.el_genesis.as_deref()).await,
+    };
 
     if execution_client.is_some() && suggested_fee_recipient == [0u8; 20] {
         warn!("suggested_fee_recipient not set in validator config; block rewards will be burned");
@@ -677,6 +684,26 @@ fn read_validator_keys(
 /// Returns `None` when integration is disabled (neither flag provided).
 /// Returns `None` and logs an error when construction or the handshake
 /// fails — consensus must keep running regardless of EL state.
+/// Construct the in-process ethrex execution engine from an EL genesis file.
+/// Returns `None` (consensus-only) when `--el-genesis` is missing or the
+/// genesis fails to load, matching the permissive posture of the external path.
+async fn build_inprocess_engine(genesis_path: Option<&Path>) -> Option<Arc<dyn ExecutionEngine>> {
+    let Some(path) = genesis_path else {
+        error!("--execution-mode inprocess requires --el-genesis");
+        return None;
+    };
+    match EthrexEngine::from_genesis_path(path).await {
+        Ok(engine) => {
+            info!(genesis = %path.display(), "In-process ethrex execution engine enabled");
+            Some(Arc::new(engine))
+        }
+        Err(err) => {
+            error!(%err, path = %path.display(), "Failed to bootstrap in-process ethrex engine");
+            None
+        }
+    }
+}
+
 async fn build_execution_client(
     endpoint: Option<&str>,
     jwt_path: Option<&Path>,

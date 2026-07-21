@@ -2026,6 +2026,7 @@ dependencies = [
  "ethlambda-blockchain",
  "ethlambda-crypto",
  "ethlambda-ethrex-client",
+ "ethlambda-ethrex-engine",
  "ethlambda-network-api",
  "ethlambda-p2p",
  "ethlambda-rpc",
@@ -2111,6 +2112,9 @@ dependencies = [
 name = "ethlambda-ethrex-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "ethlambda-ethrex-client",
+ "ethlambda-types",
  "ethrex-blockchain 15.0.0",
  "ethrex-common 15.0.0",
  "ethrex-storage 15.0.0",
