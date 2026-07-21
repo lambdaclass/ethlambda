@@ -269,9 +269,18 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         return Vec::new();
     };
 
-    store
-        .get_signed_blocks_by_slot_range(start_slot, end_slot)
-        .unwrap_or_default()
+    match store.get_signed_blocks_by_slot_range(start_slot, end_slot) {
+        Ok(blocks) => blocks,
+        Err(err) => {
+            warn!(
+                start_slot,
+                end_slot,
+                ?err,
+                "Failed to get signed blocks by slot range"
+            );
+            Vec::new()
+        }
+    }
 }
 
 async fn handle_blocks_by_root_response(

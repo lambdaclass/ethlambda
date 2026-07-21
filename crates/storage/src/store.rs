@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use lru::LruCache;
 
-use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::error::Error;
 
 use ethlambda_types::{
@@ -930,28 +930,44 @@ impl Store {
 
         while old_root != new_root {
             if old_root.is_zero() {
-                let header = self
-                    .get_block_header(&new_root)?
-                    .expect("new canonical block header exists");
+                let Some(header) = self.get_block_header(&new_root)? else {
+                    warn!(
+                        ?new_root,
+                        "Skipping block root index update for missing new head header"
+                    );
+                    break;
+                };
                 entries.push((encode_block_root_key(header.slot), new_root.to_ssz()));
                 new_root = header.parent_root;
                 continue;
             }
             if new_root.is_zero() {
-                let header = self
-                    .get_block_header(&old_root)?
-                    .expect("old canonical block header exists");
+                let Some(header) = self.get_block_header(&old_root)? else {
+                    warn!(
+                        ?old_root,
+                        "Skipping block root index update for missing old head header"
+                    );
+                    break;
+                };
                 deletes.push(encode_block_root_key(header.slot));
                 old_root = header.parent_root;
                 continue;
             }
 
-            let old_header = self
-                .get_block_header(&old_root)?
-                .expect("old canonical block header exists");
-            let new_header = self
-                .get_block_header(&new_root)?
-                .expect("new canonical block header exists");
+            let Some(old_header) = self.get_block_header(&old_root)? else {
+                warn!(
+                    ?old_root,
+                    "Skipping block root index update for missing old head header"
+                );
+                break;
+            };
+            let Some(new_header) = self.get_block_header(&new_root)? else {
+                warn!(
+                    ?new_root,
+                    "Skipping block root index update for missing new head header"
+                );
+                break;
+            };
 
             match old_header.slot.cmp(&new_header.slot) {
                 std::cmp::Ordering::Greater => {
@@ -972,14 +988,6 @@ impl Store {
         }
 
         Ok((deletes, entries))
-    }
-
-    /// Return the canonical block root at `slot`.
-    pub fn get_block_root_by_slot(&self, slot: u64) -> Option<H256> {
-        let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
-            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
     }
 
     /// Get block data for fork choice: root -> (slot, parent_root).
@@ -1233,20 +1241,20 @@ impl Store {
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
+        Ok(Self::signed_block_from_view(view.as_ref(), root))
+    }
+
+    fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
-            return Ok(None);
-        };
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
-                return Ok(None);
-            };
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
@@ -1259,15 +1267,15 @@ impl Store {
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
             None if header.slot == 0 => MultiMessageAggregate::default(),
-            None => return Ok(None),
+            None => return None,
         };
 
         let block = Block::from_header_and_body(header, body);
 
-        Ok(Some(SignedBlock {
+        Some(SignedBlock {
             message: block,
             proof,
-        }))
+        })
     }
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
@@ -1280,12 +1288,17 @@ impl Store {
         start_slot: u64,
         end_slot: u64,
     ) -> Result<Vec<SignedBlock>, Error> {
+        let view = self.backend.begin_read().expect("read view");
         let mut blocks = Vec::new();
         for slot in start_slot..=end_slot {
-            let Some(root) = self.get_block_root_by_slot(slot) else {
+            let Some(root_bytes) = view
+                .get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+            else {
                 continue;
             };
-            if let Some(block) = self.get_signed_block(&root)? {
+            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
+            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
                 blocks.push(block);
             }
         }
@@ -1786,6 +1799,14 @@ mod tests {
             .is_some()
     }
 
+    /// Return the canonical block root at `slot` for storage-index assertions.
+    fn block_root_by_slot(backend: &dyn StorageBackend, slot: u64) -> Option<H256> {
+        let view = backend.begin_read().expect("read view");
+        view.get(Table::BlockRoots, &encode_block_root_key(slot))
+            .expect("get block root")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+    }
+
     /// Generate a deterministic H256 root from an index.
     fn root(index: u64) -> H256 {
         let mut bytes = [0u8; 32];
@@ -1859,10 +1880,13 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(root_3))
             .expect("update head to block 3");
 
-        assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
-        assert_eq!(store.get_block_root_by_slot(1), Some(root_1));
-        assert_eq!(store.get_block_root_by_slot(2), None);
-        assert_eq!(store.get_block_root_by_slot(3), Some(root_3));
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), Some(root_1));
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 2), None);
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), Some(root_3));
 
         let side_block_2 = signed_block(2, anchor_root);
         let side_root_2 = side_block_2.message.hash_tree_root();
@@ -1879,11 +1903,20 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(side_root_4))
             .expect("update head to side block 4");
 
-        assert_eq!(store.get_block_root_by_slot(0), Some(anchor_root));
-        assert_eq!(store.get_block_root_by_slot(1), None);
-        assert_eq!(store.get_block_root_by_slot(2), Some(side_root_2));
-        assert_eq!(store.get_block_root_by_slot(3), None);
-        assert_eq!(store.get_block_root_by_slot(4), Some(side_root_4));
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 2),
+            Some(side_root_2)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 4),
+            Some(side_root_4)
+        );
     }
 
     #[test]
@@ -1904,7 +1937,11 @@ mod tests {
         let restored = Store::from_db_state(backend, 12345)
             .expect("restore store")
             .expect("store exists");
-        assert_eq!(restored.get_block_root_by_slot(1), Some(block_root));
+        let blocks = restored
+            .get_signed_blocks_by_slot_range(1, 1)
+            .expect("get blocks by slot range");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].message.hash_tree_root(), block_root);
     }
 
     #[test]
