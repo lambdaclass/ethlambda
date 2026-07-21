@@ -1,0 +1,15 @@
+[package]
+name = "zkvm_guest_sp1"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+sp1-zkvm = "6.1.0"
+ethlambda-types.workspace = true
+ethlambda-state-transition.workspace = true

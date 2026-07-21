@@ -9,7 +9,7 @@ members = [
     "crates/common/crypto",
     "crates/common/metrics",
     "crates/common/test-fixtures",
-    "crates/common/types",
+    "crates/common/types", "crates/guest-program/sp1",
     "crates/net/api",
     "crates/net/p2p",
     "crates/net/rpc",
