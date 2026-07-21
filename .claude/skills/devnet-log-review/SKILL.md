@@ -145,7 +145,7 @@ grep "signature verification failed" lantern_0.log
 
 ### Finalization Debugging
 
-Finalization should advance every 6-12 slots. If it stalls, investigate:
+On a healthy devnet finalization advances every few slots. If it stalls, investigate:
 
 ```bash
 # Check finalization progress
@@ -154,9 +154,11 @@ grep "finalized_slot=" ethlambda_0.log | tail -20
 # If finalized_slot stays same for 50+ slots → finalization stalled
 ```
 
-**Finalization requires >2/3 supermajority:**
-- 6 validators → need 5 votes minimum
-- 9 validators → need 7 votes minimum
+**Justification requires a ≥2/3 supermajority** (`3 * votes >= 2 * validator_count`,
+i.e. `ceil(2N/3)` — see `crates/blockchain/state_transition/src/lib.rs`):
+- 6 validators → need 4 votes minimum
+- 9 validators → need 6 votes minimum
+- 16 validators → need 11 votes minimum
 
 **See [references/FINALIZATION_DEBUG.md](references/FINALIZATION_DEBUG.md) for:**
 - Common causes of finalization stalls
@@ -184,15 +186,15 @@ Different clients have different log formats and key patterns.
 
 ## Block Proposal Flow (ethlambda)
 
-A healthy block proposal follows this sequence:
+Since the pre-build change (#445), the proposer builds at the *previous* slot's
+interval 4 and publishes aligned to the slot boundary. A healthy block proposal
+follows this sequence:
 
-1. `We are the proposer for this slot` - Node detects it's the proposer
-2. `TODO precompute poseidons in parallel + SIMD` - XMSS aggregate proof starts
-3. `packed_pcs_commit` - Proof commitment
-4. `Logup data` - Logup protocol data
-5. `AIR proof{table=poseidon16}` / `AIR proof{table=poseidon24}` - AIR proofs
-6. `Published block` - Block successfully built and published
-7. `Published block to gossipsub` - Block broadcast to network
+1. `We are the proposer for this slot` - Node detects it's the proposer (fires one slot early)
+2. leanVM proving output (`packed_pcs_commit`, `Logup data`, `AIR proof{table=poseidon16|poseidon24}`) - XMSS aggregate proof
+3. `Finished building block` - Build complete (#474; this is where the build-time metric stops)
+4. `Published block` - Published at the slot boundary (the gap to step 3 is idle wait, not build cost)
+5. `Published block to gossipsub` - Block broadcast to network
 
 ## Summary Report Format
 

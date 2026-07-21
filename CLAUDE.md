@@ -9,7 +9,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 **Rust version:** 1.92.0 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (10 crates)
+## Codebase Structure (12 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -18,17 +18,24 @@ crates/
   blockchain/               # State machine actor (GenServer pattern)
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
+    ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
+    ├─ src/aggregation.rs   # Interval-2 signature aggregation worker
+    ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
+    ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
     ├─ src/key_manager.rs   # Validator key management and signing
     ├─ src/metrics.rs       # Blockchain-level Prometheus metrics
-    ├─ fork_choice/         # LMD GHOST implementation (3SF-mini)
-    └─ state_transition/    # STF: process_slots, process_block, attestations
+    ├─ fork_choice/         # [crate] LMD GHOST implementation (3SF-mini)
+    └─ state_transition/    # [crate] STF: process_slots, process_block, attestations
+        ├─ src/justified_slots_ops.rs  # Relative-index helpers for justified_slots
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
     ├─ crypto/              # XMSS aggregation (leansig wrapper)
-    └─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
+    └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
-    ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot)
+    ├─ api/                 # Actor protocol traits wiring BlockChain ↔ P2P
+    ├─ p2p/                 # libp2p: gossipsub + req-resp (Status, BlocksByRoot, BlocksByRange)
     │   ├─ src/gossipsub/   # Topic encoding, message handling
     │   ├─ src/req_resp/    # Request/response codec and handlers
     │   └─ src/metrics.rs   # Peer connection/disconnection tracking
@@ -56,12 +63,14 @@ Interval 4: Accept accumulated attestations; build the NEXT slot's block and pub
 
 ### Attestation Pipeline
 ```
-Gossip → Signature verification → new_attestations (pending)
-  ↓ (interval 4)
-promote → known_attestations (fork choice active)
+Gossip → Signature verification → new_payloads (pending)
+  ↓ (intervals 0/4)
+promote → known_payloads (fork choice active)
   ↓
 Fork choice head update
 ```
+(Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
+`extract_latest_new_attestations`/`extract_latest_known_attestations`.)
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -105,7 +114,7 @@ let byte: u8 = code.into();
 
 ### Ownership for Large Structures
 ```rust
-// Prefer taking ownership to avoid cloning large data (signatures ~3KB)
+// Prefer taking ownership to avoid cloning large data (signatures ~2.5KB)
 pub fn insert_signed_block(&mut self, root: H256, signed_block: SignedBlock) { ... }
 
 // Add .clone() at call site if needed - makes cost explicit
@@ -252,7 +261,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 3112-byte signatures
+- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
 - Epoch-based to prevent reuse
 - Aggregation via leanVM (previously leanMultisig) for efficiency
 
@@ -268,11 +277,11 @@ actual_slot = finalized_slot + 1 + relative_index
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
-- **Req/Resp**: Status, BlocksByRoot (snappy frame compression + varint length)
+- **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
 
 ### Retry Strategy on Block Requests
-- Exponential backoff: 10ms, 40ms, 160ms, 640ms, 2560ms
-- Max 5 attempts, random peer selection on retry
+- Exponential backoff: doubling from `INITIAL_BACKOFF_MS` (5ms → 2560ms)
+- Max `MAX_FETCH_RETRIES` (10) attempts, random peer selection on retry
 
 ### Message IDs
 - 20-byte truncated SHA256 of: domain (valid/invalid snappy) + topic + data
@@ -301,9 +310,9 @@ GENESIS_VALIDATORS:
 ### Test Categories
 1. **Unit tests**: Embedded in source files
 2. **Spec tests**: From `leanSpec/fixtures/consensus/`
-   - `forkchoice_spectests.rs` (uses `on_block_without_verification`)
-   - `signature_spectests.rs`
-   - `stf_spectests.rs` (state transition)
+   - `crates/blockchain/tests/forkchoice_spectests.rs` (uses `on_block_without_verification` via `spec_test_runner`)
+   - `crates/blockchain/tests/signature_spectests.rs`
+   - `crates/blockchain/state_transition/tests/stf_spectests.rs` (state transition)
 
 ### Running Tests
 ```bash
@@ -316,7 +325,7 @@ cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads
 
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
-- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (`store.rs:368`), so blocks are always built with `attestation_count=0`
+- Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
 - The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
@@ -368,7 +377,7 @@ and are consumed during the tick pipeline (promotion at intervals 0/4,
 aggregation at interval 2).
 
 ### State Root Computation
-- Always computed via `tree_hash_root()` after full state transition
+- Always computed via `hash_tree_root()` after full state transition
 - Must match proposer's pre-computed `block.state_root`
 
 ### Finalization Checks
@@ -383,8 +392,8 @@ aggregation at interval 2).
 
 **Critical:**
 - `leansig`: XMSS signatures (leanEthereum project)
-- `ethereum_ssz`: SSZ serialization
-- `tree_hash`: Merkle tree hashing
+- `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
+- `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model
 - `libp2p`: P2P networking (custom LambdaClass fork)
 - `vergen-git2`: Build-time git commit/branch info embedded in binary
@@ -397,6 +406,7 @@ aggregation at interval 2).
 
 **Specs:** `leanSpec/src/lean_spec/` (Python reference implementation)
 **Devnet:** `lean-quickstart` (github.com/blockblaz/lean-quickstart)
+**Docs:** `docs/` — `rpc.md`, `metrics.md`, `checkpoint_sync.md`, `3sf_mini.md`, `lmd_ghost.md` (mdbook via `make docs`)
 **Releases:** See `RELEASE.md` for release process documentation
 
 ## Other implementations

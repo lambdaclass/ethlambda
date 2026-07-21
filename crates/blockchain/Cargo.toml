@@ -18,6 +18,7 @@ ethlambda-fork-choice.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
+ethlambda-test-fixtures.workspace = true
 
 libssz.workspace = true
 
@@ -33,13 +34,12 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
-ethlambda-test-fixtures.workspace = true
-serde = { workspace = true }
-serde_json = { workspace = true }
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true
 datatest-stable = "0.3.3"
+leansig.workspace = true
+rand.workspace = true
 
 [[test]]
 name = "forkchoice_spectests"

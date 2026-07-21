@@ -5,17 +5,20 @@ pub enum Table {
     BlockHeaders,
     /// Block body storage: H256 -> BlockBody
     BlockBodies,
-    /// Block signatures storage: H256 -> BlockSignatures
+    /// Block signatures storage: (slot || root) -> BlockSignatures
     ///
     /// Stored separately from blocks because the genesis block has no signatures.
-    /// All other blocks must have an entry in this table.
+    /// Keyed by slot || root so pruning can scan in slot order and stop early.
+    /// Non-genesis blocks have an entry until finalized: signatures below the
+    /// finalized boundary are pruned (`prune_old_block_signatures`), while
+    /// headers and bodies are kept forever.
     BlockSignatures,
     /// Canonical block index: slot -> block root
     BlockRoots,
     /// State storage: H256 -> State
     ///
-    /// Holds full-state snapshots only: the bootstrap anchor plus one anchor per
-    /// 1024-slot window. Never pruned. Non-anchor states live in `StateDiffs` and
+    /// Holds full-state snapshots only: the bootstrap anchor plus one anchor
+    /// every `SNAPSHOT_ANCHOR_INTERVAL` slots. Never pruned. Non-anchor states live in `StateDiffs` and
     /// are reconstructed on demand (memoized by an in-memory cache).
     States,
     /// State diffs: H256 -> StateDiff
