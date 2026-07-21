@@ -34,8 +34,6 @@ tracing.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true

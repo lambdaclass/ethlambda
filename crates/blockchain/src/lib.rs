@@ -28,11 +28,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::ProposerConfig;
+use crate::events::ChainEventSnapshot;
 use crate::store::StoreError;
+
+pub use events::{ChainEvent, EventBus, Topic};
 
 pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
+pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -125,10 +129,15 @@ fn unix_now_ms() -> u64 {
 }
 
 impl BlockChain {
+    /// Spawn the blockchain actor.
+    ///
+    /// `events` is the chain-event publication bus: the spawned actor is its
+    /// sole publisher; consumers subscribe read-only receivers.
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         config: BlockChainConfig,
+        events: EventBus,
     ) -> BlockChain {
         let BlockChainConfig {
             aggregator,
@@ -170,6 +179,7 @@ impl BlockChain {
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
+            events,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -256,6 +266,10 @@ pub struct BlockChainServer {
     /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
     /// `update_sync_status` with the same `SyncStatus` fed to the metric.
     sync_status_controller: SyncStatusController,
+
+    /// Chain-event publication bus. The actor is the sole publisher; consumers
+    /// only subscribe, preserving the one-directional write flow.
+    events: EventBus,
 }
 
 impl BlockChainServer {
@@ -331,8 +345,14 @@ impl BlockChainServer {
             .flatten()
             .is_some();
 
-        // Tick the store first - this accepts attestations at interval 0 if we have a proposal
+        // Tick the store first - this accepts attestations at interval 0 if we have a proposal.
+        // Snapshot/diff around the call so attestation-driven head or
+        // finalization moves surface as chain events.
+        let pre_tick = ChainEventSnapshot::capture(&self.store);
         store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+        // `slot` above is already derived from `timestamp_ms` (the wall clock
+        // at tick time), so it doubles as the wall-clock slot for the gate.
+        pre_tick.diff_and_emit(&self.store, &self.events, slot);
 
         // Per-interval duties for this tick. Intervals 0 (block publish) and 3
         // (safe-target update) are driven inside `store::on_tick` above, so they
@@ -681,16 +701,33 @@ impl BlockChainServer {
         // stashed for a later tick), and the real interval-0 tick is then skipped
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
+        //
+        // That interval-0 catch-up can move head/justified/finalized (it is the
+        // same attestation-acceptance step a non-proposing node runs at its
+        // interval-0 tick). Snapshot around the build so those moves surface as
+        // chain events here, matching an observer node; otherwise they would
+        // land outside every snapshot window and be silently absorbed into the
+        // later block-import diff's baseline.
+        let pre_build = ChainEventSnapshot::capture(&self.store);
         let timing = metrics::time_block_building();
-        let Ok((block, single_message_aggregates, _post_checkpoints)) =
-            store::produce_block_with_signatures(
-                &mut self.store,
-                slot,
-                validator_id,
-                self.proposer_config,
-            )
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let build_result = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            self.proposer_config,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"));
+
+        // `get_proposal_head` advances the store (interval-0 catch-up) inside
+        // `produce_block_with_signatures` *before* the build can fail, so emit
+        // the resulting head/checkpoint moves on both paths — a build failure
+        // must not strand a real finalization move outside every snapshot
+        // window. Ordered before the freshly built block's own import (which
+        // emits its `block` + head/checkpoint events). The catch-up advanced
+        // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
+        pre_build.diff_and_emit(&self.store, &self.events, slot);
+
+        let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -854,9 +891,34 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    /// Run block import and refresh metrics.
+    /// Run block import, emit the resulting chain events, and refresh metrics.
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
+        // `on_block` returns Ok early for an already-imported block, so gate
+        // the `block` event on whether this root is actually new.
+        let slot = signed_block.message.slot;
+        let block_root = signed_block.message.hash_tree_root();
+        let is_new = !self
+            .store
+            .has_state(&block_root)
+            .expect("DB read should succeed");
+        let pre_import = ChainEventSnapshot::capture(&self.store);
+
         store::on_block(&mut self.store, signed_block)?;
+
+        // `block` goes out first so subscribers see it ahead of the
+        // justified/head/finalized moves its import triggers.
+        if is_new {
+            self.events.emit(ChainEvent::Block {
+                slot,
+                block: block_root,
+            });
+        }
+        // Block import has no ready-made "now" slot like `on_tick`'s, so
+        // compute the wall-clock slot fresh for the head-recency gate.
+        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let wall_clock_slot = unix_now_ms().saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
+        pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
+
         metrics::update_head_slot(self.store.head_slot());
         let latest_justified_slot = self
             .store
