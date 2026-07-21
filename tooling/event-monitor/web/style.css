@@ -1,0 +1,339 @@
+/* event-monitor — calm, technical dashboard look. Light by default, dark via
+   prefers-color-scheme. Topic colors (block/attestation/aggregate) and status
+   colors (connected/reconnecting/down) are frozen by CONTRACT.md §6 and stay
+   constant across themes. */
+
+:root {
+  --bg: #f6f7f9;
+  --panel-bg: #ffffff;
+  --panel-border: #e1e4e9;
+  --text: #1b1f24;
+  --muted: #6b7280;
+  --muted-2: #8b93a1;
+  --grid: #e4e7ec;
+  --lane-alt: rgba(80, 96, 120, 0.045);
+  --accent: #4f8cff;
+  --chip-bg: #f0f2f5;
+
+  --topic-block: #4f8cff;
+  --topic-attestation: #37b24d;
+  --topic-aggregate: #f59f00;
+
+  --status-connected: #2f9e44;
+  --status-reconnecting: #f59f00;
+  --status-down: #e03131;
+  --status-unknown: #9aa4b2;
+
+  /* Propagation-bar state colors. Deliberately off the topic hues
+     (block/attestation/aggregate) so the two panels never read as the same
+     scale. Constant across themes, like the topic colors. */
+  --prop-first: #7048e8;   /* first node to see the id */
+  --prop-normal: #1098ad;  /* normal inter-node lag */
+  --prop-over: #e64980;    /* behind by more than a full slot */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0f13;
+    --panel-bg: #14171d;
+    --panel-border: #262a33;
+    --text: #e7e9ec;
+    --muted: #9aa4b2;
+    --muted-2: #737d8c;
+    --grid: #262a33;
+    --lane-alt: rgba(160, 180, 220, 0.05);
+    --accent: #6ea1ff;
+    --chip-bg: #1b1f27;
+  }
+}
+
+/* explicit theme override hooks, in case a host page ever stamps data-theme */
+:root[data-theme="dark"] {
+  --bg: #0d0f13;
+  --panel-bg: #14171d;
+  --panel-border: #262a33;
+  --text: #e7e9ec;
+  --muted: #9aa4b2;
+  --muted-2: #737d8c;
+  --grid: #262a33;
+  --lane-alt: rgba(160, 180, 220, 0.05);
+  --accent: #6ea1ff;
+  --chip-bg: #1b1f27;
+}
+
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel-bg: #ffffff;
+  --panel-border: #e1e4e9;
+  --text: #1b1f24;
+  --muted: #6b7280;
+  --muted-2: #8b93a1;
+  --grid: #e4e7ec;
+  --lane-alt: rgba(80, 96, 120, 0.045);
+  --accent: #4f8cff;
+  --chip-bg: #f0f2f5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+h1, h2 {
+  margin: 0;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+h2 {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---------- header ---------- */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px 24px;
+  padding: 18px 28px;
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+}
+
+.topbar-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.mode-indicator {
+  font-size: 11px;
+  color: var(--status-reconnecting);
+  letter-spacing: 0.03em;
+}
+
+.conn-banner {
+  font-size: 12px;
+  color: var(--status-reconnecting);
+  border: 1px solid var(--status-reconnecting);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.window-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.window-control input {
+  width: 58px;
+  padding: 3px 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.window-unit {
+  color: var(--muted-2);
+}
+
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--chip-bg);
+  border: 1px solid var(--panel-border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--status-unknown);
+  flex: none;
+}
+
+.status-name {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.status-rate {
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-connected .status-dot { background: var(--status-connected); }
+.status-reconnecting .status-dot { background: var(--status-reconnecting); }
+.status-down .status-dot { background: var(--status-down); }
+.status-unknown .status-dot { background: var(--status-unknown); }
+
+/* ---------- layout ---------- */
+
+main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px 28px 32px;
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 18px 20px 20px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.hint {
+  margin: 10px 2px 0;
+  font-size: 12px;
+  color: var(--muted-2);
+}
+
+.fatal-error {
+  color: var(--status-down);
+  border: 1px solid var(--status-down);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+}
+
+/* ---------- legend ---------- */
+
+.legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.legend-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.legend-block .legend-swatch { background: var(--topic-block); }
+.legend-attestation .legend-swatch { background: var(--topic-attestation); }
+.legend-aggregate .legend-swatch { background: var(--topic-aggregate); }
+
+/* ---------- beeswarm ---------- */
+
+.beeswarm-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+#beeswarm-canvas {
+  display: block;
+  width: 100%;
+}
+
+/* ---------- propagation ---------- */
+
+.toggle-group {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--chip-bg);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.toggle-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.toggle-btn:hover {
+  color: var(--text);
+}
+
+.toggle-btn-active {
+  background: var(--panel-bg);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+#propagation-canvas {
+  display: block;
+  width: 100%;
+}
+
+/* ---------- footer ---------- */
+
+.foot {
+  padding: 12px 28px 20px;
+  font-size: 11px;
+  color: var(--muted-2);
+  text-align: center;
+}
