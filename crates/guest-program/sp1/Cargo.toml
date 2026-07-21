@@ -1,15 +1,15 @@
+# Standalone workspace: this guest builds for a RISC-V zkVM target via
+# `cargo prove build`, so it is excluded from the root workspace and cannot
+# inherit its `[workspace.package]` / `[workspace.dependencies]` values.
+[workspace]
+
 [package]
 name = "zkvm_guest_sp1"
-authors.workspace = true
-edition.workspace = true
-keywords.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
+edition = "2024"
+publish = false
 
 [dependencies]
 sp1-zkvm = "6.1.0"
-ethlambda-types.workspace = true
-ethlambda-state-transition.workspace = true
+ethlambda-types = { path = "../../common/types" }
+ethlambda-state-transition = { path = "../../blockchain/state_transition" }

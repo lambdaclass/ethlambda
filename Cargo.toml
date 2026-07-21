@@ -9,12 +9,17 @@ members = [
     "crates/common/crypto",
     "crates/common/metrics",
     "crates/common/test-fixtures",
-    "crates/common/types", "crates/guest-program/sp1",
+    "crates/common/types",
     "crates/net/api",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
 ]
+
+# NOTE: zkVM guest programs are their own workspaces: they build for the respective 
+# target ISA via their respective build commands, not for the host, so `cargo {clippy,test}
+# --workspace` must not try to compile them.
+exclude = ["crates/guest-program/sp1"]
 
 [workspace.package]
 authors = ["LambdaClass"]
