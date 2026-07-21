@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     block::{Block, BlockBody, BlockHeader},
     checkpoint::Checkpoint,
+    execution_payload::ExecutionPayloadHeader,
     primitives::{self, H256},
     signature::{SignatureParseError, ValidatorPublicKey},
 };
@@ -35,6 +36,14 @@ pub struct State {
     pub justifications_roots: JustificationRoots,
     /// A bitlist of validators who participated in justifications
     pub justifications_validators: JustificationValidators,
+    /// Cached projection of the latest applied execution payload.
+    ///
+    /// `process_execution_payload` (Capella spec) validates each incoming
+    /// block's `body.execution_payload.parent_hash` against this header's
+    /// `block_hash` and then caches the new header back here. At genesis the
+    /// header is all-zero; the first non-genesis block's payload must have
+    /// `parent_hash = H256::ZERO` to be accepted.
+    pub latest_execution_payload_header: ExecutionPayloadHeader,
 }
 
 /// The maximum number of historical block roots to store in the state.
@@ -121,6 +130,7 @@ impl State {
             validators,
             justifications_roots: Default::default(),
             justifications_validators,
+            latest_execution_payload_header: ExecutionPayloadHeader::default(),
         }
     }
 }

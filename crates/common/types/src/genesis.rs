@@ -145,8 +145,11 @@ GENESIS_VALIDATORS:
         let root = state.hash_tree_root();
 
         // Pin the state root so SSZ layout changes are caught immediately.
+        // Updated 2026-05-18: M6 phase 2c added `execution_payload` to
+        // BlockBody (changes body_root inside genesis_header) and
+        // `latest_execution_payload_header` to State (adds one tree leaf).
         let expected_state_root = crate::primitives::H256::from_slice(
-            &hex::decode("babcdc9235a29dfc0d605961df51cfc85732f85291c2beea8b7510a92ec458fe")
+            &hex::decode("0d8e3a1dbbdfce50deffd8712a403843afa4be9f9cc6742ddff1d62c26373fe4")
                 .unwrap(),
         );
         assert_eq!(root, expected_state_root, "state root mismatch");
@@ -154,8 +157,9 @@ GENESIS_VALIDATORS:
         let mut block = state.latest_block_header;
         block.state_root = root;
         let block_root = block.hash_tree_root();
+        // Updated 2026-05-18: depends on the new state_root above.
         let expected_block_root = crate::primitives::H256::from_slice(
-            &hex::decode("66a8beaa81d2aaeac7212d4bf8f5fea2bd22d479566a33a83c891661c21235ef")
+            &hex::decode("110004cf4e035ef4ab350696132d4cac83f7bbb0aa8800cd230571c51a01dd6a")
                 .unwrap(),
         );
         assert_eq!(block_root, expected_block_root, "block root mismatch");

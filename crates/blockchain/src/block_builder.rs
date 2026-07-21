@@ -17,14 +17,15 @@ use std::{
 
 use ethlambda_crypto::aggregate_proofs;
 use ethlambda_state_transition::{
-    attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
-    slot_is_justifiable_after,
+    attestation_data_matches_chain, compute_time_at_slot, justified_slots_ops, process_block,
+    process_slots, slot_is_justifiable_after,
 };
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
     block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
     checkpoint::Checkpoint,
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
 };
@@ -58,6 +59,22 @@ pub struct ProposerConfig {
     pub max_attestations_per_block: usize,
 }
 
+/// Build the EL execution payload a proposer embeds when no execution client
+/// is configured (or the `engine_getPayload` roundtrip failed). It satisfies
+/// the STF's `process_execution_payload` check for a node running without an EL.
+///
+/// Sets `parent_hash` to the last cached header's `block_hash` (so the chain
+/// still links forward) and `timestamp` to `compute_time_at_slot` (so the
+/// slot-time check passes). Every other field stays zero. The real
+/// `engine_getPayload` response replaces this when an EL endpoint is wired in.
+fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
+    ExecutionPayloadV3 {
+        parent_hash: head_state.latest_execution_payload_header.block_hash,
+        timestamp: compute_time_at_slot(head_state.config.genesis_time, slot),
+        ..Default::default()
+    }
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Selects attestations via `select_attestations`, collapses entries sharing
@@ -82,6 +99,12 @@ pub struct ProposerConfig {
 /// `AttestationData` entries are packed (a proposer-side self-limit). It is
 /// clamped to `MAX_ATTESTATIONS_DATA` so the block never exceeds the cap
 /// `on_block` enforces on incoming blocks.
+///
+/// `execution_payload` carries the payload the proposer fetched from the EL
+/// (`engine_getPayload`). When `None` (no EL configured, or the roundtrip
+/// failed) it falls back to `synthetic_payload` so non-EL nodes still produce
+/// STF-valid blocks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
@@ -90,8 +113,13 @@ pub(crate) fn build_block(
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     config: ProposerConfig,
+    execution_payload: Option<ExecutionPayloadV3>,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
+
+    // Fetched-from-EL payload wins; otherwise fall back to the synthetic
+    // chain-linking one so non-EL nodes still produce STF-valid blocks.
+    let payload = execution_payload.unwrap_or_else(|| synthetic_payload(head_state, slot));
 
     let select_start = Instant::now();
     let selected = select_attestations(
@@ -133,7 +161,10 @@ pub(crate) fn build_block(
         proposer_index,
         parent_root,
         state_root: H256::ZERO,
-        body: BlockBody { attestations },
+        body: BlockBody {
+            attestations,
+            execution_payload: payload,
+        },
     };
     let mut post_state = head_state.clone();
     // ethlambda runs the STF once after selection (it projects justification
@@ -1004,6 +1035,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         // process_slots fills in the parent header's state_root before
@@ -1075,6 +1107,7 @@ mod tests {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
             },
+            None,
         )
         .expect("build_block should succeed");
 
@@ -1161,6 +1194,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let mut header_for_root = head_state.latest_block_header.clone();
@@ -1221,6 +1255,7 @@ mod tests {
                     enable_proposer_aggregation: false,
                     max_attestations_per_block: limit,
                 },
+                None,
             )
             .expect("build_block should succeed")
             .0
@@ -1290,6 +1325,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let mut header_for_root = head_state.latest_block_header.clone();
@@ -1347,6 +1383,7 @@ mod tests {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
             },
+            None,
         )
         .expect("build_block should succeed");
 
@@ -1600,6 +1637,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let mut header_for_root = head_state.latest_block_header.clone();
@@ -1653,6 +1691,7 @@ mod tests {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
             },
+            None,
         )
         .expect("build_block should succeed");
 
@@ -1719,6 +1758,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let mut header_for_root = head_state.latest_block_header.clone();
@@ -1789,6 +1829,7 @@ mod tests {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
             },
+            None,
         )
         .expect("build_block should succeed");
 
@@ -1943,5 +1984,100 @@ mod tests {
         assert_eq!(selected.len(), 1);
         let covered: HashSet<u64> = selected[0].1.participant_indices().collect();
         assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+    }
+
+    /// Phase 7 (M6): when the proposer supplies an `execution_payload`
+    /// from `engine_getPayload`, `build_block` embeds it verbatim
+    /// instead of synthesizing one. Empty attestation pool keeps the
+    /// scaffolding minimal — this test only exercises the payload
+    /// threading, not the attestation-packing loop.
+    #[test]
+    fn build_block_embeds_provided_execution_payload() {
+        use ethlambda_state_transition::SECONDS_PER_SLOT;
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots, Validator},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 4;
+        const HEAD_SLOT: u64 = 0;
+        const GENESIS_TIME: u64 = 1_700_000_000;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig {
+                genesis_time: GENESIS_TIME,
+            },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: Default::default(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
+        };
+
+        // Match what process_block_header would compute as the parent root
+        // (state_root field zeroed during the genesis transition; standard
+        // pattern from the other build_block tests).
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // Caller-supplied payload from a hypothetical `engine_getPayload`
+        // response. Honest values for `parent_hash` (matches the cached
+        // genesis header) and `timestamp` (matches `compute_time_at_slot`)
+        // so STF's `process_execution_payload` accepts it at the end of
+        // `build_block`.
+        let supplied = ExecutionPayloadV3 {
+            parent_hash: H256::ZERO,
+            timestamp: GENESIS_TIME + slot * SECONDS_PER_SLOT,
+            block_hash: H256([0xab; 32]),
+            ..Default::default()
+        };
+        let supplied_hash = supplied.hash_tree_root();
+
+        let (block, _signatures, _post_checkpoints) = build_block(
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &HashSet::new(),
+            &HashMap::new(),
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
+            Some(supplied.clone()),
+        )
+        .expect("build_block accepts supplied payload");
+
+        // The block carries the exact payload we threaded in (not a
+        // synthetic one). `block_hash` is the load-bearing field for FCU,
+        // so check it directly in addition to the tree-hash root.
+        assert_eq!(block.body.execution_payload.block_hash, supplied.block_hash);
+        assert_eq!(block.body.execution_payload.hash_tree_root(), supplied_hash);
     }
 }

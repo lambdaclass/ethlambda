@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+// `BlockBody` and `TestState` re-exports are unused while the M6 schema
+// skip is active in `ssz_spectests.rs` (the dispatch arms are commented
+// out). Keep them re-exported so the skip can be lifted by editing only
+// `ssz_spectests.rs` once leanSpec ships the executionPayload schema.
+// TODO(M6): drop the allow once the dispatch uses these again.
+#[allow(unused_imports)]
 pub use ethlambda_test_fixtures::{
     AggregatedAttestation, AttestationData, Block, BlockBody, BlockHeader, Checkpoint, Config,
     TestInfo, TestState, Validator,

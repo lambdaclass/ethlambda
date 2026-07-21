@@ -842,6 +842,7 @@ mod tests {
             validators: SszList::try_from(make_validators(num_validators)).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         }
     }
 

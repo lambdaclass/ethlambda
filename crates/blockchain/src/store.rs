@@ -10,6 +10,7 @@ use ethlambda_types::{
     },
     block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
     signature::{ValidatorPublicKey, ValidatorSignature},
     state::{HISTORICAL_ROOTS_LIMIT, State},
@@ -881,11 +882,17 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
 ///
 /// Returns the finalized block and attestation signature payloads aligned
 /// with `block.body.attestations`.
+///
+/// `execution_payload` carries the payload the proposer fetched from the EL
+/// via `engine_getPayload`. When `None` (no EL configured, or the EL
+/// roundtrip failed), `build_block` falls back to `synthetic_payload` so
+/// non-EL-paired nodes can still produce parseable blocks.
 pub fn produce_block_with_signatures(
     store: &mut Store,
     slot: u64,
     validator_index: u64,
     config: ProposerConfig,
+    execution_payload: Option<ExecutionPayloadV3>,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     // Get parent block and state to build upon
     let head_root = get_proposal_head(store, slot);
@@ -921,6 +928,7 @@ pub fn produce_block_with_signatures(
             &known_block_roots,
             &aggregated_payloads,
             config,
+            execution_payload,
         )?
     };
 
@@ -1306,7 +1314,10 @@ mod tests {
             proposer_index: 0,
             parent_root: head_root,
             state_root: H256::ZERO,
-            body: BlockBody { attestations },
+            body: BlockBody {
+                attestations,
+                execution_payload: Default::default(),
+            },
         };
         let block_root = block.hash_tree_root();
         let att_root = att_data.hash_tree_root();

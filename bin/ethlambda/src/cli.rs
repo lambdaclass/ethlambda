@@ -75,6 +75,23 @@ pub(crate) struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
+    /// URL of the ethrex (or other EL) Engine API auth endpoint, e.g.
+    /// `http://127.0.0.1:8551`. When unset, Engine API integration is disabled
+    /// and ethlambda runs as a consensus-only node. When set,
+    /// `--execution-jwt-secret` is required.
+    #[arg(long, requires = "execution_jwt_secret")]
+    pub(crate) execution_endpoint: Option<String>,
+    /// Path to a file containing the 32-byte JWT secret shared with the EL, as
+    /// a single line of hex (optionally `0x`-prefixed). Same format used by
+    /// Lighthouse/Teku/Prysm/ethrex.
+    #[arg(long, requires = "execution_endpoint")]
+    pub(crate) execution_jwt_secret: Option<PathBuf>,
+    /// 32-byte hex hash of the EL's genesis block. Seeds
+    /// `state.latest_execution_payload_header.block_hash` so the first
+    /// `forkchoiceUpdated` carries a head the EL recognizes. Only meaningful
+    /// alongside `--execution-endpoint`.
+    #[arg(long, requires = "execution_endpoint")]
+    pub(crate) execution_genesis_block_hash: Option<String>,
     /// Disable the sync-gate's suppression of validator duties.
     ///
     /// By default a node that judges itself to be syncing (local head lagging

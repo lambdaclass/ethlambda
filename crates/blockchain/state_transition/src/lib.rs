@@ -10,8 +10,11 @@ use ethlambda_types::{
 };
 use tracing::{info, warn};
 
+mod execution_payload;
 pub mod justified_slots_ops;
 pub mod metrics;
+
+pub use execution_payload::{SECONDS_PER_SLOT, compute_time_at_slot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -41,6 +44,10 @@ pub enum Error {
         "justification vote list length {actual} does not equal tracked-root count times validator count {expected}"
     )]
     JustificationVotesLengthMismatch { expected: usize, actual: usize },
+    #[error("execution payload parent_hash mismatch: expected {expected}, found {found}")]
+    InvalidPayloadParentHash { expected: H256, found: H256 },
+    #[error("execution payload timestamp mismatch: expected {expected}, found {found}")]
+    InvalidPayloadTimestamp { expected: u64, found: u64 },
     #[error("aggregated attestation has no participants")]
     EmptyAggregationBits,
     #[error("aggregation bit set at index {index} beyond validator count {validator_count}")]
@@ -116,6 +123,7 @@ pub fn process_block(state: &mut State, block: &Block) -> Result<(), Error> {
     let _timing = metrics::time_block_processing();
 
     process_block_header(state, block)?;
+    execution_payload::process_execution_payload(state, block)?;
     process_attestations(state, &block.body.attestations)?;
 
     Ok(())
@@ -791,6 +799,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         // Three supermajority attestations (3 of 4 validators each), all from
@@ -859,6 +868,7 @@ mod tests {
             validators: SszList::try_from(validators).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         // Supermajority (3 of 4) attesting from the stale source (slot 1) to the
@@ -919,6 +929,7 @@ mod tests {
             // One tracked root, but a vote list of the wrong width (3, not 1 * 4).
             justifications_roots: SszList::try_from(vec![r1]).unwrap(),
             justifications_validators: JustificationValidators::with_length(3).unwrap(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let atts: AggregatedAttestations = Vec::<AggregatedAttestation>::new().try_into().unwrap();
@@ -964,6 +975,7 @@ mod tests {
             validators: SszList::try_from(make_validators(0)).unwrap(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         };
 
         let atts: AggregatedAttestations = Vec::<AggregatedAttestation>::new().try_into().unwrap();
