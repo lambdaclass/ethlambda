@@ -13,6 +13,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
+use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -45,18 +46,20 @@ impl Topic {
 
 /// A consensus event published by the blockchain actor.
 ///
-/// Fields mirror the Ethereum beacon-API eventstream payloads so a future SSE
-/// endpoint can render a beacon-compatible stream: `block` is the block root,
+/// Fields mirror the Ethereum beacon-API eventstream payloads so the SSE
+/// endpoint renders a beacon-compatible stream: `block` is the block root,
 /// `state` the state root, and `slot` stands in for the beacon `epoch`.
 /// [`ChainEvent::JustifiedCheckpoint`] has no beacon analog; it mirrors
 /// [`ChainEvent::FinalizedCheckpoint`]'s shape as an ethlambda extension.
 ///
-/// No `Serialize` is derived: the wire encoding (decimal-string integers,
-/// `0x`-hex roots, and the out-of-band topic on the SSE `event:` line) lands
-/// with the SSE endpoint in a follow-up PR. Until then this type is
-/// internal-only, so there is no risk of an untagged shape being deserialized
-/// ambiguously (the `{slot, block, state}` variants are structurally identical).
-#[derive(Clone, Debug)]
+/// `#[serde(untagged)]` serializes only the active variant's fields, so the SSE
+/// `data:` body stays flat (`0x`-hex roots, numeric slots) while the topic name
+/// travels out-of-band on the `event:` line via [`ChainEvent::topic`]. Only
+/// `Serialize` is derived, never `Deserialize`: an untagged shape would
+/// deserialize ambiguously since the `{slot, block, state}` variants are
+/// structurally identical, but serialization always knows its variant.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
 pub enum ChainEvent {
     /// Fork choice selected a new head.
     Head { slot: u64, block: H256, state: H256 },
