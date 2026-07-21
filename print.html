@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-beb77040.js";
+            window.path_to_searchindex_js = "searchindex-fd1243a6.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-294cc887.js"></script>
@@ -1452,6 +1452,7 @@ clients.</p>
 <tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/checkpoints/justified</code></td><td>JSON</td><td>Latest justified <code>Checkpoint</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/events</code></td><td>SSE</td><td>Live stream of chain events</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}</code></td><td>JSON</td><td>Block by root or slot</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}/header</code></td><td>JSON</td><td>Block header by root or slot</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/fork_choice</code></td><td>JSON</td><td>Fork-choice tree with per-block weights</td></tr>
@@ -1489,6 +1490,27 @@ clients.</p>
 <h3 id="get-leanv0checkpointsjustified"><a class="header" href="#get-leanv0checkpointsjustified"><code>GET /lean/v0/checkpoints/justified</code></a></h3>
 <pre><code class="language-json">{ "slot": 128, "root": "0x1a2b…" }
 </code></pre>
+<h3 id="get-leanv0events"><a class="header" href="#get-leanv0events"><code>GET /lean/v0/events</code></a></h3>
+<p>Server-Sent Events stream (<code>Content-Type: text/event-stream</code>) of live chain events published by the blockchain actor. Four event types:</p>
+<p>Payload fields mirror the Ethereum beacon-API eventstream: <code>block</code> is the block root, <code>state</code> the state root, and <code>slot</code> stands in for the beacon <code>epoch</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Event</th><th>Payload</th><th>Emitted when</th></tr>
+</thead>
+<tbody>
+<tr><td><code>head</code></td><td><code>{ "slot": 128, "block": "0x…", "state": "0x…" }</code></td><td>Fork choice selects a new head within <code>HEAD_EVENT_RECENCY_SLOTS</code> (32 slots) of the wall clock; no head events fire during catch-up</td></tr>
+<tr><td><code>block</code></td><td><code>{ "slot": 128, "block": "0x…" }</code></td><td>A block is imported into the store</td></tr>
+<tr><td><code>justified_checkpoint</code></td><td><code>{ "slot": 120, "block": "0x…", "state": "0x…" }</code></td><td>The justified checkpoint advances</td></tr>
+<tr><td><code>finalized_checkpoint</code></td><td><code>{ "slot": 96, "block": "0x…", "state": "0x…" }</code></td><td>The finalized checkpoint advances</td></tr>
+</tbody>
+</table>
+</div>
+<p>The topic name travels only on the SSE <code>event:</code> line; the <code>data:</code> line carries the flat JSON payload. Example frame:</p>
+<pre><code>event: head
+data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
+</code></pre>
+<p>Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. Keep-alive comments are sent periodically to hold idle connections open.</p>
 <h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
 <p><code>block_id</code> is either:</p>
 <ul>
@@ -1602,6 +1624,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 </thead>
 <tbody>
 <tr><td>JSON</td><td><code>application/json; charset=utf-8</code></td></tr>
+<tr><td>SSE</td><td><code>text/event-stream</code></td></tr>
 <tr><td>SSZ</td><td><code>application/octet-stream</code></td></tr>
 <tr><td>Prometheus metrics</td><td><code>text/plain; version=0.0.4; charset=utf-8</code></td></tr>
 <tr><td>HTML</td><td><code>text/html; charset=utf-8</code></td></tr>
