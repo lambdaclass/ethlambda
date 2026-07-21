@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fd1243a6.js";
+            window.path_to_searchindex_js = "searchindex-739513d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-294cc887.js"></script>
@@ -272,7 +272,23 @@
 <pre><code>event: head
 data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 </code></pre>
-<p>Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. Keep-alive comments are sent periodically to hold idle connections open.</p>
+<h4 id="filtering-with-topics"><a class="header" href="#filtering-with-topics">Filtering with <code>?topics=</code></a></h4>
+<p>A <strong>required</strong> comma-separated list of event names selects which events to stream:</p>
+<pre><code class="language-bash">curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
+</code></pre>
+<p>Valid values are exactly the event names above: <code>head</code>, <code>block</code>, <code>justified_checkpoint</code>, <code>finalized_checkpoint</code>. As in the Beacon API <code>eventstream</code> endpoint, <code>topics</code> is mandatory: there is no “subscribe to everything” default; list the topics you want.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Condition</th></tr>
+</thead>
+<tbody>
+<tr><td><code>200</code></td><td>Stream opened for the listed topics</td></tr>
+<tr><td><code>400</code></td><td><code>topics</code> is missing or empty, or any listed name is not a known topic (body names the offending value)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line <code>: error - dropped N messages</code> marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.</p>
 <h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
 <p><code>block_id</code> is either:</p>
 <ul>
