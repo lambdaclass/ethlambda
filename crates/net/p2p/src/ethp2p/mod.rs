@@ -44,6 +44,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use ethlambda_network_api::P2PToBlockChainRef;
 use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
@@ -92,6 +93,12 @@ pub(crate) fn all_channels() -> Vec<String> {
 
 /// Capacity of the reconstructed-message delivery channel.
 const DELIVERY_CAPACITY: usize = 256;
+
+/// Per-peer budget for the startup QUIC dial. Kept short so an unreachable mesh
+/// peer (still binding, or a client that doesn't run ethp2p) neither disables
+/// the engine nor stalls startup on the transport's long connect timeout. The
+/// peer can still reach us via its own dial — QUIC connections are bidirectional.
+const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Derive a stable ethp2p peer id (`u64`) from a secp256k1 compressed
 /// public key: the first 8 bytes of its SHA-256, big-endian.
@@ -164,13 +171,29 @@ impl Ethp2pBroadcast {
         let net = QuicNet::bind(local_peer, bind_addr)?;
         let local_addr = net.local_addr()?;
 
-        // QUIC-level dial of peers we're responsible for dialing; peers
-        // with no address dial us and self-register via the stream preface.
-        for (peer, addr) in peers {
-            if let Some(addr) = addr {
-                net.connect(*peer, *addr).await?;
-            }
-        }
+        // QUIC-level dial of peers we're responsible for dialing (peers with no
+        // address dial us and self-register via the stream preface).
+        //
+        // Best-effort and concurrent: a peer whose ethp2p endpoint isn't
+        // reachable at startup must not disable the whole engine (a single
+        // failed dial used to abort `start` via `?`) or stall it — dialing
+        // sequentially would block startup for the transport's connect timeout
+        // once per unreachable peer. Dial all peers at once under a short budget
+        // and log-and-continue past failures, so reachable peers (notably other
+        // ethlambda nodes) still form the mesh.
+        let net_ref = &net;
+        let dials = peers.iter().filter_map(|&(peer, addr)| {
+            addr.map(|addr| async move {
+                match tokio::time::timeout(PEER_DIAL_TIMEOUT, net_ref.connect(peer, addr)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(peer, %addr, %e, "ethp2p: failed to dial mesh peer; continuing")
+                    }
+                    Err(_) => warn!(peer, %addr, "ethp2p: mesh peer dial timed out; continuing"),
+                }
+            })
+        });
+        futures::future::join_all(dials).await;
 
         let (delivered_tx, delivered_rx) = mpsc::channel(DELIVERY_CAPACITY);
         let mut engine = Engine::new(local_peer, net, delivered_tx);
