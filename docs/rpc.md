@@ -104,7 +104,22 @@ event: head
 data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 ```
 
-Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. Keep-alive comments are sent periodically to hold idle connections open.
+#### Filtering with `?topics=`
+
+A **required** comma-separated list of event names selects which events to stream:
+
+```bash
+curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
+```
+
+Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
+
+| Status | Condition |
+|--------|-----------|
+| `200` | Stream opened for the listed topics |
+| `400` | `topics` is missing or empty, or any listed name is not a known topic (body names the offending value) |
+
+Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line `: error - dropped N messages` marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.
 
 ### `GET /lean/v0/blocks/{block_id}` and `/header`
 

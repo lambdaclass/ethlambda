@@ -14,6 +14,7 @@ use ethlambda_types::ShortRoot;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
 use serde::Serialize;
+use std::str::FromStr;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -40,6 +41,26 @@ impl Topic {
             Topic::Block => "block",
             Topic::JustifiedCheckpoint => "justified_checkpoint",
             Topic::FinalizedCheckpoint => "finalized_checkpoint",
+        }
+    }
+}
+
+/// Error returned by [`Topic::from_str`] for a name matching no topic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown topic: '{0}'")]
+pub struct UnknownTopic(String);
+
+impl FromStr for Topic {
+    type Err = UnknownTopic;
+
+    /// Exact inverse of [`Topic::as_str`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "head" => Ok(Topic::Head),
+            "block" => Ok(Topic::Block),
+            "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
+            "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            other => Err(UnknownTopic(other.to_string())),
         }
     }
 }
@@ -276,6 +297,13 @@ mod tests {
         }
     }
 
+    const ALL_TOPICS: [Topic; 4] = [
+        Topic::Head,
+        Topic::Block,
+        Topic::JustifiedCheckpoint,
+        Topic::FinalizedCheckpoint,
+    ];
+
     #[tokio::test]
     async fn subscriber_receives_emitted_event() {
         let bus = EventBus::default();
@@ -287,6 +315,15 @@ mod tests {
             ChainEvent::Head { slot, .. } => assert_eq!(slot, 7),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn topic_from_str_inverts_as_str() {
+        for topic in ALL_TOPICS {
+            assert_eq!(topic.as_str().parse::<Topic>().unwrap(), topic);
+        }
+        let err = "bogus".parse::<Topic>().unwrap_err();
+        assert_eq!(err.to_string(), "unknown topic: 'bogus'");
     }
 
     #[test]
