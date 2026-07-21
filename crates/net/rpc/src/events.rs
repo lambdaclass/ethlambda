@@ -256,6 +256,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_streams_attestation_with_nested_data() {
+        use ethlambda_types::attestation::AttestationData;
+        use ethlambda_types::checkpoint::Checkpoint;
+
+        let events = EventBus::new(16);
+
+        let resp = events_response(&events, "/lean/v0/events?topics=attestation").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        events.emit(ChainEvent::Attestation {
+            validator_id: 7,
+            data: AttestationData {
+                slot: 12,
+                head: Checkpoint::default(),
+                target: Checkpoint::default(),
+                source: Checkpoint::default(),
+            },
+        });
+
+        let text = first_frame(resp).await;
+
+        assert!(
+            text.contains("event:attestation") || text.contains("event: attestation"),
+            "missing attestation event name in frame: {text}"
+        );
+        // `validator_id` at top level and the vote nested under `data` (with the
+        // beacon-style checkpoint fields), confirming the untagged enum keeps
+        // this variant's shape flat-but-nested rather than tag-wrapped.
+        assert!(
+            text.contains("\"validator_id\":7"),
+            "missing top-level validator_id: {text}"
+        );
+        assert!(
+            text.contains("\"data\":")
+                && text.contains("\"head\":")
+                && text.contains("\"target\":")
+                && text.contains("\"source\":"),
+            "missing nested attestation data fields: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn events_unknown_topic_returns_400() {
         let events = EventBus::new(16);
 

@@ -11,6 +11,7 @@
 
 use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
+use ethlambda_types::attestation::AttestationData;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
 use serde::Serialize;
@@ -22,16 +23,20 @@ use tracing::warn;
 ///
 /// These are the names consumers address events by (the SSE `event:` line and,
 /// later, `?topics=` filtering), kept separate from [`ChainEvent`] so the
-/// payload stays flat with the topic travelling out-of-band. The names match
-/// the Ethereum beacon-API eventstream topics (`head`, `block`,
-/// `finalized_checkpoint`); `justified_checkpoint` is an ethlambda extension
-/// with no beacon analog.
+/// payload stays flat with the topic travelling out-of-band. Names match the
+/// Ethereum beacon-API eventstream topics where an analog exists (`head`,
+/// `block`, `finalized_checkpoint`, `attestation`); `justified_checkpoint` and
+/// `aggregate` are ethlambda extensions with no direct beacon topic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
     Head,
     Block,
     JustifiedCheckpoint,
     FinalizedCheckpoint,
+    /// A single validator vote seen on gossip.
+    Attestation,
+    /// A committee-signature aggregate (produced locally or seen on gossip).
+    Aggregate,
 }
 
 impl Topic {
@@ -41,6 +46,8 @@ impl Topic {
             Topic::Block => "block",
             Topic::JustifiedCheckpoint => "justified_checkpoint",
             Topic::FinalizedCheckpoint => "finalized_checkpoint",
+            Topic::Attestation => "attestation",
+            Topic::Aggregate => "aggregate",
         }
     }
 }
@@ -60,6 +67,8 @@ impl FromStr for Topic {
             "block" => Ok(Topic::Block),
             "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
             "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            "attestation" => Ok(Topic::Attestation),
+            "aggregate" => Ok(Topic::Aggregate),
             other => Err(UnknownTopic(other.to_string())),
         }
     }
@@ -90,6 +99,19 @@ pub enum ChainEvent {
     JustifiedCheckpoint { slot: u64, block: H256, state: H256 },
     /// The finalized checkpoint advanced.
     FinalizedCheckpoint { slot: u64, block: H256, state: H256 },
+    /// A single validator vote seen on gossip. Carries the vote's
+    /// [`AttestationData`] and the attester's validator id; the ~3 KB XMSS
+    /// signature is deliberately omitted (too heavy for a high-rate stream).
+    Attestation {
+        validator_id: u64,
+        data: AttestationData,
+    },
+    /// A committee-signature aggregate: its [`AttestationData`] and the
+    /// participating validator ids. The SNARK proof bytes are omitted.
+    Aggregate {
+        participants: Vec<u64>,
+        data: AttestationData,
+    },
 }
 
 impl ChainEvent {
@@ -99,6 +121,8 @@ impl ChainEvent {
             ChainEvent::Block { .. } => Topic::Block,
             ChainEvent::JustifiedCheckpoint { .. } => Topic::JustifiedCheckpoint,
             ChainEvent::FinalizedCheckpoint { .. } => Topic::FinalizedCheckpoint,
+            ChainEvent::Attestation { .. } => Topic::Attestation,
+            ChainEvent::Aggregate { .. } => Topic::Aggregate,
         }
     }
 }
@@ -108,7 +132,14 @@ impl ChainEvent {
 /// Chosen so a briefly-stalled subscriber is skipped past (lagged) rather than
 /// back-pressuring the actor. Lagged subscribers re-sync via the blocks
 /// endpoints.
-const CHAIN_EVENT_CHANNEL_CAPACITY: usize = 256;
+///
+/// All topics share this one ring buffer, so the high-rate `attestation` and
+/// `aggregate` events (roughly one per validator per slot) dominate its
+/// occupancy: the window a slow subscriber can tolerate is
+/// `capacity / total_event_rate`, not per-topic. Sized for a few minutes of
+/// history at devnet validator counts; a per-topic split behind the
+/// [`EventBus`] facade is the escape hatch if the shared window bites.
+const CHAIN_EVENT_CHANNEL_CAPACITY: usize = 8192;
 
 /// Cloneable handle to the chain-event broadcast channel.
 ///
@@ -297,12 +328,23 @@ mod tests {
         }
     }
 
-    const ALL_TOPICS: [Topic; 4] = [
+    const ALL_TOPICS: [Topic; 6] = [
         Topic::Head,
         Topic::Block,
         Topic::JustifiedCheckpoint,
         Topic::FinalizedCheckpoint,
+        Topic::Attestation,
+        Topic::Aggregate,
     ];
+
+    fn test_attestation_data(slot: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
 
     #[tokio::test]
     async fn subscriber_receives_emitted_event() {
@@ -355,6 +397,20 @@ mod tests {
                     state,
                 },
                 Topic::FinalizedCheckpoint,
+            ),
+            (
+                ChainEvent::Attestation {
+                    validator_id: 0,
+                    data: test_attestation_data(1),
+                },
+                Topic::Attestation,
+            ),
+            (
+                ChainEvent::Aggregate {
+                    participants: vec![0, 1],
+                    data: test_attestation_data(1),
+                },
+                Topic::Aggregate,
             ),
         ];
         for (event, topic) in cases {
