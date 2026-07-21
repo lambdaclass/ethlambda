@@ -269,12 +269,9 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         return Vec::new();
     };
 
-    (start_slot..=end_slot)
-        .filter_map(|slot| {
-            let root = store.get_block_root_by_slot(slot)?;
-            store.get_signed_block(&root).ok().flatten()
-        })
-        .collect()
+    store
+        .get_signed_blocks_by_slot_range(start_slot, end_slot)
+        .unwrap_or_default()
 }
 
 async fn handle_blocks_by_root_response(

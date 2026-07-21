@@ -643,10 +643,6 @@ impl Store {
             ))),
             state_cache: new_state_cache(),
         };
-        let head = store.head()?;
-        if store.get_block_root_by_slot(store.head_slot()) != Some(head) {
-            store.rebuild_block_root_index()?;
-        }
         info!("Loaded store from persisted DB state");
         Ok(Some(store))
     }
@@ -978,37 +974,6 @@ impl Store {
         Ok((deletes, entries))
     }
 
-    fn rebuild_block_root_index(&self) -> Result<(), Error> {
-        let view = self.backend.begin_read().expect("read view");
-        let old_keys = view
-            .prefix_iterator(Table::BlockRoots, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
-            .map(|(key, _)| key.to_vec())
-            .collect();
-        drop(view);
-
-        let mut entries = Vec::new();
-        let mut root = self.head()?;
-        while !root.is_zero() {
-            let Some(header) = self.get_block_header(&root)? else {
-                break;
-            };
-            entries.push((encode_block_root_key(header.slot), root.to_ssz()));
-            root = header.parent_root;
-        }
-
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::BlockRoots, old_keys)
-            .expect("clear block root index");
-        batch
-            .put_batch(Table::BlockRoots, entries)
-            .expect("rebuild block root index");
-        batch.commit().expect("commit");
-        Ok(())
-    }
-
     /// Return the canonical block root at `slot`.
     pub fn get_block_root_by_slot(&self, slot: u64) -> Option<H256> {
         let view = self.backend.begin_read().expect("read view");
@@ -1303,6 +1268,28 @@ impl Store {
             message: block,
             proof,
         }))
+    }
+
+    /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
+    ///
+    /// Missing slots or blocks are skipped. This keeps the current request
+    /// behavior while centralizing the slot-index lookup so the storage backend
+    /// can optimize range reads later.
+    pub fn get_signed_blocks_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<SignedBlock>, Error> {
+        let mut blocks = Vec::new();
+        for slot in start_slot..=end_slot {
+            let Some(root) = self.get_block_root_by_slot(slot) else {
+                continue;
+            };
+            if let Some(block) = self.get_signed_block(&root)? {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
     }
 
     // ============ States ============
@@ -1900,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn from_db_state_rebuilds_block_root_index() {
+    fn from_db_state_preserves_block_root_index() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store =
             Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
@@ -1913,20 +1900,6 @@ mod tests {
         store
             .update_checkpoints(ForkCheckpoints::head_only(block_root))
             .expect("update head");
-
-        let view = backend.begin_read().expect("read view");
-        let keys = view
-            .prefix_iterator(Table::BlockRoots, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
-            .map(|(key, _)| key.to_vec())
-            .collect();
-        drop(view);
-        let mut batch = backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::BlockRoots, keys)
-            .expect("clear block roots");
-        batch.commit().expect("commit");
 
         let restored = Store::from_db_state(backend, 12345)
             .expect("restore store")
