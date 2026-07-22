@@ -3,12 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{block::Block, primitives::H256, state::State};
 
-
-/// Input type for the zkVM's 
-/// 
+/// Input type for the zkVM's
+///
 /// The inputs to the zkVM need to derive serde Serialize/deserialize
 /// which is not derived for state (libssz traits)
-/// wrapping pre-serialized SSZ bytes sidesteps that part. 
+/// wrapping pre-serialized SSZ bytes sidesteps that part.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StfInput {
     state: Vec<u8>,
