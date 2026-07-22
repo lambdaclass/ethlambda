@@ -116,15 +116,15 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 The seven variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
-| Table             | Key         | Value                                     | Pruned?                            |
-| ----------------- | ----------- | ----------------------------------------- | ---------------------------------- |
-| `BlockHeaders`    | root        | `BlockHeader`                             | never                              |
-| `BlockBodies`     | root        | `BlockBody`                               | never                              |
-| `BlockSignatures` | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized + older than ~1 day |
-| `States`          | root        | full `State` snapshot                     | never                              |
-| `StateDiffs`      | root        | `StateDiff`                               | never                              |
-| `Metadata`        | string      | SSZ scalars                               | never                              |
-| `LiveChain`       | slot ‖ root | `parent_root`                             | yes: below finalized               |
+| Table             | Key         | Value                                     | Pruned?                          |
+| ----------------- | ----------- | ----------------------------------------- | -------------------------------- |
+| `BlockHeaders`    | root        | `BlockHeader`                             | never                            |
+| `BlockBodies`     | root        | `BlockBody`                               | never                            |
+| `BlockSignatures` | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `States`          | root        | full `State` snapshot                     | never                            |
+| `StateDiffs`      | root        | `StateDiff`                               | never                            |
+| `Metadata`        | string      | SSZ scalars                               | never                            |
+| `LiveChain`       | slot ‖ root | `parent_root`                             | yes: below finalized             |
 
 ### Key encoding
 
@@ -249,20 +249,23 @@ Reads go through `get_state`, which tries three levels:
                     STATE RECONSTRUCTION
                     ────────────────────
 
-   get_state(D)?  Not in cache, no snapshot → walk back:
+   get_state(D): not in the cache and no snapshot → rebuild in two passes.
 
-     States               StateDiffs
-   ┌──────────┐      ┌────────┐  ┌────────┐  ┌────────┐
-   │ snapshot │      │ diff B │  │ diff C │  │ diff D │
-   │  at A    │◀─────│ base=A │◀─────base=B──────base=C │
-   └──────────┘      └────────┘  └────────┘  └────────┘
-        │                 ▲           ▲           ▲
-        │   1. walk base_root pointers backward ──┘
-        │
-        └── 2. replay diffs forward:  A ─▶ B ─▶ C ─▶ D
-                                                    │
-            3. latest_block_header ◀── BlockHeaders │
-            4. memoize D in the LRU cache ◀─────────┘
+   Pass 1: walk backward from D, following each diff's base_root pointer
+           and collecting diffs, until a block with a snapshot is found:
+
+   ┌────────┐  base=C   ┌────────┐  base=B   ┌────────┐  base=A   ┌──────────┐
+   │ diff D │ ───────▶  │ diff C │ ───────▶  │ diff B │ ───────▶  │ snapshot │
+   └────────┘           └────────┘           └────────┘           │   at A   │
+    (target)           (StateDiffs table)                         └──────────┘
+                                                                 (States table)
+
+   Pass 2: starting from the snapshot, apply the diffs oldest-first:
+
+   state A ──apply B──▶ state B ──apply C──▶ state C ──apply D──▶ state D ✓
+
+   The rebuilt state D gets its latest_block_header from the BlockHeaders
+   table and is memoized in the LRU cache before being returned.
 ```
 
 If the diff chain is broken or the target's header is missing, `get_state`
@@ -283,15 +286,15 @@ sequence of independent write batches:
    │      (only if the post-state      latest_justified
    │       justified a higher slot)    (+ triggers pruning)
    │
-   ├─ 2. insert_signed_block()  ┐      BlockHeaders[root]
-   │                            │      BlockBodies[root]    (if non-empty)
-   │                            ├─one─ BlockSignatures[slot‖root]
-   │                            │batch LiveChain[slot‖root]
+   ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
+   │                            │            BlockBodies[root]    (if non-empty)
+   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            │            LiveChain[slot‖root]
    │                            ┘
    │
-   ├─ 3. insert_state()         ┐      StateDiffs[root]
-   │                            ├─one─ States[root]         (anchors only)
-   │                            ┘batch (+ LRU cache insert)
+   ├─ 3. insert_state()         ┐            StateDiffs[root]
+   │                            ├─one batch─ States[root]         (anchors only)
+   │                            ┘            (+ LRU cache insert)
    │
    └─ 4. update_head()                 Metadata: head
           (re-runs fork choice)        (+ justified/finalized if advanced,
