@@ -2125,6 +2125,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-prover-core"
+version = "0.1.0"
+dependencies = [
+ "ethlambda-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ethlambda-rpc"
 version = "0.1.0"
 dependencies = [
