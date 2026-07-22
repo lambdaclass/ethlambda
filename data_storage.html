@@ -1,0 +1,626 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Data Storage - ethlambda</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-ae72efcc.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-274da26b.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/data_storage.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
+<p>This doc explains how ethlambda saves data. Especially,
+the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
+what each of the seven tables holds, and which data is in-memory only.</p>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
+(<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
+key-value abstraction, the <strong><code>StorageBackend</code></strong> trait
+(<code>crates/storage/src/api/traits.rs</code>). Two backends implement the trait:
+<a href="https://rocksdb.org/"><strong>RocksDB</strong></a> for production and an <strong>in-memory</strong> backend for tests.
+Everything persisted is SSZ-encoded bytes.</p>
+<pre><code class="language-text">                        LAYERED ARCHITECTURE
+                        ────────────────────
+
+   ┌──────────────────┐          ┌──────────────────┐
+   │ BlockChain actor │          │    P2P actor     │
+   └────────┬─────────┘          └────────┬─────────┘
+            │      (cloned Store: shared  │
+            │       backend + buffers)    │
+            ▼                             ▼
+   ┌─────────────────────────────────────────────────┐
+   │                     Store                       │
+   │        crates/storage/src/store.rs              │
+   │                                                 │
+   │  • table selection, key encoding, SSZ codec     │
+   │  • snapshot-vs-diff decisions, pruning          │
+   │  • in-memory attestation buffers + state cache  │
+   └────────────────────────┬────────────────────────┘
+                            │ begin_read() / begin_write()
+                            ▼
+   ┌─────────────────────────────────────────────────┐
+   │              StorageBackend trait               │
+   │        crates/storage/src/api/traits.rs         │
+   │                                                 │
+   │        raw bytes in, raw bytes out              │
+   └───────────┬─────────────────────────┬───────────┘
+               │ (production)            │ (test)
+               ▼                         ▼
+   ┌───────────────────────┐   ┌───────────────────────┐
+   │    RocksDBBackend     │   │    InMemoryBackend    │
+   │  (production, one     │   │  (tests, HashMap per  │
+   │   column family per   │   │   table, lost on      │
+   │   table)              │   │   drop)               │
+   └───────────────────────┘   └───────────────────────┘
+</code></pre>
+<h2 id="the-store--storagebackend-split"><a class="header" href="#the-store--storagebackend-split">The Store / StorageBackend Split</a></h2>
+<h3 id="storagebackend-dumb-bytes"><a class="header" href="#storagebackend-dumb-bytes">StorageBackend: dumb bytes</a></h3>
+<p>The <code>StorageBackend</code> trait knows nothing about consensus types. It moves raw
+bytes in and out of named tables:</p>
+<ul>
+<li><code>begin_read()</code> returns a <code>StorageReadView</code> with <code>get(table, key)</code> and
+<code>prefix_iterator(table, prefix)</code>.</li>
+<li><code>begin_write()</code> returns a <code>StorageWriteBatch</code> with <code>put_batch</code>,
+<code>delete_batch</code>, and <code>commit()</code>. A batch stages puts and deletes across
+<strong>multiple tables</strong> and applies them <strong>atomically</strong> on commit.</li>
+</ul>
+<p>The two implementations live in <code>crates/storage/src/backend/</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td><code>RocksDBBackend</code></td><td>One column family per table. Writes go through a native <code>WriteBatch</code> with <code>sync=false</code> (no fsync per commit).</td></tr>
+<tr><td><code>InMemoryBackend</code></td><td>A <code>HashMap</code> per table behind an <code>RwLock</code>. Its <code>prefix_iterator</code> sorts keys lexicographically to match RocksDB’s iteration order, because pruning relies on slot-ordered early-stop scans (see <a href="#key-encoding">Key encoding</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="store-all-the-semantics"><a class="header" href="#store-all-the-semantics">Store: all the semantics</a></h3>
+<p>The <code>Store</code> owns everything the backend doesn’t: which table each datum goes
+to, how keys are built, SSZ encoding/decoding, when to write a full state
+snapshot versus a diff, and when to prune. It is the <strong>only</strong> writer to the
+backend.</p>
+<p>A naming subtlety: the <code>Store</code> <em>struct</em> lives in the storage crate
+(<code>crates/storage/src/store.rs</code>), while the fork choice <em>logic</em> that drives it
+(<code>on_block</code>, <code>on_tick</code>, <code>update_head</code>, …) lives in
+<code>crates/blockchain/src/store.rs</code> as free functions taking <code>&amp;mut Store</code>.</p>
+<p><code>Store</code> is <code>Clone</code>, and every field is an <code>Arc</code>, so clones are cheap and all
+clones share the same backend and the same in-memory pools. At startup
+(<code>bin/ethlambda/src/main.rs</code>) one <code>Arc&lt;RocksDBBackend&gt;</code> is opened, one <code>Store</code>
+is built from it, and clones are handed to the BlockChain and P2P actors.</p>
+<pre><code class="language-text">                        INSIDE THE STORE
+                        ────────────────
+
+   ┌──────────────────────────── Store ────────────────────────────┐
+   │                                                               │
+   │   PERSISTED (via backend)         IN-MEMORY ONLY              │
+   │   ──────────────────────          ──────────────────────      │
+   │   ┌─────────────────────┐         ┌──────────────────────┐    │
+   │   │ BlockHeaders        │         │ new_payloads         │    │
+   │   │ BlockBodies         │         │  (pending aggregated │    │
+   │   │ BlockSignatures     │         │   attestations)      │    │
+   │   │ States              │         │ known_payloads       │    │
+   │   │ StateDiffs          │         │  (fork-choice-active │    │
+   │   │ Metadata            │         │   attestations)      │    │
+   │   │ LiveChain           │         │ gossip_signatures    │    │
+   │   └─────────────────────┘         │  (raw XMSS sigs      │    │
+   │                                   │   awaiting           │    │
+   │   Survives restarts.              │   aggregation)       │    │
+   │                                   │ state_cache (LRU)    │    │
+   │                                   └──────────────────────┘    │
+   │                                                               │
+   │                                   Lost on restart.            │
+   └───────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
+<p>The seven variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Key</th><th>Value</th><th>Pruned?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code></td><td>never</td></tr>
+<tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code></td><td>never</td></tr>
+<tr><td><code>BlockSignatures</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
+<tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
+<tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
+<tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
+<tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="key-encoding"><a class="header" href="#key-encoding">Key encoding</a></h3>
+<p>Two key layouts are used:</p>
+<ul>
+<li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
+(<code>root.to_ssz()</code>).</li>
+<li><strong>Slot-prefixed</strong> tables (<code>BlockSignatures</code>, <code>LiveChain</code>) use
+<code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot followed by the
+32-byte root. Big-endian means lexicographic key order equals numeric slot
+order, so pruning can iterate from the start of the table and stop at the
+first key past its cutoff instead of scanning everything.</li>
+</ul>
+<h3 id="blockheaders"><a class="header" href="#blockheaders">BlockHeaders</a></h3>
+<p><code>root → BlockHeader</code>. Written for every block, including the genesis/anchor
+block, and never pruned: headers are the permanent record of the chain.
+Headers are also read back during state reconstruction (see
+<a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
+<h3 id="blockbodies"><a class="header" href="#blockbodies">BlockBodies</a></h3>
+<p><code>root → BlockBody</code>. Written for every block <strong>except</strong> those with an empty
+body: if <code>header.body_root == EMPTY_BODY_ROOT</code> (the hash tree root of
+<code>BlockBody::default()</code>), nothing is stored and reads synthesize
+<code>BlockBody::default()</code>. This covers the genesis block and checkpoint sync
+anchors, whose bodies are either empty or unavailable. Never pruned.</p>
+<h3 id="blocksignatures"><a class="header" href="#blocksignatures">BlockSignatures</a></h3>
+<p><code>slot ‖ root → MultiMessageAggregate</code>. Despite the name, this table stores the
+block’s <strong>merged aggregate proof blob</strong>, not individual signatures — the name
+is historical and kept to avoid a RocksDB column-family migration (renaming to
+<code>BlockProof</code> is a follow-up). It is keyed by <code>slot ‖ root</code> (not plain root)
+precisely so that pruning can scan in slot order and stop early.</p>
+<p>Stored separately from headers/bodies because the genesis block has no proof.
+<code>get_signed_block</code> synthesizes an empty proof for the slot-0 anchor only; for
+any other block a missing entry (a pruned finalized block) surfaces as <code>None</code>
+rather than a fabricated block.</p>
+<p>This is the one block table that <strong>is</strong> pruned; see <a href="#pruning">Pruning</a>.</p>
+<h3 id="states"><a class="header" href="#states">States</a></h3>
+<p><code>root → State</code> (full SSZ snapshot). Holds full-state snapshots <strong>only</strong>: the
+bootstrap anchor written at initialization, plus one anchor whenever a block
+crosses a 1024-slot boundary. Never pruned — these anchors are the base every
+diff chain resolves against, so reconstruction always terminates.</p>
+<h3 id="statediffs"><a class="header" href="#statediffs">StateDiffs</a></h3>
+<p><code>root → StateDiff</code>. A parent-linked diff written for <strong>every</strong> non-genesis
+state. Never pruned, so together with the snapshots this preserves the full
+state history. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
+diff contains and how states are rebuilt.</p>
+<h3 id="metadata"><a class="header" href="#metadata">Metadata</a></h3>
+<p>String keys mapping to SSZ-encoded scalars — the <code>Store</code>’s own persistent
+fields:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
+<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (genesis time, validator count)</td></tr>
+<tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
+<tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="lmd_ghost.html">lmd_ghost.md</a>)</td></tr>
+<tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
+<tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>Latest finalized checkpoint</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
+<p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
+<code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
+deserializing a single block. It contains the finalized anchor plus all
+non-finalized blocks, and is pruned as finalization advances (the finalized
+block itself is kept).</p>
+<p>Presence in <code>LiveChain</code> is what makes a block <em>visible to fork choice</em>:
+<code>insert_pending_block</code> deliberately writes a block’s header/body/proof
+<strong>without</strong> a <code>LiveChain</code> entry, persisting the heavy proof data (~3 KB+)
+while the block waits for its parent. When the block is later processed,
+<code>insert_signed_block</code> overwrites the same keys (idempotent) and adds the
+<code>LiveChain</code> entry.</p>
+<h2 id="state-storage-snapshots--diffs"><a class="header" href="#state-storage-snapshots--diffs">State Storage: Snapshots + Diffs</a></h2>
+<p>Storing a full <code>State</code> per block would be wasteful: most fields never change
+or change predictably. Instead, <code>insert_state</code> writes:</p>
+<ol>
+<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block root, linked to its parent via
+<code>base_root</code> (the block’s <code>parent_root</code>).</li>
+<li><strong>Only at anchors</strong> a full snapshot into <code>States</code>. A block is an anchor
+when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL = 1024</code> slot boundary relative
+to its parent (~68 minutes at 4-second slots). This bounds any
+reconstruction walk to at most 1024 diff applications.</li>
+</ol>
+<p>A <code>StateDiff</code> stores only what cannot be recovered elsewhere: the target slot,
+justified/finalized checkpoints, and the justification fields
+(<code>justified_slots</code>, <code>justifications_roots</code>, <code>justifications_validators</code>,
+stored in full — they are bounded by the non-finalized window, so they stay
+small under healthy finality). The rest is deliberately omitted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Omitted field</th><th>Recovered from</th></tr>
+</thead>
+<tbody>
+<tr><td><code>config</code>, <code>validators</code></td><td>The snapshot (they never change)</td></tr>
+<tr><td><code>latest_block_header</code></td><td>The <code>BlockHeaders</code> table</td></tr>
+<tr><td><code>historical_block_hashes</code></td><td>Regenerated from <code>base_root</code> + the slot gap (the state transition appends the parent root plus one zero per skipped slot, so the append is fully predictable)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reads go through <code>get_state</code>, which tries three levels:</p>
+<ol>
+<li>An in-memory LRU cache (<code>STATE_CACHE_CAPACITY = 32</code> states, keyed by block
+root). States are content-addressed and immutable, so the cache never
+needs invalidation. The common case — reading the parent state right
+after importing its block — is a cache hit.</li>
+<li>A full snapshot in <code>States</code>.</li>
+<li>Reconstruction: walk <code>base_root</code> pointers back through <code>StateDiffs</code> until
+a snapshot is found, then replay the diffs forward.</li>
+</ol>
+<pre><code class="language-text">                    STATE RECONSTRUCTION
+                    ────────────────────
+
+   get_state(D): not in the cache and no snapshot → rebuild in two passes.
+
+   Pass 1: walk backward from D, following each diff's base_root pointer
+           and collecting diffs, until a block with a snapshot is found:
+
+   ┌────────┐  base=C   ┌────────┐  base=B   ┌────────┐  base=A   ┌──────────┐
+   │ diff D │ ───────▶  │ diff C │ ───────▶  │ diff B │ ───────▶  │ snapshot │
+   └────────┘           └────────┘           └────────┘           │   at A   │
+    (target)           (StateDiffs table)                         └──────────┘
+                                                                 (States table)
+
+   Pass 2: starting from the snapshot, apply the diffs oldest-first:
+
+   state A ──apply B──▶ state B ──apply C──▶ state C ──apply D──▶ state D ✓
+
+   The rebuilt state D gets its latest_block_header from the BlockHeaders
+   table and is memoized in the LRU cache before being returned.
+</code></pre>
+<p>If the diff chain is broken or the target’s header is missing, <code>get_state</code>
+returns <code>None</code> rather than a partial state.</p>
+<h2 id="write-paths-what-a-block-import-persists"><a class="header" href="#write-paths-what-a-block-import-persists">Write Paths: What a Block Import Persists</a></h2>
+<p>Block import (<code>on_block</code> in <code>crates/blockchain/src/store.rs</code>) commits a
+sequence of independent write batches:</p>
+<pre><code class="language-text">                 BLOCK IMPORT WRITE SEQUENCE
+                 ───────────────────────────
+
+  on_block(signed_block)
+   │
+   ├─ 1. update_checkpoints()          Metadata: head,
+   │      (only if the post-state      latest_justified
+   │       justified a higher slot)    (+ triggers pruning)
+   │
+   ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
+   │                            │            BlockBodies[root]    (if non-empty)
+   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            │            LiveChain[slot‖root]
+   │                            ┘
+   │
+   ├─ 3. insert_state()         ┐            StateDiffs[root]
+   │                            ├─one batch─ States[root]         (anchors only)
+   │                            ┘            (+ LRU cache insert)
+   │
+   └─ 4. update_head()                 Metadata: head
+          (re-runs fork choice)        (+ justified/finalized if advanced,
+                                          + pruning on finalization)
+</code></pre>
+<p>Each numbered step is atomic on its own, but the import as a whole is <strong>not</strong>
+one transaction. The commit order keeps the on-disk store consistent after any
+prefix of these steps: the justified checkpoint written in step 1 always names
+an already-persisted <strong>ancestor</strong> of the imported block (the state transition
+only counts attestations whose roots match the state’s own
+<code>historical_block_hashes</code>, and every ancestor was fully persisted when it was
+imported), and the head only advances in step 4, after the block and state are
+durable. A crash mid-import can therefore lose the tail of the import — e.g. a
+persisted block and state the head does not point to yet — but never leave
+metadata referencing missing data. Re-importing the block is idempotent (a
+duplicate is skipped via <code>has_state</code>).</p>
+<h2 id="pruning"><a class="header" href="#pruning">Pruning</a></h2>
+<p>Pruning is driven by finalization and splits into a cheap immediate phase and
+a deferred heavy phase.</p>
+<p><strong>Immediately, when finalization advances</strong> (inside <code>update_checkpoints</code>):</p>
+<ul>
+<li><code>prune_live_chain</code>: deletes <code>LiveChain</code> entries below the finalized slot,
+keeping the finalized block itself. This keeps the fork choice working set
+bounded to the non-finalized chain.</li>
+<li><code>prune_gossip_signatures</code>: drops buffered in-memory gossip signatures at or
+below the finalized slot.</li>
+<li><code>prune_stale_aggregated_payloads</code>: drops in-memory aggregated payloads
+(both pending and known) whose target slot is at or below the finalized
+slot.</li>
+</ul>
+<p><strong>Deferred</strong> (<code>prune_old_data</code>, called after a batch of blocks has been
+processed):</p>
+<ul>
+<li><code>prune_old_block_signatures</code>: deletes <code>BlockSignatures</code> entries below
+<code>cutoff = tip_slot − SIGNATURE_PRUNING_RANGE</code> (21,600 slots, ~1 day at
+4-second slots) — but <strong>only</strong> when <code>cutoff ≤ finalized_slot</code>, i.e. the
+entire pruned range lies within finalized history. Non-finalized proofs
+are never touched. Finalized blocks can never revert, so their proofs are
+not needed for fork choice, reorg safety, or re-aggregation once outside
+the window.</li>
+</ul>
+<p><strong>Never pruned:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>States</code>, <code>StateDiffs</code>, and
+<code>Metadata</code>. Headers, bodies, and the snapshot+diff chain are the full
+historical record; only the proof blobs and the fork choice index are
+disposable.</p>
+<h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
+<p>Four <code>Store</code> fields never touch the backend. All are bounded buffers shared
+across <code>Store</code> clones:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Buffer</th><th>Capacity</th><th>Contents</th></tr>
+</thead>
+<tbody>
+<tr><td><code>new_payloads</code></td><td>64 messages</td><td>Pending aggregated attestation proofs, not yet active for fork choice</td></tr>
+<tr><td><code>known_payloads</code></td><td>512 messages</td><td>Fork-choice-active aggregated proofs</td></tr>
+<tr><td><code>gossip_signatures</code></td><td>2048 signatures</td><td>Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case)</td></tr>
+<tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of reconstructed/imported states</td></tr>
+</tbody>
+</table>
+</div>
+<p>The payload buffers evict FIFO when full, and redundant proofs (whose
+participants are a subset of an existing proof for the same attestation data)
+are skipped on insert.</p>
+<p>Note that the per-validator “latest attestation” maps used by fork choice are
+not stored anywhere — they are derived on demand from these buffers via
+<code>extract_latest_known_attestations</code> and friends. See the attestation pipeline
+section of <a href="lmd_ghost.html">lmd_ghost.md</a> for how attestations move between the
+pools.</p>
+<p>After a restart these buffers start empty: pending attestations and
+un-aggregated gossip signatures are lost and must be re-collected from the
+network. Everything persisted in the seven tables survives.</p>
+<h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
+<p>A <code>Store</code> is created through one of three constructors in
+<code>crates/storage/src/store.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Constructor</th><th>When</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>from_anchor_state</code></td><td>Genesis boot</td><td>Initializes from the genesis state (no anchor block body)</td></tr>
+<tr><td><code>get_forkchoice_store</code></td><td><a href="checkpoint_sync.html">Checkpoint sync</a></td><td>Initializes from a downloaded finalized state + anchor block, after validating they are consistent</td></tr>
+<tr><td><code>from_db_state</code></td><td>Resume from an existing data directory</td><td>Re-opens the persisted store as-is</td></tr>
+</tbody>
+</table>
+</div>
+<p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
+atomic batch</strong>: all six <code>Metadata</code> keys (time = 0, config, head = safe_target
+= anchor root, justified = finalized = anchor checkpoint), the anchor header,
+the body if non-empty, a full snapshot into <code>States</code> (the base of every future
+diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
+<p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
+from <code>Metadata</code>, returning <code>None</code> for an empty DB or a <code>genesis_time</code>
+mismatch (wrong network). At startup the node prefers this path but only
+accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
+to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
+<h2 id="key-files"><a class="header" href="#key-files">Key Files</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Component</th></tr>
+</thead>
+<tbody>
+<tr><td><code>crates/storage/src/store.rs</code></td><td><code>Store</code>: persistence logic, in-memory buffers, pruning, constructors</td></tr>
+<tr><td><code>crates/storage/src/api/traits.rs</code></td><td><code>StorageBackend</code>, <code>StorageReadView</code>, <code>StorageWriteBatch</code></td></tr>
+<tr><td><code>crates/storage/src/api/tables.rs</code></td><td>The <code>Table</code> enum</td></tr>
+<tr><td><code>crates/storage/src/state_diff.rs</code></td><td><code>StateDiff</code>: diff creation and state reconstruction</td></tr>
+<tr><td><code>crates/storage/src/backend/rocksdb.rs</code></td><td>Production RocksDB backend</td></tr>
+<tr><td><code>crates/storage/src/backend/in_memory.rs</code></td><td>Test backend</td></tr>
+<tr><td><code>crates/blockchain/src/store.rs</code></td><td>Fork choice logic driving the <code>Store</code> (<code>on_block</code>, <code>on_tick</code>, …)</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="fork_choice_visualization.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="fork_choice_visualization.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

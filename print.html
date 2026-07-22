@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-739513d3.js";
+            window.path_to_searchindex_js = "searchindex-ae72efcc.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-294cc887.js"></script>
+        <script src="toc-274da26b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -2039,6 +2039,399 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <tr><td><code>finalized</code></td><td>Latest finalized checkpoint</td></tr>
 <tr><td><code>safe_target</code></td><td>Block root selected with a 2/3 validator threshold</td></tr>
 <tr><td><code>validator_count</code></td><td>Total validators in the head state</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
+<p>This doc explains how ethlambda saves data. Especially,
+the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
+what each of the seven tables holds, and which data is in-memory only.</p>
+<h2 id="overview-1"><a class="header" href="#overview-1">Overview</a></h2>
+<p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
+(<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
+key-value abstraction, the <strong><code>StorageBackend</code></strong> trait
+(<code>crates/storage/src/api/traits.rs</code>). Two backends implement the trait:
+<a href="https://rocksdb.org/"><strong>RocksDB</strong></a> for production and an <strong>in-memory</strong> backend for tests.
+Everything persisted is SSZ-encoded bytes.</p>
+<pre><code class="language-text">                        LAYERED ARCHITECTURE
+                        ────────────────────
+
+   ┌──────────────────┐          ┌──────────────────┐
+   │ BlockChain actor │          │    P2P actor     │
+   └────────┬─────────┘          └────────┬─────────┘
+            │      (cloned Store: shared  │
+            │       backend + buffers)    │
+            ▼                             ▼
+   ┌─────────────────────────────────────────────────┐
+   │                     Store                       │
+   │        crates/storage/src/store.rs              │
+   │                                                 │
+   │  • table selection, key encoding, SSZ codec     │
+   │  • snapshot-vs-diff decisions, pruning          │
+   │  • in-memory attestation buffers + state cache  │
+   └────────────────────────┬────────────────────────┘
+                            │ begin_read() / begin_write()
+                            ▼
+   ┌─────────────────────────────────────────────────┐
+   │              StorageBackend trait               │
+   │        crates/storage/src/api/traits.rs         │
+   │                                                 │
+   │        raw bytes in, raw bytes out              │
+   └───────────┬─────────────────────────┬───────────┘
+               │ (production)            │ (test)
+               ▼                         ▼
+   ┌───────────────────────┐   ┌───────────────────────┐
+   │    RocksDBBackend     │   │    InMemoryBackend    │
+   │  (production, one     │   │  (tests, HashMap per  │
+   │   column family per   │   │   table, lost on      │
+   │   table)              │   │   drop)               │
+   └───────────────────────┘   └───────────────────────┘
+</code></pre>
+<h2 id="the-store--storagebackend-split"><a class="header" href="#the-store--storagebackend-split">The Store / StorageBackend Split</a></h2>
+<h3 id="storagebackend-dumb-bytes"><a class="header" href="#storagebackend-dumb-bytes">StorageBackend: dumb bytes</a></h3>
+<p>The <code>StorageBackend</code> trait knows nothing about consensus types. It moves raw
+bytes in and out of named tables:</p>
+<ul>
+<li><code>begin_read()</code> returns a <code>StorageReadView</code> with <code>get(table, key)</code> and
+<code>prefix_iterator(table, prefix)</code>.</li>
+<li><code>begin_write()</code> returns a <code>StorageWriteBatch</code> with <code>put_batch</code>,
+<code>delete_batch</code>, and <code>commit()</code>. A batch stages puts and deletes across
+<strong>multiple tables</strong> and applies them <strong>atomically</strong> on commit.</li>
+</ul>
+<p>The two implementations live in <code>crates/storage/src/backend/</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Details</th></tr>
+</thead>
+<tbody>
+<tr><td><code>RocksDBBackend</code></td><td>One column family per table. Writes go through a native <code>WriteBatch</code> with <code>sync=false</code> (no fsync per commit).</td></tr>
+<tr><td><code>InMemoryBackend</code></td><td>A <code>HashMap</code> per table behind an <code>RwLock</code>. Its <code>prefix_iterator</code> sorts keys lexicographically to match RocksDB’s iteration order, because pruning relies on slot-ordered early-stop scans (see <a href="#key-encoding">Key encoding</a>).</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="store-all-the-semantics"><a class="header" href="#store-all-the-semantics">Store: all the semantics</a></h3>
+<p>The <code>Store</code> owns everything the backend doesn’t: which table each datum goes
+to, how keys are built, SSZ encoding/decoding, when to write a full state
+snapshot versus a diff, and when to prune. It is the <strong>only</strong> writer to the
+backend.</p>
+<p>A naming subtlety: the <code>Store</code> <em>struct</em> lives in the storage crate
+(<code>crates/storage/src/store.rs</code>), while the fork choice <em>logic</em> that drives it
+(<code>on_block</code>, <code>on_tick</code>, <code>update_head</code>, …) lives in
+<code>crates/blockchain/src/store.rs</code> as free functions taking <code>&amp;mut Store</code>.</p>
+<p><code>Store</code> is <code>Clone</code>, and every field is an <code>Arc</code>, so clones are cheap and all
+clones share the same backend and the same in-memory pools. At startup
+(<code>bin/ethlambda/src/main.rs</code>) one <code>Arc&lt;RocksDBBackend&gt;</code> is opened, one <code>Store</code>
+is built from it, and clones are handed to the BlockChain and P2P actors.</p>
+<pre><code class="language-text">                        INSIDE THE STORE
+                        ────────────────
+
+   ┌──────────────────────────── Store ────────────────────────────┐
+   │                                                               │
+   │   PERSISTED (via backend)         IN-MEMORY ONLY              │
+   │   ──────────────────────          ──────────────────────      │
+   │   ┌─────────────────────┐         ┌──────────────────────┐    │
+   │   │ BlockHeaders        │         │ new_payloads         │    │
+   │   │ BlockBodies         │         │  (pending aggregated │    │
+   │   │ BlockSignatures     │         │   attestations)      │    │
+   │   │ States              │         │ known_payloads       │    │
+   │   │ StateDiffs          │         │  (fork-choice-active │    │
+   │   │ Metadata            │         │   attestations)      │    │
+   │   │ LiveChain           │         │ gossip_signatures    │    │
+   │   └─────────────────────┘         │  (raw XMSS sigs      │    │
+   │                                   │   awaiting           │    │
+   │   Survives restarts.              │   aggregation)       │    │
+   │                                   │ state_cache (LRU)    │    │
+   │                                   └──────────────────────┘    │
+   │                                                               │
+   │                                   Lost on restart.            │
+   └───────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
+<p>The seven variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Table</th><th>Key</th><th>Value</th><th>Pruned?</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code></td><td>never</td></tr>
+<tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code></td><td>never</td></tr>
+<tr><td><code>BlockSignatures</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
+<tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
+<tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
+<tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
+<tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="key-encoding"><a class="header" href="#key-encoding">Key encoding</a></h3>
+<p>Two key layouts are used:</p>
+<ul>
+<li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
+(<code>root.to_ssz()</code>).</li>
+<li><strong>Slot-prefixed</strong> tables (<code>BlockSignatures</code>, <code>LiveChain</code>) use
+<code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot followed by the
+32-byte root. Big-endian means lexicographic key order equals numeric slot
+order, so pruning can iterate from the start of the table and stop at the
+first key past its cutoff instead of scanning everything.</li>
+</ul>
+<h3 id="blockheaders"><a class="header" href="#blockheaders">BlockHeaders</a></h3>
+<p><code>root → BlockHeader</code>. Written for every block, including the genesis/anchor
+block, and never pruned: headers are the permanent record of the chain.
+Headers are also read back during state reconstruction (see
+<a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
+<h3 id="blockbodies"><a class="header" href="#blockbodies">BlockBodies</a></h3>
+<p><code>root → BlockBody</code>. Written for every block <strong>except</strong> those with an empty
+body: if <code>header.body_root == EMPTY_BODY_ROOT</code> (the hash tree root of
+<code>BlockBody::default()</code>), nothing is stored and reads synthesize
+<code>BlockBody::default()</code>. This covers the genesis block and checkpoint sync
+anchors, whose bodies are either empty or unavailable. Never pruned.</p>
+<h3 id="blocksignatures"><a class="header" href="#blocksignatures">BlockSignatures</a></h3>
+<p><code>slot ‖ root → MultiMessageAggregate</code>. Despite the name, this table stores the
+block’s <strong>merged aggregate proof blob</strong>, not individual signatures — the name
+is historical and kept to avoid a RocksDB column-family migration (renaming to
+<code>BlockProof</code> is a follow-up). It is keyed by <code>slot ‖ root</code> (not plain root)
+precisely so that pruning can scan in slot order and stop early.</p>
+<p>Stored separately from headers/bodies because the genesis block has no proof.
+<code>get_signed_block</code> synthesizes an empty proof for the slot-0 anchor only; for
+any other block a missing entry (a pruned finalized block) surfaces as <code>None</code>
+rather than a fabricated block.</p>
+<p>This is the one block table that <strong>is</strong> pruned; see <a href="#pruning">Pruning</a>.</p>
+<h3 id="states"><a class="header" href="#states">States</a></h3>
+<p><code>root → State</code> (full SSZ snapshot). Holds full-state snapshots <strong>only</strong>: the
+bootstrap anchor written at initialization, plus one anchor whenever a block
+crosses a 1024-slot boundary. Never pruned — these anchors are the base every
+diff chain resolves against, so reconstruction always terminates.</p>
+<h3 id="statediffs"><a class="header" href="#statediffs">StateDiffs</a></h3>
+<p><code>root → StateDiff</code>. A parent-linked diff written for <strong>every</strong> non-genesis
+state. Never pruned, so together with the snapshots this preserves the full
+state history. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
+diff contains and how states are rebuilt.</p>
+<h3 id="metadata"><a class="header" href="#metadata">Metadata</a></h3>
+<p>String keys mapping to SSZ-encoded scalars — the <code>Store</code>’s own persistent
+fields:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
+<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (genesis time, validator count)</td></tr>
+<tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
+<tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a>)</td></tr>
+<tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
+<tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>Latest finalized checkpoint</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
+<p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
+<code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
+deserializing a single block. It contains the finalized anchor plus all
+non-finalized blocks, and is pruned as finalization advances (the finalized
+block itself is kept).</p>
+<p>Presence in <code>LiveChain</code> is what makes a block <em>visible to fork choice</em>:
+<code>insert_pending_block</code> deliberately writes a block’s header/body/proof
+<strong>without</strong> a <code>LiveChain</code> entry, persisting the heavy proof data (~3 KB+)
+while the block waits for its parent. When the block is later processed,
+<code>insert_signed_block</code> overwrites the same keys (idempotent) and adds the
+<code>LiveChain</code> entry.</p>
+<h2 id="state-storage-snapshots--diffs"><a class="header" href="#state-storage-snapshots--diffs">State Storage: Snapshots + Diffs</a></h2>
+<p>Storing a full <code>State</code> per block would be wasteful: most fields never change
+or change predictably. Instead, <code>insert_state</code> writes:</p>
+<ol>
+<li><strong>Always</strong> a <code>StateDiff</code> keyed by the block root, linked to its parent via
+<code>base_root</code> (the block’s <code>parent_root</code>).</li>
+<li><strong>Only at anchors</strong> a full snapshot into <code>States</code>. A block is an anchor
+when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL = 1024</code> slot boundary relative
+to its parent (~68 minutes at 4-second slots). This bounds any
+reconstruction walk to at most 1024 diff applications.</li>
+</ol>
+<p>A <code>StateDiff</code> stores only what cannot be recovered elsewhere: the target slot,
+justified/finalized checkpoints, and the justification fields
+(<code>justified_slots</code>, <code>justifications_roots</code>, <code>justifications_validators</code>,
+stored in full — they are bounded by the non-finalized window, so they stay
+small under healthy finality). The rest is deliberately omitted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Omitted field</th><th>Recovered from</th></tr>
+</thead>
+<tbody>
+<tr><td><code>config</code>, <code>validators</code></td><td>The snapshot (they never change)</td></tr>
+<tr><td><code>latest_block_header</code></td><td>The <code>BlockHeaders</code> table</td></tr>
+<tr><td><code>historical_block_hashes</code></td><td>Regenerated from <code>base_root</code> + the slot gap (the state transition appends the parent root plus one zero per skipped slot, so the append is fully predictable)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reads go through <code>get_state</code>, which tries three levels:</p>
+<ol>
+<li>An in-memory LRU cache (<code>STATE_CACHE_CAPACITY = 32</code> states, keyed by block
+root). States are content-addressed and immutable, so the cache never
+needs invalidation. The common case — reading the parent state right
+after importing its block — is a cache hit.</li>
+<li>A full snapshot in <code>States</code>.</li>
+<li>Reconstruction: walk <code>base_root</code> pointers back through <code>StateDiffs</code> until
+a snapshot is found, then replay the diffs forward.</li>
+</ol>
+<pre><code class="language-text">                    STATE RECONSTRUCTION
+                    ────────────────────
+
+   get_state(D): not in the cache and no snapshot → rebuild in two passes.
+
+   Pass 1: walk backward from D, following each diff's base_root pointer
+           and collecting diffs, until a block with a snapshot is found:
+
+   ┌────────┐  base=C   ┌────────┐  base=B   ┌────────┐  base=A   ┌──────────┐
+   │ diff D │ ───────▶  │ diff C │ ───────▶  │ diff B │ ───────▶  │ snapshot │
+   └────────┘           └────────┘           └────────┘           │   at A   │
+    (target)           (StateDiffs table)                         └──────────┘
+                                                                 (States table)
+
+   Pass 2: starting from the snapshot, apply the diffs oldest-first:
+
+   state A ──apply B──▶ state B ──apply C──▶ state C ──apply D──▶ state D ✓
+
+   The rebuilt state D gets its latest_block_header from the BlockHeaders
+   table and is memoized in the LRU cache before being returned.
+</code></pre>
+<p>If the diff chain is broken or the target’s header is missing, <code>get_state</code>
+returns <code>None</code> rather than a partial state.</p>
+<h2 id="write-paths-what-a-block-import-persists"><a class="header" href="#write-paths-what-a-block-import-persists">Write Paths: What a Block Import Persists</a></h2>
+<p>Block import (<code>on_block</code> in <code>crates/blockchain/src/store.rs</code>) commits a
+sequence of independent write batches:</p>
+<pre><code class="language-text">                 BLOCK IMPORT WRITE SEQUENCE
+                 ───────────────────────────
+
+  on_block(signed_block)
+   │
+   ├─ 1. update_checkpoints()          Metadata: head,
+   │      (only if the post-state      latest_justified
+   │       justified a higher slot)    (+ triggers pruning)
+   │
+   ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
+   │                            │            BlockBodies[root]    (if non-empty)
+   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            │            LiveChain[slot‖root]
+   │                            ┘
+   │
+   ├─ 3. insert_state()         ┐            StateDiffs[root]
+   │                            ├─one batch─ States[root]         (anchors only)
+   │                            ┘            (+ LRU cache insert)
+   │
+   └─ 4. update_head()                 Metadata: head
+          (re-runs fork choice)        (+ justified/finalized if advanced,
+                                          + pruning on finalization)
+</code></pre>
+<p>Each numbered step is atomic on its own, but the import as a whole is <strong>not</strong>
+one transaction. The commit order keeps the on-disk store consistent after any
+prefix of these steps: the justified checkpoint written in step 1 always names
+an already-persisted <strong>ancestor</strong> of the imported block (the state transition
+only counts attestations whose roots match the state’s own
+<code>historical_block_hashes</code>, and every ancestor was fully persisted when it was
+imported), and the head only advances in step 4, after the block and state are
+durable. A crash mid-import can therefore lose the tail of the import — e.g. a
+persisted block and state the head does not point to yet — but never leave
+metadata referencing missing data. Re-importing the block is idempotent (a
+duplicate is skipped via <code>has_state</code>).</p>
+<h2 id="pruning"><a class="header" href="#pruning">Pruning</a></h2>
+<p>Pruning is driven by finalization and splits into a cheap immediate phase and
+a deferred heavy phase.</p>
+<p><strong>Immediately, when finalization advances</strong> (inside <code>update_checkpoints</code>):</p>
+<ul>
+<li><code>prune_live_chain</code>: deletes <code>LiveChain</code> entries below the finalized slot,
+keeping the finalized block itself. This keeps the fork choice working set
+bounded to the non-finalized chain.</li>
+<li><code>prune_gossip_signatures</code>: drops buffered in-memory gossip signatures at or
+below the finalized slot.</li>
+<li><code>prune_stale_aggregated_payloads</code>: drops in-memory aggregated payloads
+(both pending and known) whose target slot is at or below the finalized
+slot.</li>
+</ul>
+<p><strong>Deferred</strong> (<code>prune_old_data</code>, called after a batch of blocks has been
+processed):</p>
+<ul>
+<li><code>prune_old_block_signatures</code>: deletes <code>BlockSignatures</code> entries below
+<code>cutoff = tip_slot − SIGNATURE_PRUNING_RANGE</code> (21,600 slots, ~1 day at
+4-second slots) — but <strong>only</strong> when <code>cutoff ≤ finalized_slot</code>, i.e. the
+entire pruned range lies within finalized history. Non-finalized proofs
+are never touched. Finalized blocks can never revert, so their proofs are
+not needed for fork choice, reorg safety, or re-aggregation once outside
+the window.</li>
+</ul>
+<p><strong>Never pruned:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>States</code>, <code>StateDiffs</code>, and
+<code>Metadata</code>. Headers, bodies, and the snapshot+diff chain are the full
+historical record; only the proof blobs and the fork choice index are
+disposable.</p>
+<h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
+<p>Four <code>Store</code> fields never touch the backend. All are bounded buffers shared
+across <code>Store</code> clones:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Buffer</th><th>Capacity</th><th>Contents</th></tr>
+</thead>
+<tbody>
+<tr><td><code>new_payloads</code></td><td>64 messages</td><td>Pending aggregated attestation proofs, not yet active for fork choice</td></tr>
+<tr><td><code>known_payloads</code></td><td>512 messages</td><td>Fork-choice-active aggregated proofs</td></tr>
+<tr><td><code>gossip_signatures</code></td><td>2048 signatures</td><td>Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case)</td></tr>
+<tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of reconstructed/imported states</td></tr>
+</tbody>
+</table>
+</div>
+<p>The payload buffers evict FIFO when full, and redundant proofs (whose
+participants are a subset of an existing proof for the same attestation data)
+are skipped on insert.</p>
+<p>Note that the per-validator “latest attestation” maps used by fork choice are
+not stored anywhere — they are derived on demand from these buffers via
+<code>extract_latest_known_attestations</code> and friends. See the attestation pipeline
+section of <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a> for how attestations move between the
+pools.</p>
+<p>After a restart these buffers start empty: pending attestations and
+un-aggregated gossip signatures are lost and must be re-collected from the
+network. Everything persisted in the seven tables survives.</p>
+<h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
+<p>A <code>Store</code> is created through one of three constructors in
+<code>crates/storage/src/store.rs</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Constructor</th><th>When</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>from_anchor_state</code></td><td>Genesis boot</td><td>Initializes from the genesis state (no anchor block body)</td></tr>
+<tr><td><code>get_forkchoice_store</code></td><td><a href="#checkpoint-sync">Checkpoint sync</a></td><td>Initializes from a downloaded finalized state + anchor block, after validating they are consistent</td></tr>
+<tr><td><code>from_db_state</code></td><td>Resume from an existing data directory</td><td>Re-opens the persisted store as-is</td></tr>
+</tbody>
+</table>
+</div>
+<p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
+atomic batch</strong>: all six <code>Metadata</code> keys (time = 0, config, head = safe_target
+= anchor root, justified = finalized = anchor checkpoint), the anchor header,
+the body if non-empty, a full snapshot into <code>States</code> (the base of every future
+diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
+<p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
+from <code>Metadata</code>, returning <code>None</code> for an empty DB or a <code>genesis_time</code>
+mismatch (wrong network). At startup the node prefers this path but only
+accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
+to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
+<h2 id="key-files-1"><a class="header" href="#key-files-1">Key Files</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Component</th></tr>
+</thead>
+<tbody>
+<tr><td><code>crates/storage/src/store.rs</code></td><td><code>Store</code>: persistence logic, in-memory buffers, pruning, constructors</td></tr>
+<tr><td><code>crates/storage/src/api/traits.rs</code></td><td><code>StorageBackend</code>, <code>StorageReadView</code>, <code>StorageWriteBatch</code></td></tr>
+<tr><td><code>crates/storage/src/api/tables.rs</code></td><td>The <code>Table</code> enum</td></tr>
+<tr><td><code>crates/storage/src/state_diff.rs</code></td><td><code>StateDiff</code>: diff creation and state reconstruction</td></tr>
+<tr><td><code>crates/storage/src/backend/rocksdb.rs</code></td><td>Production RocksDB backend</td></tr>
+<tr><td><code>crates/storage/src/backend/in_memory.rs</code></td><td>Test backend</td></tr>
+<tr><td><code>crates/blockchain/src/store.rs</code></td><td>Fork choice logic driving the <code>Store</code> (<code>on_block</code>, <code>on_tick</code>, …)</td></tr>
 </tbody>
 </table>
 </div>
