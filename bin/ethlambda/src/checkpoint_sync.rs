@@ -367,13 +367,7 @@ pub async fn fetch_anchor_with_retry(
         match fetch_anchor_block_and_state(checkpoint_urls, genesis_time, validators).await {
             Ok(pair) => return Ok(pair),
             Err(err) if attempt < MAX_CHECKPOINT_ATTEMPTS => {
-                warn!(
-                    attempt,
-                    max_attempts = MAX_CHECKPOINT_ATTEMPTS,
-                    %err,
-                    backoff_secs = CHECKPOINT_RETRY_BACKOFF.as_secs(),
-                    "Checkpoint sync attempt failed; retrying"
-                );
+                warn!(attempt, %err, "Checkpoint sync attempt failed; retrying");
                 tokio::time::sleep(CHECKPOINT_RETRY_BACKOFF).await;
                 attempt += 1;
             }
