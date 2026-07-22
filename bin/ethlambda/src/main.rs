@@ -52,7 +52,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::{BlockChain, BlockChainConfig, SyncStatusController};
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
@@ -235,6 +235,12 @@ async fn main() -> eyre::Result<()> {
     // metric's startup value.
     let sync_status = SyncStatusController::default();
 
+    // Chain-event bus: the blockchain actor is the sole publisher; each SSE
+    // client (`GET /lean/v0/events`) subscribes its own receiver through the
+    // clone handed to the RPC server below. With no subscribers attached, the
+    // receiver-count guard in `emit` makes every emission a no-op.
+    let events = EventBus::default();
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
@@ -247,7 +253,12 @@ async fn main() -> eyre::Result<()> {
         },
     };
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config);
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        validator_keys,
+        blockchain_config,
+        events.clone(),
+    );
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
@@ -290,6 +301,7 @@ async fn main() -> eyre::Result<()> {
             aggregator,
             sync_status,
             local_peer_id,
+            events,
             rpc_shutdown,
         )
         .await

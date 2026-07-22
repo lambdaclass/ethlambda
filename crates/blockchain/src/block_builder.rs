@@ -202,11 +202,7 @@ fn select_attestations(
     // Running per-target-root voter set, seeded from state and updated
     // incrementally as entries are selected. Mirrors the role of Eth2
     // participation flags in Prysm/Lighthouse-style packing.
-    let mut projected = ProjectedState {
-        justified_slots: head_state.justified_slots.clone(),
-        finalized_slot: head_state.latest_finalized.slot,
-        current_votes: build_running_votes(head_state),
-    };
+    let mut projected = ProjectedState::from_head_state(head_state);
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
     // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
@@ -231,12 +227,6 @@ fn select_attestations(
         extend_proofs_greedily(proofs, &mut selected, att_data);
 
         let target_root = att_data.target.root;
-        projected
-            .current_votes
-            .entry(target_root)
-            .or_default()
-            .extend(new_voters);
-
         trace!(
             tier = ?score.tier,
             new_voters = score.new_voters,
@@ -247,29 +237,7 @@ fn select_attestations(
             "selected"
         );
 
-        // Project justification / finalization. Finalize implies Justify
-        // (target is justified, AND source is finalized).
-        if score.tier <= Tier::Justify {
-            justified_slots_ops::extend_to_slot(
-                &mut projected.justified_slots,
-                projected.finalized_slot,
-                att_data.target.slot,
-            );
-            justified_slots_ops::set_justified(
-                &mut projected.justified_slots,
-                projected.finalized_slot,
-                att_data.target.slot,
-            );
-            // Justified target's voter bucket is no longer relevant for
-            // scoring (no further entry can target it: filter rejects).
-            projected.current_votes.remove(&target_root);
-        }
-        if score.tier == Tier::Finalize {
-            let new_finalized = att_data.source.slot;
-            let delta = new_finalized.saturating_sub(projected.finalized_slot) as usize;
-            justified_slots_ops::shift_window(&mut projected.justified_slots, delta);
-            projected.finalized_slot = new_finalized;
-        }
+        projected.advance(score.tier, att_data, new_voters);
     }
 
     selected
@@ -294,24 +262,22 @@ fn pick_best_candidate(
         if processed_data_roots.contains(data_root) {
             continue;
         }
-        if let Err(reason) = entry_passes_filters(
+        if let Err(reason) = projected.entry_passes_filters(
             att_data,
             chain.known_block_roots,
             chain.extended_historical_block_hashes,
-            &projected.justified_slots,
-            projected.finalized_slot,
         ) {
             trace_skipped_attestation(reason, att_data, data_root);
             continue;
         }
 
-        let Some((score, new_voters)) = score_entry(
-            att_data,
-            proofs,
-            &projected.current_votes,
-            projected.finalized_slot,
-            chain.validator_count,
-        ) else {
+        let coverage: HashSet<u64> = proofs
+            .iter()
+            .flat_map(|proof| proof.participant_indices())
+            .collect();
+        let Some((score, new_voters)) =
+            projected.score_entry(att_data, &coverage, chain.validator_count)
+        else {
             trace_skipped_attestation("zero_new_voters", att_data, data_root);
             continue;
         };
@@ -336,132 +302,191 @@ struct ChainContext<'a> {
     validator_count: usize,
 }
 
-/// Mutable projection of the post-state that `select_attestations` maintains
-/// across rounds: which slots are justified, which slot is finalized, and the
-/// running per-target-root voter set.
-struct ProjectedState {
-    justified_slots: JustifiedSlots,
-    finalized_slot: u64,
-    current_votes: HashMap<H256, HashSet<u64>>,
+/// Mutable projection of the post-state that a tiered greedy selector
+/// maintains across rounds: which slots are justified, which slot is
+/// finalized, and the running per-target-root voter set.
+///
+/// Shared by `select_attestations` (block proposal) and
+/// `aggregation::snapshot_aggregation_inputs` (interval-2 aggregation) so the
+/// two selectors project justification/finalization identically. The
+/// aggregator's projection is optimistic (a produced proof is not a processed
+/// block), but that only affects the ordering of prover work within the
+/// deadline, never the correctness of any produced proof.
+pub(crate) struct ProjectedState {
+    pub(crate) justified_slots: JustifiedSlots,
+    pub(crate) finalized_slot: u64,
+    pub(crate) current_votes: HashMap<H256, HashSet<u64>>,
 }
 
-/// Validate a candidate entry against the projected chain view.
-///
-/// Mirrors `state_transition::is_valid_vote`: the entry's head must be known,
-/// its source must be justified, its (source, target) must match the
-/// candidate-block chain view, `target.slot > source.slot`, target must not
-/// already be justified, and target must be a justifiable slot relative to
-/// the projected finalized slot. The genesis self-vote (source == target ==
-/// slot 0) is exempt from the `target.slot > source.slot` and
-/// `target_already_justified` checks since fork-choice bootstrapping needs
-/// it; STF will silently drop it, but it carries fork-choice signal.
-fn entry_passes_filters(
-    att_data: &AttestationData,
-    known_block_roots: &HashSet<H256>,
-    extended_historical_block_hashes: &[H256],
-    projected_justified_slots: &JustifiedSlots,
-    projected_finalized_slot: u64,
-) -> Result<(), &'static str> {
-    if !known_block_roots.contains(&att_data.head.root) {
-        return Err("head_root_unknown");
-    }
-    if !justified_slots_ops::is_slot_justified(
-        projected_justified_slots,
-        projected_finalized_slot,
-        att_data.source.slot,
-    ) {
-        return Err("source_not_justified");
-    }
-    if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
-        return Err("chain_mismatch");
-    }
-    let is_genesis_self_vote = is_genesis_self_vote(att_data);
-    if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
-        return Err("target_not_after_source");
-    }
-    if !is_genesis_self_vote
-        && justified_slots_ops::is_slot_justified(
-            projected_justified_slots,
-            projected_finalized_slot,
-            att_data.target.slot,
-        )
-    {
-        return Err("target_already_justified");
-    }
-    if !is_genesis_self_vote
-        && !slot_is_justifiable_after(att_data.target.slot, projected_finalized_slot)
-    {
-        return Err("target_not_justifiable");
-    }
-    Ok(())
-}
-
-/// Score a single candidate entry under the current projected state.
-///
-/// Returns `None` if the entry has zero new validators relative to the
-/// running voter set for its `target.root` (no marginal value, drop). On
-/// `Some`, the returned `HashSet` is the set of new voters contributed by
-/// this entry (caller uses it to update the running voter map without
-/// re-scanning aggregation bits). A genesis self-vote cannot justify or
-/// finalize and is always scored as tier 3.
-fn score_entry(
-    att_data: &AttestationData,
-    proofs: &[SingleMessageAggregate],
-    current_votes: &HashMap<H256, HashSet<u64>>,
-    projected_finalized_slot: u64,
-    validator_count: usize,
-) -> Option<(EntryScore, HashSet<u64>)> {
-    let prior_voters = current_votes.get(&att_data.target.root);
-    let prior_count = prior_voters.map_or(0, HashSet::len);
-
-    // Collect voters that this entry adds on top of prior_voters. Avoids
-    // cloning prior_voters; the inner contains() makes this O(participants)
-    // per candidate per round. `extend_proofs_greedily` selects proofs until
-    // none contribute new voters, so its final coverage equals this set
-    // unioned with prior_voters.
-    let mut new_voters: HashSet<u64> = HashSet::new();
-    for proof in proofs {
-        for vid in proof.participant_indices() {
-            if prior_voters.is_none_or(|prior| !prior.contains(&vid)) {
-                new_voters.insert(vid);
-            }
+impl ProjectedState {
+    /// Seed the projection from the head state: justification/finalization as
+    /// of the head, and the running voter set derived from the state's
+    /// justification bitfields (see [`build_running_votes`]).
+    pub(crate) fn from_head_state(head_state: &State) -> Self {
+        Self {
+            justified_slots: head_state.justified_slots.clone(),
+            finalized_slot: head_state.latest_finalized.slot,
+            current_votes: build_running_votes(head_state),
         }
     }
-    if new_voters.is_empty() {
-        return None;
+
+    /// Fold a selected entry into the projection: record its voters under the
+    /// entry's `target.root`, then advance justification/finalization per
+    /// `tier` (Finalize implies Justify). `new_voters` is the entry's marginal
+    /// voter set (block builder) or realized coverage (aggregator); the
+    /// resulting per-target voter set is the same union either way.
+    pub(crate) fn advance(
+        &mut self,
+        tier: Tier,
+        att_data: &AttestationData,
+        new_voters: impl IntoIterator<Item = u64>,
+    ) {
+        let target_root = att_data.target.root;
+        self.current_votes
+            .entry(target_root)
+            .or_default()
+            .extend(new_voters);
+
+        // Finalize implies Justify (target is justified, AND source is
+        // finalized).
+        if tier <= Tier::Justify {
+            justified_slots_ops::extend_to_slot(
+                &mut self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            );
+            justified_slots_ops::set_justified(
+                &mut self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            );
+            // Justified target's voter bucket is no longer relevant for
+            // scoring (no further entry can target it: filter rejects).
+            self.current_votes.remove(&target_root);
+        }
+        if tier == Tier::Finalize {
+            let new_finalized = att_data.source.slot;
+            let delta = new_finalized.saturating_sub(self.finalized_slot) as usize;
+            justified_slots_ops::shift_window(&mut self.justified_slots, delta);
+            self.finalized_slot = new_finalized;
+        }
     }
 
-    let total = prior_count + new_voters.len();
-    let crosses_2_3 = 3 * total >= 2 * validator_count;
+    /// Score a candidate entry from its realized validator `coverage` against
+    /// this projection.
+    ///
+    /// Returns `None` if `coverage` contributes zero validators relative to the
+    /// running voter set for `att_data.target.root` (no marginal value, drop).
+    /// On `Some`, the returned `HashSet` is the subset of `coverage` that is new
+    /// (caller uses it to `advance` the projection without re-scanning
+    /// `coverage`). A genesis self-vote cannot justify or finalize and is always
+    /// scored as tier 3.
+    ///
+    /// The caller resolves `coverage` and passes it in: block building unions a
+    /// data's proof participants (see `pick_best_candidate`); committee-signature
+    /// aggregation passes a job's realized raw + child participants. Keeping the
+    /// proof->coverage transform at the call site lets both share one scorer
+    /// without either duplicating the tiering.
+    pub(crate) fn score_entry(
+        &self,
+        att_data: &AttestationData,
+        coverage: &HashSet<u64>,
+        validator_count: usize,
+    ) -> Option<(EntryScore, HashSet<u64>)> {
+        let prior_voters = self.current_votes.get(&att_data.target.root);
+        let prior_count = prior_voters.map_or(0, HashSet::len);
 
-    // 3SF-mini finalization requires the source to lie past the finalized
-    // boundary (a source at or behind it is already final and must not
-    // re-finalize) and no slot strictly between source.slot and target.slot to
-    // still be justifiable (so source and target are consecutive justified
-    // checkpoints in the projected post-state). Mirrors `try_finalize` in the
-    // state transition.
-    let finalizes = crosses_2_3
-        && att_data.source.slot > projected_finalized_slot
-        && (att_data.source.slot + 1..att_data.target.slot)
-            .all(|s| !slot_is_justifiable_after(s, projected_finalized_slot));
+        let new_voters: HashSet<u64> = coverage
+            .iter()
+            .copied()
+            .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+            .collect();
+        if new_voters.is_empty() {
+            return None;
+        }
 
-    let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
-        Tier::Build
-    } else if finalizes {
-        Tier::Finalize
-    } else {
-        Tier::Justify
-    };
+        let total = prior_count + new_voters.len();
+        let crosses_2_3 = 3 * total >= 2 * validator_count;
 
-    Some((
-        EntryScore {
+        // 3SF-mini finalization requires the source to lie past the finalized
+        // boundary (a source at or behind it is already final and must not
+        // re-finalize) and no slot strictly between source.slot and target.slot
+        // to still be justifiable (so source and target are consecutive
+        // justified checkpoints in the projected post-state). Mirrors
+        // `try_finalize` in the state transition.
+        let finalizes = crosses_2_3
+            && att_data.source.slot > self.finalized_slot
+            && (att_data.source.slot + 1..att_data.target.slot)
+                .all(|s| !slot_is_justifiable_after(s, self.finalized_slot));
+
+        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
+            Tier::Build
+        } else if finalizes {
+            Tier::Finalize
+        } else {
+            Tier::Justify
+        };
+
+        let score = EntryScore {
             tier,
             new_voters: new_voters.len(),
             target_slot: att_data.target.slot,
             att_slot: att_data.slot,
-        },
-        new_voters,
-    ))
+        };
+        Some((score, new_voters))
+    }
+
+    /// Validate a candidate entry against the projection and the given chain
+    /// view.
+    ///
+    /// Mirrors `state_transition::is_valid_vote`: the entry's head must be
+    /// known, its source must be justified, its (source, target) must match
+    /// the candidate-block chain view, `target.slot > source.slot`, target
+    /// must not already be justified, and target must be a justifiable slot
+    /// relative to the projected finalized slot. The genesis self-vote
+    /// (source == target == slot 0) is exempt from the `target.slot >
+    /// source.slot` and `target_already_justified` checks since fork-choice
+    /// bootstrapping needs it; STF will silently drop it, but it carries
+    /// fork-choice signal.
+    pub(crate) fn entry_passes_filters(
+        &self,
+        att_data: &AttestationData,
+        known_block_roots: &HashSet<H256>,
+        extended_historical_block_hashes: &[H256],
+    ) -> Result<(), &'static str> {
+        if !known_block_roots.contains(&att_data.head.root) {
+            return Err("head_root_unknown");
+        }
+        if !justified_slots_ops::is_slot_justified(
+            &self.justified_slots,
+            self.finalized_slot,
+            att_data.source.slot,
+        ) {
+            return Err("source_not_justified");
+        }
+        if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
+            return Err("chain_mismatch");
+        }
+        let is_genesis_self_vote = is_genesis_self_vote(att_data);
+        if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
+            return Err("target_not_after_source");
+        }
+        if !is_genesis_self_vote
+            && justified_slots_ops::is_slot_justified(
+                &self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            )
+        {
+            return Err("target_already_justified");
+        }
+        if !is_genesis_self_vote
+            && !slot_is_justifiable_after(att_data.target.slot, self.finalized_slot)
+        {
+            return Err("target_not_justifiable");
+        }
+        Ok(())
+    }
 }
 
 /// Selection tier for a candidate `AttestationData` entry.
@@ -471,7 +496,7 @@ fn score_entry(
 /// output (`tier = Finalize` is clearer than `tier = 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-enum Tier {
+pub(crate) enum Tier {
     /// Applying the entry crosses 2/3 on target AND finalizes the source
     /// (no slot strictly between source.slot and target.slot is still
     /// justifiable given projected finalized_slot).
@@ -499,23 +524,25 @@ enum Tier {
 ///
 /// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EntryScore {
-    tier: Tier,
-    new_voters: usize,
+pub(crate) struct EntryScore {
+    pub(crate) tier: Tier,
+    pub(crate) new_voters: usize,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     target_slot: u64,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     att_slot: u64,
 }
 
 /// Total order over candidate entries; the smallest value is the best pick.
 /// `tier` leads, then three tier-dependent `Reverse`-encoded priorities, then
 /// `data_root` as the deterministic tiebreak. See [`EntryScore::ordering_key`].
-type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
+pub(crate) type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
 
 impl EntryScore {
     /// Sort key where the smallest tuple is the best candidate. `tier` always
     /// leads; the remaining three slots carry tier-dependent priorities (see
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
-    fn ordering_key(&self, data_root: H256) -> OrderingKey {
+    pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
         let more_new_voters = Reverse(self.new_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
@@ -906,16 +933,16 @@ mod tests {
         };
 
         // Supermajority (3 of 4) so the entry crosses 2/3.
-        let proofs = vec![SingleMessageAggregate::empty(make_bits(&[0, 1, 2]))];
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: FINALIZED_SLOT,
+            current_votes: HashMap::new(),
+        };
 
-        let (score, _) = score_entry(
-            &att_data,
-            &proofs,
-            &HashMap::new(),
-            FINALIZED_SLOT,
-            NUM_VALIDATORS,
-        )
-        .expect("entry contributes new voters");
+        let (score, _) = projected
+            .score_entry(&att_data, &coverage, NUM_VALIDATORS)
+            .expect("entry contributes new voters");
 
         assert_eq!(
             score.tier,
