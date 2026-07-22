@@ -1322,6 +1322,18 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        // A block seen on the network, ahead of import (import may pend it
+        // waiting for its parent chain). Beacon emits `block_gossip` at this
+        // point; we publish it from the actor — the sole publisher — instead of
+        // the P2P actor, keeping the one-directional write flow. Not
+        // recency-gated (like `block`), so a `block_gossip` subscriber can watch
+        // sync progress. Low-rate (one per block), so building the payload
+        // unconditionally is cheap; `emit`'s guard drops it on an unsubscribed
+        // node.
+        self.events.emit(ChainEvent::BlockGossip {
+            slot: msg.block.message.slot,
+            block: msg.block.message.hash_tree_root(),
+        });
         self.on_block(msg.block);
     }
 }
