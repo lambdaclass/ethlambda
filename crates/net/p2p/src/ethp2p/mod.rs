@@ -4,9 +4,11 @@
 //! default**. It lets ethlambda *also* broadcast gossip through
 //! [ethp2p-rs](https://github.com/lambdaclass/ethp2p-rs)'s Reed-Solomon
 //! broadcast engine, over a **parallel QUIC network** alongside libp2p
-//! gossipsub (which is unaffected). It is ethlambda↔ethlambda only and
-//! makes no spec-conformance or interop claim — see
-//! `docs/ethlambda-integration-plan.md` in ethp2p-rs.
+//! gossipsub (which is unaffected). It runs the **spec-conformant** ethp2p
+//! wire (per-protocol BCAST/SESS/CHUNK streams over QUIC + TLS 1.3, ALPN
+//! `eth-ec-broadcast`), so it is wire-compatible with other ethp2p
+//! implementations at the transport layer; it is exercised ethlambda↔ethlambda
+//! and cross-client interop is a later milestone.
 //!
 //! This module wires the broadcast engine into ethlambda's P2P actor:
 //! the publish handlers tee gossip here, a background task drives the
@@ -15,41 +17,49 @@
 //! by compilation, the isolated round-trip test below, and an end-to-end
 //! run on a 3-node ethlambda devnet (blocks, aggregations, and attestations
 //! all carried over the parallel QUIC mesh while the chain finalized
-//! normally). Minimal transport hardening (Phase 6) gates any non-isolated
-//! use.
+//! normally). Transport hardening (peer authentication) gates any
+//! non-isolated use.
 //!
 //! ## Model
 //!
 //! ethlambda uses **static bootnodes** (no dynamic discovery), so the peer
 //! set is known at startup: [`Ethp2pBroadcast::start`] binds a QUIC
-//! endpoint, dials the known peers, and subscribes the gossip channels.
-//! Inbound peers register themselves via the QUIC transport's stream
-//! preface, so only one side needs to dial.
+//! endpoint and dials the known peers. Each established connection — whether
+//! we dialed it or accepted it — surfaces as a transport `PeerConnected`
+//! event, which drives the engine's BCAST handshake automatically, so only
+//! one side needs to dial.
 //!
 //! ## Limitations (isolated devnet only)
 //!
-//! - **No peer authentication.** The demo QUIC transport binds no identity
-//!   to the connection, so a peer id can be spoofed. Acceptable only for an
-//!   isolated, off-by-default experiment.
-//! - **No live peer-health signal.** The transport never emits
-//!   `PeerDisconnected`, so runtime peer loss is invisible here. The only
-//!   ethlambda-side guard is a *startup* one: with fewer than
-//!   [`MIN_ETHP2P_PEERS`] configured mesh peers the engine isn't started
-//!   and the node relies solely on gossipsub. A true circuit-breaker that
-//!   reacts to peers dropping needs transport-side disconnect events
-//!   (deferred — see the integration plan's Phase 6).
-//! - **Fire-and-forget sends.** Chunks dropped under load are not retried;
-//!   gossipsub remains the authoritative path.
+//! - **No peer authentication.** The transport keeps the reference's
+//!   identity model: a self-asserted `peer_id` string in the handshake, with
+//!   no TLS-identity binding, so a peer id can be spoofed. SPKI pinning /
+//!   identity verification is the config-gated hardening added in a later
+//!   ethp2p-rs slice. Acceptable only for an isolated, off-by-default
+//!   experiment.
+//! - **Startup-only peer guard.** The transport now emits `PeerDisconnected`
+//!   and the engine acts on it internally (detaching sessions, refunding
+//!   in-flight budget), but ethlambda does not yet run a live circuit-breaker
+//!   off it. The only ethlambda-side guard is a *startup* one: with fewer
+//!   than [`MIN_ETHP2P_PEERS`] configured mesh peers the engine isn't started
+//!   and the node relies solely on gossipsub.
+//! - **Fire-and-forget sends.** Chunks dropped under load are re-planned by
+//!   the strategy but not otherwise retried; gossipsub remains the
+//!   authoritative path.
 
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ethlambda_network_api::P2PToBlockChainRef;
 use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
 use ethlambda_types::block::SignedBlock;
-use ethp2p_broadcast::engine::{DeliveredMessage, Engine, StepResult, rs_relay_factory};
+use ethp2p_broadcast::engine::{
+    DeliveredMessage, Engine, EngineConfig, StepResult, rs_relay_factory,
+};
+use ethp2p_broadcast::runtime::TokioClock;
 use ethp2p_broadcast::strategy::config::RsConfig;
 use ethp2p_broadcast::strategy::rs::state::RsStrategy;
 use ethp2p_transport::QuicNet;
@@ -100,12 +110,15 @@ const DELIVERY_CAPACITY: usize = 256;
 /// peer can still reach us via its own dial — QUIC connections are bidirectional.
 const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Derive a stable ethp2p peer id (`u64`) from a secp256k1 compressed
-/// public key: the first 8 bytes of its SHA-256, big-endian.
+/// Derive this node's stable ethp2p engine id (`u64`) from its secp256k1
+/// compressed public key: the first 8 bytes of its SHA-256, big-endian.
 ///
-/// Deterministic across restarts (same key → same id). ethp2p uses a
-/// `u64` peer-id space, distinct from libp2p's multi-byte `PeerId`; this
-/// is the bridge. Collision probability is negligible at devnet scale.
+/// Deterministic across restarts (same key → same id). The spec transport
+/// mints a *local, per-connection* id for each peer and routes by that, so
+/// this value is not an on-wire routing key; the engine uses it only as its
+/// own local identity (the handshake `peer_id` string is `peer-{id}`) and in
+/// logs. Keeping it key-derived gives each node a stable, unique id across
+/// restarts for observability.
 #[must_use]
 pub fn derive_peer_id(compressed_pubkey: &[u8]) -> u64 {
     let digest = Sha256::digest(compressed_pubkey);
@@ -151,65 +164,60 @@ impl fmt::Debug for Ethp2pBroadcast {
 }
 
 impl Ethp2pBroadcast {
-    /// Bind a QUIC endpoint for `local_peer`, then for each mesh peer
-    /// `(id, addr)`: QUIC-dial it if `addr` is `Some` (peers with `None`
-    /// are expected to dial us — the QUIC connection is bidirectional, so
-    /// only one side dials), and engine-connect *all* of them so each node
-    /// announces its channel subscriptions via the BCAST handshake.
-    /// Finally subscribe the given `channels`.
+    /// Bind a QUIC endpoint, dial each address in `dial_addrs`, and subscribe
+    /// the given `channels`.
+    ///
+    /// `local_peer` is this node's stable engine id (see [`derive_peer_id`]);
+    /// it names us in the handshake and logs but is not an on-wire routing
+    /// key. Only the addresses we must dial are passed — a peer that dials us
+    /// registers itself when the transport accepts its connection. Every
+    /// established connection (dialed or accepted) surfaces as a transport
+    /// `PeerConnected` event, which drives the engine's BCAST handshake, so no
+    /// explicit engine-connect is needed.
     ///
     /// Returns the handle plus the receiver of reconstructed
     /// [`DeliveredMessage`]s; the caller forwards those into the same
-    /// pipeline gossipsub feeds (Phase 2).
+    /// pipeline gossipsub feeds.
     pub async fn start(
         local_peer: u64,
         bind_addr: SocketAddr,
-        peers: &[(u64, Option<SocketAddr>)],
+        dial_addrs: &[SocketAddr],
         channels: &[String],
         config: RsConfig,
     ) -> io::Result<(Self, mpsc::Receiver<DeliveredMessage>)> {
-        let net = QuicNet::bind(local_peer, bind_addr)?;
+        let net = QuicNet::bind(bind_addr)?;
         let local_addr = net.local_addr()?;
 
-        // QUIC-level dial of peers we're responsible for dialing (peers with no
-        // address dial us and self-register via the stream preface).
-        //
-        // Best-effort and concurrent: a peer whose ethp2p endpoint isn't
-        // reachable at startup must not disable the whole engine (a single
-        // failed dial used to abort `start` via `?`) or stall it — dialing
-        // sequentially would block startup for the transport's connect timeout
-        // once per unreachable peer. Dial all peers at once under a short budget
-        // and log-and-continue past failures, so reachable peers (notably other
-        // ethlambda nodes) still form the mesh.
+        // Best-effort, concurrent dials: a peer whose ethp2p endpoint isn't
+        // reachable at startup must not disable the whole engine or stall it
+        // (dialing sequentially would block startup for the transport's connect
+        // timeout once per unreachable peer). Dial all at once under a short
+        // budget and log-and-continue past failures, so reachable peers
+        // (notably other ethlambda nodes) still form the mesh. The connection
+        // then drives the handshake via `PeerConnected`; the minted peer id is
+        // internal to the transport, so we discard it here.
         let net_ref = &net;
-        let dials = peers.iter().filter_map(|&(peer, addr)| {
-            addr.map(|addr| async move {
-                match tokio::time::timeout(PEER_DIAL_TIMEOUT, net_ref.connect(peer, addr)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(peer, %addr, %e, "ethp2p: failed to dial mesh peer; continuing")
-                    }
-                    Err(_) => warn!(peer, %addr, "ethp2p: mesh peer dial timed out; continuing"),
-                }
-            })
+        let dials = dial_addrs.iter().map(|&addr| async move {
+            match tokio::time::timeout(PEER_DIAL_TIMEOUT, net_ref.connect(addr)).await {
+                Ok(Ok(_peer)) => {}
+                Ok(Err(e)) => warn!(%addr, %e, "ethp2p: failed to dial mesh peer; continuing"),
+                Err(_) => warn!(%addr, "ethp2p: mesh peer dial timed out; continuing"),
+            }
         });
         futures::future::join_all(dials).await;
 
         let (delivered_tx, delivered_rx) = mpsc::channel(DELIVERY_CAPACITY);
-        let mut engine = Engine::new(local_peer, net, delivered_tx);
+        let mut engine = Engine::with_config(
+            local_peer,
+            net,
+            delivered_tx,
+            EngineConfig::default(),
+            Arc::new(TokioClock),
+        );
 
         for channel in channels {
             engine
                 .subscribe(channel.clone(), rs_relay_factory(config))
-                .map_err(|e| io::Error::other(e.to_string()))?;
-        }
-        // Engine-level handshake to every mesh peer (announces our
-        // subscriptions so peers will dispatch chunks to us, and vice
-        // versa). Fire-and-forget: the transport delivers once the QUIC
-        // connection is established in either direction.
-        for (peer, _) in peers {
-            engine
-                .connect(*peer)
                 .map_err(|e| io::Error::other(e.to_string()))?;
         }
 
@@ -278,22 +286,20 @@ impl Ethp2pBroadcast {
 pub(crate) struct Ethp2pParams {
     pub(crate) local_peer: u64,
     pub(crate) bind_addr: SocketAddr,
-    pub(crate) peers: Vec<(u64, Option<SocketAddr>)>,
+    /// Addresses of mesh peers this node dials at startup. A peer that dials
+    /// us instead is not listed — it registers when the transport accepts it.
+    pub(crate) dial_addrs: Vec<SocketAddr>,
     pub(crate) channels: Vec<String>,
     pub(crate) config: RsConfig,
 }
 
 impl Ethp2pParams {
     /// Construct with the default channel set and Reed-Solomon config.
-    pub(crate) fn new(
-        local_peer: u64,
-        bind_addr: SocketAddr,
-        peers: Vec<(u64, Option<SocketAddr>)>,
-    ) -> Self {
+    pub(crate) fn new(local_peer: u64, bind_addr: SocketAddr, dial_addrs: Vec<SocketAddr>) -> Self {
         Self {
             local_peer,
             bind_addr,
-            peers,
+            dial_addrs,
             channels: all_channels(),
             config: RsConfig::default(),
         }
@@ -345,7 +351,7 @@ pub(crate) async fn run_engine_task(
     let (mut broadcast, mut delivered_rx) = match Ethp2pBroadcast::start(
         params.local_peer,
         params.bind_addr,
-        &params.peers,
+        &params.dial_addrs,
         &params.channels,
         params.config,
     )
@@ -357,10 +363,10 @@ pub(crate) async fn run_engine_task(
             return;
         }
     };
-    metrics::set_mesh_peers(params.peers.len());
+    metrics::set_mesh_peers(params.dial_addrs.len());
     info!(
         local_peer = params.local_peer,
-        peers = params.peers.len(),
+        peers = params.dial_addrs.len(),
         bind = %params.bind_addr,
         "ethp2p broadcast engine started"
     );
@@ -505,14 +511,16 @@ mod tests {
         let channels = vec!["block".to_string()];
         let payload = pseudorandom(64 * 1024, 0xDEAD_BEEF);
 
-        // Relay binds and announces to origin (origin will dial it).
+        // Relay binds and waits to be dialed (no dial addresses); origin dials
+        // it. Each connection surfaces as `PeerConnected` on both ends, which
+        // drives the handshake, so the relay needs no dial list.
         let (mut relay, mut relay_rx) =
-            Ethp2pBroadcast::start(2, loopback(), &[(1, None)], &channels, config)
+            Ethp2pBroadcast::start(2, loopback(), &[], &channels, config)
                 .await
                 .expect("relay start");
         let relay_addr = relay.local_addr();
         let (mut origin, mut _origin_rx) =
-            Ethp2pBroadcast::start(1, loopback(), &[(2, Some(relay_addr))], &channels, config)
+            Ethp2pBroadcast::start(1, loopback(), &[relay_addr], &channels, config)
                 .await
                 .expect("origin start");
 

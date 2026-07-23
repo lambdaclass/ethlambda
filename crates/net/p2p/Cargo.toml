@@ -50,8 +50,8 @@ sha2 = "0.10"
 # resolution needs no credentials; building with the `ethp2p` feature also
 # needs `protoc` on the build host (ethp2p-broadcast compiles its .proto via
 # prost-build). The default (feature-off) build compiles neither crate.
-ethp2p-broadcast = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d03d2ba6e8e96c836c701804ea3bdce7973802d2", optional = true }
-ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d03d2ba6e8e96c836c701804ea3bdce7973802d2", optional = true }
+ethp2p-broadcast = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "3d234116e852b85be7bf8e6b9272ed66772cd98c", optional = true }
+ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "3d234116e852b85be7bf8e6b9272ed66772cd98c", optional = true }
 # Needed to serialize the RS preamble (a prost message) before publishing.
 # Version-matched to ethp2p-broadcast's prost so cargo unifies them.
 prost = { version = "0.13", optional = true }

@@ -316,26 +316,25 @@ pub fn build_swarm(
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let mut bootnode_addrs = HashMap::new();
-    // ethp2p: parallel QUIC mesh peers, derived from the same bootnodes.
-    // Each peer's ethp2p QUIC port is the gossipsub QUIC port + 1; we dial
-    // them (Some(addr)) since ethlambda's bootnode topology is static.
+    // ethp2p: parallel QUIC mesh addresses, derived from the same bootnodes.
+    // Each peer's ethp2p QUIC port is the gossipsub QUIC port + 1; we dial the
+    // secp256k1-keyed ones (the only peers that could speak ethp2p) since
+    // ethlambda's bootnode topology is static. The transport mints its own
+    // per-connection peer id, so only the address is needed here.
     #[cfg(feature = "ethp2p")]
-    let mut ethp2p_peers: Vec<(u64, Option<SocketAddr>)> = Vec::new();
+    let mut ethp2p_dial_addrs: Vec<SocketAddr> = Vec::new();
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
             continue;
         }
         #[cfg(feature = "ethp2p")]
-        if let Some(pubkey) = secp256k1_compressed(&bootnode.public_key) {
-            ethp2p_peers.push((
-                crate::ethp2p::derive_peer_id(&pubkey),
-                Some(SocketAddr::new(
-                    bootnode.ip,
-                    bootnode
-                        .quic_port
-                        .wrapping_add(crate::ethp2p::ETHP2P_PORT_OFFSET),
-                )),
+        if secp256k1_compressed(&bootnode.public_key).is_some() {
+            ethp2p_dial_addrs.push(SocketAddr::new(
+                bootnode.ip,
+                bootnode
+                    .quic_port
+                    .wrapping_add(crate::ethp2p::ETHP2P_PORT_OFFSET),
             ));
         }
         let addr = Multiaddr::empty()
@@ -402,7 +401,7 @@ pub fn build_swarm(
                 .port()
                 .wrapping_add(crate::ethp2p::ETHP2P_PORT_OFFSET),
         ),
-        ethp2p_peers,
+        ethp2p_dial_addrs,
     );
 
     Ok(BuiltSwarm {
@@ -435,17 +434,17 @@ impl P2P {
         // mesh peers are configured; otherwise the node relies solely on
         // gossipsub (no engine, no publish channel, no per-message tee).
         #[cfg(feature = "ethp2p")]
-        let (ethp2p_tx, ethp2p_rx) = if built.ethp2p.peers.len() >= crate::ethp2p::MIN_ETHP2P_PEERS
-        {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::ethp2p::PublishCmd>();
-            (Some(tx), Some(rx))
-        } else {
-            warn!(
-                peers = built.ethp2p.peers.len(),
-                "ethp2p: too few mesh peers configured; engine not started (gossipsub only)"
-            );
-            (None, None)
-        };
+        let (ethp2p_tx, ethp2p_rx) =
+            if built.ethp2p.dial_addrs.len() >= crate::ethp2p::MIN_ETHP2P_PEERS {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::ethp2p::PublishCmd>();
+                (Some(tx), Some(rx))
+            } else {
+                warn!(
+                    peers = built.ethp2p.dial_addrs.len(),
+                    "ethp2p: too few mesh peers configured; engine not started (gossipsub only)"
+                );
+                (None, None)
+            };
 
         let server = P2PServer {
             swarm_handle,
