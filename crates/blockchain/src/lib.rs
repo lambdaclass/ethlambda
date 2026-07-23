@@ -31,7 +31,7 @@ use crate::block_builder::ProposerConfig;
 use crate::events::ChainEventSnapshot;
 use crate::store::StoreError;
 
-pub use events::{ChainEvent, EventBus, Topic};
+pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 pub mod block_builder;

@@ -13,6 +13,8 @@ use ethlambda_storage::Store;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::H256;
+use serde::Serialize;
+use std::str::FromStr;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -43,20 +45,42 @@ impl Topic {
     }
 }
 
+/// Error returned by [`Topic::from_str`] for a name matching no topic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown topic: '{0}'")]
+pub struct UnknownTopic(String);
+
+impl FromStr for Topic {
+    type Err = UnknownTopic;
+
+    /// Exact inverse of [`Topic::as_str`].
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "head" => Ok(Topic::Head),
+            "block" => Ok(Topic::Block),
+            "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
+            "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            other => Err(UnknownTopic(other.to_string())),
+        }
+    }
+}
+
 /// A consensus event published by the blockchain actor.
 ///
-/// Fields mirror the Ethereum beacon-API eventstream payloads so a future SSE
-/// endpoint can render a beacon-compatible stream: `block` is the block root,
+/// Fields mirror the Ethereum beacon-API eventstream payloads so the SSE
+/// endpoint renders a beacon-compatible stream: `block` is the block root,
 /// `state` the state root, and `slot` stands in for the beacon `epoch`.
 /// [`ChainEvent::JustifiedCheckpoint`] has no beacon analog; it mirrors
 /// [`ChainEvent::FinalizedCheckpoint`]'s shape as an ethlambda extension.
 ///
-/// No `Serialize` is derived: the wire encoding (decimal-string integers,
-/// `0x`-hex roots, and the out-of-band topic on the SSE `event:` line) lands
-/// with the SSE endpoint in a follow-up PR. Until then this type is
-/// internal-only, so there is no risk of an untagged shape being deserialized
-/// ambiguously (the `{slot, block, state}` variants are structurally identical).
-#[derive(Clone, Debug)]
+/// `#[serde(untagged)]` serializes only the active variant's fields, so the SSE
+/// `data:` body stays flat (`0x`-hex roots, numeric slots) while the topic name
+/// travels out-of-band on the `event:` line via [`ChainEvent::topic`]. Only
+/// `Serialize` is derived, never `Deserialize`: an untagged shape would
+/// deserialize ambiguously since the `{slot, block, state}` variants are
+/// structurally identical, but serialization always knows its variant.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
 pub enum ChainEvent {
     /// Fork choice selected a new head.
     Head { slot: u64, block: H256, state: H256 },
@@ -273,6 +297,13 @@ mod tests {
         }
     }
 
+    const ALL_TOPICS: [Topic; 4] = [
+        Topic::Head,
+        Topic::Block,
+        Topic::JustifiedCheckpoint,
+        Topic::FinalizedCheckpoint,
+    ];
+
     #[tokio::test]
     async fn subscriber_receives_emitted_event() {
         let bus = EventBus::default();
@@ -284,6 +315,15 @@ mod tests {
             ChainEvent::Head { slot, .. } => assert_eq!(slot, 7),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn topic_from_str_inverts_as_str() {
+        for topic in ALL_TOPICS {
+            assert_eq!(topic.as_str().parse::<Topic>().unwrap(), topic);
+        }
+        let err = "bogus".parse::<Topic>().unwrap_err();
+        assert_eq!(err.to_string(), "unknown topic: 'bogus'");
     }
 
     #[test]

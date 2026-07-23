@@ -235,10 +235,10 @@ async fn main() -> eyre::Result<()> {
     // metric's startup value.
     let sync_status = SyncStatusController::default();
 
-    // Chain-event bus: the blockchain actor is the sole publisher. No consumer
-    // subscribes yet — the RPC SSE endpoint (follow-up PR) will attach here;
-    // until then the receiver-count guard in `emit` makes every emission a
-    // no-op.
+    // Chain-event bus: the blockchain actor is the sole publisher; each SSE
+    // client (`GET /lean/v0/events`) subscribes its own receiver through the
+    // clone handed to the RPC server below. With no subscribers attached, the
+    // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
     let blockchain_config = BlockChainConfig {
@@ -253,7 +253,12 @@ async fn main() -> eyre::Result<()> {
         },
     };
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config, events);
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        validator_keys,
+        blockchain_config,
+        events.clone(),
+    );
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
@@ -296,6 +301,7 @@ async fn main() -> eyre::Result<()> {
             aggregator,
             sync_status,
             local_peer_id,
+            events,
             rpc_shutdown,
         )
         .await
