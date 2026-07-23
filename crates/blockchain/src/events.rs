@@ -22,16 +22,18 @@ use tracing::warn;
 ///
 /// These are the names consumers address events by (the SSE `event:` line and,
 /// later, `?topics=` filtering), kept separate from [`ChainEvent`] so the
-/// payload stays flat with the topic travelling out-of-band. The names match
-/// the Ethereum beacon-API eventstream topics (`head`, `block`,
-/// `finalized_checkpoint`); `justified_checkpoint` is an ethlambda extension
-/// with no beacon analog.
+/// payload stays flat with the topic travelling out-of-band. Names match the
+/// Ethereum beacon-API eventstream topics where an analog exists (`head`,
+/// `block`, `finalized_checkpoint`, `block_gossip`); `justified_checkpoint` is
+/// an ethlambda extension with no direct beacon topic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
     Head,
     Block,
     JustifiedCheckpoint,
     FinalizedCheckpoint,
+    /// A block seen on gossip, before import (analog of beacon `block_gossip`).
+    BlockGossip,
 }
 
 impl Topic {
@@ -41,6 +43,7 @@ impl Topic {
             Topic::Block => "block",
             Topic::JustifiedCheckpoint => "justified_checkpoint",
             Topic::FinalizedCheckpoint => "finalized_checkpoint",
+            Topic::BlockGossip => "block_gossip",
         }
     }
 }
@@ -60,6 +63,7 @@ impl FromStr for Topic {
             "block" => Ok(Topic::Block),
             "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
             "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            "block_gossip" => Ok(Topic::BlockGossip),
             other => Err(UnknownTopic(other.to_string())),
         }
     }
@@ -90,6 +94,9 @@ pub enum ChainEvent {
     JustifiedCheckpoint { slot: u64, block: H256, state: H256 },
     /// The finalized checkpoint advanced.
     FinalizedCheckpoint { slot: u64, block: H256, state: H256 },
+    /// A block seen on gossip, before import. Analog of beacon `block_gossip`;
+    /// `block` is imported later once its parent chain is available.
+    BlockGossip { slot: u64, block: H256 },
 }
 
 impl ChainEvent {
@@ -99,6 +106,7 @@ impl ChainEvent {
             ChainEvent::Block { .. } => Topic::Block,
             ChainEvent::JustifiedCheckpoint { .. } => Topic::JustifiedCheckpoint,
             ChainEvent::FinalizedCheckpoint { .. } => Topic::FinalizedCheckpoint,
+            ChainEvent::BlockGossip { .. } => Topic::BlockGossip,
         }
     }
 }
@@ -297,11 +305,12 @@ mod tests {
         }
     }
 
-    const ALL_TOPICS: [Topic; 4] = [
+    const ALL_TOPICS: [Topic; 5] = [
         Topic::Head,
         Topic::Block,
         Topic::JustifiedCheckpoint,
         Topic::FinalizedCheckpoint,
+        Topic::BlockGossip,
     ];
 
     #[tokio::test]
@@ -355,6 +364,10 @@ mod tests {
                     state,
                 },
                 Topic::FinalizedCheckpoint,
+            ),
+            (
+                ChainEvent::BlockGossip { slot: 1, block },
+                Topic::BlockGossip,
             ),
         ];
         for (event, topic) in cases {
