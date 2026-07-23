@@ -238,6 +238,14 @@ impl Ethp2pBroadcast {
         self.local_addr
     }
 
+    /// Number of live broadcast sessions the engine currently holds (origin +
+    /// relay). Plateaus once session GC keeps pace; a monotonic climb means
+    /// cleanup is falling behind.
+    #[must_use]
+    pub fn active_session_count(&self) -> usize {
+        self.engine.active_session_count()
+    }
+
     /// Publish an opaque payload (e.g. an ssz+snappy gossip blob) on
     /// `channel` under `message_id`. Wraps the Reed-Solomon encode +
     /// origin-session setup the engine requires.
@@ -421,6 +429,9 @@ pub(crate) async fn run_engine_task(
                 }
             }
         }
+        // Sample the live-session count after each serviced event so the gauge
+        // tracks GC health (it should plateau, not climb).
+        metrics::set_active_sessions(broadcast.active_session_count());
     }
 }
 

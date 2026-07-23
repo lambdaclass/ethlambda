@@ -10,13 +10,26 @@ use std::sync::LazyLock;
 use ethlambda_metrics::*;
 
 /// Number of ethp2p mesh peers configured at startup (derived from the
-/// static bootnode set). Static for the process lifetime — runtime peer
-/// loss is not observable here (the demo QUIC transport emits no
-/// disconnect events).
+/// static bootnode set). Static for the process lifetime: the transport does
+/// emit `PeerDisconnected`, but the engine consumes it internally and this
+/// gauge is not yet updated on runtime peer loss (a live health signal is a
+/// follow-up).
 static LEAN_ETHP2P_MESH_PEERS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "lean_ethp2p_mesh_peers",
         "Number of ethp2p broadcast mesh peers configured at startup"
+    )
+    .unwrap()
+});
+
+/// Number of live ethp2p broadcast sessions held by the engine. Sampled each
+/// time the engine task services an event. It should **plateau** once session
+/// GC keeps pace with new messages; a monotonic climb means cleanup is not
+/// keeping up (a memory-health signal).
+static LEAN_ETHP2P_ACTIVE_SESSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_ethp2p_active_sessions",
+        "Number of live ethp2p broadcast sessions currently held by the engine"
     )
     .unwrap()
 });
@@ -36,6 +49,11 @@ static LEAN_ETHP2P_MESSAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// Set the configured ethp2p mesh peer gauge.
 pub(crate) fn set_mesh_peers(count: usize) {
     LEAN_ETHP2P_MESH_PEERS.set(count.try_into().unwrap_or_default());
+}
+
+/// Set the live-session gauge (sampled from the engine each event).
+pub(crate) fn set_active_sessions(count: usize) {
+    LEAN_ETHP2P_ACTIVE_SESSIONS.set(count.try_into().unwrap_or_default());
 }
 
 /// Count a message this node published (teed) onto the ethp2p mesh.
