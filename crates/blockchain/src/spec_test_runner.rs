@@ -61,7 +61,7 @@ pub fn apply_fork_choice_step(
                 )
             });
             store.insert_known_aggregated_payloads_batch(entries.collect());
-            store::update_head(store, false);
+            store::update_head(store);
             Ok(())
         }
         "attestation" => {
