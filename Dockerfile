@@ -5,7 +5,7 @@ WORKDIR /app
 
 # Install cargo-chef and system dependencies
 RUN cargo install cargo-chef
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
+RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config protobuf-compiler
 
 # Builds a cargo-chef plan
 FROM chef AS planner
