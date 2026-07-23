@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>event-monitor</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <h1>event-monitor</h1>
+      <span id="mode-indicator" class="mode-indicator"></span>
+    </div>
+    <div id="conn-banner" class="conn-banner" hidden>reconnecting to collector…</div>
+    <div class="window-control">
+      <label for="window-slots">window</label>
+      <input type="number" id="window-slots" min="1" max="500" step="1" inputmode="numeric" />
+      <span class="window-unit">slots</span>
+    </div>
+    <div id="status-bar" class="status-bar" aria-label="node connection status"></div>
+  </header>
+
+  <main>
+    <section class="panel beeswarm-panel">
+      <div class="panel-header">
+        <h2>Arrival offset within slot</h2>
+        <div id="beeswarm-legend" class="legend"></div>
+      </div>
+      <div class="beeswarm-wrap">
+        <canvas id="beeswarm-canvas"></canvas>
+      </div>
+      <p id="beeswarm-note" class="hint"></p>
+    </section>
+
+    <section class="panel propagation-panel">
+      <div class="panel-header">
+        <h2>Propagation delta</h2>
+        <div id="propagation-toggle" class="toggle-group" role="group" aria-label="propagation topic"></div>
+      </div>
+      <div class="beeswarm-wrap">
+        <canvas id="propagation-canvas"></canvas>
+      </div>
+      <div id="propagation-legend" class="legend"></div>
+      <p id="propagation-note" class="hint"></p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>event-monitor</span>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

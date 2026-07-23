@@ -1,0 +1,35 @@
+# event-monitor configuration. Copy to config.toml and edit.
+#
+# Run:  event-monitor --config config.toml
+# Then open the `listen` address in a browser.
+
+listen = "127.0.0.1:8080"     # collector bind address (the dashboard URL)
+window_slots = 30             # initial rolling window; adjustable live in the UI
+history_slots = 64            # slots of events buffered to backfill a fresh page load
+static_dir = "web"            # directory served at GET / (the frontend)
+# Upstream SSE topics to subscribe. `head` powers the propagation panel's head
+# toggle; drop it if you only care about block/aggregate propagation.
+topics = ["block", "attestation", "aggregate", "head"]
+
+# Optional offline overrides. Normally the collector auto-fetches slot geometry
+# from the first reachable node via /lean/v0/genesis and /lean/v0/config/spec.
+# genesis_time = 1770407233   # seconds
+# ms_per_slot  = 4000
+
+# One block per node. `url` is the node's RPC API base (no trailing path);
+# the collector appends /lean/v0/events, /lean/v0/genesis, /lean/v0/config/spec.
+[[nodes]]
+name = "node-2"
+url  = "http://127.0.0.1:5052"
+
+[[nodes]]
+name = "node-3"
+url  = "http://127.0.0.1:5053"
+
+[[nodes]]
+name = "node-4"
+url  = "http://127.0.0.1:5054"
+
+[[nodes]]
+name = "node-5"
+url  = "http://127.0.0.1:5055"
