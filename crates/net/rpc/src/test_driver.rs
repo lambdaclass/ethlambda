@@ -30,8 +30,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    store::{self, verify_block_signatures},
+    spec_test_runner::apply_fork_choice_step, store::verify_block_signatures,
 };
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_test_fixtures::{
@@ -39,10 +38,7 @@ use ethlambda_test_fixtures::{
     state_transition::StateTransitionRunRequest, verify_signatures::TestSignedBlock,
 };
 use ethlambda_types::{
-    attestation::{
-        AggregationBits as EthAggregationBits, SignedAggregatedAttestation, SignedAttestation,
-    },
-    block::{Block, ByteList512KiB, TypeOneMultiSignature},
+    block::Block,
     checkpoint::Checkpoint,
     primitives::H256,
     state::{State, anchor_pair_is_consistent},
@@ -230,7 +226,7 @@ async fn step_fork_choice(
     // mutate the store in between, even though the hive simulator drives
     // steps serially per fixture).
     let mut guard = driver.write().await;
-    let outcome = apply_step(&mut guard, step);
+    let outcome = apply_fork_choice_step(&mut guard, &step, None);
     let (accepted, error) = match outcome {
         Ok(()) => (true, None),
         Err(err) => {
@@ -335,77 +331,6 @@ async fn run_verify_signatures(
 // Helpers
 // ============================================================================
 
-/// Dispatch a fork-choice step against the held Store.
-fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
-    match step.step_type.as_str() {
-        "tick" => {
-            let genesis_time = store.config().genesis_time;
-            let timestamp_ms = match (step.time, step.interval) {
-                (Some(time_s), _) => time_s * 1000,
-                (None, Some(interval)) => {
-                    genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
-                }
-                (None, None) => return Err("tick step missing time and interval".to_string()),
-            };
-            store::on_tick(store, timestamp_ms, step.has_proposal.unwrap_or(false));
-            Ok(())
-        }
-        "block" => {
-            let block_data = step
-                .block
-                .ok_or_else(|| "block step missing block data".to_string())?;
-            let signed_block = block_data.to_blank_signed_block();
-            // Match the spec-test runner: advance time to the block's slot
-            // before importing, unless the step delivers the block ahead of
-            // the store clock.
-            if step.tick_to_slot {
-                let block_time_ms = store.config().genesis_time * 1000
-                    + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-                store::on_tick(store, block_time_ms, true);
-            }
-            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())
-        }
-        "attestation" => {
-            let att = step
-                .attestation
-                .ok_or_else(|| "attestation step missing data".to_string())?;
-            let signed = SignedAttestation {
-                validator_id: att
-                    .validator_id
-                    .ok_or_else(|| "attestation step missing validatorId".to_string())?,
-                data: att.data.into(),
-                signature: att
-                    .signature
-                    .ok_or_else(|| "attestation step missing signature".to_string())?,
-            };
-            store::on_gossip_attestation(store, &signed, step.is_aggregator.unwrap_or(false))
-                .map_err(|e| e.to_string())
-        }
-        "gossipAggregatedAttestation" => {
-            let att = step
-                .attestation
-                .ok_or_else(|| "gossipAggregatedAttestation step missing data".to_string())?;
-            let proof = att
-                .proof
-                .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
-            let participants: EthAggregationBits = proof.participants.into();
-            let proof_bytes: Vec<u8> = proof.proof.into();
-            let proof_data = ByteList512KiB::try_from(proof_bytes)
-                .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
-            let data: ethlambda_types::attestation::AttestationData = att.data.into();
-            let aggregated = SignedAggregatedAttestation {
-                proof: TypeOneMultiSignature::new(participants, proof_data),
-                data,
-            };
-            store::on_gossip_aggregated_attestation(store, aggregated).map_err(|e| e.to_string())
-        }
-        // `checks`-only steps are no-ops here: the simulator validates them
-        // against the snapshot returned alongside this response.
-        "checks" => Ok(()),
-        other => Err(format!("unknown step type: {other}")),
-    }
-}
-
 /// Read the post-state summary expected by the hive `state_transition/run`
 /// schema.
 fn post_summary(state: &State) -> StateTransitionPost {
@@ -421,11 +346,15 @@ fn post_summary(state: &State) -> StateTransitionPost {
 fn snapshot_store(store: &Store) -> DriverSnapshot {
     DriverSnapshot {
         head_slot: store.head_slot(),
-        head_root: store.head(),
-        time: store.time(),
-        justified_checkpoint: store.latest_justified(),
-        finalized_checkpoint: store.latest_finalized(),
-        safe_target: store.safe_target(),
+        head_root: store.head().expect("head exists"),
+        time: store.time().expect("store time exists"),
+        justified_checkpoint: store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        finalized_checkpoint: store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+        safe_target: store.safe_target().expect("safe target exists"),
     }
 }
 
@@ -449,8 +378,8 @@ mod tests {
         // Head, time, checkpoints all read without panicking; that's the
         // contract `init_fork_choice` relies on before the first reset.
         let _ = store.head();
-        assert_eq!(store.time(), 0);
-        assert_eq!(store.latest_justified().slot, 0);
-        assert_eq!(store.latest_finalized().slot, 0);
+        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.latest_justified().unwrap().slot, 0);
+        assert_eq!(store.latest_finalized().unwrap().slot, 0);
     }
 }

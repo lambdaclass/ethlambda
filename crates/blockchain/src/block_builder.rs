@@ -22,7 +22,7 @@ use ethlambda_state_transition::{
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, Block, BlockBody, TypeOneMultiSignature},
+    block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{JustifiedSlots, State},
@@ -42,6 +42,21 @@ pub struct PostBlockCheckpoints {
     pub finalized: Checkpoint,
 }
 
+/// Proposer-side block-building policy, seeded from the CLI at spawn.
+#[derive(Debug, Clone, Copy)]
+pub struct ProposerConfig {
+    /// How the proposer collapses same-`AttestationData` proofs (a block may
+    /// carry at most one entry per data). When true, they are merged via
+    /// recursive single-message aggregation into a union-coverage proof
+    /// (leanSpec #510); when false, only the single best-coverage proof per
+    /// data is kept, skipping the leanVM work.
+    pub enable_proposer_aggregation: bool,
+    /// Maximum number of distinct attestations to pack into a built block.
+    /// Proposer-side self-limit only; clamped to `MAX_ATTESTATIONS_DATA` during
+    /// selection so the block never exceeds the cap `on_block` enforces.
+    pub max_attestations_per_block: usize,
+}
+
 /// Build a valid block on top of this state.
 ///
 /// Selects attestations via `select_attestations`, collapses entries sharing
@@ -51,8 +66,8 @@ pub struct PostBlockCheckpoints {
 /// caller.
 ///
 /// The collapse strategy is gated by `enable_proposer_aggregation`:
-/// - **enabled**: same-data proofs are merged via recursive Type-1 aggregation
-///   into a single union-coverage proof (leanSpec #510). Maximizes voter
+/// - **enabled**: same-data proofs are merged via recursive single-message
+///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes voter
 ///   coverage per entry at the cost of a leanVM aggregation per duplicated
 ///   data entry.
 /// - **disabled** (default): the single best-coverage proof per data is kept
@@ -61,15 +76,20 @@ pub struct PostBlockCheckpoints {
 ///
 /// Either way the output has one entry per `AttestationData` and the
 /// attestation-to-proof correspondence stays 1:1.
+///
+/// `config.max_attestations_per_block` bounds how many distinct
+/// `AttestationData` entries are packed (a proposer-side self-limit). It is
+/// clamped to `MAX_ATTESTATIONS_DATA` so the block never exceeds the cap
+/// `on_block` enforces on incoming blocks.
 pub(crate) fn build_block(
     head_state: &State,
     slot: u64,
     proposer_index: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
-    enable_proposer_aggregation: bool,
-) -> Result<(Block, Vec<TypeOneMultiSignature>, PostBlockCheckpoints), StoreError> {
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    config: ProposerConfig,
+) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
     let select_start = Instant::now();
@@ -79,6 +99,7 @@ pub(crate) fn build_block(
         parent_root,
         known_block_roots,
         aggregated_payloads,
+        config.max_attestations_per_block,
     );
     metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
 
@@ -87,15 +108,16 @@ pub(crate) fn build_block(
     // Each AttestationData may appear at most once per block (`on_block`
     // rejects duplicates), so same-data entries must be collapsed to one.
     // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
-    // AttestationData are merged via recursive Type-1 aggregation into a
-    // union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
+    // AttestationData are merged via recursive single-message aggregation into
+    // a union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
     // work and keep only the single best-coverage proof per data. Both paths
     // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
-    let compacted = if enable_proposer_aggregation {
+    let compacted = if config.enable_proposer_aggregation {
         compact_attestations(selected, head_state, slot)?
     } else {
-        keep_best_proof_per_data(selected, slot)
+        let running_votes = build_running_votes(head_state);
+        keep_best_proof_per_data(selected, &running_votes, slot)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
 
@@ -142,17 +164,18 @@ pub(crate) fn build_block(
 /// finalization are projected incrementally so dependent attestations become
 /// eligible on the next round without re-running the STF.
 ///
-/// Stops at `MAX_ATTESTATIONS_DATA` distinct data entries or when no
-/// remaining candidate has a positive score. Within-entry proof selection is
-/// delegated to `extend_proofs_greedily`.
+/// Stops at `max_attestations_per_block` distinct data entries (clamped to
+/// `MAX_ATTESTATIONS_DATA`) or when no remaining candidate has a positive
+/// score. Within-entry proof selection is delegated to `extend_proofs_greedily`.
 fn select_attestations(
     head_state: &State,
     slot: u64,
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
-) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
-    let mut selected: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = Vec::new();
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    max_attestations_per_block: usize,
+) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
+    let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
     if aggregated_payloads.is_empty() {
         return selected;
     }
@@ -178,14 +201,13 @@ fn select_attestations(
     // Running per-target-root voter set, seeded from state and updated
     // incrementally as entries are selected. Mirrors the role of Eth2
     // participation flags in Prysm/Lighthouse-style packing.
-    let mut projected = ProjectedState {
-        justified_slots: head_state.justified_slots.clone(),
-        finalized_slot: head_state.latest_finalized.slot,
-        current_votes: build_running_votes(head_state),
-    };
+    let mut projected = ProjectedState::from_head_state(head_state);
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
-    for _round in 0..MAX_ATTESTATIONS_DATA {
+    // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
+    // (`on_block` rejects more), so the proposer-side limit never exceeds it.
+    let max_rounds = max_attestations_per_block.min(MAX_ATTESTATIONS_DATA);
+    for _round in 0..max_rounds {
         let Some((data_root, score, new_voters)) =
             pick_best_candidate(&chain, &processed_data_roots, &projected)
         else {
@@ -204,12 +226,6 @@ fn select_attestations(
         extend_proofs_greedily(proofs, &mut selected, att_data);
 
         let target_root = att_data.target.root;
-        projected
-            .current_votes
-            .entry(target_root)
-            .or_default()
-            .extend(new_voters);
-
         trace!(
             tier = ?score.tier,
             new_voters = score.new_voters,
@@ -220,29 +236,7 @@ fn select_attestations(
             "selected"
         );
 
-        // Project justification / finalization. Finalize implies Justify
-        // (target is justified, AND source is finalized).
-        if score.tier <= Tier::Justify {
-            justified_slots_ops::extend_to_slot(
-                &mut projected.justified_slots,
-                projected.finalized_slot,
-                att_data.target.slot,
-            );
-            justified_slots_ops::set_justified(
-                &mut projected.justified_slots,
-                projected.finalized_slot,
-                att_data.target.slot,
-            );
-            // Justified target's voter bucket is no longer relevant for
-            // scoring (no further entry can target it: filter rejects).
-            projected.current_votes.remove(&target_root);
-        }
-        if score.tier == Tier::Finalize {
-            let new_finalized = att_data.source.slot;
-            let delta = new_finalized.saturating_sub(projected.finalized_slot) as usize;
-            justified_slots_ops::shift_window(&mut projected.justified_slots, delta);
-            projected.finalized_slot = new_finalized;
-        }
+        projected.advance(score.tier, att_data, new_voters);
     }
 
     selected
@@ -267,24 +261,22 @@ fn pick_best_candidate(
         if processed_data_roots.contains(data_root) {
             continue;
         }
-        if let Err(reason) = entry_passes_filters(
+        if let Err(reason) = projected.entry_passes_filters(
             att_data,
             chain.known_block_roots,
             chain.extended_historical_block_hashes,
-            &projected.justified_slots,
-            projected.finalized_slot,
         ) {
             trace_skipped_attestation(reason, att_data, data_root);
             continue;
         }
 
-        let Some((score, new_voters)) = score_entry(
-            att_data,
-            proofs,
-            &projected.current_votes,
-            projected.finalized_slot,
-            chain.validator_count,
-        ) else {
+        let coverage: HashSet<u64> = proofs
+            .iter()
+            .flat_map(|proof| proof.participant_indices())
+            .collect();
+        let Some((score, new_voters)) =
+            projected.score_entry(att_data, &coverage, chain.validator_count)
+        else {
             trace_skipped_attestation("zero_new_voters", att_data, data_root);
             continue;
         };
@@ -303,131 +295,189 @@ fn pick_best_candidate(
 /// the chain-level facts used to filter and score entries. Built once before
 /// the round loop in `select_attestations`.
 struct ChainContext<'a> {
-    aggregated_payloads: &'a HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)>,
+    aggregated_payloads: &'a HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     known_block_roots: &'a HashSet<H256>,
     extended_historical_block_hashes: &'a [H256],
     validator_count: usize,
 }
 
-/// Mutable projection of the post-state that `select_attestations` maintains
-/// across rounds: which slots are justified, which slot is finalized, and the
-/// running per-target-root voter set.
-struct ProjectedState {
-    justified_slots: JustifiedSlots,
-    finalized_slot: u64,
-    current_votes: HashMap<H256, HashSet<u64>>,
+/// Mutable projection of the post-state that a tiered greedy selector
+/// maintains across rounds: which slots are justified, which slot is
+/// finalized, and the running per-target-root voter set.
+///
+/// Shared by `select_attestations` (block proposal) and
+/// `aggregation::snapshot_aggregation_inputs` (interval-2 aggregation) so the
+/// two selectors project justification/finalization identically. The
+/// aggregator's projection is optimistic (a produced proof is not a processed
+/// block), but that only affects the ordering of prover work within the
+/// deadline, never the correctness of any produced proof.
+pub(crate) struct ProjectedState {
+    pub(crate) justified_slots: JustifiedSlots,
+    pub(crate) finalized_slot: u64,
+    pub(crate) current_votes: HashMap<H256, HashSet<u64>>,
 }
 
-/// Validate a candidate entry against the projected chain view.
-///
-/// Mirrors `state_transition::is_valid_vote`: the entry's head must be known,
-/// its source must be justified, its (source, target) must match the
-/// candidate-block chain view, `target.slot > source.slot`, target must not
-/// already be justified, and target must be a justifiable slot relative to
-/// the projected finalized slot. The genesis self-vote (source == target ==
-/// slot 0) is exempt from the `target.slot > source.slot` and
-/// `target_already_justified` checks since fork-choice bootstrapping needs
-/// it; STF will silently drop it, but it carries fork-choice signal.
-fn entry_passes_filters(
-    att_data: &AttestationData,
-    known_block_roots: &HashSet<H256>,
-    extended_historical_block_hashes: &[H256],
-    projected_justified_slots: &JustifiedSlots,
-    projected_finalized_slot: u64,
-) -> Result<(), &'static str> {
-    if !known_block_roots.contains(&att_data.head.root) {
-        return Err("head_root_unknown");
-    }
-    if !justified_slots_ops::is_slot_justified(
-        projected_justified_slots,
-        projected_finalized_slot,
-        att_data.source.slot,
-    ) {
-        return Err("source_not_justified");
-    }
-    if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
-        return Err("chain_mismatch");
-    }
-    let is_genesis_self_vote = is_genesis_self_vote(att_data);
-    if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
-        return Err("target_not_after_source");
-    }
-    if !is_genesis_self_vote
-        && justified_slots_ops::is_slot_justified(
-            projected_justified_slots,
-            projected_finalized_slot,
-            att_data.target.slot,
-        )
-    {
-        return Err("target_already_justified");
-    }
-    Ok(())
-}
-
-/// Score a single candidate entry under the current projected state.
-///
-/// Returns `None` if the entry has zero new validators relative to the
-/// running voter set for its `target.root` (no marginal value, drop). On
-/// `Some`, the returned `HashSet` is the set of new voters contributed by
-/// this entry (caller uses it to update the running voter map without
-/// re-scanning aggregation bits). A genesis self-vote cannot justify or
-/// finalize and is always scored as tier 3.
-fn score_entry(
-    att_data: &AttestationData,
-    proofs: &[TypeOneMultiSignature],
-    current_votes: &HashMap<H256, HashSet<u64>>,
-    projected_finalized_slot: u64,
-    validator_count: usize,
-) -> Option<(EntryScore, HashSet<u64>)> {
-    let prior_voters = current_votes.get(&att_data.target.root);
-    let prior_count = prior_voters.map_or(0, HashSet::len);
-
-    // Collect voters that this entry adds on top of prior_voters. Avoids
-    // cloning prior_voters; the inner contains() makes this O(participants)
-    // per candidate per round. `extend_proofs_greedily` selects proofs until
-    // none contribute new voters, so its final coverage equals this set
-    // unioned with prior_voters.
-    let mut new_voters: HashSet<u64> = HashSet::new();
-    for proof in proofs {
-        for vid in proof.participant_indices() {
-            if prior_voters.is_none_or(|prior| !prior.contains(&vid)) {
-                new_voters.insert(vid);
-            }
+impl ProjectedState {
+    /// Seed the projection from the head state: justification/finalization as
+    /// of the head, and the running voter set derived from the state's
+    /// justification bitfields (see [`build_running_votes`]).
+    pub(crate) fn from_head_state(head_state: &State) -> Self {
+        Self {
+            justified_slots: head_state.justified_slots.clone(),
+            finalized_slot: head_state.latest_finalized.slot,
+            current_votes: build_running_votes(head_state),
         }
     }
-    if new_voters.is_empty() {
-        return None;
+
+    /// Fold a selected entry into the projection: record its voters under the
+    /// entry's `target.root`, then advance justification/finalization per
+    /// `tier` (Finalize implies Justify). `new_voters` is the entry's marginal
+    /// voter set (block builder) or realized coverage (aggregator); the
+    /// resulting per-target voter set is the same union either way.
+    pub(crate) fn advance(
+        &mut self,
+        tier: Tier,
+        att_data: &AttestationData,
+        new_voters: impl IntoIterator<Item = u64>,
+    ) {
+        let target_root = att_data.target.root;
+        self.current_votes
+            .entry(target_root)
+            .or_default()
+            .extend(new_voters);
+
+        // Finalize implies Justify (target is justified, AND source is
+        // finalized).
+        if tier <= Tier::Justify {
+            justified_slots_ops::extend_to_slot(
+                &mut self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            );
+            justified_slots_ops::set_justified(
+                &mut self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            );
+            // Justified target's voter bucket is no longer relevant for
+            // scoring (no further entry can target it: filter rejects).
+            self.current_votes.remove(&target_root);
+        }
+        if tier == Tier::Finalize {
+            let new_finalized = att_data.source.slot;
+            let delta = new_finalized.saturating_sub(self.finalized_slot) as usize;
+            justified_slots_ops::shift_window(&mut self.justified_slots, delta);
+            self.finalized_slot = new_finalized;
+        }
     }
 
-    let total = prior_count + new_voters.len();
-    let crosses_2_3 = 3 * total >= 2 * validator_count;
+    /// Score a candidate entry from its realized validator `coverage` against
+    /// this projection.
+    ///
+    /// Returns `None` if `coverage` contributes zero validators relative to the
+    /// running voter set for `att_data.target.root` (no marginal value, drop).
+    /// On `Some`, the returned `HashSet` is the subset of `coverage` that is new
+    /// (caller uses it to `advance` the projection without re-scanning
+    /// `coverage`). A genesis self-vote cannot justify or finalize and is always
+    /// scored as tier 3.
+    ///
+    /// The caller resolves `coverage` and passes it in: block building unions a
+    /// data's proof participants (see `pick_best_candidate`); committee-signature
+    /// aggregation passes a job's realized raw + child participants. Keeping the
+    /// proof->coverage transform at the call site lets both share one scorer
+    /// without either duplicating the tiering.
+    pub(crate) fn score_entry(
+        &self,
+        att_data: &AttestationData,
+        coverage: &HashSet<u64>,
+        validator_count: usize,
+    ) -> Option<(EntryScore, HashSet<u64>)> {
+        let prior_voters = self.current_votes.get(&att_data.target.root);
+        let prior_count = prior_voters.map_or(0, HashSet::len);
 
-    // The simple BFT finality condition finalizes the source when it lies past
-    // the finalized boundary (a source at or behind it is already final and must
-    // not re-finalize) and the target is its immediate successor, so the two are
-    // consecutive justified checkpoints in the projected post-state. Mirrors
-    // `try_finalize` in the state transition.
-    let finalizes = crosses_2_3
-        && att_data.source.slot > projected_finalized_slot
-        && att_data.source.slot + 1 == att_data.target.slot;
+        let new_voters: HashSet<u64> = coverage
+            .iter()
+            .copied()
+            .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+            .collect();
+        if new_voters.is_empty() {
+            return None;
+        }
 
-    let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
-        Tier::Build
-    } else if finalizes {
-        Tier::Finalize
-    } else {
-        Tier::Justify
-    };
+        let total = prior_count + new_voters.len();
+        let crosses_2_3 = 3 * total >= 2 * validator_count;
 
-    Some((
-        EntryScore {
+        // The simple BFT finality condition finalizes the source when it lies past
+        // the finalized boundary (a source at or behind it is already final and must
+        // not re-finalize) and the target is its immediate successor, so the two are
+        // consecutive justified checkpoints in the projected post-state. Mirrors
+        // `try_finalize` in the state transition.
+        let finalizes = crosses_2_3
+            && att_data.source.slot > self.finalized_slot
+            && att_data.source.slot + 1 == att_data.target.slot;
+
+        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
+            Tier::Build
+        } else if finalizes {
+            Tier::Finalize
+        } else {
+            Tier::Justify
+        };
+
+        let score = EntryScore {
             tier,
             new_voters: new_voters.len(),
             target_slot: att_data.target.slot,
             att_slot: att_data.slot,
-        },
-        new_voters,
-    ))
+        };
+        Some((score, new_voters))
+    }
+
+    /// Validate a candidate entry against the projection and the given chain
+    /// view.
+    ///
+    /// Mirrors `state_transition::is_valid_vote`: the entry's head must be
+    /// known, its source must be justified, its (source, target) must match
+    /// the candidate-block chain view, `target.slot > source.slot`, and target
+    /// must not already be justified. The genesis self-vote
+    /// (source == target == slot 0) is exempt from the `target.slot >
+    /// source.slot` and `target_already_justified` checks since fork-choice
+    /// bootstrapping needs it; STF will silently drop it, but it carries
+    /// fork-choice signal.
+    pub(crate) fn entry_passes_filters(
+        &self,
+        att_data: &AttestationData,
+        known_block_roots: &HashSet<H256>,
+        extended_historical_block_hashes: &[H256],
+    ) -> Result<(), &'static str> {
+        if !known_block_roots.contains(&att_data.head.root) {
+            return Err("head_root_unknown");
+        }
+        if !justified_slots_ops::is_slot_justified(
+            &self.justified_slots,
+            self.finalized_slot,
+            att_data.source.slot,
+        ) {
+            return Err("source_not_justified");
+        }
+        if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
+            return Err("chain_mismatch");
+        }
+        let is_genesis_self_vote = is_genesis_self_vote(att_data);
+        if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
+            return Err("target_not_after_source");
+        }
+        if !is_genesis_self_vote
+            && justified_slots_ops::is_slot_justified(
+                &self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            )
+        {
+            return Err("target_already_justified");
+        }
+        Ok(())
+    }
 }
 
 /// Selection tier for a candidate `AttestationData` entry.
@@ -437,7 +487,7 @@ fn score_entry(
 /// output (`tier = Finalize` is clearer than `tier = 1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-enum Tier {
+pub(crate) enum Tier {
     /// Applying the entry crosses 2/3 on target AND finalizes the source
     /// (no slot strictly between source.slot and target.slot is still
     /// justifiable given projected finalized_slot).
@@ -465,23 +515,25 @@ enum Tier {
 ///
 /// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EntryScore {
-    tier: Tier,
-    new_voters: usize,
+pub(crate) struct EntryScore {
+    pub(crate) tier: Tier,
+    pub(crate) new_voters: usize,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     target_slot: u64,
+    /// Read only inside [`EntryScore::ordering_key`]; kept private.
     att_slot: u64,
 }
 
 /// Total order over candidate entries; the smallest value is the best pick.
 /// `tier` leads, then three tier-dependent `Reverse`-encoded priorities, then
 /// `data_root` as the deterministic tiebreak. See [`EntryScore::ordering_key`].
-type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
+pub(crate) type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
 
 impl EntryScore {
     /// Sort key where the smallest tuple is the best candidate. `tier` always
     /// leads; the remaining three slots carry tier-dependent priorities (see
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
-    fn ordering_key(&self, data_root: H256) -> OrderingKey {
+    pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
         let more_new_voters = Reverse(self.new_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
@@ -531,10 +583,10 @@ fn build_running_votes(state: &State) -> HashMap<H256, HashSet<u64>> {
 /// - Multiple entries: merged into one using recursive proof aggregation
 ///   (leanSpec PR #510).
 fn compact_attestations(
-    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     head_state: &State,
     block_slot: u64,
-) -> Result<Vec<(AggregatedAttestation, TypeOneMultiSignature)>, StoreError> {
+) -> Result<Vec<(AggregatedAttestation, SingleMessageAggregate)>, StoreError> {
     // Group indices by AttestationData, preserving first-occurrence order
     let mut order: Vec<AttestationData> = Vec::new();
     let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
@@ -563,7 +615,7 @@ fn compact_attestations(
     );
 
     // Wrap in Option so we can .take() items by index without cloning
-    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
+    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
         entries.into_iter().map(Some).collect();
 
     let mut compacted = Vec::with_capacity(order.len());
@@ -577,7 +629,7 @@ fn compact_attestations(
         }
 
         // Collect all entries for this AttestationData
-        let group_items: Vec<(AggregatedAttestation, TypeOneMultiSignature)> = indices
+        let group_items: Vec<(AggregatedAttestation, SingleMessageAggregate)> = indices
             .iter()
             .map(|&idx| items[idx].take().expect("index used once"))
             .collect();
@@ -612,7 +664,7 @@ fn compact_attestations(
         let merged_proof_data = aggregate_proofs(children, &data_root, slot)
             .map_err(StoreError::SignatureAggregationFailed)?;
 
-        let merged_proof = TypeOneMultiSignature::new(merged_bits.clone(), merged_proof_data);
+        let merged_proof = SingleMessageAggregate::new(merged_bits.clone(), merged_proof_data);
         let merged_att = AggregatedAttestation {
             aggregation_bits: merged_bits,
             data,
@@ -628,30 +680,28 @@ fn compact_attestations(
 ///
 /// The block format permits at most one entry per `AttestationData`: `on_block`
 /// rejects duplicates (`StoreError::DuplicateAttestationData`). When proposer
-/// aggregation is disabled we therefore cannot keep every selected proof, nor
-/// can we merge them. For each group sharing an `AttestationData` we keep the
-/// single proof covering the most validators (ties broken by first occurrence)
-/// and drop the rest. No leanVM aggregation runs; coverage is whatever the best
-/// individual proof already had, which is the cost of skipping aggregation.
+/// aggregation is disabled we can neither keep every selected proof nor merge
+/// them, so for each group sharing an `AttestationData` exactly one proof
+/// survives and the rest are dropped. No leanVM aggregation runs.
+///
+/// The surviving proof is the one adding the most NEW voters, with ties
+/// broken by larger absolute participant count, then first occurrence.
 fn keep_best_proof_per_data(
-    entries: Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    entries: Vec<(AggregatedAttestation, SingleMessageAggregate)>,
+    running_votes: &HashMap<H256, HashSet<u64>>,
     block_slot: u64,
-) -> Vec<(AggregatedAttestation, TypeOneMultiSignature)> {
-    // Preserve first-occurrence order of distinct AttestationData; for each,
-    // track the index of the best (most participants) entry seen so far.
+) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
+    // Group entry indices by AttestationData, preserving first-occurrence order.
     let mut order: Vec<AttestationData> = Vec::new();
-    let mut best_index: HashMap<AttestationData, usize> = HashMap::new();
+    let mut groups: HashMap<AttestationData, Vec<usize>> = HashMap::new();
     for (i, (att, _)) in entries.iter().enumerate() {
-        match best_index.entry(att.data.clone()) {
+        match groups.entry(att.data.clone()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 order.push(e.key().clone());
-                e.insert(i);
+                e.insert(vec![i]);
             }
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                let current_best = entries[*e.get()].0.aggregation_bits.count_ones();
-                if att.aggregation_bits.count_ones() > current_best {
-                    e.insert(i);
-                }
+                e.get_mut().push(i);
             }
         }
     }
@@ -669,15 +719,44 @@ fn keep_best_proof_per_data(
         "Skipping attestation compaction"
     );
 
-    let mut items: Vec<Option<(AggregatedAttestation, TypeOneMultiSignature)>> =
+    // Pick the surviving index per group: most new coverage (over in-state
+    // voters plus those already claimed by earlier groups this block), then
+    // densest proof, then earliest occurrence. Computed over `entries` before
+    // it is moved into `items` for extraction.
+    let mut claimed: HashMap<H256, HashSet<u64>> = HashMap::new();
+    let mut best_per_data: Vec<usize> = Vec::with_capacity(order.len());
+    for data in &order {
+        let target_root = data.target.root;
+        let prior = running_votes.get(&target_root);
+        let block_claimed = claimed.get(&target_root);
+        let best = *groups[data]
+            .iter()
+            .max_by_key(|&&idx| {
+                let (att, proof) = &entries[idx];
+                let marginal = proof
+                    .participant_indices()
+                    .filter(|vid| {
+                        prior.is_none_or(|voted| !voted.contains(vid))
+                            && block_claimed.is_none_or(|voted| !voted.contains(vid))
+                    })
+                    .count();
+                (marginal, att.aggregation_bits.count_ones(), Reverse(idx))
+            })
+            .expect("group is non-empty");
+        // Record the winner's voters so a later group sharing this target root
+        // does not treat them as new coverage.
+        claimed
+            .entry(target_root)
+            .or_default()
+            .extend(entries[best].1.participant_indices());
+        best_per_data.push(best);
+    }
+
+    let mut items: Vec<Option<(AggregatedAttestation, SingleMessageAggregate)>> =
         entries.into_iter().map(Some).collect();
-    order
-        .iter()
-        .map(|data| {
-            items[best_index[data]]
-                .take()
-                .expect("best index taken once")
-        })
+    best_per_data
+        .into_iter()
+        .map(|idx| items[idx].take().expect("best index taken once"))
         .collect()
 }
 
@@ -695,8 +774,8 @@ fn keep_best_proof_per_data(
 /// Each selected proof is appended to `selected` paired with its
 /// corresponding AggregatedAttestation.
 fn extend_proofs_greedily(
-    proofs: &[TypeOneMultiSignature],
-    selected: &mut Vec<(AggregatedAttestation, TypeOneMultiSignature)>,
+    proofs: &[SingleMessageAggregate],
+    selected: &mut Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     att_data: &AttestationData,
 ) {
     if proofs.is_empty() {
@@ -790,7 +869,7 @@ mod tests {
     use super::*;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-        block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, TypeOneMultiSignature},
+        block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
         checkpoint::Checkpoint,
         state::State,
     };
@@ -841,16 +920,16 @@ mod tests {
         };
 
         // Supermajority (3 of 4) so the entry crosses 2/3.
-        let proofs = vec![TypeOneMultiSignature::empty(make_bits(&[0, 1, 2]))];
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: FINALIZED_SLOT,
+            current_votes: HashMap::new(),
+        };
 
-        let (score, _) = score_entry(
-            &att_data,
-            &proofs,
-            &HashMap::new(),
-            FINALIZED_SLOT,
-            NUM_VALIDATORS,
-        )
-        .expect("entry contributes new voters");
+        let (score, _) = projected
+            .score_entry(&att_data, &coverage, NUM_VALIDATORS)
+            .expect("entry contributes new voters");
 
         assert_eq!(
             score.tier,
@@ -949,7 +1028,7 @@ mod tests {
 
         // Simulate a stall: populate the payload pool with many distinct entries.
         // Each has a unique attestation slot and a large proof payload.
-        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
             HashMap::new();
 
         for i in 0..NUM_PAYLOAD_ENTRIES {
@@ -970,7 +1049,7 @@ mod tests {
 
             let proof_bytes: Vec<u8> = vec![0xAB; PROOF_SIZE];
             let proof_data = SszList::try_from(proof_bytes).expect("proof fits in ByteListMiB");
-            let proof = TypeOneMultiSignature::new(bits, proof_data);
+            let proof = SingleMessageAggregate::new(bits, proof_data);
 
             aggregated_payloads.insert(data_root, (att_data, vec![proof]));
         }
@@ -983,7 +1062,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1017,6 +1099,138 @@ mod tests {
             signed_block.message.body.attestations.len(),
             ssz_bytes.len(),
             MAX_PAYLOAD_SIZE,
+        );
+    }
+
+    /// A proposer-side `max_attestations_per_block` below `MAX_ATTESTATIONS_DATA`
+    /// must cap how many distinct `AttestationData` entries the built block
+    /// carries. The pool holds more selectable entries than the limit, so the
+    /// limit (not candidate exhaustion) is the binding constraint: building the
+    /// same pool at `MAX_ATTESTATIONS_DATA` packs strictly more.
+    #[test]
+    fn build_block_respects_configured_attestation_limit() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+        };
+        use libssz_types::SszList;
+
+        const NUM_VALIDATORS: usize = 50;
+        const NUM_PAYLOAD_ENTRIES: usize = 10;
+        const CONFIGURED_LIMIT: usize = 3;
+
+        const HEAD_SLOT: u64 = 51;
+        const TARGET_SLOT: u64 = 5;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| ethlambda_types::state::Validator {
+                attestation_pubkey: [i as u8; 52],
+                proposal_pubkey: [i as u8; 52],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let historical_block_hashes = SszList::try_from(hashes.clone()).unwrap();
+
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes,
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        let slot = HEAD_SLOT + 1;
+        let proposer_index = slot % NUM_VALIDATORS as u64;
+
+        // Common source / target / head so every payload passes the chain-match
+        // filter; distinct attestation slots give distinct data_roots, and one
+        // fresh validator per entry keeps each candidate scoring (adds a voter).
+        let source = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+        let target = Checkpoint {
+            root: hashes[TARGET_SLOT as usize],
+            slot: TARGET_SLOT,
+        };
+        let head = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+        known_block_roots.insert(hashes[0]);
+
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
+            HashMap::new();
+        for i in 0..NUM_PAYLOAD_ENTRIES {
+            let att_data = AttestationData {
+                slot: (i + 1) as u64,
+                head,
+                target,
+                source,
+            };
+            let data_root = att_data.hash_tree_root();
+
+            let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+            bits.set(i % NUM_VALIDATORS, true).unwrap();
+            let proof_data = SszList::try_from(vec![0xABu8; 8]).expect("proof fits in ByteListMiB");
+            let proof = SingleMessageAggregate::new(bits, proof_data);
+
+            aggregated_payloads.insert(data_root, (att_data, vec![proof]));
+        }
+
+        let build = |limit: usize| {
+            build_block(
+                &head_state,
+                slot,
+                proposer_index,
+                parent_root,
+                &known_block_roots,
+                &aggregated_payloads,
+                ProposerConfig {
+                    enable_proposer_aggregation: false,
+                    max_attestations_per_block: limit,
+                },
+            )
+            .expect("build_block should succeed")
+            .0
+            .body
+            .attestations
+            .len()
+        };
+
+        let limited = build(CONFIGURED_LIMIT);
+        let unlimited = build(MAX_ATTESTATIONS_DATA);
+
+        assert!(
+            (1..=CONFIGURED_LIMIT).contains(&limited),
+            "configured limit should cap attestations to {CONFIGURED_LIMIT}: got {limited}"
+        );
+        assert!(
+            unlimited > CONFIGURED_LIMIT,
+            "the pool must offer more than {CONFIGURED_LIMIT} selectable entries so the limit \
+             is the binding constraint: MAX_ATTESTATIONS_DATA build packed {unlimited}"
         );
     }
 
@@ -1105,11 +1319,11 @@ mod tests {
         };
         let data_root = att_data.hash_tree_root();
         let proofs = vec![
-            TypeOneMultiSignature::empty(make_bits(&[0])),
-            TypeOneMultiSignature::empty(make_bits(&[1, 2])),
+            SingleMessageAggregate::empty(make_bits(&[0])),
+            SingleMessageAggregate::empty(make_bits(&[1, 2])),
         ];
 
-        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<TypeOneMultiSignature>)> =
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
             HashMap::new();
         aggregated_payloads.insert(data_root, (att_data.clone(), proofs));
 
@@ -1120,7 +1334,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            false,
+            ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1135,7 +1352,7 @@ mod tests {
         assert_eq!(
             signatures.len(),
             1,
-            "one Type-1 proof per attestation entry"
+            "one single-message aggregate per attestation entry"
         );
         let kept = &block.body.attestations[0];
         assert_eq!(
@@ -1146,6 +1363,173 @@ mod tests {
             kept.aggregation_bits.count_ones(),
             2,
             "the best-coverage proof ({{1, 2}}) is kept over the smaller one ({{0}})"
+        );
+    }
+
+    /// When several proofs share one `AttestationData` but the proposer cannot
+    /// aggregate, only one may be kept. Selecting by absolute participant count
+    /// starves a small subnet whose votes are the only ones still missing from
+    /// the target's in-state coverage: a larger subnet already counted in-state
+    /// keeps winning yet adds nothing, so the target never reaches 2/3.
+    ///
+    /// This mirrors the union coverage `compact_attestations` achieves when
+    /// aggregation is enabled: the kept proof must be the one adding the most
+    /// NEW voters over the target's in-state voter set, not the largest one.
+    #[test]
+    fn keep_best_proof_per_data_prefers_marginal_coverage_over_absolute_size() {
+        let target_root = H256([9u8; 32]);
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                slot: 5,
+                root: target_root,
+            },
+            source: Checkpoint::default(),
+        };
+
+        // Two candidate proofs for the same data: a 3-validator subnet already
+        // fully counted in-state, and a 2-validator subnet {3, 7} that is the
+        // only remaining new coverage.
+        let large = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[0, 1, 2]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[0, 1, 2])),
+        );
+        let small = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[3, 7]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[3, 7])),
+        );
+        let entries = vec![large, small];
+
+        // In-state, validators {0, 1, 2} already voted for this target.
+        let mut running_votes: HashMap<H256, HashSet<u64>> = HashMap::new();
+        running_votes.insert(target_root, HashSet::from([0, 1, 2]));
+
+        let out = keep_best_proof_per_data(entries, &running_votes, att_data.slot);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "a block carries one entry per AttestationData"
+        );
+        let kept = &out[0].0;
+        assert_eq!(
+            kept.aggregation_bits.count_ones(),
+            2,
+            "marginal coverage, not absolute participant count, drives the choice"
+        );
+        assert!(
+            kept.aggregation_bits.get(3).unwrap_or(false)
+                && kept.aggregation_bits.get(7).unwrap_or(false),
+            "the small subnet {{3, 7}} adds the only new coverage and must be kept over the \
+             larger {{0, 1, 2}} subnet already counted in-state"
+        );
+    }
+
+    /// With no in-state votes for the target (a fresh target), marginal
+    /// coverage equals absolute count, so `keep_best_proof_per_data` keeps the
+    /// larger proof, preserving the pre-existing behavior.
+    #[test]
+    fn keep_best_proof_per_data_keeps_largest_when_target_is_fresh() {
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                slot: 5,
+                root: H256([9u8; 32]),
+            },
+            source: Checkpoint::default(),
+        };
+        let small = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[0]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[0])),
+        );
+        let large = (
+            AggregatedAttestation {
+                aggregation_bits: make_bits(&[1, 2]),
+                data: att_data.clone(),
+            },
+            SingleMessageAggregate::empty(make_bits(&[1, 2])),
+        );
+        let entries = vec![small, large];
+
+        let out = keep_best_proof_per_data(entries, &HashMap::new(), att_data.slot);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].0.aggregation_bits.count_ones(),
+            2,
+            "with an empty in-state voter set the larger proof wins on absolute count"
+        );
+    }
+
+    /// Two distinct `AttestationData` entries can share one `target.root`
+    /// (differing only in `slot`, `head`, or `source`). The STF unions all
+    /// their voters onto that target, so the collapse must score each group's
+    /// candidates against voters already claimed by earlier groups in this
+    /// block, not just the frozen in-state snapshot. Otherwise both groups keep
+    /// the same subnet and the block under-covers the target.
+    #[test]
+    fn keep_best_proof_per_data_accounts_for_voters_claimed_by_earlier_groups() {
+        let target_root = H256([9u8; 32]);
+        let target = Checkpoint {
+            slot: 5,
+            root: target_root,
+        };
+        // Same target root, different attestation slots -> distinct data roots.
+        let data_a = AttestationData {
+            slot: 5,
+            head: Checkpoint::default(),
+            target,
+            source: Checkpoint::default(),
+        };
+        let data_b = AttestationData {
+            slot: 6,
+            head: Checkpoint::default(),
+            target,
+            source: Checkpoint::default(),
+        };
+
+        // A has a single proof {3, 7}. B offers {3, 7} (already claimed by A)
+        // and {8, 9} (the only new coverage). B's {3, 7} is listed first, so
+        // absent claim-tracking the first-occurrence tiebreak would keep it.
+        let entry = |bits: &[usize], data: &AttestationData| {
+            (
+                AggregatedAttestation {
+                    aggregation_bits: make_bits(bits),
+                    data: data.clone(),
+                },
+                SingleMessageAggregate::empty(make_bits(bits)),
+            )
+        };
+        let entries = vec![
+            entry(&[3, 7], &data_a),
+            entry(&[3, 7], &data_b),
+            entry(&[8, 9], &data_b),
+        ];
+
+        let out = keep_best_proof_per_data(entries, &HashMap::new(), data_a.slot);
+
+        assert_eq!(out.len(), 2, "one entry per distinct AttestationData");
+        assert!(
+            out[0].0.aggregation_bits.get(3).unwrap_or(false)
+                && out[0].0.aggregation_bits.get(7).unwrap_or(false),
+            "group A keeps its only proof {{3, 7}}"
+        );
+        assert!(
+            out[1].0.aggregation_bits.get(8).unwrap_or(false)
+                && out[1].0.aggregation_bits.get(9).unwrap_or(false),
+            "group B must keep {{8, 9}}: {{3, 7}} was already claimed by group A for \
+             the same target root, so it adds no new coverage"
         );
     }
 
@@ -1240,7 +1624,7 @@ mod tests {
         for i in 0..SUPERMAJORITY {
             bits.set(i, true).unwrap();
         }
-        let proof = TypeOneMultiSignature::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof = SingleMessageAggregate::new(bits, SszList::try_from(vec![0xAB; 64]).unwrap());
 
         let mut aggregated_payloads = HashMap::new();
         aggregated_payloads.insert(data_root, (att_data.clone(), vec![proof]));
@@ -1256,7 +1640,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1371,8 +1758,8 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         let proof_a =
-            TypeOneMultiSignature::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
-        let proof_b = TypeOneMultiSignature::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
+            SingleMessageAggregate::new(bits.clone(), SszList::try_from(vec![0xAB; 64]).unwrap());
+        let proof_b = SingleMessageAggregate::new(bits, SszList::try_from(vec![0xCD; 64]).unwrap());
 
         let mut aggregated_payloads = HashMap::new();
         aggregated_payloads.insert(att_a.hash_tree_root(), (att_a.clone(), vec![proof_a]));
@@ -1389,7 +1776,10 @@ mod tests {
             parent_root,
             &known_block_roots,
             &aggregated_payloads,
-            true,
+            ProposerConfig {
+                enable_proposer_aggregation: true,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
         )
         .expect("build_block should succeed");
 
@@ -1425,14 +1815,14 @@ mod tests {
                     aggregation_bits: bits_a.clone(),
                     data: data_a.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_a),
+                SingleMessageAggregate::empty(bits_a),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_b.clone(),
                     data: data_b.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_b),
+                SingleMessageAggregate::empty(bits_b),
             ),
         ];
 
@@ -1459,21 +1849,21 @@ mod tests {
                     aggregation_bits: bits_0.clone(),
                     data: data_a.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_0),
+                SingleMessageAggregate::empty(bits_0),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_1.clone(),
                     data: data_b.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_1),
+                SingleMessageAggregate::empty(bits_1),
             ),
             (
                 AggregatedAttestation {
                     aggregation_bits: bits_2.clone(),
                     data: data_c.clone(),
                 },
-                TypeOneMultiSignature::empty(bits_2),
+                SingleMessageAggregate::empty(bits_2),
             ),
         ];
 
@@ -1500,9 +1890,9 @@ mod tests {
         //   A = {0, 1, 2, 3}  (4 validators — largest, picked first)
         //   B = {2, 3, 4}     (overlaps A on {2,3} but adds validator 4)
         //   C = {1, 2}        (subset of A — adds nothing, must be skipped)
-        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[2, 3, 4]));
-        let proof_c = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        let proof_a = SingleMessageAggregate::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = SingleMessageAggregate::empty(make_bits(&[2, 3, 4]));
+        let proof_c = SingleMessageAggregate::empty(make_bits(&[1, 2]));
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b, proof_c], &mut selected, &data);
@@ -1535,8 +1925,8 @@ mod tests {
         // B's participants are a subset of A's. After picking A, B offers zero
         // new coverage and must not be selected (its inclusion would also
         // violate the disjoint invariant).
-        let proof_a = TypeOneMultiSignature::empty(make_bits(&[0, 1, 2, 3]));
-        let proof_b = TypeOneMultiSignature::empty(make_bits(&[1, 2]));
+        let proof_a = SingleMessageAggregate::empty(make_bits(&[0, 1, 2, 3]));
+        let proof_b = SingleMessageAggregate::empty(make_bits(&[1, 2]));
 
         let mut selected = Vec::new();
         extend_proofs_greedily(&[proof_a, proof_b], &mut selected, &data);

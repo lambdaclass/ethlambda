@@ -89,7 +89,7 @@ pub(crate) struct CliOptions {
     ///
     /// A block may carry at most one entry per `AttestationData`, so the
     /// proposer must collapse same-data proofs either way. When set,
-    /// `build_block` merges them via recursive Type-1 aggregation into a single
+    /// `build_block` merges them via recursive single-message aggregation into a single
     /// union-coverage proof per data (leanSpec #510), maximizing voter coverage
     /// at the cost of a leanVM aggregation per duplicated data entry. When unset
     /// (the default), it instead keeps only the single best-coverage proof per
@@ -97,4 +97,56 @@ pub(crate) struct CliOptions {
     /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
+    /// Maximum number of distinct attestations to pack when building a block.
+    ///
+    /// Bounds how many distinct `AttestationData` entries the proposer includes
+    /// in a block it builds. This is a proposer-side self-limit only: it does
+    /// NOT change the consensus cap for accepting blocks from peers, which
+    /// stays at `MAX_ATTESTATIONS_DATA`. Values above `MAX_ATTESTATIONS_DATA`
+    /// are clamped to it, since a block carrying more would be rejected by
+    /// `on_block`.
+    #[arg(long, default_value = "3")]
+    pub(crate) max_attestations_per_block: usize,
+    /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
+    /// `shadow-integration` feature).
+    #[cfg(feature = "shadow-integration")]
+    #[command(flatten)]
+    pub(crate) shadow: ShadowOptions,
+}
+
+/// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
+/// `shadow-integration` feature.
+#[cfg(feature = "shadow-integration")]
+#[derive(Debug, clap::Args)]
+pub(crate) struct ShadowOptions {
+    /// Shadow sim only: replace the XMSS aggregation prover/verifier with a
+    /// deterministic stub (no leanVM proving/verifying). Off by default.
+    #[arg(long, default_value = "false")]
+    pub(crate) shadow_xmss_fake: bool,
+
+    /// Shadow sim only: signatures aggregated per second. Injects a sleep of
+    /// n/rate seconds into aggregation so its CPU cost shows up on Shadow's
+    /// virtual clock. Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_aggregate_signatures_rate: Option<f64>,
+
+    /// Shadow sim only: signatures verified per aggregate per second; injects
+    /// a sleep of n/rate seconds into verification. Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_verify_aggregated_signatures_rate: Option<f64>,
+
+    /// Shadow sim only: Type-1 components merged into a Type-2 per second;
+    /// injects a sleep of n/rate seconds into the proposal Type-2 merge.
+    /// Unset or <= 0 disables.
+    #[arg(long)]
+    pub(crate) shadow_xmss_merge_rate: Option<f64>,
+
+    /// Shadow sim only: byte length of each fake stub proof. Defaults to 32
+    /// KiB; capped at the 512 KiB on-wire proof limit.
+    #[arg(
+        long,
+        default_value_t = ethlambda_crypto::shadow_cost::DEFAULT_FAKE_PROOF_SIZE as u64,
+        value_parser = clap::value_parser!(u64).range(1..=524_288)
+    )]
+    pub(crate) shadow_xmss_fake_proof_size: u64,
 }

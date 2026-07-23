@@ -8,7 +8,7 @@
 //!
 //!   signedBlock:
 //!     block:  {...standard block fields...}
-//!     proof:  { proof: { data: "0x<hex-encoded merged Type-2 bytes>" } }
+//!     proof:  { proof: { data: "0x<hex-encoded merged multi-message aggregate bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
 use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
@@ -34,6 +34,7 @@ impl VerifySignaturesTestVector {
 
 /// A single verify-signatures test case.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifySignaturesTest {
     #[allow(dead_code)]
     pub network: String,
@@ -49,24 +50,33 @@ pub struct VerifySignaturesTest {
     /// spellings are accepted.
     #[serde(default, rename = "expectException", alias = "rejectionReason")]
     pub expect_exception: Option<String>,
+    /// Aggregation proof regime (see [`crate::fork_choice::ForkChoiceTest`]).
+    /// Captured only so `deny_unknown_fields` accepts it.
+    #[serde(rename = "proofSetting")]
+    #[allow(dead_code)]
+    pub proof_setting: Option<u8>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
     pub info: TestInfo,
 }
 
-/// Fixture-side signed block: a block plus its raw merged Type-2 proof bytes.
+/// Fixture-side signed block: a block plus its raw merged multi-message
+/// aggregate proof bytes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
     pub proof: MergedProof,
 }
 
-/// Merged Type-2 proof container for `SignedBlock.proof` (leanSpec PR #799).
+/// Merged multi-message aggregate proof container for `SignedBlock.proof`
+/// (leanSpec PR #799).
 ///
 /// The multi-signature container nests the raw lean-multisig wire one level
 /// deep: `{ "proof": { "data": "0x..." } }`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergedProof {
     pub proof: HexBytes,
 }
@@ -79,6 +89,7 @@ impl MergedProof {
 
 /// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HexBytes {
     pub data: String,
 }
@@ -124,7 +135,7 @@ impl From<TestSignedBlock> for SignedBlock {
 
 impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
-    /// Type-2 proof bytes verbatim.
+    /// multi-message aggregate proof bytes verbatim.
     ///
     /// The container carries the raw lean-multisig wire in the
     /// `MultiMessageAggregate` stored by `SignedBlock.proof`.
