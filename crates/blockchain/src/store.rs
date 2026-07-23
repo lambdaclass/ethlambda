@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
 use ethlambda_storage::{ForkCheckpoints, Store};
@@ -25,19 +25,44 @@ use crate::{
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
+/// Intermediate fork-choice data produced by [`update_head`], carried so the
+/// fork choice tree can be rendered without recomputing LMD GHOST.
+pub struct HeadUpdate {
+    blocks: HashMap<H256, (u64, H256)>,
+    weights: HashMap<H256, u64>,
+    head: H256,
+}
+
+/// Log an ASCII fork choice tree to the terminal, reusing the weights and
+/// block set already computed by [`update_head`].
+fn log_fork_choice_tree(store: &Store, update: &HeadUpdate) {
+    let tree = crate::fork_choice_tree::format_fork_choice_tree(
+        &update.blocks,
+        &update.weights,
+        update.head,
+        store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+    );
+    info!("\n{tree}");
+}
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store) -> HeadUpdate {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    update_head(store)
 }
 
 /// Update the head based on the fork choice rule.
 ///
-/// When `log_tree` is true, also computes block weights and logs an ASCII
-/// fork choice tree to the terminal.
-pub fn update_head(store: &mut Store, log_tree: bool) {
+/// Returns the block set, block weights, and new head computed during the
+/// update so callers can render the fork choice tree without recomputing it.
+pub fn update_head(store: &mut Store) -> HeadUpdate {
     let blocks = store
         .get_live_chain()
         .expect("get_live_chain should succeed");
@@ -104,19 +129,10 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         );
     }
 
-    if log_tree {
-        let tree = crate::fork_choice_tree::format_fork_choice_tree(
-            &blocks,
-            &weights,
-            new_head,
-            store
-                .latest_justified()
-                .expect("latest justified checkpoint exists"),
-            store
-                .latest_finalized()
-                .expect("latest finalized checkpoint exists"),
-        );
-        info!("\n{tree}");
+    HeadUpdate {
+        blocks,
+        weights,
+        head: new_head,
     }
 }
 
@@ -350,7 +366,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false);
+                    accept_new_attestations(store);
                 }
             }
             SlotInterval::AttestationProduction => {
@@ -365,7 +381,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             }
             SlotInterval::EndOfSlot => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true);
+                let update = accept_new_attestations(store);
+                log_fork_choice_tree(store, &update);
             }
         }
     }
@@ -690,7 +707,7 @@ fn on_block_core(
     // `lean_state_transition_attestations_processed_total` instead.
 
     // Update forkchoice head based on new block and attestations
-    update_head(store, false);
+    update_head(store);
 
     let block_total = block_start.elapsed();
     info!(
@@ -872,7 +889,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     on_tick(store, slot_time_ms, true);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false);
+    accept_new_attestations(store);
 
     store.head().expect("store head exists")
 }
