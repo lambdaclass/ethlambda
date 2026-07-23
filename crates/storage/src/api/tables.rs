@@ -13,6 +13,8 @@ pub enum Table {
     /// finalized boundary are pruned (`prune_old_block_signatures`), while
     /// headers and bodies are kept forever.
     BlockSignatures,
+    /// Canonical block index: slot -> block root
+    BlockRoots,
     /// State storage: H256 -> State
     ///
     /// Holds full-state snapshots only: the bootstrap anchor plus one anchor
@@ -35,10 +37,11 @@ pub enum Table {
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 7] = [
+pub const ALL_TABLES: [Table; 8] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockSignatures,
+    Table::BlockRoots,
     Table::States,
     Table::StateDiffs,
     Table::Metadata,
@@ -52,6 +55,7 @@ impl Table {
             Table::BlockHeaders => "block_headers",
             Table::BlockBodies => "block_bodies",
             Table::BlockSignatures => "block_signatures",
+            Table::BlockRoots => "block_roots",
             Table::States => "states",
             Table::StateDiffs => "state_diffs",
             Table::Metadata => "metadata",

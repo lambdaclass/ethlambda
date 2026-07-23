@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use lru::LruCache;
 
-use crate::api::{StorageBackend, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::error::Error;
 
 use ethlambda_types::{
@@ -336,6 +336,10 @@ struct GossipDataEntry {
 /// Gossip signatures snapshot: (hashed_attestation_data, Vec<(validator_id, signature)>).
 pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, ValidatorSignature)>)>;
 
+type StorageKey = Vec<u8>;
+type StorageEntry = (StorageKey, Vec<u8>);
+type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
+
 /// Bounded buffer for gossip signatures with FIFO eviction.
 ///
 /// Groups signatures by attestation data (via data_root). Each distinct
@@ -524,12 +528,17 @@ fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     (slot, root)
 }
 
+fn encode_block_root_key(slot: u64) -> Vec<u8> {
+    slot.to_be_bytes().to_vec()
+}
+
 /// Fork choice store backed by a pluggable storage backend.
 ///
 /// The Store maintains all state required for fork choice and block processing:
 ///
 /// - **Metadata**: time, config, head, safe_target, justified/finalized checkpoints
 /// - **Blocks**: headers and bodies stored separately for efficient header-only queries
+/// - **BlockRoots**: canonical block roots indexed by slot
 /// - **States**: beacon states indexed by block root
 /// - **Attestations**: latest known and pending ("new") attestations per validator
 /// - **Signatures**: gossip signatures and aggregated proofs for signature verification
@@ -625,8 +634,7 @@ impl Store {
             );
             return Ok(None);
         }
-        info!("Loaded store from persisted DB state");
-        Ok(Some(Self {
+        let store = Self {
             backend,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
@@ -634,7 +642,9 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
-        }))
+        };
+        info!("Loaded store from persisted DB state");
+        Ok(Some(store))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -695,6 +705,16 @@ impl Store {
             batch
                 .put_batch(Table::BlockHeaders, header_entries)
                 .expect("put block header");
+
+            batch
+                .put_batch(
+                    Table::BlockRoots,
+                    vec![(
+                        encode_block_root_key(anchor_state.latest_block_header.slot),
+                        anchor_block_root.to_ssz(),
+                    )],
+                )
+                .expect("put block root index");
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
@@ -822,10 +842,10 @@ impl Store {
     /// When finalization advances, prunes the LiveChain index.
     pub fn update_checkpoints(&mut self, checkpoints: ForkCheckpoints) -> Result<(), Error> {
         // Read old finalized slot before updating metadata
-        let old_finalized_slot = self
-            .latest_finalized()
-            .expect("Failed to get latest finalized checkpoint")
-            .slot;
+        let old_finalized_slot = self.latest_finalized()?.slot;
+        let old_head = self.head()?;
+        let (block_root_deletes, block_root_entries) =
+            self.block_root_index_changes(old_head, checkpoints.head)?;
 
         let mut entries = vec![(KEY_HEAD.to_vec(), checkpoints.head.to_ssz())];
 
@@ -839,6 +859,12 @@ impl Store {
 
         let mut batch = self.backend.begin_write().expect("write batch");
         batch.put_batch(Table::Metadata, entries).expect("put");
+        batch
+            .delete_batch(Table::BlockRoots, block_root_deletes)
+            .expect("delete old canonical block roots");
+        batch
+            .put_batch(Table::BlockRoots, block_root_entries)
+            .expect("put canonical block roots");
         batch.commit().expect("commit");
 
         // Lightweight pruning that should happen immediately on finalization advance:
@@ -893,6 +919,76 @@ impl Store {
     }
 
     // ============ Blocks ============
+
+    fn block_root_index_changes(
+        &self,
+        mut old_root: H256,
+        mut new_root: H256,
+    ) -> Result<BlockRootIndexChanges, Error> {
+        let mut deletes = Vec::new();
+        let mut entries = Vec::new();
+
+        while old_root != new_root {
+            if old_root.is_zero() {
+                let Some(header) = self.get_block_header(&new_root)? else {
+                    warn!(
+                        ?new_root,
+                        "Skipping block root index update for missing new head header"
+                    );
+                    break;
+                };
+                entries.push((encode_block_root_key(header.slot), new_root.to_ssz()));
+                new_root = header.parent_root;
+                continue;
+            }
+            if new_root.is_zero() {
+                let Some(header) = self.get_block_header(&old_root)? else {
+                    warn!(
+                        ?old_root,
+                        "Skipping block root index update for missing old head header"
+                    );
+                    break;
+                };
+                deletes.push(encode_block_root_key(header.slot));
+                old_root = header.parent_root;
+                continue;
+            }
+
+            let Some(old_header) = self.get_block_header(&old_root)? else {
+                warn!(
+                    ?old_root,
+                    "Skipping block root index update for missing old head header"
+                );
+                break;
+            };
+            let Some(new_header) = self.get_block_header(&new_root)? else {
+                warn!(
+                    ?new_root,
+                    "Skipping block root index update for missing new head header"
+                );
+                break;
+            };
+
+            match old_header.slot.cmp(&new_header.slot) {
+                std::cmp::Ordering::Greater => {
+                    deletes.push(encode_block_root_key(old_header.slot));
+                    old_root = old_header.parent_root;
+                }
+                std::cmp::Ordering::Less => {
+                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                    new_root = new_header.parent_root;
+                }
+                std::cmp::Ordering::Equal => {
+                    deletes.push(encode_block_root_key(old_header.slot));
+                    entries.push((encode_block_root_key(new_header.slot), new_root.to_ssz()));
+                    old_root = old_header.parent_root;
+                    new_root = new_header.parent_root;
+                }
+            }
+        }
+
+        Ok((deletes, entries))
+    }
 
     /// Get block data for fork choice: root -> (slot, parent_root).
     ///
@@ -1145,20 +1241,20 @@ impl Store {
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
+        Ok(Self::signed_block_from_view(view.as_ref(), root))
+    }
+
+    fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
-            return Ok(None);
-        };
+        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
-                return Ok(None);
-            };
+            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
@@ -1171,15 +1267,42 @@ impl Store {
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
             None if header.slot == 0 => MultiMessageAggregate::default(),
-            None => return Ok(None),
+            None => return None,
         };
 
         let block = Block::from_header_and_body(header, body);
 
-        Ok(Some(SignedBlock {
+        Some(SignedBlock {
             message: block,
             proof,
-        }))
+        })
+    }
+
+    /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
+    ///
+    /// Missing slots or blocks are skipped. This keeps the current request
+    /// behavior while centralizing the slot-index lookup so the storage backend
+    /// can optimize range reads later.
+    pub fn get_signed_blocks_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<SignedBlock>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let mut blocks = Vec::new();
+        for slot in start_slot..=end_slot {
+            let Some(root_bytes) = view
+                .get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+            else {
+                continue;
+            };
+            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
+            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
     }
 
     // ============ States ============
@@ -1635,6 +1758,12 @@ mod tests {
                 vec![(encode_slot_root_key(slot, &root), vec![0u8; 4])],
             )
             .expect("put sigs");
+        batch
+            .put_batch(
+                Table::BlockRoots,
+                vec![(encode_block_root_key(slot), root.to_ssz())],
+            )
+            .expect("put block root");
         batch.commit().expect("commit");
     }
 
@@ -1670,11 +1799,32 @@ mod tests {
             .is_some()
     }
 
+    /// Return the canonical block root at `slot` for storage-index assertions.
+    fn block_root_by_slot(backend: &dyn StorageBackend, slot: u64) -> Option<H256> {
+        let view = backend.begin_read().expect("read view");
+        view.get(Table::BlockRoots, &encode_block_root_key(slot))
+            .expect("get block root")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+    }
+
     /// Generate a deterministic H256 root from an index.
     fn root(index: u64) -> H256 {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&index.to_be_bytes());
         H256::from(bytes)
+    }
+
+    fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
     }
 
     impl Store {
@@ -1710,7 +1860,92 @@ mod tests {
     // ============ Block Signature Pruning Tests ============
 
     #[test]
-    fn prune_signatures_keeps_recent_window_when_finality_healthy() {
+    fn block_root_index_tracks_canonical_chain_across_reorgs() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let anchor_root = store.head().expect("head root");
+
+        let block_1 = signed_block(1, anchor_root);
+        let root_1 = block_1.message.hash_tree_root();
+        store
+            .insert_signed_block(root_1, block_1)
+            .expect("insert block 1");
+
+        let block_3 = signed_block(3, root_1);
+        let root_3 = block_3.message.hash_tree_root();
+        store
+            .insert_signed_block(root_3, block_3)
+            .expect("insert block 3");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root_3))
+            .expect("update head to block 3");
+
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), Some(root_1));
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 2), None);
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), Some(root_3));
+
+        let side_block_2 = signed_block(2, anchor_root);
+        let side_root_2 = side_block_2.message.hash_tree_root();
+        store
+            .insert_signed_block(side_root_2, side_block_2)
+            .expect("insert side block 2");
+
+        let side_block_4 = signed_block(4, side_root_2);
+        let side_root_4 = side_block_4.message.hash_tree_root();
+        store
+            .insert_signed_block(side_root_4, side_block_4)
+            .expect("insert side block 4");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(side_root_4))
+            .expect("update head to side block 4");
+
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 0),
+            Some(anchor_root)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 2),
+            Some(side_root_2)
+        );
+        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), None);
+        assert_eq!(
+            block_root_by_slot(store.backend.as_ref(), 4),
+            Some(side_root_4)
+        );
+    }
+
+    #[test]
+    fn from_db_state_preserves_block_root_index() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store =
+            Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+
+        let block = signed_block(1, store.head().expect("head root"));
+        let block_root = block.message.hash_tree_root();
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert block");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(block_root))
+            .expect("update head");
+
+        let restored = Store::from_db_state(backend, 12345)
+            .expect("restore store")
+            .expect("store exists");
+        let blocks = restored
+            .get_signed_blocks_by_slot_range(1, 1)
+            .expect("get blocks by slot range");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+    }
+
+    #[test]
+    fn prune_old_blocks_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1729,6 +1964,9 @@ mod tests {
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
         assert_eq!(pruned, 10);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
+
+        // Oldest signatures are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
             assert!(!has_signature(backend.as_ref(), i, &root(i)));
         }
@@ -1739,6 +1977,7 @@ mod tests {
         // Headers and bodies are always retained for the whole history.
         assert_eq!(count_entries(backend.as_ref(), Table::BlockHeaders), 13);
         assert_eq!(count_entries(backend.as_ref(), Table::BlockBodies), 13);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockRoots), 13);
     }
 
     #[test]

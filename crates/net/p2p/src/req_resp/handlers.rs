@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
@@ -269,31 +269,18 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         return Vec::new();
     };
 
-    let mut roots_by_slot = HashMap::new();
-    let mut current_root = store.head().expect("head block exists");
-
-    while !current_root.is_zero() {
-        let Ok(Some(header)) = store.get_block_header(&current_root) else {
-            break;
-        };
-
-        if header.slot < start_slot {
-            break;
+    match store.get_signed_blocks_by_slot_range(start_slot, end_slot) {
+        Ok(blocks) => blocks,
+        Err(err) => {
+            warn!(
+                start_slot,
+                end_slot,
+                ?err,
+                "Failed to get signed blocks by slot range"
+            );
+            Vec::new()
         }
-
-        if header.slot <= end_slot {
-            roots_by_slot.insert(header.slot, current_root);
-        }
-
-        current_root = header.parent_root;
     }
-
-    (start_slot..=end_slot)
-        .filter_map(|slot| {
-            let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root).ok().flatten()
-        })
-        .collect()
 }
 
 async fn handle_blocks_by_root_response(
