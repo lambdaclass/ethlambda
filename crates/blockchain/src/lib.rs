@@ -1203,13 +1203,38 @@ impl BlockChainServer {
         // if the admin API just toggled, the first gossip after the toggle
         // should already use the new value.
         let is_aggregator = self.aggregator.is_enabled();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
+        let accepted = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"))
+            .is_ok();
+
+        // Surface only votes that passed data validation and signature
+        // verification, so subscribers see the same attestations fork choice
+        // does. The ~3 KB XMSS signature is not carried. `emit`'s own guard
+        // drops the event on a node with no subscribers.
+        if accepted {
+            self.events.emit(ChainEvent::Attestation {
+                validator_id: attestation.validator_id,
+                data: attestation.data.clone(),
+            });
+        }
     }
 
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
-        let _ = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"));
+        // The store consumes the aggregate, so snapshot the event inputs first.
+        // Aggregates are low-rate (~one per subnet per slot), so building these
+        // unconditionally is cheap; `emit`'s own guard drops them on an
+        // unsubscribed node. The SNARK proof bytes are not carried.
+        let participants: Vec<u64> = attestation.proof.participant_indices().collect();
+        let data = attestation.data.clone();
+        let accepted = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"))
+            .is_ok();
+
+        // Emit only for aggregates the store accepted, mirroring `attestation`.
+        if accepted {
+            self.events
+                .emit(ChainEvent::Aggregate { participants, data });
+        }
     }
 
     fn update_sync_status(&mut self, current_slot: u64) {
@@ -1368,6 +1393,14 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // this message until the interval-2 boundary, so by the time it lands
         // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
+
+        // Surface our own freshly produced aggregate, the counterpart of the
+        // gossip-received path in `on_gossip_aggregated_attestation` (we never
+        // receive our own aggregate back over gossip). Low-rate; proof omitted.
+        self.events.emit(ChainEvent::Aggregate {
+            participants: msg.output.participants.clone(),
+            data: msg.output.hashed.data().clone(),
+        });
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
