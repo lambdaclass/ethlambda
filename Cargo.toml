@@ -13,8 +13,18 @@ members = [
     "crates/net/api",
     "crates/net/p2p",
     "crates/net/rpc",
+    "crates/prover/core",
     "crates/storage",
 ]
+
+# NOTE: zkVM guest programs are their own workspaces: they build for the respective
+# target ISA via their respective build commands, not for the host, so `cargo {clippy,test}
+# --workspace` must not try to compile them.
+#
+# `ethlambda-prover-sp1` targets the host, but its build script compiles the
+# guest ELF and needs the SP1 (`cargo prove`) toolchain, so it is kept out of
+# the default `--workspace` build too.
+exclude = ["crates/guest-program/sp1", "crates/prover/sp1"]
 
 [workspace.package]
 authors = ["LambdaClass"]
@@ -38,6 +48,8 @@ ethlambda-network-api = { path = "crates/net/api" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+ethlambda-prover-core = { path = "crates/prover/core" }
+ethlambda-prover-sp1 = { path = "crates/prover/sp1" }
 
 tracing = "0.1"
 thiserror = "2.0.9"
@@ -72,11 +84,17 @@ rand = "0.10"
 lru = "0.16"
 rocksdb = "0.24"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
 eyre = "0.6"
 
 # Allocator + heap profiling
-tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
+tikv-jemallocator = { version = "0.6", features = [
+    "stats",
+    "unprefixed_malloc_on_supported_platforms",
+    "profiling",
+] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 
 # NOTE: Shadow-simulator builds also replace quinn-udp with the fallback crate

@@ -7,6 +7,7 @@ pub mod genesis;
 pub mod primitives;
 pub mod signature;
 pub mod state;
+pub mod stf;
 
 /// Display helper for truncated root hashes (8 hex chars)
 pub struct ShortRoot<'a>(pub &'a [u8; 32]);
