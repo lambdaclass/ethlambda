@@ -217,15 +217,40 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
-    let execution_genesis_block_hash = options
-        .execution_genesis_block_hash
-        .as_deref()
-        .map(parse_h256_hex)
-        .transpose()
-        .map_err(|err| {
-            error!(%err, "Invalid --execution-genesis-block-hash");
-            eyre::eyre!(err)
-        })?;
+    // Resolve the execution layer up front: its genesis block hash seeds the
+    // consensus genesis (see `fetch_initial_state`), so it must be known before
+    // state init. `inprocess` derives the hash from the embedded engine; the
+    // `external` path takes it from `--execution-genesis-block-hash`. Both
+    // engines implement `ExecutionEngine`, so downstream call sites are identical.
+    let (execution_client, execution_genesis_block_hash) = match options.execution_mode {
+        ExecutionMode::InProcess => {
+            match build_inprocess_engine(options.el_genesis.as_deref()).await {
+                Some((engine, el_hash)) => (Some(engine), Some(el_hash)),
+                None => (None, None),
+            }
+        }
+        ExecutionMode::External => {
+            let client = build_execution_client(
+                options.execution_endpoint.as_deref(),
+                options.execution_jwt_secret.as_deref(),
+            )
+            .await;
+            let el_hash = options
+                .execution_genesis_block_hash
+                .as_deref()
+                .map(parse_h256_hex)
+                .transpose()
+                .map_err(|err| {
+                    error!(%err, "Invalid --execution-genesis-block-hash");
+                    eyre::eyre!(err)
+                })?;
+            (client, el_hash)
+        }
+    };
+
+    if execution_client.is_some() && suggested_fee_recipient == [0u8; 20] {
+        warn!("suggested_fee_recipient not set in validator config; block rewards will be burned");
+    }
 
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
@@ -262,25 +287,6 @@ async fn main() -> eyre::Result<()> {
         options.is_aggregator,
         options.aggregate_subnet_ids.as_deref(),
     );
-
-    // Optional execution-layer engine, selected by `--execution-mode`:
-    // `external` drives a separate EL over the Engine API; `inprocess` runs an
-    // embedded ethrex engine via direct library calls. Both implement
-    // `ExecutionEngine`, so downstream call sites are identical.
-    let execution_client = match options.execution_mode {
-        ExecutionMode::External => {
-            build_execution_client(
-                options.execution_endpoint.as_deref(),
-                options.execution_jwt_secret.as_deref(),
-            )
-            .await
-        }
-        ExecutionMode::InProcess => build_inprocess_engine(options.el_genesis.as_deref()).await,
-    };
-
-    if execution_client.is_some() && suggested_fee_recipient == [0u8; 20] {
-        warn!("suggested_fee_recipient not set in validator config; block rewards will be burned");
-    }
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
@@ -684,24 +690,44 @@ fn read_validator_keys(
 /// Returns `None` when integration is disabled (neither flag provided).
 /// Returns `None` and logs an error when construction or the handshake
 /// fails — consensus must keep running regardless of EL state.
-/// Construct the in-process ethrex execution engine from an EL genesis file.
-/// Returns `None` (consensus-only) when `--el-genesis` is missing or the
-/// genesis fails to load, matching the permissive posture of the external path.
-async fn build_inprocess_engine(genesis_path: Option<&Path>) -> Option<Arc<dyn ExecutionEngine>> {
+/// Construct the in-process ethrex execution engine from an EL genesis file,
+/// returning the engine together with its EL genesis block hash.
+///
+/// The embedded EL bootstraps from the same genesis, so the engine's head at
+/// startup *is* the EL genesis block — its hash seeds the consensus genesis
+/// (see `fetch_initial_state`), which is what lets the first fork-choice update
+/// point the EL at a block it recognizes. In `inprocess` mode this replaces the
+/// external path's manual `--execution-genesis-block-hash`.
+///
+/// Returns `None` (consensus-only) when `--el-genesis` is missing or the genesis
+/// fails to load, matching the permissive posture of the external path.
+async fn build_inprocess_engine(
+    genesis_path: Option<&Path>,
+) -> Option<(Arc<dyn ExecutionEngine>, H256)> {
     let Some(path) = genesis_path else {
         error!("--execution-mode inprocess requires --el-genesis");
         return None;
     };
-    match EthrexEngine::from_genesis_path(path).await {
-        Ok(engine) => {
-            info!(genesis = %path.display(), "In-process ethrex execution engine enabled");
-            Some(Arc::new(engine))
-        }
+    let engine = match EthrexEngine::from_genesis_path(path).await {
+        Ok(engine) => engine,
         Err(err) => {
             error!(%err, path = %path.display(), "Failed to bootstrap in-process ethrex engine");
-            None
+            return None;
         }
-    }
+    };
+    let el_genesis_hash = match engine.head_hash().await {
+        Ok(hash) => H256(hash.0),
+        Err(err) => {
+            error!(%err, "Failed to read in-process EL genesis block hash");
+            return None;
+        }
+    };
+    info!(
+        genesis = %path.display(),
+        el_genesis_hash = %el_genesis_hash,
+        "In-process ethrex execution engine enabled"
+    );
+    Some((Arc::new(engine), el_genesis_hash))
 }
 
 async fn build_execution_client(
