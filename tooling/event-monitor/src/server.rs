@@ -16,8 +16,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::{Config, NodeConfig};
-use crate::hub::{Hub, HubMessage};
-use crate::model::{NodeStatus, NormalizedEvent};
+use crate::hub::{HistorySnapshot, Hub, HubMessage};
 use crate::timing::Timing;
 
 /// Keep-alive comment interval on `/stream`, independent of any per-node
@@ -51,16 +50,6 @@ impl Meta {
     }
 }
 
-/// Backfill payload for `GET /api/history` (CONTRACT.md §4): recent chain
-/// events (each identical in shape to a `/stream` `chain` event) plus the
-/// latest status per node. The frontend seeds both panels from this before
-/// going live, de-duping the small overlap with the live stream.
-#[derive(Debug, Serialize)]
-struct HistoryResponse {
-    events: Vec<NormalizedEvent>,
-    status: Vec<NodeStatus>,
-}
-
 #[derive(Clone)]
 struct AppState {
     hub: Hub,
@@ -87,12 +76,12 @@ async fn meta_handler(State(state): State<AppState>) -> Json<Meta> {
     Json(state.meta.clone())
 }
 
-async fn history_handler(State(state): State<AppState>) -> Json<HistoryResponse> {
-    let snapshot = state.hub.history_snapshot();
-    Json(HistoryResponse {
-        events: snapshot.events,
-        status: snapshot.status,
-    })
+/// Backfill for `GET /api/history` (CONTRACT.md §4): recent chain events (each
+/// identical in shape to a `/stream` `chain` event) plus the latest status per
+/// node. The frontend seeds both panels from this before going live, de-duping
+/// the small overlap with the live stream.
+async fn history_handler(State(state): State<AppState>) -> Json<HistorySnapshot> {
+    Json(state.hub.history_snapshot())
 }
 
 async fn stream_handler(

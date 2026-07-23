@@ -90,6 +90,14 @@ fn now_ms() -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn node_status(name: &str, state: NodeState, events_per_sec: f64) -> NodeStatus {
+    NodeStatus {
+        node: name.to_string(),
+        state,
+        events_per_sec,
+    }
+}
+
 /// Runs forever: connects, streams, and on any disconnect/error reconnects
 /// with capped exponential backoff. Intended to be spawned as one long-lived
 /// task per configured node.
@@ -102,11 +110,7 @@ pub async fn run_collector(
 ) {
     let mut backoff = Backoff::new();
     loop {
-        hub.publish_status(NodeStatus {
-            node: node.name.clone(),
-            state: NodeState::Reconnecting,
-            events_per_sec: 0.0,
-        });
+        hub.publish_status(node_status(&node.name, NodeState::Reconnecting, 0.0));
 
         match connect_and_stream(&node, &topics, &timing, &hub, &client).await {
             Ok(()) => {
@@ -124,11 +128,7 @@ pub async fn run_collector(
         } else {
             NodeState::Reconnecting
         };
-        hub.publish_status(NodeStatus {
-            node: node.name.clone(),
-            state,
-            events_per_sec: 0.0,
-        });
+        hub.publish_status(node_status(&node.name, state, 0.0));
         tokio::time::sleep(delay).await;
     }
 }
@@ -144,19 +144,15 @@ async fn connect_and_stream(
     client: &reqwest::Client,
 ) -> Result<(), CollectorError> {
     let url = format!(
-        "{}/lean/v0/events?topics={}",
-        node.url.trim_end_matches('/'),
+        "{}?topics={}",
+        node.endpoint("/lean/v0/events"),
         topics.join(",")
     );
 
     let response = client.get(&url).send().await?.error_for_status()?;
     let mut stream = response.bytes_stream().eventsource();
 
-    hub.publish_status(NodeStatus {
-        node: node.name.clone(),
-        state: NodeState::Connected,
-        events_per_sec: 0.0,
-    });
+    hub.publish_status(node_status(&node.name, NodeState::Connected, 0.0));
     tracing::info!(node = %node.name, %url, "connected to SSE stream");
 
     let mut rate = RateTracker::new();
@@ -176,11 +172,11 @@ async fn connect_and_stream(
                 }
             }
             _ = heartbeat.tick() => {
-                hub.publish_status(NodeStatus {
-                    node: node.name.clone(),
-                    state: NodeState::Connected,
-                    events_per_sec: rate.rate_and_reset(),
-                });
+                hub.publish_status(node_status(
+                    &node.name,
+                    NodeState::Connected,
+                    rate.rate_and_reset(),
+                ));
             }
         }
     }

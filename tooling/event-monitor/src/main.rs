@@ -28,9 +28,8 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let config_path = args.config.clone();
     let config = Config::load(&args.config).inspect_err(|err| {
-        tracing::error!(%err, config = %config_path.display(), "failed to load config");
+        tracing::error!(%err, config = %args.config.display(), "failed to load config");
     })?;
 
     let client = reqwest::Client::new();

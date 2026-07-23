@@ -61,7 +61,7 @@ export function createPropagation({ toggleEl, canvas, legendEl, noteEl, meta }) 
   const nodeNames = meta.nodes.map((n) => n.name);
   const laneIndex = new Map(nodeNames.map((name, i) => [name, i]));
 
-  // topic -> Map<id, { slot, arrivals: Map<node, arrival_ms> }>
+  // topic -> Map<id, { slot, minArrival, arrivals: Map<node, {arrival, jitter}> }>
   const groups = new Map(TOPICS.map((t) => [t, new Map()]));
   // topic -> [id, ...] in first-seen order, for the per-topic id cap.
   const insertionOrder = new Map(TOPICS.map((t) => [t, []]));
@@ -110,12 +110,13 @@ export function createPropagation({ toggleEl, canvas, legendEl, noteEl, meta }) 
   function addEvent(ev) {
     if (!TOPICS.includes(ev.topic)) return;
     if (ev.id == null) return; // ungroupable (e.g. attestation)
+    if (!laneIndex.has(ev.node)) return; // node not in meta.nodes; ignore defensively
 
     const group = groups.get(ev.topic);
     const order = insertionOrder.get(ev.topic);
     let entry = group.get(ev.id);
     if (!entry) {
-      entry = { slot: ev.slot, arrivals: new Map() };
+      entry = { slot: ev.slot, arrivals: new Map(), minArrival: Infinity };
       group.set(ev.id, entry);
       order.push(ev.id);
       if (order.length > MAX_IDS_PER_TOPIC) {
@@ -124,10 +125,14 @@ export function createPropagation({ toggleEl, canvas, legendEl, noteEl, meta }) 
       }
     }
     // Keep the earliest arrival per node for this id (first sighting wins).
+    // Jitter is hashed once here (stable per id+node) rather than every frame,
+    // and the id's min arrival is tracked incrementally for the delta baseline.
     const prior = entry.arrivals.get(ev.node);
-    if (prior === undefined || ev.arrival_ms < prior) {
-      entry.arrivals.set(ev.node, ev.arrival_ms);
+    if (prior === undefined || ev.arrival_ms < prior.arrival) {
+      const jitter = prior ? prior.jitter : hashJitter(`${ev.id}|${ev.node}`) * JITTER_RANGE;
+      entry.arrivals.set(ev.node, { arrival: ev.arrival_ms, jitter });
     }
+    if (ev.arrival_ms < entry.minArrival) entry.minArrival = ev.arrival_ms;
     if (ev.slot > maxSlotSeen) maxSlotSeen = ev.slot;
   }
 
@@ -195,24 +200,22 @@ export function createPropagation({ toggleEl, canvas, legendEl, noteEl, meta }) 
 
     const group = groups.get(selectedTopic);
     let plotted = 0;
-    for (const [id, entry] of group) {
+    for (const [, entry] of group) {
       const age = maxSlotSeen - entry.slot;
       if (age >= windowSlots) continue;
       if (entry.arrivals.size === 0) continue;
-      const minArrival = Math.min(...entry.arrivals.values());
+      const minArrival = entry.minArrival;
       const alpha = FADE_FLOOR + (1 - FADE_FLOOR) * Math.pow(FADE_DECAY, age);
 
-      for (const [node, arrival] of entry.arrivals) {
-        const y = laneY(node);
-        if (y === undefined) continue;
-        const delta = arrival - minArrival;
+      for (const [node, rec] of entry.arrivals) {
+        const delta = rec.arrival - minArrival;
         const x = xForDelta(delta);
+        const y = laneY(node) + rec.jitter;
         const color = delta === 0 ? theme.first : delta > msPerSlot ? theme.over : theme.normal;
-        const jitter = hashJitter(`${id}|${node}`) * JITTER_RANGE;
         ctx.globalAlpha = alpha;
         ctx.fillStyle = color;
         ctx.beginPath();
-        ctx.arc(x, y + jitter, DOT_RADIUS, 0, Math.PI * 2);
+        ctx.arc(x, y, DOT_RADIUS, 0, Math.PI * 2);
         ctx.fill();
         plotted++;
       }

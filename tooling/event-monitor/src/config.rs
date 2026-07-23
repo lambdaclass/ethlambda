@@ -42,6 +42,14 @@ pub struct NodeConfig {
     pub url: String,
 }
 
+impl NodeConfig {
+    /// Joins `path` (leading slash included) onto this node's base URL, the
+    /// single place the trailing-slash-tolerant URL convention lives.
+    pub fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.url.trim_end_matches('/'), path)
+    }
+}
+
 fn default_window_slots() -> u32 {
     30
 }

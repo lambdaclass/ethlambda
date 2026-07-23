@@ -23,20 +23,14 @@ pub struct AttestationData {
 }
 
 /// `block`, `safe_target`, `block_gossip`: `{ "slot": N, "block": "0x..." }`.
+///
+/// Also used for `head` / `justified_checkpoint` / `finalized_checkpoint`, whose
+/// wire shape adds a `state: "0x..."` field; serde ignores it, since only `slot`
+/// and `block` are surfaced on the [`NormalizedEvent`].
 #[derive(Debug, Clone, Deserialize)]
 struct SlotBlockPayload {
     slot: u64,
     block: String,
-}
-
-/// `head`, `justified_checkpoint`, `finalized_checkpoint`:
-/// `{ "slot": N, "block": "0x...", "state": "0x..." }`.
-#[derive(Debug, Clone, Deserialize)]
-struct CheckpointEventPayload {
-    slot: u64,
-    block: String,
-    #[allow(dead_code)] // part of the wire shape; not surfaced on NormalizedEvent
-    state: String,
 }
 
 /// `attestation`: `{ "validator_id": N, "data": {...} }`.
@@ -56,18 +50,14 @@ struct AggregatePayload {
 /// `chain_reorg`:
 /// `{ "slot":N, "depth":N, "old_head_block":"0x...", "old_head_state":"0x...",
 ///    "new_head_block":"0x...", "new_head_state":"0x..." }`.
+///
+/// Only `slot` and `new_head_block` are surfaced on the [`NormalizedEvent`]; the
+/// remaining fields of the wire shape (documented above) are ignored on
+/// deserialize.
 #[derive(Debug, Clone, Deserialize)]
 struct ReorgPayload {
     slot: u64,
-    #[allow(dead_code)]
-    depth: u64,
-    #[allow(dead_code)]
-    old_head_block: String,
-    #[allow(dead_code)]
-    old_head_state: String,
     new_head_block: String,
-    #[allow(dead_code)]
-    new_head_state: String,
 }
 
 /// Collector -> browser payload (CONTRACT.md §3). Field names and shape are
@@ -147,13 +137,13 @@ pub fn normalize(
     };
 
     let (slot, id, validator_id, participants) = match topic {
-        "block" | "safe_target" | "block_gossip" => {
+        "block"
+        | "safe_target"
+        | "block_gossip"
+        | "head"
+        | "justified_checkpoint"
+        | "finalized_checkpoint" => {
             let payload: SlotBlockPayload = serde_json::from_str(data).map_err(to_json_err)?;
-            (payload.slot, Some(payload.block), None, None)
-        }
-        "head" | "justified_checkpoint" | "finalized_checkpoint" => {
-            let payload: CheckpointEventPayload =
-                serde_json::from_str(data).map_err(to_json_err)?;
             (payload.slot, Some(payload.block), None, None)
         }
         "chain_reorg" => {

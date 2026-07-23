@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::model::{NodeStatus, NormalizedEvent};
@@ -29,8 +30,9 @@ pub enum HubMessage {
 }
 
 /// Point-in-time backfill payload served by `GET /api/history`: the retained
-/// recent chain events plus the latest status per node (CONTRACT.md §4).
-#[derive(Debug, Clone, Default)]
+/// recent chain events plus the latest status per node (CONTRACT.md §4). Its
+/// field names match that endpoint's JSON exactly, so it is serialized directly.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct HistorySnapshot {
     pub events: Vec<NormalizedEvent>,
     pub status: Vec<NodeStatus>,

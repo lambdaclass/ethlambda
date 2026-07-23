@@ -86,11 +86,15 @@ async fn fetch_from_first_reachable(
     client: &reqwest::Client,
 ) -> Option<Fetched> {
     for node in nodes {
-        let genesis_url = format!("{}/lean/v0/genesis", node.url.trim_end_matches('/'));
-        let spec_url = format!("{}/lean/v0/config/spec", node.url.trim_end_matches('/'));
+        let genesis_url = node.endpoint("/lean/v0/genesis");
+        let spec_url = node.endpoint("/lean/v0/config/spec");
 
-        let genesis = fetch_json::<GenesisResponse>(client, &genesis_url).await;
-        let spec = fetch_json::<SpecResponse>(client, &spec_url).await;
+        // The two fetches are independent; run them concurrently so a slow or
+        // dead node costs one FETCH_TIMEOUT, not two in series.
+        let (genesis, spec) = tokio::join!(
+            fetch_json::<GenesisResponse>(client, &genesis_url),
+            fetch_json::<SpecResponse>(client, &spec_url),
+        );
 
         match (genesis, spec) {
             (Ok(genesis), Ok(spec)) => {
