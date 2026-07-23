@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::{
-        block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
+        block::{Block, BlockBody, BlockProof, SignedBlock},
         state::State,
     };
     use std::sync::Arc;
@@ -385,7 +385,7 @@ mod tests {
                 state_root,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         store
             .insert_signed_block(root, signed_block)

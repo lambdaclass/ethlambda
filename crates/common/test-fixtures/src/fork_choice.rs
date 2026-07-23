@@ -8,7 +8,7 @@ use crate::{
     deser_xmss_hex,
 };
 use ethlambda_types::attestation::XmssSignature;
-use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
+use ethlambda_types::block::{BlockProof, SignedBlock};
 use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
@@ -209,7 +209,7 @@ impl BlockStepData {
     pub fn to_blank_signed_block(&self) -> SignedBlock {
         SignedBlock {
             message: self.to_block(),
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 }

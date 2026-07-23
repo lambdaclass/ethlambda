@@ -11,7 +11,8 @@
 //!     proof:  { proof: { data: "0x<hex-encoded merged multi-message aggregate bytes>" } }
 
 use crate::{Block, TestInfo, TestState};
-use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
+use ethlambda_types::attestation::blank_xmss_signature;
+use ethlambda_types::block::{BlockProof, MultiMessageAggregate, SignedBlock};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt;
@@ -139,17 +140,23 @@ impl TestSignedBlock {
     ///
     /// The container carries the raw lean-multisig wire in the
     /// `MultiMessageAggregate` stored by `SignedBlock.proof`.
+    ///
+    /// NOTE: these fixtures use the leanSpec #799 layout (proposer folded into
+    /// one merged Type-2). This client now carries the proposer signature
+    /// outside the attestation aggregate, so the merged bytes land in
+    /// `attestation_proof` with an empty proposer signature. The verify spec
+    /// tests therefore fail against these fixtures until they are regenerated.
     pub fn try_into_signed_block_with_proofs(self) -> Result<SignedBlock, SignedBlockConvertError> {
         let bytes = self
             .proof
             .decode()
             .map_err(|err| SignedBlockConvertError::InvalidProofHex(err.to_string()))?;
         let len = bytes.len();
-        let proof = MultiMessageAggregate::from_bytes(&bytes)
+        let attestation_proof = MultiMessageAggregate::from_bytes(&bytes)
             .map_err(|_| SignedBlockConvertError::ProofTooLarge(len))?;
         Ok(SignedBlock {
             message: self.block.into(),
-            proof,
+            proof: BlockProof::new(blank_xmss_signature(), attestation_proof),
         })
     }
 }
