@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
-use ethlambda_state_transition::is_proposer;
+use ethlambda_state_transition::{is_heartbeat_committee_member, is_proposer};
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -666,9 +666,18 @@ impl BlockChainServer {
 
             // Publish to gossip network
             if let Some(ref p2p) = self.p2p {
-                let _ = p2p.publish_attestation(signed_attestation).inspect_err(
-                    |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
-                );
+                let _ = p2p
+                    .publish_attestation(signed_attestation.clone())
+                    .inspect_err(
+                        |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
+                    );
+                let head_state = self.store.head_state();
+                let num_validators = head_state.validators.len() as u64;
+                if is_heartbeat_committee_member(validator_id, slot, num_validators) {
+                    let _ = p2p.publish_heartbeat_attestation(signed_attestation).inspect_err(
+                        |err| error!(%slot, %validator_id, %err, "Failed to publish attestation"),
+                    );
+                }
                 info!(%slot, %validator_id, "Published attestation");
             }
         }
