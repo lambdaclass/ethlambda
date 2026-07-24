@@ -385,16 +385,16 @@ mod tests {
 
     fn create_test_validator() -> Validator {
         Validator {
-            attestation_pubkey: [1u8; 52],
-            proposal_pubkey: [11u8; 52],
+            attestation_pubkey: [1u8; 32],
+            proposal_pubkey: [11u8; 32],
             index: 0,
         }
     }
 
     fn create_different_validator() -> Validator {
         Validator {
-            attestation_pubkey: [2u8; 52],
-            proposal_pubkey: [22u8; 52],
+            attestation_pubkey: [2u8; 32],
+            proposal_pubkey: [22u8; 32],
             index: 0,
         }
     }
@@ -402,8 +402,8 @@ mod tests {
     fn create_validators_with_indices(count: usize) -> Vec<Validator> {
         (0..count)
             .map(|i| Validator {
-                attestation_pubkey: [i as u8 + 1; 52],
-                proposal_pubkey: [i as u8 + 101; 52],
+                attestation_pubkey: [i as u8 + 1; 32],
+                proposal_pubkey: [i as u8 + 101; 32],
                 index: i as u64,
             })
             .collect()

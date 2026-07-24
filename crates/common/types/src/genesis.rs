@@ -44,7 +44,11 @@ where
     let bytes =
         hex::decode(s).map_err(|_| D::Error::custom(format!("pubkey is not valid hex: {s}")))?;
     bytes.try_into().map_err(|v: Vec<u8>| {
-        D::Error::custom(format!("pubkey has length {} (expected 52)", v.len()))
+        D::Error::custom(format!(
+            "pubkey has length {} (expected {})",
+            v.len(),
+            crate::signature::PUBLIC_KEY_SIZE
+        ))
     })
 }
 
@@ -56,12 +60,12 @@ mod tests {
         state::{State, Validator},
     };
 
-    const ATT_PUBKEY_A: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800";
-    const PROP_PUBKEY_A: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
-    const ATT_PUBKEY_B: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410";
-    const PROP_PUBKEY_B: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800";
-    const ATT_PUBKEY_C: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
-    const PROP_PUBKEY_C: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410";
+    const ATT_PUBKEY_A: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d";
+    const PROP_PUBKEY_A: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940f";
+    const ATT_PUBKEY_B: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05";
+    const PROP_PUBKEY_B: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d";
+    const ATT_PUBKEY_C: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940f";
+    const PROP_PUBKEY_C: &str = "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05";
 
     const TEST_CONFIG_YAML: &str = r#"# Genesis Settings
 GENESIS_TIME: 1770407233
@@ -74,12 +78,12 @@ VALIDATOR_COUNT: 3
 
 # Genesis Validator Pubkeys
 GENESIS_VALIDATORS:
-    - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800"
-      proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333"
-    - attestation_pubkey: "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410"
-      proposal_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800"
-    - attestation_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333"
-      proposal_pubkey: "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05e143e305017847445859650d6dd06e6efb3f8410"
+    - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d"
+      proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940f"
+    - attestation_pubkey: "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05"
+      proposal_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d"
+    - attestation_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940f"
+      proposal_pubkey: "8d9cbc508b20ef43e165f8559c1bdd18aaeda805ef565a4f9ffd6e4fbed01c05"
 "#;
 
     #[test]
@@ -146,7 +150,7 @@ GENESIS_VALIDATORS:
 
         // Pin the state root so SSZ layout changes are caught immediately.
         let expected_state_root = crate::primitives::H256::from_slice(
-            &hex::decode("babcdc9235a29dfc0d605961df51cfc85732f85291c2beea8b7510a92ec458fe")
+            &hex::decode("3e8c8507e94e045327c2fc66a58db374805cb490a087b3101bb13a9b8b611b54")
                 .unwrap(),
         );
         assert_eq!(root, expected_state_root, "state root mismatch");
@@ -155,7 +159,7 @@ GENESIS_VALIDATORS:
         block.state_root = root;
         let block_root = block.hash_tree_root();
         let expected_block_root = crate::primitives::H256::from_slice(
-            &hex::decode("66a8beaa81d2aaeac7212d4bf8f5fea2bd22d479566a33a83c891661c21235ef")
+            &hex::decode("ba3502921697db025b3a6d7c05fbaf58e52155575438cca9794e22e6e9872090")
                 .unwrap(),
         );
         assert_eq!(block_root, expected_block_root, "block root mismatch");

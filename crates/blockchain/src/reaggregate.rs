@@ -122,11 +122,8 @@ pub fn reaggregate_from_block(
         // Step 1: SNARK-split this attestation's component out of the block's
         // merged multi-message aggregate proof.
         let merged_bytes = signed_block.proof.proof_bytes();
-        let split_bytes = match ethlambda_crypto::split_type_2_by_message(
-            merged_bytes,
-            pubkeys_per_component.clone(),
-            &data_root,
-        ) {
+        let split_bytes = match ethlambda_crypto::split_type_2_by_message(merged_bytes, &data_root)
+        {
             Ok(bytes) => bytes,
             Err(err) => {
                 debug!(%err, data_root = %ethlambda_types::ShortRoot(&data_root.0),

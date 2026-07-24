@@ -6,7 +6,7 @@ use crate::{
     block::{Block, BlockBody, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{self, H256},
-    signature::{SignatureParseError, ValidatorPublicKey},
+    signature::{PUBLIC_KEY_SIZE, SignatureParseError, ValidatorPublicKey},
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
@@ -95,7 +95,7 @@ impl Validator {
     }
 }
 
-pub type ValidatorPubkeyBytes = [u8; 52];
+pub type ValidatorPubkeyBytes = [u8; PUBLIC_KEY_SIZE];
 
 impl State {
     pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {

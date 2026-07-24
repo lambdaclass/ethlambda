@@ -12,12 +12,11 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 
+# rec_aggregation is leanVM's recursive XMSS aggregation prover/verifier;
+# xmss provides the public-key/signature types its API consumes.
+rec_aggregation.workspace = true
+xmss.workspace = true
 
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df" }
-# leansig_wrapper provides XmssPublicKey/XmssSignature types used by lean-multisig's public API
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df" }
-
-leansig.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 
@@ -26,3 +25,4 @@ shadow-integration = []
 
 [dev-dependencies]
 hex.workspace = true
+ssz.workspace = true

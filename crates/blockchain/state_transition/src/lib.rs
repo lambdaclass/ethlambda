@@ -623,8 +623,8 @@ mod tests {
     fn make_validators(n: usize) -> Vec<Validator> {
         (0..n)
             .map(|i| Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect()

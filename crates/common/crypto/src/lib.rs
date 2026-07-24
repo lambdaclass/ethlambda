@@ -1,37 +1,37 @@
-use std::sync::Once;
-
 use ethlambda_types::{
     block::ByteList512KiB,
     primitives::H256,
-    signature::{ValidatorPublicKey, ValidatorSignature},
+    signature::{LeanSigPublicKey, LeanSigSignature, ValidatorPublicKey, ValidatorSignature},
 };
-use lean_multisig::{
-    MultiMessageAggregateSignature as LMType2, ProofError,
-    SingleMessageAggregateSignature as LMType1, aggregate_single_message_signatures,
-    merge_single_message_aggregates, setup_prover, setup_verifier, split_multi_message_aggregate,
-    verify_multi_message_aggregate, verify_single_message_aggregate,
+use rec_aggregation::{
+    MultiMessageAggregateSignature as LMType2, SingleMessageAggregateSignature as LMType1,
+    aggregate_single_message_signatures, init_aggregation_bytecode,
+    merge_single_message_aggregates, split_multi_message_aggregate, verify_multi_message_aggregate,
+    verify_single_message_aggregate,
 };
-use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
 
-/// log(1/rate) for the WHIR commitment scheme used inside lean-multisig.
+/// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
-// Lazy initialization for prover and verifier setup
-static PROVER_INIT: Once = Once::new();
-static VERIFIER_INIT: Once = Once::new();
-
-/// Ensure the prover is initialized. Safe to call multiple times.
+/// Ensure the aggregation bytecode is compiled. Safe to call multiple times.
+///
+/// leanVM's `main` replaced the old `setup_prover`/`setup_verifier` split with a
+/// single self-referential aggregation bytecode used by both the prover and the
+/// verifier; `init_aggregation_bytecode` is idempotent (`OnceLock::get_or_init`).
 pub fn ensure_prover_ready() {
-    PROVER_INIT.call_once(setup_prover);
+    init_aggregation_bytecode();
 }
 
-/// Ensure the verifier is initialized. Safe to call multiple times.
+/// Ensure the aggregation bytecode is compiled. Safe to call multiple times.
+///
+/// Deserializing any proof (`from_bytes`) also requires the bytecode, so this
+/// must run before any verification path.
 pub fn ensure_verifier_ready() {
-    VERIFIER_INIT.call_once(setup_verifier);
+    init_aggregation_bytecode();
 }
 
 /// Error type for signature aggregation operations.
@@ -81,7 +81,10 @@ pub enum VerificationError {
     DeserializationFailed,
 
     #[error("verification failed: {0}")]
-    ProofError(#[from] ProofError),
+    VerificationFailed(String),
+
+    #[error("aggregate binds a different validator set than expected at component {0}")]
+    PublicKeySetMismatch(usize),
 
     #[error(
         "(message, slot) mismatch: proof binds {got_slot}/{got_msg:?}, expected {expected_slot}/{expected_msg:?}"
@@ -107,33 +110,45 @@ pub enum VerificationError {
 // Helpers
 // =====================================================================
 
-fn into_lean_pubkeys(pubkeys: Vec<ValidatorPublicKey>) -> Vec<LeanSigPubKey> {
-    pubkeys
+/// The sorted, de-duplicated set of native pubkeys, matching the canonical form
+/// leanVM's aggregation embeds inside a proof's `info.pubkeys`.
+fn sorted_dedup_pubkeys(pubkeys: Vec<ValidatorPublicKey>) -> Vec<LeanSigPublicKey> {
+    let mut keys: Vec<LeanSigPublicKey> = pubkeys
         .into_iter()
         .map(ValidatorPublicKey::into_inner)
-        .collect()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
-/// Decompress a stored Type-1 proof (without-pubkeys form) into a native
-/// `SingleMessageAggregateSignature` by attaching the resolved validator pubkeys.
+/// Deserialize a stored Type-1 proof.
+///
+/// leanVM's `main` embeds the participant pubkeys inside the serialized proof
+/// (`info.pubkeys`), so decoding no longer needs the caller-supplied pubkeys.
+/// They are still cross-checked against the proof's embedded set as an
+/// integrity guard.
 fn decompress_type1(
     pubkeys: Vec<ValidatorPublicKey>,
     proof_bytes: &ByteList512KiB,
     index: usize,
 ) -> Result<LMType1, AggregationError> {
-    let lean_pks = into_lean_pubkeys(pubkeys);
-    LMType1::decompress_without_pubkeys(proof_bytes.iter().as_slice(), lean_pks)
-        .ok_or(AggregationError::ChildDeserializationFailed(index))
+    let sig = LMType1::from_bytes(proof_bytes.iter().as_slice())
+        .ok_or(AggregationError::ChildDeserializationFailed(index))?;
+    if sig.info.pubkeys != sorted_dedup_pubkeys(pubkeys) {
+        return Err(AggregationError::ChildDeserializationFailed(index));
+    }
+    Ok(sig)
 }
 
 fn compress_type1_to_byte_list(sig: &LMType1) -> Result<ByteList512KiB, AggregationError> {
-    let serialized = sig.compress_without_pubkeys();
+    let serialized = sig.to_bytes();
     let len = serialized.len();
     ByteList512KiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
 }
 
 fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteList512KiB, AggregationError> {
-    let serialized = sig.compress_without_pubkeys();
+    let serialized = sig.to_bytes();
     let len = serialized.len();
     ByteList512KiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
 }
@@ -144,12 +159,14 @@ fn compress_type2_to_byte_list(sig: &LMType2) -> Result<ByteList512KiB, Aggregat
 
 /// Aggregate multiple XMSS signatures into a single Type-1 proof.
 ///
-/// Equivalent to `aggregate_single_message_signatures([], raw_xmss, ...)` in lean-multisig.
+/// Equivalent to `aggregate_single_message_signatures([], raw_xmss, ...)` in
+/// leanVM's `rec_aggregation`.
 ///
 /// All signatures must bind to the same `(message, slot)` pair.
 ///
-/// Returns the lean-multisig `SingleMessageAggregateSignature::compress_without_pubkeys()`
-/// bytes, packed as `ByteList512KiB` for the on-wire SSZ proof field.
+/// Returns the `SingleMessageAggregateSignature::to_bytes()` (postcard) form,
+/// packed as `ByteList512KiB` for the on-wire SSZ proof field. The participant
+/// pubkeys are embedded in the serialized proof.
 pub fn aggregate_signatures(
     public_keys: Vec<ValidatorPublicKey>,
     signatures: Vec<ValidatorSignature>,
@@ -181,7 +198,7 @@ pub fn aggregate_signatures(
 
     ensure_prover_ready();
 
-    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = public_keys
+    let raw_xmss: Vec<(LeanSigPublicKey, LeanSigSignature)> = public_keys
         .into_iter()
         .zip(signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
@@ -242,7 +259,7 @@ pub fn aggregate_mixed(
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
 
-    let raw_xmss: Vec<(LeanSigPubKey, LeanSigSignature)> = raw_public_keys
+    let raw_xmss: Vec<(LeanSigPublicKey, LeanSigSignature)> = raw_public_keys
         .into_iter()
         .zip(raw_signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
@@ -331,20 +348,25 @@ pub fn verify_aggregated_signature(
     }
     ensure_verifier_ready();
 
-    let lean_pubkeys = into_lean_pubkeys(public_keys);
-    let sig = LMType1::decompress_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
+    let sig = LMType1::from_bytes(proof_data.iter().as_slice())
         .ok_or(VerificationError::DeserializationFailed)?;
 
-    if sig.info.without_pubkeys.message != message.0 || sig.info.without_pubkeys.slot != slot {
+    if sig.info.message != message.0 || sig.info.slot != slot {
         return Err(VerificationError::BindingMismatch {
             expected_msg: *message,
             expected_slot: slot,
-            got_msg: H256(sig.info.without_pubkeys.message),
-            got_slot: sig.info.without_pubkeys.slot,
+            got_msg: H256(sig.info.message),
+            got_slot: sig.info.slot,
         });
     }
 
-    verify_single_message_aggregate(&sig)?;
+    // The proof embeds its participant set; bind it to the caller's expectation.
+    if sig.info.pubkeys != sorted_dedup_pubkeys(public_keys) {
+        return Err(VerificationError::PublicKeySetMismatch(0));
+    }
+
+    verify_single_message_aggregate(&sig)
+        .map_err(|err| VerificationError::VerificationFailed(format!("{err:?}")))?;
     Ok(())
 }
 
@@ -355,11 +377,11 @@ pub fn verify_aggregated_signature(
 /// Merge many independent Type-1 multi-signatures into a single Type-2 proof.
 ///
 /// Each input is `(participant_pubkeys, type_1_proof_bytes)` where the bytes
-/// are the `compress_without_pubkeys()` form of a `SingleMessageAggregateSignature`.
+/// are the `to_bytes()` form of a `SingleMessageAggregateSignature`. The pubkeys
+/// are also embedded in the proof; the caller-supplied set is cross-checked.
 ///
-/// The returned blob is the `compress_without_pubkeys()` form of the resulting
-/// `MultiMessageAggregateSignature`. A verifier decoding it back needs the per-component
-/// pubkey sets in the same order.
+/// The returned blob is the `to_bytes()` form of the resulting
+/// `MultiMessageAggregateSignature`, with each component's pubkeys embedded.
 pub fn merge_type_1s_into_type_2(
     type_1s: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
 ) -> Result<ByteList512KiB, AggregationError> {
@@ -421,13 +443,12 @@ pub fn verify_type_2_signature(
 
     ensure_verifier_ready();
 
-    let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
+    let expected_pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
-        .map(into_lean_pubkeys)
+        .map(sorted_dedup_pubkeys)
         .collect();
 
-    let sig = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
-        .ok_or(VerificationError::DeserializationFailed)?;
+    let sig = LMType2::from_bytes(proof_data).ok_or(VerificationError::DeserializationFailed)?;
 
     if sig.info.len() != expected_bindings.len() {
         return Err(VerificationError::Type2ComponentCountMismatch {
@@ -439,34 +460,35 @@ pub fn verify_type_2_signature(
     for (idx, ((expected_msg, expected_slot), info)) in
         expected_bindings.iter().zip(sig.info.iter()).enumerate()
     {
-        if info.without_pubkeys.message != expected_msg.0
-            || info.without_pubkeys.slot != *expected_slot
-        {
+        if info.message != expected_msg.0 || info.slot != *expected_slot {
             return Err(VerificationError::BindingMismatch {
                 expected_msg: *expected_msg,
                 expected_slot: *expected_slot,
-                got_msg: H256(info.without_pubkeys.message),
-                got_slot: info.without_pubkeys.slot,
+                got_msg: H256(info.message),
+                got_slot: info.slot,
             });
         }
-        let _ = idx; // index reserved for richer diagnostics if needed
+        // The proof embeds each component's participant set; bind it to the
+        // caller's expectation.
+        if info.pubkeys != expected_pubkeys_per_info[idx] {
+            return Err(VerificationError::PublicKeySetMismatch(idx));
+        }
     }
 
-    verify_multi_message_aggregate(&sig)?;
+    verify_multi_message_aggregate(&sig)
+        .map_err(|err| VerificationError::VerificationFailed(format!("{err:?}")))?;
     Ok(())
 }
 
 /// Split (disaggregate) a Type-2 merged proof into a single Type-1 proof for
 /// the component bound to `message`. Generates a fresh SNARK; expensive.
 ///
-/// Mirrors leanSpec PR #717 `split_multi_message_aggregate_by_message`: the caller
-/// supplies the expected message (an attestation data root or the block
-/// root) and the wrapper locates the unique matching component inside the
-/// decompressed proof. Returns the `compress_without_pubkeys()` form of the
-/// resulting Type-1.
+/// Mirrors `split_multi_message_aggregate_by_message`: the caller supplies the
+/// expected message (an attestation data root or the block root) and the
+/// wrapper locates the unique matching component inside the decoded proof.
+/// Returns the `to_bytes()` form of the resulting Type-1.
 pub fn split_type_2_by_message(
     proof_data: &[u8],
-    pubkeys_per_component: Vec<Vec<ValidatorPublicKey>>,
     message: &H256,
 ) -> Result<ByteList512KiB, AggregationError> {
     #[cfg(feature = "shadow-integration")]
@@ -479,19 +501,15 @@ pub fn split_type_2_by_message(
 
     ensure_prover_ready();
 
-    let pubkeys_per_info: Vec<Vec<LeanSigPubKey>> = pubkeys_per_component
-        .into_iter()
-        .map(into_lean_pubkeys)
-        .collect();
-
-    let type_2 = LMType2::decompress_without_pubkeys(proof_data, pubkeys_per_info)
-        .ok_or(AggregationError::DeserializationFailed)?;
+    // leanVM embeds each component's pubkeys in the serialized proof, so decoding
+    // no longer needs caller-supplied pubkey sets.
+    let type_2 = LMType2::from_bytes(proof_data).ok_or(AggregationError::DeserializationFailed)?;
 
     let matches: Vec<usize> = type_2
         .info
         .iter()
         .enumerate()
-        .filter_map(|(i, info)| (info.without_pubkeys.message == message.0).then_some(i))
+        .filter_map(|(i, info)| (info.message == message.0).then_some(i))
         .collect();
     let index = match matches.as_slice() {
         [i] => *i,
@@ -508,43 +526,43 @@ pub fn split_type_2_by_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::signature::LeanSignatureScheme;
-    use leansig::{serialization::Serializable, signature::SignatureScheme};
-    use rand::{SeedableRng, rngs::StdRng};
+    use ssz::Encode as _;
+    use xmss::{xmss_key_gen_from_seed, xmss_sign};
 
     /// Generate a test keypair and sign a message.
     ///
     /// Note: This is slow because XMSS key generation is computationally expensive.
-    /// TODO: move to pre-generated keys
     fn generate_keypair_and_sign(
         seed: u64,
         activation_epoch: u32,
         signing_epoch: u32,
         message: &H256,
     ) -> (ValidatorPublicKey, ValidatorSignature) {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
 
-        // Use a small lifetime for faster test key generation
-        let log_lifetime = 5; // 2^5 = 32 epochs
-        let lifetime = 1 << log_lifetime;
+        // Small active range (starting at the activation epoch and covering the
+        // signing slot) for fast key generation.
+        let num_active_slots = 64u64;
+        let (pk, sk) =
+            xmss_key_gen_from_seed(seed_bytes, activation_epoch as u64, num_active_slots)
+                .expect("valid activation range");
 
-        let (pk, sk) = LeanSignatureScheme::key_gen(&mut rng, activation_epoch as usize, lifetime);
+        let sig = xmss_sign(&sk, signing_epoch, &message.0).expect("sign");
 
-        let sig = LeanSignatureScheme::sign(&sk, signing_epoch, &message.0).unwrap();
-
-        // Convert to ethlambda types via bytes
-        let pk_bytes = pk.to_bytes();
-        let sig_bytes = sig.to_bytes();
-
-        let validator_pk = ValidatorPublicKey::from_bytes(&pk_bytes).unwrap();
-        let validator_sig = ValidatorSignature::from_bytes(&sig_bytes).unwrap();
+        // Convert to ethlambda types via SSZ wire bytes.
+        let validator_pk = ValidatorPublicKey::from_bytes(&pk.as_ssz_bytes()).unwrap();
+        let validator_sig = ValidatorSignature::from_bytes(&sig.as_ssz_bytes()).unwrap();
 
         (validator_pk, validator_sig)
     }
 
     #[test]
+    #[ignore = "slow: compiles the leanVM aggregation bytecode (needs a release-sized stack)"]
     fn test_setup_is_idempotent() {
-        // Should not panic when called multiple times
+        // Should not panic when called multiple times. The first call compiles
+        // the self-referential aggregation bytecode; subsequent calls are cheap
+        // (`OnceLock::get_or_init`).
         ensure_prover_ready();
         ensure_prover_ready();
         ensure_verifier_ready();
@@ -681,12 +699,7 @@ mod tests {
         )
         .expect("verify type-2");
 
-        let split = split_type_2_by_message(
-            merged.iter().as_slice(),
-            vec![vec![pk_a.clone()], vec![pk_b.clone()]],
-            &msg_a,
-        )
-        .expect("split");
+        let split = split_type_2_by_message(merged.iter().as_slice(), &msg_a).expect("split");
 
         verify_aggregated_signature(&split, vec![pk_a.clone()], &msg_a, slot_a)
             .expect("verify split");

@@ -784,31 +784,22 @@ mod tests {
     fn make_validators(n: usize) -> Vec<Validator> {
         (0..n)
             .map(|i| Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect()
     }
 
-    /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
-    /// only need `ValidatorSignature::from_bytes` to succeed. `resolve_job`
-    /// never checks signature validity, only that it clones and carries a
-    /// resolvable id — mirrors `ethlambda_storage::store::tests::make_dummy_sig`.
+    /// A structurally valid XMSS signature for tests that only need
+    /// `ValidatorSignature::from_bytes` to succeed. `resolve_job` never checks
+    /// signature validity, only that it clones and carries a resolvable id —
+    /// mirrors `ethlambda_storage::store::tests::make_dummy_sig`. An all-zero
+    /// blob decodes as a valid (unverifiable) signature.
     fn dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::LeanSignatureScheme;
-        use leansig::{serialization::Serializable, signature::SignatureScheme};
-        use rand::{SeedableRng, rngs::StdRng};
-
-        static CACHED_SIG: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
-            let mut rng = StdRng::seed_from_u64(42);
-            let lifetime = 1 << 5; // small for speed
-            let (_pk, sk) = LeanSignatureScheme::key_gen(&mut rng, 0, lifetime);
-            let sig = LeanSignatureScheme::sign(&sk, 0, &[0u8; 32]).unwrap();
-            sig.to_bytes()
-        });
-
-        ValidatorSignature::from_bytes(&CACHED_SIG).expect("cached test signature")
+        use ethlambda_types::signature::SIGNATURE_SIZE;
+        ValidatorSignature::from_bytes(&vec![0u8; SIGNATURE_SIZE])
+            .expect("all-zero test signature decodes")
     }
 
     /// A `HashedAttestationData` over default (all-zero) data for `resolve_job`
