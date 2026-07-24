@@ -43,10 +43,16 @@ ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
 
-# ethrex — in-process execution layer (pinned git rev)
+# ethrex — pinned git rev. Every ethrex crate in the workspace MUST share this
+# rev: ethrex-crypto bundles a C SHA3 whose symbols are not namespaced, so two
+# ethrex versions in the graph collide at link time under GNU ld (Linux). The
+# in-process EL (ethrex-{common,storage,blockchain}) and the p2p ENR helpers
+# (ethrex-{p2p,rlp,common}) are unified on this single rev.
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 
 tracing = "0.1"
 thiserror = "2.0.9"
