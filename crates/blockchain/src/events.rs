@@ -25,14 +25,17 @@ use tracing::warn;
 /// later, `?topics=` filtering), kept separate from [`ChainEvent`] so the
 /// payload stays flat with the topic travelling out-of-band. Names match the
 /// Ethereum beacon-API eventstream topics where an analog exists (`head`,
-/// `block`, `finalized_checkpoint`, `attestation`); `justified_checkpoint` and
-/// `aggregate` are ethlambda extensions with no direct beacon topic.
+/// `block`, `finalized_checkpoint`, `block_gossip`, `attestation`);
+/// `justified_checkpoint` and `aggregate` are ethlambda extensions with no
+/// direct beacon topic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topic {
     Head,
     Block,
     JustifiedCheckpoint,
     FinalizedCheckpoint,
+    /// A block seen on gossip, before import (analog of beacon `block_gossip`).
+    BlockGossip,
     /// A single validator vote seen on gossip.
     Attestation,
     /// A committee-signature aggregate (produced locally or seen on gossip).
@@ -46,6 +49,7 @@ impl Topic {
             Topic::Block => "block",
             Topic::JustifiedCheckpoint => "justified_checkpoint",
             Topic::FinalizedCheckpoint => "finalized_checkpoint",
+            Topic::BlockGossip => "block_gossip",
             Topic::Attestation => "attestation",
             Topic::Aggregate => "aggregate",
         }
@@ -67,6 +71,7 @@ impl FromStr for Topic {
             "block" => Ok(Topic::Block),
             "justified_checkpoint" => Ok(Topic::JustifiedCheckpoint),
             "finalized_checkpoint" => Ok(Topic::FinalizedCheckpoint),
+            "block_gossip" => Ok(Topic::BlockGossip),
             "attestation" => Ok(Topic::Attestation),
             "aggregate" => Ok(Topic::Aggregate),
             other => Err(UnknownTopic(other.to_string())),
@@ -99,6 +104,9 @@ pub enum ChainEvent {
     JustifiedCheckpoint { slot: u64, block: H256, state: H256 },
     /// The finalized checkpoint advanced.
     FinalizedCheckpoint { slot: u64, block: H256, state: H256 },
+    /// A block seen on gossip, before import. Analog of beacon `block_gossip`;
+    /// `block` is imported later once its parent chain is available.
+    BlockGossip { slot: u64, block: H256 },
     /// A single validator vote seen on gossip. Carries the vote's
     /// [`AttestationData`] and the attester's validator id; the ~3 KB XMSS
     /// signature is deliberately omitted (too heavy for a high-rate stream).
@@ -121,6 +129,7 @@ impl ChainEvent {
             ChainEvent::Block { .. } => Topic::Block,
             ChainEvent::JustifiedCheckpoint { .. } => Topic::JustifiedCheckpoint,
             ChainEvent::FinalizedCheckpoint { .. } => Topic::FinalizedCheckpoint,
+            ChainEvent::BlockGossip { .. } => Topic::BlockGossip,
             ChainEvent::Attestation { .. } => Topic::Attestation,
             ChainEvent::Aggregate { .. } => Topic::Aggregate,
         }
@@ -328,11 +337,12 @@ mod tests {
         }
     }
 
-    const ALL_TOPICS: [Topic; 6] = [
+    const ALL_TOPICS: [Topic; 7] = [
         Topic::Head,
         Topic::Block,
         Topic::JustifiedCheckpoint,
         Topic::FinalizedCheckpoint,
+        Topic::BlockGossip,
         Topic::Attestation,
         Topic::Aggregate,
     ];
@@ -397,6 +407,10 @@ mod tests {
                     state,
                 },
                 Topic::FinalizedCheckpoint,
+            ),
+            (
+                ChainEvent::BlockGossip { slot: 1, block },
+                Topic::BlockGossip,
             ),
             (
                 ChainEvent::Attestation {

@@ -86,7 +86,7 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 
 ### `GET /lean/v0/events`
 
-Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Six event types:
+Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Seven event types:
 
 Payload fields mirror the Ethereum beacon-API eventstream where an analog exists: `block` is the block root, `state` the state root, and `slot` stands in for the beacon `epoch`. `justified_checkpoint` and `aggregate` are ethlambda extensions with no beacon topic.
 
@@ -96,6 +96,7 @@ Payload fields mirror the Ethereum beacon-API eventstream where an analog exists
 | `block` | `{ "slot": 128, "block": "0x…" }` | A block is imported into the store |
 | `justified_checkpoint` | `{ "slot": 120, "block": "0x…", "state": "0x…" }` | The justified checkpoint advances |
 | `finalized_checkpoint` | `{ "slot": 96, "block": "0x…", "state": "0x…" }` | The finalized checkpoint advances |
+| `block_gossip` | `{ "slot": 128, "block": "0x…" }` | A block is seen on the network, before import |
 | `attestation` | `{ "validator_id": 4, "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A single validator vote passes gossip validation (signature omitted) |
 | `aggregate` | `{ "participants": [0, 3, 4], "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A committee-signature aggregate is produced locally or accepted from gossip (proof omitted) |
 
@@ -114,7 +115,7 @@ A **required** comma-separated list of event names selects which events to strea
 curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
 ```
 
-Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `attestation`, `aggregate`. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
+Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
 
 | Status | Condition |
 |--------|-----------|

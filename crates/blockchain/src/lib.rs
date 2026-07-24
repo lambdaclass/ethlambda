@@ -1347,6 +1347,10 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        self.events.emit(ChainEvent::BlockGossip {
+            slot: msg.block.message.slot,
+            block: msg.block.message.hash_tree_root(),
+        });
         self.on_block(msg.block);
     }
 }
