@@ -5,24 +5,46 @@ use std::path::PathBuf;
 
 use crate::version;
 
+// Node options plus optional sub-commands.
+//
+// The seven node-required arguments are declared `Option<T>` with
+// `required = true`: together with `subcommand_negates_reqs`, clap keeps
+// enforcing them (with its native missing-argument errors) for the flat node
+// invocation while letting sub-commands parse without any of them. Plain
+// non-`Option` fields would make sub-command invocations fail during derive
+// extraction even though validation was negated.
+// `args_conflicts_with_subcommands` rejects mixed invocations
+// (e.g. `--genesis x benchmark`) instead of silently ignoring the node flags.
+//
+// NOT a doc comment: clap derive turns struct doc comments into the
+// `long_about` shown by `--help`, and this note is for maintainers, not users.
 #[derive(Debug, clap::Parser)]
-#[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
+#[command(
+    name = "ethlambda",
+    author = "LambdaClass",
+    version = version::CLIENT_VERSION,
+    about = "ethlambda consensus client",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
 pub(crate) struct CliOptions {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
     /// Path to the chain genesis config (e.g., config.yaml).
-    #[arg(long)]
-    pub(crate) genesis: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) genesis: Option<PathBuf>,
     /// Path to the validator registry (e.g., annotated_validators.yaml).
-    #[arg(long)]
-    pub(crate) validators: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) validators: Option<PathBuf>,
     /// Path to the bootnode list (e.g., nodes.yaml).
-    #[arg(long)]
-    pub(crate) bootnodes: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) bootnodes: Option<PathBuf>,
     /// Path to validator-config.yaml (validator name registry for metrics labels).
-    #[arg(long)]
-    pub(crate) validator_config: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) validator_config: Option<PathBuf>,
     /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
-    #[arg(long)]
-    pub(crate) hash_sig_keys_dir: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) hash_sig_keys_dir: Option<PathBuf>,
     #[arg(long, default_value = "9000")]
     pub(crate) gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -31,11 +53,11 @@ pub(crate) struct CliOptions {
     pub(crate) api_port: u16,
     #[arg(long, default_value = "5054")]
     pub(crate) metrics_port: u16,
-    #[arg(long)]
-    pub(crate) node_key: PathBuf,
+    #[arg(long, required = true)]
+    pub(crate) node_key: Option<PathBuf>,
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
-    #[arg(long)]
-    pub(crate) node_id: String,
+    #[arg(long, required = true)]
+    pub(crate) node_id: Option<String>,
     /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
     /// When set, skips genesis initialization and fetches the finalized state
     /// and block from each peer's `/lean/v0/states/finalized` and
@@ -149,4 +171,119 @@ pub(crate) struct ShadowOptions {
         value_parser = clap::value_parser!(u64).range(1..=524_288)
     )]
     pub(crate) shadow_xmss_fake_proof_size: u64,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum Command {
+    /// Benchmark block building offline against a controlled workload.
+    Benchmark(crate::benchmark::BenchmarkOptions),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    /// The flat node invocation shape used by lean-quickstart, the Dockerfile,
+    /// and the devnet skills. It must keep parsing unchanged.
+    const FLAT_INVOCATION: &[&str] = &[
+        "ethlambda",
+        "--genesis",
+        "config.yaml",
+        "--validators",
+        "annotated_validators.yaml",
+        "--bootnodes",
+        "nodes.yaml",
+        "--validator-config",
+        "validator-config.yaml",
+        "--hash-sig-keys-dir",
+        "hash-sig-keys/",
+        "--node-key",
+        "node.key",
+        "--node-id",
+        "ethlambda_0",
+        "--gossipsub-port",
+        "9001",
+        "--is-aggregator",
+    ];
+
+    #[test]
+    fn flat_node_invocation_parses_unchanged() {
+        let options = CliOptions::try_parse_from(FLAT_INVOCATION).expect("flat invocation parses");
+        assert!(options.command.is_none());
+        assert_eq!(options.genesis.as_deref(), Some("config.yaml".as_ref()));
+        assert_eq!(options.node_id.as_deref(), Some("ethlambda_0"));
+        assert_eq!(options.gossipsub_port, 9001);
+        assert!(options.is_aggregator);
+    }
+
+    #[test]
+    fn missing_required_node_flag_keeps_clap_error() {
+        let without_genesis: Vec<&str> = FLAT_INVOCATION
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1 && *i != 2)
+            .map(|(_, arg)| *arg)
+            .collect();
+        let err = CliOptions::try_parse_from(without_genesis)
+            .expect_err("missing --genesis must still error");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn benchmark_subcommand_parses_without_node_args() {
+        let options = CliOptions::try_parse_from([
+            "ethlambda",
+            "benchmark",
+            "synthetic",
+            "--mock-crypto",
+            "--iterations",
+            "3",
+        ])
+        .expect("benchmark subcommand parses without node args");
+        assert!(matches!(options.command, Some(Command::Benchmark(_))));
+        assert!(options.genesis.is_none());
+        assert!(options.node_id.is_none());
+    }
+
+    #[test]
+    fn node_flags_mixed_with_subcommand_are_rejected() {
+        let err = CliOptions::try_parse_from([
+            "ethlambda",
+            "--genesis",
+            "config.yaml",
+            "benchmark",
+            "synthetic",
+        ])
+        .expect_err("mixing node flags with a subcommand must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn mock_crypto_conflicts_with_proposer_aggregation() {
+        let err = CliOptions::try_parse_from([
+            "ethlambda",
+            "benchmark",
+            "synthetic",
+            "--mock-crypto",
+            "--enable-proposer-aggregation",
+        ])
+        .expect_err("--mock-crypto cannot drive real leanVM aggregation");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn node_id_value_named_benchmark_is_not_a_subcommand() {
+        let mut args: Vec<&str> = FLAT_INVOCATION.to_vec();
+        let node_id_position = args
+            .iter()
+            .position(|arg| *arg == "ethlambda_0")
+            .expect("node id value present");
+        args[node_id_position] = "benchmark";
+        let options =
+            CliOptions::try_parse_from(args).expect("flag values must not become subcommands");
+        assert!(options.command.is_none());
+        assert_eq!(options.node_id.as_deref(), Some("benchmark"));
+    }
 }

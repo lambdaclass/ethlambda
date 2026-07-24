@@ -49,3 +49,11 @@ jobs:
 
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
+
+      # Reuses the release build from the test step; validates the benchmark
+      # harness end-to-end and its JSON output contract in a few seconds.
+      - name: Benchmark smoke (mock crypto)
+        run: |
+          cargo run --release --bin ethlambda -- benchmark synthetic --mock-crypto \
+            --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
+            | jq -e '.schema_version == 1 and (.samples | length == 3)'
