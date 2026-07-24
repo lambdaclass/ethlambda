@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ae72efcc.js";
+            window.path_to_searchindex_js = "searchindex-055bfc71.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -1491,7 +1491,7 @@ clients.</p>
 <pre><code class="language-json">{ "slot": 128, "root": "0x1a2b…" }
 </code></pre>
 <h3 id="get-leanv0events"><a class="header" href="#get-leanv0events"><code>GET /lean/v0/events</code></a></h3>
-<p>Server-Sent Events stream (<code>Content-Type: text/event-stream</code>) of live chain events published by the blockchain actor. Four event types:</p>
+<p>Server-Sent Events stream (<code>Content-Type: text/event-stream</code>) of live chain events published by the blockchain actor. Five event types:</p>
 <p>Payload fields mirror the Ethereum beacon-API eventstream: <code>block</code> is the block root, <code>state</code> the state root, and <code>slot</code> stands in for the beacon <code>epoch</code>.</p>
 <div class="table-wrapper">
 <table>
@@ -1503,6 +1503,7 @@ clients.</p>
 <tr><td><code>block</code></td><td><code>{ "slot": 128, "block": "0x…" }</code></td><td>A block is imported into the store</td></tr>
 <tr><td><code>justified_checkpoint</code></td><td><code>{ "slot": 120, "block": "0x…", "state": "0x…" }</code></td><td>The justified checkpoint advances</td></tr>
 <tr><td><code>finalized_checkpoint</code></td><td><code>{ "slot": 96, "block": "0x…", "state": "0x…" }</code></td><td>The finalized checkpoint advances</td></tr>
+<tr><td><code>block_gossip</code></td><td><code>{ "slot": 128, "block": "0x…" }</code></td><td>A block is seen on the network, before import</td></tr>
 </tbody>
 </table>
 </div>
@@ -1514,7 +1515,7 @@ data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 <p>A <strong>required</strong> comma-separated list of event names selects which events to stream:</p>
 <pre><code class="language-bash">curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
 </code></pre>
-<p>Valid values are exactly the event names above: <code>head</code>, <code>block</code>, <code>justified_checkpoint</code>, <code>finalized_checkpoint</code>. As in the Beacon API <code>eventstream</code> endpoint, <code>topics</code> is mandatory: there is no “subscribe to everything” default; list the topics you want.</p>
+<p>Valid values are exactly the event names above: <code>head</code>, <code>block</code>, <code>justified_checkpoint</code>, <code>finalized_checkpoint</code>, <code>block_gossip</code>. As in the Beacon API <code>eventstream</code> endpoint, <code>topics</code> is mandatory: there is no “subscribe to everything” default; list the topics you want.</p>
 <div class="table-wrapper">
 <table>
 <thead>
