@@ -22,7 +22,7 @@ pub struct AttestationData {
     pub source: Checkpoint,
 }
 
-/// `block`, `safe_target`, `block_gossip`: `{ "slot": N, "block": "0x..." }`.
+/// `block`, `block_gossip`: `{ "slot": N, "block": "0x..." }`.
 ///
 /// Also used for `head` / `justified_checkpoint` / `finalized_checkpoint`, whose
 /// wire shape adds a `state: "0x..."` field; serde ignores it, since only `slot`
@@ -45,19 +45,6 @@ struct AttestationPayload {
 struct AggregatePayload {
     participants: Vec<u64>,
     data: AttestationData,
-}
-
-/// `chain_reorg`:
-/// `{ "slot":N, "depth":N, "old_head_block":"0x...", "old_head_state":"0x...",
-///    "new_head_block":"0x...", "new_head_state":"0x..." }`.
-///
-/// Only `slot` and `new_head_block` are surfaced on the [`NormalizedEvent`]; the
-/// remaining fields of the wire shape (documented above) are ignored on
-/// deserialize.
-#[derive(Debug, Clone, Deserialize)]
-struct ReorgPayload {
-    slot: u64,
-    new_head_block: String,
 }
 
 /// Collector -> browser payload (CONTRACT.md §3). Field names and shape are
@@ -137,18 +124,9 @@ pub fn normalize(
     };
 
     let (slot, id, validator_id, participants) = match topic {
-        "block"
-        | "safe_target"
-        | "block_gossip"
-        | "head"
-        | "justified_checkpoint"
-        | "finalized_checkpoint" => {
+        "block" | "block_gossip" | "head" | "justified_checkpoint" | "finalized_checkpoint" => {
             let payload: SlotBlockPayload = serde_json::from_str(data).map_err(to_json_err)?;
             (payload.slot, Some(payload.block), None, None)
-        }
-        "chain_reorg" => {
-            let payload: ReorgPayload = serde_json::from_str(data).map_err(to_json_err)?;
-            (payload.slot, Some(payload.new_head_block), None, None)
         }
         "attestation" => {
             let payload: AttestationPayload = serde_json::from_str(data).map_err(to_json_err)?;
@@ -216,15 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_target_topic_maps_id_to_block_root() {
-        let data = r#"{ "slot": 127, "block": "0xdeadbeef" }"#;
-        let ev = normalize("node-2", "safe_target", data, 500, &timing()).unwrap();
-        assert_eq!(ev.topic, "safe_target");
-        assert_eq!(ev.slot, 127);
-        assert_eq!(ev.id, Some("0xdeadbeef".to_string()));
-    }
-
-    #[test]
     fn block_gossip_topic_maps_id_to_block_root() {
         let data = r#"{ "slot": 128, "block": "0xabc123" }"#;
         let ev = normalize("node-2", "block_gossip", data, 1_000, &timing()).unwrap();
@@ -253,18 +222,6 @@ mod tests {
         let data = r#"{ "slot": 96, "block": "0xcccc", "state": "0xdddd" }"#;
         let ev = normalize("node-2", "finalized_checkpoint", data, 0, &timing()).unwrap();
         assert_eq!(ev.id, Some("0xcccc".to_string()));
-    }
-
-    #[test]
-    fn chain_reorg_maps_id_to_new_head_block() {
-        let data = r#"{
-            "slot": 128, "depth": 2,
-            "old_head_block": "0xold1", "old_head_state": "0xold2",
-            "new_head_block": "0xnew1", "new_head_state": "0xnew2"
-        }"#;
-        let ev = normalize("node-2", "chain_reorg", data, 0, &timing()).unwrap();
-        assert_eq!(ev.slot, 128);
-        assert_eq!(ev.id, Some("0xnew1".to_string()));
     }
 
     #[test]

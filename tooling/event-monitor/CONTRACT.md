@@ -55,8 +55,6 @@ Per-topic `data:` JSON shapes the collector must handle:
 | `head` | `{ "slot": 128, "block": "0x…", "state": "0x…" }` | `slot` |
 | `justified_checkpoint` | `{ "slot": 128, "block": "0x…", "state": "0x…" }` | `slot` |
 | `finalized_checkpoint` | `{ "slot": 128, "block": "0x…", "state": "0x…" }` | `slot` |
-| `safe_target` | `{ "slot": 128, "block": "0x…" }` | `slot` |
-| `chain_reorg` | `{ "slot":…, "depth":…, "old_head_block":"0x…", "old_head_state":"0x…", "new_head_block":"0x…", "new_head_state":"0x…" }` | `slot` |
 | `block_gossip` | `{ "slot": 128, "block": "0x…" }` | `slot` |
 
 A `Checkpoint` (`head`/`target`/`source`) is `{ "root": "0x…", "slot": N }`.
@@ -107,7 +105,7 @@ Serialized as JSON. Field names are frozen:
 | `slot` | u64 | slot the event refers to (from `slot` or `data.slot`) |
 | `arrival_ms` | i64 | collector receive time, epoch ms |
 | `offset_ms` | i64 | `arrival_ms - slot_start_ms`; can be negative |
-| `id` | string \| null | grouping/propagation identity: block/head/safe_target/gossip → the `block` root; reorg → `new_head_block`; checkpoints → `block`; **aggregate → a session-stable content hash** of `(data, sorted participants)`, hex `0x…`; **attestation → null** |
+| `id` | string \| null | grouping/propagation identity: block/head/gossip → the `block` root; checkpoints → `block`; **aggregate → a session-stable content hash** of `(data, sorted participants)`, hex `0x…`; **attestation → null** |
 | `validator_id` | u64 \| null | set only for `attestation` |
 | `participants` | u32 \| null | set only for `aggregate`: participant **count** (never the full list — keep frames light) |
 
@@ -224,7 +222,7 @@ Cap points per node (e.g. 2000) with oldest-first decimation so an attestation
 flood can't wedge rendering. Legend + a note that older slots fade.
 
 **Bottom — propagation delta** (canvas beeswarm): a topic toggle
-(`block` default / `aggregate` / `head`). Group events of that topic by `id`;
+(`block` default / `aggregate`). Group events of that topic by `id`;
 for every id in the last `window_slots`, plot one dot per node in that node's
 lane at `x = clamp(arrival_ms − min(arrival_ms over nodes for that id), 0,
 ms_per_slot)`, jittered, faded by slot age. **Fixed 0…`ms_per_slot` x-axis**

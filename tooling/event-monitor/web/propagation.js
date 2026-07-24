@@ -8,7 +8,7 @@
 // rAF loop) rather than sharing a core, to keep each panel independently
 // readable; keep the two in sync when changing the visual language.
 
-const TOPICS = ["block", "aggregate", "head"];
+const TOPICS = ["block", "aggregate"];
 const MAX_IDS_PER_TOPIC = 400;
 
 const LANE_HEIGHT = 40;
