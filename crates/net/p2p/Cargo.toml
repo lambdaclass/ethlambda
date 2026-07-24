@@ -46,12 +46,14 @@ libssz-types.workspace = true
 sha2 = "0.10"
 
 # ethp2p-rs erasure-coded broadcast (experimental, off by default).
-# Pinned to a github.com/lambdaclass/ethp2p-rs commit. The repo is public, so
-# resolution needs no credentials; building with the `ethp2p` feature also
-# needs `protoc` on the build host (ethp2p-broadcast compiles its .proto via
-# prost-build). The default (feature-off) build compiles neither crate.
-ethp2p-broadcast = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "3d234116e852b85be7bf8e6b9272ed66772cd98c", optional = true }
-ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "3d234116e852b85be7bf8e6b9272ed66772cd98c", optional = true }
+# Pinned to the merged main commit of github.com/lambdaclass/ethp2p-rs (PR #20:
+# spec-conformant transport + reconstruct-reset + bounded-queue backpressure +
+# peer-id pinning). The repo is public, so resolution needs no credentials;
+# building with the `ethp2p` feature also needs `protoc` on the build host
+# (ethp2p-broadcast compiles its .proto via prost-build). The default
+# (feature-off) build compiles neither crate.
+ethp2p-broadcast = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d852f23544cd9b7d0634474d54dbf3f417a16140", optional = true }
+ethp2p-transport = { git = "https://github.com/lambdaclass/ethp2p-rs", rev = "d852f23544cd9b7d0634474d54dbf3f417a16140", optional = true }
 # Needed to serialize the RS preamble (a prost message) before publishing.
 # Version-matched to ethp2p-broadcast's prost so cargo unifies them.
 prost = { version = "0.13", optional = true }
