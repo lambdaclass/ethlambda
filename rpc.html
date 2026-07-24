@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-055bfc71.js";
+            window.path_to_searchindex_js = "searchindex-c3b8cc23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -253,8 +253,8 @@
 <pre><code class="language-json">{ "slot": 128, "root": "0x1a2b…" }
 </code></pre>
 <h3 id="get-leanv0events"><a class="header" href="#get-leanv0events"><code>GET /lean/v0/events</code></a></h3>
-<p>Server-Sent Events stream (<code>Content-Type: text/event-stream</code>) of live chain events published by the blockchain actor. Five event types:</p>
-<p>Payload fields mirror the Ethereum beacon-API eventstream: <code>block</code> is the block root, <code>state</code> the state root, and <code>slot</code> stands in for the beacon <code>epoch</code>.</p>
+<p>Server-Sent Events stream (<code>Content-Type: text/event-stream</code>) of live chain events published by the blockchain actor. Seven event types:</p>
+<p>Payload fields mirror the Ethereum beacon-API eventstream where an analog exists: <code>block</code> is the block root, <code>state</code> the state root, and <code>slot</code> stands in for the beacon <code>epoch</code>. <code>justified_checkpoint</code> and <code>aggregate</code> are ethlambda extensions with no beacon topic.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -266,6 +266,8 @@
 <tr><td><code>justified_checkpoint</code></td><td><code>{ "slot": 120, "block": "0x…", "state": "0x…" }</code></td><td>The justified checkpoint advances</td></tr>
 <tr><td><code>finalized_checkpoint</code></td><td><code>{ "slot": 96, "block": "0x…", "state": "0x…" }</code></td><td>The finalized checkpoint advances</td></tr>
 <tr><td><code>block_gossip</code></td><td><code>{ "slot": 128, "block": "0x…" }</code></td><td>A block is seen on the network, before import</td></tr>
+<tr><td><code>attestation</code></td><td><code>{ "validator_id": 4, "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }</code></td><td>A single validator vote passes gossip validation (signature omitted)</td></tr>
+<tr><td><code>aggregate</code></td><td><code>{ "participants": [0, 3, 4], "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }</code></td><td>A committee-signature aggregate is produced locally or accepted from gossip (proof omitted)</td></tr>
 </tbody>
 </table>
 </div>
@@ -277,7 +279,7 @@ data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 <p>A <strong>required</strong> comma-separated list of event names selects which events to stream:</p>
 <pre><code class="language-bash">curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
 </code></pre>
-<p>Valid values are exactly the event names above: <code>head</code>, <code>block</code>, <code>justified_checkpoint</code>, <code>finalized_checkpoint</code>, <code>block_gossip</code>. As in the Beacon API <code>eventstream</code> endpoint, <code>topics</code> is mandatory: there is no “subscribe to everything” default; list the topics you want.</p>
+<p>Valid values are exactly the event names above: <code>head</code>, <code>block</code>, <code>justified_checkpoint</code>, <code>finalized_checkpoint</code>, <code>block_gossip</code>, <code>attestation</code>, <code>aggregate</code>. As in the Beacon API <code>eventstream</code> endpoint, <code>topics</code> is mandatory: there is no “subscribe to everything” default; list the topics you want.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -289,7 +291,8 @@ data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
 </tbody>
 </table>
 </div>
-<p>Events are fanned out over a bounded broadcast channel. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line <code>: error - dropped N messages</code> marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.</p>
+<p>Events are fanned out over a single bounded broadcast channel shared by all topics. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line <code>: error - dropped N messages</code> marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.</p>
+<p>Because the ring buffer is shared, the high-rate <code>attestation</code> events (roughly one per validator per slot) dominate its occupancy: a subscriber’s tolerable stall is <code>capacity / total_event_rate</code>, not per-topic, so filtering with <code>?topics=</code> narrows what you receive but does <strong>not</strong> widen the lag window against an attestation flood. Subscribers that only need low-rate topics (<code>head</code>, <code>finalized_checkpoint</code>, …) are still evicted at the aggregate rate. If real usage shows this biting, the fix is a per-topic channel split behind the event bus (the <code>subscribe(TopicSet)</code> API is unaffected).</p>
 <h3 id="get-leanv0blocksblock_id-and-header"><a class="header" href="#get-leanv0blocksblock_id-and-header"><code>GET /lean/v0/blocks/{block_id}</code> and <code>/header</code></a></h3>
 <p><code>block_id</code> is either:</p>
 <ul>
