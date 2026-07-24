@@ -1798,8 +1798,8 @@ mod tests {
     /// post-state's `latest_block_header`).
     fn sample_state(slot: u64, parent_root: H256, hbh: Vec<H256>) -> State {
         let validators = vec![Validator {
-            attestation_pubkey: [7u8; 52],
-            proposal_pubkey: [9u8; 52],
+            attestation_pubkey: [7u8; 32],
+            proposal_pubkey: [9u8; 32],
             index: 0,
         }];
         let mut state = State::from_genesis(1_000, validators);
@@ -2484,19 +2484,12 @@ mod tests {
     // ============ GossipSignatureBuffer Tests ============
 
     fn make_dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::LeanSignatureScheme;
-        use leansig::{serialization::Serializable, signature::SignatureScheme};
-        use rand::{SeedableRng, rngs::StdRng};
-
-        static CACHED_SIG: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
-            let mut rng = StdRng::seed_from_u64(42);
-            let lifetime = 1 << 5; // small for speed
-            let (_pk, sk) = LeanSignatureScheme::key_gen(&mut rng, 0, lifetime);
-            let sig = LeanSignatureScheme::sign(&sk, 0, &[0u8; 32]).unwrap();
-            sig.to_bytes()
-        });
-
-        ValidatorSignature::from_bytes(&CACHED_SIG).expect("cached test signature")
+        // These tests never check signature validity, only that a signature
+        // decodes and carries through the buffers. An all-zero blob is a
+        // structurally valid (unverifiable) XMSS signature.
+        use ethlambda_types::signature::SIGNATURE_SIZE;
+        ValidatorSignature::from_bytes(&vec![0u8; SIGNATURE_SIZE])
+            .expect("all-zero test signature decodes")
     }
 
     #[test]

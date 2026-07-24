@@ -14,7 +14,9 @@ thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 
-leansig.workspace = true
+xmss.workspace = true
+ssz.workspace = true
+postcard.workspace = true
 
 libssz.workspace = true
 libssz-derive.workspace = true

@@ -479,8 +479,8 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> eyre::Result<Vec<Bootnode
 #[derive(Debug, Deserialize, Clone)]
 struct AnnotatedValidator {
     index: u64,
-    /// Parsed for hex-format validation only; not cross-checked against the
-    /// loaded secret key since leansig doesn't expose any pk getters.
+    /// Parsed for hex-format validation only; not currently cross-checked
+    /// against the loaded secret key's derived public key.
     #[serde(rename = "pubkey_hex", deserialize_with = "deser_pubkey_hex")]
     _pubkey_hex: ValidatorPubkeyBytes,
     privkey_file: PathBuf,
@@ -496,7 +496,12 @@ where
     let pubkey: ValidatorPubkeyBytes = hex::decode(&value)
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
-        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+        .map_err(|_| {
+            D::Error::custom(format!(
+                "ValidatorPubkey length != {}",
+                ethlambda_types::signature::PUBLIC_KEY_SIZE
+            ))
+        })?;
     Ok(pubkey)
 }
 
