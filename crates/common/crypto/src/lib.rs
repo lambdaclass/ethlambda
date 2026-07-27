@@ -3,13 +3,15 @@ use ethlambda_types::{
     primitives::H256,
     signature::{LeanSigPublicKey, LeanSigSignature, ValidatorPublicKey, ValidatorSignature},
 };
-use rec_aggregation::{
+use lean_multisig::{
     MultiMessageAggregateSignature as LMType2, SingleMessageAggregateSignature as LMType1,
-    aggregate_single_message_signatures, init_aggregation_bytecode,
-    merge_single_message_aggregates, split_multi_message_aggregate, verify_multi_message_aggregate,
+    aggregate_single_message_signatures, merge_single_message_aggregates, setup_prover,
+    setup_verifier, split_multi_message_aggregate, verify_multi_message_aggregate,
     verify_single_message_aggregate,
 };
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
+use tracing::error;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
@@ -17,21 +19,26 @@ pub mod shadow_cost;
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
-/// Ensure the aggregation bytecode is compiled. Safe to call multiple times.
-///
-/// leanVM's `main` replaced the old `setup_prover`/`setup_verifier` split with a
-/// single self-referential aggregation bytecode used by both the prover and the
-/// verifier; `init_aggregation_bytecode` is idempotent (`OnceLock::get_or_init`).
-pub fn ensure_prover_ready() {
-    init_aggregation_bytecode();
+/// leanVM allows one proof at a time per process; a second one panics.
+static PROVER_PERMIT: Mutex<()> = Mutex::new(());
+
+/// The permit guards no data, so a poisoned lock is recovered rather than propagated:
+/// one panicking prover must not brick every later proof. It is still an incident.
+fn prover_permit() -> MutexGuard<'static, ()> {
+    PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
+        error!("a previous proving job panicked while holding the permit; continuing");
+        poisoned.into_inner()
+    })
 }
 
-/// Ensure the aggregation bytecode is compiled. Safe to call multiple times.
-///
-/// Deserializing any proof (`from_bytes`) also requires the bytecode, so this
-/// must run before any verification path.
+/// Engages leanVM's arena; skipping it stays correct but slow.
+pub fn ensure_prover_ready() {
+    setup_prover();
+}
+
+/// Needed before any decode, not just before verifying.
 pub fn ensure_verifier_ready() {
-    init_aggregation_bytecode();
+    setup_verifier();
 }
 
 /// Error type for signature aggregation operations.
@@ -187,6 +194,7 @@ pub fn aggregate_signatures(
     }
 
     ensure_prover_ready();
+    let _permit = prover_permit();
 
     let raw_xmss: Vec<(LeanSigPublicKey, LeanSigSignature)> = public_keys
         .into_iter()
@@ -242,6 +250,7 @@ pub fn aggregate_mixed(
     }
 
     ensure_prover_ready();
+    let _permit = prover_permit();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
@@ -296,6 +305,7 @@ pub fn aggregate_proofs(
     }
 
     ensure_prover_ready();
+    let _permit = prover_permit();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
@@ -391,6 +401,7 @@ pub fn merge_type_1s_into_type_2(
     }
 
     ensure_prover_ready();
+    let _permit = prover_permit();
 
     let type_1s_native: Vec<LMType1> = type_1s
         .into_iter()
@@ -485,6 +496,7 @@ pub fn split_type_2_by_message(
     }
 
     ensure_prover_ready();
+    let _permit = prover_permit();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
@@ -515,8 +527,8 @@ pub fn split_type_2_by_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
     use ssz::Encode as _;
-    use xmss::{xmss_key_gen_from_seed, xmss_sign};
 
     /// Generate a test keypair and sign a message.
     ///
