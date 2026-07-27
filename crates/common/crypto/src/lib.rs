@@ -351,12 +351,12 @@ pub fn verify_aggregated_signature(
     let sig = LMType1::from_bytes(proof_data.iter().as_slice())
         .ok_or(VerificationError::DeserializationFailed)?;
 
-    if sig.info.message != message.0 || sig.info.slot != slot {
+    if sig.info.core.message != message.0 || sig.info.core.slot != slot {
         return Err(VerificationError::BindingMismatch {
             expected_msg: *message,
             expected_slot: slot,
-            got_msg: H256(sig.info.message),
-            got_slot: sig.info.slot,
+            got_msg: H256(sig.info.core.message),
+            got_slot: sig.info.core.slot,
         });
     }
 
@@ -460,12 +460,12 @@ pub fn verify_type_2_signature(
     for (idx, ((expected_msg, expected_slot), info)) in
         expected_bindings.iter().zip(sig.info.iter()).enumerate()
     {
-        if info.message != expected_msg.0 || info.slot != *expected_slot {
+        if info.core.message != expected_msg.0 || info.core.slot != *expected_slot {
             return Err(VerificationError::BindingMismatch {
                 expected_msg: *expected_msg,
                 expected_slot: *expected_slot,
-                got_msg: H256(info.message),
-                got_slot: info.slot,
+                got_msg: H256(info.core.message),
+                got_slot: info.core.slot,
             });
         }
         // The proof embeds each component's participant set; bind it to the
@@ -509,7 +509,7 @@ pub fn split_type_2_by_message(
         .info
         .iter()
         .enumerate()
-        .filter_map(|(i, info)| (info.message == message.0).then_some(i))
+        .filter_map(|(i, info)| (info.core.message == message.0).then_some(i))
         .collect();
     let index = match matches.as_slice() {
         [i] => *i,
