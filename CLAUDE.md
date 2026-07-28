@@ -6,7 +6,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 ## Quick Reference
 
 **Main branch:** `main`
-**Rust version:** 1.92.0 (edition 2024)
+**Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
 ## Codebase Structure (12 workspace crates)

@@ -104,7 +104,7 @@ runs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "1.92.0"
+        toolchain: "1.97.1"
 
     - name: Setup cache
       uses: Swatinem/rust-cache@v2
