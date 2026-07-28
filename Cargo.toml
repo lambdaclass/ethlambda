@@ -26,6 +26,16 @@ repository = "https://github.com/lambdaclass/ethlambda"
 rust-version = "1.92.0"
 version = "0.1.0"
 
+# Cross-crate inlining matters here: the hot paths (SSZ encode/decode, hashing,
+# fork choice traversal) are split across workspace crates and their
+# dependencies, so keeping every crate in its own codegen unit leaves inlining
+# opportunities on the table. Thin LTO plus a single codegen unit trades build
+# time for that, matching ethrex's release profile.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
