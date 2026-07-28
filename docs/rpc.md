@@ -166,7 +166,7 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 
 ```json
 {
-  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.85.0",
+  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.97.1",
   "peer_id": "16Uiu2HAm7v1x…"
 }
 ```

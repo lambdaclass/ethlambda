@@ -1,6 +1,6 @@
 # syntax=docker.io/docker/dockerfile:1.7-labs
 
-FROM rust:1.92-bookworm AS chef
+FROM rust:1.97-bookworm AS chef
 WORKDIR /app
 
 # Install cargo-chef and system dependencies
