@@ -36,6 +36,18 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+# Test profile (see the `test` target in the Makefile). Tests need release-grade
+# opt-level: signature verification/aggregation stack-overflows without it. They
+# do not need a whole-program-optimized binary, so this drops thin LTO, restores
+# parallel codegen, and keeps line tables for backtraces, which makes test
+# rebuilds finish in a fraction of the time of a `release` build.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = "line-tables-only"
+incremental = true
+
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
