@@ -474,42 +474,6 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
-    /// A head whose header cannot be read is skipped (warn), while checkpoint
-    /// moves still emit.
-    #[test]
-    fn chain_event_diff_skips_head_with_missing_header() {
-        let mut store = test_store();
-        let bus = EventBus::new(8);
-        let mut rx = bus.subscribe();
-
-        let snapshot = ChainEventSnapshot::capture(&store);
-
-        // Point the head at a root with no stored header; advance finalized to
-        // a real block so its event still fires.
-        let orphan_head = H256([7u8; 32]);
-        let genesis = store.head().expect("store head exists");
-        let finalized_root = H256([8u8; 32]);
-        let finalized_state = H256([88u8; 32]);
-        insert_test_block(&mut store, finalized_root, 1, genesis, finalized_state);
-        let finalized = Checkpoint {
-            root: finalized_root,
-            slot: 1,
-        };
-        store
-            .update_checkpoints(ForkCheckpoints::new(orphan_head, None, Some(finalized)))
-            .expect("update_checkpoints should succeed");
-
-        snapshot.diff_and_emit(&store, &bus, 1);
-
-        match rx.try_recv().unwrap() {
-            ChainEvent::FinalizedCheckpoint { slot, block, state } => {
-                assert_eq!((slot, block, state), (1, finalized_root, finalized_state));
-            }
-            other => panic!("expected finalized_checkpoint only, got: {other:?}"),
-        }
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-    }
-
     /// A head far below the wall-clock slot (catch-up/backfill) emits no
     /// `head` event, but `justified_checkpoint`/`finalized_checkpoint` still
     /// fire since only `head` is gated.

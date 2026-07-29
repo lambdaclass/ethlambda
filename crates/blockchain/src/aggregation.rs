@@ -20,13 +20,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::aggregate_mixed;
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_storage::Store;
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregationBits, AttestationData, HashedAttestationData},
     block::{ByteList512KiB, SingleMessageAggregate},
     primitives::H256,
-    signature::{ValidatorPublicKey, ValidatorSignature},
     state::Validator,
 };
 use spawned_concurrency::message::Message;
@@ -425,7 +425,7 @@ fn resolve_job(
         let Some(validator) = validators.get(*vid as usize) else {
             continue;
         };
-        let Ok(pubkey) = validator.get_attestation_pubkey() else {
+        let Ok(pubkey) = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) else {
             continue;
         };
         raw_by_id.insert(*vid, (pubkey, sig.clone()));
@@ -492,7 +492,10 @@ fn resolve_child_pubkeys(
         let participant_ids: Vec<u64> = proof.participant_indices().collect();
         let child_pubkeys: Vec<ValidatorPublicKey> = participant_ids
             .iter()
-            .filter_map(|&vid| validators.get(vid as usize)?.get_attestation_pubkey().ok())
+            .filter_map(|&vid| {
+                let v = validators.get(vid as usize)?;
+                ValidatorPublicKey::from_bytes(&v.attestation_pubkey).ok()
+            })
             .collect();
         if child_pubkeys.len() != participant_ids.len() {
             warn!(
@@ -796,7 +799,7 @@ mod tests {
     /// never checks signature validity, only that it clones and carries a
     /// resolvable id — mirrors `ethlambda_storage::store::tests::make_dummy_sig`.
     fn dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::LeanSignatureScheme;
+        use ethlambda_crypto::signature::LeanSignatureScheme;
         use leansig::{serialization::Serializable, signature::SignatureScheme};
         use rand::{SeedableRng, rngs::StdRng};
 

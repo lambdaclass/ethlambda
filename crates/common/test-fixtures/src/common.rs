@@ -2,12 +2,11 @@ use ethlambda_types::{
     attestation::{
         AggregatedAttestation as DomainAggregatedAttestation,
         AggregationBits as DomainAggregationBits, AttestationData as DomainAttestationData,
-        XmssSignature,
+        SIGNATURE_SIZE, XmssSignature,
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     checkpoint::Checkpoint as DomainCheckpoint,
     primitives::H256,
-    signature::SIGNATURE_SIZE,
     state::{
         ChainConfig, JustificationValidators, JustifiedSlots, State, Validator as DomainValidator,
         ValidatorPubkeyBytes,

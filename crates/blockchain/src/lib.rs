@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -10,7 +11,6 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
 };
 
 use crate::aggregation::{
@@ -763,7 +763,10 @@ impl BlockChainServer {
         // Decode the proposer's proposal pubkey once and reuse it both for the
         // singleton single-message aggregate wrap and for the multi-message
         // aggregate merge inputs.
-        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+        let Ok(proposer_pubkey) = ValidatorPublicKey::from_bytes(
+            &proposer_validator.proposal_pubkey,
+        )
+        .inspect_err(
             |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
         ) else {
             metrics::inc_block_building_failures();
@@ -802,7 +805,7 @@ impl BlockChainServer {
                     resolve_failed = true;
                     break;
                 };
-                match validator.get_attestation_pubkey() {
+                match ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) {
                     Ok(pk) => pubkeys.push(pk),
                     Err(err) => {
                         error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
