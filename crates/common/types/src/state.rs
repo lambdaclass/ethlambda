@@ -6,7 +6,6 @@ use crate::{
     block::{Block, BlockBody, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{self, H256},
-    signature::{PUBLIC_KEY_SIZE, SignatureParseError, ValidatorPublicKey},
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
@@ -85,15 +84,13 @@ where
     serializer.serialize_str(&hex::encode(pubkey))
 }
 
-impl Validator {
-    pub fn get_attestation_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
-        ValidatorPublicKey::from_bytes(&self.attestation_pubkey)
-    }
-
-    pub fn get_proposal_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
-        ValidatorPublicKey::from_bytes(&self.proposal_pubkey)
-    }
-}
+/// Size of an SSZ-encoded XMSS public key in bytes.
+///
+/// Sourced from leanVM's xmss crate rather than hardcoded, so it tracks the
+/// scheme parameters. Lives here rather than in `ethlambda-crypto` because the
+/// validator registry is a plain wire type that must not depend on the signing
+/// backend.
+pub const PUBLIC_KEY_SIZE: usize = xmss::PUB_KEY_SSZ_LEN;
 
 pub type ValidatorPubkeyBytes = [u8; PUBLIC_KEY_SIZE];
 

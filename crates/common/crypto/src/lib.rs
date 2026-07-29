@@ -1,7 +1,7 @@
-use ethlambda_types::{
-    block::ByteList512KiB,
-    primitives::H256,
-    signature::{LeanSigPublicKey, LeanSigSignature, ValidatorPublicKey, ValidatorSignature},
+use ethlambda_types::{block::ByteList512KiB, primitives::H256};
+
+use crate::signature::{
+    LeanSigPublicKey, LeanSigSignature, ValidatorPublicKey, ValidatorSignature,
 };
 use lean_multisig::{
     MultiMessageAggregateSignature as LMType2, SingleMessageAggregateSignature as LMType1,
@@ -12,6 +12,8 @@ use lean_multisig::{
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use tracing::error;
+
+pub mod signature;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;

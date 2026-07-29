@@ -47,7 +47,7 @@ where
         D::Error::custom(format!(
             "pubkey has length {} (expected {})",
             v.len(),
-            crate::signature::PUBLIC_KEY_SIZE
+            crate::state::PUBLIC_KEY_SIZE
         ))
     })
 }

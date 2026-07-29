@@ -7,7 +7,6 @@ use crate::{
     block::SingleMessageAggregate,
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::SIGNATURE_SIZE,
 };
 
 /// Validator specific attestation wrapping shared attestation data.
@@ -54,6 +53,14 @@ pub struct SignedAttestation {
     /// Signature aggregation produced by the leanVM (SNARKs in the future).
     pub signature: XmssSignature,
 }
+
+/// Size of an SSZ-encoded XMSS signature in bytes.
+///
+/// Sourced from leanVM's xmss crate rather than hardcoded, so it tracks the
+/// scheme parameters (`WOTS_SIG_SIZE_FE`, `LOG_LIFETIME`, `XMSS_DIGEST_LEN`).
+/// This is the SSZ wire size, so it lives here rather than in
+/// `ethlambda-crypto`: parent containers only need the length.
+pub const SIGNATURE_SIZE: usize = xmss::SIGNATURE_SSZ_LEN;
 
 /// XMSS signature as a fixed-length byte vector (`SIGNATURE_SIZE` bytes).
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;

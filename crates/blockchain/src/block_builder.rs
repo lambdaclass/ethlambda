@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-use ethlambda_crypto::aggregate_proofs;
+use ethlambda_crypto::{aggregate_proofs, signature::ValidatorPublicKey};
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
     slot_is_justifiable_after,
@@ -657,11 +657,11 @@ fn compact_attestations(
                 let pubkeys = proof
                     .participant_indices()
                     .map(|vid| {
-                        head_state
+                        let validator = head_state
                             .validators
                             .get(vid as usize)
-                            .ok_or(StoreError::InvalidValidatorIndex)?
-                            .get_attestation_pubkey()
+                            .ok_or(StoreError::InvalidValidatorIndex)?;
+                        ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                             .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
                     })
                     .collect::<Result<Vec<_>, _>>()?;

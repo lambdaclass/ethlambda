@@ -14,9 +14,9 @@ thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 
+# Only for the XMSS wire-size constants (PUB_KEY_SSZ_LEN / SIGNATURE_SSZ_LEN);
+# the signing primitives themselves live in ethlambda-crypto.
 xmss.workspace = true
-ssz.workspace = true
-postcard.workspace = true
 
 libssz.workspace = true
 libssz-derive.workspace = true

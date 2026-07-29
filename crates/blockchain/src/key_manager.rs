@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use ethlambda_crypto::signature::{ValidatorSecretKey, ValidatorSignature};
 use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorSecretKey, ValidatorSignature},
 };
 use tracing::{info, warn};
 

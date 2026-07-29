@@ -2070,9 +2070,11 @@ dependencies = [
  "ethlambda-types",
  "hex",
  "lean-multisig",
+ "postcard",
  "rand 0.10.1",
  "thiserror 2.0.18",
  "tracing",
+ "xmss",
 ]
 
 [[package]]
@@ -2170,6 +2172,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-crypto",
  "ethlambda-types",
  "libssz",
  "libssz-derive",
@@ -2199,14 +2202,12 @@ name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
  "datatest-stable 0.3.3",
- "ethereum_ssz",
  "ethlambda-test-fixtures",
  "hex",
  "libssz",
  "libssz-derive",
  "libssz-merkle",
  "libssz-types",
- "postcard",
  "rand 0.10.1",
  "serde",
  "serde_json",

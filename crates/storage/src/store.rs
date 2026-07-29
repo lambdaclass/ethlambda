@@ -7,6 +7,7 @@ use lru::LruCache;
 use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::error::Error;
 
+use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
@@ -14,7 +15,6 @@ use ethlambda_types::{
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
@@ -2698,7 +2698,7 @@ mod tests {
         // These tests never check signature validity, only that a signature
         // decodes and carries through the buffers. An all-zero blob is a
         // structurally valid (unverifiable) XMSS signature.
-        use ethlambda_types::signature::SIGNATURE_SIZE;
+        use ethlambda_types::attestation::SIGNATURE_SIZE;
         ValidatorSignature::from_bytes(&vec![0u8; SIGNATURE_SIZE])
             .expect("all-zero test signature decodes")
     }

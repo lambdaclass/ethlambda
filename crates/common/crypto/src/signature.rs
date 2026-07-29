@@ -1,12 +1,13 @@
+//! Validator XMSS signatures, public/secret keys, and the leanVM-backed
+//! primitives behind them.
+
 use std::ops::Range;
 
+use ethlambda_types::primitives::H256;
 use ssz::{Decode, Encode};
 use xmss::{
-    PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey, XmssSignature,
-    XmssSignatureError, xmss_sign, xmss_verify,
+    XmssPublicKey, XmssSecretKey, XmssSignature, XmssSignatureError, xmss_sign, xmss_verify,
 };
-
-use crate::primitives::H256;
 
 /// The public key type from leanVM's xmss crate.
 pub type LeanSigPublicKey = XmssPublicKey;
@@ -18,15 +19,6 @@ pub type LeanSigSignature = XmssSignature;
 pub type LeanSigSecretKey = XmssSecretKey;
 
 pub type Signature = LeanSigSignature;
-
-/// Size of an SSZ-encoded XMSS signature in bytes.
-///
-/// Sourced from leanVM's xmss crate rather than hardcoded, so it tracks the
-/// scheme parameters (`WOTS_SIG_SIZE_FE`, `LOG_LIFETIME`, `XMSS_DIGEST_LEN`).
-pub const SIGNATURE_SIZE: usize = SIGNATURE_SSZ_LEN;
-
-/// Size of an SSZ-encoded XMSS public key in bytes.
-pub const PUBLIC_KEY_SIZE: usize = PUB_KEY_SSZ_LEN;
 
 /// Error returned when parsing signature or key bytes fails.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -150,6 +142,7 @@ impl ValidatorSecretKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
     use xmss::xmss_key_gen_from_seed;
 
     /// Generate a validator key pair over a small activation range.
