@@ -490,25 +490,15 @@ impl BlockChainServer {
 
         coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
 
-        // Throttle to a single job when interval 4 of this slot will build the
-        // next slot's block: that build runs its own leanVM proofs, and the two
-        // otherwise contend for the prover. Mirror the propose path's condition
-        // (`SlotInterval::EndOfSlot`) so a slot where duties are suppressed
-        // keeps the full job budget. The one job we keep is the best-scoring
-        // candidate, so the highest-value coverage survives the cap.
+        // Limit ourselves to a single round of aggregation if we propose next round.
+        // This buys us time to build the block before the next slot's interval-0 tick.
         let next_proposer = self
             .get_our_proposer(slot + 1)
             .filter(|_| self.sync_status.duties_allowed());
-        let max_jobs = match next_proposer {
-            Some(validator_id) => {
-                trace!(
-                    %slot,
-                    next_slot_proposer = validator_id,
-                    "Throttling aggregation to a single job ahead of our block proposal"
-                );
-                1
-            }
-            None => MAX_AGGREGATION_JOBS,
+        let max_jobs = if next_proposer.is_some() {
+            1
+        } else {
+            MAX_AGGREGATION_JOBS
         };
 
         let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
