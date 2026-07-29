@@ -86,11 +86,12 @@ where
 
 /// Size of an SSZ-encoded XMSS public key in bytes.
 ///
-/// Sourced from leanVM's xmss crate rather than hardcoded, so it tracks the
-/// scheme parameters. Lives here rather than in `ethlambda-crypto` because the
-/// validator registry is a plain wire type that must not depend on the signing
-/// backend.
-pub const PUBLIC_KEY_SIZE: usize = xmss::PUB_KEY_SSZ_LEN;
+/// Mirrors leanVM's `xmss::PUB_KEY_SSZ_LEN`, hardcoded so this crate stays free
+/// of the signing backend: the validator registry is a plain wire type.
+/// `ethlambda-crypto` static-asserts the two agree, so a leanVM bump that
+/// changes the scheme parameters breaks the build rather than silently
+/// producing keys of the wrong length.
+pub const PUBLIC_KEY_SIZE: usize = 32;
 
 pub type ValidatorPubkeyBytes = [u8; PUBLIC_KEY_SIZE];
 

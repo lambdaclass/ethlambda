@@ -3,11 +3,27 @@
 
 use std::ops::Range;
 
-use ethlambda_types::primitives::H256;
+use ethlambda_types::{attestation::SIGNATURE_SIZE, primitives::H256, state::PUBLIC_KEY_SIZE};
 use ssz::{Decode, Encode};
 use xmss::{
-    XmssPublicKey, XmssSecretKey, XmssSignature, XmssSignatureError, xmss_sign, xmss_verify,
+    PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey, XmssSignature,
+    XmssSignatureError, xmss_sign, xmss_verify,
 };
+
+// `ethlambda-types` hardcodes the XMSS wire sizes so it can stay free of the
+// signing backend. This crate is the only place that sees both sides, so it is
+// where they get pinned together: a leanVM bump that changes the scheme
+// parameters fails to compile here instead of silently corrupting the wire
+// format (every `XmssSignature` / `ValidatorPubkeyBytes` in `ethlambda-types` is
+// sized by these constants).
+const _: () = assert!(
+    SIGNATURE_SIZE == SIGNATURE_SSZ_LEN,
+    "ethlambda_types::attestation::SIGNATURE_SIZE no longer matches xmss::SIGNATURE_SSZ_LEN",
+);
+const _: () = assert!(
+    PUBLIC_KEY_SIZE == PUB_KEY_SSZ_LEN,
+    "ethlambda_types::state::PUBLIC_KEY_SIZE no longer matches xmss::PUB_KEY_SSZ_LEN",
+);
 
 /// The public key type from leanVM's xmss crate.
 pub type LeanSigPublicKey = XmssPublicKey;
@@ -142,7 +158,6 @@ impl ValidatorSecretKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::state::PUBLIC_KEY_SIZE;
     use xmss::xmss_key_gen_from_seed;
 
     /// Generate a validator key pair over a small activation range.

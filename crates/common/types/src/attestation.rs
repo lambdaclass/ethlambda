@@ -56,11 +56,12 @@ pub struct SignedAttestation {
 
 /// Size of an SSZ-encoded XMSS signature in bytes.
 ///
-/// Sourced from leanVM's xmss crate rather than hardcoded, so it tracks the
-/// scheme parameters (`WOTS_SIG_SIZE_FE`, `LOG_LIFETIME`, `XMSS_DIGEST_LEN`).
-/// This is the SSZ wire size, so it lives here rather than in
-/// `ethlambda-crypto`: parent containers only need the length.
-pub const SIGNATURE_SIZE: usize = xmss::SIGNATURE_SSZ_LEN;
+/// Mirrors leanVM's `xmss::SIGNATURE_SSZ_LEN`, hardcoded so this crate stays
+/// free of the signing backend: parent containers only need the length, not the
+/// scheme. `ethlambda-crypto` static-asserts the two agree, so a leanVM bump
+/// that changes the scheme parameters breaks the build rather than silently
+/// producing blobs of the wrong length.
+pub const SIGNATURE_SIZE: usize = 1208;
 
 /// XMSS signature as a fixed-length byte vector (`SIGNATURE_SIZE` bytes).
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
