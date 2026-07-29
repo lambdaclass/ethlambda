@@ -14,7 +14,8 @@
 //! aggregation material once (raw-first + trim, see [`resolve_job`]), then a
 //! pure in-memory loop scores and orders candidates by consensus value
 //! (current-slot before stale, then Finalize > Justify > Build), emitting at
-//! most [`MAX_AGGREGATION_JOBS`] jobs.
+//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to a
+//! single job in the slot before one of our validators proposes.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -176,7 +177,7 @@ impl Message for EarlyAggregationCheck {
 /// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
-const MAX_AGGREGATION_JOBS: usize = 3;
+pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
 /// thread, touches the store, does no heavy cryptography. Returns `None` when
@@ -190,7 +191,7 @@ const MAX_AGGREGATION_JOBS: usize = 3;
 ///    (`store.iter_gossip_signatures()`) and payload-only groups
 ///    (`store.new_payload_keys()` not already a gossip candidate, requiring
 ///    at least two existing proofs to merge).
-/// 2. **Greedy loop**, at most [`MAX_AGGREGATION_JOBS`] rounds: each round
+/// 2. **Greedy loop**, at most `max_jobs` rounds: each round
 ///    scores every unselected candidate against the projected state and
 ///    keeps the lowest ordering key (current-slot before stale, then
 ///    Finalize > Justify > Build, mirroring the block builder). The winning
@@ -198,9 +199,14 @@ const MAX_AGGREGATION_JOBS: usize = 3;
 ///    realized coverage.
 ///
 /// Stops early when no remaining candidate scores (converged).
+///
+/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
+/// the caller is about to build a block at interval 4 (see
+/// `BlockChainServer::start_aggregation_session`).
 pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
+    max_jobs: usize,
 ) -> Option<AggregationSnapshot> {
     let gossip_groups = store.iter_gossip_signatures();
     let new_payload_keys = store.new_payload_keys();
@@ -269,9 +275,8 @@ pub fn snapshot_aggregation_inputs(
 
     let mut projected = block_builder::ProjectedState::from_head_state(&head_state);
 
-    let mut jobs: Vec<AggregationJob> =
-        Vec::with_capacity(MAX_AGGREGATION_JOBS.min(groups_considered));
-    for _round in 0..MAX_AGGREGATION_JOBS {
+    let mut jobs: Vec<AggregationJob> = Vec::with_capacity(max_jobs.min(groups_considered));
+    for _round in 0..max_jobs {
         let Some((data_root, score)) = pick_best_candidate(
             &candidates,
             &projected,
@@ -1192,7 +1197,7 @@ mod tests {
     fn snapshot_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(snapshot_aggregation_inputs(&store, 0).is_none());
+        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
     }
 
     /// A single gossip signature with no other material to merge is dropped
@@ -1221,7 +1226,7 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(snapshot_aggregation_inputs(&store, 0).is_none());
+        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -1264,7 +1269,7 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            snapshot_aggregation_inputs(&store, 999).is_none(),
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS).is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -1320,7 +1325,7 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let snapshot = snapshot_aggregation_inputs(&store, HEAD_SLOT)
+        let snapshot = snapshot_aggregation_inputs(&store, HEAD_SLOT, MAX_AGGREGATION_JOBS)
             .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(
@@ -1330,23 +1335,26 @@ mod tests {
         );
     }
 
-    /// With more scoring candidates than `MAX_AGGREGATION_JOBS`, exactly that
-    /// many jobs are produced — the best `MAX_AGGREGATION_JOBS` by ordering
-    /// key. Five Build-tier candidates (2 raw sigs each, well under the 2/3
-    /// threshold) differ only by `target_slot`; Build-tier ordering prefers
-    /// larger `target_slot` on a new_voters tie, so the top three by slot win.
-    #[test]
-    fn snapshot_caps_jobs_at_max_aggregation_jobs() {
+    /// Number of competing candidates built by
+    /// [`store_with_competing_build_tier_groups`]; more than either job cap so
+    /// both cap tests actually bind.
+    const NUM_GROUPS: usize = 5;
+
+    /// Store holding `NUM_GROUPS` competing Build-tier candidates (2 raw sigs
+    /// each, well under the 2/3 threshold) that differ only by `target_slot`
+    /// (`1..=NUM_GROUPS`, all justifiable at delta <= 5). Build-tier ordering
+    /// prefers larger `target_slot` on a new_voters tie, so selection takes
+    /// them highest-slot-first.
+    fn store_with_competing_build_tier_groups() -> Store {
         const NUM_VALIDATORS: usize = 10;
         const HEAD_SLOT: u64 = 10;
-        const NUM_GROUPS: usize = 5;
 
         let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
         let mut store = new_test_store(make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes));
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
 
         for i in 0..NUM_GROUPS {
-            let target_slot = i as u64 + 1; // 1..=5, all justifiable (delta <= 5)
+            let target_slot = i as u64 + 1;
             let att_data = AttestationData {
                 slot: target_slot,
                 head: Checkpoint {
@@ -1368,7 +1376,18 @@ mod tests {
             store.insert_gossip_signature(hashed, (2 * i + 1) as u64, dummy_sig());
         }
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999).expect("should produce jobs");
+        store
+    }
+
+    /// With more scoring candidates than `MAX_AGGREGATION_JOBS`, exactly that
+    /// many jobs are produced — the best `MAX_AGGREGATION_JOBS` by ordering
+    /// key, i.e. the top two by `target_slot`.
+    #[test]
+    fn snapshot_caps_jobs_at_max_aggregation_jobs() {
+        let store = store_with_competing_build_tier_groups();
+
+        let snapshot = snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS)
+            .expect("should produce jobs");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
         assert_eq!(snapshot.jobs.len(), MAX_AGGREGATION_JOBS);
 
@@ -1379,8 +1398,27 @@ mod tests {
             .collect();
         assert_eq!(
             selected_targets,
-            HashSet::from([3, 4, 5]),
-            "the three highest target_slot groups win the new_voters tie"
+            HashSet::from([4, 5]),
+            "the two highest target_slot groups win the new_voters tie"
+        );
+    }
+
+    /// The proposer cap (`max_jobs = 1`) yields exactly one job from the same
+    /// pool, and it is the single best-scoring candidate — the one the uncapped
+    /// selection also picks first (highest `target_slot`). Every other candidate
+    /// is still counted in `groups_considered`, so the cap is visibly a
+    /// selection bound rather than a narrower candidate pool.
+    #[test]
+    fn snapshot_caps_jobs_at_one_for_proposer() {
+        let store = store_with_competing_build_tier_groups();
+
+        let snapshot = snapshot_aggregation_inputs(&store, 999, 1).expect("should produce a job");
+        assert_eq!(snapshot.groups_considered, NUM_GROUPS);
+        assert_eq!(snapshot.jobs.len(), 1);
+        assert_eq!(
+            snapshot.jobs[0].hashed.data().target.slot,
+            NUM_GROUPS as u64,
+            "the single job is the best-scoring candidate, not an arbitrary one"
         );
     }
 }
