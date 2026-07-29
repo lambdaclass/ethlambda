@@ -1922,7 +1922,6 @@ dependencies = [
  "rand 0.10.1",
  "rayon",
  "serde",
- "serde_json",
  "spawned-concurrency",
  "thiserror 2.0.18",
  "tokio",
@@ -2036,6 +2035,7 @@ dependencies = [
  "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
+ "futures-util",
  "hex",
  "http-body-util",
  "jemalloc_pprof",
@@ -2068,6 +2068,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-crypto",
  "ethlambda-types",
  "leansig",
  "libssz",
@@ -2100,7 +2101,6 @@ dependencies = [
  "datatest-stable",
  "ethlambda-test-fixtures",
  "hex",
- "leansig",
  "libssz",
  "libssz-derive",
  "libssz-merkle",

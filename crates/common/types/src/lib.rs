@@ -7,7 +7,6 @@ mod el_genesis;
 pub mod execution_payload;
 pub mod genesis;
 pub mod primitives;
-pub mod signature;
 pub mod state;
 
 /// Display helper for truncated root hashes (8 hex chars)

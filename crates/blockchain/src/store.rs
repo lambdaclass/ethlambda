@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -12,7 +13,6 @@ use ethlambda_types::{
     checkpoint::Checkpoint,
     execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
     state::{HISTORICAL_ROOTS_LIMIT, State},
 };
 use tracing::{info, trace, warn};
@@ -26,19 +26,44 @@ use crate::{
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
+/// Intermediate fork-choice data produced by [`update_head`], carried so the
+/// fork choice tree can be rendered without recomputing LMD GHOST.
+pub struct HeadUpdate {
+    blocks: HashMap<H256, (u64, H256)>,
+    weights: HashMap<H256, u64>,
+    head: H256,
+}
+
+/// Log an ASCII fork choice tree to the terminal, reusing the weights and
+/// block set already computed by [`update_head`].
+fn log_fork_choice_tree(store: &Store, update: &HeadUpdate) {
+    let tree = crate::fork_choice_tree::format_fork_choice_tree(
+        &update.blocks,
+        &update.weights,
+        update.head,
+        store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+    );
+    info!("\n{tree}");
+}
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store) -> HeadUpdate {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    update_head(store)
 }
 
 /// Update the head based on the fork choice rule.
 ///
-/// When `log_tree` is true, also computes block weights and logs an ASCII
-/// fork choice tree to the terminal.
-pub fn update_head(store: &mut Store, log_tree: bool) {
+/// Returns the block set, block weights, and new head computed during the
+/// update so callers can render the fork choice tree without recomputing it.
+pub fn update_head(store: &mut Store) -> HeadUpdate {
     let blocks = store
         .get_live_chain()
         .expect("get_live_chain should succeed");
@@ -105,19 +130,10 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         );
     }
 
-    if log_tree {
-        let tree = crate::fork_choice_tree::format_fork_choice_tree(
-            &blocks,
-            &weights,
-            new_head,
-            store
-                .latest_justified()
-                .expect("latest justified checkpoint exists"),
-            store
-                .latest_finalized()
-                .expect("latest finalized checkpoint exists"),
-        );
-        info!("\n{tree}");
+    HeadUpdate {
+        blocks,
+        weights,
+        head: new_head,
     }
 }
 
@@ -351,7 +367,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false);
+                    accept_new_attestations(store);
                 }
             }
             SlotInterval::AttestationProduction => {
@@ -366,7 +382,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             }
             SlotInterval::EndOfSlot => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true);
+                let update = accept_new_attestations(store);
+                log_fork_choice_tree(store, &update);
             }
         }
     }
@@ -402,9 +419,10 @@ pub fn on_gossip_attestation(
     if validator_id >= target_state.validators.len() as u64 {
         return Err(StoreError::InvalidValidatorIndex);
     }
-    let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_attestation_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+    let validator_pubkey = ValidatorPublicKey::from_bytes(
+        &target_state.validators[validator_id as usize].attestation_pubkey,
+    )
+    .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
     // Verify the validator's XMSS signature
     let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
@@ -497,8 +515,7 @@ fn on_gossip_aggregated_attestation_core(
     let pubkeys: Vec<_> = participant_indices
         .iter()
         .map(|&vid| {
-            validators[vid as usize]
-                .get_attestation_pubkey()
+            ValidatorPublicKey::from_bytes(&validators[vid as usize].attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
         })
         .collect::<Result<_, _>>()?;
@@ -691,7 +708,7 @@ fn on_block_core(
     // `lean_state_transition_attestations_processed_total` instead.
 
     // Update forkchoice head based on new block and attestations
-    update_head(store, false);
+    update_head(store);
 
     let block_total = block_start.elapsed();
     info!(
@@ -873,7 +890,7 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     on_tick(store, slot_time_ms, true);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false);
+    accept_new_attestations(store);
 
     store.head().expect("store head exists")
 }
@@ -1133,8 +1150,7 @@ pub fn verify_block_signatures(
             let validator = validators
                 .get(vid as usize)
                 .ok_or(StoreError::InvalidValidatorIndex)?;
-            let pk = validator
-                .get_attestation_pubkey()
+            let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pk);
         }
@@ -1147,8 +1163,7 @@ pub fn verify_block_signatures(
     let proposer_validator = validators
         .get(block.proposer_index as usize)
         .ok_or(StoreError::InvalidValidatorIndex)?;
-    let proposer_pubkey = proposer_validator
-        .get_proposal_pubkey()
+    let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     pubkeys_per_component.push(vec![proposer_pubkey]);
     let block_slot_u32 =

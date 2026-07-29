@@ -36,6 +36,7 @@ use cli::{CliOptions, ExecutionMode};
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_ethrex_engine::EthrexEngine;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
@@ -45,7 +46,6 @@ use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,
-    signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
 };
 use eyre::WrapErr;
@@ -53,7 +53,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-use ethlambda_blockchain::{BlockChain, BlockChainConfig, SyncStatusController};
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
 use ethlambda_ethrex_client::{
     ETHLAMBDA_ENGINE_CAPABILITIES, EngineClient, ExecutionEngine, JwtSecret,
 };
@@ -294,6 +294,12 @@ async fn main() -> eyre::Result<()> {
     // metric's startup value.
     let sync_status = SyncStatusController::default();
 
+    // Chain-event bus: the blockchain actor is the sole publisher; each SSE
+    // client (`GET /lean/v0/events`) subscribes its own receiver through the
+    // clone handed to the RPC server below. With no subscribers attached, the
+    // receiver-count guard in `emit` makes every emission a no-op.
+    let events = EventBus::default();
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
@@ -308,7 +314,12 @@ async fn main() -> eyre::Result<()> {
         suggested_fee_recipient,
     };
 
-    let blockchain = BlockChain::spawn(store.clone(), validator_keys, blockchain_config);
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        validator_keys,
+        blockchain_config,
+        events.clone(),
+    );
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
@@ -351,6 +362,7 @@ async fn main() -> eyre::Result<()> {
             aggregator,
             sync_status,
             local_peer_id,
+            events,
             rpc_shutdown,
         )
         .await
@@ -892,7 +904,7 @@ async fn fetch_initial_state(
 
     info!(?checkpoint_urls, "Starting checkpoint sync");
 
-    let (state, signed_block) = checkpoint_sync::fetch_anchor_block_and_state(
+    let (state, signed_block) = checkpoint_sync::fetch_anchor_with_retry(
         checkpoint_urls,
         genesis.genesis_time,
         &validators,

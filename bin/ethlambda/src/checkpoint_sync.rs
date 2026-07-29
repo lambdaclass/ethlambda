@@ -27,6 +27,14 @@ const MAX_ANCHOR_FETCH_ATTEMPTS: u32 = 3;
 /// Delay between anchor fetch attempts.
 const ANCHOR_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Fixed backoff between checkpoint-sync attempts.
+const CHECKPOINT_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Maximum checkpoint-sync attempts before the process gives up, giving a
+/// slow-to-boot peer time to become reachable. Attempts stay within Hive's
+/// client-startup budget when each one fails fast.
+const MAX_CHECKPOINT_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
     #[error("HTTP request failed: {0}")]
@@ -342,6 +350,28 @@ pub async fn fetch_anchor_block_and_state(
                 }
                 last_err = Some(err);
             }
+        }
+    }
+}
+
+/// Fetch the finalized anchor, retrying any failure (e.g. the peer not yet
+/// reachable) for up to MAX_CHECKPOINT_ATTEMPTS attempts with a fixed backoff
+/// between them before giving up.
+pub async fn fetch_anchor_with_retry(
+    checkpoint_urls: &[String],
+    genesis_time: u64,
+    validators: &[Validator],
+) -> Result<(State, SignedBlock), CheckpointSyncError> {
+    let mut attempt: u32 = 1;
+    loop {
+        match fetch_anchor_block_and_state(checkpoint_urls, genesis_time, validators).await {
+            Ok(pair) => return Ok(pair),
+            Err(err) if attempt < MAX_CHECKPOINT_ATTEMPTS => {
+                warn!(attempt, %err, "Checkpoint sync attempt failed; retrying");
+                tokio::time::sleep(CHECKPOINT_RETRY_BACKOFF).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use axum::{Extension, Router};
-use ethlambda_blockchain::SyncStatusController;
+use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +12,7 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 mod admin;
 mod base;
 mod blocks;
+mod events;
 mod fork_choice;
 mod genesis;
 mod heap_profiling;
@@ -64,11 +65,13 @@ pub async fn start_rpc_server(
     aggregator: AggregatorController,
     sync_status: SyncStatusController,
     peer_id: String,
+    events: EventBus,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store, config.version, peer_id)
         .layer(Extension(aggregator))
-        .layer(Extension(sync_status));
+        .layer(Extension(sync_status))
+        .layer(Extension(events));
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
@@ -115,6 +118,7 @@ fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Rou
     Router::new()
         .merge(base::routes())
         .merge(blocks::routes())
+        .merge(events::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
         .merge(node::routes(version, peer_id))

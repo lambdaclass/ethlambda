@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_ethrex_client::ExecutionEngine;
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
@@ -13,13 +14,12 @@ use ethlambda_types::{
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
 };
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, PRIOR_WORKER_JOIN_TIMEOUT,
-    run_aggregation_worker,
+    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
+    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -31,12 +31,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::ProposerConfig;
+use crate::events::ChainEventSnapshot;
 use crate::store::StoreError;
+
+pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
 mod el_integration;
+pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
 pub mod metrics;
@@ -133,10 +137,15 @@ fn unix_now_ms() -> u64 {
 }
 
 impl BlockChain {
+    /// Spawn the blockchain actor.
+    ///
+    /// `events` is the chain-event publication bus: the spawned actor is its
+    /// sole publisher; consumers subscribe read-only receivers.
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         config: BlockChainConfig,
+        events: EventBus,
     ) -> BlockChain {
         let BlockChainConfig {
             aggregator,
@@ -182,6 +191,7 @@ impl BlockChain {
             suggested_fee_recipient,
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
+            events,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -289,6 +299,10 @@ pub struct BlockChainServer {
     /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
     /// `update_sync_status` with the same `SyncStatus` fed to the metric.
     sync_status_controller: SyncStatusController,
+
+    /// Chain-event publication bus. The actor is the sole publisher; consumers
+    /// only subscribe, preserving the one-directional write flow.
+    events: EventBus,
 }
 
 impl BlockChainServer {
@@ -364,8 +378,14 @@ impl BlockChainServer {
             .flatten()
             .is_some();
 
-        // Tick the store first - this accepts attestations at interval 0 if we have a proposal
+        // Tick the store first - this accepts attestations at interval 0 if we have a proposal.
+        // Snapshot/diff around the call so attestation-driven head or
+        // finalization moves surface as chain events.
+        let pre_tick = ChainEventSnapshot::capture(&self.store);
         store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+        // `slot` above is already derived from `timestamp_ms` (the wall clock
+        // at tick time), so it doubles as the wall-clock slot for the gate.
+        pre_tick.diff_and_emit(&self.store, &self.events, slot);
 
         // Per-interval duties for this tick. Intervals 0 (block publish) and 3
         // (safe-target update) are driven inside `store::on_tick` above, so they
@@ -491,9 +511,14 @@ impl BlockChainServer {
 
     /// Kick off a committee-signature aggregation session:
     /// 1. If a prior session is still running (pathological), warn and join it.
-    /// 2. Snapshot the aggregation inputs from the store.
+    /// 2. Snapshot the aggregation inputs from the store, capped at a single job
+    ///    when we propose next slot.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
     /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
+    ///
+    /// Both entry points land here — the interval-2 tick and the early
+    /// 2/3-threshold trigger — so the proposer cap applies to whichever one
+    /// starts the slot's session.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.current_aggregation.take() {
             prior.cancel.cancel();
@@ -516,7 +541,19 @@ impl BlockChainServer {
 
         coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot) else {
+        // Limit ourselves to a single round of aggregation if we propose next round.
+        // This buys us time to build the block before the next slot's interval-0 tick.
+        let next_proposer = self
+            .get_our_proposer(slot + 1)
+            .filter(|_| self.sync_status.duties_allowed());
+        let max_jobs = if next_proposer.is_some() {
+            1
+        } else {
+            MAX_AGGREGATION_JOBS
+        };
+
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
         };
@@ -741,17 +778,34 @@ impl BlockChainServer {
         // stashed for a later tick), and the real interval-0 tick is then skipped
         // by the idempotency guard in `on_tick`, since the store clock is already
         // here.
+        //
+        // That interval-0 catch-up can move head/justified/finalized (it is the
+        // same attestation-acceptance step a non-proposing node runs at its
+        // interval-0 tick). Snapshot around the build so those moves surface as
+        // chain events here, matching an observer node; otherwise they would
+        // land outside every snapshot window and be silently absorbed into the
+        // later block-import diff's baseline.
+        let pre_build = ChainEventSnapshot::capture(&self.store);
         let timing = metrics::time_block_building();
-        let Ok((block, single_message_aggregates, _post_checkpoints)) =
-            store::produce_block_with_signatures(
-                &mut self.store,
-                slot,
-                validator_id,
-                self.proposer_config,
-                execution_payload,
-            )
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"))
-        else {
+        let build_result = store::produce_block_with_signatures(
+            &mut self.store,
+            slot,
+            validator_id,
+            self.proposer_config,
+            execution_payload,
+        )
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"));
+
+        // `get_proposal_head` advances the store (interval-0 catch-up) inside
+        // `produce_block_with_signatures` *before* the build can fail, so emit
+        // the resulting head/checkpoint moves on both paths — a build failure
+        // must not strand a real finalization move outside every snapshot
+        // window. Ordered before the freshly built block's own import (which
+        // emits its `block` + head/checkpoint events). The catch-up advanced
+        // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
+        pre_build.diff_and_emit(&self.store, &self.events, slot);
+
+        let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
             return;
         };
@@ -787,7 +841,10 @@ impl BlockChainServer {
         // Decode the proposer's proposal pubkey once and reuse it both for the
         // singleton single-message aggregate wrap and for the multi-message
         // aggregate merge inputs.
-        let Ok(proposer_pubkey) = proposer_validator.get_proposal_pubkey().inspect_err(
+        let Ok(proposer_pubkey) = ValidatorPublicKey::from_bytes(
+            &proposer_validator.proposal_pubkey,
+        )
+        .inspect_err(
             |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
         ) else {
             metrics::inc_block_building_failures();
@@ -826,7 +883,7 @@ impl BlockChainServer {
                     resolve_failed = true;
                     break;
                 };
-                match validator.get_attestation_pubkey() {
+                match ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) {
                     Ok(pk) => pubkeys.push(pk),
                     Err(err) => {
                         error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
@@ -943,9 +1000,34 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    /// Run block import and refresh metrics.
+    /// Run block import, emit the resulting chain events, and refresh metrics.
     fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
+        // `on_block` returns Ok early for an already-imported block, so gate
+        // the `block` event on whether this root is actually new.
+        let slot = signed_block.message.slot;
+        let block_root = signed_block.message.hash_tree_root();
+        let is_new = !self
+            .store
+            .has_state(&block_root)
+            .expect("DB read should succeed");
+        let pre_import = ChainEventSnapshot::capture(&self.store);
+
         store::on_block(&mut self.store, signed_block)?;
+
+        // `block` goes out first so subscribers see it ahead of the
+        // justified/head/finalized moves its import triggers.
+        if is_new {
+            self.events.emit(ChainEvent::Block {
+                slot,
+                block: block_root,
+            });
+        }
+        // Block import has no ready-made "now" slot like `on_tick`'s, so
+        // compute the wall-clock slot fresh for the head-recency gate.
+        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let wall_clock_slot = unix_now_ms().saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
+        pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
+
         metrics::update_head_slot(self.store.head_slot());
         let latest_justified_slot = self
             .store
@@ -1230,13 +1312,38 @@ impl BlockChainServer {
         // if the admin API just toggled, the first gossip after the toggle
         // should already use the new value.
         let is_aggregator = self.aggregator.is_enabled();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
+        let accepted = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"))
+            .is_ok();
+
+        // Surface only votes that passed data validation and signature
+        // verification, so subscribers see the same attestations fork choice
+        // does. The ~3 KB XMSS signature is not carried. `emit`'s own guard
+        // drops the event on a node with no subscribers.
+        if accepted {
+            self.events.emit(ChainEvent::Attestation {
+                validator_id: attestation.validator_id,
+                data: attestation.data.clone(),
+            });
+        }
     }
 
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
-        let _ = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"));
+        // The store consumes the aggregate, so snapshot the event inputs first.
+        // Aggregates are low-rate (~one per subnet per slot), so building these
+        // unconditionally is cheap; `emit`'s own guard drops them on an
+        // unsubscribed node. The SNARK proof bytes are not carried.
+        let participants: Vec<u64> = attestation.proof.participant_indices().collect();
+        let data = attestation.data.clone();
+        let accepted = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"))
+            .is_ok();
+
+        // Emit only for aggregates the store accepted, mirroring `attestation`.
+        if accepted {
+            self.events
+                .emit(ChainEvent::Aggregate { participants, data });
+        }
     }
 
     fn update_sync_status(&mut self, current_slot: u64) {
@@ -1349,6 +1456,12 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        self.events.emit(ChainEvent::BlockGossip {
+            slot: msg.block.message.slot,
+            block: msg.block.message.hash_tree_root(),
+        });
+        // EL-gated import: validates the payload with the execution layer
+        // before the block reaches the store (no-op when no EL is configured).
         self.import_gossiped_block(msg.block).await;
     }
 }
@@ -1395,6 +1508,14 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // this message until the interval-2 boundary, so by the time it lands
         // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
+
+        // Surface our own freshly produced aggregate, the counterpart of the
+        // gossip-received path in `on_gossip_aggregated_attestation` (we never
+        // receive our own aggregate back over gossip). Low-rate; proof omitted.
+        self.events.emit(ChainEvent::Aggregate {
+            participants: msg.output.participants.clone(),
+            data: msg.output.hashed.data().clone(),
+        });
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
