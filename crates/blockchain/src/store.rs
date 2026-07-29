@@ -1133,14 +1133,20 @@ pub fn verify_block_signatures(
     }
 
     let block_root = block.hash_tree_root();
-    let structural_elapsed = total_start.elapsed();
-
+    // Slot narrowing is a range check, so it closes out the structural segment
+    // rather than landing between two timers and escaping both.
     let block_slot_u32 =
         u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
+    // One instant ends the structural segment and starts the crypto one, so the
+    // two reported components sum to `total_elapsed` with no gap between them.
+    let structural_end = std::time::Instant::now();
+    let structural_elapsed = structural_end.duration_since(total_start);
 
     // 1. Verify the proposer's raw XMSS signature over the block root. It is
     //    carried outside the attestation aggregate, so it is checked directly
     //    against the proposer's proposal pubkey with the hash-based verifier.
+    //    Counted in `crypto_elapsed` below along with the aggregate, so this
+    //    cost is reported rather than falling between the timers.
     let proposer_validator = validators
         .get(block.proposer_index as usize)
         .ok_or(StoreError::InvalidValidatorIndex)?;
@@ -1155,7 +1161,6 @@ pub fn verify_block_signatures(
     // 2. Verify the attestation aggregate (Type-2 over the body attestations
     //    only). A block with no attestations carries no aggregate; reject a
     //    stray proof rather than silently ignoring it.
-    let crypto_start = std::time::Instant::now();
     if attestations.is_empty() {
         if !signed_block
             .proof
@@ -1197,9 +1202,10 @@ pub fn verify_block_signatures(
         )
         .map_err(StoreError::AggregateVerificationFailed)?;
     }
-    let crypto_elapsed = crypto_start.elapsed();
+    let total_end = std::time::Instant::now();
+    let crypto_elapsed = total_end.duration_since(structural_end);
+    let total_elapsed = total_end.duration_since(total_start);
 
-    let total_elapsed = total_start.elapsed();
     info!(
         slot = block.slot,
         attestation_count = attestations.len(),
