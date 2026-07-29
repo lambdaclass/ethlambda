@@ -6,7 +6,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 ## Quick Reference
 
 **Main branch:** `main`
-**Rust version:** 1.92.0 (edition 2024)
+**Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
 ## Codebase Structure (12 workspace crates)
@@ -316,10 +316,16 @@ GENESIS_VALIDATORS:
 
 ### Running Tests
 ```bash
-cargo test --workspace --release                                    # All workspace tests
+cargo test --workspace --profile release-fast                       # All workspace tests
 cargo test -p ethlambda-blockchain --test forkchoice_spectests
 cargo test -p ethlambda-blockchain --test forkchoice_spectests -- --test-threads=1  # Sequential
 ```
+
+Tests run under `release-fast`: release-grade opt-level (needed to avoid stack
+overflows in signature verification/aggregation) but no LTO, parallel codegen,
+incremental, and line-tables-only debuginfo, so rebuilds are much faster than
+`--release`. Artifacts land in `target/release-fast/`, separate from
+`cargo build --release`.
 
 ## Common Gotchas
 

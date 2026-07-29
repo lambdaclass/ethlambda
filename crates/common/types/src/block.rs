@@ -418,7 +418,7 @@ mod tests {
             body: BlockBody::default(),
         };
         // A distinctive, full-size XMSS signature blob (fixed `SIGNATURE_SIZE`).
-        let proposer_bytes: Vec<u8> = (0..crate::signature::SIGNATURE_SIZE)
+        let proposer_bytes: Vec<u8> = (0..crate::attestation::SIGNATURE_SIZE)
             .map(|i| (i % 251) as u8)
             .collect();
         let proposer_signature = XmssSignature::try_from(proposer_bytes.clone()).unwrap();

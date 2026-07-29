@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -10,13 +11,12 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{BlockProof, ByteList512KiB, MultiMessageAggregate, SignedBlock},
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorPublicKey,
 };
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, PRIOR_WORKER_JOIN_TIMEOUT,
-    run_aggregation_worker,
+    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
+    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -460,9 +460,14 @@ impl BlockChainServer {
 
     /// Kick off a committee-signature aggregation session:
     /// 1. If a prior session is still running (pathological), warn and join it.
-    /// 2. Snapshot the aggregation inputs from the store.
+    /// 2. Snapshot the aggregation inputs from the store, capped at a single job
+    ///    when we propose next slot.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
     /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
+    ///
+    /// Both entry points land here — the interval-2 tick and the early
+    /// 2/3-threshold trigger — so the proposer cap applies to whichever one
+    /// starts the slot's session.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.current_aggregation.take() {
             prior.cancel.cancel();
@@ -485,7 +490,19 @@ impl BlockChainServer {
 
         coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot) else {
+        // Limit ourselves to a single round of aggregation if we propose next round.
+        // This buys us time to build the block before the next slot's interval-0 tick.
+        let next_proposer = self
+            .get_our_proposer(slot + 1)
+            .filter(|_| self.sync_status.duties_allowed());
+        let max_jobs = if next_proposer.is_some() {
+            1
+        } else {
+            MAX_AGGREGATION_JOBS
+        };
+
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
         };
@@ -784,7 +801,7 @@ impl BlockChainServer {
                         resolve_failed = true;
                         break;
                     };
-                    match validator.get_attestation_pubkey() {
+                    match ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) {
                         Ok(pk) => pubkeys.push(pk),
                         Err(err) => {
                             error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
@@ -1187,13 +1204,38 @@ impl BlockChainServer {
         // if the admin API just toggled, the first gossip after the toggle
         // should already use the new value.
         let is_aggregator = self.aggregator.is_enabled();
-        let _ = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"));
+        let accepted = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"))
+            .is_ok();
+
+        // Surface only votes that passed data validation and signature
+        // verification, so subscribers see the same attestations fork choice
+        // does. The ~3 KB XMSS signature is not carried. `emit`'s own guard
+        // drops the event on a node with no subscribers.
+        if accepted {
+            self.events.emit(ChainEvent::Attestation {
+                validator_id: attestation.validator_id,
+                data: attestation.data.clone(),
+            });
+        }
     }
 
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
-        let _ = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
-            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"));
+        // The store consumes the aggregate, so snapshot the event inputs first.
+        // Aggregates are low-rate (~one per subnet per slot), so building these
+        // unconditionally is cheap; `emit`'s own guard drops them on an
+        // unsubscribed node. The SNARK proof bytes are not carried.
+        let participants: Vec<u64> = attestation.proof.participant_indices().collect();
+        let data = attestation.data.clone();
+        let accepted = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
+            .inspect_err(|err| warn!(%err, "Failed to process gossiped aggregated attestation"))
+            .is_ok();
+
+        // Emit only for aggregates the store accepted, mirroring `attestation`.
+        if accepted {
+            self.events
+                .emit(ChainEvent::Aggregate { participants, data });
+        }
     }
 
     fn update_sync_status(&mut self, current_slot: u64) {
@@ -1306,6 +1348,10 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+        self.events.emit(ChainEvent::BlockGossip {
+            slot: msg.block.message.slot,
+            block: msg.block.message.hash_tree_root(),
+        });
         self.on_block(msg.block);
     }
 }
@@ -1352,6 +1398,14 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // this message until the interval-2 boundary, so by the time it lands
         // the aggregate is safe to apply and gossip immediately.
         aggregation::apply_aggregated_group(&mut self.store, &msg.output);
+
+        // Surface our own freshly produced aggregate, the counterpart of the
+        // gossip-received path in `on_gossip_aggregated_attestation` (we never
+        // receive our own aggregate back over gossip). Low-rate; proof omitted.
+        self.events.emit(ChainEvent::Aggregate {
+            participants: msg.output.participants.clone(),
+            data: msg.output.hashed.data().clone(),
+        });
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {

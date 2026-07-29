@@ -24,6 +24,7 @@
 
 use std::collections::HashSet;
 
+use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::{
@@ -32,7 +33,6 @@ use ethlambda_types::{
     },
     block::{SignedBlock, SingleMessageAggregate},
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorPublicKey,
 };
 use tracing::{debug, warn};
 
@@ -84,7 +84,9 @@ pub fn reaggregate_from_block(
                 warn!(vid, "Reaggregation aborted: participant out of range");
                 return Vec::new();
             }
-            let Ok(pk) = validators[vid as usize].get_attestation_pubkey() else {
+            let Ok(pk) =
+                ValidatorPublicKey::from_bytes(&validators[vid as usize].attestation_pubkey)
+            else {
                 warn!(vid, "Reaggregation aborted: bad attestation pubkey");
                 return Vec::new();
             };
@@ -154,7 +156,9 @@ pub fn reaggregate_from_block(
                         bad = true;
                         break;
                     }
-                    match validators[vid as usize].get_attestation_pubkey() {
+                    match ValidatorPublicKey::from_bytes(
+                        &validators[vid as usize].attestation_pubkey,
+                    ) {
                         Ok(pk) => pubkeys.push(pk),
                         Err(_) => {
                             bad = true;

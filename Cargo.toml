@@ -23,8 +23,34 @@ keywords = ["ethereum", "blockchain", "consensus", "protocol"]
 license = "LICENSE"
 readme = "README.md"
 repository = "https://github.com/lambdaclass/ethlambda"
-rust-version = "1.92.0"
+rust-version = "1.97.1"
 version = "0.1.0"
+
+# Cross-crate inlining matters here: the hot paths (SSZ encode/decode, hashing,
+# fork choice traversal) are split across workspace crates and their
+# dependencies, so keeping every crate in its own codegen unit leaves inlining
+# opportunities on the table. Fat LTO plus a single codegen unit trades build
+# time for that.
+#
+# Fat rather than thin: on an 8-node devnet, fat cut mean state transition time
+# a further 2.1% over thin (every fat node beat every thin node) at no measurable
+# build-time or image-size cost. ethrex uses thin here; we diverge deliberately.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Test profile (see the `test` target in the Makefile). Tests need release-grade
+# opt-level: signature verification/aggregation stack-overflows without it. They
+# do not need a whole-program-optimized binary, so this drops LTO, restores
+# parallel codegen, and keeps line tables for backtraces, which makes test
+# rebuilds finish in a fraction of the time of a `release` build.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = "line-tables-only"
+incremental = true
 
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
