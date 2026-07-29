@@ -1,17 +1,42 @@
-.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test tooling-lint tooling-test docs docs-deps docs-serve
+
+# Each tool under tooling/ is its own Cargo workspace (own [workspace] table and
+# Cargo.lock), so `--workspace` commands at the repo root never reach them. They
+# have to be driven one manifest at a time.
+TOOLING_MANIFESTS = tooling/*/Cargo.toml
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
+	@set -e; for manifest in $(TOOLING_MANIFESTS); do \
+		[ -e "$$manifest" ] || continue; \
+		echo "cargo fmt --manifest-path $$manifest --all"; \
+		cargo fmt --manifest-path "$$manifest" --all; \
+	done
 
-lint: ## 🔍 Run clippy on all workspace crates
+lint: tooling-lint ## 🔍 Run clippy on all workspace crates
 	cargo clippy --workspace --all-targets -- -D warnings
 
-test: leanSpec/fixtures ## 🧪 Run all tests
+test: leanSpec/fixtures tooling-test ## 🧪 Run all tests
 	# Tests need to be run on release to avoid stack overflows during signature verification/aggregation
 	cargo test --workspace --release
+
+tooling-lint: ## 🔧 Format-check and clippy the standalone tooling workspaces
+	@set -e; for manifest in $(TOOLING_MANIFESTS); do \
+		[ -e "$$manifest" ] || continue; \
+		echo "==> lint $$manifest"; \
+		cargo fmt --manifest-path "$$manifest" --all -- --check; \
+		cargo clippy --manifest-path "$$manifest" --all-targets -- -D warnings; \
+	done
+
+tooling-test: ## 🔧 Run the standalone tooling workspaces' test suites
+	@set -e; for manifest in $(TOOLING_MANIFESTS); do \
+		[ -e "$$manifest" ] || continue; \
+		echo "==> test $$manifest"; \
+		cargo test --manifest-path "$$manifest"; \
+	done
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)

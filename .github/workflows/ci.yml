@@ -30,7 +30,14 @@ jobs:
           components: rustfmt, clippy
 
       - name: Setup cache
+        # Tools under tooling/ are separate Cargo workspaces with their own
+        # target dir and Cargo.lock, so they need listing explicitly or their
+        # builds are neither cached nor reflected in the cache key.
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tooling/event-monitor
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -40,6 +47,16 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # tooling/ is outside the root workspace, so the steps above never touch
+      # it. Its tests run here rather than in the `test` job because clippy has
+      # already compiled the test targets, and because they need none of that
+      # job's leanSpec fixtures.
+      - name: Lint tooling
+        run: make tooling-lint
+
+      - name: Test tooling
+        run: make tooling-test
 
   test:
     name: Test

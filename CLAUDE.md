@@ -87,6 +87,10 @@ make lint                                    # Clippy with -D warnings
 make test                                    # All tests + forkchoice spec tests
 ```
 
+Each of the three also covers the standalone tooling workspaces under `tooling/`
+(see `tooling-lint` / `tooling-test`), which `--workspace` commands at the repo
+root do not reach. CI runs the same two targets in its `Lint` job.
+
 ### Common Operations
 ```bash
 .claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
