@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 
 use crate::config::NodeConfig;
 use crate::hub::Hub;
-use crate::model::{self, NodeState, NodeStatus};
+use crate::model::{self, NodeState, NodeStatus, NormalizeError};
 use crate::timing::Timing;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -24,6 +24,31 @@ enum CollectorError {
     Http(#[from] reqwest::Error),
     #[error("event stream error: {0}")]
     Stream(String),
+}
+
+/// Outcome of one connection attempt, as the reconnect loop needs it.
+struct Attempt {
+    /// `true` once the connection stayed up for at least one
+    /// [`HEARTBEAT_INTERVAL`] while streaming.
+    ///
+    /// Keyed on how *long* the session lasted rather than on how it ended: a
+    /// node restart surfaces as an error after hours of healthy streaming and
+    /// must not inherit the failure ramp, while a peer that accepts the
+    /// request and instantly drops the stream ends cleanly yet must keep
+    /// ramping instead of being hammered at [`INITIAL_BACKOFF`].
+    healthy: bool,
+    /// `None` on a clean end-of-stream, `Some` on a transport/parse failure.
+    error: Option<CollectorError>,
+}
+
+impl Attempt {
+    /// The connection was never established.
+    fn failed(error: CollectorError) -> Self {
+        Self {
+            healthy: false,
+            error: Some(error),
+        }
+    }
 }
 
 /// Exponential backoff capped at [`MAX_BACKOFF`]. Used both to pace
@@ -43,6 +68,17 @@ impl Backoff {
 
     fn reset(&mut self) {
         self.delay = INITIAL_BACKOFF;
+    }
+
+    /// Folds one attempt's outcome into the ramp: a session that proved
+    /// healthy clears it, so the next reconnect starts from
+    /// [`INITIAL_BACKOFF`] instead of inheriting the delay earned by earlier
+    /// failures. Without this, every node restart ratchets the delay one step
+    /// permanently and a perfectly healthy node eventually reports `down`.
+    fn record(&mut self, attempt: &Attempt) {
+        if attempt.healthy {
+            self.reset();
+        }
     }
 
     /// Returns the delay to wait before the next attempt, then doubles
@@ -112,15 +148,14 @@ pub async fn run_collector(
     loop {
         hub.publish_status(node_status(&node.name, NodeState::Reconnecting, 0.0));
 
-        match connect_and_stream(&node, &topics, &timing, &hub, &client).await {
-            Ok(()) => {
-                tracing::info!(node = %node.name, "SSE stream ended; reconnecting");
-                backoff.reset();
-            }
-            Err(err) => {
+        let attempt = connect_and_stream(&node, &topics, &timing, &hub, &client).await;
+        match &attempt.error {
+            None => tracing::info!(node = %node.name, "SSE stream ended; reconnecting"),
+            Some(err) => {
                 tracing::warn!(node = %node.name, %err, "SSE connection failed; will retry");
             }
         }
+        backoff.record(&attempt);
 
         let delay = backoff.advance();
         let state = if delay >= MAX_BACKOFF {
@@ -134,22 +169,30 @@ pub async fn run_collector(
 }
 
 /// Opens one SSE connection and streams frames until the connection ends or
-/// errors. Returns `Ok(())` on a clean end-of-stream (server closed it),
-/// `Err` on a transport/parse failure.
+/// errors. The returned [`Attempt`] carries both how the session ended and
+/// whether it lasted long enough to count as healthy.
 async fn connect_and_stream(
     node: &NodeConfig,
     topics: &[String],
     timing: &Timing,
     hub: &Hub,
     client: &reqwest::Client,
-) -> Result<(), CollectorError> {
+) -> Attempt {
     let url = format!(
         "{}?topics={}",
         node.endpoint("/lean/v0/events"),
         topics.join(",")
     );
 
-    let response = client.get(&url).send().await?.error_for_status()?;
+    let response = match client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+    {
+        Ok(response) => response,
+        Err(err) => return Attempt::failed(err.into()),
+    };
     let mut stream = response.bytes_stream().eventsource();
 
     hub.publish_status(node_status(&node.name, NodeState::Connected, 0.0));
@@ -158,6 +201,8 @@ async fn connect_and_stream(
     let mut rate = RateTracker::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // the first tick fires immediately; consume it
+    let mut healthy = false;
+    let mut warned_implausible_slot = false;
 
     loop {
         tokio::select! {
@@ -165,13 +210,19 @@ async fn connect_and_stream(
                 match frame {
                     Some(Ok(event)) => {
                         rate.tick();
-                        handle_frame(node, &event, timing, hub);
+                        handle_frame(node, &event, timing, hub, &mut warned_implausible_slot);
                     }
-                    Some(Err(err)) => return Err(CollectorError::Stream(err.to_string())),
-                    None => return Ok(()),
+                    Some(Err(err)) => {
+                        let error = Some(CollectorError::Stream(err.to_string()));
+                        return Attempt { healthy, error };
+                    }
+                    None => return Attempt { healthy, error: None },
                 }
             }
             _ = heartbeat.tick() => {
+                // Surviving a whole heartbeat interval while streaming is what
+                // marks the session healthy for backoff purposes.
+                healthy = true;
                 hub.publish_status(node_status(
                     &node.name,
                     NodeState::Connected,
@@ -185,7 +236,17 @@ async fn connect_and_stream(
 /// Normalizes one already-parsed SSE frame and publishes it on the hub.
 /// Never panics: an unknown topic or payload we can't parse is logged and
 /// dropped (CONTRACT.md §2).
-fn handle_frame(node: &NodeConfig, event: &SseEvent, timing: &Timing, hub: &Hub) {
+///
+/// `warned_implausible_slot` latches the one-per-session warning for slots the
+/// collector clock says cannot be real; a node on the wrong genesis produces
+/// one such frame per event, and the point is to be noticed, not to flood.
+fn handle_frame(
+    node: &NodeConfig,
+    event: &SseEvent,
+    timing: &Timing,
+    hub: &Hub,
+    warned_implausible_slot: &mut bool,
+) {
     // Defensive: eventsource-stream already suppresses comment/keep-alive
     // lines (they never build a non-empty data buffer), but guard anyway.
     if event.data.is_empty() {
@@ -193,6 +254,16 @@ fn handle_frame(node: &NodeConfig, event: &SseEvent, timing: &Timing, hub: &Hub)
     }
     match model::normalize(&node.name, &event.event, &event.data, now_ms(), timing) {
         Ok(normalized) => hub.publish_chain(normalized),
+        Err(err @ NormalizeError::ImplausibleSlot { .. }) => {
+            if !*warned_implausible_slot {
+                *warned_implausible_slot = true;
+                tracing::warn!(
+                    node = %node.name,
+                    %err,
+                    "dropping events with implausible slots; is this node on a different genesis?"
+                );
+            }
+        }
         Err(err) => {
             tracing::debug!(
                 node = %node.name,
@@ -229,6 +300,52 @@ mod tests {
         backoff.advance();
         backoff.reset();
         assert_eq!(backoff.advance(), INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn healthy_session_clears_the_ramp_even_when_it_ends_with_an_error() {
+        // The common shape of a node restart: hours of healthy streaming, then
+        // the connection drops with an error. The next reconnect must start
+        // from INITIAL_BACKOFF, not inherit the ramp.
+        let mut backoff = Backoff::new();
+        backoff.advance();
+        backoff.advance();
+        backoff.record(&Attempt {
+            healthy: true,
+            error: Some(CollectorError::Stream(
+                "connection reset by peer".to_string(),
+            )),
+        });
+        assert_eq!(backoff.advance(), INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn unhealthy_session_keeps_the_ramp_climbing_even_when_it_ends_cleanly() {
+        // A peer that accepts the request and immediately closes the stream
+        // ends cleanly, but must not be retried at INITIAL_BACKOFF forever.
+        let mut backoff = Backoff::new();
+        assert_eq!(backoff.advance(), INITIAL_BACKOFF);
+        backoff.record(&Attempt {
+            healthy: false,
+            error: None,
+        });
+        assert_eq!(backoff.advance(), INITIAL_BACKOFF * 2);
+    }
+
+    #[test]
+    fn repeated_healthy_sessions_never_ratchet_toward_down() {
+        // Regression: with the reset keyed on clean end-of-stream instead of on
+        // session health, each restart ratcheted the delay one step and after
+        // ~7 restarts a healthy node was reported Down with 10s reconnects.
+        let mut backoff = Backoff::new();
+        for _ in 0..20 {
+            let delay = backoff.advance();
+            assert!(delay < MAX_BACKOFF, "delay ratcheted to the Down threshold");
+            backoff.record(&Attempt {
+                healthy: true,
+                error: Some(CollectorError::Stream("node restarted".to_string())),
+            });
+        }
     }
 
     #[test]

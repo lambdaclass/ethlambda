@@ -61,6 +61,20 @@ pub struct NormalizedEvent {
     pub participants: Option<u32>,
 }
 
+/// How far ahead of the collector's own clock an event's slot may be before we
+/// treat it as bogus. A node slightly ahead of us is normal (clock skew, an
+/// event emitted just before its slot boundary), but a slot far in the future
+/// means the node is on a different genesis or the payload is corrupt. Such an
+/// event must not be accepted: both the collector's history ring and the
+/// dashboard's rolling window key their retention off the highest slot seen,
+/// which only ever moves up, so one bogus slot would age out every real event
+/// and blank the view until a restart.
+///
+/// Only the future side is bounded. Old slots are legitimate and common
+/// (`finalized_checkpoint` trails head, a syncing node replays history) and
+/// cannot move the watermark.
+const MAX_FUTURE_SLOTS: u64 = 8;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NormalizeError {
     #[error("unknown topic: {0}")]
@@ -70,6 +84,14 @@ pub enum NormalizeError {
         topic: String,
         #[source]
         source: serde_json::Error,
+    },
+    #[error(
+        "topic {topic} reports slot {slot}, more than {MAX_FUTURE_SLOTS} slots ahead of the collector's own slot {collector_slot}"
+    )]
+    ImplausibleSlot {
+        topic: String,
+        slot: u64,
+        collector_slot: u64,
     },
 }
 
@@ -141,6 +163,15 @@ pub fn normalize(
         other => return Err(NormalizeError::UnknownTopic(other.to_string())),
     };
 
+    let collector_slot = timing.slot_at(arrival_ms);
+    if slot > collector_slot.saturating_add(MAX_FUTURE_SLOTS) {
+        return Err(NormalizeError::ImplausibleSlot {
+            topic: topic.to_string(),
+            slot,
+            collector_slot,
+        });
+    }
+
     Ok(NormalizedEvent {
         node: node.to_string(),
         topic: topic.to_string(),
@@ -181,22 +212,31 @@ mod tests {
         }
     }
 
+    /// Collector-clock arrival `offset_ms` into `slot`, so fixtures place the
+    /// arrival inside a plausible slot the way real events do (see
+    /// [`MAX_FUTURE_SLOTS`]).
+    fn arrival_for(slot: u64, offset_ms: i64) -> i64 {
+        slot as i64 * 4_000 + offset_ms
+    }
+
     #[test]
     fn block_topic_maps_id_to_block_root() {
         let data = r#"{ "slot": 128, "block": "0xabc123" }"#;
-        let ev = normalize("node-2", "block", data, 1_000, &timing()).unwrap();
+        let arrival = arrival_for(128, 123);
+        let ev = normalize("node-2", "block", data, arrival, &timing()).unwrap();
         assert_eq!(ev.topic, "block");
         assert_eq!(ev.slot, 128);
         assert_eq!(ev.id, Some("0xabc123".to_string()));
         assert_eq!(ev.validator_id, None);
         assert_eq!(ev.participants, None);
-        assert_eq!(ev.offset_ms, 1_000 - 128 * 4_000);
+        assert_eq!(ev.offset_ms, 123);
     }
 
     #[test]
     fn block_gossip_topic_maps_id_to_block_root() {
         let data = r#"{ "slot": 128, "block": "0xabc123" }"#;
-        let ev = normalize("node-2", "block_gossip", data, 1_000, &timing()).unwrap();
+        let arrival = arrival_for(128, 1_000);
+        let ev = normalize("node-2", "block_gossip", data, arrival, &timing()).unwrap();
         assert_eq!(ev.topic, "block_gossip");
         assert_eq!(ev.id, Some("0xabc123".to_string()));
     }
@@ -204,7 +244,8 @@ mod tests {
     #[test]
     fn head_topic_maps_id_to_block_root_ignoring_state() {
         let data = r#"{ "slot": 128, "block": "0x1a2b", "state": "0x3c4d" }"#;
-        let ev = normalize("node-2", "head", data, 2_000, &timing()).unwrap();
+        let arrival = arrival_for(128, 2_000);
+        let ev = normalize("node-2", "head", data, arrival, &timing()).unwrap();
         assert_eq!(ev.topic, "head");
         assert_eq!(ev.slot, 128);
         assert_eq!(ev.id, Some("0x1a2b".to_string()));
@@ -212,15 +253,18 @@ mod tests {
 
     #[test]
     fn justified_checkpoint_maps_id_to_block_root() {
+        // Checkpoints trail head, so the arrival sits well past their own slot.
         let data = r#"{ "slot": 120, "block": "0xaaaa", "state": "0xbbbb" }"#;
-        let ev = normalize("node-2", "justified_checkpoint", data, 0, &timing()).unwrap();
+        let arrival = arrival_for(128, 0);
+        let ev = normalize("node-2", "justified_checkpoint", data, arrival, &timing()).unwrap();
         assert_eq!(ev.id, Some("0xaaaa".to_string()));
     }
 
     #[test]
     fn finalized_checkpoint_maps_id_to_block_root() {
         let data = r#"{ "slot": 96, "block": "0xcccc", "state": "0xdddd" }"#;
-        let ev = normalize("node-2", "finalized_checkpoint", data, 0, &timing()).unwrap();
+        let arrival = arrival_for(128, 0);
+        let ev = normalize("node-2", "finalized_checkpoint", data, arrival, &timing()).unwrap();
         assert_eq!(ev.id, Some("0xcccc".to_string()));
     }
 
@@ -235,7 +279,8 @@ mod tests {
                 "source": {"root": "0xs", "slot": 4}
             }
         }"#;
-        let ev = normalize("node-2", "attestation", data, 0, &timing()).unwrap();
+        let arrival = arrival_for(12, 800);
+        let ev = normalize("node-2", "attestation", data, arrival, &timing()).unwrap();
         assert_eq!(ev.topic, "attestation");
         assert_eq!(ev.slot, 12);
         assert_eq!(ev.id, None);
@@ -254,7 +299,8 @@ mod tests {
                 "source": {"root": "0xs", "slot": 4}
             }
         }"#;
-        let ev = normalize("node-2", "aggregate", data, 0, &timing()).unwrap();
+        let arrival = arrival_for(12, 1_600);
+        let ev = normalize("node-2", "aggregate", data, arrival, &timing()).unwrap();
         assert_eq!(ev.topic, "aggregate");
         assert_eq!(ev.slot, 12);
         assert_eq!(ev.validator_id, None);
@@ -284,8 +330,15 @@ mod tests {
                 "source": {"root": "0xs", "slot": 4}
             }
         }"#;
-        let ev_a = normalize("node-2", "aggregate", data_a, 0, &timing()).unwrap();
-        let ev_b = normalize("node-3", "aggregate", data_b, 999, &timing()).unwrap();
+        let ev_a = normalize("node-2", "aggregate", data_a, arrival_for(12, 0), &timing()).unwrap();
+        let ev_b = normalize(
+            "node-3",
+            "aggregate",
+            data_b,
+            arrival_for(12, 999),
+            &timing(),
+        )
+        .unwrap();
         assert_eq!(ev_a.id, ev_b.id);
     }
 
@@ -304,8 +357,9 @@ mod tests {
             }}"#
             )
         };
-        let ev_a = normalize("node-2", "aggregate", &base("[0,1,2]"), 0, &timing()).unwrap();
-        let ev_b = normalize("node-2", "aggregate", &base("[0,1,3]"), 0, &timing()).unwrap();
+        let arrival = arrival_for(12, 1_600);
+        let ev_a = normalize("node-2", "aggregate", &base("[0,1,2]"), arrival, &timing()).unwrap();
+        let ev_b = normalize("node-2", "aggregate", &base("[0,1,3]"), arrival, &timing()).unwrap();
         assert_ne!(ev_a.id, ev_b.id);
     }
 
@@ -329,9 +383,60 @@ mod tests {
                 "source": {"root": "0xs", "slot": 4}
             }
         }"#;
-        let ev_a = normalize("node-2", "aggregate", data_a, 0, &timing()).unwrap();
-        let ev_b = normalize("node-2", "aggregate", data_b, 0, &timing()).unwrap();
+        let arrival = arrival_for(13, 1_600);
+        let ev_a = normalize("node-2", "aggregate", data_a, arrival, &timing()).unwrap();
+        let ev_b = normalize("node-2", "aggregate", data_b, arrival, &timing()).unwrap();
         assert_ne!(ev_a.id, ev_b.id);
+    }
+
+    #[test]
+    fn slot_far_ahead_of_the_collector_clock_is_rejected() {
+        // A node on a different genesis reports slots wildly ahead of ours.
+        // Accepting one would ratchet the history/window watermark past every
+        // real event and blank the dashboard, so it must be dropped.
+        let data = r#"{ "slot": 900000, "block": "0xdead" }"#;
+        let err = normalize("node-2", "block", data, arrival_for(128, 0), &timing()).unwrap_err();
+        assert!(matches!(
+            err,
+            NormalizeError::ImplausibleSlot { slot: 900000, .. }
+        ));
+    }
+
+    #[test]
+    fn slot_slightly_ahead_of_the_collector_clock_is_accepted() {
+        // Modest clock skew, or an event emitted just before its slot boundary,
+        // is normal and must still get through.
+        let t = timing();
+        let collector_slot = 128;
+        for ahead in 0..=MAX_FUTURE_SLOTS {
+            let data = format!(
+                r#"{{ "slot": {}, "block": "0xabc" }}"#,
+                collector_slot + ahead
+            );
+            let arrival = arrival_for(collector_slot, 0);
+            let ev = normalize("node-2", "block", &data, arrival, &t)
+                .unwrap_or_else(|err| panic!("{ahead} slots ahead should be accepted: {err}"));
+            assert_eq!(ev.slot, collector_slot + ahead);
+        }
+
+        let data = format!(
+            r#"{{ "slot": {}, "block": "0xabc" }}"#,
+            collector_slot + MAX_FUTURE_SLOTS + 1
+        );
+        let arrival = arrival_for(collector_slot, 0);
+        let err = normalize("node-2", "block", &data, arrival, &t).unwrap_err();
+        assert!(matches!(err, NormalizeError::ImplausibleSlot { .. }));
+    }
+
+    #[test]
+    fn old_slots_are_always_accepted() {
+        // Past slots are legitimate and common: finalized/justified checkpoints
+        // trail head, and a syncing node replays history. They also cannot move
+        // the watermark, so there is no reason to bound them.
+        let data = r#"{ "slot": 1, "block": "0xold", "state": "0xstate" }"#;
+        let arrival = arrival_for(500_000, 0);
+        let ev = normalize("node-2", "finalized_checkpoint", data, arrival, &timing()).unwrap();
+        assert_eq!(ev.slot, 1);
     }
 
     #[test]

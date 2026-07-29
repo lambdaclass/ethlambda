@@ -41,6 +41,20 @@ impl Timing {
         let slot_start_ms = self.genesis_time as i64 * 1000 + slot as i64 * self.ms_per_slot as i64;
         arrival_ms - slot_start_ms
     }
+
+    /// The slot the collector's own clock is in at `now_ms`, used to bound how
+    /// far ahead of us an event's slot may plausibly be. Saturates at slot 0
+    /// for timestamps at or before genesis.
+    pub fn slot_at(&self, now_ms: i64) -> u64 {
+        let genesis_ms = self.genesis_time as i64 * 1000;
+        let elapsed_ms = now_ms.saturating_sub(genesis_ms);
+        if elapsed_ms <= 0 {
+            return 0;
+        }
+        // `ms_per_slot` comes off the wire, so treat a bogus 0 as 1ms rather
+        // than dividing by zero.
+        elapsed_ms as u64 / self.ms_per_slot.max(1)
+    }
 }
 
 /// Config-supplied overrides for offline testing (CONTRACT.md §5).
@@ -194,5 +208,35 @@ mod tests {
         let t = timing();
         let genesis_ms = t.genesis_time as i64 * 1000;
         assert_eq!(t.offset_ms(0, genesis_ms + 500), 500);
+    }
+
+    #[test]
+    fn slot_at_counts_whole_slots_since_genesis() {
+        let t = timing();
+        let genesis_ms = t.genesis_time as i64 * 1000;
+        assert_eq!(t.slot_at(genesis_ms), 0);
+        assert_eq!(t.slot_at(genesis_ms + 3_999), 0);
+        assert_eq!(t.slot_at(genesis_ms + 4_000), 1);
+        assert_eq!(t.slot_at(genesis_ms + 128 * 4_000 + 123), 128);
+    }
+
+    #[test]
+    fn slot_at_saturates_at_zero_before_genesis() {
+        let t = timing();
+        let genesis_ms = t.genesis_time as i64 * 1000;
+        assert_eq!(t.slot_at(genesis_ms - 1), 0);
+        assert_eq!(t.slot_at(0), 0);
+    }
+
+    #[test]
+    fn slot_at_survives_a_bogus_zero_ms_per_slot() {
+        // `ms_per_slot` comes off the wire, so a malformed spec response must
+        // not divide by zero.
+        let t = Timing {
+            genesis_time: 0,
+            ms_per_slot: 0,
+            intervals_per_slot: 5,
+        };
+        assert_eq!(t.slot_at(5_000), 5_000);
     }
 }

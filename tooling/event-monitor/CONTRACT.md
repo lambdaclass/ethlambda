@@ -79,6 +79,19 @@ offset_ms     = arrival_ms - slot_start_ms        // may be negative under clock
 (`SystemTime::now()` → epoch ms). Config may override `genesis_time` /
 `ms_per_slot` for offline testing.
 
+### Slot plausibility bound
+
+Once slot geometry is known, the collector drops any event whose `slot` is more
+than `MAX_FUTURE_SLOTS` (8) ahead of the slot its own clock is in, warning once
+per node per connection. Both the collector's history ring (§4) and the
+dashboard's rolling window (§6) key retention off the highest slot seen, and
+that watermark only ever moves up, so a single event from a node on a different
+genesis would age out every real event and blank the view until a restart.
+
+Only the future side is bounded. Old slots are legitimate and common
+(`finalized_checkpoint` trails head, a syncing node replays history) and cannot
+move the watermark, so they are always accepted.
+
 ---
 
 ## 3. NormalizedEvent (collector → browser payload)
@@ -173,6 +186,11 @@ live events), then fetches `/api/history`, seeds history, and flushes the
 buffer, de-duping the overlap by `(node, topic, slot, id, validator_id,
 arrival_ms)`. The broadcast never replays to new subscribers, so this
 guarantees no gap and no double-count.
+
+Status is applied immediately rather than buffered, so **live status wins**: the
+frontend ignores a snapshot `status` entry for any node whose status already
+arrived on the open stream, since the snapshot is a point-in-time record and can
+be the older of the two.
 
 ---
 

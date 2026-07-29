@@ -141,6 +141,10 @@ async function boot() {
   const seen = new Set();
   const liveBuffer = [];
   let loading = backfilling;
+  // Nodes whose status already arrived live while /api/history was in flight.
+  // Unlike chain events, status is applied immediately rather than buffered, so
+  // the snapshot (a point-in-time record, possibly older) must not clobber it.
+  const liveStatusNodes = new Set();
 
   const ingestDeduped = (ev) => {
     const key = eventKey(ev);
@@ -170,6 +174,7 @@ async function boot() {
     } catch {
       return;
     }
+    if (loading) liveStatusNodes.add(status.node);
     applyStatus(chips, status);
   });
 
@@ -177,7 +182,9 @@ async function boot() {
     try {
       const history = await fetchHistory();
       if (Array.isArray(history.status)) {
-        history.status.forEach((s) => applyStatus(chips, s));
+        history.status
+          .filter((s) => !liveStatusNodes.has(s.node))
+          .forEach((s) => applyStatus(chips, s));
       }
       if (Array.isArray(history.events)) {
         history.events.forEach(ingestDeduped);
