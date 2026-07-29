@@ -14,9 +14,8 @@
 //! aggregation material once (raw-first + trim, see [`resolve_job`]), then a
 //! pure in-memory loop scores and orders candidates by consensus value
 //! (current-slot before stale, then Finalize > Justify > Build), emitting at
-//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to
-//! [`PROPOSER_MAX_AGGREGATION_JOBS`] in the slot before one of our validators
-//! proposes.
+//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to a
+//! single job in the slot before one of our validators proposes.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -178,14 +177,7 @@ impl Message for EarlyAggregationCheck {
 /// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
-pub(crate) const MAX_AGGREGATION_JOBS: usize = 3;
-
-/// Job cap for a session running in the slot before one of our validators
-/// proposes. The interval-4 build runs its own leanVM proofs for the block it
-/// is about to publish; keeping this slot's aggregation to a single job leaves
-/// the prover to that build instead of racing it. The one job we do run is the
-/// best-scoring candidate, so the highest-value coverage is retained.
-pub(crate) const PROPOSER_MAX_AGGREGATION_JOBS: usize = 1;
+pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
 /// thread, touches the store, does no heavy cryptography. Returns `None` when
@@ -208,9 +200,9 @@ pub(crate) const PROPOSER_MAX_AGGREGATION_JOBS: usize = 1;
 ///
 /// Stops early when no remaining candidate scores (converged).
 ///
-/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and
-/// [`PROPOSER_MAX_AGGREGATION_JOBS`] when the caller is about to build a block
-/// at interval 4 (see `BlockChainServer::start_aggregation_session`).
+/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
+/// the caller is about to build a block at interval 4 (see
+/// `BlockChainServer::start_aggregation_session`).
 pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
@@ -1386,7 +1378,7 @@ mod tests {
 
     /// With more scoring candidates than `MAX_AGGREGATION_JOBS`, exactly that
     /// many jobs are produced — the best `MAX_AGGREGATION_JOBS` by ordering
-    /// key, i.e. the top three by `target_slot`.
+    /// key, i.e. the top two by `target_slot`.
     #[test]
     fn snapshot_caps_jobs_at_max_aggregation_jobs() {
         let store = store_with_competing_build_tier_groups();
@@ -1403,24 +1395,23 @@ mod tests {
             .collect();
         assert_eq!(
             selected_targets,
-            HashSet::from([3, 4, 5]),
-            "the three highest target_slot groups win the new_voters tie"
+            HashSet::from([4, 5]),
+            "the two highest target_slot groups win the new_voters tie"
         );
     }
 
-    /// The proposer cap yields exactly one job from the same pool, and it is
-    /// the single best-scoring candidate — the one the uncapped selection also
-    /// picks first (highest `target_slot`). Every other candidate is still
-    /// counted in `groups_considered`, so the cap is visibly a selection bound
-    /// rather than a narrower candidate pool.
+    /// The proposer cap (`max_jobs = 1`) yields exactly one job from the same
+    /// pool, and it is the single best-scoring candidate — the one the uncapped
+    /// selection also picks first (highest `target_slot`). Every other candidate
+    /// is still counted in `groups_considered`, so the cap is visibly a
+    /// selection bound rather than a narrower candidate pool.
     #[test]
     fn snapshot_caps_jobs_at_one_for_proposer() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, PROPOSER_MAX_AGGREGATION_JOBS)
-            .expect("should produce a job");
+        let snapshot = snapshot_aggregation_inputs(&store, 999, 1).expect("should produce a job");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
-        assert_eq!(snapshot.jobs.len(), PROPOSER_MAX_AGGREGATION_JOBS);
+        assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(
             snapshot.jobs[0].hashed.data().target.slot,
             NUM_GROUPS as u64,
