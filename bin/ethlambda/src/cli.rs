@@ -14,6 +14,10 @@ pub(crate) enum ExecutionMode {
     External,
     /// In-process: run an embedded ethrex execution layer, driven by direct
     /// library calls (requires `--el-genesis`). No Engine API / JSON-RPC hop.
+    ///
+    /// Spelled `inprocess` on the CLI (clap would otherwise derive
+    /// `in-process` from the variant name).
+    #[value(name = "inprocess")]
     InProcess,
 }
 
