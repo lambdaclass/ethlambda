@@ -31,8 +31,26 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 /// has piled up against one edge.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Upper bound on `MILLISECONDS_PER_SLOT`. One hour per slot is already absurd
+/// for a consensus client; anything past it is a malformed spec response, not a
+/// configuration choice.
+const MAX_MS_PER_SLOT: u64 = 3_600_000;
+
+/// Upper bound on `genesis_time` (seconds): 2100-01-01. Its only job is to keep
+/// `genesis_time * 1000` far inside `i64`, since [`Timing::offset_ms`] does that
+/// multiply and an absurd value from a malformed response would otherwise
+/// overflow — a panic in a debug build.
+///
+/// Note this bounds only the *absurd* side. A `genesis_time` in the near future
+/// is legitimate: a devnet is routinely configured before its genesis fires.
+const MAX_GENESIS_TIME: u64 = 4_102_444_800;
+
 /// Resolved slot geometry used to compute `offset_ms` for incoming events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` so a change can be pushed to open dashboards on `/stream`
+/// (CONTRACT.md §4 `event: geometry`); the field names are the same three
+/// `/api/meta` publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Timing {
     pub genesis_time: u64,
     pub ms_per_slot: u64,
@@ -40,6 +58,34 @@ pub struct Timing {
 }
 
 impl Timing {
+    /// Rejects geometry that would make every downstream number meaningless.
+    ///
+    /// Nothing here crashes if it slips through — `slot_at` floors the divisor,
+    /// the frontend defaults a zero `ms_per_slot` — but the result is every dot
+    /// piled against one edge with no explanation, which for a monitoring tool
+    /// is worse than refusing to start. Checked at the one place geometry
+    /// enters the process, so both the network fetch and the config overrides
+    /// go through it.
+    fn validate(&self) -> Result<(), BootstrapError> {
+        let reject = |reason: String| Err(BootstrapError::ImplausibleGeometry { reason });
+        if self.ms_per_slot == 0 || self.ms_per_slot > MAX_MS_PER_SLOT {
+            return reject(format!(
+                "ms_per_slot is {}, expected 1..={MAX_MS_PER_SLOT}",
+                self.ms_per_slot
+            ));
+        }
+        if self.intervals_per_slot == 0 {
+            return reject("intervals_per_slot is 0; the slot axis divides by it".to_string());
+        }
+        if self.genesis_time > MAX_GENESIS_TIME {
+            return reject(format!(
+                "genesis_time is {}, expected 0..={MAX_GENESIS_TIME}",
+                self.genesis_time
+            ));
+        }
+        Ok(())
+    }
+
     /// `offset_ms = arrival_ms - (genesis_time*1000 + slot*ms_per_slot)`.
     ///
     /// May be negative: an event can arrive before its nominal slot start
@@ -91,6 +137,8 @@ pub enum BootstrapError {
         "no reachable node provided slot geometry and config did not override genesis_time/ms_per_slot"
     )]
     NoTimingSource,
+    #[error("implausible slot geometry: {reason}")]
+    ImplausibleGeometry { reason: String },
 }
 
 struct Fetched {
@@ -169,11 +217,13 @@ pub async fn bootstrap(
         .map(|f| f.intervals_per_slot)
         .unwrap_or(DEFAULT_INTERVALS_PER_SLOT);
 
-    Ok(Timing {
+    let timing = Timing {
         genesis_time,
         ms_per_slot,
         intervals_per_slot,
-    })
+    };
+    timing.validate()?;
+    Ok(timing)
 }
 
 /// Re-resolves slot geometry every [`REFRESH_INTERVAL`] and republishes it on
@@ -191,9 +241,14 @@ pub async fn bootstrap(
 /// none, and an unreachable node is expected during a rolling restart.
 ///
 /// Already-loaded browser tabs keep the `ms_per_slot` / `intervals_per_slot`
-/// they fetched from `/api/meta`, and their own client-side slot watermark, so
-/// they need a reload after a geometry change. Server-computed `offset_ms`
-/// values are correct immediately.
+/// they fetched from `/api/meta`, and their own client-side slot watermark,
+/// which only ever moves up. A restarted chain's low slots therefore sit below
+/// it and every event ages out of the window on arrival, so the tab goes blank —
+/// indistinguishable from the chain having died, which is the question this tool
+/// exists to answer. The change is broadcast on `/stream` (CONTRACT.md §4
+/// `event: geometry`) so the tab can say so and offer a reload instead of
+/// silently emptying. Server-computed `offset_ms` values are correct
+/// immediately.
 pub async fn run_refresher(
     nodes: Vec<NodeConfig>,
     overrides: TimingOverrides,
@@ -228,6 +283,9 @@ pub async fn run_refresher(
             "slot geometry changed; dropping retained history and re-basing offsets"
         );
         hub.reset_history();
+        // Announce before switching over, so no subscriber can receive an event
+        // stamped with the new geometry before being told the geometry moved.
+        hub.publish_geometry(fresh);
         // A send error means every receiver is gone, i.e. we are shutting down.
         let _ = timing_tx.send(fresh);
     }
@@ -291,6 +349,82 @@ mod tests {
         let genesis_ms = t.genesis_time as i64 * 1000;
         assert_eq!(t.slot_at(genesis_ms - 1), 0);
         assert_eq!(t.slot_at(0), 0);
+    }
+
+    #[test]
+    fn valid_geometry_passes_validation() {
+        assert!(timing().validate().is_ok());
+        // Genesis in the future is legitimate: a devnet is configured before it
+        // fires, and until then every offset is simply negative.
+        let future = Timing {
+            genesis_time: MAX_GENESIS_TIME,
+            ..timing()
+        };
+        assert!(future.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_or_absurd_ms_per_slot_is_rejected() {
+        // A malformed spec response used to pass straight through: nothing
+        // crashed, but every dot piled against one edge with no explanation.
+        for ms_per_slot in [0, MAX_MS_PER_SLOT + 1] {
+            let t = Timing {
+                ms_per_slot,
+                ..timing()
+            };
+            assert!(
+                matches!(
+                    t.validate(),
+                    Err(BootstrapError::ImplausibleGeometry { .. })
+                ),
+                "ms_per_slot {ms_per_slot} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_intervals_per_slot_is_rejected() {
+        // The beeswarm's axis split divides by it.
+        let t = Timing {
+            intervals_per_slot: 0,
+            ..timing()
+        };
+        assert!(matches!(
+            t.validate(),
+            Err(BootstrapError::ImplausibleGeometry { .. })
+        ));
+    }
+
+    #[test]
+    fn a_genesis_time_that_would_overflow_the_offset_math_is_rejected() {
+        // `offset_ms` multiplies genesis_time by 1000 as an i64, which panics in
+        // a debug build on an absurd value off the wire.
+        let t = Timing {
+            genesis_time: u64::MAX,
+            ..timing()
+        };
+        assert!(matches!(
+            t.validate(),
+            Err(BootstrapError::ImplausibleGeometry { .. })
+        ));
+    }
+
+    #[test]
+    fn the_largest_accepted_genesis_time_does_not_overflow_offset_ms() {
+        // Pins the bound to what it exists for: the accepted maximum, at the
+        // largest accepted slot duration, must stay inside i64.
+        let t = Timing {
+            genesis_time: MAX_GENESIS_TIME,
+            ms_per_slot: MAX_MS_PER_SLOT,
+            intervals_per_slot: 5,
+        };
+        assert!(t.validate().is_ok());
+        assert!(
+            MAX_GENESIS_TIME.checked_mul(1000).unwrap() < i64::MAX as u64,
+            "MAX_GENESIS_TIME must keep genesis_time * 1000 inside i64"
+        );
+        // Non-panicking in a debug build is the assertion.
+        let _ = t.offset_ms(0, 0);
     }
 
     #[test]

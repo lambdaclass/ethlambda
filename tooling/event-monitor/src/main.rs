@@ -32,7 +32,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(%err, config = %args.config.display(), "failed to load config");
     })?;
 
-    let client = reqwest::Client::new();
+    // Carries the connect/read timeouts every SSE subscription depends on to
+    // fail rather than hang; see `collector::build_client`.
+    let client = collector::build_client()?;
     let timing = timing::bootstrap(&config.nodes, config.timing_overrides(), &client)
         .await
         .inspect_err(|err| tracing::error!(%err, "failed to bootstrap slot timing"))?;

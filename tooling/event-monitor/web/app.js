@@ -61,6 +61,22 @@ function createLiveSource() {
   return es;
 }
 
+// A geometry change (CONTRACT.md §4 `event: geometry`) invalidates this tab
+// wholesale: `ms_per_slot` / `intervals_per_slot` came from the /api/meta fetch
+// at load, and the panels' slot watermark only ever moves up, so a restarted
+// chain's low slots age out on arrival and every panel empties. That is exactly
+// indistinguishable from the chain having died, so say so rather than letting
+// the view go quietly blank.
+function wireGeometryBanner(source) {
+  const banner = document.getElementById("geometry-banner");
+  if (!banner) return;
+  const reload = document.getElementById("geometry-reload");
+  if (reload) reload.addEventListener("click", () => location.reload());
+  source.addEventListener("geometry", () => {
+    banner.hidden = false;
+  });
+}
+
 async function fetchMeta() {
   const res = await fetch("/api/meta");
   if (!res.ok) throw new Error(`GET /api/meta failed: ${res.status}`);
@@ -127,6 +143,7 @@ async function boot() {
   });
 
   wireWindowControl(meta, [beeswarm, propagation]);
+  wireGeometryBanner(source);
 
   const ingest = (ev) => {
     beeswarm.addEvent(ev);

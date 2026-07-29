@@ -74,8 +74,15 @@ struct AppState {
     timing: watch::Receiver<Timing>,
 }
 
-/// Builds the full axum app: `/stream`, `/api/meta`, `/api/history`, and
-/// static file serving (with an `index.html` fallback) rooted at `static_dir`.
+/// Builds the full axum app: `/stream`, `/api/meta`, `/api/history`, and static
+/// file serving rooted at `static_dir`.
+///
+/// `/` is routed to `index.html` explicitly and everything unmatched 404s. The
+/// dashboard is one page, not a client-routed SPA, so a catch-all `index.html`
+/// fallback bought nothing and cost the two signals worth having: a typo'd asset
+/// path came back as `200 text/html` and surfaced as a mystery JS parse error,
+/// and a wrong API path answered `200` instead of telling a frozen contract's
+/// caller it had the path wrong.
 pub fn build_router(
     hub: Hub,
     meta: MetaConfig,
@@ -84,15 +91,13 @@ pub fn build_router(
 ) -> Router {
     let state = AppState { hub, meta, timing };
 
-    let index_html = static_dir.join("index.html");
-    let serve_dir = ServeDir::new(static_dir).fallback(ServeFile::new(index_html));
-
     Router::new()
         .route("/stream", get(stream_handler))
         .route("/api/meta", get(meta_handler))
         .route("/api/history", get(history_handler))
+        .route_service("/", ServeFile::new(static_dir.join("index.html")))
         .with_state(state)
-        .fallback_service(serve_dir)
+        .fallback_service(ServeDir::new(static_dir))
 }
 
 async fn meta_handler(State(state): State<AppState>) -> Json<Meta> {
@@ -117,6 +122,7 @@ async fn stream_handler(
         match message {
             Ok(HubMessage::Chain(event)) => Some(Ok(sse_event("chain", &event))),
             Ok(HubMessage::Status(status)) => Some(Ok(sse_event("status", &status))),
+            Ok(HubMessage::Geometry(timing)) => Some(Ok(sse_event("geometry", &timing))),
             // Best-effort stream: a slow browser subscriber that falls
             // behind simply skips the messages it missed, same contract as
             // the upstream ethlambda SSE endpoint (CONTRACT.md §4).

@@ -149,6 +149,41 @@ h2 {
   padding: 3px 10px;
 }
 
+/* Shown when the collector reports a slot-geometry change: this tab's geometry
+   and slot watermark are stale from that point on and every panel will empty
+   (see wireGeometryBanner in app.js). Louder than .conn-banner because a
+   reconnect resolves itself and this needs a click. */
+/* A class-level `display` outranks the UA stylesheet's `[hidden] {display:none}`,
+   so the attribute has to be honoured explicitly or the banner is always on. */
+.geometry-banner[hidden] {
+  display: none;
+}
+
+.geometry-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--status-down);
+  border: 1px solid var(--status-down);
+  border-radius: 999px;
+  padding: 3px 4px 3px 10px;
+}
+
+.geometry-reload {
+  font: inherit;
+  color: var(--panel-bg);
+  background: var(--status-down);
+  border: none;
+  border-radius: 999px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.geometry-reload:hover {
+  filter: brightness(1.1);
+}
+
 .window-control {
   display: inline-flex;
   align-items: center;

@@ -9,6 +9,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::model::{NodeStatus, NormalizedEvent};
+use crate::timing::Timing;
 
 /// Capacity of the broadcast channel. A slow subscriber (browser) that falls
 /// behind by more than this many messages will observe a `Lagged` error on
@@ -21,8 +22,20 @@ const HUB_CAPACITY: usize = 4096;
 /// without bound before the slot-age prune catches up.
 const HISTORY_MAX_EVENTS: usize = 50_000;
 
-/// One message on the hub: either a normalized chain event (`event: chain`)
-/// or a node status update (`event: status`) per CONTRACT.md §4.
+/// Per `(node, topic)` cap on what one `GET /api/history` response carries.
+/// Matches `MAX_POINTS_PER_NODE` in `web/beeswarm.js`, the tightest cap on the
+/// consuming side: shipping more than a panel can hold is megabytes the frontend
+/// discards on arrival.
+///
+/// Keyed per topic as well as per node so an attestation flood can't crowd out
+/// the block/aggregate events the propagation panel groups by `id` — there are
+/// an order of magnitude more attestations than blocks, so a per-node-only cap
+/// would starve exactly the series that panel needs.
+const SNAPSHOT_MAX_EVENTS_PER_SERIES: usize = 2_000;
+
+/// One message on the hub: a normalized chain event (`event: chain`), a node
+/// status update (`event: status`), or a slot-geometry change
+/// (`event: geometry`) per CONTRACT.md §4.
 ///
 /// Chain events are `Arc`-wrapped because every one is fanned out to each
 /// `/stream` subscriber *and* retained in the history ring; sharing one
@@ -31,6 +44,7 @@ const HISTORY_MAX_EVENTS: usize = 50_000;
 pub enum HubMessage {
     Chain(Arc<NormalizedEvent>),
     Status(NodeStatus),
+    Geometry(Timing),
 }
 
 /// Point-in-time backfill payload served by `GET /api/history`: the retained
@@ -101,9 +115,26 @@ impl History {
     /// Cheap because the events are `Arc`s: this copies pointers, not the
     /// events themselves, which matters because the caller holds the mutex
     /// across it while every collector is trying to publish.
+    ///
+    /// Walks newest-first so the per-series cap keeps the *most recent*
+    /// [`SNAPSHOT_MAX_EVENTS_PER_SERIES`] events of each `(node, topic)`, then
+    /// restores the oldest-first order the contract promises.
     fn snapshot(&self) -> HistorySnapshot {
+        let mut kept: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let mut events = Vec::new();
+        for event in self.events.iter().rev() {
+            let count = kept
+                .entry((event.node.as_str(), event.topic.as_str()))
+                .or_default();
+            if *count >= SNAPSHOT_MAX_EVENTS_PER_SERIES {
+                continue;
+            }
+            *count += 1;
+            events.push(Arc::clone(event));
+        }
+        events.reverse();
         HistorySnapshot {
-            events: self.events.iter().map(Arc::clone).collect(),
+            events,
             status: self.status.values().cloned().collect(),
         }
     }
@@ -150,6 +181,15 @@ impl Hub {
         let _ = self.tx.send(HubMessage::Status(status));
     }
 
+    /// Publishes a slot-geometry change so already-loaded dashboards learn their
+    /// `ms_per_slot` / `intervals_per_slot` and slot watermark are stale
+    /// (CONTRACT.md §4). Deliberately *not* retained in history: a tab opening
+    /// afterwards fetches current geometry from `/api/meta`, so replaying this
+    /// would only tell it to reload into the state it already has.
+    pub fn publish_geometry(&self, timing: Timing) {
+        let _ = self.tx.send(HubMessage::Geometry(timing));
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<HubMessage> {
         self.tx.subscribe()
     }
@@ -181,9 +221,13 @@ mod tests {
     use crate::model::NodeState;
 
     fn chain_event(node: &str, slot: u64) -> NormalizedEvent {
+        topic_event(node, "block", slot)
+    }
+
+    fn topic_event(node: &str, topic: &str, slot: u64) -> NormalizedEvent {
         NormalizedEvent {
             node: node.to_string(),
-            topic: "block".to_string(),
+            topic: topic.to_string(),
             slot,
             arrival_ms: slot as i64 * 4_000,
             offset_ms: 0,
@@ -207,8 +251,64 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         match msg {
             HubMessage::Status(status) => assert_eq!(status.node, "node-2"),
-            HubMessage::Chain(_) => panic!("expected a Status message"),
+            other => panic!("expected a Status message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn geometry_is_broadcast_but_not_retained_in_history() {
+        let hub = Hub::new(64);
+        let mut rx = hub.subscribe();
+        let timing = Timing {
+            genesis_time: 1_770_407_233,
+            ms_per_slot: 4_000,
+            intervals_per_slot: 5,
+        };
+
+        hub.publish_geometry(timing);
+
+        match rx.recv().await.unwrap() {
+            HubMessage::Geometry(published) => assert_eq!(published, timing),
+            other => panic!("expected a Geometry message, got {other:?}"),
+        }
+        // A tab opening after the change reads current geometry from /api/meta,
+        // so there is nothing for the backfill to say.
+        assert!(hub.history_snapshot().events.is_empty());
+    }
+
+    #[test]
+    fn the_history_snapshot_caps_each_node_and_topic_independently() {
+        // A flood of one topic must not crowd another out of the backfill: the
+        // propagation panel groups block/aggregate by id, and there are an order
+        // of magnitude more attestations than blocks.
+        let hub = Hub::new(u64::MAX); // no slot-age pruning, so the cap is what bites
+        let flood = SNAPSHOT_MAX_EVENTS_PER_SERIES + 500;
+        for i in 0..flood {
+            hub.publish_chain(topic_event("node-0", "attestation", i as u64));
+        }
+        for i in 0..10 {
+            hub.publish_chain(topic_event("node-0", "block", i as u64));
+        }
+
+        let snap = hub.history_snapshot();
+        let count = |topic: &str| {
+            snap.events
+                .iter()
+                .filter(|event| event.topic == topic)
+                .count()
+        };
+        assert_eq!(count("attestation"), SNAPSHOT_MAX_EVENTS_PER_SERIES);
+        assert_eq!(count("block"), 10);
+        // Newest kept, oldest dropped, and the contract's oldest-first order
+        // survives the newest-first walk.
+        let attestations: Vec<u64> = snap
+            .events
+            .iter()
+            .filter(|event| event.topic == "attestation")
+            .map(|event| event.slot)
+            .collect();
+        assert_eq!(attestations.first(), Some(&500));
+        assert_eq!(attestations.last(), Some(&(flood as u64 - 1)));
     }
 
     #[test]

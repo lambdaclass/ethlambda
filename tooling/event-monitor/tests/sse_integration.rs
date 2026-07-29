@@ -48,7 +48,7 @@ async fn collect_chain_events(
         while collected.len() < want {
             match rx.recv().await.expect("hub sender dropped unexpectedly") {
                 HubMessage::Chain(event) => collected.push(event),
-                HubMessage::Status(_) => continue,
+                HubMessage::Status(_) | HubMessage::Geometry(_) => continue,
             }
         }
     })
@@ -83,7 +83,7 @@ async fn collector_normalizes_frames_from_a_live_sse_server() {
     });
     let hub = Hub::new(64);
     let mut rx = hub.subscribe();
-    let client = reqwest::Client::new();
+    let client = event_monitor::collector::build_client().expect("client should build");
 
     let topics = vec![
         "block".to_string(),
@@ -143,7 +143,7 @@ async fn collector_publishes_connected_status_on_success() {
     });
     let hub = Hub::new(64);
     let mut rx = hub.subscribe();
-    let client = reqwest::Client::new();
+    let client = event_monitor::collector::build_client().expect("client should build");
 
     let collector_handle = tokio::spawn(run_collector(
         node,

@@ -53,15 +53,18 @@ jobs:
       # tests run in this job rather than in `test` because clippy has already
       # compiled the test targets, and because they need none of that job's
       # leanSpec fixtures.
+      # `--locked` so the committed Cargo.lock is actually enforced: without it
+      # cargo silently resolves and rewrites the lockfile in CI, and a stale or
+      # missing entry never fails the build.
       - name: Lint tooling
         working-directory: tooling/event-monitor
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test tooling
         working-directory: tooling/event-monitor
-        run: cargo test
+        run: cargo test --locked
 
   test:
     name: Test

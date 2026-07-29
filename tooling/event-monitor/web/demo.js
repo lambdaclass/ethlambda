@@ -12,6 +12,12 @@ const INTERVALS_PER_SLOT = 5;
 const WINDOW_SLOTS = 30;
 const VALIDATOR_COUNT = 16;
 const SLOW_NODE = "node-5"; // consistently later, so the panels have something to show
+// A node whose clock runs ahead of the collector's, so some of its blocks are
+// stamped before their own slot boundary (CONTRACT.md §2: offset_ms may be
+// negative). Rare but real, and the only way ?demo=1 exercises the clamped-early
+// rendering in beeswarm.js.
+const SKEWED_NODE = "node-3";
+const SKEWED_BLOCK_FRACTION = 0.25;
 
 export function createDemoMeta() {
   return {
@@ -71,9 +77,10 @@ export function createDemoSource(meta) {
     const blockRoot = fakeRoot(`block:${currentSlot}`);
     const aggId = fakeRoot(`aggregate:${currentSlot}`);
 
-    // blocks: ~0.6s into the slot
+    // blocks: ~0.6s into the slot, except for the skewed node's early ones
     for (const node of meta.nodes) {
-      const offset = 600 + nodeDelayMs(node.name);
+      const early = node.name === SKEWED_NODE && Math.random() < SKEWED_BLOCK_FRACTION;
+      const offset = early ? -(20 + Math.random() * 120) : 600 + nodeDelayMs(node.name);
       schedule(
         () =>
           emitChain({
@@ -86,7 +93,9 @@ export function createDemoSource(meta) {
             validator_id: null,
             participants: null,
           }),
-        offset
+        // A negative offset means "before the boundary"; there is no earlier
+        // time to fire at, so emit immediately.
+        Math.max(offset, 0)
       );
     }
 

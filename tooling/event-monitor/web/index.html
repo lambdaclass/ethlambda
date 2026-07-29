@@ -13,6 +13,10 @@
       <span id="mode-indicator" class="mode-indicator"></span>
     </div>
     <div id="conn-banner" class="conn-banner" hidden>reconnecting to collector…</div>
+    <div id="geometry-banner" class="geometry-banner" hidden>
+      <span>slot geometry changed (new genesis): this view is stale</span>
+      <button type="button" id="geometry-reload" class="geometry-reload">Reload</button>
+    </div>
     <div class="window-control">
       <label for="window-slots">window</label>
       <input type="number" id="window-slots" min="1" max="500" step="1" inputmode="numeric" />

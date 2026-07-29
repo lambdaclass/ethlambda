@@ -18,6 +18,48 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Bounds the TCP/TLS handshake. Without it, a node whose packets are dropped
+/// rather than refused leaves the collector parked in `send()` indefinitely, so
+/// it reports `reconnecting` forever and can never reach `down`.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds the wait for *each* read: first the response headers, then every
+/// subsequent chunk of the stream. Two failure classes need it, and neither is
+/// reachable through the reconnect loop without it:
+///
+/// - a socket that completes the handshake and then never answers (a blackhole,
+///   or a proxy that accepts and drops) hangs in `send()`, so the collector
+///   sits at `reconnecting` and never logs a retry;
+/// - a half-open connection where the node stops sending leaves the heartbeat
+///   publishing `connected` at 0.0 events/sec indefinitely.
+///
+/// Upstream sends an SSE keep-alive comment every 15s (axum's `KeepAlive`
+/// default), so silence past three of those is a genuine stall rather than an
+/// idle chain. Tolerating a loaded node is worth more here than reaching `down`
+/// quickly: a blackholed node costs this timeout per attempt, so it reports
+/// `reconnecting` for a few minutes before the ramp settles into `down`. Slow to
+/// converge, but no longer wrong forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The shared HTTP client for every collector *and* the slot-geometry fetches.
+///
+/// Both timeouts belong on the client rather than on a `RequestBuilder`:
+/// `RequestBuilder::timeout` is a *total* deadline covering the response body,
+/// which for an SSE subscription means tearing down a perfectly healthy
+/// long-lived stream on a timer. `read_timeout` bounds each read instead, which
+/// is what "stalled" actually means here. Geometry fetches layer their own
+/// stricter total timeout on top (see [`crate::timing`]).
+pub fn build_client() -> reqwest::Result<reqwest::Client> {
+    client_with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT)
+}
+
+fn client_with_timeouts(connect: Duration, read: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CollectorError {
     #[error("http error: {0}")]
@@ -126,11 +168,45 @@ fn now_ms() -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn node_status(name: &str, state: NodeState, events_per_sec: f64) -> NodeStatus {
-    NodeStatus {
-        node: name.to_string(),
-        state,
-        events_per_sec,
+/// Publishes this node's [`NodeStatus`] on the hub, remembering the last state
+/// it sent so a state that hasn't changed isn't re-announced.
+struct StatusPublisher {
+    node: String,
+    hub: Hub,
+    last_state: Option<NodeState>,
+}
+
+impl StatusPublisher {
+    fn new(node: String, hub: Hub) -> Self {
+        Self {
+            node,
+            hub,
+            last_state: None,
+        }
+    }
+
+    /// Publishes unconditionally, carrying `events_per_sec`. For the heartbeat,
+    /// whose whole point is a refreshed rate even when the state is unchanged.
+    fn publish(&mut self, state: NodeState, events_per_sec: f64) {
+        self.last_state = Some(state);
+        self.hub.publish_status(NodeStatus {
+            node: self.node.clone(),
+            state,
+            events_per_sec,
+        });
+    }
+
+    /// Publishes only when the state differs from the last one sent, at a rate
+    /// of zero (no state but `Connected` has a meaningful rate).
+    ///
+    /// The dedupe is what keeps a permanently-down node's chip still: the
+    /// reconnect loop passes through `Reconnecting` on its way into every
+    /// attempt, so without it the chip flipped red → amber → red once per
+    /// cycle for a node that never came back.
+    fn publish_change(&mut self, state: NodeState) {
+        if self.last_state != Some(state) {
+            self.publish(state, 0.0);
+        }
     }
 }
 
@@ -145,10 +221,11 @@ pub async fn run_collector(
     client: reqwest::Client,
 ) {
     let mut backoff = Backoff::new();
-    loop {
-        hub.publish_status(node_status(&node.name, NodeState::Reconnecting, 0.0));
+    let mut status = StatusPublisher::new(node.name.clone(), hub);
+    status.publish_change(NodeState::Reconnecting);
 
-        let attempt = connect_and_stream(&node, &topics, &timing, &hub, &client).await;
+    loop {
+        let attempt = connect_and_stream(&node, &topics, &timing, &mut status, &client).await;
         match &attempt.error {
             None => tracing::info!(node = %node.name, "SSE stream ended; reconnecting"),
             Some(err) => {
@@ -163,7 +240,7 @@ pub async fn run_collector(
         } else {
             NodeState::Reconnecting
         };
-        hub.publish_status(node_status(&node.name, state, 0.0));
+        status.publish_change(state);
         tokio::time::sleep(delay).await;
     }
 }
@@ -175,7 +252,7 @@ async fn connect_and_stream(
     node: &NodeConfig,
     topics: &[String],
     timing: &watch::Receiver<Timing>,
-    hub: &Hub,
+    status: &mut StatusPublisher,
     client: &reqwest::Client,
 ) -> Attempt {
     let url = format!(
@@ -195,9 +272,12 @@ async fn connect_and_stream(
     };
     let mut stream = response.bytes_stream().eventsource();
 
-    hub.publish_status(node_status(&node.name, NodeState::Connected, 0.0));
+    status.publish(NodeState::Connected, 0.0);
     tracing::info!(node = %node.name, %url, "connected to SSE stream");
 
+    // Chain events go straight to the hub; only status flows through the
+    // publisher, which the heartbeat arm borrows mutably.
+    let hub = status.hub.clone();
     let mut rate = RateTracker::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // the first tick fires immediately; consume it
@@ -213,7 +293,7 @@ async fn connect_and_stream(
                         // Re-read per frame so a geometry refresh takes effect
                         // without tearing down the connection.
                         let geometry = *timing.borrow();
-                        handle_frame(node, &event, geometry, hub, &mut warned_implausible_slot);
+                        handle_frame(node, &event, geometry, &hub, &mut warned_implausible_slot);
                     }
                     Some(Err(err)) => {
                         let error = Some(CollectorError::Stream(err.to_string()));
@@ -226,11 +306,7 @@ async fn connect_and_stream(
                 // Surviving a whole heartbeat interval while streaming is what
                 // marks the session healthy for backoff purposes.
                 healthy = true;
-                hub.publish_status(node_status(
-                    &node.name,
-                    NodeState::Connected,
-                    rate.rate_and_reset(),
-                ));
+                status.publish(NodeState::Connected, rate.rate_and_reset());
             }
         }
     }
@@ -281,6 +357,7 @@ fn handle_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::HubMessage;
 
     #[test]
     fn backoff_doubles_until_capped() {
@@ -349,6 +426,112 @@ mod tests {
                 error: Some(CollectorError::Stream("node restarted".to_string())),
             });
         }
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_accepts_and_never_answers_times_out() {
+        // The failure class the read timeout exists for: the handshake succeeds,
+        // so `connect_timeout` never fires, and no byte of the response ever
+        // arrives. Before the read timeout this parked in `send()` forever, so
+        // the reconnect loop was never reached and `Down` was unreachable for
+        // every blackholed node.
+        //
+        // Uses a short read timeout so the test is fast; the ramp from a failed
+        // attempt to `Down` is covered by the backoff tests above.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind blackhole listener");
+        let addr = listener.local_addr().expect("blackhole has no local addr");
+        // Accept connections and hold them open without writing a single byte.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let client = client_with_timeouts(CONNECT_TIMEOUT, Duration::from_millis(200))
+            .expect("client should build");
+        let err = client
+            .get(format!("http://{addr}/lean/v0/events?topics=block"))
+            .send()
+            .await
+            .expect_err("a blackholed socket must not resolve to a response");
+        assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+    }
+
+    #[test]
+    fn the_shared_client_carries_a_read_timeout() {
+        // Guards the read timeout against being dropped from the builder, which
+        // would silently reintroduce the hang above. Only the read timeout is
+        // checkable this way: reqwest hands `connect_timeout` to the connector
+        // and never reports it on `Client`'s `Debug`, and a behavioural test for
+        // it needs an address that blackholes SYNs, which no CI network
+        // guarantees.
+        let client = build_client().expect("client should build");
+        let debug = format!("{client:?}");
+        assert!(
+            debug.contains(&format!("read_timeout: {READ_TIMEOUT:?}")),
+            "read timeout missing from the shared client: {debug}"
+        );
+    }
+
+    #[test]
+    fn the_read_timeout_tolerates_the_upstream_keep_alive_interval() {
+        // Upstream holds an idle stream open with a keep-alive comment every 15s
+        // (axum's `KeepAlive` default). A read timeout at or under that would
+        // tear down healthy connections on an idle chain, which is the failure
+        // this fix must not trade for the one it removes.
+        assert!(
+            READ_TIMEOUT >= Duration::from_secs(45),
+            "read timeout must leave room for missed keep-alives"
+        );
+    }
+
+    #[test]
+    fn a_state_that_has_not_changed_is_not_republished() {
+        // Regression: the reconnect loop announced Reconnecting on its way into
+        // every attempt, so a node that stayed down flipped its chip
+        // red -> amber -> red once per cycle.
+        let hub = Hub::new(64);
+        let mut rx = hub.subscribe();
+        let mut status = StatusPublisher::new("node-2".to_string(), hub);
+
+        status.publish_change(NodeState::Reconnecting);
+        status.publish_change(NodeState::Reconnecting);
+        status.publish_change(NodeState::Down);
+        status.publish_change(NodeState::Reconnecting);
+
+        let mut states = Vec::new();
+        while let Ok(HubMessage::Status(status)) = rx.try_recv() {
+            states.push(status.state);
+        }
+        assert_eq!(
+            states,
+            vec![
+                NodeState::Reconnecting,
+                NodeState::Down,
+                NodeState::Reconnecting
+            ]
+        );
+    }
+
+    #[test]
+    fn heartbeats_always_publish_so_the_rate_stays_fresh() {
+        // The dedupe must not swallow heartbeats: they carry a refreshed
+        // events/sec even though the state is unchanged.
+        let hub = Hub::new(64);
+        let mut rx = hub.subscribe();
+        let mut status = StatusPublisher::new("node-2".to_string(), hub);
+
+        status.publish(NodeState::Connected, 4.0);
+        status.publish(NodeState::Connected, 2.0);
+
+        let mut rates = Vec::new();
+        while let Ok(HubMessage::Status(status)) = rx.try_recv() {
+            rates.push(status.events_per_sec);
+        }
+        assert_eq!(rates, vec![4.0, 2.0]);
     }
 
     #[test]

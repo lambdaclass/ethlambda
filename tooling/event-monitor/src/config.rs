@@ -121,6 +121,20 @@ impl Config {
                 "`nodes` is empty; add at least one [[nodes]] entry",
             ));
         }
+        // `static_dir` is relative to the *working directory*, not to this config
+        // file, and it defaults to `web` — so every invocation from outside
+        // `tooling/event-monitor/` hits this. Without the check the collector
+        // starts, logs that the dashboard is ready, and answers `GET /` with a
+        // 404 no one is watching for.
+        let index_html = Path::new(&self.static_dir).join("index.html");
+        if !index_html.is_file() {
+            return Err(invalid(&format!(
+                "`static_dir` is {:?} but {} does not exist; \
+                 the path is relative to the working directory, not to this file",
+                self.static_dir,
+                index_html.display()
+            )));
+        }
         Ok(())
     }
 
@@ -155,8 +169,18 @@ mod tests {
         assert!(cfg.ms_per_slot.is_none());
     }
 
+    /// The real `web/` directory, by absolute path. `validate` checks
+    /// `static_dir` against the filesystem, so fixtures must not depend on the
+    /// test process's working directory.
+    fn web_dir() -> String {
+        format!("{}/web", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Parses `toml_str` with a valid absolute `static_dir` prepended, for the
+    /// fixtures that go on to call [`Config::validate`].
     fn parse(toml_str: &str) -> Config {
-        toml::from_str(toml_str).expect("fixture should parse")
+        let with_static_dir = format!("static_dir = {:?}\n{toml_str}", web_dir());
+        toml::from_str(&with_static_dir).expect("fixture should parse")
     }
 
     #[test]
@@ -208,6 +232,30 @@ mod tests {
         "#,
         );
         assert!(cfg.validate(Path::new("config.toml")).is_ok());
+    }
+
+    #[test]
+    fn a_static_dir_without_an_index_html_is_rejected() {
+        // Regression: this used to start cleanly, log "dashboard ready", and
+        // answer GET / with a 404. It fires on any invocation from outside
+        // `tooling/event-monitor/`, since `static_dir` defaults to `web`.
+        let cfg: Config = toml::from_str(
+            r#"
+            listen = "127.0.0.1:8080"
+            static_dir = "definitely-not-a-real-directory"
+
+            [[nodes]]
+            name = "node-2"
+            url = "http://127.0.0.1:5052"
+        "#,
+        )
+        .expect("fixture should parse");
+        let err = cfg.validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(
+            err.to_string().contains("index.html"),
+            "the error should name the file it looked for: {err}"
+        );
     }
 
     #[test]

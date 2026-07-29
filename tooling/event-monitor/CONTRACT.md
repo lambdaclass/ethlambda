@@ -79,6 +79,22 @@ offset_ms     = arrival_ms - slot_start_ms        // may be negative under clock
 (`SystemTime::now()` → epoch ms). Config may override `genesis_time` /
 `ms_per_slot` for offline testing.
 
+Geometry is range-checked wherever it enters the process — both the network fetch
+and the config overrides — and the collector refuses to start on a `ms_per_slot`
+or `intervals_per_slot` of zero, an absurd `ms_per_slot`, or a `genesis_time`
+large enough to overflow the `offset_ms` multiply. None of those crash if let
+through; they just pile every dot against one edge with no explanation. A
+`genesis_time` in the *future* is legitimate and accepted: a devnet is routinely
+configured before its genesis fires.
+
+**Timeouts.** The shared HTTP client sets `connect_timeout` and `read_timeout`
+(the latter comfortably above upstream's 15s SSE keep-alive). They belong on the
+client, not on a `RequestBuilder`: a per-request `timeout` is a *total* deadline
+and would tear down a healthy long-lived SSE stream on a timer. Without them, a
+socket that completes the handshake and then never answers parks the collector in
+`send()` forever, so it reports `reconnecting` and can never reach `down` — and a
+half-open connection leaves the heartbeat publishing `connected` at 0.0/s.
+
 **What `offset_ms` actually measures.** It is stamped when the *collector*
 receives the frame, so it includes the collector↔node round trip, not just the
 node's own event time. One clock is deliberate: it makes propagation deltas
@@ -92,10 +108,14 @@ republished when it changes, so a regenerated genesis does not silently
 invalidate every subsequent `offset_ms`. On a change the collector drops its
 retained history and slot watermark: those events were computed against the old
 epoch and their slot numbers belong to a different chain. A failed refresh keeps
-the current geometry. Already-loaded browser tabs keep the `ms_per_slot` /
-`intervals_per_slot` they fetched from `/api/meta` plus their own client-side
-watermark, so **reload the page after a genesis change**; server-computed
-`offset_ms` values are correct immediately.
+the current geometry. Server-computed `offset_ms` values are correct immediately.
+
+Already-loaded browser tabs keep the `ms_per_slot` / `intervals_per_slot` they
+fetched from `/api/meta` plus their own client-side watermark, which only ever
+moves up — so a restarted chain's low slots age out on arrival and every panel
+empties, which is indistinguishable from the chain having died. The change is
+therefore broadcast on `/stream` as `event: geometry` (§4) and the tab shows a
+reload banner instead of going quietly blank.
 
 ### Slot plausibility bound
 
@@ -151,12 +171,19 @@ canonical JSON of `{data, sorted participants}` rendered as `0x…` hex is fine.
 Served by axum on the configured `listen` address.
 
 ### `GET /`
-Serves `web/index.html` (and `web/` assets under their paths, e.g. `/app.js`,
-`/style.css`). Static file serving rooted at the configured `static_dir`
-(default `web`).
+Serves `web/index.html`, with `web/` assets under their own paths (e.g.
+`/app.js`, `/style.css`). Static file serving rooted at the configured
+`static_dir` (default `web`, resolved **relative to the working directory**, not
+to the config file; startup fails if it holds no `index.html`).
+
+`/` is routed to `index.html` explicitly and **every unmatched path 404s**. This
+is one page, not a client-routed SPA, so a catch-all HTML fallback only hid
+mistakes: a typo'd asset path came back `200 text/html` and surfaced as a JS
+parse error, and a wrong API path answered `200` instead of telling the caller of
+a frozen contract that it had the path wrong.
 
 ### `GET /stream`  (SSE, `text/event-stream`)
-The merged live stream. Two SSE **event names**:
+The merged live stream. Three SSE **event names**:
 
 - `event: chain` — `data:` is one NormalizedEvent (§3).
 - `event: status` — `data:` is a node status object:
@@ -164,7 +191,18 @@ The merged live stream. Two SSE **event names**:
   { "node": "node-2", "state": "connected", "events_per_sec": 4.2 }
   ```
   `state` ∈ `"connected" | "reconnecting" | "down"`. Emitted on every state
-  change and at least every few seconds as a heartbeat with a refreshed rate.
+  *change* and at least every few seconds as a heartbeat with a refreshed rate.
+  A state identical to the last one published is not re-announced, so a node
+  that stays down holds one colour instead of flipping once per retry cycle.
+- `event: geometry` — `data:` is the new slot geometry, the same three fields
+  `/api/meta` publishes:
+  ```json
+  { "genesis_time": 1770407233, "ms_per_slot": 4000, "intervals_per_slot": 5 }
+  ```
+  Emitted only when a refresh re-resolves geometry and it **changed** (§2). It
+  tells an already-loaded tab that its geometry and slot watermark are stale;
+  the frontend responds with a reload banner. Not retained in history: a tab
+  opening afterwards reads current geometry from `/api/meta`.
 
 Keep-alive comments are sent to hold idle connections open. Best-effort: a slow
 browser may miss events (same contract as upstream).
@@ -189,7 +227,11 @@ One-shot bootstrap the frontend fetches on load:
 ### `GET /api/history`  (JSON)
 Startup backfill so a freshly-opened dashboard isn't blank. Returns the
 collector's bounded in-memory ring of recent events (retained for
-`history_slots` slots, hard-capped) plus the latest status per node:
+`history_slots` slots, hard-capped) plus the latest status per node. The response
+is additionally capped per `(node, topic)` at the frontend's own per-node point
+cap, since anything past that is megabytes the panels discard on arrival; the cap
+is per topic as well as per node so an attestation flood can't crowd the
+block/aggregate events out of the propagation panel's backfill.
 
 ```json
 {
@@ -278,6 +320,14 @@ saturates at the right edge. The slot boundary is drawn in the overflow accent
 (`--prop-over`) over the gridlines, and only the far end of the band is labelled
 (`+ms_per_slot`).
 
+A **negative** `offset_ms` is legitimate (§2: clock skew, or an event stamped
+just before its slot boundary) and there is no room left of `LEFT_MARGIN` to plot
+it in, so it clamps to `x = 0`. The clamp must not be silent: at the 0.1–0.2s
+resolution this panel exists for, an event 30ms before its boundary and one
+landing exactly on it are different observations. Such a dot keeps its topic fill
+and is **outlined in the overflow accent** (`--prop-over`) — the same accent the
+right edge uses for the mirror-image case.
+
 The propagation panel keeps its single fixed `0 … ms_per_slot` scale: it already
 distinguishes over-one-slot deltas by color (`--prop-over`), so it needs no
 second region.
@@ -296,6 +346,10 @@ the three colors; empty topics show a "Waiting for … events" note.
 
 **Status bar**: one chip per node showing `state` (green/amber/red) and
 `events_per_sec`, driven by `status` events.
+
+**Geometry banner**: on `event: geometry` (§4), a banner states that the view is
+stale and offers a reload. Without it the panels simply empty, which reads as
+"the chain died" — the one conclusion this tool must not fabricate.
 
 Design language: match the calm, technical look of the approved mockup (thin
 gridlines, muted labels, the three topic colors above). Must be readable in both

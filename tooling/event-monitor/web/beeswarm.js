@@ -21,6 +21,9 @@ const LEFT_MARGIN = 92;
 const RIGHT_MARGIN = 16;
 const JITTER_RANGE = 11; // px, +/- around the lane center
 const DOT_RADIUS = 2.6;
+// Outline width for a dot whose real offset was negative and so had to clamp to
+// x=0; see addEvent().
+const EARLY_RING_WIDTH = 1.4;
 
 // Fade older slots non-linearly: the newest slot is fully opaque and each
 // older slot drops geometrically toward a faint floor (front-loaded, so
@@ -117,10 +120,18 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
     // Clamp to the full two-slot span, not to one slot: the overflow band is
     // what makes a late arrival distinguishable from an on-boundary one.
     const offsetMs = Math.min(Math.max(ev.offset_ms, 0), msPerSlot * 2);
+    // Negative offsets are real (CONTRACT.md §2: clock skew, or an event
+    // stamped just before its slot boundary) and there is no room left of
+    // LEFT_MARGIN to plot them in, so they clamp to x=0 like any other early
+    // arrival. Flagging them keeps the clamp honest: at the 0.1-0.2s resolution
+    // this tool exists for, an event 30ms *before* its boundary and one landing
+    // exactly on it must not be the same dot. Marked in the overflow accent, the
+    // same treatment the right edge already gets.
     const seed = `${ev.node}|${ev.topic}|${ev.slot}|${ev.id ?? ""}|${ev.validator_id ?? ""}|${ev.arrival_ms}`;
     arr.push({
       topic: ev.topic,
       offsetMs,
+      early: ev.offset_ms < 0,
       slot: ev.slot,
       jitter: hashJitter(seed) * JITTER_RANGE,
     });
@@ -242,6 +253,13 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
         ctx.beginPath();
         ctx.arc(x, y + pt.jitter, DOT_RADIUS, 0, Math.PI * 2);
         ctx.fill();
+        // Ring, not a recolor: a clamped-negative offset still needs to say
+        // which topic it was.
+        if (pt.early) {
+          ctx.strokeStyle = theme.overflowEdge;
+          ctx.lineWidth = EARLY_RING_WIDTH;
+          ctx.stroke();
+        }
       }
     });
     ctx.globalAlpha = 1;
@@ -294,7 +312,9 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
         `Showing the last ${windowSlots} slots. Older slots fade out, then drop. ` +
         `Past the slot boundary the axis compresses the next full slot into the ` +
         `tinted band, so late arrivals stay distinguishable; beyond that they ` +
-        `saturate at the right edge.`;
+        `saturate at the right edge. A dot outlined in the same accent arrived ` +
+        `before its slot boundary (negative offset, i.e. clock skew) and is ` +
+        `clamped to 0.`;
     }
   }
 
