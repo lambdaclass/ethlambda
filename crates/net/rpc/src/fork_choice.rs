@@ -36,17 +36,19 @@ pub struct ForkChoiceNode {
 pub(crate) async fn get_fork_choice(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
-    let blocks = store.get_live_chain();
+    let blocks = store.get_live_chain().expect("live chain is not empty");
     let attestations = store.extract_latest_known_attestations();
 
-    let justified = store.latest_justified();
-    let finalized = store.latest_finalized();
+    let justified = store
+        .latest_justified()
+        .expect("justified checkpoint exists");
+    let finalized = store.latest_finalized().expect("finalized block exists");
     let start_slot = finalized.slot;
 
     let weights = ethlambda_fork_choice::compute_block_weights(start_slot, &blocks, &attestations);
 
-    let head = store.head();
-    let safe_target = store.safe_target();
+    let head = store.head().expect("head block exists");
+    let safe_target = store.safe_target().expect("safe target exists");
 
     let head_state = store.head_state();
     let validator_count = head_state.validators.len() as u64;
@@ -56,6 +58,8 @@ pub(crate) async fn get_fork_choice(
         .map(|(root, &(slot, parent_root))| {
             let proposer_index = store
                 .get_block_header(root)
+                .ok()
+                .flatten()
                 .map(|h| h.proposer_index)
                 .unwrap_or(0);
 

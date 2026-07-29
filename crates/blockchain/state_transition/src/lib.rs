@@ -37,6 +37,10 @@ pub enum Error {
     },
     #[error("zero hash found in justifications_roots")]
     ZeroHashInJustificationRoots,
+    #[error(
+        "justification vote list length {actual} does not equal tracked-root count times validator count {expected}"
+    )]
+    JustificationVotesLengthMismatch { expected: usize, actual: usize },
     #[error("aggregated attestation has no participants")]
     EmptyAggregationBits,
     #[error("aggregation bit set at index {index} beyond validator count {validator_count}")]
@@ -238,7 +242,33 @@ fn process_attestations(
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
     let _timing = metrics::time_attestations_processing();
-    // Precondition: justifications_roots must not contain zero hashes (spec state.py L389).
+
+    // Validate the justification bookkeeping before unpacking the flat vote list
+    // (leanSpec #1178). A `State` decoded from untrusted bytes (e.g. checkpoint
+    // sync) can satisfy SSZ yet still violate these cross-field invariants; without
+    // these guards the unpack below would silently produce short vote segments.
+    let validator_count = state.validators.len();
+
+    // An empty registry leaves no segment width, so the flat layout cannot be
+    // recovered. The header stage already rejects this first, but the unpack
+    // below relies on it directly.
+    if validator_count == 0 {
+        return Err(Error::NoValidators);
+    }
+
+    // The flat vote list must hold exactly one full validator segment per tracked
+    // root; a mismatched length means the segments no longer line up with the roots.
+    let expected_vote_count = state.justifications_roots.len() * validator_count;
+    let actual_vote_count = state.justifications_validators.len();
+    if actual_vote_count != expected_vote_count {
+        return Err(Error::JustificationVotesLengthMismatch {
+            expected: expected_vote_count,
+            actual: actual_vote_count,
+        });
+    }
+
+    // The zero hash marks a skipped slot, never a real block, so it cannot track
+    // votes (spec state.py L389).
     if state
         .justifications_roots
         .iter()
@@ -246,7 +276,7 @@ fn process_attestations(
     {
         return Err(Error::ZeroHashInJustificationRoots);
     }
-    let validator_count = state.validators.len();
+
     let mut attestations_processed: u64 = 0;
     let mut justifications: HashMap<H256, Vec<bool>> = state
         .justifications_roots
@@ -853,5 +883,94 @@ mod tests {
         // rewind or re-finalize.
         assert_eq!(state.latest_finalized.slot, 4);
         assert_eq!(state.latest_finalized.root, r4);
+    }
+
+    /// leanSpec #1178: a `State` whose flat justification vote list is not
+    /// tracked-root count × validator count is rejected with a typed error rather
+    /// than silently producing short vote segments. Reachable via a malformed
+    /// checkpoint-sync anchor, whose SSZ decoding cannot enforce this cross-field
+    /// invariant.
+    #[test]
+    fn process_attestations_rejects_justification_votes_length_mismatch() {
+        const NUM_VALIDATORS: usize = 4;
+        let r1 = H256([1u8; 32]);
+
+        let mut state = State {
+            config: ChainConfig { genesis_time: 0 },
+            slot: 2,
+            latest_block_header: BlockHeader {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            latest_finalized: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            historical_block_hashes: SszList::try_from(vec![H256::ZERO, r1]).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(make_validators(NUM_VALIDATORS)).unwrap(),
+            // One tracked root, but a vote list of the wrong width (3, not 1 * 4).
+            justifications_roots: SszList::try_from(vec![r1]).unwrap(),
+            justifications_validators: JustificationValidators::with_length(3).unwrap(),
+        };
+
+        let atts: AggregatedAttestations = Vec::<AggregatedAttestation>::new().try_into().unwrap();
+        let err = process_attestations(&mut state, &atts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::JustificationVotesLengthMismatch {
+                    expected: 4,
+                    actual: 3
+                }
+            ),
+            "expected JustificationVotesLengthMismatch {{ expected: 4, actual: 3 }}, got {err:?}"
+        );
+    }
+
+    /// leanSpec #1178: `process_attestations` on a state with no validators is
+    /// rejected with a typed error. Belt-and-suspenders: the header stage already
+    /// rejects an empty registry first in the normal flow, but the flat-vote
+    /// unpack relies on a non-zero segment width directly.
+    #[test]
+    fn process_attestations_rejects_empty_validator_registry() {
+        let mut state = State {
+            config: ChainConfig { genesis_time: 0 },
+            slot: 1,
+            latest_block_header: BlockHeader {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            latest_finalized: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            historical_block_hashes: SszList::try_from(vec![H256::ZERO]).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(make_validators(0)).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let atts: AggregatedAttestations = Vec::<AggregatedAttestation>::new().try_into().unwrap();
+        let err = process_attestations(&mut state, &atts).unwrap_err();
+        assert!(
+            matches!(err, Error::NoValidators),
+            "expected NoValidators, got {err:?}"
+        );
     }
 }

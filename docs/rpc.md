@@ -28,10 +28,13 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
 | `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
+| `GET` | `/lean/v0/events` | SSE | Live stream of chain events |
 | `GET` | `/lean/v0/blocks/{block_id}` | JSON | Block by root or slot |
 | `GET` | `/lean/v0/blocks/{block_id}/header` | JSON | Block header by root or slot |
 | `GET` | `/lean/v0/fork_choice` | JSON | Fork-choice tree with per-block weights |
 | `GET` | `/lean/v0/fork_choice/ui` | HTML | Interactive D3.js visualization |
+| `GET` | `/lean/v0/node/identity` | JSON | Client version and libp2p peer ID |
+| `GET` | `/lean/v0/node/syncing` | JSON | Sync status relative to the wall clock |
 | `GET` | `/lean/v0/admin/aggregator` | JSON | Current aggregator role |
 | `POST` | `/lean/v0/admin/aggregator` | JSON | Toggle aggregator role at runtime |
 
@@ -81,6 +84,48 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 { "slot": 128, "root": "0x1a2b…" }
 ```
 
+### `GET /lean/v0/events`
+
+Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Seven event types:
+
+Payload fields mirror the Ethereum beacon-API eventstream where an analog exists: `block` is the block root, `state` the state root, and `slot` stands in for the beacon `epoch`. `justified_checkpoint` and `aggregate` are ethlambda extensions with no beacon topic.
+
+| Event | Payload | Emitted when |
+|-------|---------|--------------|
+| `head` | `{ "slot": 128, "block": "0x…", "state": "0x…" }` | Fork choice selects a new head within `HEAD_EVENT_RECENCY_SLOTS` (32 slots) of the wall clock; no head events fire during catch-up |
+| `block` | `{ "slot": 128, "block": "0x…" }` | A block is imported into the store |
+| `justified_checkpoint` | `{ "slot": 120, "block": "0x…", "state": "0x…" }` | The justified checkpoint advances |
+| `finalized_checkpoint` | `{ "slot": 96, "block": "0x…", "state": "0x…" }` | The finalized checkpoint advances |
+| `block_gossip` | `{ "slot": 128, "block": "0x…" }` | A block is seen on the network, before import |
+| `attestation` | `{ "validator_id": 4, "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A single validator vote passes gossip validation (signature omitted) |
+| `aggregate` | `{ "participants": [0, 3, 4], "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A committee-signature aggregate is produced locally or accepted from gossip (proof omitted) |
+
+The topic name travels only on the SSE `event:` line; the `data:` line carries the flat JSON payload. Example frame:
+
+```
+event: head
+data: {"slot":128,"block":"0x1a2b…","state":"0x3c4d…"}
+```
+
+#### Filtering with `?topics=`
+
+A **required** comma-separated list of event names selects which events to stream:
+
+```bash
+curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
+```
+
+Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
+
+| Status | Condition |
+|--------|-----------|
+| `200` | Stream opened for the listed topics |
+| `400` | `topics` is missing or empty, or any listed name is not a known topic (body names the offending value) |
+
+Events are fanned out over a single bounded broadcast channel shared by all topics. A client that reads too slowly skips past the events it missed: they are dropped for that subscriber rather than back-pressured onto the actor, so treat the stream as best-effort and re-sync via the blocks endpoints after a gap. A client that falls behind receives an SSE comment line `: error - dropped N messages` marking the gap (wire-compatible with Lighthouse) before the stream continues; re-sync via the blocks endpoints rather than trusting the skipped range. Keep-alive comments are sent periodically to hold idle connections open.
+
+Because the ring buffer is shared, the high-rate `attestation` events (roughly one per validator per slot) dominate its occupancy: a subscriber's tolerable stall is `capacity / total_event_rate`, not per-topic, so filtering with `?topics=` narrows what you receive but does **not** widen the lag window against an attestation flood. Subscribers that only need low-rate topics (`head`, `finalized_checkpoint`, …) are still evicted at the aggregate rate. If real usage shows this biting, the fix is a per-topic channel split behind the event bus (the `subscribe(TopicSet)` API is unaffected).
+
 ### `GET /lean/v0/blocks/{block_id}` and `/header`
 
 `block_id` is either:
@@ -116,6 +161,29 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
 ```
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
+
+### `GET /lean/v0/node/identity`
+
+```json
+{
+  "version": "ethlambda/v0.1.0-main-892ad575/x86_64-unknown-linux-gnu/rustc-v1.97.1",
+  "peer_id": "16Uiu2HAm7v1x…"
+}
+```
+
+`version` is the full client version string, identical to what `ethlambda --version` prints: crate semver, git branch and short SHA, target triple, and rustc version. Baked in at compile time from `CARGO_PKG_VERSION` plus the `vergen-git2` build metadata.
+
+`peer_id` is the node's libp2p peer ID (base58), derived from the node key and fixed for the lifetime of the process; it matches the identity the node presents to peers on the wire.
+
+### `GET /lean/v0/node/syncing`
+
+```json
+{ "is_syncing": false, "head_slot": 1024, "sync_distance": 1, "finalized_slot": 986 }
+```
+
+`is_syncing` is the node's own stateful sync decision: head-vs-wall-clock lag with hysteresis and a network-stall override, updated each tick. It is the same signal that gates validator duties and drives the `lean_node_sync_status` metric, so the endpoint, the gate, and the metric always agree.
+
+`sync_distance` is the raw number of slots between the node's current head and the current wall-clock slot, computed per request. Because `is_syncing` carries hysteresis and stall handling and is not recomputed from `sync_distance`, the two can point different ways near the threshold or during a network-wide stall.
 
 ### `GET` / `POST /lean/v0/admin/aggregator`
 
@@ -170,6 +238,7 @@ When the binary boots with `HIVE_LEAN_TEST_DRIVER=1` (any of `1`/`true`/`yes`), 
 | Kind | `Content-Type` |
 |------|----------------|
 | JSON | `application/json; charset=utf-8` |
+| SSE | `text/event-stream` |
 | SSZ | `application/octet-stream` |
 | Prometheus metrics | `text/plain; version=0.0.4; charset=utf-8` |
 | HTML | `text/html; charset=utf-8` |

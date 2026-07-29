@@ -130,7 +130,7 @@ pub(crate) fn emit_post_block_coverage(
     // the head is normally the block proposed at `reporting_slot + 1`, which
     // carries this round's votes; filter by `data.slot` so we count the same
     // cohort even if the head is at a different slot.
-    if let Some(block) = store.get_block(&store.head()) {
+    if let Ok(Some(block)) = store.get_block(&store.head().expect("head exists")) {
         for att in block.body.attestations.iter() {
             if att.data.slot == reporting_slot {
                 cov_add(&mut block_v, &mut block_s, &att.aggregation_bits);

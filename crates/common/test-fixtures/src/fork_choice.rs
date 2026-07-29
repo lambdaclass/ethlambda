@@ -33,6 +33,7 @@ impl ForkChoiceTestVector {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkChoiceTest {
     #[allow(dead_code)]
     pub network: String,
@@ -52,6 +53,11 @@ pub struct ForkChoiceTest {
     #[serde(rename = "maxSlot")]
     #[allow(dead_code)]
     pub max_slot: u64,
+    /// Top-level expected rejection reason for whole-vector negative tests.
+    /// Captured only so `deny_unknown_fields` accepts it.
+    #[serde(rename = "rejectionReason")]
+    #[allow(dead_code)]
+    pub rejection_reason: Option<String>,
     #[serde(rename = "_info")]
     pub info: TestInfo,
 }
@@ -73,6 +79,7 @@ impl ForkChoiceTest {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkChoiceStep {
     /// Whether this step is expected to be accepted by the store.
     ///
@@ -98,6 +105,20 @@ pub struct ForkChoiceStep {
     /// `false` to deliver the block ahead of the store clock.
     #[serde(rename = "tickToSlot", default = "default_true")]
     pub tick_to_slot: bool,
+    /// Full canonical store snapshot the simulator emits after every step
+    /// (leanSpec `StoreSnapshot`). Captured but not yet asserted by the offline
+    /// runner.
+    // TODO(leanSpec storeSnapshot): assert the snapshot contents against Store
+    // getters (block roots, block weights, aggregated-payload participant sets,
+    // gossip-signature groups) once the required Store plumbing exists.
+    #[serde(rename = "storeSnapshot")]
+    pub store_snapshot: Option<StoreSnapshot>,
+    /// Expected rejection reason for a step marked `valid: false`. Captured only
+    /// so `deny_unknown_fields` accepts it; step outcomes are asserted via the
+    /// `valid` flag.
+    #[serde(rename = "rejectionReason")]
+    #[allow(dead_code)]
+    pub rejection_reason: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -105,6 +126,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationStepData {
     #[serde(rename = "validatorIndex")]
     pub validator_id: Option<u64>,
@@ -122,6 +144,7 @@ pub struct AttestationStepData {
 /// `{ data: "0x<hex>" }`; the latter is the lean-multisig single-message
 /// aggregate `compress_without_pubkeys()` bytes for that AttestationData.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofStepData {
     pub participants: AggregationBits,
     pub proof: HexByteList,
@@ -129,6 +152,7 @@ pub struct ProofStepData {
 
 /// Hex-encoded byte list in the fixture format: `{ "data": "0xdeadbeef" }`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HexByteList {
     data: String,
 }
@@ -151,6 +175,7 @@ where
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockStepData {
     pub slot: u64,
     #[serde(rename = "proposerIndex")]
@@ -199,6 +224,7 @@ impl BlockStepData {
 /// Root-typed fields have a `*RootLabel` companion that resolves a block label via the
 /// step's block registry, mirroring the leanSpec fixture schema.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreChecks {
     /// Expected store time in intervals since genesis.
     pub time: Option<u64>,
@@ -244,13 +270,72 @@ pub struct StoreChecks {
 
     #[serde(rename = "attestationTargetSlot")]
     pub attestation_target_slot: Option<u64>,
+    /// Expected attestation target block root by label reference.
+    #[serde(rename = "attestationTargetRootLabel")]
+    pub attestation_target_root_label: Option<String>,
     #[serde(rename = "attestationChecks")]
     pub attestation_checks: Option<Vec<AttestationCheck>>,
     #[serde(rename = "lexicographicHeadAmong")]
     pub lexicographic_head_among: Option<Vec<String>>,
+
+    /// Equal-slot equivocation tiebreak: the listed fork labels must each be
+    /// targeted by an attestation in the accepted (known) aggregated pool, and
+    /// the head must sit on the fork whose attestation carries the largest
+    /// `hash_tree_root` (leanSpec #1189). Scheme-independent: roots are read
+    /// from the store, never pinned.
+    #[serde(rename = "canonicalEquivocationHeadAmong")]
+    pub canonical_equivocation_head_among: Option<Vec<String>>,
+
+    /// Expected sorted-unique set of target slots keyed in the raw gossip
+    /// signature pool.
+    #[serde(rename = "attestationSignatureTargetSlots")]
+    pub attestation_signature_target_slots: Option<Vec<u64>>,
+    /// Expected sorted-unique set of target slots keyed in the pending (new)
+    /// aggregated proof pool.
+    #[serde(rename = "latestNewAggregatedTargetSlots")]
+    pub latest_new_aggregated_target_slots: Option<Vec<u64>>,
+    /// Expected sorted-unique set of target slots keyed in the accepted (known)
+    /// aggregated proof pool.
+    #[serde(rename = "latestKnownAggregatedTargetSlots")]
+    pub latest_known_aggregated_target_slots: Option<Vec<u64>>,
+
+    /// Expected union of validator indices across pending-pool proofs, keyed by
+    /// target slot. JSON object keys are stringified slots (e.g. `"1"`); parse
+    /// them to `u64` at assertion time.
+    #[serde(rename = "newPoolProofParticipants")]
+    pub new_pool_proof_participants: Option<HashMap<String, Vec<u64>>>,
+
+    /// Expected number of aggregated attestations in the block built for this
+    /// step. More than one means votes split over incompatible sources.
+    #[serde(rename = "blockAttestationCount")]
+    pub block_attestation_count: Option<u64>,
+    /// Detailed per-aggregate checks on the block built for this step.
+    #[serde(rename = "blockAttestations")]
+    pub block_attestations: Option<Vec<BlockAttestationCheck>>,
+
+    /// Expected count of blocks from the previous head back to its common
+    /// ancestor with the new head.
+    #[serde(rename = "reorgDepth")]
+    pub reorg_depth: Option<u64>,
+
+    /// Block labels that must still be present in the block tree (verifying
+    /// abandoned forks are retained).
+    #[serde(rename = "labelsInStore")]
+    pub labels_in_store: Option<Vec<String>>,
+
+    /// Expected root of the block built for this step, named by label. The
+    /// offline runner does not build blocks (it imports fixture-supplied ones),
+    /// so this is captured but not asserted.
+    // TODO(leanSpec filledBlockRootLabel): assert once a block-building step
+    // exists; the offline runner imports blocks rather than building them.
+    #[serde(rename = "filledBlockRootLabel")]
+    #[allow(dead_code)]
+    pub filled_block_root_label: Option<String>,
 }
 
+/// Per-validator attestation content check within a step's `attestationChecks`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationCheck {
     pub validator: u64,
     #[serde(rename = "attestationSlot")]
@@ -259,7 +344,88 @@ pub struct AttestationCheck {
     pub head_slot: Option<u64>,
     #[serde(rename = "sourceSlot")]
     pub source_slot: Option<u64>,
+    /// Expected source checkpoint root, named by label and resolved to a root.
+    #[serde(rename = "sourceRootLabel")]
+    pub source_root_label: Option<String>,
     #[serde(rename = "targetSlot")]
     pub target_slot: Option<u64>,
     pub location: String,
+}
+
+/// Checks for one aggregated attestation in a built block body
+/// (leanSpec `AggregatedAttestationCheck`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockAttestationCheck {
+    /// Validator indices this aggregate must cover exactly.
+    pub participants: Vec<u64>,
+    #[serde(rename = "attestationSlot")]
+    pub attestation_slot: Option<u64>,
+    #[serde(rename = "targetSlot")]
+    pub target_slot: Option<u64>,
+}
+
+// ============================================================================
+// Store snapshot (leanSpec `StoreSnapshot`)
+// ============================================================================
+
+/// Canonical store snapshot emitted after every fork-choice step.
+///
+/// Parsed in full so `deny_unknown_fields` accepts it, but not yet asserted by
+/// the offline runner; see the `TODO(leanSpec storeSnapshot)` on
+/// [`ForkChoiceStep::store_snapshot`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct StoreSnapshot {
+    pub time: u64,
+    #[serde(rename = "headRoot")]
+    pub head_root: H256,
+    #[serde(rename = "safeTargetRoot")]
+    pub safe_target_root: H256,
+    #[serde(rename = "latestJustified")]
+    pub latest_justified: Checkpoint,
+    #[serde(rename = "latestFinalized")]
+    pub latest_finalized: Checkpoint,
+    #[serde(rename = "blockRoots")]
+    pub block_roots: Vec<H256>,
+    #[serde(rename = "blockWeights")]
+    pub block_weights: Vec<BlockWeightEntry>,
+    #[serde(rename = "knownAggregatedPayloads")]
+    pub known_aggregated_payloads: Vec<AggregatedPayloadEntry>,
+    #[serde(rename = "newAggregatedPayloads")]
+    pub new_aggregated_payloads: Vec<AggregatedPayloadEntry>,
+    #[serde(rename = "attestationSignatures")]
+    pub attestation_signatures: Vec<AttestationSignatureEntry>,
+}
+
+/// A `{root, weight}` entry in [`StoreSnapshot::block_weights`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct BlockWeightEntry {
+    pub root: H256,
+    pub weight: u64,
+}
+
+/// A `{dataRoot, participantSets}` entry in the snapshot's aggregated pools.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct AggregatedPayloadEntry {
+    #[serde(rename = "dataRoot")]
+    pub data_root: H256,
+    #[serde(rename = "participantSets")]
+    pub participant_sets: Vec<Vec<u64>>,
+}
+
+/// A `{dataRoot, validatorIndices}` entry in the snapshot's signature pool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct AttestationSignatureEntry {
+    #[serde(rename = "dataRoot")]
+    pub data_root: H256,
+    #[serde(rename = "validatorIndices")]
+    pub validator_indices: Vec<u64>,
 }

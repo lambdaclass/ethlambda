@@ -11,7 +11,7 @@ struct GenesisResponse {
 }
 
 async fn get_genesis(State(store): State<Store>) -> impl IntoResponse {
-    let genesis_time = store.config().genesis_time;
+    let genesis_time = store.config().expect("config exists").genesis_time;
     // Lean validators are fixed at genesis (no churn), so the current head
     // state's validator registry always equals the genesis validator count.
     let validator_count = store.head_state().validators.len() as u64;

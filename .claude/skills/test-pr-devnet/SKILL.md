@@ -53,7 +53,7 @@ Test ethlambda branch changes in a multi-client local devnet with zeam (Zig), re
 **Success criteria:**
 - ✅ No errors in ethlambda logs
 - ✅ All 4 nodes at same head slot
-- ✅ Finalization advancing (every 6-12 slots)
+- ✅ Finalization advancing (every few slots on a healthy devnet)
 - ✅ Each validator produces blocks for their slots
 
 ### Sync Recovery (~90-120s)
@@ -139,24 +139,12 @@ sleep 10  # Wait for sync
 # Quick status
 .claude/skills/test-pr-devnet/scripts/check-status.sh
 
-# Detailed analysis (use devnet-log-review skill in lean-quickstart)
-cd $LEAN_QUICKSTART
+# Detailed analysis (use this repo's devnet-log-review skill; dump logs first)
+for node in zeam_0 ream_0 qlean_0 ethlambda_0; do
+    docker logs "$node" > "${node}.log" 2>&1
+done
 .claude/skills/devnet-log-review/scripts/analyze-logs.sh
 ```
-
-## Protocol Compatibility
-
-| Client | Status | Gossipsub | BlocksByRoot |
-|--------|--------|-----------|--------------|
-| ream | ✅ Full | ✅ Full | ✅ Full |
-| zeam | ✅ Full | ✅ Full | ⚠️ Limited |
-| qlean | ✅ Full | ✅ Full | ⚠️ Limited |
-| ethlambda | ✅ Full | ✅ Full | ✅ Full |
-
-**Notes:**
-- zeam/qlean BlocksByRoot errors are expected (not a blocker)
-- ream ↔ ethlambda BlocksByRoot should work perfectly
-- All clients use Gossipsub for block propagation
 
 ## Verification Checklist
 
@@ -256,5 +244,5 @@ docker logs ethlambda_0 2>&1 | grep -i "peer\|connection" | head -20
 
 ## References
 
-- **[ethlambda CLAUDE.md](../../CLAUDE.md)** - Development workflow, detailed debugging commands
-- **[lean-quickstart devnet-log-review](../../../lean-quickstart/.claude/skills/devnet-log-review/SKILL.md)** - Comprehensive log analysis
+- **[ethlambda CLAUDE.md](../../../CLAUDE.md)** - Development workflow, detailed debugging commands
+- **[devnet-log-review](../devnet-log-review/SKILL.md)** - Comprehensive log analysis (in this repo)

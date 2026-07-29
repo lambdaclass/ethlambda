@@ -34,6 +34,7 @@ impl VerifySignaturesTestVector {
 
 /// A single verify-signatures test case.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifySignaturesTest {
     #[allow(dead_code)]
     pub network: String,
@@ -49,6 +50,11 @@ pub struct VerifySignaturesTest {
     /// spellings are accepted.
     #[serde(default, rename = "expectException", alias = "rejectionReason")]
     pub expect_exception: Option<String>,
+    /// Aggregation proof regime (see [`crate::fork_choice::ForkChoiceTest`]).
+    /// Captured only so `deny_unknown_fields` accepts it.
+    #[serde(rename = "proofSetting")]
+    #[allow(dead_code)]
+    pub proof_setting: Option<u8>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
     pub info: TestInfo,
@@ -57,6 +63,7 @@ pub struct VerifySignaturesTest {
 /// Fixture-side signed block: a block plus its raw merged multi-message
 /// aggregate proof bytes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
@@ -69,6 +76,7 @@ pub struct TestSignedBlock {
 /// The multi-signature container nests the raw lean-multisig wire one level
 /// deep: `{ "proof": { "data": "0x..." } }`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergedProof {
     pub proof: HexBytes,
 }
@@ -81,6 +89,7 @@ impl MergedProof {
 
 /// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HexBytes {
     pub data: String,
 }

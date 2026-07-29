@@ -1,6 +1,48 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use tracing::debug;
 
 use crate::metrics::SyncStatus;
+
+/// Shared, runtime-readable node sync status.
+///
+/// The blockchain actor is the sole writer: once per tick it calls
+/// [`SyncStatusController::set`] with the same [`SyncStatus`] it feeds the
+/// `lean_node_sync_status` metric (see `BlockChainServer::update_sync_status`).
+/// Read paths outside the actor — notably the RPC `/lean/v0/node/syncing`
+/// endpoint — clone the controller and read the current status without touching
+/// actor state. Mirrors [`ethlambda_types::aggregator::AggregatorController`].
+#[derive(Clone, Debug)]
+pub struct SyncStatusController {
+    status: Arc<AtomicU8>,
+}
+
+impl SyncStatusController {
+    /// Construct a controller seeded with `initial` (the actor seeds
+    /// [`SyncStatus::Idle`], matching the metric's startup value).
+    pub fn new(initial: SyncStatus) -> Self {
+        Self {
+            status: Arc::new(AtomicU8::new(initial as u8)),
+        }
+    }
+
+    /// Publish the current sync status.
+    pub fn set(&self, status: SyncStatus) {
+        self.status.store(status as u8, Ordering::Relaxed);
+    }
+
+    /// Read the current sync status.
+    pub fn get(&self) -> SyncStatus {
+        SyncStatus::from_u8(self.status.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for SyncStatusController {
+    fn default() -> Self {
+        Self::new(SyncStatus::Idle)
+    }
+}
 
 /// Local head lag beyond which the node is considered to be syncing.
 ///

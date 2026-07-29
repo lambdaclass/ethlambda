@@ -154,26 +154,60 @@ pub(crate) struct Behaviour {
 
 /// Configuration for building the libp2p swarm.
 ///
-/// INVARIANT: `is_aggregator` is consumed once during [`build_swarm`] to decide
-/// subnet subscriptions and is NOT stored on [`P2PServer`]. Runtime toggles
-/// of the aggregator role via the admin API (see
-/// [`ethlambda_types::aggregator::AggregatorController`]) intentionally do
-/// not resubscribe gossip subnets — this is the leanSpec PR #636 scope
-/// limitation ("hot-standby model"). If a runtime reader is ever added on
-/// the P2P side, it must consult the shared `AggregatorController` instead
-/// of a bool captured here, or the runtime toggle will silently diverge.
+/// INVARIANT: `subscription_subnets` is the fixed set of attestation subnets
+/// this node subscribes to. It is computed once by the caller via
+/// [`attestation_subscription_subnets`] and shared with the blockchain actor,
+/// so both agree on exactly which subnets feed this node's gossip groups. The
+/// set is consumed during [`build_swarm`] and NOT stored on [`P2PServer`]:
+/// runtime toggles of the aggregator role via the admin API (see
+/// [`ethlambda_types::aggregator::AggregatorController`]) intentionally do not
+/// resubscribe gossip subnets; this is the leanSpec PR #636 "hot-standby model"
+/// scope limitation. A node that may aggregate at runtime must include those
+/// subnets here at startup.
 pub struct SwarmConfig {
     pub node_key: Vec<u8>,
     pub bootnodes: Vec<Bootnode>,
     pub listening_socket: SocketAddr,
     pub validator_ids: Vec<u64>,
     pub attestation_committee_count: u64,
-    pub is_aggregator: bool,
-    pub aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Attestation subnets to subscribe to, precomputed via
+    /// [`attestation_subscription_subnets`].
+    pub subscription_subnets: HashSet<u64>,
+}
+
+/// The attestation subnets a node subscribes to: every validator subscribes
+/// to its own committee subnet (`validator_id % attestation_committee_count`)
+/// for mesh health, and an aggregator additionally subscribes to any explicit
+/// `aggregate_subnet_ids`, falling back to subnet 0 when it would otherwise
+/// subscribe to none.
+pub fn attestation_subscription_subnets(
+    validator_ids: &[u64],
+    attestation_committee_count: u64,
+    is_aggregator: bool,
+    aggregate_subnet_ids: Option<&[u64]>,
+) -> HashSet<u64> {
+    let mut subnets: HashSet<u64> = validator_ids
+        .iter()
+        .map(|vid| vid % attestation_committee_count)
+        .collect();
+    if is_aggregator {
+        if let Some(ids) = aggregate_subnet_ids {
+            subnets.extend(ids.iter().copied());
+        }
+        // Fall back to subnet 0 only when the aggregator has no validators and
+        // no explicit subnets; otherwise leave the set as configured.
+        if subnets.is_empty() {
+            subnets.insert(0);
+        }
+    }
+    subnets
 }
 
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
+    /// This node's libp2p peer ID, derived from the node key. Exposed so the
+    /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
+    pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
     pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
     pub(crate) attestation_committee_count: u64,
@@ -301,35 +335,18 @@ pub fn build_swarm(
         .subscribe(&aggregation_topic)
         .unwrap();
 
-    // Subscribe to attestation subnets per leanSpec (`src/lean_spec/__main__.py`):
-    // every validator subscribes to its own subnet for mesh health; aggregators
-    // additionally subscribe to explicit `aggregate_subnet_ids` and fall back to
-    // subnet 0 when they have no validators of their own.
-    let validator_subnets: HashSet<u64> = config
+    // The committee metric should reflect validator membership only, not
+    // aggregator-only subscriptions.
+    let metric_subnet = config
         .validator_ids
         .iter()
         .map(|vid| vid % config.attestation_committee_count)
-        .collect();
-
-    // The committee metric should reflect validator membership only, not
-    // aggregator-only subscriptions.
-    let metric_subnet = validator_subnets.iter().copied().min().unwrap_or(0);
+        .min()
+        .unwrap_or(0);
     metrics::set_attestation_committee_subnet(metric_subnet);
 
-    let mut subscription_subnets = validator_subnets;
-    if config.is_aggregator {
-        if let Some(ref explicit_ids) = config.aggregate_subnet_ids {
-            subscription_subnets.extend(explicit_ids);
-        }
-        // Fall back to subnet 0 only when the aggregator has no validators
-        // and no explicit subnets — otherwise leave the set as configured.
-        if subscription_subnets.is_empty() {
-            subscription_subnets.insert(0);
-        }
-    }
-
     let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
-    for &subnet_id in &subscription_subnets {
+    for &subnet_id in &config.subscription_subnets {
         let topic = attestation_subnet_topic(subnet_id);
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
         info!(subnet_id, "Subscribed to attestation subnet");
@@ -339,6 +356,7 @@ pub fn build_swarm(
     info!(socket=%config.listening_socket, "P2P node started");
 
     Ok(BuiltSwarm {
+        local_peer_id,
         swarm,
         attestation_topics,
         attestation_committee_count: config.attestation_committee_count,

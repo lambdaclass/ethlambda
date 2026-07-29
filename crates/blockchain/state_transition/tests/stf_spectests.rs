@@ -53,6 +53,20 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         match (result, test.post) {
             (Ok(_), Some(expected_post)) => {
                 compare_post_states(&post_state, &expected_post, &block_registry)?;
+                // Hardening: the full post-state hash_tree_root must equal the
+                // fixture's `postStateRoot`. The per-field `post` checks only
+                // pin the fields the fixture chose to enumerate; this catches
+                // any state field they omit.
+                if let Some(expected_root) = test.post_state_root {
+                    let actual_root = post_state.hash_tree_root();
+                    if actual_root != expected_root {
+                        return Err(format!(
+                            "Test '{name}' post-state root mismatch: \
+                             expected {expected_root:?}, got {actual_root:?}"
+                        )
+                        .into());
+                    }
+                }
             }
             (Ok(_), None) => {
                 return Err(

@@ -1,11 +1,13 @@
+//! Validator XMSS signatures, public/secret keys, and the leansig-backed
+//! primitives behind them.
+
 use std::ops::Range;
 
+use ethlambda_types::primitives::H256;
 use leansig::{
     serialization::Serializable,
     signature::{SignatureScheme, SignatureSchemeSecretKey as _, SigningError},
 };
-
-use crate::primitives::H256;
 
 /// The XMSS signature scheme used for validator signatures.
 ///
@@ -24,11 +26,6 @@ pub type LeanSigSignature = <LeanSignatureScheme as SignatureScheme>::Signature;
 pub type LeanSigSecretKey = <LeanSignatureScheme as SignatureScheme>::SecretKey;
 
 pub type Signature = LeanSigSignature;
-
-/// Size of an XMSS signature in bytes.
-///
-/// Computed from: path(32*8*4) + rho(7*4) + hashes(46*8*4) + ssz_offsets(3*4) = 2536
-pub const SIGNATURE_SIZE: usize = 2536;
 
 /// Error returned when parsing signature or key bytes fails.
 #[derive(Debug, Clone, thiserror::Error)]
