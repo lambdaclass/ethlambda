@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use event_monitor::config::Config;
 use event_monitor::hub::Hub;
@@ -42,22 +42,32 @@ async fn main() -> anyhow::Result<()> {
         intervals_per_slot = timing.intervals_per_slot,
         "resolved slot geometry"
     );
-    let timing = Arc::new(timing);
+    // Geometry is shared by watch channel rather than a plain Arc so a
+    // regenerated genesis can be picked up without a restart: the refresher
+    // publishes, collectors re-read per frame, and `/api/meta` reads per request.
+    let (timing_tx, timing_rx) = watch::channel(timing);
 
     let hub = Hub::new(config.history_slots as u64);
     for node in &config.nodes {
         tokio::spawn(collector::run_collector(
             node.clone(),
             config.topics.clone(),
-            timing.clone(),
+            timing_rx.clone(),
             hub.clone(),
             client.clone(),
         ));
     }
+    tokio::spawn(timing::run_refresher(
+        config.nodes.clone(),
+        config.timing_overrides(),
+        client.clone(),
+        timing_tx,
+        hub.clone(),
+    ));
 
-    let meta = server::Meta::new(&config, &timing);
+    let meta = server::MetaConfig::new(&config);
     let static_dir = Path::new(&config.static_dir).to_path_buf();
-    let app = server::build_router(hub, meta, &static_dir);
+    let app = server::build_router(hub, meta, timing_rx, &static_dir);
 
     let listen_addr = config.listen;
     let listener = TcpListener::bind(listen_addr).await?;

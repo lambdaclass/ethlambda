@@ -36,11 +36,13 @@ async fn fake_events_handler() -> Sse<impl Stream<Item = Result<SseEvent, Infall
 }
 
 /// Pulls `HubMessage`s off `rx` until `want` [`NormalizedEvent`]s (ignoring
-/// `Status` heartbeats) have been collected, or `RECV_TIMEOUT` elapses.
+/// `Status` heartbeats) have been collected, or `RECV_TIMEOUT` elapses. Events
+/// arrive `Arc`-wrapped, since the hub shares one allocation between the
+/// broadcast fan-out and the history ring.
 async fn collect_chain_events(
     rx: &mut tokio::sync::broadcast::Receiver<HubMessage>,
     want: usize,
-) -> Vec<NormalizedEvent> {
+) -> Vec<Arc<NormalizedEvent>> {
     let mut collected = Vec::with_capacity(want);
     timeout(RECV_TIMEOUT, async {
         while collected.len() < want {
@@ -74,7 +76,7 @@ async fn collector_normalizes_frames_from_a_live_sse_server() {
         name: "fake-node".to_string(),
         url: format!("http://{addr}"),
     };
-    let timing = Arc::new(Timing {
+    let (_timing_tx, timing) = tokio::sync::watch::channel(Timing {
         genesis_time: 0,
         ms_per_slot: 4_000,
         intervals_per_slot: 5,
@@ -134,7 +136,7 @@ async fn collector_publishes_connected_status_on_success() {
         name: "fake-node-2".to_string(),
         url: format!("http://{addr}"),
     };
-    let timing = Arc::new(Timing {
+    let (_timing_tx, timing) = tokio::sync::watch::channel(Timing {
         genesis_time: 0,
         ms_per_slot: 4_000,
         intervals_per_slot: 5,

@@ -12,6 +12,7 @@
   --muted-2: #8b93a1;
   --grid: #e4e7ec;
   --lane-alt: rgba(80, 96, 120, 0.045);
+  --overflow-band: rgba(230, 73, 128, 0.06);
   --accent: #4f8cff;
   --chip-bg: #f0f2f5;
 
@@ -42,6 +43,7 @@
     --muted-2: #737d8c;
     --grid: #262a33;
     --lane-alt: rgba(160, 180, 220, 0.05);
+    --overflow-band: rgba(230, 73, 128, 0.10);
     --accent: #6ea1ff;
     --chip-bg: #1b1f27;
   }
@@ -57,6 +59,7 @@
   --muted-2: #737d8c;
   --grid: #262a33;
   --lane-alt: rgba(160, 180, 220, 0.05);
+  --overflow-band: rgba(230, 73, 128, 0.10);
   --accent: #6ea1ff;
   --chip-bg: #1b1f27;
 }
@@ -70,6 +73,7 @@
   --muted-2: #8b93a1;
   --grid: #e4e7ec;
   --lane-alt: rgba(80, 96, 120, 0.045);
+  --overflow-band: rgba(230, 73, 128, 0.06);
   --accent: #4f8cff;
   --chip-bg: #f0f2f5;
 }

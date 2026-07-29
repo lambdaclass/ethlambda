@@ -5,6 +5,15 @@
 const TOPICS = ["block", "attestation", "aggregate"];
 const MAX_POINTS_PER_NODE = 2000;
 
+// The x-axis covers two slots, but not at one scale. The first slot gets the
+// bulk of the width at full resolution; the second is compressed into a narrow
+// overflow band whose width is OVERFLOW_INTERVAL_FRACTION of one first-slot
+// interval. Arrivals that spill past their slot boundary are the interesting
+// failure mode, so they need real positions rather than piling up against a
+// clamp, but they should not cost resolution in the region where every healthy
+// event lands. Anything beyond two slots saturates at the right edge.
+const OVERFLOW_INTERVAL_FRACTION = 0.5;
+
 const LANE_HEIGHT = 40;
 const TOP_MARGIN = 14;
 const BOTTOM_MARGIN = 30;
@@ -42,6 +51,8 @@ function readTheme() {
     grid: get("--grid", "#d0d3d9"),
     text: get("--muted", "#6b7280"),
     laneAlt: get("--lane-alt", "rgba(0,0,0,0.04)"),
+    overflowBand: get("--overflow-band", "rgba(230,73,128,0.07)"),
+    overflowEdge: get("--prop-over", "#e64980"),
     topics: {
       block: get("--topic-block", "#4f8cff"),
       attestation: get("--topic-attestation", "#37b24d"),
@@ -103,7 +114,9 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
     const arr = perNode.get(ev.node);
     if (!arr) return; // event from a node not in meta.nodes; ignore defensively
     if (ev.slot > maxSlotSeen) maxSlotSeen = ev.slot;
-    const offsetMs = Math.min(Math.max(ev.offset_ms, 0), msPerSlot);
+    // Clamp to the full two-slot span, not to one slot: the overflow band is
+    // what makes a late arrival distinguishable from an on-boundary one.
+    const offsetMs = Math.min(Math.max(ev.offset_ms, 0), msPerSlot * 2);
     const seed = `${ev.node}|${ev.topic}|${ev.slot}|${ev.id ?? ""}|${ev.validator_id ?? ""}|${ev.arrival_ms}`;
     arr.push({
       topic: ev.topic,
@@ -118,9 +131,25 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
     }
   }
 
+  // Splits the available width between the full-resolution first slot and the
+  // compressed overflow band. Solving
+  //   total = main + main * FRACTION / intervals
+  // keeps the band exactly FRACTION of one first-slot interval wide.
+  function axis() {
+    const total = cssWidth - LEFT_MARGIN - RIGHT_MARGIN;
+    const main = total / (1 + OVERFLOW_INTERVAL_FRACTION / intervals);
+    return { main, overflow: total - main };
+  }
+
+  // Piecewise-linear: linear within the slot, then compressed across the
+  // second slot. `offsetMs` is expected pre-clamped to [0, 2 * msPerSlot].
   function xForOffset(offsetMs) {
-    const plotWidth = cssWidth - LEFT_MARGIN - RIGHT_MARGIN;
-    return LEFT_MARGIN + (offsetMs / msPerSlot) * plotWidth;
+    const { main, overflow } = axis();
+    if (offsetMs <= msPerSlot) {
+      return LEFT_MARGIN + (Math.max(offsetMs, 0) / msPerSlot) * main;
+    }
+    const over = Math.min(offsetMs - msPerSlot, msPerSlot);
+    return LEFT_MARGIN + main + (over / msPerSlot) * overflow;
   }
 
   function laneY(nodeName) {
@@ -149,6 +178,13 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
       }
     });
 
+    // Tint the compressed overflow band so its different scale is visible
+    // before anyone reads the axis labels.
+    const boundaryX = xForOffset(msPerSlot);
+    const rightEdge = cssWidth - RIGHT_MARGIN;
+    ctx.fillStyle = theme.overflowBand;
+    ctx.fillRect(boundaryX, TOP_MARGIN, rightEdge - boundaryX, plotBottom - TOP_MARGIN);
+
     // gridlines every ms_per_slot / intervals_per_slot, plus axis labels
     const step = msPerSlot / intervals;
     ctx.strokeStyle = theme.grid;
@@ -165,8 +201,24 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
       ctx.stroke();
       ctx.fillText(`${Math.round(ms)}`, x, plotBottom + 6);
     }
+
+    // The slot boundary is drawn over the gridlines in the overflow accent, so
+    // "spilled into the next slot" reads at a glance.
+    ctx.strokeStyle = theme.overflowEdge;
+    ctx.beginPath();
+    ctx.moveTo(boundaryX, TOP_MARGIN);
+    ctx.lineTo(boundaryX, plotBottom);
+    ctx.stroke();
+
+    // Only the far end of the band is labelled; there is no room for more.
+    ctx.fillStyle = theme.text;
+    ctx.textAlign = "right";
+    ctx.fillText(`+${msPerSlot}`, rightEdge, plotBottom + 6);
+
     ctx.textAlign = "left";
     ctx.fillText("ms into slot", LEFT_MARGIN, plotBottom + 18);
+    ctx.textAlign = "right";
+    ctx.fillText("next slot (compressed)", rightEdge, plotBottom + 18);
 
     // lane labels
     ctx.textAlign = "right";
@@ -238,7 +290,11 @@ export function createBeeswarm({ canvas, legendEl, noteEl, meta }) {
 
   function updateNote() {
     if (noteEl) {
-      noteEl.textContent = `Showing the last ${windowSlots} slots. Older slots fade out, then drop.`;
+      noteEl.textContent =
+        `Showing the last ${windowSlots} slots. Older slots fade out, then drop. ` +
+        `Past the slot boundary the axis compresses the next full slot into the ` +
+        `tinted band, so late arrivals stay distinguishable; beyond that they ` +
+        `saturate at the right edge.`;
     }
   }
 

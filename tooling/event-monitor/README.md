@@ -14,6 +14,20 @@ Standalone: its own Cargo workspace, **no dependency on any ethlambda crate** â€
 it only speaks the documented SSE/HTTP wire shape. See [`CONTRACT.md`](./CONTRACT.md)
 for the authoritative interface between the Rust backend and the JS frontend.
 
+## Reading the numbers
+
+Two caveats worth knowing before drawing conclusions from a panel:
+
+- Arrival is timestamped **on the collector**, so every offset includes the
+  collectorâ†”node round trip. That single clock is what makes propagation deltas
+  skew-free, but it also means nodes reached over different links (loopback vs a
+  WAN tunnel) carry a systematic offset that looks like lag. Compare nodes whose
+  paths are comparable.
+- The collector re-resolves slot geometry every 60s and drops its retained
+  history if `genesis_time` changes, so a regenerated genesis no longer corrupts
+  offsets silently. An already-open dashboard still needs a **page reload** after
+  such a change to pick up the new geometry and reset its own slot watermark.
+
 ## Run
 
 ```bash

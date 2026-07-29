@@ -3,11 +3,11 @@
 //! capped exponential backoff and reports connection state changes plus a
 //! periodic heartbeat (CONTRACT.md §2, §4).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eventsource_stream::{Event as SseEvent, Eventsource};
 use futures_util::StreamExt;
+use tokio::sync::watch;
 
 use crate::config::NodeConfig;
 use crate::hub::Hub;
@@ -140,7 +140,7 @@ fn node_status(name: &str, state: NodeState, events_per_sec: f64) -> NodeStatus 
 pub async fn run_collector(
     node: NodeConfig,
     topics: Vec<String>,
-    timing: Arc<Timing>,
+    timing: watch::Receiver<Timing>,
     hub: Hub,
     client: reqwest::Client,
 ) {
@@ -174,7 +174,7 @@ pub async fn run_collector(
 async fn connect_and_stream(
     node: &NodeConfig,
     topics: &[String],
-    timing: &Timing,
+    timing: &watch::Receiver<Timing>,
     hub: &Hub,
     client: &reqwest::Client,
 ) -> Attempt {
@@ -210,7 +210,10 @@ async fn connect_and_stream(
                 match frame {
                     Some(Ok(event)) => {
                         rate.tick();
-                        handle_frame(node, &event, timing, hub, &mut warned_implausible_slot);
+                        // Re-read per frame so a geometry refresh takes effect
+                        // without tearing down the connection.
+                        let geometry = *timing.borrow();
+                        handle_frame(node, &event, geometry, hub, &mut warned_implausible_slot);
                     }
                     Some(Err(err)) => {
                         let error = Some(CollectorError::Stream(err.to_string()));
@@ -243,7 +246,7 @@ async fn connect_and_stream(
 fn handle_frame(
     node: &NodeConfig,
     event: &SseEvent,
-    timing: &Timing,
+    timing: Timing,
     hub: &Hub,
     warned_implausible_slot: &mut bool,
 ) {
@@ -252,7 +255,7 @@ fn handle_frame(
     if event.data.is_empty() {
         return;
     }
-    match model::normalize(&node.name, &event.event, &event.data, now_ms(), timing) {
+    match model::normalize(&node.name, &event.event, &event.data, now_ms(), &timing) {
         Ok(normalized) => hub.publish_chain(normalized),
         Err(err @ NormalizeError::ImplausibleSlot { .. }) => {
             if !*warned_implausible_slot {

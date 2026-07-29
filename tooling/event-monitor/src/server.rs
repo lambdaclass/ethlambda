@@ -12,6 +12,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use futures_util::{Stream, StreamExt};
 use serde::Serialize;
+use tokio::sync::watch;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -24,9 +25,6 @@ use crate::timing::Timing;
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// One-shot bootstrap payload the frontend fetches on load (CONTRACT.md §4).
-/// Small and cheap to clone per-request, so `AppState` holds it directly
-/// rather than behind an `Arc` (serde's `Serialize` isn't derived for
-/// `Arc<T>` without the optional `rc` feature).
 #[derive(Debug, Clone, Serialize)]
 pub struct Meta {
     pub genesis_time: u64,
@@ -37,15 +35,34 @@ pub struct Meta {
     pub nodes: Vec<NodeConfig>,
 }
 
-impl Meta {
-    pub fn new(config: &Config, timing: &Timing) -> Self {
+/// The config-derived half of [`Meta`]. The timing half is read live per
+/// request from the geometry watch channel, so a refresh
+/// ([`crate::timing::run_refresher`]) reaches the next page load without a
+/// restart.
+#[derive(Debug, Clone)]
+pub struct MetaConfig {
+    window_slots: u32,
+    topics: Vec<String>,
+    nodes: Vec<NodeConfig>,
+}
+
+impl MetaConfig {
+    pub fn new(config: &Config) -> Self {
         Self {
-            genesis_time: timing.genesis_time,
-            ms_per_slot: timing.ms_per_slot,
-            intervals_per_slot: timing.intervals_per_slot,
             window_slots: config.window_slots,
             topics: config.topics.clone(),
             nodes: config.nodes.clone(),
+        }
+    }
+
+    fn with_timing(&self, timing: Timing) -> Meta {
+        Meta {
+            genesis_time: timing.genesis_time,
+            ms_per_slot: timing.ms_per_slot,
+            intervals_per_slot: timing.intervals_per_slot,
+            window_slots: self.window_slots,
+            topics: self.topics.clone(),
+            nodes: self.nodes.clone(),
         }
     }
 }
@@ -53,13 +70,19 @@ impl Meta {
 #[derive(Clone)]
 struct AppState {
     hub: Hub,
-    meta: Meta,
+    meta: MetaConfig,
+    timing: watch::Receiver<Timing>,
 }
 
 /// Builds the full axum app: `/stream`, `/api/meta`, `/api/history`, and
 /// static file serving (with an `index.html` fallback) rooted at `static_dir`.
-pub fn build_router(hub: Hub, meta: Meta, static_dir: &Path) -> Router {
-    let state = AppState { hub, meta };
+pub fn build_router(
+    hub: Hub,
+    meta: MetaConfig,
+    timing: watch::Receiver<Timing>,
+    static_dir: &Path,
+) -> Router {
+    let state = AppState { hub, meta, timing };
 
     let index_html = static_dir.join("index.html");
     let serve_dir = ServeDir::new(static_dir).fallback(ServeFile::new(index_html));
@@ -73,7 +96,9 @@ pub fn build_router(hub: Hub, meta: Meta, static_dir: &Path) -> Router {
 }
 
 async fn meta_handler(State(state): State<AppState>) -> Json<Meta> {
-    Json(state.meta.clone())
+    // Copy the geometry out immediately rather than holding the watch borrow.
+    let timing = *state.timing.borrow();
+    Json(state.meta.with_timing(timing))
 }
 
 /// Backfill for `GET /api/history` (CONTRACT.md §4): recent chain events (each

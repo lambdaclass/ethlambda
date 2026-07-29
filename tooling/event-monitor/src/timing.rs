@@ -12,19 +12,27 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::sync::watch;
 
 use crate::config::NodeConfig;
+use crate::hub::Hub;
 
-/// Fallback used only when no node answered `/lean/v0/config/spec` and the
-/// config didn't need a network fetch at all (both `genesis_time` and
-/// `ms_per_slot` overridden). Matches ethlambda's own default (5 intervals
-/// per 4s slot).
+/// Fallback used when no node answered `/lean/v0/config/spec`. Matches
+/// ethlambda's own default (5 intervals per 4s slot). Unlike `genesis_time` and
+/// `ms_per_slot` this has no config override, so it is the only source left when
+/// the fetch comes back empty.
 pub const DEFAULT_INTERVALS_PER_SLOT: u64 = 5;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How often slot geometry is re-resolved. A regenerated genesis is routine on
+/// a devnet and silently invalidates every `offset_ms` computed against the old
+/// epoch, so poll for it rather than relying on someone noticing that every dot
+/// has piled up against one edge.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Resolved slot geometry used to compute `offset_ms` for incoming events.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub genesis_time: u64,
     pub ms_per_slot: u64,
@@ -166,6 +174,63 @@ pub async fn bootstrap(
         ms_per_slot,
         intervals_per_slot,
     })
+}
+
+/// Re-resolves slot geometry every [`REFRESH_INTERVAL`] and republishes it on
+/// `timing_tx` when it changes, so a regenerated genesis stops silently
+/// corrupting every subsequent `offset_ms`.
+///
+/// On a change the retained history is dropped: those events' offsets were
+/// computed against the previous epoch and their slot numbers belong to a
+/// different chain, so keeping them would mix two incomparable series in one
+/// backfill. Dropping them also clears the slot watermark, which the history
+/// ring only ever moves upward and which a restarted chain's low slots would
+/// otherwise sit below.
+///
+/// A failed refresh is logged and ignored: the current geometry is better than
+/// none, and an unreachable node is expected during a rolling restart.
+///
+/// Already-loaded browser tabs keep the `ms_per_slot` / `intervals_per_slot`
+/// they fetched from `/api/meta`, and their own client-side slot watermark, so
+/// they need a reload after a geometry change. Server-computed `offset_ms`
+/// values are correct immediately.
+pub async fn run_refresher(
+    nodes: Vec<NodeConfig>,
+    overrides: TimingOverrides,
+    client: reqwest::Client,
+    timing_tx: watch::Sender<Timing>,
+    hub: Hub,
+) {
+    let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+    ticker.tick().await; // the first tick fires immediately; bootstrap just ran
+
+    loop {
+        ticker.tick().await;
+
+        let fresh = match bootstrap(&nodes, overrides, &client).await {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                tracing::debug!(%err, "slot geometry refresh failed; keeping current geometry");
+                continue;
+            }
+        };
+
+        let current = *timing_tx.borrow();
+        if fresh == current {
+            continue;
+        }
+
+        tracing::warn!(
+            old_genesis_time = current.genesis_time,
+            new_genesis_time = fresh.genesis_time,
+            old_ms_per_slot = current.ms_per_slot,
+            new_ms_per_slot = fresh.ms_per_slot,
+            "slot geometry changed; dropping retained history and re-basing offsets"
+        );
+        hub.reset_history();
+        // A send error means every receiver is gone, i.e. we are shutting down.
+        let _ = timing_tx.send(fresh);
+    }
 }
 
 #[cfg(test)]

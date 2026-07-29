@@ -84,6 +84,8 @@ pub enum ConfigError {
         #[source]
         source: Box<toml::de::Error>,
     },
+    #[error("config file {path} is invalid: {reason}")]
+    Invalid { path: String, reason: String },
 }
 
 impl Config {
@@ -92,10 +94,34 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let config: Config = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
             source: Box::new(source),
-        })
+        })?;
+        config.validate(path)?;
+        Ok(config)
+    }
+
+    /// Rejects configs that would only fail later as an opaque retry loop.
+    fn validate(&self, path: &Path) -> Result<(), ConfigError> {
+        let invalid = |reason: &str| ConfigError::Invalid {
+            path: path.display().to_string(),
+            reason: reason.to_string(),
+        };
+        // Upstream requires a non-empty `topics`: an empty list produces
+        // `?topics=`, which every node answers with 400, so the collector would
+        // otherwise retry forever without ever saying why.
+        if self.topics.is_empty() {
+            return Err(invalid(
+                "`topics` is empty; list at least one topic to subscribe to",
+            ));
+        }
+        if self.nodes.is_empty() {
+            return Err(invalid(
+                "`nodes` is empty; add at least one [[nodes]] entry",
+            ));
+        }
+        Ok(())
     }
 
     pub fn timing_overrides(&self) -> TimingOverrides {
@@ -127,6 +153,61 @@ mod tests {
         assert_eq!(cfg.nodes.len(), 1);
         assert!(cfg.genesis_time.is_none());
         assert!(cfg.ms_per_slot.is_none());
+    }
+
+    fn parse(toml_str: &str) -> Config {
+        toml::from_str(toml_str).expect("fixture should parse")
+    }
+
+    #[test]
+    fn empty_topics_is_rejected_rather_than_retried_forever() {
+        let cfg = parse(
+            r#"
+            listen = "127.0.0.1:8080"
+            topics = []
+
+            [[nodes]]
+            name = "node-2"
+            url = "http://127.0.0.1:5052"
+        "#,
+        );
+        let err = cfg.validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn empty_nodes_is_rejected() {
+        // `nodes` has no serde default, so omitting it fails deserialization
+        // before validation ever runs; an explicit empty list is the only way to
+        // express this, and it is what the check exists for.
+        let cfg = parse(
+            r#"
+            listen = "127.0.0.1:8080"
+            nodes = []
+        "#,
+        );
+        let err = cfg.validate(Path::new("config.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn a_config_without_a_nodes_key_fails_to_parse() {
+        let err = toml::from_str::<Config>(r#"listen = "127.0.0.1:8080""#).unwrap_err();
+        assert!(err.to_string().contains("nodes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_populated_config_passes_validation() {
+        let cfg = parse(
+            r#"
+            listen = "127.0.0.1:8080"
+
+            [[nodes]]
+            name = "node-2"
+            url = "http://127.0.0.1:5052"
+        "#,
+        );
+        assert!(cfg.validate(Path::new("config.toml")).is_ok());
     }
 
     #[test]

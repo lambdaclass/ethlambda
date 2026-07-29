@@ -79,6 +79,24 @@ offset_ms     = arrival_ms - slot_start_ms        // may be negative under clock
 (`SystemTime::now()` → epoch ms). Config may override `genesis_time` /
 `ms_per_slot` for offline testing.
 
+**What `offset_ms` actually measures.** It is stamped when the *collector*
+receives the frame, so it includes the collector↔node round trip, not just the
+node's own event time. One clock is deliberate: it makes propagation deltas
+skew-free, which no per-node timestamp could (the events carry none). The
+consequence is that nodes reached over different links (loopback vs a WAN
+tunnel) carry a systematic per-node offset that reads as lag in both panels.
+Cross-node comparisons are only as good as the comparability of those paths.
+
+**Refresh.** Geometry is re-resolved every `REFRESH_INTERVAL` (60s) and
+republished when it changes, so a regenerated genesis does not silently
+invalidate every subsequent `offset_ms`. On a change the collector drops its
+retained history and slot watermark: those events were computed against the old
+epoch and their slot numbers belong to a different chain. A failed refresh keeps
+the current geometry. Already-loaded browser tabs keep the `ms_per_slot` /
+`intervals_per_slot` they fetched from `/api/meta` plus their own client-side
+watermark, so **reload the page after a genesis change**; server-computed
+`offset_ms` values are correct immediately.
+
 ### Slot plausibility bound
 
 Once slot geometry is known, the collector drops any event whose `slot` is more
@@ -230,14 +248,39 @@ Single dark/light-adaptive page, no framework, no build step. Fetches
 that live-adjusts the rolling `window_slots` for **both** panels (clamped
 `1..500`). Client-side only; no collector restart.
 
-**Top — rolling beeswarm** (canvas): x-axis `0 … ms_per_slot`, gridlines at every
-`ms_per_slot / intervals_per_slot`. One horizontal lane per node. Each incoming
+**Top — rolling beeswarm** (canvas): one horizontal lane per node. Each incoming
 `chain` event for topic `block`/`attestation`/`aggregate` is a dot at
-`x = clamp(offset_ms, 0, ms_per_slot)`, small vertical jitter within its lane,
-colored by topic: block `#4f8cff`, attestation `#37b24d`, aggregate `#f59f00`.
-Keep only events from the last `window_slots` slots; older dots fade then drop.
-Cap points per node (e.g. 2000) with oldest-first decimation so an attestation
-flood can't wedge rendering. Legend + a note that older slots fade.
+`x = xForOffset(clamp(offset_ms, 0, 2 * ms_per_slot))`, small vertical jitter
+within its lane, colored by topic: block `#4f8cff`, attestation `#37b24d`,
+aggregate `#f59f00`. Keep only events from the last `window_slots` slots; older
+dots fade then drop. Cap points per node (e.g. 2000) with oldest-first
+decimation so an attestation flood can't wedge rendering. Legend + a note that
+older slots fade.
+
+The x-axis spans **two slots at two scales**. The first slot occupies the bulk
+of the width at full resolution with gridlines every
+`ms_per_slot / intervals_per_slot`; the second is compressed into a tinted
+overflow band whose width is `OVERFLOW_INTERVAL_FRACTION` (0.5) of one
+first-slot interval, i.e. the first slot keeps `1 / (1 + 0.5/intervals)` of the
+plot width (90.9% at 5 intervals). Solve
+`total = main + main * FRACTION / intervals` for the split:
+
+```
+offset_ms <= ms_per_slot :  x = LEFT + (offset_ms / ms_per_slot) * main
+offset_ms >  ms_per_slot :  x = LEFT + main
+                              + (min(offset_ms - ms_per_slot, ms_per_slot) / ms_per_slot) * overflow
+```
+
+An arrival that spills past its slot boundary is the failure mode worth seeing,
+so it gets a real position rather than piling up against a clamp, without
+costing resolution where every healthy event lands. Beyond two slots it
+saturates at the right edge. The slot boundary is drawn in the overflow accent
+(`--prop-over`) over the gridlines, and only the far end of the band is labelled
+(`+ms_per_slot`).
+
+The propagation panel keeps its single fixed `0 … ms_per_slot` scale: it already
+distinguishes over-one-slot deltas by color (`--prop-over`), so it needs no
+second region.
 
 **Bottom — propagation delta** (canvas beeswarm): a topic toggle
 (`block` default / `aggregate`). Group events of that topic by `id`;

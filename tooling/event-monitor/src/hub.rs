@@ -23,18 +23,24 @@ const HISTORY_MAX_EVENTS: usize = 50_000;
 
 /// One message on the hub: either a normalized chain event (`event: chain`)
 /// or a node status update (`event: status`) per CONTRACT.md §4.
+///
+/// Chain events are `Arc`-wrapped because every one is fanned out to each
+/// `/stream` subscriber *and* retained in the history ring; sharing one
+/// allocation keeps that from being a deep copy per destination.
 #[derive(Debug, Clone)]
 pub enum HubMessage {
-    Chain(NormalizedEvent),
+    Chain(Arc<NormalizedEvent>),
     Status(NodeStatus),
 }
 
 /// Point-in-time backfill payload served by `GET /api/history`: the retained
 /// recent chain events plus the latest status per node (CONTRACT.md §4). Its
 /// field names match that endpoint's JSON exactly, so it is serialized directly.
+/// `Arc` is transparent to serde (the `rc` feature), so the wire shape is
+/// identical to a `/stream` `chain` event as the contract requires.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HistorySnapshot {
-    pub events: Vec<NormalizedEvent>,
+    pub events: Vec<Arc<NormalizedEvent>>,
     pub status: Vec<NodeStatus>,
 }
 
@@ -42,7 +48,7 @@ pub struct HistorySnapshot {
 /// (relative to the newest slot seen) and hard-capped at
 /// [`HISTORY_MAX_EVENTS`], plus the latest status per node.
 struct History {
-    events: VecDeque<NormalizedEvent>,
+    events: VecDeque<Arc<NormalizedEvent>>,
     status: BTreeMap<String, NodeStatus>,
     max_slot: u64,
     retain_slots: u64,
@@ -58,7 +64,7 @@ impl History {
         }
     }
 
-    fn push_event(&mut self, event: NormalizedEvent) {
+    fn push_event(&mut self, event: Arc<NormalizedEvent>) {
         self.max_slot = self.max_slot.max(event.slot);
         self.events.push_back(event);
         self.prune();
@@ -66,6 +72,13 @@ impl History {
 
     fn record_status(&mut self, status: NodeStatus) {
         self.status.insert(status.node.clone(), status);
+    }
+
+    /// Drops every retained event and the slot watermark, keeping per-node
+    /// status (a connection's state survives a geometry change).
+    fn reset(&mut self) {
+        self.events.clear();
+        self.max_slot = 0;
     }
 
     /// Drops events older than `retain_slots` relative to the newest slot
@@ -85,9 +98,12 @@ impl History {
         }
     }
 
+    /// Cheap because the events are `Arc`s: this copies pointers, not the
+    /// events themselves, which matters because the caller holds the mutex
+    /// across it while every collector is trying to publish.
     fn snapshot(&self) -> HistorySnapshot {
         HistorySnapshot {
-            events: self.events.iter().cloned().collect(),
+            events: self.events.iter().map(Arc::clone).collect(),
             status: self.status.values().cloned().collect(),
         }
     }
@@ -118,8 +134,9 @@ impl Hub {
     /// frontend de-dups the small overlap). Ignores the "no subscribers"
     /// send error: normal when no browser is connected yet.
     pub fn publish_chain(&self, event: NormalizedEvent) {
+        let event = Arc::new(event);
         if let Ok(mut history) = self.history.lock() {
-            history.push_event(event.clone());
+            history.push_event(Arc::clone(&event));
         }
         let _ = self.tx.send(HubMessage::Chain(event));
     }
@@ -145,6 +162,16 @@ impl Hub {
             .lock()
             .map(|history| history.snapshot())
             .unwrap_or_default()
+    }
+
+    /// Drops retained events and the slot watermark. Called when slot geometry
+    /// changes, since events carrying the old epoch's `offset_ms` and the old
+    /// chain's slot numbers are not comparable with what follows
+    /// ([`crate::timing::run_refresher`]).
+    pub fn reset_history(&self) {
+        if let Ok(mut history) = self.history.lock() {
+            history.reset();
+        }
     }
 }
 
@@ -216,6 +243,33 @@ mod tests {
         // Only the latest status per node is retained.
         assert_eq!(snap.status.len(), 1);
         assert_eq!(snap.status[0].state, NodeState::Connected);
+    }
+
+    #[test]
+    fn reset_history_drops_events_and_the_slot_watermark_but_keeps_status() {
+        let hub = Hub::new(5);
+        hub.publish_status(NodeStatus {
+            node: "node-0".to_string(),
+            state: NodeState::Connected,
+            events_per_sec: 3.0,
+        });
+        for slot in 1_000..1_010 {
+            hub.publish_chain(chain_event("node-0", slot));
+        }
+        hub.reset_history();
+
+        let snap = hub.history_snapshot();
+        assert!(snap.events.is_empty());
+        // Status survives: a connection's state is unaffected by geometry.
+        assert_eq!(snap.status.len(), 1);
+
+        // The watermark reset is the point: a chain restarted at low slots must
+        // not be pruned as "older than the retain window" by the old high mark.
+        hub.publish_chain(chain_event("node-0", 1));
+        hub.publish_chain(chain_event("node-0", 2));
+        let snap = hub.history_snapshot();
+        assert_eq!(snap.events.len(), 2);
+        assert_eq!(snap.events[0].slot, 1);
     }
 
     #[test]
