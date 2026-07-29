@@ -23,4 +23,4 @@
 
 - [ ] Ran `make fmt` — clean
 - [ ] Ran `make lint` (clippy with `-D warnings`) — clean
-- [ ] Ran `cargo test --workspace --release` — all passing
+- [ ] Ran `make test` (`cargo test --workspace --profile release-fast`) — all passing
