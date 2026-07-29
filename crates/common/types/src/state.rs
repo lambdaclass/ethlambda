@@ -6,7 +6,6 @@ use crate::{
     block::{Block, BlockBody, BlockHeader},
     checkpoint::Checkpoint,
     primitives::{self, H256},
-    signature::{SignatureParseError, ValidatorPublicKey},
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
@@ -83,16 +82,6 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(&hex::encode(pubkey))
-}
-
-impl Validator {
-    pub fn get_attestation_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
-        ValidatorPublicKey::from_bytes(&self.attestation_pubkey)
-    }
-
-    pub fn get_proposal_pubkey(&self) -> Result<ValidatorPublicKey, SignatureParseError> {
-        ValidatorPublicKey::from_bytes(&self.proposal_pubkey)
-    }
 }
 
 pub type ValidatorPubkeyBytes = [u8; 52];
