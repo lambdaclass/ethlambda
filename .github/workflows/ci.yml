@@ -48,15 +48,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # tooling/ is outside the root workspace, so the steps above never touch
-      # it. Its tests run here rather than in the `test` job because clippy has
-      # already compiled the test targets, and because they need none of that
-      # job's leanSpec fixtures.
+      # tooling/event-monitor declares its own [workspace] table, so every step
+      # above stops at the root workspace members and never reaches it. Its
+      # tests run in this job rather than in `test` because clippy has already
+      # compiled the test targets, and because they need none of that job's
+      # leanSpec fixtures.
       - name: Lint tooling
-        run: make tooling-lint
+        working-directory: tooling/event-monitor
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
 
       - name: Test tooling
-        run: make tooling-test
+        working-directory: tooling/event-monitor
+        run: cargo test
 
   test:
     name: Test
