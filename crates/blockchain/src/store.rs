@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -11,7 +12,6 @@ use ethlambda_types::{
     block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
     state::{HISTORICAL_ROOTS_LIMIT, State},
 };
 use tracing::{info, trace, warn};
@@ -418,9 +418,10 @@ pub fn on_gossip_attestation(
     if validator_id >= target_state.validators.len() as u64 {
         return Err(StoreError::InvalidValidatorIndex);
     }
-    let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_attestation_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+    let validator_pubkey = ValidatorPublicKey::from_bytes(
+        &target_state.validators[validator_id as usize].attestation_pubkey,
+    )
+    .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
     // Verify the validator's XMSS signature
     let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
@@ -513,8 +514,7 @@ fn on_gossip_aggregated_attestation_core(
     let pubkeys: Vec<_> = participant_indices
         .iter()
         .map(|&vid| {
-            validators[vid as usize]
-                .get_attestation_pubkey()
+            ValidatorPublicKey::from_bytes(&validators[vid as usize].attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
         })
         .collect::<Result<_, _>>()?;
@@ -1142,8 +1142,7 @@ pub fn verify_block_signatures(
             let validator = validators
                 .get(vid as usize)
                 .ok_or(StoreError::InvalidValidatorIndex)?;
-            let pk = validator
-                .get_attestation_pubkey()
+            let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pk);
         }
@@ -1156,8 +1155,7 @@ pub fn verify_block_signatures(
     let proposer_validator = validators
         .get(block.proposer_index as usize)
         .ok_or(StoreError::InvalidValidatorIndex)?;
-    let proposer_pubkey = proposer_validator
-        .get_proposal_pubkey()
+    let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     pubkeys_per_component.push(vec![proposer_pubkey]);
     let block_slot_u32 =

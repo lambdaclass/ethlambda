@@ -2169,6 +2169,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-crypto",
  "ethlambda-types",
  "leansig",
  "libssz",
@@ -2201,7 +2202,6 @@ dependencies = [
  "datatest-stable 0.3.3",
  "ethlambda-test-fixtures",
  "hex",
- "leansig",
  "libssz",
  "libssz-derive",
  "libssz-merkle",

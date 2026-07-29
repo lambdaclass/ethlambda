@@ -36,6 +36,7 @@ use cli::CliOptions;
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
@@ -44,7 +45,6 @@ use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
     genesis::GenesisConfig,
-    signature::ValidatorSecretKey,
     state::{State, ValidatorPubkeyBytes},
 };
 use eyre::WrapErr;

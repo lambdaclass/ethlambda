@@ -1,10 +1,8 @@
 use std::sync::Once;
 
-use ethlambda_types::{
-    block::ByteList512KiB,
-    primitives::H256,
-    signature::{ValidatorPublicKey, ValidatorSignature},
-};
+use ethlambda_types::{block::ByteList512KiB, primitives::H256};
+
+use crate::signature::{ValidatorPublicKey, ValidatorSignature};
 use lean_multisig::{
     MultiMessageAggregateSignature as LMType2, ProofError,
     SingleMessageAggregateSignature as LMType1, aggregate_single_message_signatures,
@@ -13,6 +11,8 @@ use lean_multisig::{
 };
 use leansig_wrapper::{XmssPublicKey as LeanSigPubKey, XmssSignature as LeanSigSignature};
 use thiserror::Error;
+
+pub mod signature;
 
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
@@ -508,7 +508,7 @@ pub fn split_type_2_by_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_types::signature::LeanSignatureScheme;
+    use crate::signature::LeanSignatureScheme;
     use leansig::{serialization::Serializable, signature::SignatureScheme};
     use rand::{SeedableRng, rngs::StdRng};
 

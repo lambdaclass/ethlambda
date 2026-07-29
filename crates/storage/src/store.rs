@@ -7,6 +7,7 @@ use lru::LruCache;
 use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::error::Error;
 
+use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
@@ -14,7 +15,6 @@ use ethlambda_types::{
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::ValidatorSignature,
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
@@ -2695,7 +2695,7 @@ mod tests {
     // ============ GossipSignatureBuffer Tests ============
 
     fn make_dummy_sig() -> ValidatorSignature {
-        use ethlambda_types::signature::LeanSignatureScheme;
+        use ethlambda_crypto::signature::LeanSignatureScheme;
         use leansig::{serialization::Serializable, signature::SignatureScheme};
         use rand::{SeedableRng, rngs::StdRng};
 

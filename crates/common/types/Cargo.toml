@@ -14,8 +14,6 @@ thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 
-leansig.workspace = true
-
 libssz.workspace = true
 libssz-derive.workspace = true
 libssz-merkle.workspace = true
