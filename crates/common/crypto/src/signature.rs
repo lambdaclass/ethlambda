@@ -16,14 +16,16 @@ use xmss::{
 // parameters fails to compile here instead of silently corrupting the wire
 // format (every `XmssSignature` / `ValidatorPubkeyBytes` in `ethlambda-types` is
 // sized by these constants).
-const _: () = assert!(
-    SIGNATURE_SIZE == SIGNATURE_SSZ_LEN,
-    "ethlambda_types::attestation::SIGNATURE_SIZE no longer matches xmss::SIGNATURE_SSZ_LEN",
-);
-const _: () = assert!(
-    PUBLIC_KEY_SIZE == PUB_KEY_SSZ_LEN,
-    "ethlambda_types::state::PUBLIC_KEY_SIZE no longer matches xmss::PUB_KEY_SSZ_LEN",
-);
+//
+// Written as an array-length mismatch rather than `assert!` so that rustc prints
+// both evaluated sizes; a const panic message has to be a string literal and so
+// cannot name the numbers that actually differ.
+//
+// When one of these fires, correct the constant in `ethlambda-types` to the size
+// rustc reports. Do not take rustc's `help:` suggestion to edit the length on
+// these lines, which only silences the check.
+const _: [(); SIGNATURE_SIZE] = [(); SIGNATURE_SSZ_LEN];
+const _: [(); PUBLIC_KEY_SIZE] = [(); PUB_KEY_SSZ_LEN];
 
 /// The public key type from leanVM's xmss crate.
 pub type LeanSigPublicKey = XmssPublicKey;
