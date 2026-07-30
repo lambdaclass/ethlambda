@@ -48,6 +48,14 @@ pub enum Error {
         index: usize,
         validator_count: usize,
     },
+    #[error(
+        "justified slot {slot} is outside the tracked range (finalized_boundary={finalized_slot}, tracked_length={tracked_length})"
+    )]
+    JustifiedSlotOutOfRange {
+        slot: u64,
+        finalized_slot: u64,
+        tracked_length: usize,
+    },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -309,7 +317,7 @@ fn process_attestations(
         let source = attestation_data.source;
         let target = attestation_data.target;
 
-        if !is_valid_vote(state, attestation_data) {
+        if !is_valid_vote(state, attestation_data)? {
             continue;
         }
 
@@ -392,7 +400,15 @@ fn process_attestations(
 ///    rejects zero-hash source or target roots)
 /// 4. Target slot > source slot
 /// 5. Target slot is justifiable after the finalized slot
-fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
+///
+/// A failed check drops the vote and leaves the block valid, matching the
+/// spec's `continue` semantics. The exception is a source or target slot past
+/// the tracked justification window: that has no justification status to read
+/// at all, so it invalidates the whole block via `JustifiedSlotOutOfRange`
+/// (leanSpec #1023). After `process_block_header` the window covers up to
+/// `block.slot - 1`, so this is exactly a vote whose source or target slot is
+/// at or beyond the importing block's own slot.
+fn is_valid_vote(state: &State, data: &AttestationData) -> Result<bool, Error> {
     let source = data.source;
     let target = data.target;
 
@@ -401,9 +417,8 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         &state.justified_slots,
         state.latest_finalized.slot,
         source.slot,
-    ) {
-        // TODO: why doesn't this make the block invalid?
-        return false;
+    )? {
+        return Ok(false);
     }
 
     // Ignore votes for targets that have already reached consensus
@@ -411,27 +426,27 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         &state.justified_slots,
         state.latest_finalized.slot,
         target.slot,
-    ) {
-        return false;
+    )? {
+        return Ok(false);
     }
 
     // Ensure the vote refers to blocks that actually exist on our chain;
     // also rejects zero-hash source or target inline.
     if !attestation_data_matches_chain(&state.historical_block_hashes, data) {
-        return false;
+        return Ok(false);
     }
 
     // Ensure time flows forward
     if target.slot <= source.slot {
-        return false;
+        return Ok(false);
     }
 
     // Ensure the target falls on a slot that can be justified after the finalized one.
     if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
-        return false;
+        return Ok(false);
     }
 
-    true
+    Ok(true)
 }
 
 /// Attempt to advance finalization from source to target.
