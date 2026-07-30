@@ -21,25 +21,30 @@ pub mod shadow_cost;
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
-/// leanVM allows one proof at a time per process; a second one panics.
-static PROVER_PERMIT: Mutex<()> = Mutex::new(());
-
+/// Claims the right to prove, initializing the backend on first use.
+///
+/// Setup and the permit are handed out together because every prover entry point needs
+/// both: leanVM allows one proof at a time per process, and a second concurrent one panics.
+/// Proving is legal only while the returned guard is alive.
+///
+/// Setup deliberately skips leanVM's `setup_prover`, which engages a bump arena that never
+/// returns pages to the OS: `free` is a no-op and a phase reset only rewinds the per-thread
+/// bump pointers, so a node's RSS ratchets to its high-water mark and stays there.
+/// `setup_prover_without_arena` runs the same prover on the system allocator: slower,
+/// bounded, identical proofs.
+///
 /// The permit guards no data, so a poisoned lock is recovered rather than propagated:
 /// one panicking prover must not brick every later proof. It is still an incident.
-fn prover_permit() -> MutexGuard<'static, ()> {
-    PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
+fn acquire_prover() -> MutexGuard<'static, ()> {
+    static PROVER_PERMIT: Mutex<()> = Mutex::new(());
+    let permit = PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
         error!("a previous proving job panicked while holding the permit; continuing");
         poisoned.into_inner()
-    })
-}
-
-/// Initializes the proving backend on the system allocator.
-///
-/// leanVM's `setup_prover` enables a bump arena that never releases pages, so every
-/// node's RSS climbs to the arena cap regardless of how much proving it does. We trade
-/// the arena's throughput for bounded memory: proving is slower, results are identical.
-pub fn ensure_prover_ready() {
+    });
+    // Idempotent, and cheap after the first call. Held under the permit so the one-time
+    // bytecode compile runs serialized rather than racing every waiting caller into it.
     setup_prover_without_arena();
+    permit
 }
 
 /// Needed before any decode, not just before verifying.
@@ -199,8 +204,7 @@ pub fn aggregate_signatures(
         return Ok(dummy);
     }
 
-    ensure_prover_ready();
-    let _permit = prover_permit();
+    let _permit = acquire_prover();
 
     let raw_xmss: Vec<(LeanSigPublicKey, LeanSigSignature)> = public_keys
         .into_iter()
@@ -255,8 +259,7 @@ pub fn aggregate_mixed(
         return Ok(dummy);
     }
 
-    ensure_prover_ready();
-    let _permit = prover_permit();
+    let _permit = acquire_prover();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
@@ -310,8 +313,7 @@ pub fn aggregate_proofs(
         return Ok(dummy);
     }
 
-    ensure_prover_ready();
-    let _permit = prover_permit();
+    let _permit = acquire_prover();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
@@ -406,8 +408,7 @@ pub fn merge_type_1s_into_type_2(
         return Ok(dummy);
     }
 
-    ensure_prover_ready();
-    let _permit = prover_permit();
+    let _permit = acquire_prover();
 
     let type_1s_native: Vec<LMType1> = type_1s
         .into_iter()
@@ -501,8 +502,7 @@ pub fn split_type_2_by_message(
         ));
     }
 
-    ensure_prover_ready();
-    let _permit = prover_permit();
+    let _permit = acquire_prover();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
@@ -570,8 +570,11 @@ mod tests {
         // Should not panic when called multiple times. The first call compiles
         // the self-referential aggregation bytecode; subsequent calls are cheap
         // (`OnceLock::get_or_init`).
-        ensure_prover_ready();
-        ensure_prover_ready();
+        //
+        // The permit is dropped between acquisitions: it is not reentrant, so holding
+        // both at once would deadlock. That also covers release-on-drop.
+        drop(acquire_prover());
+        drop(acquire_prover());
         ensure_verifier_ready();
         ensure_verifier_ready();
     }
