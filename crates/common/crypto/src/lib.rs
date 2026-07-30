@@ -5,11 +5,11 @@ use crate::signature::{
 };
 use lean_multisig::{
     MultiMessageAggregateSignature as LMType2, SingleMessageAggregateSignature as LMType1,
-    aggregate_single_message_signatures, merge_single_message_aggregates,
+    aggregate_single_message_signatures, merge_single_message_aggregates, setup_prover,
     setup_prover_without_arena, setup_verifier, split_multi_message_aggregate,
     verify_multi_message_aggregate, verify_single_message_aggregate,
 };
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use thiserror::Error;
 use tracing::error;
 
@@ -21,26 +21,27 @@ pub mod shadow_cost;
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
+/// Whether to prove on leanVM's arena. Latched by the first [`acquire_prover`].
+static USE_ARENA: OnceLock<bool> = OnceLock::new();
+
+/// Opts the prover into leanVM's bump arena: faster proving, unbounded RSS.
+///
+/// The arena never returns pages to the OS, so a node's memory ratchets to its
+/// allocation high-water mark and stays there. Off by default; worth it only where
+/// memory is plentiful and proving latency matters.
+///
+/// Must be called before the first prove. Returns `false` if the choice was already
+/// latched, meaning the call had no effect.
+#[must_use = "the arena is not enabled if the choice was already latched"]
+pub fn enable_prover_arena() -> bool {
+    USE_ARENA.set(true).is_ok()
+}
+
 /// Claims the right to prove, initializing the backend on first use.
 ///
 /// Setup and the permit are handed out together because every prover entry point needs
 /// both: leanVM allows one proof at a time per process, and a second concurrent one panics.
 /// Proving is legal only while the returned guard is alive.
-///
-/// Take it as late as the setup allows. Callers that only reshape their inputs claim it
-/// right before the prove call, since conversion touches no prover state. Callers that
-/// decode a stored proof claim it up front instead: decoding needs the aggregation
-/// bytecode that setup installs, and a Type-2 decode without it returns `None`, which
-/// surfaces as a bogus `DeserializationFailed`.
-///
-/// Setup deliberately skips leanVM's `setup_prover`, which engages a bump arena that never
-/// returns pages to the OS: `free` is a no-op and a phase reset only rewinds the per-thread
-/// bump pointers, so a node's RSS ratchets to its high-water mark and stays there.
-/// `setup_prover_without_arena` runs the same prover on the system allocator: slower,
-/// bounded, identical proofs.
-///
-/// The permit guards no data, so a poisoned lock is recovered rather than propagated:
-/// one panicking prover must not brick every later proof. It is still an incident.
 fn acquire_prover() -> MutexGuard<'static, ()> {
     static PROVER_PERMIT: Mutex<()> = Mutex::new(());
     let permit = PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
@@ -48,7 +49,12 @@ fn acquire_prover() -> MutexGuard<'static, ()> {
         poisoned.into_inner()
     });
     // Idempotent, and cheap after the first call (each step is `Once`/`OnceLock` guarded).
-    setup_prover_without_arena();
+    // This also latches the allocator choice: `enable_prover_arena` is a no-op afterwards.
+    if *USE_ARENA.get_or_init(|| false) {
+        setup_prover();
+    } else {
+        setup_prover_without_arena();
+    }
     permit
 }
 
