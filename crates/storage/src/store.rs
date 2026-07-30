@@ -521,15 +521,6 @@ fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
     result
 }
 
-/// The bare slot prefix of a slot||root key, for use as a range bound.
-///
-/// Keys for smaller slots sort before it, and keys for `slot` itself sort after
-/// it (they extend it with a root), so it is both the inclusive start bound of
-/// `slot` and the exclusive end bound of "every slot below `slot`".
-fn slot_root_key_bound(slot: u64) -> [u8; 8] {
-    slot.to_be_bytes()
-}
-
 /// Decode a slot||root key (LiveChain / BlockSignatures) from bytes.
 fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
@@ -1102,16 +1093,17 @@ impl Store {
             return Ok(0);
         }
 
-        // Keys are slot||root in big-endian slot order, so every key below the
-        // cutoff sorts before the cutoff's bare slot bound: a single range
-        // delete drops them all without reading the table (and without walking
-        // the tombstones left by earlier prunes).
+        // Keys are slot||root in big-endian slot order, so the cutoff's bare
+        // slot prefix is an exact upper bound: keys below the cutoff sort
+        // before it, and keys at the cutoff sort after it (they extend it with
+        // a root). A single range delete drops them all without reading the
+        // table (and without walking the tombstones left by earlier prunes).
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
             .delete_range(
                 Table::BlockSignatures,
-                &slot_root_key_bound(0),
-                &slot_root_key_bound(cutoff),
+                &0u64.to_be_bytes(),
+                &cutoff.to_be_bytes(),
             )
             .expect("delete finalized block signatures");
         batch.commit().expect("commit");
