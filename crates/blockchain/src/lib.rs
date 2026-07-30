@@ -15,8 +15,8 @@ use ethlambda_types::{
 
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, PRIOR_WORKER_JOIN_TIMEOUT,
-    run_aggregation_worker,
+    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
+    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -460,9 +460,14 @@ impl BlockChainServer {
 
     /// Kick off a committee-signature aggregation session:
     /// 1. If a prior session is still running (pathological), warn and join it.
-    /// 2. Snapshot the aggregation inputs from the store.
+    /// 2. Snapshot the aggregation inputs from the store, capped at a single job
+    ///    when we propose next slot.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
     /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
+    ///
+    /// Both entry points land here — the interval-2 tick and the early
+    /// 2/3-threshold trigger — so the proposer cap applies to whichever one
+    /// starts the slot's session.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
         if let Some(prior) = self.current_aggregation.take() {
             prior.cancel.cancel();
@@ -485,7 +490,19 @@ impl BlockChainServer {
 
         coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot) else {
+        // Limit ourselves to a single round of aggregation if we propose next round.
+        // This buys us time to build the block before the next slot's interval-0 tick.
+        let next_proposer = self
+            .get_our_proposer(slot + 1)
+            .filter(|_| self.sync_status.duties_allowed());
+        let max_jobs = if next_proposer.is_some() {
+            1
+        } else {
+            MAX_AGGREGATION_JOBS
+        };
+
+        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
         };
