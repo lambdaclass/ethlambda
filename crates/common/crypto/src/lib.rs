@@ -1,3 +1,14 @@
+//! XMSS signature aggregation and verification, wrapping leanVM.
+//!
+//! [`init_leanvm`] must be called once at startup, before anything else here: it compiles
+//! the aggregation bytecode and fixes the prover's allocator. Proving panics without it,
+//! and decoding a stored proof misreports as a corrupt proof. Binaries call it straight
+//! after argument parsing; tests that touch a proof call it themselves.
+//!
+//! Everything else assumes it has run. Aggregation produces Type-1 proofs (one message,
+//! one slot) and Type-2 proofs (several messages merged); both travel without their
+//! participant pubkeys, which a receiver rebuilds from its own validator registry.
+
 use ethlambda_types::{block::ByteList512KiB, primitives::H256};
 
 use crate::signature::{
@@ -9,7 +20,7 @@ use lean_multisig::{
     setup_prover_without_arena, setup_verifier, split_multi_message_aggregate,
     verify_multi_message_aggregate, verify_single_message_aggregate,
 };
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use tracing::error;
 
@@ -21,46 +32,41 @@ pub mod shadow_cost;
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
-/// Whether to prove on leanVM's arena. Latched by the first [`acquire_prover`].
-static USE_ARENA: OnceLock<bool> = OnceLock::new();
-
-/// Opts the prover into leanVM's bump arena: faster proving, unbounded RSS.
+/// Initializes the leanVM backend. Call once at startup, before any other function here.
 ///
-/// The arena never returns pages to the OS, so a node's memory ratchets to its
-/// allocation high-water mark and stays there. Off by default; worth it only where
-/// memory is plentiful and proving latency matters.
+/// Everything downstream assumes this has run: proving panics without the aggregation
+/// bytecode, and decoding a stored proof needs it too (a Type-2 decode rebuilds the
+/// bytecode claim and returns `None` without it, which surfaces as a bogus
+/// `DeserializationFailed`). Doing it up front keeps the cost off the first duty.
 ///
-/// Must be called before the first prove. Returns `false` if the choice was already
-/// latched, meaning the call had no effect.
-#[must_use = "the arena is not enabled if the choice was already latched"]
-pub fn enable_prover_arena() -> bool {
-    USE_ARENA.set(true).is_ok()
-}
-
-/// Claims the right to prove, initializing the backend on first use.
+/// `use_arena` picks the prover's allocator. leanVM's arena is faster but never returns
+/// pages to the OS, so a node's RSS ratchets to its allocation high-water mark and stays
+/// there; the system allocator trades throughput for bounded memory.
 ///
-/// Setup and the permit are handed out together because every prover entry point needs
-/// both: leanVM allows one proof at a time per process, and a second concurrent one panics.
-/// Proving is legal only while the returned guard is alive.
-fn acquire_prover() -> MutexGuard<'static, ()> {
-    static PROVER_PERMIT: Mutex<()> = Mutex::new(());
-    let permit = PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
-        error!("a previous proving job panicked while holding the permit; continuing");
-        poisoned.into_inner()
-    });
-    // Idempotent, and cheap after the first call (each step is `Once`/`OnceLock` guarded).
-    // This also latches the allocator choice: `enable_prover_arena` is a no-op afterwards.
-    if *USE_ARENA.get_or_init(|| false) {
+/// Idempotent: every step is `Once`/`OnceLock` guarded.
+pub fn init_leanvm(use_arena: bool) {
+    if use_arena {
         setup_prover();
     } else {
         setup_prover_without_arena();
     }
-    permit
+    setup_verifier();
 }
 
-/// Needed before any decode, not just before verifying.
-pub fn ensure_verifier_ready() {
-    setup_verifier();
+/// Claims the exclusive right to prove.
+///
+/// leanVM allows one proof at a time per process; a second concurrent one panics.
+/// Proving is legal only while the returned guard is alive, so take it immediately
+/// before the prove call: decoding and argument conversion need no permit.
+///
+/// The permit guards no data, so a poisoned lock is recovered rather than propagated:
+/// one panicking prover must not brick every later proof. It is still an incident.
+fn acquire_prover() -> MutexGuard<'static, ()> {
+    static PROVER_PERMIT: Mutex<()> = Mutex::new(());
+    PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
+        error!("a previous proving job panicked while holding the permit; continuing");
+        poisoned.into_inner()
+    })
 }
 
 /// Error type for signature aggregation operations.
@@ -270,10 +276,6 @@ pub fn aggregate_mixed(
         return Ok(dummy);
     }
 
-    // Held from here rather than from the aggregate call: decoding the children needs
-    // the aggregation bytecode that `acquire_prover` installs.
-    let _permit = acquire_prover();
-
     let children_native: Vec<LMType1> = children
         .into_iter()
         .enumerate()
@@ -285,6 +287,8 @@ pub fn aggregate_mixed(
         .zip(raw_signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
+
+    let _permit = acquire_prover();
 
     let proof = aggregate_single_message_signatures(
         &children_native,
@@ -326,15 +330,13 @@ pub fn aggregate_proofs(
         return Ok(dummy);
     }
 
-    // Held from here rather than from the aggregate call: decoding the children needs
-    // the aggregation bytecode that `acquire_prover` installs.
-    let _permit = acquire_prover();
-
     let children_native: Vec<LMType1> = children
         .into_iter()
         .enumerate()
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
+
+    let _permit = acquire_prover();
 
     let proof = aggregate_single_message_signatures(
         &children_native,
@@ -369,7 +371,6 @@ pub fn verify_aggregated_signature(
         crate::shadow_cost::sleep(crate::shadow_cost::verify_delay(verify_n));
         return Ok(());
     }
-    ensure_verifier_ready();
 
     let lean_pubkeys = into_lean_pubkeys(public_keys);
     let sig = LMType1::from_bytes_without_pubkeys(proof_data.iter().as_slice(), lean_pubkeys)
@@ -423,15 +424,13 @@ pub fn merge_type_1s_into_type_2(
         return Ok(dummy);
     }
 
-    // Held from here rather than from the merge call: decoding the inputs needs
-    // the aggregation bytecode that `acquire_prover` installs.
-    let _permit = acquire_prover();
-
     let type_1s_native: Vec<LMType1> = type_1s
         .into_iter()
         .enumerate()
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
+
+    let _permit = acquire_prover();
 
     let merged = merge_single_message_aggregates(type_1s_native, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
@@ -461,8 +460,6 @@ pub fn verify_type_2_signature(
     if crate::shadow_cost::fake_xmss() {
         return Ok(());
     }
-
-    ensure_verifier_ready();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
@@ -519,11 +516,6 @@ pub fn split_type_2_by_message(
         ));
     }
 
-    // Held from here rather than from the split call: the Type-2 decode below rebuilds
-    // the bytecode claim, so it needs the aggregation bytecode that `acquire_prover`
-    // installs. Without it the decode returns `None` and looks like a corrupt proof.
-    let _permit = acquire_prover();
-
     let pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
         .map(into_lean_pubkeys)
@@ -543,6 +535,8 @@ pub fn split_type_2_by_message(
         [] => return Err(AggregationError::UnknownMessage),
         _ => return Err(AggregationError::MultipleMessages),
     };
+
+    let _permit = acquire_prover();
 
     let component = split_multi_message_aggregate(type_2, index, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
@@ -584,24 +578,31 @@ mod tests {
         (validator_pk, validator_sig)
     }
 
+    /// Stands in for the startup call every binary makes. Without it the prover panics
+    /// on the missing aggregation bytecode.
+    fn init() {
+        init_leanvm(false);
+    }
+
     #[test]
     #[ignore = "slow: compiles the leanVM aggregation bytecode (needs a release-sized stack)"]
     fn test_setup_is_idempotent() {
         // Should not panic when called multiple times. The first call compiles
         // the self-referential aggregation bytecode; subsequent calls are cheap
         // (`OnceLock::get_or_init`).
-        //
+        init_leanvm(false);
+        init_leanvm(false);
+
         // The permit is dropped between acquisitions: it is not reentrant, so holding
         // both at once would deadlock. That also covers release-on-drop.
         drop(acquire_prover());
         drop(acquire_prover());
-        ensure_verifier_ready();
-        ensure_verifier_ready();
     }
 
     #[test]
     #[ignore = "too slow"]
     fn test_aggregate_single_signature() {
+        init();
         let message = H256::from([42u8; 32]);
         let slot = 10u32;
         let activation_epoch = 5u32;
@@ -626,6 +627,7 @@ mod tests {
     #[test]
     #[ignore = "too slow"]
     fn test_aggregate_multiple_signatures() {
+        init();
         let message = H256::from([42u8; 32]);
         let slot = 15u32;
 
@@ -662,6 +664,7 @@ mod tests {
     #[test]
     #[ignore = "too slow"]
     fn test_verify_wrong_message_fails() {
+        init();
         let message = H256::from([42u8; 32]);
         let wrong_message = H256::from([43u8; 32]);
         let slot = 10u32;
@@ -683,6 +686,7 @@ mod tests {
     #[test]
     #[ignore = "too slow"]
     fn test_verify_wrong_slot_fails() {
+        init();
         let message = H256::from([42u8; 32]);
         let slot = 10u32;
         let wrong_slot = 11u32;
@@ -708,6 +712,7 @@ mod tests {
     #[test]
     #[ignore = "too slow"]
     fn test_verify_wrong_pubkey_set_fails() {
+        init();
         let message = H256::from([42u8; 32]);
         let slot = 10u32;
 
@@ -730,6 +735,7 @@ mod tests {
     #[test]
     #[ignore = "too slow"]
     fn test_type_2_merge_verify_split_round_trip() {
+        init();
         let msg_a = H256::from([0x11u8; 32]);
         let msg_b = H256::from([0x22u8; 32]);
         let slot_a: u32 = 7;

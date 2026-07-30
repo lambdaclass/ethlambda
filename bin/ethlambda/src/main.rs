@@ -85,14 +85,13 @@ async fn main() -> eyre::Result<()> {
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
 
-    // Before anything can prove: the allocator choice latches on the first proof.
-    if options.prover_arena {
-        if ethlambda_crypto::enable_prover_arena() {
-            info!("Proving on leanVM's arena; memory grows to the high-water mark");
-        } else {
-            warn!("--prover-arena had no effect: something proved before startup finished");
-        }
-    }
+    // Compiles the aggregation bytecode and fixes the prover's allocator. Ahead of the
+    // test-driver branch below, which verifies signatures, and of every consensus path.
+    info!(
+        arena = options.prover_arena,
+        "Initializing leanVM prover and verifier"
+    );
+    ethlambda_crypto::init_leanvm(options.prover_arena);
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();

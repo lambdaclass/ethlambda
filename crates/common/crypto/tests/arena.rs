@@ -1,12 +1,11 @@
-//! Coverage for the arena opt-in.
+//! Coverage for the arena path of [`init_leanvm`].
 //!
-//! The choice latches process-wide on the first prove, so this cannot live in the lib
-//! test binary: enabling the arena there would change the allocator under every other
-//! test, and whether the call won the latch would depend on test ordering. An
+//! leanVM's arena engages process-wide and cannot be disengaged, so this cannot live in
+//! the lib test binary: it would change the allocator under every other test. An
 //! integration test gets its own process.
 
 use ethlambda_crypto::{
-    aggregate_signatures, enable_prover_arena,
+    aggregate_signatures, init_leanvm,
     signature::{ValidatorPublicKey, ValidatorSignature},
     verify_aggregated_signature,
 };
@@ -38,14 +37,7 @@ fn keypair_and_signature(
 #[test]
 #[ignore = "too slow"]
 fn aggregates_on_the_arena_when_enabled() {
-    assert!(
-        enable_prover_arena(),
-        "nothing has proved yet, so the choice must still be open"
-    );
-    assert!(
-        !enable_prover_arena(),
-        "the choice is latched once set, so a second call reports no effect"
-    );
+    init_leanvm(true);
 
     let message = H256::from([7u8; 32]);
     let slot = 10u32;
