@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ethlambda_state_transition::state_transition;
+use ethlambda_test_fixtures::{RejectionReason, rejection::check_rejection_reason};
 use ethlambda_types::{
     block::Block,
     primitives::{H256, HashTreeRoot as _},
@@ -69,12 +70,24 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 }
             }
             (Ok(_), None) => {
-                return Err(
-                    format!("Test '{name}' failed: expected failure but got success").into(),
-                );
+                let expected = test
+                    .rejection_reason
+                    .as_ref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Test '{name}' failed: expected failure{expected} but got success"
+                )
+                .into());
             }
-            (Err(_), None) => {
-                // Expected failure
+            // Expected failure. When the fixture names why, the transition must
+            // have failed for that reason: a state-root mismatch standing in for
+            // the rule under test is a pass for the wrong reason.
+            (Err(err), None) => {
+                if let Some(expected) = test.rejection_reason.as_ref() {
+                    let actual = RejectionReason::from(&err);
+                    check_rejection_reason(&name, expected, Some(&actual), &err)?;
+                }
             }
             (Err(err), Some(_)) => {
                 return Err(format!(

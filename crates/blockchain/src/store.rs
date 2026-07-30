@@ -1058,6 +1058,9 @@ pub enum StoreError {
     #[error("Aggregated signature verification failed: {0}")]
     AggregateVerificationFailed(ethlambda_crypto::VerificationError),
 
+    #[error("Block proof verification failed: {0}")]
+    BlockProofVerificationFailed(ethlambda_crypto::VerificationError),
+
     #[error("Signature aggregation failed: {0}")]
     SignatureAggregationFailed(ethlambda_crypto::AggregationError),
 
@@ -1170,7 +1173,7 @@ pub fn verify_block_signatures(
         pubkeys_per_component,
         &expected_bindings,
     )
-    .map_err(StoreError::AggregateVerificationFailed)?;
+    .map_err(StoreError::BlockProofVerificationFailed)?;
     let crypto_elapsed = crypto_start.elapsed();
 
     let total_elapsed = total_start.elapsed();

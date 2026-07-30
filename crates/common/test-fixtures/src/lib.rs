@@ -6,7 +6,9 @@
 
 mod common;
 pub mod fork_choice;
+pub mod rejection;
 pub mod state_transition;
 pub mod verify_signatures;
 
 pub use common::*;
+pub use rejection::RejectionReason;

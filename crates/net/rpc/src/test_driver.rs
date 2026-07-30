@@ -231,7 +231,7 @@ async fn step_fork_choice(
         Ok(()) => (true, None),
         Err(err) => {
             debug!(%err, "fork-choice step rejected");
-            (false, Some(err))
+            (false, Some(err.to_string()))
         }
     };
     let snapshot = snapshot_store(&guard);
