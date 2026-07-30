@@ -5,9 +5,9 @@ use crate::signature::{
 };
 use lean_multisig::{
     MultiMessageAggregateSignature as LMType2, SingleMessageAggregateSignature as LMType1,
-    aggregate_single_message_signatures, merge_single_message_aggregates, setup_prover,
-    setup_verifier, split_multi_message_aggregate, verify_multi_message_aggregate,
-    verify_single_message_aggregate,
+    aggregate_single_message_signatures, merge_single_message_aggregates,
+    setup_prover_without_arena, setup_verifier, split_multi_message_aggregate,
+    verify_multi_message_aggregate, verify_single_message_aggregate,
 };
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
@@ -33,9 +33,13 @@ fn prover_permit() -> MutexGuard<'static, ()> {
     })
 }
 
-/// Engages leanVM's arena; skipping it stays correct but slow.
+/// Initializes the proving backend on the system allocator.
+///
+/// leanVM's `setup_prover` enables a bump arena that never releases pages, so every
+/// node's RSS climbs to the arena cap regardless of how much proving it does. We trade
+/// the arena's throughput for bounded memory: proving is slower, results are identical.
 pub fn ensure_prover_ready() {
-    setup_prover();
+    setup_prover_without_arena();
 }
 
 /// Needed before any decode, not just before verifying.

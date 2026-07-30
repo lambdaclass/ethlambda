@@ -59,8 +59,8 @@ clap = { version = "4.3", features = ["derive", "env"] }
 # leanVM's `main` internalized XMSS (dropping the external leanSig dependency)
 # and reworked the aggregation API (see "Xmss api rework").
 # Pinned to a `main` commit for reproducible builds; bump the revs to track main.
-xmss = { git = "https://github.com/leanEthereum/leanVM.git", rev = "380da82c330eac2841252a655a86ea48ec173bb6" }
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "380da82c330eac2841252a655a86ea48ec173bb6" }
+xmss = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
+lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
 
 # SSZ codec used by leanVM's xmss pubkey/signature types (ethereum_ssz, not libssz).
 ssz = { package = "ethereum_ssz", version = "0.10" }
