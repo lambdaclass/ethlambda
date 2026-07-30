@@ -27,6 +27,11 @@ const LOG_INV_RATE: usize = 2;
 /// both: leanVM allows one proof at a time per process, and a second concurrent one panics.
 /// Proving is legal only while the returned guard is alive.
 ///
+/// Call this immediately before the prove call, not at the top of the function: decoding
+/// and argument conversion need no permit, and holding it across them serializes callers
+/// for no reason. Decoding does need the aggregation bytecode, which is what
+/// [`ensure_verifier_ready`] is for.
+///
 /// Setup deliberately skips leanVM's `setup_prover`, which engages a bump arena that never
 /// returns pages to the OS: `free` is a no-op and a phase reset only rewinds the per-thread
 /// bump pointers, so a node's RSS ratchets to its high-water mark and stays there.
@@ -41,8 +46,7 @@ fn acquire_prover() -> MutexGuard<'static, ()> {
         error!("a previous proving job panicked while holding the permit; continuing");
         poisoned.into_inner()
     });
-    // Idempotent, and cheap after the first call. Held under the permit so the one-time
-    // bytecode compile runs serialized rather than racing every waiting caller into it.
+    // Idempotent, and cheap after the first call (each step is `Once`/`OnceLock` guarded).
     setup_prover_without_arena();
     permit
 }
@@ -204,13 +208,13 @@ pub fn aggregate_signatures(
         return Ok(dummy);
     }
 
-    let _permit = acquire_prover();
-
     let raw_xmss: Vec<(LeanSigPublicKey, LeanSigSignature)> = public_keys
         .into_iter()
         .zip(signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
+
+    let _permit = acquire_prover();
 
     let proof = aggregate_single_message_signatures(&[], raw_xmss, message.0, slot, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
@@ -259,7 +263,9 @@ pub fn aggregate_mixed(
         return Ok(dummy);
     }
 
-    let _permit = acquire_prover();
+    // Decoding needs the aggregation bytecode, but not the permit: no proving
+    // happens until the aggregate call below.
+    ensure_verifier_ready();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
@@ -272,6 +278,8 @@ pub fn aggregate_mixed(
         .zip(raw_signatures)
         .map(|(pk, sig)| (pk.into_inner(), sig.into_inner()))
         .collect();
+
+    let _permit = acquire_prover();
 
     let proof = aggregate_single_message_signatures(
         &children_native,
@@ -313,13 +321,17 @@ pub fn aggregate_proofs(
         return Ok(dummy);
     }
 
-    let _permit = acquire_prover();
+    // Decoding needs the aggregation bytecode, but not the permit: no proving
+    // happens until the aggregate call below.
+    ensure_verifier_ready();
 
     let children_native: Vec<LMType1> = children
         .into_iter()
         .enumerate()
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
+
+    let _permit = acquire_prover();
 
     let proof = aggregate_single_message_signatures(
         &children_native,
@@ -408,13 +420,17 @@ pub fn merge_type_1s_into_type_2(
         return Ok(dummy);
     }
 
-    let _permit = acquire_prover();
+    // Decoding needs the aggregation bytecode, but not the permit: no proving
+    // happens until the merge call below.
+    ensure_verifier_ready();
 
     let type_1s_native: Vec<LMType1> = type_1s
         .into_iter()
         .enumerate()
         .map(|(i, (pubkeys, proof_bytes))| decompress_type1(pubkeys, &proof_bytes, i))
         .collect::<Result<_, _>>()?;
+
+    let _permit = acquire_prover();
 
     let merged = merge_single_message_aggregates(type_1s_native, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
@@ -502,7 +518,10 @@ pub fn split_type_2_by_message(
         ));
     }
 
-    let _permit = acquire_prover();
+    // Type-2 decode rebuilds the bytecode claim, so it needs the aggregation bytecode:
+    // without it the decode returns `None` and looks like a corrupt proof. It does not
+    // need the permit, though; no proving happens until the split call below.
+    ensure_verifier_ready();
 
     let pubkeys_per_info: Vec<Vec<LeanSigPublicKey>> = pubkeys_per_component
         .into_iter()
@@ -523,6 +542,8 @@ pub fn split_type_2_by_message(
         [] => return Err(AggregationError::UnknownMessage),
         _ => return Err(AggregationError::MultipleMessages),
     };
+
+    let _permit = acquire_prover();
 
     let component = split_multi_message_aggregate(type_2, index, LOG_INV_RATE)
         .map_err(|err| AggregationError::ProverFailure(err.to_string()))?;
