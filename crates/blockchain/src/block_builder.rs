@@ -792,10 +792,14 @@ fn extend_proofs_greedily(
     }
 
     let mut covered: HashSet<u64> = HashSet::new();
-    let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
+    let mut remaining_indices: Vec<usize> = (0..proofs.len()).collect();
 
     while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators (count only, no allocation)
+        // Pick proof covering the most uncovered validators (count only, no
+        // allocation). Coverage ties break to the lowest index (pool insertion
+        // order): a HashSet here would let hash-iteration order pick an
+        // arbitrary equal-coverage winner, making the built block's
+        // aggregation bits differ from run to run.
         let best = remaining_indices
             .iter()
             .map(|&idx| {
@@ -805,7 +809,7 @@ fn extend_proofs_greedily(
                     .count();
                 (idx, count)
             })
-            .max_by_key(|&(_, count)| count);
+            .max_by_key(|&(idx, count)| (count, Reverse(idx)));
 
         let Some((best_idx, best_count)) = best else {
             break;
@@ -832,7 +836,7 @@ fn extend_proofs_greedily(
 
         covered.extend(new_covered);
         selected.push((att, proof.clone()));
-        remaining_indices.remove(&best_idx);
+        remaining_indices.retain(|&idx| idx != best_idx);
     }
 }
 
