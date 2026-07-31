@@ -9,143 +9,199 @@
 use serde::{Deserialize, Deserializer};
 use std::fmt;
 
-/// Declare the reason vocabulary once and derive the enum plus its wire
-/// spellings from a single table, so the mirror of leanSpec's `RejectionReason`
-/// cannot drift between the type and the strings it parses.
-macro_rules! rejection_reasons {
-    (
-        $(
-            $(#[doc = $doc:literal])*
-            $variant:ident => $wire:literal,
-        )*
-    ) => {
-        /// Language-neutral reason the spec rejects an invalid input.
-        ///
-        /// Mirrors leanSpec's `RejectionReason` StrEnum
-        /// (`src/lean_spec/spec/forks/lstar/errors.py`), which is the vocabulary
-        /// fixtures use for their `rejectionReason` field. Clients match on the
-        /// reason code, never on a human-readable message.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub enum RejectionReason {
-            $(
-                $(#[doc = $doc])*
-                $variant,
-            )*
-            /// A reason string this build does not know.
-            ///
-            /// Fixtures track leanSpec's latest release, so a new reason can
-            /// arrive before the mapping below learns it. Deserialization keeps
-            /// it verbatim (the Hive test driver must still answer such a step
-            /// rather than reject the request) and the offline runners fail on
-            /// it, naming the string to add here.
-            Unknown(String),
-        }
-
-        impl RejectionReason {
-            /// The wire spelling fixtures use for this reason.
-            pub fn as_str(&self) -> &str {
-                match self {
-                    $( Self::$variant => $wire, )*
-                    Self::Unknown(reason) => reason,
-                }
-            }
-        }
-
-        impl From<&str> for RejectionReason {
-            fn from(reason: &str) -> Self {
-                match reason {
-                    $( $wire => Self::$variant, )*
-                    other => Self::Unknown(other.to_string()),
-                }
-            }
-        }
-    };
-}
-
-rejection_reasons! {
+/// Language-neutral reason the spec rejects an invalid input.
+///
+/// Mirrors leanSpec's `RejectionReason` StrEnum
+/// (`src/lean_spec/spec/forks/lstar/errors.py`), which is the vocabulary fixtures
+/// use for their `rejectionReason` field. Clients match on the reason code, never
+/// on a human-readable message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectionReason {
     // Block validation
     /// The block slot is not strictly greater than the current state slot.
-    BlockSlotNotInFuture => "BLOCK_SLOT_NOT_IN_FUTURE",
+    BlockSlotNotInFuture,
     /// The block slot runs so far beyond its parent it would force an unbounded
     /// empty-slot walk.
-    BlockSlotGapTooLarge => "BLOCK_SLOT_GAP_TOO_LARGE",
+    BlockSlotGapTooLarge,
     /// The block slot is beyond the store's accepted future horizon.
-    BlockTooFarInFuture => "BLOCK_TOO_FAR_IN_FUTURE",
+    BlockTooFarInFuture,
     /// The block slot is not newer than the latest block header.
-    BlockOlderThanLatestHeader => "BLOCK_OLDER_THAN_LATEST_HEADER",
+    BlockOlderThanLatestHeader,
     /// The block slot disagrees with the state slot after slot processing.
-    BlockSlotMismatch => "BLOCK_SLOT_MISMATCH",
+    BlockSlotMismatch,
     /// The block parent root disagrees with the latest block header root.
-    ParentRootMismatch => "PARENT_ROOT_MISMATCH",
+    ParentRootMismatch,
     /// The block state root disagrees with the computed post-state root.
-    StateRootMismatch => "STATE_ROOT_MISMATCH",
+    StateRootMismatch,
     /// The block references a parent the store has never seen.
-    UnknownParentBlock => "UNKNOWN_PARENT_BLOCK",
+    UnknownParentBlock,
     /// The proposer index does not address any registered validator.
-    ProposerIndexOutOfRange => "PROPOSER_INDEX_OUT_OF_RANGE",
+    ProposerIndexOutOfRange,
     /// The registry holds no validators, so no proposer can be scheduled.
-    EmptyValidatorRegistry => "EMPTY_VALIDATOR_REGISTRY",
+    EmptyValidatorRegistry,
     /// The block proposer is not the scheduled proposer for its slot.
-    WrongProposer => "WRONG_PROPOSER",
+    WrongProposer,
     /// The block carries more distinct attestation data entries than allowed.
-    TooManyAttestationData => "TOO_MANY_ATTESTATION_DATA",
+    TooManyAttestationData,
     /// The block carries the same attestation data entry more than once.
-    DuplicateAttestationData => "DUPLICATE_ATTESTATION_DATA",
+    DuplicateAttestationData,
     /// An aggregated attestation references no validator at all.
-    EmptyAggregationBits => "EMPTY_AGGREGATION_BITS",
+    EmptyAggregationBits,
 
     // Attestation validation
     /// The attestation source root is not a known block.
-    UnknownSourceBlock => "UNKNOWN_SOURCE_BLOCK",
+    UnknownSourceBlock,
     /// The attestation target root is not a known block.
-    UnknownTargetBlock => "UNKNOWN_TARGET_BLOCK",
+    UnknownTargetBlock,
     /// The attestation head root is not a known block.
-    UnknownHeadBlock => "UNKNOWN_HEAD_BLOCK",
+    UnknownHeadBlock,
     /// The attestation source checkpoint slot exceeds its target slot.
-    SourceAfterTarget => "SOURCE_AFTER_TARGET",
+    SourceAfterTarget,
     /// The attestation head checkpoint is older than its target.
-    HeadOlderThanTarget => "HEAD_OLDER_THAN_TARGET",
+    HeadOlderThanTarget,
     /// The source checkpoint slot disagrees with the referenced block.
-    SourceSlotMismatch => "SOURCE_SLOT_MISMATCH",
+    SourceSlotMismatch,
     /// The target checkpoint slot disagrees with the referenced block.
-    TargetSlotMismatch => "TARGET_SLOT_MISMATCH",
+    TargetSlotMismatch,
     /// The head checkpoint slot disagrees with the referenced block.
-    HeadSlotMismatch => "HEAD_SLOT_MISMATCH",
+    HeadSlotMismatch,
     /// The attestation source checkpoint is not an ancestor of its target.
-    SourceNotAncestorOfTarget => "SOURCE_NOT_ANCESTOR_OF_TARGET",
+    SourceNotAncestorOfTarget,
     /// The attestation target checkpoint is not an ancestor of its head.
-    TargetNotAncestorOfHead => "TARGET_NOT_ANCESTOR_OF_HEAD",
+    TargetNotAncestorOfHead,
     /// The attestation head checkpoint does not descend from the finalized block.
-    HeadNotDescendantOfFinalized => "HEAD_NOT_DESCENDANT_OF_FINALIZED",
+    HeadNotDescendantOfFinalized,
     /// The attestation slot is beyond the store's acceptance horizon.
-    AttestationTooFarInFuture => "ATTESTATION_TOO_FAR_IN_FUTURE",
+    AttestationTooFarInFuture,
     /// The attestation slot precedes its head block's slot.
-    AttestationSlotBeforeHead => "ATTESTATION_SLOT_BEFORE_HEAD",
+    AttestationSlotBeforeHead,
     /// The referenced validator does not exist in the state registry.
-    ValidatorNotInState => "VALIDATOR_NOT_IN_STATE",
+    ValidatorNotInState,
     /// The validator index does not address any registered validator.
-    ValidatorIndexOutOfRange => "VALIDATOR_INDEX_OUT_OF_RANGE",
+    ValidatorIndexOutOfRange,
     /// A justification query named a slot beyond the tracked window.
-    JustifiedSlotOutOfRange => "JUSTIFIED_SLOT_OUT_OF_RANGE",
+    JustifiedSlotOutOfRange,
     /// A tracked justification root is the zero hash, which is not a valid root.
-    ZeroHashJustificationRoot => "ZERO_HASH_JUSTIFICATION_ROOT",
+    ZeroHashJustificationRoot,
     /// The flat vote list length is not the tracked-root count times the
     /// validator count.
-    JustificationVotesLengthMismatch => "JUSTIFICATION_VOTES_LENGTH_MISMATCH",
+    JustificationVotesLengthMismatch,
 
     // Cryptographic verification
     /// An attestation signature or aggregate proof fails verification.
-    InvalidSignature => "INVALID_SIGNATURE",
+    InvalidSignature,
     /// The block's multi-message aggregate proof fails verification.
-    InvalidBlockProof => "INVALID_BLOCK_PROOF",
+    InvalidBlockProof,
 
     // Anchor initialization
     /// The anchor block state root disagrees with the anchor state.
-    AnchorStateRootMismatch => "ANCHOR_STATE_ROOT_MISMATCH",
+    AnchorStateRootMismatch,
 
     // Wire decoding
     /// The input bytes cannot be decoded into the expected structure.
-    DecodeError => "DECODE_ERROR",
+    DecodeError,
+
+    /// A reason string this build does not know.
+    ///
+    /// Fixtures track leanSpec's latest release, so a new reason can arrive
+    /// before this enum learns it. Deserialization keeps it verbatim (the Hive
+    /// test driver must still answer such a step rather than reject the request)
+    /// and the offline runners fail on it, naming the string to add here.
+    Unknown(String),
+}
+
+impl RejectionReason {
+    /// The wire spelling fixtures use for this reason.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::BlockSlotNotInFuture => "BLOCK_SLOT_NOT_IN_FUTURE",
+            Self::BlockSlotGapTooLarge => "BLOCK_SLOT_GAP_TOO_LARGE",
+            Self::BlockTooFarInFuture => "BLOCK_TOO_FAR_IN_FUTURE",
+            Self::BlockOlderThanLatestHeader => "BLOCK_OLDER_THAN_LATEST_HEADER",
+            Self::BlockSlotMismatch => "BLOCK_SLOT_MISMATCH",
+            Self::ParentRootMismatch => "PARENT_ROOT_MISMATCH",
+            Self::StateRootMismatch => "STATE_ROOT_MISMATCH",
+            Self::UnknownParentBlock => "UNKNOWN_PARENT_BLOCK",
+            Self::ProposerIndexOutOfRange => "PROPOSER_INDEX_OUT_OF_RANGE",
+            Self::EmptyValidatorRegistry => "EMPTY_VALIDATOR_REGISTRY",
+            Self::WrongProposer => "WRONG_PROPOSER",
+            Self::TooManyAttestationData => "TOO_MANY_ATTESTATION_DATA",
+            Self::DuplicateAttestationData => "DUPLICATE_ATTESTATION_DATA",
+            Self::EmptyAggregationBits => "EMPTY_AGGREGATION_BITS",
+            Self::UnknownSourceBlock => "UNKNOWN_SOURCE_BLOCK",
+            Self::UnknownTargetBlock => "UNKNOWN_TARGET_BLOCK",
+            Self::UnknownHeadBlock => "UNKNOWN_HEAD_BLOCK",
+            Self::SourceAfterTarget => "SOURCE_AFTER_TARGET",
+            Self::HeadOlderThanTarget => "HEAD_OLDER_THAN_TARGET",
+            Self::SourceSlotMismatch => "SOURCE_SLOT_MISMATCH",
+            Self::TargetSlotMismatch => "TARGET_SLOT_MISMATCH",
+            Self::HeadSlotMismatch => "HEAD_SLOT_MISMATCH",
+            Self::SourceNotAncestorOfTarget => "SOURCE_NOT_ANCESTOR_OF_TARGET",
+            Self::TargetNotAncestorOfHead => "TARGET_NOT_ANCESTOR_OF_HEAD",
+            Self::HeadNotDescendantOfFinalized => "HEAD_NOT_DESCENDANT_OF_FINALIZED",
+            Self::AttestationTooFarInFuture => "ATTESTATION_TOO_FAR_IN_FUTURE",
+            Self::AttestationSlotBeforeHead => "ATTESTATION_SLOT_BEFORE_HEAD",
+            Self::ValidatorNotInState => "VALIDATOR_NOT_IN_STATE",
+            Self::ValidatorIndexOutOfRange => "VALIDATOR_INDEX_OUT_OF_RANGE",
+            Self::JustifiedSlotOutOfRange => "JUSTIFIED_SLOT_OUT_OF_RANGE",
+            Self::ZeroHashJustificationRoot => "ZERO_HASH_JUSTIFICATION_ROOT",
+            Self::JustificationVotesLengthMismatch => "JUSTIFICATION_VOTES_LENGTH_MISMATCH",
+            Self::InvalidSignature => "INVALID_SIGNATURE",
+            Self::InvalidBlockProof => "INVALID_BLOCK_PROOF",
+            Self::AnchorStateRootMismatch => "ANCHOR_STATE_ROOT_MISMATCH",
+            Self::DecodeError => "DECODE_ERROR",
+            Self::Unknown(reason) => reason,
+        }
+    }
+}
+
+/// Parse a fixture's `rejectionReason`, keeping an unrecognised one verbatim.
+///
+/// The catch-all is why a missing arm here cannot pass silently: an unmapped
+/// reason becomes [`RejectionReason::Unknown`], which every runner reports as a
+/// failure naming the string to add.
+impl From<&str> for RejectionReason {
+    fn from(reason: &str) -> Self {
+        match reason {
+            "BLOCK_SLOT_NOT_IN_FUTURE" => Self::BlockSlotNotInFuture,
+            "BLOCK_SLOT_GAP_TOO_LARGE" => Self::BlockSlotGapTooLarge,
+            "BLOCK_TOO_FAR_IN_FUTURE" => Self::BlockTooFarInFuture,
+            "BLOCK_OLDER_THAN_LATEST_HEADER" => Self::BlockOlderThanLatestHeader,
+            "BLOCK_SLOT_MISMATCH" => Self::BlockSlotMismatch,
+            "PARENT_ROOT_MISMATCH" => Self::ParentRootMismatch,
+            "STATE_ROOT_MISMATCH" => Self::StateRootMismatch,
+            "UNKNOWN_PARENT_BLOCK" => Self::UnknownParentBlock,
+            "PROPOSER_INDEX_OUT_OF_RANGE" => Self::ProposerIndexOutOfRange,
+            "EMPTY_VALIDATOR_REGISTRY" => Self::EmptyValidatorRegistry,
+            "WRONG_PROPOSER" => Self::WrongProposer,
+            "TOO_MANY_ATTESTATION_DATA" => Self::TooManyAttestationData,
+            "DUPLICATE_ATTESTATION_DATA" => Self::DuplicateAttestationData,
+            "EMPTY_AGGREGATION_BITS" => Self::EmptyAggregationBits,
+            "UNKNOWN_SOURCE_BLOCK" => Self::UnknownSourceBlock,
+            "UNKNOWN_TARGET_BLOCK" => Self::UnknownTargetBlock,
+            "UNKNOWN_HEAD_BLOCK" => Self::UnknownHeadBlock,
+            "SOURCE_AFTER_TARGET" => Self::SourceAfterTarget,
+            "HEAD_OLDER_THAN_TARGET" => Self::HeadOlderThanTarget,
+            "SOURCE_SLOT_MISMATCH" => Self::SourceSlotMismatch,
+            "TARGET_SLOT_MISMATCH" => Self::TargetSlotMismatch,
+            "HEAD_SLOT_MISMATCH" => Self::HeadSlotMismatch,
+            "SOURCE_NOT_ANCESTOR_OF_TARGET" => Self::SourceNotAncestorOfTarget,
+            "TARGET_NOT_ANCESTOR_OF_HEAD" => Self::TargetNotAncestorOfHead,
+            "HEAD_NOT_DESCENDANT_OF_FINALIZED" => Self::HeadNotDescendantOfFinalized,
+            "ATTESTATION_TOO_FAR_IN_FUTURE" => Self::AttestationTooFarInFuture,
+            "ATTESTATION_SLOT_BEFORE_HEAD" => Self::AttestationSlotBeforeHead,
+            "VALIDATOR_NOT_IN_STATE" => Self::ValidatorNotInState,
+            "VALIDATOR_INDEX_OUT_OF_RANGE" => Self::ValidatorIndexOutOfRange,
+            "JUSTIFIED_SLOT_OUT_OF_RANGE" => Self::JustifiedSlotOutOfRange,
+            "ZERO_HASH_JUSTIFICATION_ROOT" => Self::ZeroHashJustificationRoot,
+            "JUSTIFICATION_VOTES_LENGTH_MISMATCH" => Self::JustificationVotesLengthMismatch,
+            "INVALID_SIGNATURE" => Self::InvalidSignature,
+            "INVALID_BLOCK_PROOF" => Self::InvalidBlockProof,
+            "ANCHOR_STATE_ROOT_MISMATCH" => Self::AnchorStateRootMismatch,
+            "DECODE_ERROR" => Self::DecodeError,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
 }
 
 impl fmt::Display for RejectionReason {
