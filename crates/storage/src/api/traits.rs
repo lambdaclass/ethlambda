@@ -43,6 +43,15 @@ pub trait StorageWriteBatch: Send {
     /// Delete multiple keys from a table.
     fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error>;
 
+    /// Delete every key in the half-open range `[from, to)` from a table.
+    ///
+    /// Unlike [`delete_batch`](Self::delete_batch), the caller does not need to
+    /// know the keys, so the write cost need not scale with the number of
+    /// entries covered: RocksDB records a single range tombstone instead of one
+    /// delete per key. Operations within a batch apply in call order, so a later
+    /// `put_batch` for a key inside the range still wins.
+    fn delete_range(&mut self, table: Table, from: &[u8], to: &[u8]) -> Result<(), Error>;
+
     /// Commit the batch, consuming it.
     fn commit(self: Box<Self>) -> Result<(), Error>;
 }
