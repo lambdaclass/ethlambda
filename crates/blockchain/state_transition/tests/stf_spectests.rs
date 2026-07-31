@@ -13,6 +13,30 @@ use crate::types::PostState;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "state_transition_test";
 
+/// Fixtures this runner cannot replay, matched as substrings of the test name.
+///
+/// Both entries are authored against leanSpec's `BlockSpec.skip_slot_processing`,
+/// which drives the filler to call `process_block` alone. The flag never reaches
+/// the emitted fixture (`StateTransitionFixture` carries only `pre`, `blocks`,
+/// `post`, `postStateRoot` and `rejectionReason`), and the failing block is
+/// written with a zero `stateRoot`, so replaying `state_transition()` as the
+/// fixture format prescribes always advances the slot first and then dies on the
+/// state root instead of hitting the rule under test. Nothing in the JSON marks
+/// the entry point, so no client can reproduce these two: ream, zeam, gean,
+/// lantern and grandine all "pass" them on the state-root mismatch because they
+/// assert only that *some* error occurred.
+///
+/// Skip until leanSpec emits the entry point, or drops these vectors: they pin a
+/// Python-level API contract rather than cross-client behaviour.
+const SKIP_TESTS: &[&str] = &[
+    // Expects BLOCK_SLOT_MISMATCH from `process_block` on a state at slot 1 with
+    // a block claiming slot 2; `process_slots` makes the slots agree first.
+    "test_block_with_wrong_slot",
+    // Expects BLOCK_OLDER_THAN_LATEST_HEADER from a second block at the tip's
+    // slot; `process_slots` rejects the first block before the header check runs.
+    "test_block_at_parent_slot_rejected_when_slot_processing_skipped",
+];
+
 mod types;
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
@@ -24,6 +48,10 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
             )
             .into());
+        }
+        if let Some(skip) = SKIP_TESTS.iter().find(|skip| name.contains(*skip)) {
+            println!("Skipping {skip} (see SKIP_TESTS comment)");
+            continue;
         }
         println!("Running test: {}", name);
 
