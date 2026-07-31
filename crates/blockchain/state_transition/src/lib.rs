@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ethlambda_types::{
     ShortRoot,
     attestation::AttestationData,
-    block::{AggregatedAttestations, Block, BlockHeader},
+    block::{AggregatedAttestations, Block, BlockHeader, MAX_ATTESTATIONS_DATA},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{HISTORICAL_ROOTS_LIMIT, JustificationValidators, State},
@@ -56,6 +56,8 @@ pub enum Error {
         finalized_slot: u64,
         tracked_length: usize,
     },
+    #[error("block carries {count} distinct AttestationData entries; maximum is {max}")]
+    TooManyAttestationData { count: usize, max: usize },
 }
 
 /// Transition the given pre-state to the block's post-state.
@@ -250,6 +252,24 @@ fn process_attestations(
     attestations: &AggregatedAttestations,
 ) -> Result<(), Error> {
     let _timing = metrics::time_attestations_processing();
+
+    // Cap the distinct attestation data a block may carry (leanSpec #536).
+    //
+    // Each distinct data allocates a tally sized to the validator set below, so the
+    // distinct count, not the attestation count, is what drives the work here. Split
+    // aggregates over one data share their tally and count once.
+    //
+    // `on_block` re-checks this before signature verification so a crafted block is
+    // rejected cheaply, but the bound belongs to the transition: this is the only
+    // entry point block production and fixture replay share with block import.
+    let distinct_attestation_data: HashSet<&AttestationData> =
+        attestations.iter().map(|att| &att.data).collect();
+    if distinct_attestation_data.len() > MAX_ATTESTATIONS_DATA {
+        return Err(Error::TooManyAttestationData {
+            count: distinct_attestation_data.len(),
+            max: MAX_ATTESTATIONS_DATA,
+        });
+    }
 
     // Validate the justification bookkeeping before unpacking the flat vote list
     // (leanSpec #1178). A `State` decoded from untrusted bytes (e.g. checkpoint
