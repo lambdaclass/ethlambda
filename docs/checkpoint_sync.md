@@ -74,14 +74,6 @@ Beyond that window the node prefers a checkpoint when one is offered, since catc
 
 To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.
 
-Each outcome has one unambiguous boot log line:
-
-| Log line | Meaning |
-| ---------- | --------- |
-| `Resuming from existing DB state head_slot=… current_slot=… gap=…` | Resumed from disk, nothing downloaded |
-| `Starting checkpoint sync checkpoint_urls=[…]` then `Checkpoint sync complete …` | Downloaded a checkpoint |
-| `No checkpoint sync URL provided, initializing from genesis state` | Started from genesis |
-
 ## Verification Checks
 
 All checks are performed before the state is accepted:
