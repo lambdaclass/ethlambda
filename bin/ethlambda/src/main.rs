@@ -691,31 +691,15 @@ async fn fetch_initial_state(
         let head_slot = store.head_slot();
         let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
-            info!(
-                head_slot,
-                current_slot, gap, "Resuming from existing DB state"
-            );
+            info!(head_slot, current_slot, gap, "Resuming from existing DB");
             return Ok(store);
         }
-        // Stale, but with no checkpoint URL resuming is the only
-        // non-destructive option: re-initializing from genesis would discard
-        // this history, so close the gap over P2P instead. That only works
-        // while peers can still serve the range; beyond their block-signature
-        // pruning horizon the node cannot catch up and needs a checkpoint URL.
+        warn!(head_slot, current_slot, gap, "Existing DB state is stale");
         if checkpoint_urls.is_empty() {
-            warn!(
-                head_slot,
-                current_slot,
-                gap,
-                "Existing DB state is stale and no checkpoint sync URL was provided; \
-                 resuming anyway and relying on P2P sync to catch up"
-            );
+            warn!("No checkpoint sync URL provided, resuming from existing stale DB");
             return Ok(store);
         }
-        warn!(
-            head_slot,
-            current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
-        );
+        warn!("Falling through to checkpoint sync");
     }
 
     if checkpoint_urls.is_empty() {
