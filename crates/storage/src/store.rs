@@ -14,6 +14,7 @@ use ethlambda_types::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
+    genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
@@ -21,7 +22,7 @@ use libssz::{SszDecode, SszEncode};
 
 use crate::state_diff::StateDiff;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -606,33 +607,36 @@ impl Store {
 
     /// Build a Store from the state already persisted in the storage backend.
     ///
-    /// Returns `None` if the backend is empty or its persisted `genesis_time`
-    /// doesn't match `expected_genesis_time`.
+    /// Returns `None` when the backend holds no chain state yet, leaving the
+    /// caller to initialize one from genesis or a checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GenesisMismatch`] when the persisted chain was started
+    /// from a different genesis than `genesis`. This is fatal rather than a
+    /// fall back to "treat the DB as empty": writing a new anchor on top would
+    /// leave the foreign chain's rows in place, and slot-indexed reads such as
+    /// [`Self::get_signed_blocks_by_slot_range`] would then serve them to
+    /// peers.
     pub fn from_db_state(
         backend: Arc<dyn StorageBackend>,
-        expected_genesis_time: u64,
+        genesis: &GenesisConfig,
     ) -> Result<Option<Self>, Error> {
-        let persisted_config = {
+        {
+            // Both keys are written by `init_store`, so a backend missing
+            // either has never held a chain.
             let view = backend.begin_read().expect("read view");
-            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
-                return Ok(None);
-            };
-            if view
-                .get(Table::Metadata, KEY_LATEST_FINALIZED)
-                .expect("get latest finalized")
-                .is_none()
-            {
+            let has_chain = view
+                .get(Table::Metadata, KEY_CONFIG)
+                .expect("get config")
+                .is_some()
+                && view
+                    .get(Table::Metadata, KEY_LATEST_FINALIZED)
+                    .expect("get latest finalized")
+                    .is_some();
+            if !has_chain {
                 return Ok(None);
             }
-            ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
-        };
-        if persisted_config.genesis_time != expected_genesis_time {
-            warn!(
-                db_genesis_time = persisted_config.genesis_time,
-                expected_genesis_time,
-                "Persisted DB has a different genesis_time; treating as empty"
-            );
-            return Ok(None);
         }
         let store = Self {
             backend,
@@ -643,6 +647,27 @@ impl Store {
             ))),
             state_cache: new_state_cache(),
         };
+
+        // Compare against the finalized state rather than the persisted
+        // `ChainConfig`: the config carries only `genesis_time`, so it cannot
+        // catch a chain that shares our genesis time but not our validator
+        // set. Finalized is chosen over head because it is the state the
+        // anchor is rebuilt from and it never gets pruned.
+        let finalized = store.latest_finalized()?.root;
+        let state = store
+            .get_state(&finalized)?
+            .ok_or(Error::UnexpectedMissingState(finalized))?;
+        genesis.verify_state(&state).inspect_err(|err| {
+            error!(
+                %err,
+                db_genesis_time = state.config.genesis_time,
+                db_validators = state.validators.len(),
+                expected_genesis_time = genesis.genesis_time,
+                expected_validators = genesis.genesis_validators.len(),
+                "Persisted DB belongs to a different network; refusing to reuse this data directory"
+            )
+        })?;
+
         info!("Loaded store from persisted DB state");
         Ok(Some(store))
     }
@@ -1706,6 +1731,32 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+    use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
+
+    /// Validator at `index` whose two pubkeys are filled with `seed`, so
+    /// changing the seed changes the registry without changing its size.
+    fn validator(index: u64, seed: u8) -> Validator {
+        Validator {
+            attestation_pubkey: [seed; 52],
+            proposal_pubkey: [seed.wrapping_add(1); 52],
+            index,
+        }
+    }
+
+    /// Genesis config describing a chain started at `genesis_time` with
+    /// `validators`, for the `from_db_state` identity check.
+    fn genesis_config(genesis_time: u64, validators: &[Validator]) -> GenesisConfig {
+        GenesisConfig {
+            genesis_time,
+            genesis_validators: validators
+                .iter()
+                .map(|v| GenesisValidatorEntry {
+                    attestation_pubkey: v.attestation_pubkey,
+                    proposal_pubkey: v.proposal_pubkey,
+                })
+                .collect(),
+        }
+    }
 
     /// Insert a block header (and dummy body + signature) for a given root, slot,
     /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
@@ -1902,7 +1953,7 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(block_root))
             .expect("update head");
 
-        let restored = Store::from_db_state(backend, 12345)
+        let restored = Store::from_db_state(backend, &genesis_config(12345, &[]))
             .expect("restore store")
             .expect("store exists");
         let blocks = restored
@@ -2939,34 +2990,65 @@ mod tests {
     fn from_db_state_returns_none_on_empty_backend() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_none()
         );
     }
 
     #[test]
-    fn from_db_state_returns_some_on_matching_genesis_time() {
+    fn from_db_state_returns_some_on_matching_genesis() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_some()
         );
     }
 
+    /// Previously this returned `None` ("treat as empty"), which let the caller
+    /// write a fresh anchor over another network's rows. It is now fatal.
     #[test]
-    fn from_db_state_returns_none_on_genesis_time_mismatch() {
+    fn from_db_state_errors_on_genesis_time_mismatch() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
-        assert!(
-            Store::from_db_state(backend, 99999)
-                .expect("Failed to get store")
-                .is_none()
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = Store::from_db_state(backend, &genesis_config(99999, &[])) else {
+            panic!("genesis time mismatch must be fatal");
+        };
+        assert!(matches!(
+            err,
+            Error::GenesisMismatch(GenesisMismatch::GenesisTime {
+                expected: 99999,
+                got: 12345,
+            })
+        ));
+    }
+
+    /// The case a `genesis_time`-only check cannot see: same network start
+    /// time, different validator registry.
+    #[test]
+    fn from_db_state_errors_on_validator_set_mismatch() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let persisted = vec![validator(0, 1), validator(1, 2)];
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, persisted.clone()),
         );
+
+        let mut foreign = persisted;
+        foreign[1] = validator(1, 9);
+        let Err(err) = Store::from_db_state(backend, &genesis_config(12345, &foreign)) else {
+            panic!("validator set mismatch must be fatal");
+        };
+        assert!(matches!(
+            err,
+            Error::GenesisMismatch(GenesisMismatch::ValidatorPubkey { index: 1 })
+        ));
     }
 
     #[test]
@@ -2985,7 +3067,7 @@ mod tests {
             .expect("put config");
         batch.commit().expect("commit");
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_none()
         );
