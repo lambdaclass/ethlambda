@@ -9,6 +9,10 @@ on:
         description: "Docker image tags, comma-separated (e.g., latest,v0.1.0)"
         required: false
         default: "latest"
+      features:
+        description: "Extra Cargo features to compile in, space-separated (e.g. 'ethp2p'). Appended to each variant's base features."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -35,22 +39,27 @@ jobs:
             name: amd64
           - runner: ubuntu-22.04-arm
             name: arm64
-        # Each tag is published twice: once as the regular image and once as a
-        # Shadow-simulator-compatible image (tag suffixed "-shadow"). The shadow
-        # build args mirror the `shadow-docker-build` Makefile target. LOCKED=
-        # builds the shadow variant unlocked (the quinn-udp [patch] is absent
-        # from Cargo.lock; see Dockerfile), so -shadow images are not
-        # reproducible and should not be treated as equivalent-security
-        # artifacts to the regular tags.
+        # Each tag is published twice: a regular image and a
+        # Shadow-simulator-compatible one ("-shadow"). The `features` dispatch
+        # input is appended to each variant's base features, so e.g.
+        # `-f features=ethp2p -f tags=ethp2p` publishes `:ethp2p` (regular +
+        # ethp2p) and `:ethp2p-shadow` (shadow-integration + ethp2p). On push to
+        # main the input is empty, preserving the plain regular/shadow images.
+        #
+        # The shadow extra_args mirror the `shadow-docker-build` Makefile target;
+        # LOCKED= builds it unlocked (the quinn-udp [patch] is absent from
+        # Cargo.lock; see Dockerfile), so -shadow images are not reproducible and
+        # should not be treated as equivalent-security artifacts.
         variant:
           - name: default
             suffix: ""
-            build_args: ""
+            base_features: ""
+            extra_args: ""
           - name: shadow
             suffix: "-shadow"
-            build_args: |
+            base_features: "shadow-integration"
+            extra_args: |
               SHADOW=1
-              FEATURES=shadow-integration
               NO_DEFAULT_FEATURES=--no-default-features
               LOCKED=
     runs-on: ${{ matrix.arch.runner }}
@@ -83,6 +92,17 @@ jobs:
           TAGS="${TAGS%,}"  # Remove trailing comma
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
 
+      - name: Compose Cargo features
+        id: features
+        env:
+          BASE: ${{ matrix.variant.base_features }}
+          INPUT: ${{ inputs.features }}
+        run: |
+          # Variant-mandatory base features + optional dispatch input; xargs
+          # trims and collapses whitespace (empty when both are empty).
+          COMBINED="$(echo "${BASE} ${INPUT}" | xargs)"
+          echo "value=${COMBINED}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -91,7 +111,8 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
-            ${{ matrix.variant.build_args }}
+            FEATURES=${{ steps.features.outputs.value }}
+            ${{ matrix.variant.extra_args }}
           push: true
           tags: ${{ steps.prep.outputs.tags }}
           platforms: linux/${{ matrix.arch.name }}
@@ -119,9 +140,10 @@ jobs:
           FIRST_TAG="${TAG_ARRAY[0]}"
           SHORT="${SHORT_SHA::7}"
 
-          # Publish each tag twice: the regular image and its "-shadow" twin.
-          # These suffixes must stay in sync with the `variant` matrix suffixes
-          # in the build-image job above: a new variant must be added in both.
+          # Publish each tag twice: the regular ethp2p image and its "-shadow"
+          # twin. These suffixes must stay in sync with the `variant` matrix
+          # suffixes in the build-image job above: a new variant must be added
+          # in both.
           for suffix in "" "-shadow"; do
             # First tag also gets an immutable sha-<sha> tag.
             docker buildx imagetools create \
