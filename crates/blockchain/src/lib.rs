@@ -18,7 +18,7 @@ use ethlambda_types::{
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
-    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    PRIOR_WORKER_JOIN_TIMEOUT, SlotOrdering, run_aggregation_worker,
 };
 use crate::heartbeat_fold::heartbeat_aggregation_snapshot;
 use crate::key_manager::ValidatorKeyPair;
@@ -541,12 +541,31 @@ impl BlockChainServer {
         // build most needs and the proposer's scarce resource is leanVM time before
         // its interval-3 build. When nothing is foldable (no buffered heartbeat
         // signature, or every signer already covered by an existing type-1) we fall
-        // back to an ordinary single subnet job.
+        // back to an ordinary single subnet job, still preferring this slot's
+        // groups since the block wants this slot's committee covered.
+        //
+        // Not proposing means the committee's votes are worth no queue jump: this
+        // node folds nothing, and every peer already has those votes raw off the
+        // global heartbeat topic. `TierOnly` therefore aggregates a current-slot
+        // group only when it wins on consensus value (finalizes, justifies, or
+        // adds coverage nothing else does), leaving the jobs for the finality
+        // progress only an aggregator can produce.
         let snapshot = if self.proposes_next_slot(slot) {
-            heartbeat_aggregation_snapshot(&self.store, slot)
-                .or_else(|| aggregation::snapshot_aggregation_inputs(&self.store, slot, 1))
+            heartbeat_aggregation_snapshot(&self.store, slot).or_else(|| {
+                aggregation::snapshot_aggregation_inputs(
+                    &self.store,
+                    slot,
+                    1,
+                    SlotOrdering::CurrentSlotFirst,
+                )
+            })
         } else {
-            aggregation::snapshot_aggregation_inputs(&self.store, slot, MAX_AGGREGATION_JOBS)
+            aggregation::snapshot_aggregation_inputs(
+                &self.store,
+                slot,
+                MAX_AGGREGATION_JOBS,
+                SlotOrdering::TierOnly,
+            )
         };
         let Some(snapshot) = snapshot else {
             // Nothing to aggregate this slot.

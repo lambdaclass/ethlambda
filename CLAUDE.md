@@ -77,10 +77,10 @@ line up with other clients even while the interval grid inside the slot diverges
 One session per slot, started at interval 2 or earlier once a threshold is met.
 Two roles trigger it:
 
-| role | early threshold | jobs |
-|---|---|---|
-| committee aggregator | 2/3 of signatures expected from subscribed subnets | up to `MAX_AGGREGATION_JOBS` from the subnet pool |
-| next slot's proposer | `ceil(3K'/4)` heartbeat votes (the safe-target threshold) | exactly 1, over the heartbeat committee votes |
+| role | early threshold | jobs | subnet ordering |
+|---|---|---|---|
+| committee aggregator | 2/3 of signatures expected from subscribed subnets | up to `MAX_AGGREGATION_JOBS` from the subnet pool | `SlotOrdering::TierOnly` |
+| next slot's proposer | `ceil(3K'/4)` heartbeat votes (the safe-target threshold) | exactly 1, over the heartbeat committee votes | `SlotOrdering::CurrentSlotFirst` (fallback only) |
 
 The proposer's job is built by `heartbeat_fold::heartbeat_aggregation_snapshot`,
 which picks the `AttestationData` with the most buffered committee signers and
@@ -89,6 +89,14 @@ type-1) before calling `aggregate_mixed`. It falls back to a single subnet job w
 nothing is foldable. The result flows through the ordinary `AggregateProduced` path
 into `new_payloads`, is promoted at interval 3, and reaches the builder as one
 candidate among many; `Tier::Heartbeat` is what makes it win.
+
+Heartbeat signatures are the proposer's alone: `heartbeat_aggregation_snapshot` is
+the only reader of that buffer. An aggregator that does not propose the next slot
+sees the same committee votes only where they duplicate into its subnet pool, and
+`SlotOrdering::TierOnly` denies them the recency bucket there, so they are
+aggregated only when they win on consensus value (Finalize > Justify > Build).
+Recency is worth a queue jump only to the proposer, which is the one node that has
+to pack those votes; everyone else already has them raw off the global topic.
 
 `K` is `HEARTBEAT_COMMITTEE_SIZE` from the genesis config (default 16); `K' = min(K, n)`
 and every threshold is denominated in `K'`, never the raw `K`. `N` is
