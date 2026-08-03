@@ -988,6 +988,13 @@ validators:
 
     /// A DB from another network is not resumable, so the no-URL path still
     /// falls back to genesis.
+    ///
+    /// This pins current behavior, not a desired one. `from_db_state` treats a
+    /// `GENESIS_TIME` mismatch as an empty DB and only warns, so with no
+    /// checkpoint URL the node writes a genesis anchor over a populated
+    /// foreign-network directory: the same data loss the resume ordering
+    /// removes everywhere else. Left as-is deliberately, and this test is here
+    /// to make the change visible when someone fixes it.
     #[tokio::test]
     async fn initializes_from_genesis_when_db_genesis_time_differs() {
         let seeded_genesis = test_genesis(now_secs());
