@@ -111,6 +111,50 @@ pub enum RejectionReason {
 }
 
 impl RejectionReason {
+    /// Every reason this build knows, in declaration order.
+    ///
+    /// [`Self::as_str`] and [`From<&str>`] are two parallel tables; this list is
+    /// what `every_known_reason_round_trips` walks to prove they agree, so a new
+    /// variant belongs here alongside its two arms.
+    pub const ALL: &'static [Self] = &[
+        Self::BlockSlotNotInFuture,
+        Self::BlockSlotGapTooLarge,
+        Self::BlockTooFarInFuture,
+        Self::BlockOlderThanLatestHeader,
+        Self::BlockSlotMismatch,
+        Self::ParentRootMismatch,
+        Self::StateRootMismatch,
+        Self::UnknownParentBlock,
+        Self::ProposerIndexOutOfRange,
+        Self::EmptyValidatorRegistry,
+        Self::WrongProposer,
+        Self::TooManyAttestationData,
+        Self::DuplicateAttestationData,
+        Self::EmptyAggregationBits,
+        Self::UnknownSourceBlock,
+        Self::UnknownTargetBlock,
+        Self::UnknownHeadBlock,
+        Self::SourceAfterTarget,
+        Self::HeadOlderThanTarget,
+        Self::SourceSlotMismatch,
+        Self::TargetSlotMismatch,
+        Self::HeadSlotMismatch,
+        Self::SourceNotAncestorOfTarget,
+        Self::TargetNotAncestorOfHead,
+        Self::HeadNotDescendantOfFinalized,
+        Self::AttestationTooFarInFuture,
+        Self::AttestationSlotBeforeHead,
+        Self::ValidatorNotInState,
+        Self::ValidatorIndexOutOfRange,
+        Self::JustifiedSlotOutOfRange,
+        Self::ZeroHashJustificationRoot,
+        Self::JustificationVotesLengthMismatch,
+        Self::InvalidSignature,
+        Self::InvalidBlockProof,
+        Self::AnchorStateRootMismatch,
+        Self::DecodeError,
+    ];
+
     /// The wire spelling fixtures use for this reason.
     pub fn as_str(&self) -> &str {
         match self {
@@ -278,6 +322,8 @@ impl From<&ethlambda_state_transition::Error> for RejectionReason {
             // so a bit set beyond the registry is an out-of-range validator
             // index rather than a malformed bitlist.
             Error::AggregationBitsOutOfBounds { .. } => Self::ValidatorIndexOutOfRange,
+            Error::JustifiedSlotOutOfRange { .. } => Self::JustifiedSlotOutOfRange,
+            Error::TooManyAttestationData { .. } => Self::TooManyAttestationData,
         }
     }
 }
@@ -285,6 +331,26 @@ impl From<&ethlambda_state_transition::Error> for RejectionReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk every known reason through both tables. A spelling that appears in
+    /// only one of them, or twice in [`RejectionReason::as_str`] (which would
+    /// leave one variant unreachable from a fixture), fails here.
+    #[test]
+    fn every_known_reason_round_trips() {
+        let mut spellings = std::collections::HashSet::new();
+        for reason in RejectionReason::ALL {
+            let spelling = reason.as_str();
+            assert_eq!(
+                &RejectionReason::from(spelling),
+                reason,
+                "'{spelling}' does not parse back to {reason:?}"
+            );
+            assert!(
+                spellings.insert(spelling),
+                "'{spelling}' is the wire spelling of more than one reason"
+            );
+        }
+    }
 
     #[test]
     fn known_reasons_round_trip_through_their_wire_spelling() {
