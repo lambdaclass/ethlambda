@@ -531,6 +531,8 @@ fn on_gossip_aggregated_attestation_core(
             &data_root,
             slot,
         )
+        .inspect(|_| metrics::inc_pq_sig_aggregated_signatures_valid())
+        .inspect_err(|_| metrics::inc_pq_sig_aggregated_signatures_invalid())
         .map_err(StoreError::AggregateVerificationFailed)?;
     }
 
