@@ -6,6 +6,8 @@
 
 use ethlambda_types::state::JustifiedSlots;
 
+use crate::Error;
+
 /// Calculate relative index for a slot after finalization.
 /// Returns None if slot <= finalized_slot (implicitly justified).
 fn relative_index(target_slot: u64, finalized_slot: u64) -> Option<usize> {
@@ -16,10 +18,27 @@ fn relative_index(target_slot: u64, finalized_slot: u64) -> Option<usize> {
 }
 
 /// Check if a slot is justified (finalized slots are implicitly justified).
-pub fn is_slot_justified(slots: &JustifiedSlots, finalized_slot: u64, target_slot: u64) -> bool {
-    relative_index(target_slot, finalized_slot)
-        .map(|idx| slots.get(idx).unwrap_or(false))
-        .unwrap_or(true) // Finalized slots are implicitly justified
+///
+/// A slot past the finalized boundary but beyond the tracked bitlist has no
+/// justification status to report. The spec surfaces that as a domain rejection
+/// (leanSpec #1023, `JUSTIFIED_SLOT_OUT_OF_RANGE`) rather than reading it as
+/// "not justified", so a block carrying such a vote is invalid. Callers on the
+/// state transition path must propagate the error; callers that only pre-filter
+/// candidate votes may treat it as "unknown, so not justified".
+pub fn is_slot_justified(
+    slots: &JustifiedSlots,
+    finalized_slot: u64,
+    target_slot: u64,
+) -> Result<bool, Error> {
+    // Finalized slots are implicitly justified and need no tracked bit.
+    let Some(idx) = relative_index(target_slot, finalized_slot) else {
+        return Ok(true);
+    };
+    slots.get(idx).ok_or(Error::JustifiedSlotOutOfRange {
+        slot: target_slot,
+        finalized_slot,
+        tracked_length: slots.len(),
+    })
 }
 
 /// Mark a slot as justified. No-op if slot is finalized.
