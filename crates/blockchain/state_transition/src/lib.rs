@@ -485,17 +485,22 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         return false;
     }
 
+    // Ensure the target falls on a slot that can be justified after the finalized one.
+    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
+        return false;
+    }
+
     true
 }
 
 /// Attempt to advance finalization from source to target.
 ///
 /// Finalization advances only when the source lies past the old finalized point
-/// and the target is the source's immediate successor, so the two are
-/// consecutive justified checkpoints. A source at or behind the finalized
-/// boundary is already final: it may justify a newer target, but it must not
-/// re-finalize. When finalization advances, shifts the justified_slots window
-/// and prunes stale justifications.
+/// and there are no justifiable slots between source.slot and target.slot
+/// (exclusive). A source at or behind the finalized boundary is already final:
+/// it may justify a newer target, but it must not re-finalize or scan below the
+/// finalized boundary. When finalization advances, shifts the justified_slots
+/// window and prunes stale justifications.
 fn try_finalize(
     state: &mut State,
     source: Checkpoint,
@@ -509,10 +514,10 @@ fn try_finalize(
         return;
     }
 
-    // Consider whether finalization can advance. Every slot is justifiable now,
-    // so "no justifiable slot strictly between source and target" collapses to
-    // the two being adjacent.
-    if source.slot + 1 != target.slot {
+    // Consider whether finalization can advance.
+    if ((source.slot + 1)..target.slot)
+        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
+    {
         metrics::inc_finalizations("error");
         return;
     }
@@ -621,6 +626,47 @@ pub fn attestation_data_matches_chain(
         && historical_block_hashes[head_slot] == data.head.root
 }
 
+/// Checks if the slot is a valid candidate for justification after a given finalized slot.
+///
+/// According to the 3SF-mini specification, a slot is justifiable if its
+/// distance (`delta`) from the last finalized slot is:
+///     1. Less than or equal to 5.
+///     2. A perfect square (e.g., 9, 16, 25...).
+///     3. A pronic number (of the form x^2 + x, e.g., 6, 12, 20...).
+///
+/// See https://github.com/ethereum/research/blob/c003fe1c1a785797e7b53e3cbf9569b989be6e93/3sf-mini/consensus.py#L52-L54
+/// for the 3SF-mini reference.
+///
+/// For why we have unjustifiable slots, consider that in high-latency
+/// scenarios, validators may vote for many different slots, making none of them
+/// reach the supermajority threshold. By having unjustifiable slots, we can
+/// funnel votes towards only some slots, increasing finalization chances.
+pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
+    let Some(delta) = slot.checked_sub(finalized_slot) else {
+        // Candidate slot must not be before finalized slot
+        return false;
+    };
+    // Rule 1: The first 5 slots after finalization are always justifiable.
+    //
+    // Examples: delta = 0, 1, 2, 3, 4, 5
+    delta <= 5
+        // Rule 2: Slots at perfect square distances are justifiable.
+        //
+        // Examples: delta = 1, 4, 9, 16, 25, 36, 49, 64, ...
+        // Check: integer square root squared equals delta
+        || delta.isqrt().pow(2) == delta
+        // Rule 3: Slots at pronic number distances are justifiable.
+        //
+        // Pronic numbers have the form n(n+1): 2, 6, 12, 20, 30, 42, 56, ...
+        // Mathematical insight: For pronic delta = n(n+1), we have:
+        //   4*delta + 1 = 4n(n+1) + 1 = (2n+1)^2
+        // Check: 4*delta+1 is an odd perfect square
+        || delta
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(1))
+            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,10 +752,11 @@ mod tests {
     }
 
     #[test]
-    fn finalization_requires_adjacent_source_and_target() {
-        // The simple BFT condition: only consecutive checkpoints finalize. Pinned
-        // here because the 3SF-mini justifiability rules that used to gate this
-        // are gone.
+    fn finalization_blocked_by_justifiable_slot_between_source_and_target() {
+        // Source and target must be *consecutive justified checkpoints*, which
+        // under 3SF-mini means no slot strictly between them is still justifiable
+        // relative to the finalized boundary. Here slot 4 is (delta = 4 <= 5), so
+        // the pair is not consecutive and finalization must not advance.
         let mut state = State::from_genesis(0, make_validators(4));
         state.latest_finalized = Checkpoint {
             root: H256::ZERO,
@@ -732,7 +779,10 @@ mod tests {
             &mut justifications,
             &root_to_slot,
         );
-        assert_eq!(state.latest_finalized.slot, 0, "gap must not finalize");
+        assert_eq!(
+            state.latest_finalized.slot, 0,
+            "justifiable slot between source and target must not finalize"
+        );
     }
 
     fn make_validators(n: usize) -> Vec<Validator> {

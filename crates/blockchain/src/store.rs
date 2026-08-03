@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_state_transition::{
     effective_heartbeat_committee_size, is_heartbeat_committee_member, is_proposer,
+    slot_is_justifiable_after,
 };
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -1052,15 +1053,11 @@ pub fn get_attestation_target(store: &Store) -> Checkpoint {
 /// Note: the walk-back still starts from `store.head()` (the pre-import head), not
 /// the new block. This is correct because the new block is only 1 slot ahead with less than 2/3 of votes — the
 /// walk-back immediately reaches the same chain. The important fix is using the
-/// post-state justified for the clamping guard.
+/// post-state justified/finalized for the justifiability check and clamping guard.
 pub fn get_attestation_target_with_checkpoints(
     store: &Store,
     justified: Checkpoint,
-    // Unused under the simple BFT finality condition: every slot is justifiable
-    // now, so the target no longer needs a justifiability walk-back. Kept on the
-    // signature because callers resolve both checkpoints from the same
-    // post-state and the pair reads as one unit.
-    _finalized: Checkpoint,
+    finalized: Checkpoint,
 ) -> Checkpoint {
     // Start from current head
     let mut target_block_root = store.head().unwrap();
@@ -1089,6 +1086,22 @@ pub fn get_attestation_target_with_checkpoints(
         } else {
             break;
         }
+    }
+
+    let finalized_slot = finalized.slot;
+
+    // Ensure target is in justifiable slot range
+    //
+    // Walk back until we find a slot that satisfies justifiability rules
+    // relative to the latest finalized checkpoint.
+    while target_header.slot > finalized_slot
+        && !slot_is_justifiable_after(target_header.slot, finalized_slot)
+    {
+        target_block_root = target_header.parent_root;
+        target_header = store
+            .get_block_header(&target_block_root)
+            .expect("parent block exists")
+            .unwrap();
     }
 
     // Guard: clamp target to justified (not in the spec).
