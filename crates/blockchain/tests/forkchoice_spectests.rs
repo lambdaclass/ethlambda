@@ -166,12 +166,19 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 /// a named reason must match the reason the client's error classifies to. A
 /// rejection the classifier does not recognise fails the step as well: silently
 /// accepting it would restore exactly the "any error will do" behaviour.
+///
+/// A [`StepError::Harness`] fails the step whatever the fixture expected: it
+/// means the runner never replayed the step, so it can satisfy neither a
+/// `valid: true` step nor an expected rejection.
 fn assert_step_outcome(
     step_idx: usize,
     expected_valid: bool,
     expected_reason: Option<&RejectionReason>,
     result: Result<(), StepError>,
 ) -> datatest_stable::Result<()> {
+    if let Err(StepError::Harness(reason)) = &result {
+        return Err(format!("Step {step_idx} could not be replayed: {reason}").into());
+    }
     match (result, expected_valid) {
         (Ok(()), true) => Ok(()),
         (Ok(()), false) => Err(format!(
@@ -185,7 +192,8 @@ fn assert_step_outcome(
             Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
         }
         // Older fixtures mark a step invalid without naming a reason; the
-        // rejection itself is all they assert.
+        // rejection itself is all they assert. Only store rejections reach here,
+        // harness failures having already been rejected above.
         (Err(_), false) if expected_reason.is_none() => Ok(()),
         (Err(err), false) => check_rejection_reason(
             &format!("Step {step_idx}"),
