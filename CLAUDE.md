@@ -52,14 +52,50 @@ crates/
 - Communication via `mpsc::unbounded_channel`
 - Shared storage via `Arc<dyn StorageBackend>` (clone Store, share backend)
 
-### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
+### Tick-Based Validator Duties (4-second slots, 4 intervals of 1000ms)
 ```
-Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
-Interval 1: Attestation production (all validators, including proposer)
-Interval 2: Aggregation (aggregators create proofs from gossip signatures)
-Interval 3: Safe target update (fork choice)
-Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
+Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 3 (see below) and aligned to publish here. Block import merges the block's slot-(T-1) committee bits into the heartbeat vote store; new payloads are promoted to known.
+Interval 1: Attestation production (all validators, including proposer). Committee members republish the same signature to the global heartbeat topic. The early-aggregation window check is scheduled.
+Interval 2: Safe target update from current-slot heartbeat votes; the aggregation session starts (or already started early) and its aggregates begin publishing.
+Interval 3: lagging_head (RLMD window) then fast_head (GHOST-Eph); accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
+
+The slot stays 4000ms across the 5→4 interval change: the XMSS epoch is the slot, so
+key lifetime is untouched, `GENESIS_TIME` configs stay valid, and slot numbers still
+line up with other clients even while the interval grid inside the slot diverges.
+
+### Two-Tier Fork Choice (heartbeat)
+
+| value | interval | base | vote window | pool | `min_score` |
+|---|---|---|---|---|---|
+| `safe_target` | 2 | `latest_justified` | `slot == S` only | heartbeat (gossip) | `ceil(3K'/4)` |
+| `lagging_head` | 3 | `latest_justified` | `[S-N, S)` | heartbeat ∪ `known_payloads` | `ceil(2n/3)` |
+| `fast_head` | 3 | `lagging_head` | `slot == S-1`, expanding | heartbeat | `0` |
+
+### Aggregation triggers
+
+One session per slot, started at interval 2 or earlier once a threshold is met.
+Two roles trigger it:
+
+| role | early threshold | jobs |
+|---|---|---|
+| committee aggregator | 2/3 of signatures expected from subscribed subnets | up to `MAX_AGGREGATION_JOBS` from the subnet pool |
+| next slot's proposer | `ceil(3K'/4)` heartbeat votes (the safe-target threshold) | exactly 1, over the heartbeat committee votes |
+
+The proposer's job is built by `heartbeat_fold::heartbeat_aggregation_snapshot`,
+which picks the `AttestationData` with the most buffered committee signers and
+reduces the raw signer set to `B \ A` (signers not already covered by an existing
+type-1) before calling `aggregate_mixed`. It falls back to a single subnet job when
+nothing is foldable. The result flows through the ordinary `AggregateProduced` path
+into `new_payloads`, is promoted at interval 3, and reaches the builder as one
+candidate among many; `Tier::Heartbeat` is what makes it win.
+
+`K` is `HEARTBEAT_COMMITTEE_SIZE` from the genesis config (default 16); `K' = min(K, n)`
+and every threshold is denominated in `K'`, never the raw `K`. `N` is
+`RLMD_LOOKBACK_LIMIT` (8). Heartbeat votes ride in `body.attestations` — there is no
+dedicated `BlockBody` field — and are extracted on import by
+`store::extract_heartbeat_votes`, whose `data.slot == block.slot - 1` gate exactly
+mirrors the packer's `Tier::Heartbeat`.
 
 ### Attestation Pipeline
 ```
@@ -274,7 +310,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3)
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
-  - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
+  - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|heartbeat|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)

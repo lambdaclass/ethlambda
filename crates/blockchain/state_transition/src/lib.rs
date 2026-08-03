@@ -13,6 +13,14 @@ use tracing::{info, warn};
 pub mod justified_slots_ops;
 pub mod metrics;
 
+/// Re-exported next to [`is_heartbeat_committee_member`], which is where callers
+/// reason about them. They are declared in `ethlambda-types` only because
+/// `ethlambda-storage` seeds its metadata key from the default and does not
+/// depend on this crate.
+pub use ethlambda_types::constants::{
+    DEFAULT_HEARTBEAT_COMMITTEE_SIZE, MAX_HEARTBEAT_COMMITTEE_SIZE,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("target slot {target_slot} is in the past (current is {current_slot})")]
@@ -235,6 +243,57 @@ pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool
     current_proposer(slot, num_validators) == Some(validator_index)
 }
 
+/// Effective heartbeat committee size: the configured size clamped to the
+/// registry, `K' = min(K, n)`.
+///
+/// Load-bearing rather than defensive. The committee is built by walking
+/// `K` steps round-robin from the proposer, so once `K > n` each validator is
+/// picked `ceil(K / n)` times and the *set* is just the whole registry. A
+/// threshold denominated in the raw `K` — `ceil(3K/4)` for the safe target —
+/// would then demand more votes than there are validators to cast them, and the
+/// safe target would pin to `latest_justified` forever. At the default `K = 16`
+/// that is not hypothetical: local devnets and the spec fixtures routinely run
+/// `n <= 16`.
+///
+/// Every heartbeat threshold must be denominated in this value, never in `K`.
+pub fn effective_heartbeat_committee_size(committee_size: u64, num_validators: u64) -> u64 {
+    committee_size.min(num_validators)
+}
+
+/// Check if a validator is part of the heartbeat committee for a given slot.
+///
+/// The committee for `slot` is the proposer plus the next `K' - 1` validators,
+/// round-robin:
+///
+/// ```text
+/// proposer(slot) = slot % n
+/// committee      = { (p + i) mod n : 0 <= i < K' },  p = proposer(slot)
+/// ```
+///
+/// Membership is consumed both by heartbeat gossip admission and by the
+/// fork-choice extraction that runs on every node over every block, so two
+/// nodes disagreeing here disagree about which bits of a block are heartbeat
+/// votes. `num_validators` must therefore always come from the state at the
+/// vote's *own* slot, never from the head state.
+pub fn is_heartbeat_committee_member(
+    validator_index: u64,
+    slot: u64,
+    num_validators: u64,
+    committee_size: u64,
+) -> bool {
+    let Some(proposer) = current_proposer(slot, num_validators) else {
+        return false;
+    };
+    if validator_index >= num_validators {
+        return false;
+    }
+    // Distance from the proposer walking forward round-robin. Membership is
+    // that distance falling inside the effective committee width, which is the
+    // closed form of the `(p + i) mod n` set-builder above.
+    let offset = (validator_index + num_validators - proposer) % num_validators;
+    offset < effective_heartbeat_committee_size(committee_size, num_validators)
+}
+
 /// Apply attestations and update justification/finalization
 /// according to the Lean Consensus 3SF-mini rules.
 fn process_attestations(
@@ -426,22 +485,17 @@ fn is_valid_vote(state: &State, data: &AttestationData) -> bool {
         return false;
     }
 
-    // Ensure the target falls on a slot that can be justified after the finalized one.
-    if !slot_is_justifiable_after(target.slot, state.latest_finalized.slot) {
-        return false;
-    }
-
     true
 }
 
 /// Attempt to advance finalization from source to target.
 ///
 /// Finalization advances only when the source lies past the old finalized point
-/// and there are no justifiable slots between source.slot and target.slot
-/// (exclusive). A source at or behind the finalized boundary is already final:
-/// it may justify a newer target, but it must not re-finalize or scan below the
-/// finalized boundary. When finalization advances, shifts the justified_slots
-/// window and prunes stale justifications.
+/// and the target is the source's immediate successor, so the two are
+/// consecutive justified checkpoints. A source at or behind the finalized
+/// boundary is already final: it may justify a newer target, but it must not
+/// re-finalize. When finalization advances, shifts the justified_slots window
+/// and prunes stale justifications.
 fn try_finalize(
     state: &mut State,
     source: Checkpoint,
@@ -455,10 +509,10 @@ fn try_finalize(
         return;
     }
 
-    // Consider whether finalization can advance.
-    if ((source.slot + 1)..target.slot)
-        .any(|slot| slot_is_justifiable_after(slot, state.latest_finalized.slot))
-    {
+    // Consider whether finalization can advance. Every slot is justifiable now,
+    // so "no justifiable slot strictly between source and target" collapses to
+    // the two being adjacent.
+    if source.slot + 1 != target.slot {
         metrics::inc_finalizations("error");
         return;
     }
@@ -567,47 +621,6 @@ pub fn attestation_data_matches_chain(
         && historical_block_hashes[head_slot] == data.head.root
 }
 
-/// Checks if the slot is a valid candidate for justification after a given finalized slot.
-///
-/// According to the 3SF-mini specification, a slot is justifiable if its
-/// distance (`delta`) from the last finalized slot is:
-///     1. Less than or equal to 5.
-///     2. A perfect square (e.g., 9, 16, 25...).
-///     3. A pronic number (of the form x^2 + x, e.g., 6, 12, 20...).
-///
-/// See https://github.com/ethereum/research/blob/c003fe1c1a785797e7b53e3cbf9569b989be6e93/3sf-mini/consensus.py#L52-L54
-/// for the 3SF-mini reference.
-///
-/// For why we have unjustifiable slots, consider that in high-latency
-/// scenarios, validators may vote for many different slots, making none of them
-/// reach the supermajority threshold. By having unjustifiable slots, we can
-/// funnel votes towards only some slots, increasing finalization chances.
-pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
-    let Some(delta) = slot.checked_sub(finalized_slot) else {
-        // Candidate slot must not be before finalized slot
-        return false;
-    };
-    // Rule 1: The first 5 slots after finalization are always justifiable.
-    //
-    // Examples: delta = 0, 1, 2, 3, 4, 5
-    delta <= 5
-        // Rule 2: Slots at perfect square distances are justifiable.
-        //
-        // Examples: delta = 1, 4, 9, 16, 25, 36, 49, 64, ...
-        // Check: integer square root squared equals delta
-        || delta.isqrt().pow(2) == delta
-        // Rule 3: Slots at pronic number distances are justifiable.
-        //
-        // Pronic numbers have the form n(n+1): 2, 6, 12, 20, 30, 42, 56, ...
-        // Mathematical insight: For pronic delta = n(n+1), we have:
-        //   4*delta + 1 = 4n(n+1) + 1 = (2n+1)^2
-        // Check: 4*delta+1 is an odd perfect square
-        || delta
-            .checked_mul(4)
-            .and_then(|v| v.checked_add(1))
-            .is_some_and(|val| val.isqrt().pow(2) == val && val % 2 == 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +632,108 @@ mod tests {
         state::{ChainConfig, JustifiedSlots, State, Validator},
     };
     use libssz_types::SszList;
+
+    /// Collect the heartbeat committee for `slot` by asking the predicate about
+    /// every validator, so the tests exercise exactly what callers call.
+    fn committee(slot: u64, num_validators: u64, committee_size: u64) -> Vec<u64> {
+        (0..num_validators)
+            .filter(|vid| is_heartbeat_committee_member(*vid, slot, num_validators, committee_size))
+            .collect()
+    }
+
+    #[test]
+    fn committee_is_proposer_plus_next_k_minus_one() {
+        // n = 64, K = 16, slot 100 -> proposer 36, committee {36..=51}.
+        assert_eq!(committee(100, 64, 16), (36..=51).collect::<Vec<_>>());
+        // Slot 101 shifts by exactly one.
+        assert_eq!(committee(101, 64, 16), (37..=52).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn committee_wraps_around_the_registry() {
+        // Proposer 60 with K = 8 wraps past the end: {60..=63} ∪ {0..=3}.
+        let mut expected: Vec<u64> = (60..=63).collect();
+        expected.extend(0..=3);
+        expected.sort_unstable();
+        assert_eq!(committee(60, 64, 8), expected);
+    }
+
+    #[test]
+    fn committee_at_or_above_registry_size_is_everyone() {
+        // K == n and K > n both collapse to the whole registry, for every slot.
+        for slot in 0..20 {
+            assert_eq!(committee(slot, 16, 16), (0..16).collect::<Vec<_>>());
+            assert_eq!(committee(slot, 16, 64), (0..16).collect::<Vec<_>>());
+            assert_eq!(committee(slot, 8, 16), (0..8).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn committee_handles_degenerate_registries() {
+        // Single validator: always the whole committee.
+        assert_eq!(committee(0, 1, 16), vec![0]);
+        assert_eq!(committee(7, 1, 16), vec![0]);
+        // Empty registry: nobody, and no division by zero.
+        assert!(!is_heartbeat_committee_member(0, 5, 0, 16));
+        // Out-of-range index is never a member.
+        assert!(!is_heartbeat_committee_member(64, 0, 64, 16));
+    }
+
+    #[test]
+    fn effective_committee_size_keeps_thresholds_reachable() {
+        // The regression this guards: a threshold denominated in the raw K would
+        // demand more votes than there are validators, pinning the safe target to
+        // latest_justified forever.
+        for num_validators in [1u64, 4, 8, 16, 64] {
+            for configured in [1u64, 4, 16, 64, 4096] {
+                let effective = effective_heartbeat_committee_size(configured, num_validators);
+                assert!(
+                    effective <= num_validators,
+                    "K'={effective} exceeds n={num_validators}"
+                );
+                let threshold = (3 * effective).div_ceil(4);
+                assert!(
+                    threshold <= num_validators,
+                    "ceil(3K'/4)={threshold} unreachable at n={num_validators}"
+                );
+                // And it really is the size of the set the predicate yields.
+                assert_eq!(
+                    committee(0, num_validators, configured).len() as u64,
+                    effective
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finalization_requires_adjacent_source_and_target() {
+        // The simple BFT condition: only consecutive checkpoints finalize. Pinned
+        // here because the 3SF-mini justifiability rules that used to gate this
+        // are gone.
+        let mut state = State::from_genesis(0, make_validators(4));
+        state.latest_finalized = Checkpoint {
+            root: H256::ZERO,
+            slot: 0,
+        };
+        let mut justifications = HashMap::new();
+        let root_to_slot = HashMap::new();
+
+        // A gap between source and target must not finalize.
+        try_finalize(
+            &mut state,
+            Checkpoint {
+                root: H256([1; 32]),
+                slot: 3,
+            },
+            Checkpoint {
+                root: H256([2; 32]),
+                slot: 5,
+            },
+            &mut justifications,
+            &root_to_slot,
+        );
+        assert_eq!(state.latest_finalized.slot, 0, "gap must not finalize");
+    }
 
     fn make_validators(n: usize) -> Vec<Validator> {
         (0..n)

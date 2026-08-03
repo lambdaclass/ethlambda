@@ -12,7 +12,7 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        attestation_subnet_topic,
+        HEARTBEAT_TOPIC_KIND, attestation_subnet_topic,
     },
 };
 use crate::{P2PServer, metrics};
@@ -128,10 +128,70 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                     .inspect_err(|err| error!(%err, "Failed to forward attestation to blockchain"));
             }
         }
+        Some(kind) if kind == HEARTBEAT_TOPIC_KIND => {
+            info!(kind = "heartbeat", peer_count, "P2P message received");
+            let compressed_len = message.data.len();
+            let Ok(uncompressed_data) = decompress_message(&message.data)
+                .inspect_err(|err| error!(%err, "Failed to decompress gossipped heartbeat"))
+            else {
+                return;
+            };
+            metrics::observe_gossip_attestation_size(uncompressed_data.len(), compressed_len);
+
+            let Ok(signed_attestation) = SignedAttestation::from_ssz_bytes(&uncompressed_data)
+                .inspect_err(|err| error!(?err, "Failed to decode gossipped heartbeat"))
+            else {
+                return;
+            };
+            let slot = signed_attestation.data.slot;
+            let validator = signed_attestation.validator_id;
+            info!(
+                %slot,
+                validator,
+                head_root = %ShortRoot(&signed_attestation.data.head.root.0),
+                target_slot = signed_attestation.data.target.slot,
+                target_root = %ShortRoot(&signed_attestation.data.target.root.0),
+                source_slot = signed_attestation.data.source.slot,
+                source_root = %ShortRoot(&signed_attestation.data.source.root.0),
+                "Received heartbeat attestation from gossip"
+            );
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain
+                    .new_heartbeat_attestation(signed_attestation)
+                    .inspect_err(|err| error!(%err, "Failed to forward heartbeat to blockchain"));
+            }
+        }
         _ => {
             trace!("Received message on unknown topic: {}", message.topic);
         }
     }
+}
+
+/// Republish a committee member's attestation to the global heartbeat topic.
+///
+/// The topic is a latency shortcut, nothing more: it gets the committee's raw
+/// signatures to the next proposer within one interval, without waiting for a
+/// subnet aggregate to be built and propagated. This publishes the *same*
+/// signature the validator already sent to its subnet, so no extra XMSS epoch is
+/// consumed and no second signing operation is needed.
+pub async fn publish_heartbeat_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
+    let slot = attestation.data.slot;
+    let validator = attestation.validator_id;
+
+    let ssz_bytes = attestation.to_ssz();
+    let compressed = compress_message(&ssz_bytes);
+    metrics::observe_gossip_attestation_size(ssz_bytes.len(), compressed.len());
+
+    server
+        .swarm_handle
+        .publish(server.heartbeat_topic.clone(), compressed);
+    info!(
+        %slot,
+        validator,
+        target_slot = attestation.data.target.slot,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        "Published heartbeat attestation to gossipsub"
+    );
 }
 
 pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAttestation) {

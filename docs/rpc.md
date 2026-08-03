@@ -48,19 +48,27 @@ The handler emits a fixed, compact body (no whitespace):
 
 ### `GET /lean/v0/config/spec`
 
-Protocol constants the node was built with. Keys mirror the leanSpec constant names:
+Protocol constants the node runs with. Keys mirror the leanSpec constant names:
 
 ```json
 {
   "MILLISECONDS_PER_SLOT": 4000,
-  "INTERVALS_PER_SLOT": 5,
-  "MILLISECONDS_PER_INTERVAL": 800,
+  "INTERVALS_PER_SLOT": 4,
+  "MILLISECONDS_PER_INTERVAL": 1000,
   "HISTORICAL_ROOTS_LIMIT": 262144,
+  "HEARTBEAT_COMMITTEE_SIZE": 16,
+  "RLMD_LOOKBACK_LIMIT": 8,
   "FORK_DIGEST": "12345678"
 }
 ```
 
 `FORK_DIGEST` is the 4-byte hex string (no `0x` prefix) embedded in gossipsub topic names.
+
+`HEARTBEAT_COMMITTEE_SIZE` is the network's configured `K`, read from the persisted
+store rather than from the config file on disk — the value is adopted once at first
+boot and a later config edit is warned about, not applied. It is served here because
+a mismatched `K` across a network is a fork-choice divergence that produces no
+error, only disagreement, so this endpoint is how you check for agreement.
 
 ### `GET /lean/v0/genesis`
 
@@ -156,9 +164,16 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
   "justified": { "slot": 128, "root": "0x…" },
   "finalized": { "slot": 96,  "root": "0x…" },
   "safe_target": "0x…",
+  "lagging_head": "0x…",
   "validator_count": 16
 }
 ```
+
+`head` is the *fast* head: GHOST-Eph over the previous slot's heartbeat committee
+votes, rooted at `lagging_head`. `lagging_head` is the RLMD-window tree base,
+computed over the last `RLMD_LOOKBACK_LIMIT` slots at a `ceil(2n/3)` threshold. A
+frozen `lagging_head` under a moving `head` is the RLMD-window failure signature,
+which is why both are exposed.
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
 

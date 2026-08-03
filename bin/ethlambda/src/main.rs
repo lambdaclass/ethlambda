@@ -205,9 +205,21 @@ async fn main() -> eyre::Result<()> {
         .filter(|url| !url.is_empty())
         .collect();
 
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+    let mut store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
         .await
         .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+
+    // Adopt the genesis config's HEARTBEAT_COMMITTEE_SIZE on first boot only; a
+    // persisted value wins thereafter, because committee membership decides which
+    // bits of an imported block count as heartbeat votes and a restart must not
+    // change that silently. A mismatch is warned about, not applied.
+    store
+        .reconcile_heartbeat_committee_size(genesis_config.heartbeat_committee_size)
+        .inspect_err(|err| error!(%err, "Failed to persist heartbeat committee size"))?;
+    info!(
+        heartbeat_committee_size = store.heartbeat_committee_size(),
+        "Heartbeat committee configured"
+    );
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 

@@ -1,12 +1,24 @@
 //! Committee-signature aggregation: off-thread worker orchestration and the
 //! pure functions it runs.
 //!
-//! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
-//! threshold is met — via
+//! The blockchain actor fires one aggregation session per slot via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
 //! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
+//!
+//! Two roles trigger a session, and either can start it at interval 2 or up to
+//! [`EARLY_AGGREGATION_WINDOW`] early once its own threshold is met:
+//!
+//! - a **committee aggregator**, whose threshold is 2/3 of the signatures expected
+//!   from its subscribed subnets, and which selects up to [`MAX_AGGREGATION_JOBS`]
+//!   jobs from the subnet pool;
+//! - the **next slot's proposer**, whose threshold is the safe target's
+//!   `ceil(3K'/4)` of the heartbeat committee, and which runs exactly one job over
+//!   those heartbeat votes (see [`crate::heartbeat_fold`]).
+//!
+//! Both job kinds share this worker, deadline, and result path, so a folded
+//! heartbeat aggregate reaches the block builder through the ordinary payload pool
+//! rather than a private channel.
 //!
 //! [`snapshot_aggregation_inputs`] builds the session's job list with a tiered
 //! greedy selector modeled on `block_builder::select_attestations`: an
@@ -14,8 +26,7 @@
 //! aggregation material once (raw-first + trim, see [`resolve_job`]), then a
 //! pure in-memory loop scores and orders candidates by consensus value
 //! (current-slot before stale, then Finalize > Justify > Build), emitting at
-//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to a
-//! single job in the slot before one of our validators proposes.
+//! most `max_jobs` jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -45,7 +56,10 @@ use crate::{MILLISECONDS_PER_INTERVAL, metrics};
 /// started early (see `maybe_start_early_aggregation`) ends correspondingly
 /// earlier. The deadline only stops new jobs from starting — a job mid-proof
 /// finishes and publishes right after.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
+///
+/// Derived from the interval width rather than written as a literal so it keeps
+/// meaning "one interval" across changes to the interval grid.
+pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(MILLISECONDS_PER_INTERVAL);
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
@@ -66,6 +80,20 @@ const _: () = assert!(
     "EARLY_AGGREGATION_WINDOW must not exceed one interval"
 );
 
+/// Where a job's raw signatures came from.
+///
+/// Only affects which histogram the prover time lands in: the heartbeat fold has
+/// its own deadline pressure (it must finish before the proposer's interval-3
+/// build), so merging its timing into the committee session's would hide exactly
+/// the signal that tells you whether a chosen `K` still fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobSource {
+    /// Gossip signatures and payload-only merges from the attestation subnets.
+    Subnet,
+    /// Raw committee signatures from the global heartbeat topic.
+    Heartbeat,
+}
+
 /// A single pre-prepared aggregation group.
 ///
 /// Built on the actor thread from a store snapshot; consumed by an off-thread
@@ -83,6 +111,7 @@ pub struct AggregationJob {
     pub(crate) raw_ids: Vec<u64>,
     /// Gossip-signature keys to delete on successful aggregation.
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
+    pub(crate) source: JobSource,
 }
 
 impl AggregationJob {
@@ -177,6 +206,10 @@ impl Message for EarlyAggregationCheck {
 /// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
+///
+/// A session run because we propose the next slot uses one job instead, spent on
+/// the heartbeat committee's votes; see
+/// `BlockChainServer::start_aggregation_session`.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
@@ -200,9 +233,10 @@ pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 ///
 /// Stops early when no remaining candidate scores (converged).
 ///
-/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
-/// the caller is about to build a block at interval 4 (see
-/// `BlockChainServer::start_aggregation_session`).
+/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session. A session run
+/// because we propose the next slot prefers a single heartbeat job instead
+/// ([`crate::heartbeat_fold::heartbeat_aggregation_snapshot`]) and only falls back
+/// here, with `max_jobs = 1`, when nothing is foldable.
 pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
@@ -312,7 +346,7 @@ pub fn snapshot_aggregation_inputs(
         // Fold the job's realized coverage into the shared projection so
         // same-target candidates re-tier across rounds exactly as the block
         // builder's post-state would.
-        projected.advance(score.tier, att_data, coverage.iter().copied());
+        projected.advance(score.effect, att_data, coverage.iter().copied());
 
         jobs.push(job);
     }
@@ -480,6 +514,7 @@ fn resolve_job(
         raw_sigs,
         raw_ids,
         keys_to_delete,
+        source: JobSource::Subnet,
     })
 }
 
@@ -530,7 +565,10 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     let data_root = job.hashed.root();
 
     let proof_data = {
-        let _timing = metrics::time_pq_sig_aggregated_signatures_building();
+        let _timing = match job.source {
+            JobSource::Subnet => metrics::time_pq_sig_aggregated_signatures_building(),
+            JobSource::Heartbeat => metrics::time_heartbeat_fold(),
+        };
         aggregate_mixed(
             job.children,
             job.raw_pubkeys,
@@ -1035,6 +1073,7 @@ mod tests {
                 raw_sigs: Vec::new(),
                 raw_ids: coverage.into_iter().collect(),
                 keys_to_delete: Vec::new(),
+                source: JobSource::Subnet,
             }
         };
 
@@ -1128,6 +1167,7 @@ mod tests {
                 raw_sigs: Vec::new(),
                 raw_ids: coverage.into_iter().collect(),
                 keys_to_delete: Vec::new(),
+                source: JobSource::Subnet,
             }
         };
 

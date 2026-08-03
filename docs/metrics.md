@@ -49,7 +49,9 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 
 | Name   | Type  | Usage | Sample collection event | Labels | Buckets | Supported |
 |--------|-------|-------|-------------------------|--------|---------|-----------|
-| `lean_head_slot` | Gauge | Latest slot of the lean chain | On get fork choice head | | | ✅ |
+| `lean_head_slot` | Gauge | Latest slot of the lean chain (the fast head) | On get fork choice head | | | ✅ |
+| `lean_fast_head_slot` | Gauge | Fast head slot (GHOST-Eph over the previous slot's committee votes) | Each tick | | | ❌ |
+| `lean_lagging_head_slot` | Gauge | Lagging head slot: the RLMD-window tree base the fast head sits on | Each tick | | | ❌ |
 | `lean_current_slot` | Gauge | Current slot of the lean chain | On scrape | | | ✅(*) |
 | `lean_safe_target_slot` | Gauge | Safe target slot | On safe target update | | | ✅ |
 |`lean_fork_choice_block_processing_time_seconds`| Histogram | Time taken to process block | On fork choice process block | | 0.005, 0.01, 0.025, 0.05, 0.1, 1, 1.25, 1.5, 2, 4 | ✅ |
@@ -58,12 +60,25 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |`lean_attestation_validation_time_seconds`| Histogram | Time taken to validate attestation | On validate attestation | | 0.005, 0.01, 0.025, 0.05, 0.1, 1 | ✅ |
 | `lean_fork_choice_reorgs_total` | Counter | Total number of fork choice reorgs | On fork choice reorg | | | ✅ |
 | `lean_fork_choice_reorg_depth` | Histogram | Depth of fork choice reorgs (in blocks) | On fork choice reorg | | 1, 2, 3, 5, 7, 10, 20, 30, 50, 100 | ✅ |
-| `lean_tick_interval_duration_seconds` | Histogram | Elapsed time between clock ticks in seconds | At the start of each tick interval | | 0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6 | ✅ |
+| `lean_tick_interval_duration_seconds` | Histogram | Elapsed time between clock ticks in seconds | At the start of each tick interval | | 0.5, 0.75, 0.9, 1.0, 1.005, 1.01, 1.015, 1.02, 1.025, 1.05, 1.1, 1.25, 1.5, 2.0 | ✅ |
 | `lean_gossip_signatures` | Gauge | Number of gossip signatures in fork-choice store | On gossip signatures update | | | ✅ |
 | `lean_latest_new_aggregated_payloads` | Gauge | Number of new aggregated payload items | On `latest_new_aggregated_payloads` update | | | ✅ |
 | `lean_latest_known_aggregated_payloads` | Gauge | Number of known aggregated payload items | On `latest_known_aggregated_payloads` update | | | ✅ |
 | `lean_committee_signatures_aggregation_time_seconds` | Histogram | Time taken to aggregate committee signatures | On committee signatures aggregation | | 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
 | `lean_node_sync_status` | Gauge | Node sync status | On node sync status change | status=idle,syncing,synced | | ✅ |
+
+### Heartbeat / two-tier fork choice
+
+| Name   | Type  | Usage | Sample collection event | Labels | Buckets | Supported |
+|--------|-------|-------|-------------------------|--------|---------|-----------|
+| `lean_heartbeat_votes_received_total` | Counter | Heartbeat votes recorded, by where they arrived from. Read against `lean_fast_head_window_slots` this is the view-merge health signal: gossip winning means gossip beat the block | On heartbeat vote insert | source=gossip,block | | ❌ |
+| `lean_heartbeat_votes_in_block` | Histogram | Committee bits extracted from an imported block. Recovers the observability a dedicated body field would have given | On block import | | 0, 1, 2, 4, 8, 12, 16, 24, 32, 64 | ❌ |
+| `lean_heartbeat_entries_in_block` | Histogram | Distinct `Tier::Heartbeat` entries packed. At `MAX_ATTESTATIONS_DATA` committee votes are being truncated and `Tier::Finalize` is starved — note it is the *entry* count that matters, not the bit count | On block build | | 0, 1, 2, 3, 4, 8, 16, 32, 64 | ❌ |
+| `lean_heartbeat_committee_participation` | Gauge | Distinct committee voters holding a vote for the last slot. Against `ceil(3K'/4)` this is the safe-target stall predictor | On heartbeat vote insert | | | ❌ |
+| `lean_heartbeat_committee_size` | Gauge | Effective committee size `K' = min(K, n)`, so a config disagreement across a network is visible without reading configs | On safe target update | | | ❌ |
+| `lean_fast_head_window_slots` | Histogram | Slots the fast head's expanding vote window had to walk back. Greater than 1 means slots were missed | On head update | | 0, 1, 2, 3, 4, 6, 8 | ❌ |
+| `lean_heartbeat_fold_time_seconds` | Histogram | `aggregate_mixed` cost in the heartbeat fold, separate from the committee session. This is what tells you whether a chosen `K` still fits inside interval 1 | On heartbeat fold | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2 | ❌ |
+| `lean_heartbeat_fold_skipped_total` | Counter | Folds skipped because every buffered signer was already covered (`B \ A` empty) — the free path | On heartbeat fold snapshot | | | ❌ |
 
 ## State Transition Metrics
 

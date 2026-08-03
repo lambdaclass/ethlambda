@@ -1,5 +1,7 @@
-use axum::{Router, response::IntoResponse, routing::get};
-use ethlambda_blockchain::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT};
+use axum::{Router, extract::State as AxumState, response::IntoResponse, routing::get};
+use ethlambda_blockchain::{
+    INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, RLMD_LOOKBACK_LIMIT,
+};
 use ethlambda_storage::Store;
 use ethlambda_types::{constants::FORK_DIGEST, state::HISTORICAL_ROOTS_LIMIT};
 use serde::Serialize;
@@ -16,16 +18,27 @@ struct SpecResponse {
     ms_per_interval: u64,
     #[serde(rename = "HISTORICAL_ROOTS_LIMIT")]
     historical_roots_limit: u64,
+    /// The network's configured heartbeat committee size, `K`.
+    ///
+    /// Served next to the interval constants so a devnet can be checked for
+    /// agreement without reading configs: a mismatched `K` is a fork-choice
+    /// divergence that produces no error, only disagreement.
+    #[serde(rename = "HEARTBEAT_COMMITTEE_SIZE")]
+    heartbeat_committee_size: u64,
+    #[serde(rename = "RLMD_LOOKBACK_LIMIT")]
+    rlmd_lookback_limit: u64,
     #[serde(rename = "FORK_DIGEST")]
     fork_digest: &'static str,
 }
 
-async fn get_spec() -> impl IntoResponse {
+async fn get_spec(AxumState(store): AxumState<Store>) -> impl IntoResponse {
     json_response(SpecResponse {
         ms_per_slot: MILLISECONDS_PER_SLOT,
         intervals_per_slot: INTERVALS_PER_SLOT,
         ms_per_interval: MILLISECONDS_PER_INTERVAL,
         historical_roots_limit: HISTORICAL_ROOTS_LIMIT as u64,
+        heartbeat_committee_size: store.heartbeat_committee_size(),
+        rlmd_lookback_limit: RLMD_LOOKBACK_LIMIT,
         fork_digest: FORK_DIGEST,
     })
 }
@@ -43,8 +56,9 @@ mod tests {
         http::{Request, StatusCode},
     };
     use ethlambda_blockchain::{
-        INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+        INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, RLMD_LOOKBACK_LIMIT,
     };
+    use ethlambda_state_transition::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_storage::{Store, backend::InMemoryBackend};
     use ethlambda_types::state::HISTORICAL_ROOTS_LIMIT;
     use http_body_util::BodyExt;
@@ -74,6 +88,11 @@ mod tests {
             json["HISTORICAL_ROOTS_LIMIT"],
             HISTORICAL_ROOTS_LIMIT as u64
         );
+        assert_eq!(
+            json["HEARTBEAT_COMMITTEE_SIZE"],
+            DEFAULT_HEARTBEAT_COMMITTEE_SIZE
+        );
+        assert_eq!(json["RLMD_LOOKBACK_LIMIT"], RLMD_LOOKBACK_LIMIT);
         assert_eq!(json["FORK_DIGEST"], FORK_DIGEST);
     }
 }
