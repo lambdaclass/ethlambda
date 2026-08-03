@@ -551,6 +551,15 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
+    /// Cached copy of the persisted [`ChainConfig`].
+    ///
+    /// The config is written once at bootstrap and has no setter, so a plain copy
+    /// per `Store` cannot go stale: sharing it behind an `Arc` would buy nothing.
+    /// It stays in `Table::Metadata` under `KEY_CONFIG` because `from_db_state`
+    /// reads it back to reject a DB whose `genesis_time` disagrees with the config
+    /// file; this field only spares every caller a backend round trip and a
+    /// `Result` it could never act on.
+    config: ChainConfig,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
@@ -636,6 +645,7 @@ impl Store {
         }
         let store = Self {
             backend,
+            config: persisted_config,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -748,6 +758,7 @@ impl Store {
 
         Ok(Self {
             backend,
+            config: anchor_state.config,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -796,8 +807,11 @@ impl Store {
     // ============ Config ============
 
     /// Returns the chain configuration.
-    pub fn config(&self) -> Result<ChainConfig, Error> {
-        self.get_metadata(KEY_CONFIG)
+    ///
+    /// Infallible: the config is fixed at bootstrap and cached in the `Store`,
+    /// so this never reads the backend.
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
     }
 
     // ============ Head ============
@@ -1801,6 +1815,7 @@ mod tests {
             let backend = Arc::new(InMemoryBackend::new());
             Self {
                 backend,
+                config: ChainConfig { genesis_time: 0 },
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -1815,6 +1830,7 @@ mod tests {
         fn test_store_with_backend(backend: Arc<InMemoryBackend>) -> Self {
             Self {
                 backend,
+                config: ChainConfig { genesis_time: 0 },
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
