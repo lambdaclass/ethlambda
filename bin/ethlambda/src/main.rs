@@ -709,18 +709,10 @@ async fn fetch_initial_state(
         // `SIGNATURE_PRUNING_RANGE`, so beyond that horizon they cannot serve
         // the history the node is missing.
         if checkpoint_urls.is_empty() {
-            warn!(
-                head_slot,
-                current_slot,
-                gap,
-                "Existing DB state is stale; no checkpoint sync URL, resuming anyway"
-            );
+            warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
             return Ok(store);
         }
-        warn!(
-            head_slot,
-            current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
-        );
+        warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
     }
 
     if checkpoint_urls.is_empty() {
