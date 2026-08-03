@@ -54,19 +54,14 @@ impl StepError {
 /// report as an unclassified rejection rather than accepting silently. The match
 /// is exhaustive so a new [`StoreError`] variant forces that decision here.
 ///
-/// Two variants are context-dependent and classified for the gossip path they
-/// are reached through in fixtures:
-///
-/// * `InvalidValidatorIndex` is raised both for a gossip attestation from an
-///   unregistered validator (`VALIDATOR_NOT_IN_STATE`) and for a block-level
-///   participant bounds check (`VALIDATOR_INDEX_OUT_OF_RANGE`, spec
-///   `signatures.py`). Only the former has fixtures today.
-/// * `StateTransitionFailed` defers to the state-transition classification,
-///   which the STF runner asserts directly.
+/// `StateTransitionFailed` is the one context-dependent variant: it defers to
+/// the state-transition classification, which the STF runner asserts directly.
 pub fn rejection_reason(err: &StoreError) -> Option<RejectionReason> {
     let reason = match err {
         StoreError::MissingParentState { .. } => RejectionReason::UnknownParentBlock,
-        StoreError::InvalidValidatorIndex => RejectionReason::ValidatorNotInState,
+        StoreError::ValidatorNotInState { .. } => RejectionReason::ValidatorNotInState,
+        StoreError::AttesterIndexOutOfRange { .. } => RejectionReason::ValidatorIndexOutOfRange,
+        StoreError::ProposerIndexOutOfRange { .. } => RejectionReason::ProposerIndexOutOfRange,
         StoreError::SignatureDecodingFailed | StoreError::SignatureVerificationFailed => {
             RejectionReason::InvalidSignature
         }
