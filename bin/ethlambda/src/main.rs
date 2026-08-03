@@ -694,7 +694,6 @@ async fn fetch_initial_state(
             info!(head_slot, current_slot, gap, "Resuming from existing DB");
             return Ok(store);
         }
-        warn!(head_slot, current_slot, gap, "Existing DB state is stale");
         // No checkpoint URL was configured, so just run the node against the
         // data directory it was given: that is the setup asked for, and there
         // is no anchor to switch to. The warning is the point of this arm,
@@ -703,10 +702,18 @@ async fn fetch_initial_state(
         // `SIGNATURE_PRUNING_RANGE`, so beyond that horizon they cannot serve
         // the history the node is missing.
         if checkpoint_urls.is_empty() {
-            warn!("No checkpoint sync URL provided, resuming from existing stale DB");
+            warn!(
+                head_slot,
+                current_slot,
+                gap,
+                "Existing DB state is stale; no checkpoint sync URL, resuming anyway"
+            );
             return Ok(store);
         }
-        warn!("Falling through to checkpoint sync");
+        warn!(
+            head_slot,
+            current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
+        );
     }
 
     if checkpoint_urls.is_empty() {
