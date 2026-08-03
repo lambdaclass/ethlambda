@@ -45,10 +45,8 @@ pub struct VerifySignaturesTest {
     pub anchor_state: TestState,
     #[serde(rename = "signedBlock")]
     pub signed_block: TestSignedBlock,
-    /// Expected rejection reason, when present. Newer fixtures name this field
-    /// `rejectionReason` (leanSpec replaced `expectException`); both
-    /// spellings are accepted.
-    #[serde(default, rename = "rejectionReason", alias = "expectException")]
+    /// Expected rejection reason, when present.
+    #[serde(default, rename = "rejectionReason")]
     pub rejection_reason: Option<RejectionReason>,
     /// Aggregation proof regime (see [`crate::fork_choice::ForkChoiceTest`]).
     /// Captured only so `deny_unknown_fields` accepts it.

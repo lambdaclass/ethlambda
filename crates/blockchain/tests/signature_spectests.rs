@@ -40,6 +40,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         println!("Running test: {}", name);
 
+        // Read before the fixture is consumed field by field below.
+        let expected_reason = test.rejection_reason.clone();
+
         // Step 1: Populate the pre-state with the test fixture
         let anchor_state: State = test.anchor_state.into();
 
@@ -70,7 +73,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 
         // Step 3: Check that it succeeded or failed as expected, and that a
         // rejection is the one the fixture named rather than any failure at all.
-        match (result, test.rejection_reason.as_ref()) {
+        match (result, expected_reason.as_ref()) {
             (Ok(_), None) => {
                 // Expected success, got success
             }
