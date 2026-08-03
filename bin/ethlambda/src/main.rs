@@ -695,6 +695,13 @@ async fn fetch_initial_state(
             return Ok(store);
         }
         warn!(head_slot, current_slot, gap, "Existing DB state is stale");
+        // No checkpoint URL was configured, so just run the node against the
+        // data directory it was given: that is the setup asked for, and there
+        // is no anchor to switch to. The warning is the point of this arm,
+        // since the DB is known to be stale and range sync may not be able to
+        // close a gap this large: peers prune block signatures past
+        // `SIGNATURE_PRUNING_RANGE`, so beyond that horizon they cannot serve
+        // the history the node is missing.
         if checkpoint_urls.is_empty() {
             warn!("No checkpoint sync URL provided, resuming from existing stale DB");
             return Ok(store);
