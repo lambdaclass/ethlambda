@@ -288,7 +288,10 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ## HTTP Servers (API + Metrics)
 
-The RPC crate runs two independent Axum servers (API on `:5052`, metrics/debug on `:5054`). See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
+The RPC crate serves the API router (`--api-port`, default 5052) and the metrics/debug routers
+(`--metrics-port`, default 5054). When the two ports differ it binds two independent Axum servers;
+when they are equal it merges all three routers onto a single listener, so pointing both flags at
+one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Configuration Files
 
