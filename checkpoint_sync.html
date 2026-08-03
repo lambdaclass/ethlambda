@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-65f9fda8.js";
+            window.path_to_searchindex_js = "searchindex-69dc5805.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -197,7 +197,7 @@
   --node-id ethlambda_0
 </code></pre>
 <p>Where <code>&lt;URL&gt;</code> is the address of a checkpoint source (see <a href="#checkpoint-sources">Checkpoint Sources</a> below).</p>
-<p>When <code>--checkpoint-sync-url</code> is omitted, the node initializes from genesis.</p>
+<p>State already on disk takes precedence over both checkpoint sync and genesis: if the data directory holds a previous run’s chain state for this network, the node resumes from it. <code>--checkpoint-sync-url</code> is the fallback for when there is nothing resumable on disk, or when what is there has fallen too far behind (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>). With no resumable state and no URL, the node initializes from genesis.</p>
 <h2 id="checkpoint-sources"><a class="header" href="#checkpoint-sources">Checkpoint Sources</a></h2>
 <h3 id="direct-peer"><a class="header" href="#direct-peer">Direct peer</a></h3>
 <p>Any running node that serves the finalized state as SSZ can be used as a checkpoint source, not just ethlambda. For ethlambda nodes, the endpoint is <code>/lean/v0/states/finalized</code>.</p>
@@ -222,7 +222,26 @@
 <h3 id="failure-and-success"><a class="header" href="#failure-and-success">Failure and success</a></h3>
 <p>If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.</p>
 <p>After successful initialization, the node starts normally: it connects to the P2P network and begins participating from the checkpoint slot.</p>
-<p>If the data directory (<code>./data</code>) already contains state from a previous run, checkpoint sync writes the new anchor state on top without clearing existing data. For a clean checkpoint sync, remove the data directory first.</p>
+<h2 id="restarts-and-existing-state"><a class="header" href="#restarts-and-existing-state">Restarts and Existing State</a></h2>
+<p>A node restarted against a populated data directory resumes from disk rather than re-initializing, so no flag is needed to preserve the chain across a redeploy. The decision is made before any download:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>State in data directory</th><th><code>--checkpoint-sync-url</code></th><th>Result</th></tr>
+</thead>
+<tbody>
+<tr><td>None, or from another network (<code>GENESIS_TIME</code> differs)</td><td>omitted</td><td>Initialize from genesis</td></tr>
+<tr><td>None, or from another network</td><td>set</td><td>Checkpoint sync</td></tr>
+<tr><td>Present, head within the resume window</td><td>either</td><td>Resume from disk (no download)</td></tr>
+<tr><td>Present, head beyond the resume window</td><td>set</td><td>Checkpoint sync</td></tr>
+<tr><td>Present, head beyond the resume window</td><td>omitted</td><td>Resume from disk anyway, with a warning</td></tr>
+</tbody>
+</table>
+</div>
+<p>The resume window is <code>MAX_RESUMABLE_DB_STATE_AGE</code> (450 slots, ~30 minutes at 4-second slots) measured as <code>current_slot - head_slot</code>. Staleness is measured against the head, not the finalized checkpoint, so a node whose head is current still resumes during a finality stall.</p>
+<p>Beyond that window the node prefers a checkpoint when one is offered, since catching up over P2P costs more than downloading a recent state. With no URL configured there is no anchor to switch to, so the node simply runs against the data directory it was given: that is the setup that was asked for. The warning is there because range sync may not be able to close a gap this large. Peers prune block signatures past <code>SIGNATURE_PRUNING_RANGE</code> (21600 slots, ~1 day), so beyond that horizon they cannot serve the history the node is missing and it needs a checkpoint URL to catch up at all. The warning logs the gap so this is visible in the boot log.</p>
+<p>When a checkpoint URL <em>is</em> set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for “resume whatever is on disk”; that path never exits.</p>
+<p>To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.</p>
 <h2 id="verification-checks"><a class="header" href="#verification-checks">Verification Checks</a></h2>
 <p>All checks are performed before the state is accepted:</p>
 <div class="table-wrapper">
