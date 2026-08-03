@@ -72,6 +72,8 @@ The resume window is `MAX_RESUMABLE_DB_STATE_AGE` (450 slots, ~30 minutes at 4-s
 
 Beyond that window the node prefers a checkpoint when one is offered, since catching up over P2P costs more than downloading a recent state. With no URL to fall back on it resumes regardless and relies on P2P sync, because re-initializing from genesis would discard the existing history. That recovery only works while peers can still serve the missing range; past their block-signature pruning horizon (`SIGNATURE_PRUNING_RANGE`, 21600 slots, ~1 day) the node cannot catch up and needs a checkpoint URL. The warning logs the gap so this is visible in the boot log.
 
+When a checkpoint URL *is* set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for "resume whatever is on disk"; that path never exits.
+
 To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.
 
 ## Verification Checks

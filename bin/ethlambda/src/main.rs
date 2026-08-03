@@ -655,6 +655,13 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 /// An empty `checkpoint_urls` creates a genesis state from the local genesis
 /// configuration.
 ///
+/// Aborting when every URL fails is deliberate, and applies even when a stale
+/// resumable DB is in hand: an operator who configured a checkpoint URL asked
+/// for a specific anchor, so an unreachable one is a misconfiguration to
+/// surface at boot rather than paper over by silently starting a node that is
+/// hours behind. Dropping the flag is the way to say "resume whatever is on
+/// disk"; that path never aborts.
+///
 /// Fetching the matching signed block lets the local store serve a valid
 /// anchor via the `BlocksByRoot` req-resp protocol; without it, peers
 /// requesting the anchor would receive a synthetic block whose hash differs
