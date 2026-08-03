@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ethlambda_state_transition::state_transition;
+use ethlambda_state_transition::{process_block, state_transition};
 use ethlambda_test_fixtures::{RejectionReason, rejection::check_rejection_reason};
 use ethlambda_types::{
     block::Block,
@@ -13,27 +13,36 @@ use crate::types::PostState;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "state_transition_test";
 
-/// Fixtures this runner cannot replay, matched as substrings of the test name.
+/// Fixtures to replay through `process_block` alone, matched as substrings of
+/// the test name.
 ///
-/// Both entries are authored against leanSpec's `BlockSpec.skip_slot_processing`,
-/// which drives the filler to call `process_block` alone. The flag never reaches
-/// the emitted fixture (`StateTransitionFixture` carries only `pre`, `blocks`,
-/// `post`, `postStateRoot` and `rejectionReason`), and the failing block is
-/// written with a zero `stateRoot`, so replaying `state_transition()` as the
-/// fixture format prescribes always advances the slot first and then dies on the
-/// state root instead of hitting the rule under test. Nothing in the JSON marks
-/// the entry point, so no client can reproduce these two: ream, zeam, gean,
-/// lantern and grandine all "pass" them on the state-root mismatch because they
-/// assert only that *some* error occurred.
+/// Both entries are authored against leanSpec's `BlockSpec.skip_slot_processing`
+/// (`packages/testing/src/consensus_testing/test_types/block_spec.py`), which
+/// drives the filler to call `process_block` instead of `state_transition`, and
+/// to write the failing block with a placeholder zero `stateRoot`. That entry
+/// point never reaches the emitted fixture: `StateTransitionFixture` carries only
+/// `pre`, `blocks`, `post`, `postStateRoot` and `rejectionReason`. Replaying
+/// `state_transition()` as the format otherwise prescribes therefore runs
+/// `process_slots` first, which either makes the slots agree or rejects the block
+/// early, and the run dies before reaching the rule under test.
 ///
-/// Skip until leanSpec emits the entry point, or drops these vectors: they pin a
-/// Python-level API contract rather than cross-client behaviour.
-const SKIP_TESTS: &[&str] = &[
-    // Expects BLOCK_SLOT_MISMATCH from `process_block` on a state at slot 1 with
-    // a block claiming slot 2; `process_slots` makes the slots agree first.
+/// So the entry point is supplied here, which is the one piece of information the
+/// JSON omits, rather than skipping the vectors: `process_block` alone does
+/// enforce both rules and reports exactly the reason each fixture names. Scoped
+/// to these two names, not applied as a general "retry under another entry point"
+/// fallback, which would let any negative fixture pass on whichever path happens
+/// to produce the expected reason.
+///
+/// Upstream: the flag arrived in leanSpec PR #161 and grew a
+/// `check_state_transition` sibling in PR #1186, but nothing emits either into
+/// the fixture yet. Drop this list once something does; a vector that no longer
+/// needs the override then fails here loudly instead of passing quietly.
+const PROCESS_BLOCK_ONLY_TESTS: &[&str] = &[
+    // BLOCK_SLOT_MISMATCH from a state at slot 1 and a block claiming slot 2;
+    // `process_slots` would make the slots agree first.
     "test_block_with_wrong_slot",
-    // Expects BLOCK_OLDER_THAN_LATEST_HEADER from a second block at the tip's
-    // slot; `process_slots` rejects the first block before the header check runs.
+    // BLOCK_OLDER_THAN_LATEST_HEADER from a second block at the tip's slot;
+    // `process_slots` would reject the first block before the header check runs.
     "test_block_at_parent_slot_rejected_when_slot_processing_skipped",
 ];
 
@@ -49,9 +58,18 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             )
             .into());
         }
-        if let Some(skip) = SKIP_TESTS.iter().find(|skip| name.contains(*skip)) {
-            println!("Skipping {skip} (see SKIP_TESTS comment)");
-            continue;
+        // Which entry point replays this fixture (see `PROCESS_BLOCK_ONLY_TESTS`).
+        let process_block_only = PROCESS_BLOCK_ONLY_TESTS
+            .iter()
+            .any(|entry| name.contains(entry));
+        // Skipping slot processing also skips the post-state root check, so the
+        // override is only sound for a fixture that asserts a rejection.
+        if process_block_only && test.post.is_some() {
+            return Err(format!(
+                "Test '{name}' is listed in PROCESS_BLOCK_ONLY_TESTS but carries a `post`, \
+                 which `process_block` alone cannot verify. Remove it from the list."
+            )
+            .into());
         }
         println!("Running test: {}", name);
 
@@ -73,7 +91,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             let block: Block = block.into();
             let label = format!("block_{}", i + 1);
             block_registry.insert(label, block.hash_tree_root());
-            result = state_transition(&mut pre_state, &block);
+            result = if process_block_only {
+                process_block(&mut pre_state, &block)
+            } else {
+                state_transition(&mut pre_state, &block)
+            };
             if result.is_err() {
                 break;
             }
