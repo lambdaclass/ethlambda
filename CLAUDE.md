@@ -359,14 +359,21 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
   headers and bodies are kept forever. `get_signed_block` returns `None` for a
   pruned finalized block
 - States are stored as parent-linked diffs (`StateDiffs`, never pruned) plus
-  full-state snapshots (`States`) written only at 1024-slot anchors (and the
-  bootstrap). Neither is ever pruned. `get_state` returns an anchor snapshot or
-  reconstructs by walking diffs back to the nearest anchor; results are memoized
-  in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
+  full-state snapshots (`States`) written only every `SNAPSHOT_ANCHOR_INTERVAL`
+  slots (and the bootstrap). Neither is ever pruned. `get_state` returns an anchor
+  snapshot or reconstructs by walking diffs back to the nearest anchor; results are
+  memoized in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
+- `StateDiff` omits `config` and `validators` entirely and takes them from the
+  nearest ancestor snapshot: an STF that ever mutated either would silently corrupt
+  every reconstructed state. `historical_block_hashes` is likewise not stored but
+  regenerated from `base_root` plus the slot gap, guarded by `validate_history_append`
 - `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
+- `BlockRoots` is the canonical `slot → root` index, rewritten on every head update:
+  `block_root_index_changes` walks both branches to their common ancestor, so a reorg
+  deletes the slots leaving the canonical chain and writes the ones joining it
 - Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
 
-### Storage Tables (7)
+### Storage Tables (8)
 
 These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
 
@@ -375,15 +382,28 @@ These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
 | `BlockHeaders` | H256 → BlockHeader | Block headers by root |
 | `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
 | `BlockSignatures` | (slot\|\|root) → BlockSignatures | Type-2 proof blob; keyed slot\|\|root so pruning scans in slot order and stops early; absent for genesis, pruned below finalized |
-| `States` | H256 → State | Full-state snapshots; bootstrap + 1024-slot anchors only; never pruned |
+| `BlockRoots` | slot → H256 | Canonical block root per slot; rewritten on reorg, never pruned. Backs `get_block_by_slot` and BlocksByRange serving |
+| `States` | H256 → State | Full-state snapshots; bootstrap + `SNAPSHOT_ANCHOR_INTERVAL` anchors only; never pruned |
 | `StateDiffs` | H256 → StateDiff | Parent-linked state diff per non-genesis state; never pruned |
-| `Metadata` | string → various | Store state (head, config, checkpoints) |
+| `Metadata` | string → various | Store state (time, config, head, safe target, checkpoints) |
 | `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
 
 Attestations and gossip signatures are **not** persisted tables; they live in
 in-memory `Store` buffers (`new_payloads`, `known_payloads`, `gossip_signatures`)
 and are consumed during the tick pipeline (promotion at intervals 0/4,
 aggregation at interval 2).
+
+### What Is Constant in the DB
+
+`Metadata["config"]` (a `ChainConfig`, currently just `genesis_time`) is written once
+at bootstrap and never rewritten: it has a getter but no setter. It doubles as the
+DB fingerprint, since `from_db_state` refuses to resume a DB whose persisted
+`genesis_time` disagrees with the config file.
+
+The genesis validator registry is constant too, but it lives inside each `States`
+snapshot rather than in its own table. Everything else moves: the remaining
+`Metadata` keys are mutated in place, `BlockRoots` is rewritten on reorg, and the
+block/state tables are write-once per entry with a growing key set.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition
