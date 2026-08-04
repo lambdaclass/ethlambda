@@ -125,8 +125,7 @@ fn resolve_fold_job(
     known_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
 ) -> Option<AggregationJob> {
-    let (children, accepted_child_ids) =
-        select_fold_children(new_proofs, known_proofs, HashSet::new(), validators);
+    let (children, accepted_child_ids) = select_fold_children(new_proofs, known_proofs, validators);
     let covered: HashSet<u64> = accepted_child_ids.iter().copied().collect();
 
     // B \ A, in ascending validator order (XMSS aggregation requires it, which
@@ -187,10 +186,9 @@ fn resolve_fold_job(
 fn select_fold_children(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
-    seed_covered: HashSet<u64>,
     validators: &[Validator],
 ) -> (Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>, Vec<u64>) {
-    let mut covered = seed_covered;
+    let mut covered: HashSet<u64> = HashSet::new();
     let mut children = Vec::new();
     let mut child_ids: Vec<u64> = Vec::new();
 

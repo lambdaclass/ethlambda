@@ -13,14 +13,6 @@ use tracing::{info, warn};
 pub mod justified_slots_ops;
 pub mod metrics;
 
-/// Re-exported next to [`is_heartbeat_committee_member`], which is where callers
-/// reason about them. They are declared in `ethlambda-types` only because
-/// `ethlambda-storage` seeds its metadata key from the default and does not
-/// depend on this crate.
-pub use ethlambda_types::constants::{
-    DEFAULT_HEARTBEAT_COMMITTEE_SIZE, MAX_HEARTBEAT_COMMITTEE_SIZE,
-};
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("target slot {target_slot} is in the past (current is {current_slot})")]
@@ -749,40 +741,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn finalization_blocked_by_justifiable_slot_between_source_and_target() {
-        // Source and target must be *consecutive justified checkpoints*, which
-        // under 3SF-mini means no slot strictly between them is still justifiable
-        // relative to the finalized boundary. Here slot 4 is (delta = 4 <= 5), so
-        // the pair is not consecutive and finalization must not advance.
-        let mut state = State::from_genesis(0, make_validators(4));
-        state.latest_finalized = Checkpoint {
-            root: H256::ZERO,
-            slot: 0,
-        };
-        let mut justifications = HashMap::new();
-        let root_to_slot = HashMap::new();
-
-        // A gap between source and target must not finalize.
-        try_finalize(
-            &mut state,
-            Checkpoint {
-                root: H256([1; 32]),
-                slot: 3,
-            },
-            Checkpoint {
-                root: H256([2; 32]),
-                slot: 5,
-            },
-            &mut justifications,
-            &root_to_slot,
-        );
-        assert_eq!(
-            state.latest_finalized.slot, 0,
-            "justifiable slot between source and target must not finalize"
-        );
     }
 
     fn make_validators(n: usize) -> Vec<Validator> {

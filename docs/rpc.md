@@ -57,7 +57,6 @@ Protocol constants the node runs with. Keys mirror the leanSpec constant names:
   "MILLISECONDS_PER_INTERVAL": 1000,
   "HISTORICAL_ROOTS_LIMIT": 262144,
   "HEARTBEAT_COMMITTEE_SIZE": 16,
-  "RLMD_LOOKBACK_LIMIT": 8,
   "FORK_DIGEST": "12345678"
 }
 ```
@@ -164,16 +163,9 @@ The fork-choice tree from the finalized root, with LMD-GHOST weights computed ov
   "justified": { "slot": 128, "root": "0x…" },
   "finalized": { "slot": 96,  "root": "0x…" },
   "safe_target": "0x…",
-  "lagging_head": "0x…",
   "validator_count": 16
 }
 ```
-
-`head` is the *fast* head: GHOST-Eph over the previous slot's heartbeat committee
-votes, rooted at `lagging_head`. `lagging_head` is the RLMD-window tree base,
-computed over the last `RLMD_LOOKBACK_LIMIT` slots at a `ceil(2n/3)` threshold. A
-frozen `lagging_head` under a moving `head` is the RLMD-window failure signature,
-which is why both are exposed.
 
 `/lean/v0/fork_choice/ui` serves an interactive D3.js page rendering this data. See [Fork Choice Visualization](./fork_choice_visualization.md).
 

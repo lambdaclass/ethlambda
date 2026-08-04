@@ -56,26 +56,10 @@ pub struct ProposerConfig {
     /// Proposer-side self-limit only; clamped to `MAX_ATTESTATIONS_DATA` during
     /// selection so the block never exceeds the cap `on_block` enforces.
     pub max_attestations_per_block: usize,
-}
-
-/// Identity and chain context of the block being built: everything that names
-/// *which* block this is, as opposed to *what* goes in it (the candidate payloads)
-/// or *how much* goes in it (the [`ProposerConfig`] policy).
-///
-/// Grouped rather than passed positionally because `slot` is load-bearing in two
-/// places at once — it is the block's own slot and, minus one, the slot whose
-/// committee the heartbeat tier packs — and because the three fields describing
-/// the parent are only meaningful together.
-pub(crate) struct BlockTarget<'a> {
-    pub(crate) head_state: &'a State,
-    pub(crate) slot: u64,
-    pub(crate) proposer_index: u64,
-    pub(crate) parent_root: H256,
-    pub(crate) known_block_roots: &'a HashSet<H256>,
     /// The network's `K`. Used only to classify entries into
     /// [`Tier::Heartbeat`], never to validate anything, so a stale value builds a
     /// worse block rather than an invalid one.
-    pub(crate) heartbeat_committee_size: u64,
+    pub heartbeat_committee_size: u64,
 }
 
 /// Build a valid block on top of this state.
@@ -103,18 +87,15 @@ pub(crate) struct BlockTarget<'a> {
 /// clamped to `MAX_ATTESTATIONS_DATA` so the block never exceeds the cap
 /// `on_block` enforces on incoming blocks.
 pub(crate) fn build_block(
-    target: BlockTarget<'_>,
+    head_state: &State,
+    slot: u64,
+    proposer_index: u64,
+    parent_root: H256,
+    known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     config: ProposerConfig,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
-    let BlockTarget {
-        head_state,
-        slot,
-        proposer_index,
-        parent_root,
-        known_block_roots,
-        heartbeat_committee_size,
-    } = target;
+    let heartbeat_committee_size = config.heartbeat_committee_size;
     info!(slot, proposer_index, "Building block");
 
     let select_start = Instant::now();
@@ -1065,7 +1046,7 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethlambda_state_transition::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
+    use ethlambda_types::constants::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
@@ -1629,18 +1610,16 @@ mod tests {
 
         // Build the block; this should succeed (the bug: no size guard)
         let (block, signatures, _post_checkpoints) = build_block(
-            BlockTarget {
-                head_state: &head_state,
-                slot,
-                proposer_index,
-                parent_root,
-                known_block_roots: &known_block_roots,
-                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
-            },
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
             &aggregated_payloads,
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -1778,18 +1757,16 @@ mod tests {
 
         let build = |limit: usize| {
             build_block(
-                BlockTarget {
-                    head_state: &head_state,
-                    slot,
-                    proposer_index,
-                    parent_root,
-                    known_block_roots: &known_block_roots,
-                    heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
-                },
+                &head_state,
+                slot,
+                proposer_index,
+                parent_root,
+                &known_block_roots,
                 &aggregated_payloads,
                 ProposerConfig {
                     enable_proposer_aggregation: false,
                     max_attestations_per_block: limit,
+                    heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
                 },
             )
             .expect("build_block should succeed")
@@ -1907,18 +1884,16 @@ mod tests {
         aggregated_payloads.insert(data_root, (att_data.clone(), proofs));
 
         let (block, signatures, _post_checkpoints) = build_block(
-            BlockTarget {
-                head_state: &head_state,
-                slot,
-                proposer_index,
-                parent_root,
-                known_block_roots: &known_block_roots,
-                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
-            },
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
             &aggregated_payloads,
             ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -2216,18 +2191,16 @@ mod tests {
         known_block_roots.insert(hashes[0]);
 
         let (block, _signatures, post_checkpoints) = build_block(
-            BlockTarget {
-                head_state: &head_state,
-                slot,
-                proposer_index,
-                parent_root,
-                known_block_roots: &known_block_roots,
-                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
-            },
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
             &aggregated_payloads,
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -2355,18 +2328,16 @@ mod tests {
         known_block_roots.insert(hashes[0]);
 
         let (block, _signatures, post_checkpoints) = build_block(
-            BlockTarget {
-                head_state: &head_state,
-                slot,
-                proposer_index,
-                parent_root,
-                known_block_roots: &known_block_roots,
-                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
-            },
+            &head_state,
+            slot,
+            proposer_index,
+            parent_root,
+            &known_block_roots,
             &aggregated_payloads,
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");

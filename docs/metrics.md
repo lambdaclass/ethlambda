@@ -49,8 +49,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 
 | Name   | Type  | Usage | Sample collection event | Labels | Buckets | Supported |
 |--------|-------|-------|-------------------------|--------|---------|-----------|
-| `lean_head_slot` | Gauge | Latest slot of the lean chain (the fast head) | On get fork choice head | | | ✅ |
-| `lean_fast_head_slot` | Gauge | Fast head slot (GHOST-Eph over the previous slot's committee votes) | Each tick | | | ❌ |
+| `lean_head_slot` | Gauge | Latest slot of the lean chain | On get fork choice head | | | ✅ |
 | `lean_lagging_head_slot` | Gauge | Lagging head slot: the RLMD-window tree base the fast head sits on | Each tick | | | ❌ |
 | `lean_current_slot` | Gauge | Current slot of the lean chain | On scrape | | | ✅(*) |
 | `lean_safe_target_slot` | Gauge | Safe target slot | On safe target update | | | ✅ |

@@ -262,6 +262,9 @@ async fn main() -> eyre::Result<()> {
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
+            // Read once here rather than per build: the persisted value is
+            // authoritative from first boot and cannot change at runtime.
+            heartbeat_committee_size: store.heartbeat_committee_size(),
         },
     };
 

@@ -92,10 +92,9 @@ pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 /// The four ticks inside a slot.
 ///
 /// Declared in wall-clock order; the discriminant is the interval index within
-/// the slot. `Aggregation` and `EndOfSlot` from the 5-interval grid are gone:
-/// committee aggregation is anchored to the interval-2 boundary rather than
-/// occupying a tick of its own, and the end-of-slot duties (promote payloads,
-/// log the tree, build the next block) fold into [`Self::HeadUpdate`].
+/// the slot. The 5-interval grid's `Aggregation` tick is gone: committee
+/// aggregation is now anchored to the interval-2 boundary rather than occupying
+/// a tick of its own, so its duties fold into [`Self::SafeTargetUpdate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
     /// 0 ms. The slot's block arrives; import merges committee bits into the
@@ -109,7 +108,7 @@ pub(crate) enum SlotInterval {
     SafeTargetUpdate,
     /// 3000 ms. `lagging_head` then `fast_head`; promote payloads, log the tree,
     /// and build + publish the next slot's block aligned to its slot boundary.
-    HeadUpdate,
+    EndOfSlot,
 }
 
 impl SlotInterval {
@@ -122,7 +121,7 @@ impl SlotInterval {
             0 => Self::BlockPublication,
             1 => Self::AttestationProduction,
             2 => Self::SafeTargetUpdate,
-            3 => Self::HeadUpdate,
+            3 => Self::EndOfSlot,
             _ => unreachable!("slots only have {INTERVALS_PER_SLOT} intervals"),
         }
     }
@@ -354,7 +353,7 @@ impl BlockChainServer {
         // needs (those stragglers surface in the `late` section instead). Skip
         // empty snapshots so a missed round keeps the last set we saw. Pure
         // observability.
-        if interval == SlotInterval::HeadUpdate
+        if interval == SlotInterval::EndOfSlot
             && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
         {
             self.pre_merge_coverage = Some(snapshot);
@@ -469,7 +468,7 @@ impl BlockChainServer {
             // `on_tick` skips the interval-0 tick whenever this build overruns
             // its interval. The head update itself runs inside `store::on_tick`
             // above, so the build sees this slot's `fast_head` as its parent.
-            SlotInterval::HeadUpdate => {
+            SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
                     .get_our_proposer(next_slot)
@@ -485,7 +484,6 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metrics (head may change when attestations are promoted at intervals 0/3)
         metrics::update_head_slot(self.store.head_slot());
-        metrics::update_fast_head_slot(self.store.head_slot());
         metrics::update_lagging_head_slot(self.store.lagging_head_slot());
 
         // Advance XMSS keys for next slot so the signing paths don't have to
@@ -1479,9 +1477,9 @@ impl BlockChainServer {
     }
 
     /// Actor lifecycle hook: wait for any in-flight aggregation worker to exit
-    /// before the actor is fully stopped. We cancel the session's token and wait up
-    /// to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current `aggregate_job` call
-    /// to finish (the proof itself cannot be interrupted).
+    /// before the actor is fully stopped. We cancel the session's token and
+    /// wait up to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current
+    /// `aggregate_job` call to finish (the proof itself cannot be interrupted).
     #[stopped]
     async fn on_stopped(&mut self, _ctx: &Context<Self>) {
         let Some(session) = self.current_aggregation.take() else {

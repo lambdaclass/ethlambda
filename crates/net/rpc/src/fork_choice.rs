@@ -21,11 +21,6 @@ pub struct ForkChoiceResponse {
     justified: Checkpoint,
     finalized: Checkpoint,
     safe_target: H256,
-    /// The RLMD-window tree base the fast head (`head`) is computed on top of.
-    /// Exposed next to `safe_target` so the two-tier structure is visible: a
-    /// frozen `lagging_head` under a moving `head` is the RLMD-window failure
-    /// signature.
-    lagging_head: H256,
     validator_count: u64,
 }
 
@@ -54,7 +49,6 @@ pub(crate) async fn get_fork_choice(
 
     let head = store.head().expect("head block exists");
     let safe_target = store.safe_target().expect("safe target exists");
-    let lagging_head = store.lagging_head().expect("lagging head exists");
 
     let head_state = store.head_state();
     let validator_count = head_state.validators.len() as u64;
@@ -85,7 +79,6 @@ pub(crate) async fn get_fork_choice(
         justified,
         finalized,
         safe_target,
-        lagging_head,
         validator_count,
     };
 
@@ -150,7 +143,6 @@ mod tests {
         assert!(json["finalized"]["root"].is_string());
         assert!(json["finalized"]["slot"].is_number());
         assert!(json["safe_target"].is_string());
-        assert!(json["lagging_head"].is_string());
         assert!(json["validator_count"].is_number());
     }
 

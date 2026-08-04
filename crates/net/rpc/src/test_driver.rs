@@ -140,7 +140,6 @@ struct DriverSnapshot {
     justified_checkpoint: Checkpoint,
     finalized_checkpoint: Checkpoint,
     safe_target: H256,
-    lagging_head: H256,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,7 +355,6 @@ fn snapshot_store(store: &Store) -> DriverSnapshot {
             .latest_finalized()
             .expect("latest finalized checkpoint exists"),
         safe_target: store.safe_target().expect("safe target exists"),
-        lagging_head: store.lagging_head().expect("lagging head exists"),
     }
 }
 

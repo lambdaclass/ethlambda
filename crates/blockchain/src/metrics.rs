@@ -700,18 +700,6 @@ pub fn update_safe_target_slot(slot: u64) {
 
 // --- Heartbeat / two-tier fork choice ---
 
-/// Set the fast-head gauge.
-///
-/// Tracks the same value as `lean_head_slot` (the fast head *is* the store head);
-/// exported under its own name so dashboards can pair it with
-/// `lean_lagging_head_slot` without relying on that equivalence holding forever.
-pub fn update_fast_head_slot(slot: u64) {
-    static LEAN_FAST_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
-        register_int_gauge!("lean_fast_head_slot", "Fast head slot (GHOST-Eph)").unwrap()
-    });
-    LEAN_FAST_HEAD_SLOT.set(slot.try_into().unwrap());
-}
-
 /// Set the lagging-head gauge: the RLMD-window tree base.
 ///
 /// A frozen lagging head under a moving fast head is the RLMD-window failure

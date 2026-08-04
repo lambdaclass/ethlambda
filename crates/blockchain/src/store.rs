@@ -22,7 +22,7 @@ use tracing::{info, trace, warn};
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
     MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, RLMD_LOOKBACK_LIMIT, SlotInterval,
-    block_builder::{BlockTarget, PostBlockCheckpoints, ProposerConfig, build_block},
+    block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
 
@@ -569,7 +569,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
                 // Update safe target for validators
                 update_safe_target(store);
             }
-            SlotInterval::HeadUpdate => {
+            SlotInterval::EndOfSlot => {
                 // Recompute the tree base from the RLMD window, then the fast
                 // head on top of it, before promoting this slot's payloads and
                 // logging the resulting tree.
@@ -1103,7 +1103,6 @@ pub fn get_attestation_target_with_checkpoints(
             .expect("parent block exists")
             .unwrap();
     }
-
     // Guard: clamp target to justified (not in the spec).
     //
     // The spec's walk-back has no lower bound, so it can produce attestations
@@ -1249,14 +1248,11 @@ pub fn produce_block_with_signatures(
     let (block, signatures, post_checkpoints) = {
         let _timing = metrics::time_block_building_payload_aggregation();
         build_block(
-            BlockTarget {
-                head_state: &head_state,
-                slot,
-                proposer_index: validator_index,
-                parent_root: head_root,
-                known_block_roots: &known_block_roots,
-                heartbeat_committee_size: store.heartbeat_committee_size(),
-            },
+            &head_state,
+            slot,
+            validator_index,
+            head_root,
+            &known_block_roots,
             &aggregated_payloads,
             config,
         )?
