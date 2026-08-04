@@ -167,6 +167,16 @@ impl StorageWriteBatch for RocksDBWriteBatch {
         Ok(())
     }
 
+    fn delete_range(&mut self, table: Table, from: &[u8], to: &[u8]) -> Result<(), Error> {
+        let cf = self
+            .db
+            .cf_handle(cf_name(table))
+            .ok_or_else(|| format!("Column family {} not found", cf_name(table)))?;
+
+        self.batch.delete_range_cf(&cf, from, to);
+        Ok(())
+    }
+
     fn commit(self: Box<Self>) -> Result<(), Error> {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(false);
