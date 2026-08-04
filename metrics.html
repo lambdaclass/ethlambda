@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-69dc5805.js";
+            window.path_to_searchindex_js = "searchindex-e79bb1a1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -337,6 +337,27 @@
 <tr><td><code>lean_gossip_aggregation_size_bytes</code></td><td>Histogram</td><td>Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire)</td><td>On gossip aggregation send/receive</td><td>compression=raw,snappy</td><td>1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576</td></tr>
 <tr><td><code>lean_reqresp_request_size_bytes</code></td><td>Histogram</td><td>Bytes size of a req/resp request (raw SSZ or snappy on-wire)</td><td>On req/resp request send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>64, 128, 256, 512, 1024, 4096, 16384, 65536</td></tr>
 <tr><td><code>lean_reqresp_response_chunk_size_bytes</code></td><td>Histogram</td><td>Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire)</td><td>On req/resp response chunk send/receive</td><td>protocol=status,blocks_by_root<br>compression=raw,snappy</td><td>128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
+<p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
+<p>Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a <code>data.slot</code> several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out <code>before</code> entirely.</p>
+<p>Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.</p>
+<p>The aggregate metrics do include an aggregator’s own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.</p>
+<p>In practice the distribution is bimodal and dominated by production rather than propagation: a mode in the lowest bucket for aggregates that made their interval, plus a tail for those whose proving overran it. A late aggregate is late for every node at once, so that tail shows up on receivers too and is not evidence of a slow network. Read a rising tail as aggregation cost, and cross-check <code>lean_pq_sig_aggregated_signatures_building_time_seconds</code> and <code>lean_committee_signatures_aggregation_time_seconds</code> to confirm.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_gossip_block_arrival_delay_seconds</code></td><td>Histogram</td><td>Absolute delay between a gossip block’s arrival and the start of the interval it was due in</td><td>On gossip block receipt, before import</td><td></td><td>0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16</td></tr>
+<tr><td><code>lean_gossip_attestation_arrival_delay_seconds</code></td><td>Histogram</td><td>Absolute delay between a gossip attestation’s arrival and the start of the interval it was due in</td><td>On gossip attestation receipt</td><td></td><td>0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16</td></tr>
+<tr><td><code>lean_gossip_aggregation_arrival_delay_seconds</code></td><td>Histogram</td><td>Absolute delay between an aggregate becoming available (gossip receipt, or local production) and the most recent aggregation-interval boundary at or before it</td><td>On gossip aggregated-attestation receipt, or on local aggregate production</td><td></td><td>0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16</td></tr>
+<tr><td><code>lean_gossip_block_arrival_total</code></td><td>Counter</td><td>Gossip blocks by arrival position relative to the interval they were due in</td><td>On gossip block receipt, before import</td><td>position=before,inside,after</td><td></td></tr>
+<tr><td><code>lean_gossip_attestation_arrival_total</code></td><td>Counter</td><td>Gossip attestations by arrival position relative to the interval they were due in</td><td>On gossip attestation receipt</td><td>position=before,inside,after</td><td></td></tr>
+<tr><td><code>lean_gossip_aggregation_arrival_total</code></td><td>Counter</td><td>Aggregates by arrival position relative to the most recent aggregation-interval boundary</td><td>On gossip aggregated-attestation receipt, or on local aggregate production</td><td>position=inside,after</td><td></td></tr>
 </tbody>
 </table>
 </div>
