@@ -202,21 +202,21 @@ async fn checks_step_is_noop_but_returns_current_snapshot() {
 }
 
 #[tokio::test]
-async fn state_transition_with_no_blocks_and_expect_exception_reports_failure() {
+async fn state_transition_with_no_blocks_and_expected_rejection_reports_failure() {
     let driver = fresh_driver();
     let router = build_router(driver);
 
     let body = json!({
         "pre": genesis_anchor_state_json(0),
         "blocks": [],
-        "expectException": "any failure",
+        "rejectionReason": "BLOCK_SLOT_NOT_IN_FUTURE",
     });
 
     let (status, response) =
         post(&router, "/lean/v0/test_driver/state_transition/run", &body).await;
     assert_eq!(status, StatusCode::OK);
-    // No blocks + expectException present → driver forces an STF error so the
-    // simulator's `succeeded == expectException.is_none()` check holds.
+    // No blocks + rejectionReason present → driver forces an STF error so the
+    // simulator's `succeeded == rejectionReason.is_none()` check holds.
     assert_eq!(response["succeeded"], json!(false));
     assert!(response["post"].is_null());
     assert!(response["error"].as_str().is_some());
@@ -248,7 +248,7 @@ async fn verify_signatures_with_empty_validator_set_fails_cleanly() {
     // Build a signed block referencing the genesis state but with an invalid
     // proposer (no validators in the set). The driver should return
     // succeeded:false with a descriptive error, matching the simulator's
-    // expectException path.
+    // expected-rejection path.
     //
     // The proof blob is empty (`0x`): the verifier rejects the proposer-index
     // bound before reaching the SNARK decode, so the bytes content doesn't

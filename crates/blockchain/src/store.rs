@@ -416,7 +416,9 @@ pub fn on_gossip_attestation(
         .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(target.root))?;
     if validator_id >= target_state.validators.len() as u64 {
-        return Err(StoreError::InvalidValidatorIndex);
+        return Err(StoreError::ValidatorNotInState {
+            validator_index: validator_id,
+        });
     }
     let validator_pubkey = ValidatorPublicKey::from_bytes(
         &target_state.validators[validator_id as usize].attestation_pubkey,
@@ -507,8 +509,11 @@ fn on_gossip_aggregated_attestation_core(
     if participant_indices.is_empty() {
         return Err(StoreError::EmptyAggregationBits);
     }
-    if participant_indices.iter().any(|&vid| vid >= num_validators) {
-        return Err(StoreError::InvalidValidatorIndex);
+    if let Some(&validator_index) = participant_indices
+        .iter()
+        .find(|&&vid| vid >= num_validators)
+    {
+        return Err(StoreError::ValidatorNotInState { validator_index });
     }
 
     let pubkeys: Vec<_> = participant_indices
@@ -531,6 +536,8 @@ fn on_gossip_aggregated_attestation_core(
             &data_root,
             slot,
         )
+        .inspect(|_| metrics::inc_pq_sig_aggregated_signatures_valid())
+        .inspect_err(|_| metrics::inc_pq_sig_aggregated_signatures_invalid())
         .map_err(StoreError::AggregateVerificationFailed)?;
     }
 
@@ -974,8 +981,28 @@ pub enum StoreError {
     #[error("Parent state not found for slot {slot}. Missing block: {parent_root}")]
     MissingParentState { parent_root: H256, slot: u64 },
 
-    #[error("Validator index out of range")]
-    InvalidValidatorIndex,
+    /// A gossiped vote names a validator the target state's registry does not
+    /// hold (spec `VALIDATOR_NOT_IN_STATE`).
+    #[error("Validator {validator_index} is not in the state registry")]
+    ValidatorNotInState { validator_index: u64 },
+
+    /// A block attestation's participant bits reach past the registry
+    /// (spec `VALIDATOR_INDEX_OUT_OF_RANGE`).
+    #[error(
+        "Attester index {validator_index} is beyond the {num_validators} registered validators"
+    )]
+    AttesterIndexOutOfRange {
+        validator_index: u64,
+        num_validators: u64,
+    },
+
+    /// A block's `proposer_index` reaches past the registry
+    /// (spec `PROPOSER_INDEX_OUT_OF_RANGE`).
+    #[error("Proposer index {proposer_index} is beyond the {num_validators} registered validators")]
+    ProposerIndexOutOfRange {
+        proposer_index: u64,
+        num_validators: u64,
+    },
 
     #[error("Failed to decode validator {0}'s public key")]
     PubkeyDecodingFailed(u64),
@@ -1058,6 +1085,9 @@ pub enum StoreError {
     #[error("Aggregated signature verification failed: {0}")]
     AggregateVerificationFailed(ethlambda_crypto::VerificationError),
 
+    #[error("Block proof verification failed: {0}")]
+    BlockProofVerificationFailed(ethlambda_crypto::VerificationError),
+
     #[error("Signature aggregation failed: {0}")]
     SignatureAggregationFailed(ethlambda_crypto::AggregationError),
 
@@ -1116,12 +1146,18 @@ pub fn verify_block_signatures(
     for attestation in attestations.iter() {
         for vid in validator_indices(&attestation.aggregation_bits) {
             if vid >= num_validators {
-                return Err(StoreError::InvalidValidatorIndex);
+                return Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: vid,
+                    num_validators,
+                });
             }
         }
     }
     if block.proposer_index >= num_validators {
-        return Err(StoreError::InvalidValidatorIndex);
+        return Err(StoreError::ProposerIndexOutOfRange {
+            proposer_index: block.proposer_index,
+            num_validators,
+        });
     }
 
     let block_root = block.hash_tree_root();
@@ -1139,9 +1175,11 @@ pub fn verify_block_signatures(
     for attestation in attestations.iter() {
         let mut pubkeys = Vec::new();
         for vid in validator_indices(&attestation.aggregation_bits) {
-            let validator = validators
-                .get(vid as usize)
-                .ok_or(StoreError::InvalidValidatorIndex)?;
+            let out_of_range = StoreError::AttesterIndexOutOfRange {
+                validator_index: vid,
+                num_validators,
+            };
+            let validator = validators.get(vid as usize).ok_or(out_of_range)?;
             let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pk);
@@ -1152,9 +1190,13 @@ pub fn verify_block_signatures(
         expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
     }
 
+    let proposer_out_of_range = StoreError::ProposerIndexOutOfRange {
+        proposer_index: block.proposer_index,
+        num_validators,
+    };
     let proposer_validator = validators
         .get(block.proposer_index as usize)
-        .ok_or(StoreError::InvalidValidatorIndex)?;
+        .ok_or(proposer_out_of_range)?;
     let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     pubkeys_per_component.push(vec![proposer_pubkey]);
@@ -1170,7 +1212,7 @@ pub fn verify_block_signatures(
         pubkeys_per_component,
         &expected_bindings,
     )
-    .map_err(StoreError::AggregateVerificationFailed)?;
+    .map_err(StoreError::BlockProofVerificationFailed)?;
     let crypto_elapsed = crypto_start.elapsed();
 
     let total_elapsed = total_start.elapsed();
@@ -1787,6 +1829,87 @@ mod tests {
                     if gap == gap_slot && max == HISTORICAL_ROOTS_LIMIT as u64
             ),
             "Expected BlockSlotGapTooLarge, got: {result:?}"
+        );
+    }
+
+    /// A registry of `count` validators with placeholder keys.
+    ///
+    /// The bounds checks under test run before any key is decoded, so zeroed
+    /// pubkeys are enough.
+    fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
+        (0..count)
+            .map(|index| ethlambda_types::state::Validator {
+                attestation_pubkey: [0u8; 52],
+                proposal_pubkey: [0u8; 52],
+                index,
+            })
+            .collect()
+    }
+
+    /// An out-of-range attester and an out-of-range proposer are distinct
+    /// rejections, because the spec names them distinctly
+    /// (`VALIDATOR_INDEX_OUT_OF_RANGE` vs `PROPOSER_INDEX_OUT_OF_RANGE`,
+    /// `signatures.py`). Reporting one variant for both would classify whichever
+    /// fixture arrives second for the wrong reason.
+    #[test]
+    fn verify_block_signatures_separates_attester_and_proposer_bounds() {
+        let state = State::from_genesis(1000, make_validators(2));
+
+        let att_data = AttestationData {
+            slot: 0,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        };
+        // Bit 2 is one past the last registered validator.
+        let attestations = AggregatedAttestations::try_from(vec![AggregatedAttestation {
+            aggregation_bits: make_bits(&[2]),
+            data: att_data,
+        }])
+        .unwrap();
+
+        let out_of_range_attester = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 1,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody { attestations },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let result = verify_block_signatures(&state, &out_of_range_attester);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: 2,
+                    num_validators: 2,
+                })
+            ),
+            "Expected AttesterIndexOutOfRange, got: {result:?}"
+        );
+
+        let out_of_range_proposer = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 2,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let result = verify_block_signatures(&state, &out_of_range_proposer);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::ProposerIndexOutOfRange {
+                    proposer_index: 2,
+                    num_validators: 2,
+                })
+            ),
+            "Expected ProposerIndexOutOfRange, got: {result:?}"
         );
     }
 }

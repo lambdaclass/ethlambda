@@ -457,11 +457,19 @@ impl ProjectedState {
         if !known_block_roots.contains(&att_data.head.root) {
             return Err("head_root_unknown");
         }
+        // The projection is seeded from the head state, whose window stops at
+        // `head.slot - 1`, so slots between the head and the candidate block are
+        // legitimately untracked here. That is not a validity verdict: this is a
+        // pre-filter over gossip candidates, so an untracked slot reads as "not
+        // justified yet" and the STF stays the authority on
+        // `JustifiedSlotOutOfRange`.
         if !justified_slots_ops::is_slot_justified(
             &self.justified_slots,
             self.finalized_slot,
             att_data.source.slot,
-        ) {
+        )
+        .unwrap_or(false)
+        {
             return Err("source_not_justified");
         }
         if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
@@ -471,12 +479,15 @@ impl ProjectedState {
         if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
             return Err("target_not_after_source");
         }
+        // An untracked target slot (commonly the head block's own slot) is not yet
+        // justified, so it stays eligible. Same reasoning as the source check above.
         if !is_genesis_self_vote
             && justified_slots_ops::is_slot_justified(
                 &self.justified_slots,
                 self.finalized_slot,
                 att_data.target.slot,
             )
+            .unwrap_or(false)
         {
             return Err("target_already_justified");
         }
@@ -657,10 +668,13 @@ fn compact_attestations(
                 let pubkeys = proof
                     .participant_indices()
                     .map(|vid| {
+                        let not_in_state = StoreError::ValidatorNotInState {
+                            validator_index: vid,
+                        };
                         let validator = head_state
                             .validators
                             .get(vid as usize)
-                            .ok_or(StoreError::InvalidValidatorIndex)?;
+                            .ok_or(not_in_state)?;
                         ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                             .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
                     })

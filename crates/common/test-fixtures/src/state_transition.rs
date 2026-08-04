@@ -11,14 +11,19 @@ use serde::Deserialize;
 /// Request body for `POST /lean/v0/test_driver/state_transition/run`.
 ///
 /// The simulator sends the full fixture case verbatim; we only need `pre` and
-/// `blocks` to drive the STF. `expect_exception` is captured because Ream's
+/// `blocks` to drive the STF. `rejection_reason` is captured because Ream's
 /// driver uses its presence to force a deterministic error when `blocks` is
 /// empty (otherwise the suite would expect a failure with no STF call to
 /// produce one).
+///
+/// Deliberately a `String` and not a [`crate::RejectionReason`]: the driver reads
+/// presence only, never the value, so typing it would buy nothing here. The
+/// offline runners, which do assert the reason, parse the same field into
+/// [`crate::RejectionReason`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct StateTransitionRunRequest {
     pub pre: TestState,
     pub blocks: Vec<Block>,
-    #[serde(default, rename = "expectException", alias = "rejectionReason")]
-    pub expect_exception: Option<String>,
+    #[serde(default, rename = "rejectionReason")]
+    pub rejection_reason: Option<String>,
 }

@@ -2189,6 +2189,7 @@ dependencies = [
 name = "ethlambda-test-fixtures"
 version = "0.1.0"
 dependencies = [
+ "ethlambda-state-transition",
  "ethlambda-types",
  "hex",
  "libssz",

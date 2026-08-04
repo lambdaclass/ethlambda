@@ -24,7 +24,7 @@ ethlambda \
 
 Where `<URL>` is the address of a checkpoint source (see [Checkpoint Sources](#checkpoint-sources) below).
 
-When `--checkpoint-sync-url` is omitted, the node initializes from genesis.
+State already on disk takes precedence over both checkpoint sync and genesis: if the data directory holds a previous run's chain state for this network, the node resumes from it. `--checkpoint-sync-url` is the fallback for when there is nothing resumable on disk, or when what is there has fallen too far behind (see [Restarts and Existing State](#restarts-and-existing-state)). With no resumable state and no URL, the node initializes from genesis.
 
 ## Checkpoint Sources
 
@@ -56,7 +56,25 @@ If any step fails (network error, decoding error, verification failure), the nod
 
 After successful initialization, the node starts normally: it connects to the P2P network and begins participating from the checkpoint slot.
 
-If the data directory (`./data`) already contains state from a previous run, checkpoint sync writes the new anchor state on top without clearing existing data. For a clean checkpoint sync, remove the data directory first.
+## Restarts and Existing State
+
+A node restarted against a populated data directory resumes from disk rather than re-initializing, so no flag is needed to preserve the chain across a redeploy. The decision is made before any download:
+
+| State in data directory | `--checkpoint-sync-url` | Result |
+| ------------------------- | ------------------------- | -------- |
+| None, or from another network (`GENESIS_TIME` differs) | omitted | Initialize from genesis |
+| None, or from another network | set | Checkpoint sync |
+| Present, head within the resume window | either | Resume from disk (no download) |
+| Present, head beyond the resume window | set | Checkpoint sync |
+| Present, head beyond the resume window | omitted | Resume from disk anyway, with a warning |
+
+The resume window is `MAX_RESUMABLE_DB_STATE_AGE` (450 slots, ~30 minutes at 4-second slots) measured as `current_slot - head_slot`. Staleness is measured against the head, not the finalized checkpoint, so a node whose head is current still resumes during a finality stall.
+
+Beyond that window the node prefers a checkpoint when one is offered, since catching up over P2P costs more than downloading a recent state. With no URL configured there is no anchor to switch to, so the node simply runs against the data directory it was given: that is the setup that was asked for. The warning is there because range sync may not be able to close a gap this large. Peers prune block signatures past `SIGNATURE_PRUNING_RANGE` (21600 slots, ~1 day), so beyond that horizon they cannot serve the history the node is missing and it needs a checkpoint URL to catch up at all. The warning logs the gap so this is visible in the boot log.
+
+When a checkpoint URL *is* set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for "resume whatever is on disk"; that path never exits.
+
+To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.
 
 ## Verification Checks
 
