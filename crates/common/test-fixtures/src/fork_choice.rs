@@ -4,8 +4,8 @@
 //! endpoints, which receive the same JSON shapes from the lean spec-assets simulator.
 
 use crate::{
-    AggregationBits, AttestationData, Block, BlockBody, Checkpoint, TestInfo, TestState,
-    deser_xmss_hex,
+    AggregationBits, AttestationData, Block, BlockBody, Checkpoint, RejectionReason, TestInfo,
+    TestState, deser_xmss_hex,
 };
 use ethlambda_types::attestation::XmssSignature;
 use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
@@ -53,11 +53,10 @@ pub struct ForkChoiceTest {
     #[serde(rename = "maxSlot")]
     #[allow(dead_code)]
     pub max_slot: u64,
-    /// Top-level expected rejection reason for whole-vector negative tests.
-    /// Captured only so `deny_unknown_fields` accepts it.
+    /// Expected rejection reason for whole-vector negative tests, which carry no
+    /// steps: the store must refuse the anchor itself.
     #[serde(rename = "rejectionReason")]
-    #[allow(dead_code)]
-    pub rejection_reason: Option<String>,
+    pub rejection_reason: Option<RejectionReason>,
     #[serde(rename = "_info")]
     pub info: TestInfo,
 }
@@ -113,12 +112,10 @@ pub struct ForkChoiceStep {
     // gossip-signature groups) once the required Store plumbing exists.
     #[serde(rename = "storeSnapshot")]
     pub store_snapshot: Option<StoreSnapshot>,
-    /// Expected rejection reason for a step marked `valid: false`. Captured only
-    /// so `deny_unknown_fields` accepts it; step outcomes are asserted via the
-    /// `valid` flag.
+    /// Expected rejection reason for a step marked `valid: false`. When set, the
+    /// step must not just fail: it must fail for this reason.
     #[serde(rename = "rejectionReason")]
-    #[allow(dead_code)]
-    pub rejection_reason: Option<String>,
+    pub rejection_reason: Option<RejectionReason>,
 }
 
 fn default_true() -> bool {

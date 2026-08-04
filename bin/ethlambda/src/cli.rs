@@ -37,11 +37,17 @@ pub(crate) struct CliOptions {
     #[arg(long)]
     pub(crate) node_id: String,
     /// Base URL(s) of checkpoint-sync peer API servers (e.g., http://peer:5052).
-    /// When set, skips genesis initialization and fetches the finalized state
-    /// and block from each peer's `/lean/v0/states/finalized` and
-    /// `/lean/v0/blocks/finalized` endpoints. For backward compatibility, a
-    /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
-    /// path is stripped.
+    /// When set, fetches the finalized state and block from each peer's
+    /// `/lean/v0/states/finalized` and `/lean/v0/blocks/finalized` endpoints.
+    /// For backward compatibility, a URL ending in
+    /// `/lean/v0/states/finalized` is accepted and the trailing path is
+    /// stripped.
+    ///
+    /// This is a fallback, not a precedence: state already in the data
+    /// directory always wins, so these URLs are only used when there is no
+    /// resumable state on disk (or it has fallen too far behind the current
+    /// slot). With neither resumable state nor URLs, the node starts from
+    /// genesis.
     ///
     /// Multiple URLs may be supplied for redundancy, either comma-separated
     /// (`--checkpoint-sync-url u1,u2`) or by repeating the flag
