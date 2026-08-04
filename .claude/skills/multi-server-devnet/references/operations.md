@@ -205,7 +205,13 @@ The **central** stack is a separate one-time deployment: a prometheus started wi
 `:9099`), a Loki with `allow_structured_metadata: true` + schema v13/tsdb and
 `retention_enabled: true` (it is false by default and `retention_period` alone is
 silently ignored), and a Grafana with provisioning dirs for datasources,
-dashboards, and alerting.
+dashboards, and alerting. Two distinct dirs matter here: the **provisioning** tree
+(`GRAFANA_PROV_DIR`, mounted at `/etc/grafana/provisioning`) holds the datasource,
+dashboard-provider and alerting yamls; the **dashboard JSONs** live in a separate
+host dir (`GRAFANA_DASHBOARDS_DIR`) bind-mounted read-only at the provider's
+`options.path` (`/var/lib/grafana/dashboards`). `deploy-finality-alert.sh` writes
+to the first; dashboards go to the second. A JSON dropped in
+`GRAFANA_PROV_DIR/dashboards` is silently ignored.
 
 **node_exporter is a systemd service, not a container.** It's installed from
 `github.com/lambdaclass/monitoring-stack` (ansible: `make inventory TARGET=...`

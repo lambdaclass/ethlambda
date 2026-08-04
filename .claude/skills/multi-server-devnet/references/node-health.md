@@ -236,6 +236,24 @@ histogram_quantile(0.9, sum by (le) (rate(lean_committee_signatures_aggregation_
 histogram_quantile(0.9, sum by (le) (rate(lean_pq_sig_aggregated_signatures_building_time_seconds_bucket{network="$NET"}[10m])))
 ```
 
+**Receiver side** — the same question asked of what *arrives* rather than what
+this node produces. `lean_gossip_*_arrival_total` classifies each gossip message
+by whether it landed inside the interval it was due in, so an on-time fraction
+well under 1 says votes are arriving late rather than not at all:
+```promql
+# share of arrivals inside their due interval, per node (block|attestation|aggregation)
+sum by (job) (rate(lean_gossip_attestation_arrival_total{network="$NET", position="inside"}[10m]))
+/ sum by (job) (rate(lean_gossip_attestation_arrival_total{network="$NET"}[10m]))
+# how late, in seconds (absolute distance from the due interval's start)
+histogram_quantile(0.9, sum by (le, job) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network="$NET"}[10m])))
+```
+One node low while the fleet is fine is that node's own clock or CPU; everyone
+dropping together is chain-wide production or propagation. Graphed in the client
+dashboard's **Gossip Arrival Timing** row. Aggregates are anchored to the latest
+aggregation-interval boundary, not their own data slot, so their tail reads as
+aggregation cost (cross-check the two aggregation-time histograms above), and
+`position="before"` never appears for them.
+
 **Log:** presence/absence timing — e.g. `"Finished building block"` arriving
 after the next slot boundary. For exact slot-relative offsets and spill
 detection, use the **`devnet-profiling`** skill (this item only says in/out of

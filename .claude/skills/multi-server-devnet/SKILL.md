@@ -207,16 +207,33 @@ Relabel gotcha: that file is a single-file bind-mount — edit by full overwrite
 `--web.enable-remote-write-receiver`; Grafana groups by **job name**, so a
 converted node must be relabelled (both `job_name:` and `client_type:`).
 `scripts/finality-dashboard.json` is a ready Grafana dashboard (head / justified
-/ finalized per devnet, one series per `network`) — drop it in the provisioning
-dashboards dir; it auto-loads. `scripts/client-dashboard.json` is the main
-per-node dashboard for the same dir (see the inventory below). Every dashboard
-picks its datasource through a **template variable** (`ds_prom`/`ds_loki`;
+/ finalized per devnet, one series per `network`) — copy it to the central
+Grafana's **dashboards dir** and it auto-loads. `scripts/client-dashboard.json` is
+the main per-node dashboard for the same dir (see the inventory below). Every
+dashboard picks its datasource through a **template variable** (`ds_prom`/`ds_loki`;
 `datasource` on the client dashboard) rather than a pinned uid, so they drop into
-any Grafana unedited — no deployment-specific datasource ids in the JSON. Gotcha: that dir
-is bind-mounted **read-only** into the container, so Grafana UI edits are
-reverted on the next provisioner sweep (~30s) despite `allowUiUpdates: true`.
-Edit the JSON and re-copy; treat the repo copy as the source of truth and keep it
-in sync, since nothing pulls server-side edits back.
+any Grafana unedited — no deployment-specific datasource ids in the JSON.
+
+**That dir is NOT `<GRAFANA_PROV_DIR>/dashboards`** — the provisioning tree holds
+only the provider yaml (`dashboards.yml`, which declares
+`options.path: /var/lib/grafana/dashboards`); the JSONs live in whatever host dir
+is bind-mounted there, a sibling of the provisioning tree in this deployment
+(`GRAFANA_DASHBOARDS_DIR` in `devnet.env`). Confirm before copying, since dropping
+a dashboard in the provisioning dir loads nothing and looks like a silent no-op:
+```bash
+ssh "$METRICS_HOST" 'sudo docker inspect '"$GRAFANA_CONTAINER"' \
+  --format "{{range .Mounts}}{{.Source}} -> {{.Destination}} (ro={{not .RW}}){{println}}{{end}}"'
+# ship it (back up first; the provisioner sweeps every ~30s)
+ssh "$METRICS_HOST" "cp -p $GRAFANA_DASHBOARDS_DIR/client-dashboard.json{,.bak-\$(date +%Y%m%d-%H%M%S)}"
+cat scripts/client-dashboard.json | ssh "$METRICS_HOST" "cat > $GRAFANA_DASHBOARDS_DIR/client-dashboard.json"
+```
+Verify it landed with
+`curl -s $GRAFANA_BASE_URL/api/dashboards/uid/<uid> | jq '.dashboard.version'` (the
+version bumps on each sweep that reads a changed file). Gotcha: that dir is
+bind-mounted **read-only** into the container, so Grafana UI edits are reverted on
+the next provisioner sweep (~30s) despite `allowUiUpdates: true`. Edit the JSON and
+re-copy; treat the repo copy as the source of truth and keep it in sync, since
+nothing pulls server-side edits back.
 
 **Logs (Loki + promtail).** Mirrors the metrics path: a per-host **promtail**
 ships node-container stdout/stderr to the **central Loki** (7d retention;
@@ -368,12 +385,13 @@ Swap (persistent): `fallocate -l 16G /swapfile && chmod 600 && mkswap && swapon`
 | `deploy-finality-alert.sh` | operator | `[WEBHOOK_FILE]`; `METRICS_HOST`, `GRAFANA_*`, `PROM_DS_UID`; `DRY_RUN` | Render + ship the "lost finality" Slack alert to the central Grafana |
 | `devnet-env.sh` / `devnet.env.example` | operator | `$DEVNET_ENV`, `./devnet.env`, script dir | Load this deployment's hosts/urls/Grafana ids as defaults; exported vars win. Copy the example to `devnet.env` (gitignored) once |
 
-**Grafana dashboards** (drop into the provisioned dashboards dir; they auto-load in
-~30s and pick their datasource through a template variable, so no editing):
+**Grafana dashboards** (copy into the central Grafana's dashboards dir —
+`GRAFANA_DASHBOARDS_DIR`, *not* the provisioning tree; they auto-load in ~30s and
+pick their datasource through a template variable, so no editing):
 
 | File | uid | Content |
 |---|---|---|
-| `client-dashboard.json` | `lean-ethereum-clients-dashboard` | The main per-node dashboard: Overview (start time, validators, committees, head/justified/finalized, slot + finality-delay graphs) plus 13 collapsed sections (config, sync, peers, req/resp + mesh, gossip, PQ signatures, aggregation coverage, block production, proposal internals, fork choice, attestations, state transition, storage + tick health). Filters `network`/`job`/`instance` — `instance` is the **host**, not the node |
+| `client-dashboard.json` | `lean-ethereum-clients-dashboard` | The main per-node dashboard: Overview (start time, validators, committees, head/justified/finalized, slot + finality-delay graphs) plus 14 collapsed sections (config, sync, peers, req/resp + mesh, gossip, gossip arrival timing, PQ signatures, aggregation coverage, block production, proposal internals, fork choice, attestations, state transition, storage + tick health). Filters `network`/`job`/`instance` — `instance` is the **host**, not the node |
 | `finality-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
 | `resources-dashboard.json` | `devnet-resources` | Per-node CPU cores + memory working set (+ limit + %-of-limit for OOM watch) from cAdvisor |
 | `logs-dashboard.json` | `devnet-logs` | Loki logs panel + log-volume-by-level, filtered `network`/`node`/`stream`/`search` |
