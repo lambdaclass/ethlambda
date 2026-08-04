@@ -1028,7 +1028,7 @@ validators:
         seed_db(backend.clone(), &seeded_genesis);
 
         let mut other_genesis = test_genesis(genesis_time);
-        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
+        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; PUBLIC_KEY_SIZE];
         let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
             panic!("a foreign validator set must not be silently re-anchored");
         };

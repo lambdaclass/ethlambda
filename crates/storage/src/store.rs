@@ -1732,13 +1732,14 @@ mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
     use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
     /// Validator at `index` whose two pubkeys are filled with `seed`, so
     /// changing the seed changes the registry without changing its size.
     fn validator(index: u64, seed: u8) -> Validator {
         Validator {
-            attestation_pubkey: [seed; 52],
-            proposal_pubkey: [seed.wrapping_add(1); 52],
+            attestation_pubkey: [seed; PUBLIC_KEY_SIZE],
+            proposal_pubkey: [seed.wrapping_add(1); PUBLIC_KEY_SIZE],
             index,
         }
     }
