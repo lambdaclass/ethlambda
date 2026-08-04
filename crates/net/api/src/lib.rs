@@ -20,11 +20,24 @@ pub trait BlockChainToP2P: Send + Sync {
     fn fetch_block(&self, root: H256) -> Result<(), ActorError>;
 }
 
+/// How a block reached this node.
+///
+/// Distinguishes blocks announced on gossip from blocks pulled by req/resp
+/// during sync: the two have very different arrival-time characteristics, so
+/// consumers that care about timeliness must be able to tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSource {
+    /// Received on the block gossip topic.
+    Gossip,
+    /// Fetched via req/resp (`BlocksByRoot` / `BlocksByRange`).
+    Sync,
+}
+
 // --- Protocol: P2P -> BlockChain ---
 
 #[protocol]
 pub trait P2PToBlockChain: Send + Sync {
-    fn new_block(&self, block: SignedBlock) -> Result<(), ActorError>;
+    fn new_block(&self, block: SignedBlock, source: BlockSource) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
         &self,
