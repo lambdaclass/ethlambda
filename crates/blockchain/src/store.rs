@@ -1013,6 +1013,17 @@ pub enum StoreError {
     #[error("Validator signature verification failed")]
     SignatureVerificationFailed,
 
+    /// Kept apart from [`Self::SignatureDecodingFailed`] because the proposer
+    /// signature is a component of the block proof, so the spec reports its
+    /// failure as an invalid block proof rather than an invalid signature.
+    #[error("Block proposer signature could not be decoded")]
+    ProposerSignatureDecodingFailed,
+
+    /// See [`Self::ProposerSignatureDecodingFailed`] for why this is distinct
+    /// from [`Self::SignatureVerificationFailed`].
+    #[error("Block proposer signature verification failed")]
+    ProposerSignatureVerificationFailed,
+
     #[error("Block carries an attestation proof but has no attestations")]
     UnexpectedAttestationProof,
 
@@ -1193,9 +1204,9 @@ pub fn verify_block_signatures(
     let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     let proposer_signature = ValidatorSignature::from_bytes(&signed_block.proof.proposer_signature)
-        .map_err(|_| StoreError::SignatureDecodingFailed)?;
+        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
     if !proposer_signature.is_valid(&proposer_pubkey, block_slot_u32, &block_root) {
-        return Err(StoreError::SignatureVerificationFailed);
+        return Err(StoreError::ProposerSignatureVerificationFailed);
     }
 
     // 2. Verify the attestation aggregate (Type-2 over the body attestations
