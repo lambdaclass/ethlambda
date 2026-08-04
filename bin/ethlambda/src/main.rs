@@ -772,6 +772,7 @@ mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::genesis::GenesisValidatorEntry;
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
@@ -897,8 +898,8 @@ validators:
         GenesisConfig {
             genesis_time,
             genesis_validators: vec![GenesisValidatorEntry {
-                attestation_pubkey: [1u8; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [1u8; PUBLIC_KEY_SIZE],
+                proposal_pubkey: [2u8; PUBLIC_KEY_SIZE],
             }],
         }
     }
