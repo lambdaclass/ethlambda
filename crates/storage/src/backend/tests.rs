@@ -19,6 +19,8 @@ pub fn run_backend_tests(backend: &dyn StorageBackend) {
     test_nonexistent_key(backend);
     test_delete_then_put(backend);
     test_put_then_delete(backend);
+    test_delete_range(backend);
+    test_delete_range_then_put(backend);
     test_multiple_tables(backend);
 }
 
@@ -169,6 +171,66 @@ fn test_put_then_delete(backend: &dyn StorageBackend) {
     assert_eq!(
         view.get(Table::BlockHeaders, b"test_put_del_key").unwrap(),
         None
+    );
+}
+
+fn test_delete_range(backend: &dyn StorageBackend) {
+    // Keys sort lexicographically, so `b` and `c` fall inside [b, d) while the
+    // bounds' neighbours `a` and `d` stay: the range is half-open.
+    {
+        let mut batch = backend.begin_write().unwrap();
+        let entries = ["a", "b", "c", "d"]
+            .iter()
+            .map(|suffix| (format!("test_range:{suffix}").into_bytes(), b"v".to_vec()))
+            .collect();
+        batch.put_batch(Table::LiveChain, entries).unwrap();
+        batch.commit().unwrap();
+    }
+
+    {
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .delete_range(Table::LiveChain, b"test_range:b", b"test_range:d")
+            .unwrap();
+        batch.commit().unwrap();
+    }
+
+    let view = backend.begin_read().unwrap();
+    let mut keys: Vec<_> = view
+        .prefix_iterator(Table::LiveChain, b"test_range:")
+        .unwrap()
+        .map(|entry| entry.unwrap().0)
+        .collect();
+
+    keys.sort();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(&*keys[0], b"test_range:a");
+    assert_eq!(&*keys[1], b"test_range:d");
+}
+
+fn test_delete_range_then_put(backend: &dyn StorageBackend) {
+    // Range delete then put of a key inside the range - put should win.
+    {
+        let mut batch = backend.begin_write().unwrap();
+        let entries = vec![(b"test_range_put:b".to_vec(), b"old".to_vec())];
+        batch.put_batch(Table::LiveChain, entries).unwrap();
+        batch.commit().unwrap();
+    }
+
+    {
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .delete_range(Table::LiveChain, b"test_range_put:a", b"test_range_put:z")
+            .unwrap();
+        let entries = vec![(b"test_range_put:b".to_vec(), b"new".to_vec())];
+        batch.put_batch(Table::LiveChain, entries).unwrap();
+        batch.commit().unwrap();
+    }
+
+    let view = backend.begin_read().unwrap();
+    assert_eq!(
+        view.get(Table::LiveChain, b"test_range_put:b").unwrap(),
+        Some(b"new".to_vec())
     );
 }
 
