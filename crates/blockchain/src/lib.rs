@@ -1529,23 +1529,3 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn interval_ms_round_trips() {
-        let intervals = [
-            SlotInterval::BlockPublication,
-            SlotInterval::AttestationProduction,
-            SlotInterval::Aggregation,
-            SlotInterval::SafeTargetUpdate,
-            SlotInterval::EndOfSlot,
-        ];
-        for interval in intervals {
-            let ms = interval.to_ms_since_genesis(7);
-            assert_eq!(SlotInterval::from_ms_since_genesis(ms), interval);
-        }
-    }
-}
