@@ -668,10 +668,13 @@ fn compact_attestations(
                 let pubkeys = proof
                     .participant_indices()
                     .map(|vid| {
+                        let not_in_state = StoreError::ValidatorNotInState {
+                            validator_index: vid,
+                        };
                         let validator = head_state
                             .validators
                             .get(vid as usize)
-                            .ok_or(StoreError::InvalidValidatorIndex)?;
+                            .ok_or(not_in_state)?;
                         ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                             .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
                     })

@@ -4,7 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use ethlambda_blockchain::{spec_test_runner::apply_fork_choice_step, store};
+use ethlambda_blockchain::{
+    spec_test_runner::{StepError, apply_fork_choice_step},
+    store,
+};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, validator_indices},
@@ -13,8 +16,10 @@ use ethlambda_types::{
     state::{State, anchor_pair_is_consistent},
 };
 
-use ethlambda_test_fixtures::fork_choice::{
-    AttestationCheck, BlockAttestationCheck, ForkChoiceTestVector, StoreChecks,
+use ethlambda_test_fixtures::{
+    RejectionReason,
+    fork_choice::{AttestationCheck, BlockAttestationCheck, ForkChoiceTestVector, StoreChecks},
+    rejection::check_rejection_reason,
 };
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "fork_choice_test";
@@ -56,6 +61,26 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let anchor_block: Block = test.anchor_block.into();
         let pair_ok = anchor_pair_is_consistent(&mut anchor_state, &anchor_block);
         if test.steps.is_empty() {
+            // The only anchor rejection the store can express is an inconsistent
+            // (state, block) pair, so any other reason means the fixture exercises
+            // a rule this runner does not model yet.
+            match test.rejection_reason.as_ref() {
+                Some(RejectionReason::AnchorStateRootMismatch) => {}
+                Some(other) => {
+                    return Err(format!(
+                        "Fixture '{name}' has no steps and expects anchor rejection \
+                         {other}, which this runner cannot assert"
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "Fixture '{name}' has no steps (expects anchor rejection) \
+                         but names no rejectionReason"
+                    )
+                    .into());
+                }
+            }
             if pair_ok {
                 return Err(format!(
                     "Fixture '{name}' has no steps (expects anchor rejection) \
@@ -110,7 +135,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             }
 
             let result = apply_fork_choice_step(&mut store, &step, Some(proofs_are_mocked));
-            assert_step_outcome(step_idx, step.valid, result)?;
+            assert_step_outcome(step_idx, step.valid, step.rejection_reason.as_ref(), result)?;
 
             // Fold this step's blocks into the cumulative tree before checks so
             // ancestry walks see blocks finalization may have just pruned from
@@ -134,17 +159,49 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
     Ok(())
 }
 
-fn assert_step_outcome<T, E: std::fmt::Debug>(
+/// Assert a step's outcome against its `valid` flag and, for expected
+/// rejections, against the `rejectionReason` the fixture names.
+///
+/// Checking only that the step failed lets a fixture pass on the wrong error, so
+/// a named reason must match the reason the client's error classifies to. A
+/// rejection the classifier does not recognise fails the step as well: silently
+/// accepting it would restore exactly the "any error will do" behaviour.
+///
+/// A [`StepError::Harness`] fails the step whatever the fixture expected: it
+/// means the runner never replayed the step, so it can satisfy neither a
+/// `valid: true` step nor an expected rejection.
+fn assert_step_outcome(
     step_idx: usize,
     expected_valid: bool,
-    result: Result<T, E>,
+    expected_reason: Option<&RejectionReason>,
+    result: Result<(), StepError>,
 ) -> datatest_stable::Result<()> {
+    if let Err(StepError::Harness(reason)) = &result {
+        return Err(format!("Step {step_idx} could not be replayed: {reason}").into());
+    }
     match (result, expected_valid) {
-        (Ok(_), false) => Err(format!("Step {step_idx} expected failure but got success").into()),
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(format!(
+            "Step {step_idx} expected failure{} but got success",
+            expected_reason
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        )
+        .into()),
         (Err(err), true) => {
             Err(format!("Step {step_idx} expected success but got failure: {err:?}").into())
         }
-        _ => Ok(()),
+        // Older fixtures mark a step invalid without naming a reason; the
+        // rejection itself is all they assert. Only store rejections reach here,
+        // harness failures having already been rejected above.
+        (Err(_), false) if expected_reason.is_none() => Ok(()),
+        (Err(err), false) => check_rejection_reason(
+            &format!("Step {step_idx}"),
+            expected_reason.expect("reason is set on this arm"),
+            err.rejection_reason().as_ref(),
+            &err,
+        )
+        .map_err(Into::into),
     }
 }
 
