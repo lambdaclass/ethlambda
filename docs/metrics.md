@@ -128,14 +128,18 @@ Blocks anchor to interval 0 of their own slot and attestations to interval 1 of 
 
 Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.
 
+The aggregate metrics do include an aggregator's own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.
+
+In practice the distribution is bimodal and dominated by production rather than propagation: a mode in the lowest bucket for aggregates that made their interval, plus a tail for those whose proving overran it. A late aggregate is late for every node at once, so that tail shows up on receivers too and is not evidence of a slow network. Read a rising tail as aggregation cost, and cross-check `lean_pq_sig_aggregated_signatures_building_time_seconds` and `lean_committee_signatures_aggregation_time_seconds` to confirm.
+
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_gossip_block_arrival_delay_seconds` | Histogram | Absolute delay between a gossip block's arrival and the start of the interval it was due in | On gossip block receipt, before import | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
 | `lean_gossip_attestation_arrival_delay_seconds` | Histogram | Absolute delay between a gossip attestation's arrival and the start of the interval it was due in | On gossip attestation receipt | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
-| `lean_gossip_aggregation_arrival_delay_seconds` | Histogram | Absolute delay between a gossip aggregate's arrival and the most recent aggregation-interval boundary at or before it | On gossip aggregated-attestation receipt | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
+| `lean_gossip_aggregation_arrival_delay_seconds` | Histogram | Absolute delay between an aggregate becoming available (gossip receipt, or local production) and the most recent aggregation-interval boundary at or before it | On gossip aggregated-attestation receipt, or on local aggregate production | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
 | `lean_gossip_block_arrival_total` | Counter | Gossip blocks by arrival position relative to the interval they were due in | On gossip block receipt, before import | position=before,inside,after | |
 | `lean_gossip_attestation_arrival_total` | Counter | Gossip attestations by arrival position relative to the interval they were due in | On gossip attestation receipt | position=before,inside,after | |
-| `lean_gossip_aggregation_arrival_total` | Counter | Gossip aggregates by arrival position relative to the most recent aggregation-interval boundary | On gossip aggregated-attestation receipt | position=inside,after | |
+| `lean_gossip_aggregation_arrival_total` | Counter | Aggregates by arrival position relative to the most recent aggregation-interval boundary | On gossip aggregated-attestation receipt, or on local aggregate production | position=inside,after | |
 
 ### Storage
 

@@ -575,8 +575,10 @@ static LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS: std::sync::LazyLock<Histog
     std::sync::LazyLock::new(|| {
         register_histogram!(
             "lean_gossip_aggregation_arrival_delay_seconds",
-            "Absolute delay between a gossip aggregate's arrival and the most recent \
-             aggregation-interval boundary at or before it",
+            "Absolute delay between an aggregate becoming available, whether received on gossip \
+             or produced locally, and the most recent aggregation-interval boundary at or before \
+             it. A locally produced aggregate is held until that boundary, so it normally lands \
+             near zero and only registers a delay when proving overran its interval",
             gossip_arrival_delay_buckets()
         )
         .unwrap()
@@ -606,10 +608,10 @@ static LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL: std::sync::LazyLock<IntCounterVec>
     std::sync::LazyLock::new(|| {
         register_int_counter_vec!(
             "lean_gossip_aggregation_arrival_total",
-            "Gossip aggregates by arrival position relative to the most recent \
-             aggregation-interval boundary. Anchored to the latest such boundary rather than \
-             the aggregate's own data slot, so an arrival can never precede it: only `inside` \
-             and `after` occur, never `before`.",
+            "Aggregates, received on gossip or produced locally, by arrival position relative to \
+             the most recent aggregation-interval boundary. Anchored to the latest such boundary \
+             rather than the aggregate's own data slot, so an arrival can never precede it: only \
+             `inside` and `after` occur, never `before`.",
             &["position"]
         )
         .unwrap()

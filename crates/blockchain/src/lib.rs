@@ -1438,6 +1438,8 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 
 impl Handler<AggregateProduced> for BlockChainServer {
     async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
+        let arrival_ms = unix_now_ms();
+
         // Drop results from a prior session (or from an unexpected late worker).
         // Current session may be None if the actor already cleaned it up; accept
         // the message only when ids match.
@@ -1450,6 +1452,17 @@ impl Handler<AggregateProduced> for BlockChainServer {
             );
             return;
         }
+
+        // Count our own aggregate in the same series as gossip-received ones,
+        // so an aggregator does not report an empty aggregate arrival profile.
+        // Delivery of this message is held to the interval-2 boundary upstream,
+        // so a local aggregate lands near zero unless proving overran the
+        // interval. Sharing one series with received aggregates is deliberate
+        // and costs little in practice: a late aggregate is late for every node
+        // at once, so both populations are dominated by production time rather
+        // than propagation and their distributions look alike.
+        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
 
         // Publish alignment is enforced upstream: the worker delays delivery of
         // this message until the interval-2 boundary, so by the time it lands
