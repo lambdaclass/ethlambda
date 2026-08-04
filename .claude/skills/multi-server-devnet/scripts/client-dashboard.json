@@ -1473,46 +1473,38 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Process start time of every node in scope, rendered relative to now (\"6 days ago\"), newest first. A row jumping to the top of the sort means that node restarted. Only ethlambda exports lean_node_start_time_seconds, so converted canaries are absent.",
+          "description": "Time since each node's process started, one tile per node. Colour flags a recent (re)start: red < 15m, orange < 1h, yellow < 6h, dark green beyond. Thresholds compare the tile's own value, which is why the value is an age rather than a timestamp. Only ethlambda exports lean_node_start_time_seconds, so converted canaries are absent.",
           "fieldConfig": {
             "defaults": {
-              "custom": {
-                "align": "auto",
-                "cellOptions": {
-                  "type": "auto"
-                },
-                "inspect": false
+              "color": {
+                "mode": "thresholds"
               },
+              "decimals": 1,
               "mappings": [],
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "text",
+                    "color": "red",
                     "value": 0
+                  },
+                  {
+                    "color": "orange",
+                    "value": 900
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 3600
+                  },
+                  {
+                    "color": "dark-green",
+                    "value": 21600
                   }
                 ]
               },
-              "unit": "dateTimeFromNow"
+              "unit": "s"
             },
-            "overrides": [
-              {
-                "matcher": {
-                  "id": "byName",
-                  "options": "Node"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "none"
-                  },
-                  {
-                    "id": "custom.width",
-                    "value": 180
-                  }
-                ]
-              }
-            ]
+            "overrides": []
           },
           "gridPos": {
             "h": 8,
@@ -1522,22 +1514,25 @@
           },
           "id": 72,
           "options": {
-            "cellHeight": "sm",
-            "footer": {
-              "countRows": false,
-              "fields": "",
-              "reducer": [
-                "sum"
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "orientation": "auto",
+            "percentChangeColorMode": "standard",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
               ],
-              "show": false
+              "fields": "",
+              "values": false
             },
-            "showHeader": true,
-            "sortBy": [
-              {
-                "desc": true,
-                "displayName": "Started"
-              }
-            ]
+            "showPercentChange": false,
+            "text": {
+              "titleSize": 11,
+              "valueSize": 16
+            },
+            "textMode": "value_and_name",
+            "wideLayout": false
           },
           "pluginVersion": "12.3.2",
           "targets": [
@@ -1548,37 +1543,15 @@
               },
               "editorMode": "code",
               "exemplar": false,
-              "expr": "lean_node_start_time_seconds{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"} * 1000",
-              "format": "table",
+              "expr": "time() - lean_node_start_time_seconds{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}",
               "instant": true,
-              "legendFormat": "__auto",
+              "legendFormat": "{{job}}",
               "range": false,
               "refId": "A"
             }
           ],
-          "title": "Node start times",
-          "transformations": [
-            {
-              "id": "organize",
-              "options": {
-                "excludeByName": {
-                  "Time": true,
-                  "__name__": true,
-                  "client_type": true,
-                  "instance": true,
-                  "network": true,
-                  "type": true
-                },
-                "includeByName": {},
-                "indexByName": {},
-                "renameByName": {
-                  "Value": "Started",
-                  "job": "Node"
-                }
-              }
-            }
-          ],
-          "type": "table"
+          "title": "Time since node start",
+          "type": "stat"
         },
         {
           "datasource": {
