@@ -773,6 +773,7 @@ async fn fetch_initial_state(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_types::genesis::GenesisValidatorEntry;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
@@ -898,6 +899,7 @@ validators:
     fn test_genesis(genesis_time: u64) -> GenesisConfig {
         GenesisConfig {
             genesis_time,
+            heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             genesis_validators: vec![GenesisValidatorEntry {
                 attestation_pubkey: [1u8; 52],
                 proposal_pubkey: [2u8; 52],

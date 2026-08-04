@@ -710,7 +710,10 @@ pub fn on_gossip_heartbeat_attestation(
         .ok_or(StoreError::MissingTargetState(data.target.root))?;
     let num_validators = target_state.validators.len() as u64;
     if validator_id >= num_validators {
-        return Err(StoreError::InvalidValidatorIndex);
+        return Err(StoreError::AttesterIndexOutOfRange {
+            validator_index: validator_id,
+            num_validators,
+        });
     }
 
     if !is_heartbeat_committee_member(

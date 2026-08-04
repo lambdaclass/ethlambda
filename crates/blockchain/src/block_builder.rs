@@ -1325,7 +1325,10 @@ mod tests {
                 &advanced.justified_slots,
                 advanced.finalized_slot,
                 data.target.slot,
-            ),
+            )
+            // Same reading as the packer's pre-filter: a slot the projection
+            // window does not track is not justified yet.
+            .unwrap_or(false),
             "a heartbeat entry must not justify its target on tier alone"
         );
 
@@ -1334,11 +1337,14 @@ mod tests {
         // `advance` being inert.
         let mut justified = empty_projection();
         justified.advance(EntryEffect::Justifies, &data, HashSet::from([7]));
-        assert!(justified_slots_ops::is_slot_justified(
-            &justified.justified_slots,
-            justified.finalized_slot,
-            data.target.slot,
-        ));
+        assert!(
+            justified_slots_ops::is_slot_justified(
+                &justified.justified_slots,
+                justified.finalized_slot,
+                data.target.slot,
+            )
+            .unwrap_or(false)
+        );
     }
 
     /// Under cap pressure the surviving heartbeat entries must be the

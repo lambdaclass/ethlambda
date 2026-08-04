@@ -98,6 +98,12 @@ pub fn rejection_reason(err: &StoreError) -> Option<RejectionReason> {
         | StoreError::SignatureAggregationFailed(_)
         | StoreError::MissingTargetState(_)
         | StoreError::SlotOutOfRange(_) => return None,
+
+        // Placeholder: leanSpec names no rejection reason for the heartbeat tier
+        // yet, so these report as unclassified until it does. Revisit once the
+        // spec fixtures cover heartbeat vote validation.
+        StoreError::HeartbeatVoteOutOfSlot { .. }
+        | StoreError::NotHeartbeatCommitteeMember { .. } => return None,
     };
     Some(reason)
 }
