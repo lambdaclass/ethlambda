@@ -1,6 +1,6 @@
 ---
 name: multi-server-devnet
-description: This skill should be used for managing long-lived lean-consensus devnets that run as detached docker containers on remote hosts — the current setup is one INDEPENDENT single-host devnet per server, federated into one Grafana. Works for any server names and any number of servers/nodes. Trigger when the user asks to "start/reset the devnet(s)", "start a devnet on <server>", "restart the devnet", "rolling restart", "recover stalled nodes", "the devnet stopped finalizing", "investigate the finality stall", "convert nodes to zeam/ream/qlean/grandine/gean/lantern", "multi-client devnet", "add a client to the devnet", "canary a new client/build", "scale the devnet / add a node", "set up grafana/prometheus for the devnets", "pull the latest image on the servers", or "add swap / memory limits to the servers". Distinct from the local single-host `devnet-runner` skill.
+description: This skill should be used for managing long-lived lean-consensus devnets that run as detached docker containers on remote hosts — the usual setup is one INDEPENDENT single-host devnet per server, federated into one Grafana, but it also covers a single chain whose node indices are SPLIT across hosts. Works for any server names and any number of servers/nodes. Trigger when the user asks to "start/reset the devnet(s)", "start a devnet on <server>", "reset the cross-server devnet", "restart the devnet on both servers", "restart the devnet", "rolling restart", "recover stalled nodes", "the devnet stopped finalizing", "investigate the finality stall", "convert nodes to zeam/ream/qlean/grandine/gean/lantern", "multi-client devnet", "add a client to the devnet", "canary a new client/build", "scale the devnet / add a node", "set up grafana/prometheus for the devnets", "pull the latest image on the servers", or "add swap / memory limits to the servers". Distinct from the local single-host `devnet-runner` skill.
 version: 0.3.0
 ---
 
@@ -19,6 +19,24 @@ cross-server peering. They are kept apart by pointing **every ENR at
 `127.0.0.1`**, so a node only ever discovers peers on its own host even though
 all devnets share the dummy fork digest. One central Grafana/Prometheus
 federates all of them, labelled per devnet.
+
+**Variant: one chain spanning several hosts.** A deployment may instead run a
+single chain whose node indices are split across hosts (host A owns `0..k`, host
+B owns `k+1..N-1`). Everything below still applies with three changes, and
+`start-range.sh` / `check-range.sh` / `teardown.sh` exist for exactly this shape:
+
+- **ENRs carry each host's real (e.g. tailnet) IP**, not `127.0.0.1`, or the
+  halves never discover each other. Put the per-host ip in the source
+  `validator-config.yaml`'s `enrFields.ip`; `make-genesis.sh` pins `127.0.0.1`
+  and so is NOT usable as-is — generate from a hand-built validator-config
+  instead (keep it: it also carries the node privkeys, so reusing it verbatim
+  preserves every node's identity across a reset).
+- **Aggregators are no longer "node k → subnet k".** Each host owns a slice of
+  the subnets (host B's node `36` may aggregate subnet `4`), so the mapping is
+  passed explicitly rather than derived from the index.
+- **`ceil(2/3·NODES)` spans both hosts**, so losing one host halts the whole
+  chain rather than half of it, and a restart on either half checkpoint-syncs
+  from the other.
 
 Nothing about the servers is hardcoded. Establish these from the operator:
 
@@ -180,6 +198,50 @@ bash scripts/sweep.sh                                # head/justified/finalized 
 A young devnet can sit at `finalized=0` while justified jumps
 (square/pronic-distance slots) — that's the bootstrap regime, not a stall; leave
 it alone (see `references/operations.md`).
+
+### Reset a chain that SPANS hosts (one genesis, node indices split)
+Same order as above, but each host owns a slice and the aggregator→subnet map is
+explicit. Reuse the existing source `validator-config.yaml` verbatim (real
+per-host ENR ips + node privkeys) and re-stamp GENESIS_TIME with lean-quickstart's
+`generate-genesis.sh <ABSOLUTE genesis dir> --mode ansible --offset N` — keygen is
+skipped when the keys are already there, so only the small artifacts change.
+
+```bash
+# 0. stage the new genesis alongside the LIVE one (non-destructive: nothing stops yet).
+#    Do the big key sync here, while the old chain still runs.
+(cd BUILD_DIR && COPYFILE_DISABLE=1 tar cf - .) | \
+  ssh "$SSH_USER@$h" 'sudo rm -rf /opt/lean-quickstart/genesis-new
+    sudo mkdir -p /opt/lean-quickstart/genesis-new
+    sudo tar xf - -C /opt/lean-quickstart/genesis-new'
+
+# 1. PRE-FLIGHT the image against that staged genesis BEFORE anything is wiped --
+#    a pubkey-size mismatch (52B leanSig vs 32B leanVM-main) fails at genesis parse,
+#    upstream of every sync path, and no --checkpoint-sync-url can save it.
+#    --network none + a throwaway data dir cannot touch the live devnet.
+#    Use `docker run -d --name X` + explicit `docker rm -f`: `timeout` kills the
+#    docker CLIENT, not the container, so --rm never fires and it leaks.
+ssh "$SSH_USER@$h" 'sudo docker run -d --name gval --network none \
+  -v /opt/lean-quickstart/genesis-new:/config:ro -v /tmp/gval-data:/data IMAGE \
+  --genesis /config/config.yaml ... --node-id node_0'   # want: "Loaded genesis
+  # configuration validator_count=N" -> "Loaded validator key pairs" -> "Initialized store"
+
+# 2. teardown per host (containers, archive genesis, wipe data) -- run BEFORE the
+#    GENESIS_TIME stamp. Archives genesis to genesis.bak-<ts> so the retired
+#    chain's hash-sig keys survive, and promotes genesis-new into place.
+ssh "$SSH_USER@$h" 'bash /tmp/teardown.sh'
+
+# 3. re-stamp GENESIS_TIME, reship ONLY the regenerated small files, launch each slice
+ssh "$SSH_USER@$hA" "ETH_IMG=IMAGE bash /tmp/start-range.sh 0 31 8 0:0 1:1 2:2 3:3"
+ssh "$SSH_USER@$hB" "ETH_IMG=IMAGE bash /tmp/start-range.sh 32 63 8 36:4 37:5 38:6 39:7"
+ssh "$SSH_USER@$h" 'bash /tmp/check-range.sh START END'   # range-aware host-check
+```
+Measured on a 64-node/2-host chain: teardown incl. a 184 GB RocksDB wipe **7s per
+host** (`rm -rf` of RocksDB is far cheaper than the genesis-countdown budget
+assumes), reship + 32 `docker run` ~25s per host, mesh at full peer count *before*
+genesis — so `--offset 300` left minutes of slack. Starting host A before host B
+fills A's log with WARN `Failed to negotiate transport protocol(s)` for B's
+not-yet-up nodes; benign dial races, peers converge. Grep `ERROR` by level, since
+`-i error` also matches those warnings.
 
 ### Set up / refresh observability
 Per host: a Prometheus that scrapes this devnet's nodes with a `network=<name>`
@@ -375,6 +437,9 @@ Swap (persistent): `fallocate -l 16G /swapfile && chmod 600 && mkswap && swapon`
 | `subnet-align-validators.py` | operator | `GENESIS_DIR NODES SUBNETS VPN` | Rewrite `annotated_validators.yaml` so each node's validators sit in ONE subnet. Called by `make-genesis.sh`; identity at `VPN=1` |
 | `start-devnet.sh` | host | `NODES SUBNETS [N:client ...]`; `ETH_IMG`, `MEM`, `LOGOPT`, `EXTRA_ETH_FLAGS`, `ALLOW_STALE_DATA` | Launch a fresh devnet (all-ethlambda + canaries, per-subnet aggregators). Preflight: genesis/SUBNETS match, empty data dirs, known clients |
 | `host-check.sh` | host | `[NODES]`; `LAG_THRESHOLD` | Per-node table (container status, restarts, head/justified/finalized, sync, aggregator, peers) read from `127.0.0.1` only — works when the central prom doesn't. Exit ≠0 = needs attention |
+| `start-range.sh` | host | `START END SUBNETS [N:subnet ...]`; `ETH_IMG`, `MEM`, `LOGOPT`, `EXTRA_ETH_FLAGS`, `ALLOW_STALE_DATA` | Launch one host's SLICE of a chain that spans hosts (`start-devnet.sh` only does `0..NODES-1` with aggregator = index). Aggregator→subnet map is explicit; preflight also logs the genesis pubkey size so a 52B/32B image mismatch is caught before launch |
+| `check-range.sh` | host | `START END` | Range-aware `host-check.sh` for a host owning `START..END` (status, head/justified/finalized, peers, aggregator, restarts). Exit ≠0 = needs attention |
+| `teardown.sh` | host | `KEEP_GENESIS`, `STAGED` | Retire this host's slice in wipe-before-stamp order: clear `--restart` policy then remove containers, archive genesis to `genesis.bak-<ts>` (**keeps the retired chain's hash-sig keys**), promote a staged genesis, wipe `data/node_*` |
 | `cs-restart.sh` | host | `CS_PORT[,PORT2] node...`; `IMAGE`, `AGG`, `SUBNETS` | Checkpoint-sync restart: 60s backoff, crash logs, aggregator role **preserved** by default (`AGG=auto\|<id>\|off` to set it, `IMAGE=` to canary a build) |
 | `convert.sh` | host | `CS_PORT N:client[:agg]...`; `ACC` (default: from genesis) | Convert nodes to other clients. Validates specs first; warns on aggregator loss |
 | `start-observability.sh` | host | `RECREATE`, `PROM_*`, `CADVISOR_*` | Create this host's prometheus + cadvisor containers (node_exporter is systemd, not here) |
