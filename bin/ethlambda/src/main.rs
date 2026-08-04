@@ -641,11 +641,26 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 
 /// Fetch the initial state for the node.
 ///
-/// If `checkpoint_urls` is empty, creates a genesis state from the local
-/// genesis configuration. Otherwise performs checkpoint sync by downloading
-/// and verifying the finalized state AND signed block from a peer. URLs are
-/// tried in order: the first peer that succeeds wins, and failures fall over
-/// to the next URL. Startup only aborts if every URL fails.
+/// State already on disk wins: a previous run's DB is resumed from whenever it
+/// exists and belongs to this network, whether or not `checkpoint_urls` is
+/// supplied. `checkpoint_urls` is the fallback for when there is nothing
+/// resumable on disk, or when what is there has fallen too far behind the
+/// current slot to be worth catching up over P2P
+/// ([`MAX_RESUMABLE_DB_STATE_AGE`]).
+///
+/// With no resumable DB state, a non-empty `checkpoint_urls` performs checkpoint
+/// sync by downloading and verifying the finalized state AND signed block from a
+/// peer. URLs are tried in order: the first peer that succeeds wins, and
+/// failures fall over to the next URL. Startup only aborts if every URL fails.
+/// An empty `checkpoint_urls` creates a genesis state from the local genesis
+/// configuration.
+///
+/// Aborting when every URL fails is deliberate, and applies even when a stale
+/// resumable DB is in hand: an operator who configured a checkpoint URL asked
+/// for a specific anchor, so an unreachable one is a misconfiguration to
+/// surface at boot rather than paper over by silently starting a node that is
+/// hours behind. Dropping the flag is the way to say "resume whatever is on
+/// disk"; that path never aborts.
 ///
 /// Fetching the matching signed block lets the local store serve a valid
 /// anchor via the `BlocksByRoot` req-resp protocol; without it, peers
@@ -669,20 +684,10 @@ async fn fetch_initial_state(
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
-    if checkpoint_urls.is_empty() {
-        info!("No checkpoint sync URL provided, initializing from genesis state");
-        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
-    };
-
-    // Checkpoint sync path: try URLs in order, fail over to the next on error.
-    info!(
-        url_count = checkpoint_urls.len(),
-        "Starting checkpoint sync"
-    );
-    // Checkpoint sync path
-
-    // Prefer resuming from a fresh on-disk state to avoid re-downloading what we already have.
+    // Prefer resuming from on-disk state to avoid re-downloading what we already
+    // have. Tried before the checkpoint-sync and genesis paths so that a restart
+    // without `--checkpoint-sync-url` keeps the chain instead of writing a
+    // slot-0 anchor over it.
     if let Ok(Some(store)) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
@@ -693,18 +698,30 @@ async fn fetch_initial_state(
         let head_slot = store.head_slot();
         let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
-            info!(
-                head_slot,
-                current_slot, gap, "Resuming from existing DB state"
-            );
+            info!(head_slot, current_slot, gap, "Resuming from existing DB");
             return Ok(store);
         }
-        warn!(
-            head_slot,
-            current_slot, gap, "Existing DB state is stale; falling through to checkpoint sync"
-        );
+        // No checkpoint URL was configured, so just run the node against the
+        // data directory it was given: that is the setup asked for, and there
+        // is no anchor to switch to. The warning is the point of this arm,
+        // since the DB is known to be stale and range sync may not be able to
+        // close a gap this large: peers prune block signatures past
+        // `SIGNATURE_PRUNING_RANGE`, so beyond that horizon they cannot serve
+        // the history the node is missing.
+        if checkpoint_urls.is_empty() {
+            warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+            return Ok(store);
+        }
+        warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
     }
 
+    if checkpoint_urls.is_empty() {
+        info!("No checkpoint sync URL provided, initializing from genesis state");
+        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
+        return Ok(Store::from_anchor_state(backend, genesis_state));
+    }
+
+    // Checkpoint sync path: try URLs in order, fail over to the next on error.
     info!(?checkpoint_urls, "Starting checkpoint sync");
 
     let (state, signed_block) = checkpoint_sync::fetch_anchor_with_retry(
@@ -740,6 +757,8 @@ async fn fetch_initial_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::genesis::GenesisValidatorEntry;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
@@ -827,5 +846,158 @@ validators:
             .or(file.config.attestation_committee_count)
             .unwrap_or(1);
         assert_eq!(resolved, 1);
+    }
+
+    /// Slot of the anchor seeded into the test DB. Any non-zero slot works: a
+    /// genesis re-initialization always anchors at slot 0, so a non-zero head
+    /// slot is what distinguishes "resumed from disk" from "started over".
+    const SEEDED_HEAD_SLOT: u64 = 12;
+
+    /// Loopback port 1 refuses connections immediately, so the checkpoint-sync
+    /// path fails fast and deterministically without reaching the network.
+    const UNREACHABLE_CHECKPOINT_URL: &str = "http://127.0.0.1:1";
+
+    fn now_secs() -> u64 {
+        SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_secs()
+    }
+
+    /// A `genesis_time` placing the current slot exactly `gap` slots ahead of
+    /// [`SEEDED_HEAD_SLOT`], so a test picks which side of
+    /// [`MAX_RESUMABLE_DB_STATE_AGE`] the seeded DB lands on.
+    ///
+    /// `current_slot` is derived from the wall clock inside
+    /// [`fetch_initial_state`], so `genesis_time` is the only knob and no clock
+    /// injection is needed. Sub-second truncation here only ever *shortens* the
+    /// elapsed time, and a whole slot of it would have to pass between this
+    /// call and the read inside the function to shift the gap.
+    fn genesis_time_for_gap(gap: u64) -> u64 {
+        let seconds_per_slot = MILLISECONDS_PER_SLOT / 1_000;
+        now_secs() - (SEEDED_HEAD_SLOT + gap) * seconds_per_slot
+    }
+
+    /// Single-validator genesis config. The pubkeys are placeholders; none of
+    /// the paths under test verify signatures.
+    fn test_genesis(genesis_time: u64) -> GenesisConfig {
+        GenesisConfig {
+            genesis_time,
+            genesis_validators: vec![GenesisValidatorEntry {
+                attestation_pubkey: [1u8; 52],
+                proposal_pubkey: [2u8; 52],
+            }],
+        }
+    }
+
+    /// Write an anchor at [`SEEDED_HEAD_SLOT`] into `backend`, standing in for a
+    /// previous run's persisted chain state.
+    fn seed_db(backend: Arc<dyn StorageBackend>, genesis: &GenesisConfig) {
+        let mut anchor = State::from_genesis(genesis.genesis_time, genesis.validators());
+        anchor.slot = SEEDED_HEAD_SLOT;
+        anchor.latest_block_header.slot = SEEDED_HEAD_SLOT;
+        Store::from_anchor_state(backend, anchor);
+    }
+
+    #[tokio::test]
+    async fn initializes_from_genesis_when_db_is_empty() {
+        let genesis = test_genesis(now_secs());
+        let backend = Arc::new(InMemoryBackend::default());
+
+        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+
+        assert_eq!(store.head_slot(), 0);
+    }
+
+    #[tokio::test]
+    async fn resumes_from_fresh_db_without_checkpoint_url() {
+        let genesis = test_genesis(genesis_time_for_gap(MAX_RESUMABLE_DB_STATE_AGE / 2));
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &genesis);
+
+        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+
+        assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
+    }
+
+    /// With no checkpoint URL to fall back to, resuming a stale DB beats
+    /// clobbering it with a slot-0 genesis anchor: P2P forward-sync can close
+    /// the gap, a genesis re-init cannot.
+    #[tokio::test]
+    async fn resumes_from_stale_db_without_checkpoint_url() {
+        let genesis = test_genesis(genesis_time_for_gap(MAX_RESUMABLE_DB_STATE_AGE + 100));
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &genesis);
+
+        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+
+        assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
+    }
+
+    /// A DB inside the resume window wins over a checkpoint URL: the store
+    /// comes back even though the URL is unreachable, so nothing was dialed.
+    ///
+    /// This and [`falls_through_to_checkpoint_sync_when_db_is_stale`] are what
+    /// pin the [`MAX_RESUMABLE_DB_STATE_AGE`] comparison. The no-URL tests
+    /// cannot: both of their branches return the same store, so inverting the
+    /// threshold leaves them green. The gap is exactly the window bound here,
+    /// so an off-by-one to `<` also fails this test.
+    #[tokio::test(start_paused = true)]
+    async fn resumes_from_fresh_db_with_checkpoint_url() {
+        let genesis = test_genesis(genesis_time_for_gap(MAX_RESUMABLE_DB_STATE_AGE));
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &genesis);
+
+        let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
+        let store = fetch_initial_state(&urls, &genesis, backend).await.unwrap();
+
+        assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
+    }
+
+    /// Past the resume window a checkpoint URL takes over, so an unreachable
+    /// one surfaces as a startup error rather than a silent stale resume.
+    ///
+    /// Paused time collapses the `CHECKPOINT_RETRY_BACKOFF` sleeps between
+    /// attempts; the connection refusal itself is immediate.
+    #[tokio::test(start_paused = true)]
+    async fn falls_through_to_checkpoint_sync_when_db_is_stale() {
+        let genesis = test_genesis(genesis_time_for_gap(MAX_RESUMABLE_DB_STATE_AGE + 1));
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &genesis);
+
+        let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = fetch_initial_state(&urls, &genesis, backend).await else {
+            panic!("unreachable checkpoint URL must abort startup");
+        };
+
+        assert!(
+            matches!(err, checkpoint_sync::CheckpointSyncError::Http(_)),
+            "expected a transport error, got {err:?}"
+        );
+    }
+
+    /// A DB from another network is not resumable, so the no-URL path still
+    /// falls back to genesis.
+    ///
+    /// This pins current behavior, not a desired one. `from_db_state` treats a
+    /// `GENESIS_TIME` mismatch as an empty DB and only warns, so with no
+    /// checkpoint URL the node writes a genesis anchor over a populated
+    /// foreign-network directory: the same data loss the resume ordering
+    /// removes everywhere else. Left as-is deliberately, and this test is here
+    /// to make the change visible when someone fixes it.
+    #[tokio::test]
+    async fn initializes_from_genesis_when_db_genesis_time_differs() {
+        let seeded_genesis = test_genesis(now_secs());
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &seeded_genesis);
+
+        let other_genesis = test_genesis(seeded_genesis.genesis_time + 1);
+        let store = fetch_initial_state(&[], &other_genesis, backend)
+            .await
+            .unwrap();
+
+        assert_eq!(store.head_slot(), 0);
     }
 }

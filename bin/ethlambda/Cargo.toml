@@ -49,5 +49,11 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 libc.workspace = true
 
+[dev-dependencies]
+# `test-util` for `#[tokio::test(start_paused = true)]`: the checkpoint-sync
+# tests would otherwise wait out the real retry backoff. Dev-only, so the
+# feature never reaches the shipped binary.
+tokio = { workspace = true, features = ["test-util"] }
+
 [build-dependencies]
 vergen-git2.workspace = true

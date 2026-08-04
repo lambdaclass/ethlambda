@@ -38,12 +38,10 @@ pub struct StateTransitionTest {
     /// any state field those checks don't enumerate is still pinned.
     #[serde(rename = "postStateRoot")]
     pub post_state_root: Option<H256>,
-    /// Expected rejection reason for negative cases. Captured only so
-    /// `deny_unknown_fields` accepts it; failure is asserted via a missing
-    /// `post`.
+    /// Expected rejection reason for negative cases. A missing `post` asserts
+    /// that the transition failed; this pins *why* it had to fail.
     #[serde(rename = "rejectionReason")]
-    #[allow(dead_code)]
-    pub rejection_reason: Option<String>,
+    pub rejection_reason: Option<RejectionReason>,
     /// Aggregation proof regime (unused by the STF runner). Captured only so
     /// `deny_unknown_fields` accepts it.
     #[serde(rename = "proofSetting")]

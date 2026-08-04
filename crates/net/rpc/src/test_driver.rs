@@ -231,7 +231,7 @@ async fn step_fork_choice(
         Ok(()) => (true, None),
         Err(err) => {
             debug!(%err, "fork-choice step rejected");
-            (false, Some(err))
+            (false, Some(err.to_string()))
         }
     };
     let snapshot = snapshot_store(&guard);
@@ -247,14 +247,14 @@ async fn step_fork_choice(
 ///
 /// Runs `state_transition(pre, block)` for each block in sequence. The
 /// `succeeded` flag reflects whether the full STF chain executed without
-/// error; the simulator compares it to the fixture's `expectException` field.
+/// error; the simulator compares it to the fixture's `rejectionReason` field.
 async fn run_state_transition(
     Json(request): Json<StateTransitionRunRequest>,
 ) -> Json<StateTransitionResponse> {
     let mut state: State = request.pre.into();
     let blocks: Vec<Block> = request.blocks.into_iter().map(Into::into).collect();
 
-    let response = match apply_state_transition(&mut state, &blocks, request.expect_exception) {
+    let response = match apply_state_transition(&mut state, &blocks, request.rejection_reason) {
         Ok(()) => StateTransitionResponse {
             succeeded: true,
             error: None,
@@ -271,22 +271,22 @@ async fn run_state_transition(
 
 /// Run the STF for each block in `blocks` and return the first error (if any).
 ///
-/// When `blocks` is empty and `expect_exception` is set the spec fixture wants
+/// When `blocks` is empty and `rejection_reason` is set the spec fixture wants
 /// failure but the STF entry point never runs, so call `process_slots(slot)`
 /// against the current slot. That call returns `Err(StateSlotIsNewer)` because
 /// the STF rejects `target_slot <= current_slot`, giving the simulator a
-/// deterministic non-2xx outcome that matches the fixture's `expectException`.
+/// deterministic non-2xx outcome that matches the fixture's `rejectionReason`.
 fn apply_state_transition(
     state: &mut State,
     blocks: &[Block],
-    expect_exception: Option<String>,
+    rejection_reason: Option<String>,
 ) -> Result<(), String> {
     for block in blocks {
         ethlambda_state_transition::state_transition(state, block)
             .map_err(|err| err.to_string())?;
     }
 
-    if blocks.is_empty() && expect_exception.is_some() {
+    if blocks.is_empty() && rejection_reason.is_some() {
         let target_slot = state.slot;
         ethlambda_state_transition::process_slots(state, target_slot)
             .map_err(|err| err.to_string())?;
