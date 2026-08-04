@@ -131,9 +131,25 @@ like ethlambda:
 ## convert.sh usage
 
 ```
-ACC=<SUBNETS> convert.sh <CS_PORT> <spec>...   spec = N:client[:agg]   client in zeam|ream|qlean|gean|lantern|grandine
-# e.g. on a 2-subnet devnet:  ACC=2 convert.sh 5052 25:zeam 26:zeam 27:zeam
+convert.sh <CS_PORT> <spec>...   spec = N:client[:agg]   client in zeam|ream|qlean|gean|lantern|grandine
+# e.g.  convert.sh 5052 25:zeam 26:zeam 27:zeam
+# ACC=<SUBNETS> only to override what the genesis says
 ```
-No BASE arg (each devnet numbers nodes from 0). `ACC` = the devnet's `SUBNETS`.
-Keeps the 60s backoff and memory limits. CS_PORT = a healthy same-devnet node's api
-port. After converting, relabel prometheus (see operations.md).
+No BASE arg (each devnet numbers nodes from 0). `ACC` (the devnet's `SUBNETS` /
+`ATTESTATION_COMMITTEE_COUNT`) is read from `genesis/config.yaml` on the host, so it
+can't silently disagree with the chain — a wrong value puts the node's votes on a
+subnet nobody aggregates. CS_PORT = a healthy same-devnet node's api port.
+
+Guards, both learned the hard way:
+
+- **Specs are validated before anything is removed.** A typo'd client name used to
+  be caught only after the container was gone, the data wiped and the 60s backoff
+  slept — leaving the node down.
+- **Converting an aggregator away warns.** If the node currently runs with
+  `--is-aggregator` and the new spec has no `:agg`, that subnet is left with no
+  aggregator: votes verify, nothing is stored, `attestation_count` goes to 0 and
+  finality dies quietly. Either keep the role (`N:client:agg`) or move it to
+  another node first (`AGG=<subnet> cs-restart.sh <CS_PORT> <node>`).
+
+Keeps the 60s backoff, memory limits, and json-log caps. After converting, relabel
+prometheus (see operations.md) and confirm with `host-check.sh`.

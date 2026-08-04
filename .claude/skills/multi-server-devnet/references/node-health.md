@@ -40,6 +40,11 @@ log strings (`crates/blockchain/src`). Cross-checks:
 - Log greps are written as match strings. Apply them to
   `sudo docker logs <container>` or, via Loki in Grafana Explore, as
   `{network="$NET", node="<client>_n"} |= "<string>"`.
+- **No Prometheus?** `scripts/host-check.sh` on the host covers items 1, 4 and 6
+  at a glance (head/justified/finalized, sync state, aggregator flag, peer count,
+  container status + restart count) straight off each node's `127.0.0.1` metrics
+  port. Use it when the central stack is unreachable, or as the first pass before
+  reaching for the queries below.
 
 ---
 
@@ -105,20 +110,20 @@ network"` → it is missing ancestors and back-filling.
 
 **Means — two levels:**
 
-- **Valid** (passes `validate_attestation_data`, `store.rs:172`): source → target
+- **Valid** (passes `validate_attestation_data` in `crates/blockchain/src/store.rs`): source → target
   → head lie on one parent chain, `source.slot ≤ target.slot ≤ head.slot`, each
   checkpoint's slot matches its block, and the vote isn't from the future.
 - **Useful:** an attestation only *helps* if its **source matches the head
   state's latest-justified checkpoint**, and its **target is a justifiable slot
   strictly between the source and the head — not the head itself and not the
-  source.** ethlambda's `produce_attestation_data` (`store.rs:759`) enforces both:
+  source.** ethlambda's `produce_attestation_data` (same file) enforces both:
   - Source is read from the **head state's** `latest_justified`, which always
     lies on the head's own chain — deliberately *not* the store's global
     `latest_justified` (which is a highest-slot-wins max that can latch onto an
     off-head sibling). Sourcing off-head makes every head-chain target fail
     `is_valid_vote`, so the head can never re-justify and block production stalls
     (leanSpec #1166 / #595).
-  - Target is `get_attestation_target` (`store.rs:646`): walk back from the head
+  - Target is `get_attestation_target`: walk back from the head
     toward the safe target, then back to the nearest slot satisfying
     `slot_is_justifiable_after(finalized)`, clamped to `≥ source`. That yields a
     justifiable, on-chain slot newer than the source and at/behind the head.

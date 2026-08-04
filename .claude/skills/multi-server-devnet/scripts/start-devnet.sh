@@ -14,8 +14,8 @@
 #             (everything else runs ethlambda)
 set -u
 NODES=$1; SUBNETS=$2; shift 2
-# Paths are env-overridable (same as cs-restart.sh/agg-restart.sh) so the launch
-# can be exercised against a fixture dir without touching the real devnet.
+# Paths are env-overridable (same as cs-restart.sh) so the launch can be
+# exercised against a fixture dir without touching the real devnet.
 GENESIS=${GENESIS:-/opt/lean-quickstart/genesis}
 DATA=${DATA:-/opt/lean-quickstart/data}
 # Per-container limits, env-overridable (same pattern as the *_IMG vars below).
@@ -51,11 +51,48 @@ GEAN_IMG=${GEAN_IMG:-ghcr.io/geanlabs/gean:devnet5}
 LANTERN_IMG=${LANTERN_IMG:-bitminemavan/lantern:devnet5}
 GRANDINE_IMG=${GRANDINE_IMG:-sifrai/lean:devnet-5}
 
+CLIENTS="ethlambda zeam ream qlean gean lantern grandine"
+
 # map node index -> canary client (empty = ethlambda)
 declare -A CANARY
-for spec in "$@"; do CANARY[${spec%%:*}]=${spec#*:}; done
+for spec in "$@"; do
+  n=${spec%%:*}; client=${spec#*:}
+  case "$n" in ''|*[!0-9]*) log "ERROR: bad node index in spec '$spec'"; exit 1;; esac
+  case " $CLIENTS " in *" $client "*) ;; *) log "ERROR: unknown client '$client' in spec '$spec' (want: $CLIENTS)"; exit 1;; esac
+  CANARY[$n]=$client
+done
 
-log "=== start-devnet NODES=$NODES SUBNETS=$SUBNETS canaries=[$*] GT=$(sudo grep ^GENESIS_TIME $GENESIS/config.yaml | awk '{print $2}') ==="
+# --- preflight: the two mistakes that cost a whole devnet ---------------------
+cfg_val(){ sudo awk -v k="$1:" '$1==k{print $2}' "$GENESIS/config.yaml" 2>/dev/null; }
+GT=$(cfg_val GENESIS_TIME); GACC=$(cfg_val ATTESTATION_COMMITTEE_COUNT)
+[ -n "$GT" ] || { log "ERROR: no GENESIS_TIME in $GENESIS/config.yaml -- is the genesis shipped?"; exit 1; }
+# SUBNETS drives the aggregator set and every client's --attestation-committee-count.
+# If it disagrees with the genesis the chain was built with, nodes compute a different
+# subnet map than the aggregators listen on and votes vanish.
+if [ -n "$GACC" ] && [ "$GACC" != "$SUBNETS" ]; then
+  log "ERROR: SUBNETS=$SUBNETS but the genesis says ATTESTATION_COMMITTEE_COUNT=$GACC."
+  log "  Pass $GACC (or ship the genesis you meant to run)."
+  exit 1
+fi
+# A node that resumes an old DB against a NEW genesis forks onto its own chain
+# (the genesis-time landmine). Fresh start => data dirs must be empty.
+stale=$(sudo find "$DATA" -mindepth 2 -maxdepth 2 -path "$DATA/node_*" -print -quit 2>/dev/null)
+if [ -n "$stale" ] && [ -z "${ALLOW_STALE_DATA:-}" ]; then
+  log "ERROR: leftover node data under $DATA (e.g. $stale)."
+  log "  Wipe it first:  sudo rm -rf $DATA/node_*"
+  log "  Do that BEFORE generating genesis -- it is the one step that scales with chain"
+  log "  age, so it must not run against the GENESIS_TIME countdown."
+  log "  To relaunch on the EXISTING chain instead, use cs-restart.sh (checkpoint sync),"
+  log "  or override with ALLOW_STALE_DATA=1 if you know the data matches this genesis."
+  exit 1
+fi
+gt_delta=$((GT - $(date +%s)))
+if [ "$gt_delta" -lt -3600 ]; then
+  log "WARNING: GENESIS_TIME is $(( -gt_delta / 60 ))min in the PAST with empty data dirs --"
+  log "  nodes will boot thousands of slots behind and sit in the sync gate. Stale genesis dir?"
+fi
+
+log "=== start-devnet NODES=$NODES SUBNETS=$SUBNETS canaries=[$*] GT=$GT (genesis in ${gt_delta}s) ==="
 
 for n in $(seq 0 $((NODES-1))); do
   G=$((9000+n)); A=$((5052+n)); M=$((9200+n))
@@ -79,7 +116,8 @@ for n in $(seq 0 $((NODES-1))); do
         --bootnodes /config/nodes.yaml --validator-config /config/validator-config.yaml \
         --hash-sig-keys-dir /config/hash-sig-keys --data-dir /data \
         --gossipsub-port "$G" --node-id "$NAME" --node-key /config/"$NAME".key \
-        --http-address 0.0.0.0 --api-port "$A" --metrics-port "$M" $aggflags $EXTRA_ETH_FLAGS >/dev/null \
+        --http-address 0.0.0.0 --api-port "$A" --metrics-port "$M" \
+        --attestation-committee-count "$SUBNETS" $aggflags $EXTRA_ETH_FLAGS >/dev/null \
         && log "$NAME ethlambda started${aggflags:+ (agg subnet $n)}" || log "FAIL $NAME ethlambda";;
     zeam)
       # console_log_level=info exposes zeam's own duty publishes (attestation /

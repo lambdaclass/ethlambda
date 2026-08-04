@@ -1,7 +1,7 @@
 ---
 name: multi-server-devnet
 description: This skill should be used for managing long-lived lean-consensus devnets that run as detached docker containers on remote hosts — the current setup is one INDEPENDENT single-host devnet per server, federated into one Grafana. Works for any server names and any number of servers/nodes. Trigger when the user asks to "start/reset the devnet(s)", "start a devnet on <server>", "restart the devnet", "rolling restart", "recover stalled nodes", "the devnet stopped finalizing", "investigate the finality stall", "convert nodes to zeam/ream/qlean/grandine/gean/lantern", "multi-client devnet", "add a client to the devnet", "canary a new client/build", "scale the devnet / add a node", "set up grafana/prometheus for the devnets", "pull the latest image on the servers", or "add swap / memory limits to the servers". Distinct from the local single-host `devnet-runner` skill.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # Multi-Server Devnet
@@ -33,6 +33,11 @@ Put those values in `scripts/devnet.env` (copy `scripts/devnet.env.example`;
 gitignored) instead of retyping them: the operator-side scripts source it via
 `scripts/devnet-env.sh`, and an env var exported in the shell still wins over the
 file. It is the one place a deployment's hosts, urls, and Grafana ids live.
+Per-devnet `NODES`/`SUBNETS` are recorded there too, but as the operator's
+inventory — the scripts take them as positional args, and the authority on a
+running devnet is always its own `genesis/config.yaml`
+(`ATTESTATION_COMMITTEE_COUNT`), which `start-devnet.sh` and `convert.sh` check
+against.
 
 Per devnet, node `n` (0 ≤ n < NODES) on its host:
 
@@ -86,6 +91,14 @@ devnet only — one server's chain stalling never affects another's.
    leaks ~1.8 GiB/h) must OOM one container, not starve the whole host. With
    several devnets-per-fleet this matters more, not less — but here each host runs
    only its own devnet.
+5. **A node must come back with the role it had.** A restart that drops
+   `--is-aggregator` leaves its subnet with no aggregator: attestations still
+   verify and the logs look healthy, but nobody stores the gossip signatures, so
+   blocks are built with `attestation_count=0` and finality dies quietly.
+   `cs-restart.sh` preserves the role; `convert.sh` warns when a conversion would
+   remove one. After any restart, confirm one `AGG=yes` per subnet with
+   `host-check.sh` (or `lean_is_aggregator`). Same for `--log-opt`: every
+   `docker run` must cap the json log, or one verbose canary fills the disk.
 
 ## Editing genesis / mass restarts needs care
 
@@ -151,13 +164,22 @@ bash scripts/make-genesis.sh OUTDIR NODES SUBNETS KEYS_DIR SRC_VCONFIG [GT_OFFSE
 #   ssh, so push Mac→host.
 
 # 3. host-side: launch all nodes (+ canaries). Args: NODES SUBNETS [N:client ...]
-scp scripts/start-devnet.sh "$SSH_USER@$h:/tmp/"
+scp scripts/start-devnet.sh scripts/host-check.sh "$SSH_USER@$h:/tmp/"
 ssh "$SSH_USER@$h" "bash /tmp/start-devnet.sh NODES SUBNETS 28:zeam 29:ream 30:qlean 31:lantern"
 ```
-Verify ~2 min after genesis with `scripts/sweep.sh`: head climbing, justified
-advancing, then finality. A young devnet can sit at `finalized=0` while justified
-jumps (square/pronic-distance slots) — that's the bootstrap regime, not a stall;
-leave it alone (see `references/operations.md`).
+`start-devnet.sh` refuses to launch when its `SUBNETS` disagrees with the genesis
+on disk, when node data dirs are non-empty (step 0 skipped ⇒ nodes resume an old
+DB against a new genesis and fork off; `ALLOW_STALE_DATA=1` overrides), or when a
+canary spec names an unknown client — all three otherwise cost the whole devnet.
+
+Verify ~2 min after genesis, host-side first, then across devnets:
+```bash
+ssh "$SSH_USER@$h" "bash /tmp/host-check.sh NODES"   # every node up + following (exit≠0 = attention)
+bash scripts/sweep.sh                                # head/justified/finalized per devnet
+```
+A young devnet can sit at `finalized=0` while justified jumps
+(square/pronic-distance slots) — that's the bootstrap regime, not a stall; leave
+it alone (see `references/operations.md`).
 
 ### Set up / refresh observability
 Per host: a Prometheus that scrapes this devnet's nodes with a `network=<name>`
@@ -175,6 +197,9 @@ memory). Details + the Node Exporter Full dashboard in `references/operations.md
 # operator-side: emit this devnet's prometheus.yml (network label + per-node client_type)
 bash scripts/prometheus-config.sh NETWORK NODES HOST_IP CENTRAL_WRITE_URL [N:client ...] > /tmp/prometheus.yml
 cat /tmp/prometheus.yml | ssh "$SSH_USER@$h" 'sudo tee /opt/lean-quickstart/observability/prometheus.yml >/dev/null && sudo docker restart prometheus'
+# host-side: create the scrapers on a NEW host (existing ones are left alone
+# unless RECREATE=1 — a config change only needs the restart above)
+scp scripts/start-observability.sh "$SSH_USER@$h:/tmp/"; ssh "$SSH_USER@$h" 'bash /tmp/start-observability.sh'
 ```
 Relabel gotcha: that file is a single-file bind-mount — edit by full overwrite
 (`tee`) + `docker restart prometheus`, never `sed -i`+HUP (inode trap, see
@@ -194,24 +219,16 @@ Edit the JSON and re-copy; treat the repo copy as the source of truth and keep i
 in sync, since nothing pulls server-side edits back.
 
 **Logs (Loki + promtail).** Mirrors the metrics path: a per-host **promtail**
-ships node-container stdout/stderr to the **central Loki** (a container in the
-central docker stack; filesystem store, 7d retention; Grafana has it as a
-provisioned datasource). promtail reads via the **Docker daemon API** (docker_sd), so it is
-immune to json-file rotation and works on a live devnet with no restart — it only
-mounts the socket. Low-card **indexed labels** match prometheus: `network` (same
-value), `node` (`<client>_N`, e.g. `zeam_8`), `client_type`, `instance`, `stream`, plus `level`
-(extracted from the line). The pipeline (see `promtail-config.sh`) also: strips
-ANSI colour codes from the client's pretty-logger output; **merges multi-line
-events** (fork-choice tree dumps etc.) into one entry via a `multiline` stage
-(`firstline` = a leading ISO timestamp; strip ANSI must run first so it anchors) —
-without it each dump line is a separate level-less entry; and attaches
-high-cardinality fields (`slot`, `validator`, `proposer`, `block_root`, target/
-source slot+root, `peer_id`, …) as Loki **structured metadata** — filterable
-(`| slot="123"`) and shown in Grafana's log-detail view, WITHOUT indexing them as
-labels (which would explode stream cardinality). Query in Grafana Explore with
-e.g. `{network="<devnet>"} | level="ERROR"`, or use the provisioned **Devnet
-Logs** dashboard (`scripts/logs-dashboard.json`, uid `devnet-logs`: logs panel +
-log-volume-by-level timeline, filters network/node/stream/search).
+ships node-container stdout/stderr to the **central Loki** (7d retention;
+provisioned Grafana datasource). It discovers containers through the **Docker
+daemon API**, so it is immune to json-file rotation and safe to deploy on a live
+devnet — it only mounts the socket. Indexed labels match prometheus (`network`,
+`node` = `<client>_N`, `client_type`, `instance`, `stream`, `level`);
+high-cardinality fields (`slot`, `validator`, `block_root`, …) ride as Loki
+**structured metadata** instead, so they stay filterable (`| slot="123"`) without
+exploding stream cardinality. Query in Grafana Explore
+(`{network="<devnet>"} | level="ERROR"`) or use the provisioned **Devnet Logs**
+dashboard (`scripts/logs-dashboard.json`).
 ```bash
 # operator-side: emit this host's promtail.yml (network label + push to central Loki)
 bash scripts/promtail-config.sh NETWORK HOST_IP LOKI_PUSH_URL [N:client ...] \
@@ -224,19 +241,12 @@ scp scripts/start-promtail.sh "$SSH_USER@$h:/tmp/"; ssh "$SSH_USER@$h" 'bash /tm
 `client_type`. Same single-file bind-mount inode trap as prometheus.yml: overwrite
 with `tee` then `sudo docker restart promtail`.
 
-**First-start backlog gotcha:** docker_sd has no "since", so on a fresh
-`positions.yaml` promtail replays each container's FULL retained history (the
-600m×N json files reach back days) — Loki rejects it as too-old and rate-limits,
-and the read burns 2+ cores per host (disturbs the devnet). A `drop older_than: 1h`
-pipeline stage (baked into `promtail-config.sh`) stops the *shipping*, but promtail
-still *reads* the whole backlog. On hosts with large logs, after first launch
-**seed the positions to now** so it skips the read:
-```bash
-ssh "$SSH_USER@$h" 'POS=/opt/lean-quickstart/observability/promtail-data/positions.yaml
-  sudo docker stop promtail; N=$(date +%s)
-  sudo sed -i -E "s/: \"[0-9]+\"/: \"$((N-300))\"/" "$POS"; sudo docker start promtail'
-```
-Positions persist (mounted dir), so this is a one-time fixup per host.
+**One trap on first launch:** promtail replays each container's whole retained log
+history (docker_sd has no "since"), which Loki rejects as too-old and which burns
+2+ cores per host while it reads. `promtail-config.sh` bakes in the `drop
+older_than: 1h` guard, but on a host with large logs you also want to seed
+`positions.yaml` to "now" once — the pipeline stages, the exact seed command, and
+why the stage order matters are in `references/operations.md`.
 
 **Finality alert (Slack).** `scripts/grafana-finality-alert.yaml.template` provisions
 a per-devnet "lost finality" rule into the central Grafana: fires when
@@ -260,13 +270,31 @@ rule needs a concrete datasource uid, which is why `PROM_DS_UID` is explicit.
 
 ### Recover crashed / frozen / split nodes (no chain reset)
 Use `scripts/cs-restart.sh` on the affected server — checkpoint-sync restart with
-the 60s backoff and crash-log preservation built in:
+the 60s backoff, per-container crash-log preservation, and **aggregator-role
+preservation** built in:
 ```bash
-ssh "$SSH_USER@$h" "bash /tmp/cs-restart.sh <CS_PORT> <node>..."
+ssh "$SSH_USER@$h" "bash /tmp/cs-restart.sh <CS_PORT[,CS_PORT2]> <node>..."
+ssh "$SSH_USER@$h" "bash /tmp/host-check.sh <NODES>"   # verify after
 ```
-`CS_PORT` = a healthy same-devnet node's api (an aggregator stays up — use it).
-Restart aggregators last, sourcing checkpoint from a healthy non-aggregator. For
-many nodes, launch detached and poll `/tmp/cs-restart.log` (detached-SSH and
+`CS_PORT` = a healthy same-devnet node's api (an aggregator stays up — use it);
+comma-separate a second one and ethlambda falls over to it if the first fails.
+It reads the topology flags (`--is-aggregator`, `--aggregate-subnet-ids`,
+`--attestation-committee-count`) off the container it replaces, so restarting an
+aggregator no longer demotes it — the failure that looks like a healthy devnet
+which silently stops finalizing. If the container is already gone there is nothing
+to read: pass `SUBNETS=<n>` so the rule (nodes `0..SUBNETS-1`) can be re-derived.
+Restart aggregators last, sourcing checkpoint from a healthy non-aggregator.
+`AGG=` overrides the preserved role when you want to *change* it, and `IMAGE=`
+canaries a build on the node (aggregators included):
+
+| | |
+|---|---|
+| `AGG` unset | preserve the role the container had (default) |
+| `AGG=auto SUBNETS=n` | apply the topology rule — repairs a node that lost its role |
+| `AGG=<id>` | promote this node to aggregate subnet `<id>` |
+| `AGG=off` | demote deliberately |
+
+For many nodes, launch detached and poll `/tmp/cs-restart.log` (detached-SSH and
 pkill-bracket gotchas in `references/operations.md`).
 
 ### "Is this node working?" — the all-is-good checklist
@@ -283,22 +311,30 @@ per-node fault (so a healthy node isn't blamed for a chain-wide stall). For duty
 ### "A devnet stopped finalizing" — investigate
 Do NOT immediately restart. Diagnose that devnet in order (full method in
 `references/operations.md`): is it the young-devnet bootstrap regime (justified
-still advancing, finalized=0)? → vote count vs `ceil(2/3·NODES)` → which
-validator cohort is missing on the aggregator → are missing nodes silent or
-voting STALE targets → host memory/CPU via the central Prometheus (reachable even
-when that server's SSH is down) → confirm no block rejections (rules out a canary
-interop fork). Common causes: a host OOM freezing fork choice; nodes restarted
-without the 60s backoff; a frozen canary thinning votes; aggregator backlog. Fix
-the cause, then `cs-restart.sh` the affected nodes; deep in the spiral, a fresh
-genesis is faster.
+still advancing, finalized=0)? → `host-check.sh` for the per-node picture (who is
+down, restarting, or lagging past the sync gate) → vote count vs
+`ceil(2/3·NODES)` → which validator cohort is missing on the aggregator → are
+missing nodes silent or voting STALE targets → host memory/CPU via the central
+Prometheus (reachable even when that server's SSH is down) → confirm no block
+rejections (rules out a canary interop fork). Common causes: a host OOM freezing
+fork choice; nodes restarted without the 60s backoff; **an aggregator that came
+back without its role** (check `lean_is_aggregator`/the `AGG` column — one per
+subnet must be `yes`); a frozen canary thinning votes; aggregator backlog. Fix the
+cause, then `cs-restart.sh` the affected nodes; deep in the spiral, a fresh genesis
+is faster.
 
 ### Convert nodes to other clients (zeam/ream/qlean/grandine/gean/lantern)
 Node identity stays `node_n`; the container is renamed to `<client>_n` to reflect
 the new client (so Grafana/logs show it). Use `scripts/convert.sh` (per-client CLI
-shapes + memory limits + 60s backoff; `ACC=<SUBNETS>` env sets committee count):
+shapes + memory limits + 60s backoff; committee count read from the genesis on
+disk, `ACC=<SUBNETS>` only to override):
 ```bash
-ssh "$SSH_USER@$h" "ACC=SUBNETS bash /tmp/convert.sh <CS_PORT> <N:client[:agg]>..."
+ssh "$SSH_USER@$h" "bash /tmp/convert.sh <CS_PORT> <N:client[:agg]>..."
 ```
+It validates every spec before removing anything (a typo used to be discovered
+after the node's container and data were already gone) and warns when the node it
+is replacing was an aggregator and the new spec has no `:agg` — that silently
+leaves a subnet with no aggregator.
 **Canary one node per client type first** and confirm the vote count holds before
 scaling — a broken client converted en masse can drop the ethlambda count below
 `ceil(2/3·NODES)` and kill that devnet's finality. Keep aggregators on ethlambda
@@ -313,28 +349,43 @@ Swap (persistent): `fallocate -l 16G /swapfile && chmod 600 && mkswap && swapon`
 
 ## Resources
 
-- `scripts/devnet.env.example` — template for `scripts/devnet.env` (gitignored): this deployment's `SERVERS`, `SSH_USER`, central prometheus/loki urls, and the Grafana ids the alert deploy needs. Copy + fill in once.
-- `scripts/devnet-env.sh` — sourced helper that loads `devnet.env` (lookup: `$DEVNET_ENV`, `./devnet.env`, script dir) as defaults; exported vars win.
-- `scripts/make-genesis.sh` — operator-side: build one devnet's genesis dir (127.0.0.1 ENRs, per-subnet aggregators, hardlinked keys, runs lean-quickstart `generate-genesis.sh`). Args: `OUTDIR NODES SUBNETS KEYS_DIR SRC_VCONFIG [GT_OFFSET]`. Env `VALIDATORS_PER_NODE` (default 1).
-- `scripts/merge-keyshards.py` — operator-side: merge hash-sig key shards into one sequentially-indexed dir + manifest. hash-sig-cli has no `--start-index` (always emits `validator_0..N-1`), so generating a key set across several machines in parallel needs this reindex. Refuses to mix key formats, so a stale 52-byte `Dim46` shard can't poison a 32-byte `Dim42` genesis. Args: `OUTDIR SHARD_DIR...` (shards concatenated in order).
-- `scripts/subnet-align-validators.py` — operator-side: rewrite `annotated_validators.yaml` so each node's validators all belong to one subnet. Called automatically by `make-genesis.sh`; identity when `VALIDATORS_PER_NODE=1`. Args: `GENESIS_DIR NODES SUBNETS VALIDATORS_PER_NODE`.
-- `scripts/start-devnet.sh` — per-host: launch a full devnet (all-ethlambda + optional canaries, per-subnet aggregators, devnet5 images). Args: `NODES SUBNETS [N:client ...]`.
-- `scripts/prometheus-config.sh` — operator-side: emit a per-devnet prometheus.yml with `network` label + per-node `client_type`. Args: `NETWORK NODES HOST_IP CENTRAL_WRITE_URL [N:client ...]`.
-- `scripts/promtail-config.sh` — operator-side: emit a per-host promtail.yml (docker_sd → central Loki, labels mirror prometheus, `drop older_than 1h` backlog guard). Args: `NETWORK HOST_IP LOKI_PUSH_URL [N:client ...]`.
-- `scripts/start-promtail.sh` — per-host: (re)launch the promtail log shipper (reads `/opt/lean-quickstart/observability/promtail.yml`; env `PROMTAIL_IMG`). Safe on a live devnet (no gossip backoff).
-- `scripts/cs-restart.sh` — per-host checkpoint-sync restart of specific nodes (args: `CS_PORT node...`).
-- `scripts/agg-restart.sh` — per-host checkpoint-sync restart of aggregator nodes preserving role / swapping image (env `IMAGE`, `SUBNET`; args: `CS_PORT node...`).
-- `scripts/convert.sh` — per-host multi-client conversion (env `ACC`; args: `CS_PORT N:client[:agg]...`).
-- `scripts/sweep.sh` — operator-side audit: per-devnet head/justified/finalized + client mix from the central Prometheus (env: `CENTRAL_PROM_URL`).
-- `scripts/finality-dashboard.json` — Grafana dashboard: head/justified/finalized per devnet (one series per `network`). Provision it into the dashboards dir.
-- `scripts/grafana-finality-alert.yaml.template` — Grafana unified-alerting provisioning for the per-devnet "lost finality" rule + Slack contact point. Placeholders (`__SLACK_WEBHOOK_URL__`, `__GRAFANA_BASE_URL__`, `__PROM_DS_UID__`) are filled at deploy time.
-- `scripts/deploy-finality-alert.sh` — render + ship that alert to the central Grafana and reload it. Env: `METRICS_HOST`, `GRAFANA_PROV_DIR`, `GRAFANA_CONTAINER`, `GRAFANA_BASE_URL`, `PROM_DS_UID` (all required); arg: `[WEBHOOK_FILE]` (default `./webhook.txt`, a gitignored secret).
-- `scripts/logs-dashboard.json` — Grafana dashboard (uid `devnet-logs`): Loki-backed logs panel + log-volume-by-level timeline, filtered by `network`/`node`/`stream`/`search`. Drop into the provisioned dashboards dir; auto-loads in ~30s.
-- `scripts/resources-dashboard.json` — Grafana dashboard (uid `devnet-resources`): per-node CPU cores + memory working-set (+8 GiB limit) + %-of-limit (OOM watch), from the cAdvisor metrics the per-host prometheus already scrapes. Filtered by `network`/`name`. Same provisioned dashboards dir.
-- `scripts/client-dashboard.json` — Grafana dashboard (uid `lean-ethereum-clients-dashboard`): the main per-node client dashboard. Expanded Overview (start time / validators / committees / head / justified / finalized stats, the three slot graphs, the three finality-delay graphs) plus 13 collapsed sections: devnet configuration, sync status, peers, req/resp + gossip mesh, gossip messages, PQ signatures, aggregation coverage, block production, block proposal internals, fork choice, attestations, state transition, storage + tick health. Filtered by `network` (single-select) / `job` / `instance`; `instance` is the **host**, not the node. Same provisioned dashboards dir.
-- `references/node-health.md` — per-node "all is good" checklist (follows chain, valid+useful attestations, non-empty proposals, aggregate+publish, on-time duties, peers+mesh, votes-land-in-blocks) with a Prometheus query + log grep per item, plus a devnet-level finality-advances section. Node-health vs devnet-health.
-- `references/operations.md` — topology model, the failure modes behind each golden rule, bootstrap-vs-stall diagnosis, detached-SSH/pkill gotchas, prometheus/grafana wiring, host recovery.
-- `references/clients.md` — per-client images, CLI shapes, conversion principle, interop status.
+**Scripts.** "operator" runs on your machine, "host" is scp'd and run on a server.
+
+| Script | Where | Args / env | What |
+|---|---|---|---|
+| `make-genesis.sh` | operator | `OUTDIR NODES SUBNETS KEYS_DIR SRC_VCONFIG [GT_OFFSET]`; `VALIDATORS_PER_NODE` | Build one devnet's genesis dir: 127.0.0.1 ENRs, per-subnet aggregators, hardlinked keys, runs lean-quickstart `generate-genesis.sh` + subnet alignment |
+| `merge-keyshards.py` | operator | `OUTDIR SHARD_DIR...` | Merge hash-sig key shards into one 0..N-1 dir + manifest (hash-sig-cli has no `--start-index`, so parallel keygen collides). Refuses to mix key formats, so a stale 52-byte `Dim46` shard can't poison a 32-byte `Dim42` genesis |
+| `subnet-align-validators.py` | operator | `GENESIS_DIR NODES SUBNETS VPN` | Rewrite `annotated_validators.yaml` so each node's validators sit in ONE subnet. Called by `make-genesis.sh`; identity at `VPN=1` |
+| `start-devnet.sh` | host | `NODES SUBNETS [N:client ...]`; `ETH_IMG`, `MEM`, `LOGOPT`, `EXTRA_ETH_FLAGS`, `ALLOW_STALE_DATA` | Launch a fresh devnet (all-ethlambda + canaries, per-subnet aggregators). Preflight: genesis/SUBNETS match, empty data dirs, known clients |
+| `host-check.sh` | host | `[NODES]`; `LAG_THRESHOLD` | Per-node table (container status, restarts, head/justified/finalized, sync, aggregator, peers) read from `127.0.0.1` only — works when the central prom doesn't. Exit ≠0 = needs attention |
+| `cs-restart.sh` | host | `CS_PORT[,PORT2] node...`; `IMAGE`, `AGG`, `SUBNETS` | Checkpoint-sync restart: 60s backoff, crash logs, aggregator role **preserved** by default (`AGG=auto\|<id>\|off` to set it, `IMAGE=` to canary a build) |
+| `convert.sh` | host | `CS_PORT N:client[:agg]...`; `ACC` (default: from genesis) | Convert nodes to other clients. Validates specs first; warns on aggregator loss |
+| `start-observability.sh` | host | `RECREATE`, `PROM_*`, `CADVISOR_*` | Create this host's prometheus + cadvisor containers (node_exporter is systemd, not here) |
+| `start-promtail.sh` | host | `PROMTAIL_IMG` | (Re)launch the log shipper. Safe on a live devnet (not a gossip peer) |
+| `prometheus-config.sh` | operator | `NETWORK NODES HOST_IP CENTRAL_WRITE_URL [N:client ...]` | Emit a per-devnet prometheus.yml (`network` label + per-node `client_type`) |
+| `promtail-config.sh` | operator | `NETWORK HOST_IP LOKI_PUSH_URL [N:client ...]` | Emit a per-host promtail.yml (docker_sd → central Loki, labels mirror prometheus, backlog guard) |
+| `sweep.sh` | operator | `CENTRAL_PROM_URL` | Cross-devnet audit: head/justified/finalized + client mix from the central Prometheus |
+| `deploy-finality-alert.sh` | operator | `[WEBHOOK_FILE]`; `METRICS_HOST`, `GRAFANA_*`, `PROM_DS_UID`; `DRY_RUN` | Render + ship the "lost finality" Slack alert to the central Grafana |
+| `devnet-env.sh` / `devnet.env.example` | operator | `$DEVNET_ENV`, `./devnet.env`, script dir | Load this deployment's hosts/urls/Grafana ids as defaults; exported vars win. Copy the example to `devnet.env` (gitignored) once |
+
+**Grafana dashboards** (drop into the provisioned dashboards dir; they auto-load in
+~30s and pick their datasource through a template variable, so no editing):
+
+| File | uid | Content |
+|---|---|---|
+| `client-dashboard.json` | `lean-ethereum-clients-dashboard` | The main per-node dashboard: Overview (start time, validators, committees, head/justified/finalized, slot + finality-delay graphs) plus 13 collapsed sections (config, sync, peers, req/resp + mesh, gossip, PQ signatures, aggregation coverage, block production, proposal internals, fork choice, attestations, state transition, storage + tick health). Filters `network`/`job`/`instance` — `instance` is the **host**, not the node |
+| `finality-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
+| `resources-dashboard.json` | `devnet-resources` | Per-node CPU cores + memory working set (+ limit + %-of-limit for OOM watch) from cAdvisor |
+| `logs-dashboard.json` | `devnet-logs` | Loki logs panel + log-volume-by-level, filtered `network`/`node`/`stream`/`search` |
+| `grafana-finality-alert.yaml.template` | — | Unified-alerting provisioning for the per-devnet "lost finality" rule + Slack contact point; placeholders filled by the deploy script |
+
+**References.** `node-health.md` — per-node "all is good" checklist (chain follow,
+valid+useful attestations, non-empty proposals, aggregate+publish, on-time duties,
+peers+mesh, votes-land-in-blocks) with a Prometheus query + log grep per item, and
+why devnet-health is judged separately. `operations.md` — topology model, the
+failure mode behind each golden rule, bootstrap-vs-stall diagnosis, detached-SSH /
+pkill gotchas, prometheus + Loki wiring and their traps, host recovery.
+`clients.md` — per-client images, CLI shapes, conversion principle, interop status.
 
 Topology specifics and chain history for the operator's particular deployment
 live in their project memory notes; verify versions/interop against the live

@@ -87,6 +87,31 @@ replacement. `cs-restart.sh` does this automatically (only for nodes that were
 running; already-down nodes start immediately). Restart one node at a time per
 host; hosts can run in parallel.
 
+## Restarting must not change a node's role
+
+`--is-aggregator` is not a preference, it is part of the devnet's topology: with
+one aggregator per subnet, a node that comes back without the flag leaves its
+subnet unaggregated. Nothing errors — attestations still verify and are logged as
+processed — but no gossip signature is stored, so proposers build blocks with
+`attestation_count=0` and finality stops while every other signal looks healthy.
+
+`cs-restart.sh` therefore reads the topology flags (`--is-aggregator`,
+`--aggregate-subnet-ids`, `--attestation-committee-count`) off the container it is
+replacing (`docker inspect -f '{{join .Config.Cmd " "}}'`; the image's ENTRYPOINT
+is the binary, so run args live in `.Config.Cmd`) and passes them through.
+Experiment flags are deliberately NOT carried over — a restart is where an
+experiment ends. When the container is already gone there is nothing to read, so
+pass `SUBNETS=<n>` and the rule (nodes `0..SUBNETS-1`, node `k` → subnet `k`) is
+re-derived. To SET the role instead of preserving it, the same script takes
+`AGG=auto` (re-apply the topology rule — the repair for a node that lost its role),
+`AGG=<id>` (promote), or `AGG=off` (deliberate demotion); `IMAGE=` swaps the image
+in the same pass, so canarying a build on an aggregator keeps its role.
+
+There is deliberately only ONE restart path: with a separate script per role, the
+role handling silently drifts out of whichever one gets used every day.
+
+Verify after any restart with `host-check.sh` — one `AGG=yes` per subnet.
+
 ## Diagnosing a finalization stall
 
 A stall is rarely "a client crashed." Walk these in order (all scoped to the one
@@ -95,6 +120,11 @@ affected devnet):
 0. **Bootstrap, not stall?** If the devnet is young and justified is still
    advancing (jumping square/pronic slots) with finalized=0, it's the bootstrap
    regime — leave it (see the young-devnet section above).
+0b. **Per-node picture, from the host itself.** `host-check.sh [NODES]` on the
+   affected server: which containers are down/restarting, which heads lag past the
+   sync-gate threshold (those nodes stop attesting and proposing), and whether one
+   `AGG=yes` still exists per subnet. It reads only `127.0.0.1`, so it works when
+   remote_write or the central stack is the thing that is broken.
 1. **Vote math.** Threshold is `ceil(2/3 · NODES)` for that devnet. Pull recent
    `Checkpoint justified ... vote_count=V threshold=T` from a stable node. If
    `V < T`, not enough aligned votes.
@@ -167,7 +197,15 @@ default). Use POSIX classes (`[0-9]` not `\d`); the variable's `regex:` filter f
 is JS and CAN keep `\d`, since only `allValue` reaches the query. (The Loki logs
 dashboard can safely use `.*` because promtail only ships
 `ethlambda_*` containers in the first place.) `scripts/prometheus-config.sh`
-emits the per-host file; `scripts/setup`-style container creation is in SKILL.md.
+emits the per-host file; `scripts/start-observability.sh` creates the per-host
+`prometheus` + `cadvisor` containers (it refuses to touch existing ones without
+`RECREATE=1`, since a live scraper's flags may not be the ones it would use).
+The **central** stack is a separate one-time deployment: a prometheus started with
+`--web.enable-remote-write-receiver` on a routable address + distinct port (e.g.
+`:9099`), a Loki with `allow_structured_metadata: true` + schema v13/tsdb and
+`retention_enabled: true` (it is false by default and `retention_period` alone is
+silently ignored), and a Grafana with provisioning dirs for datasources,
+dashboards, and alerting.
 
 **node_exporter is a systemd service, not a container.** It's installed from
 `github.com/lambdaclass/monitoring-stack` (ansible: `make inventory TARGET=...`
