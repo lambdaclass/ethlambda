@@ -74,38 +74,6 @@ do). To compare a server's value:
 ssh "$SSH_USER@$h" 'sudo grep ^GENESIS_TIME /opt/lean-quickstart/genesis/config.yaml'
 ```
 
-## Young-devnet bootstrap: finalized=0 with justified advancing is NOT a stall
-
-A freshly-started devnet can sit at `finalized=0` for ~100+ slots while justified
-advances in jumps (e.g. 1→5→6→16→36→72→110→121). This is the sparse
-justifiable-slot regime, not a stall, and it self-recovers — do not restart it.
-
-Why: if the first few slots don't finalize (slow aggregation warm-up, a frozen
-canary thinning votes), delta-from-finalized grows past 5 and only
-square/pronic-distance slots stay justifiable. Finalization needs a justified
-link whose gap contains no justifiable slot; with finalized=0 that lines up only
-occasionally. After the first finalization, justifiable slots re-densify and it
-converges to per-slot finality within ~60 slots. Before treating a young devnet
-as stalled, confirm justified is genuinely FROZEN (not just jumping) — and note a
-vote target that looks unjustifiable vs finalized=0 may be valid vs a finalized
-the store just advanced to; re-sample before concluding a node is buggy.
-
-## keep-DB resume is unsafe — always checkpoint sync
-
-On the current build, restarting a node on its existing RocksDB panics the
-BlockChain actor: `crates/blockchain/src/store.rs:566 .expect("safe target
-exists")` (aggregators may also hit `storage/src/store.rs:1336`). The persisted
-`safe_target` references a block header not reloaded. The process stays up (p2p
-alive) but the consensus actor is dead — head frozen, `ERROR Failed to forward
-attestation to blockchain err=Actor stopped` spam. The node looks alive but
-contributes nothing.
-
-Checkpoint sync builds a fresh store whose `safe_target` is the anchor (always
-present), so it never hits the panic. **Always wipe + `--checkpoint-sync-url` on
-restart.** Source = a healthy same-host node's api port (the host aggregator
-stays up, so use it). The new image *can* read the old RocksDB; the bug is in
-resume, not DB compatibility.
-
 ## The mandatory 60s gossip backoff
 
 When a running container is removed, peers PRUNE it and set a ~60s gossipsub
