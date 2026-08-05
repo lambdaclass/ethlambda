@@ -331,7 +331,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let genesis_time_ms = store.config().unwrap().genesis_time * 1000;
+    let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
@@ -889,8 +889,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time_ms =
-        store.config().expect("config exists").genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
