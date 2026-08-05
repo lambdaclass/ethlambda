@@ -114,7 +114,7 @@ pub fn apply_fork_choice_step(
 ) -> Result<(), StepError> {
     match step.step_type.as_str() {
         "tick" => {
-            let genesis_time = store.config().expect("config exists").genesis_time;
+            let genesis_time = store.config().genesis_time;
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
@@ -136,7 +136,7 @@ pub fn apply_fork_choice_step(
                 .ok_or_else(|| StepError::Harness("block step missing block data".to_string()))?;
             let signed_block = block_data.to_blank_signed_block();
             if step.tick_to_slot {
-                let block_time_ms = store.config().expect("config exists").genesis_time * 1000
+                let block_time_ms = store.config().genesis_time * 1000
                     + signed_block.message.slot * MILLISECONDS_PER_SLOT;
                 store::on_tick(store, block_time_ms, true);
             }

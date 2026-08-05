@@ -224,11 +224,11 @@ fields:
 
 `config` is the odd one out: `init_store` writes it once at bootstrap and
 nothing ever rewrites it afterward (it has a getter, `Store::config`, but no
-setter). That also makes it the DB's fingerprint: `from_db_state` refuses to
-resume a data directory whose persisted `genesis_time` disagrees with the
-node's own config file, treating the mismatch as an empty DB (see
-[Startup and Restore](#startup-and-restore)). Every other `Metadata` key is
-mutated in place as the chain progresses.
+setter). Because it never changes, the `Store` keeps a copy in memory and
+reads of it never reach the backend. It is also part of the DB's fingerprint:
+`from_db_state` refuses to resume a data directory belonging to another
+network (see [Startup and Restore](#startup-and-restore)). Every other
+`Metadata` key is mutated in place as the chain progresses.
 
 ### LiveChain
 
@@ -434,8 +434,12 @@ its `BlockRoots` entry, the body if non-empty, a full snapshot into `States`
 (the base of every future diff chain), and the anchor's `LiveChain` entry.
 
 `from_db_state` is the restore path: it reads `config` and `latest_finalized`
-from `Metadata`, returning `None` for an empty DB or a `genesis_time`
-mismatch (wrong network). At startup the node prefers this path but only
+from `Metadata`, returning `None` for an empty DB. A populated DB from another
+network is fatal instead: the finalized state's genesis time and validator
+registry are compared against the genesis config, and a mismatch fails with
+`Error::GenesisMismatch` rather than being treated as empty, since writing a
+fresh anchor would leave the foreign chain's rows in place to be served to
+peers. At startup the node prefers this path but only
 accepts the on-disk store if its head is at most `MAX_RESUMABLE_DB_STATE_AGE
 = 450` slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.
