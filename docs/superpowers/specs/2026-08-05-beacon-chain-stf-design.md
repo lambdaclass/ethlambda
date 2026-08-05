@@ -126,8 +126,16 @@ function seven times. Two mechanisms prevent that:
 1. **Accessors for fork-invariant fields.** About 20 of the state's fields exist
    unchanged in every fork. One local `macro_rules!` in `containers/mod.rs`
    generates the read and write accessor pair for each, from a single list. That
-   list doubles as the crate's statement of which fields are fork-invariant, and
-   the macro is the only one in the crate.
+   list doubles as the crate's statement of which fields are fork-invariant.
+
+   The macro has two rules, `copy` and `reference`, because returning `&u64` for
+   a slot would make the state transition noisier than returning it by value.
+   Write accessors are named explicitly (`slot`, `slot_mut`) rather than derived
+   from the field name, since `macro_rules!` cannot concatenate identifiers on
+   stable Rust.
+
+   There is one other macro in the crate, for the fixed-length byte strings in
+   `primitives.rs`, and no procedural macros beyond the SSZ derives.
 
 2. **Matching only where the spec diverges.** State transition functions take
    `&mut BeaconState` and use accessors. A function matches on the fork only
@@ -152,8 +160,13 @@ pub use minimal::*;
 pub use mainnet::*;
 ```
 
-with a `compile_error!` if both are enabled. Constants feed const-generic bounds
-directly: `SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>`. The test
+There is only a `preset-minimal` feature, with mainnet as the implicit default.
+A `preset-mainnet` feature would need to be mutually exclusive with it, and
+mutually exclusive features are awkward under Cargo's feature unification:
+`--features preset-minimal` would silently keep mainnet unless the caller also
+passed `--no-default-features`. Constants feed const-generic bounds directly:
+`SszVector<Root, { preset::SLOTS_PER_HISTORICAL_ROOT }>`, where the braces are
+required because the argument is a path rather than a bare identifier. The test
 target runs the suite twice, once per preset, and each run walks only its own
 fixture tree.
 
@@ -173,8 +186,19 @@ plus `get_head`. Proposer boost and the equivocating-indices set are fields on
 ### Fixture runners
 
 `make consensus-spec-tests` downloads and extracts the three release tarballs
-into a gitignored directory, with the version pinned in the Makefile. Cases are
-`.ssz_snappy` (raw snappy, not framed) plus `meta.yaml` where a suite needs it.
+into a gitignored directory, with the version pinned in the Makefile. All three
+unpack to `tests/<name>/...`, so they extract into one directory and land side by
+side:
+
+```text
+consensus-spec-tests/tests/<config>/<fork>/<runner>/<handler>/<suite>/<case>/
+```
+
+Cases are `.ssz_snappy` (raw snappy, not framed) plus `meta.yaml` where a suite
+needs it. `ssz_static` cases also carry `roots.yaml`, holding the expected
+`hash_tree_root`, and `value.yaml`. The runners use `serialized.ssz_snappy` and
+`roots.yaml`; nothing needs `value.yaml`, which is what spares the containers
+from needing serde implementations.
 
 | Runner | Gate for |
 |--------|----------|
@@ -248,7 +272,11 @@ Chosen to match ethrex where ethrex has made the choice.
 
 `c-kzg` does not export `compute_challenge` or the cell-proof batch challenge,
 both of which have their own fixture handlers, so `kzg.rs` implements those two
-directly from the spec.
+directly from the spec. That is what `num-bigint` is for: both reduce a SHA-256
+digest modulo the BLS field order.
+
+The KZG suites are all `kzg-mainnet` and the trusted setup is not
+preset-dependent, so the embedded mainnet setup is correct under both presets.
 
 ## Deliberate simplifications
 
