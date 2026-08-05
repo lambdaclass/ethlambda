@@ -89,7 +89,6 @@ make test                                    # All tests + forkchoice spec tests
 
 ### Common Operations
 ```bash
-.claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
@@ -97,7 +96,9 @@ make run-devnet                                          # Run local devnet with
 
 ### Testing with Local Devnet
 
-See `.claude/skills/test-pr-devnet/SKILL.md` for multi-client devnet testing workflows.
+See `.claude/skills/devnet-runner/SKILL.md` for running a local multi-client devnet
+(node roster, image tags, pause/unpause instability testing) and
+`.claude/skills/devnet-log-review/SKILL.md` for analyzing the dumped logs.
 
 ## Important Patterns & Idioms
 

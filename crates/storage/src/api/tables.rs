@@ -5,14 +5,14 @@ pub enum Table {
     BlockHeaders,
     /// Block body storage: H256 -> BlockBody
     BlockBodies,
-    /// Block signatures storage: (slot || root) -> BlockSignatures
+    /// Block proof storage: (slot || root) -> BlockProof
     ///
-    /// Stored separately from blocks because the genesis block has no signatures.
+    /// Stored separately from blocks because the genesis block has no proof.
     /// Keyed by slot || root so pruning can scan in slot order and stop early.
-    /// Non-genesis blocks have an entry until finalized: signatures below the
-    /// finalized boundary are pruned (`prune_old_block_signatures`), while
+    /// Non-genesis blocks have an entry until finalized: proofs below the
+    /// finalized boundary are pruned (`prune_old_block_proofs`), while
     /// headers and bodies are kept forever.
-    BlockSignatures,
+    BlockProof,
     /// Canonical block index: slot -> block root
     BlockRoots,
     /// State storage: H256 -> State
@@ -40,7 +40,7 @@ pub enum Table {
 pub const ALL_TABLES: [Table; 8] = [
     Table::BlockHeaders,
     Table::BlockBodies,
-    Table::BlockSignatures,
+    Table::BlockProof,
     Table::BlockRoots,
     Table::States,
     Table::StateDiffs,
@@ -54,7 +54,7 @@ impl Table {
         match self {
             Table::BlockHeaders => "block_headers",
             Table::BlockBodies => "block_bodies",
-            Table::BlockSignatures => "block_signatures",
+            Table::BlockProof => "block_proof",
             Table::BlockRoots => "block_roots",
             Table::States => "states",
             Table::StateDiffs => "state_diffs",
