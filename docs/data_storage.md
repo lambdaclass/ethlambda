@@ -267,12 +267,9 @@ small under healthy finality). The rest is deliberately omitted:
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config`, `validators`    | The snapshot (they never change)                                                                                                                              |
 | `latest_block_header`     | The `BlockHeaders` table                                                                                                                                      |
-| `historical_block_hashes` | Regenerated from `base_root` + the slot gap (the state transition appends the parent root plus one zero per skipped slot, so the append is fully predictable) |
+| `historical_block_hashes` | Regenerated from `base_root` + the slot gap |
 
-Omitting `config` and `validators` is a bet, not a fallback: a diff carries no
-copy of either, so if a future state transition ever mutated one, every state
-reconstructed past that point would silently pick up the ancestor snapshot's
-stale value instead. The `historical_block_hashes` append is checked rather
+The `historical_block_hashes` append is checked rather
 than trusted blindly: `validate_history_append`
 (`crates/storage/src/state_diff.rs`) rejects a diff whose appended hashes
 don't match the expected slot gap or aren't zero-filled for skipped slots,
