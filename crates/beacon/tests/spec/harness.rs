@@ -7,6 +7,9 @@
 //! that quietly matches nothing.
 
 use ethlambda_beacon::ForkName;
+use ethlambda_beacon::primitives::{HashTreeRoot as _, Root};
+use libssz::{SszDecode as _, SszEncode as _};
+use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
 use super::{Case, PRESET, collect, fixture_root};
 
@@ -84,4 +87,44 @@ fn snappy_decompression_yields_decodable_ssz() {
 #[derive(serde::Deserialize)]
 struct RootFile {
     root: String,
+}
+
+/// The specification's `Checkpoint`, declared here rather than imported.
+///
+/// This is the harness proving out the whole chain a container runner depends
+/// on: raw-snappy decompression, SSZ decoding, merkleization, and re-encoding,
+/// checked against a fixture's own expected root. `Checkpoint` is the smallest
+/// container that exists in every fork, so it isolates that chain from anything
+/// fork-specific. The real containers land with their own suites.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
+struct Checkpoint {
+    epoch: u64,
+    root: Root,
+}
+
+#[test]
+fn container_round_trip_matches_the_fixture_root() {
+    let mut report = super::Report::new();
+
+    for case in collect(PRESET, "ssz_static", "Checkpoint") {
+        let bytes = case.ssz_bytes("serialized");
+        let expected: RootFile = case.yaml("roots");
+
+        let outcome = match Checkpoint::from_ssz_bytes(&bytes) {
+            Err(err) => Err(format!("decode failed: {err:?}")),
+            Ok(checkpoint) => {
+                let root = format!("0x{}", hex::encode(checkpoint.hash_tree_root().0));
+                if root != expected.root {
+                    Err(format!("root {root} != expected {}", expected.root))
+                } else if checkpoint.to_ssz() != bytes {
+                    Err("re-encoding did not reproduce the fixture bytes".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        report.record(&case, outcome);
+    }
+
+    report.finish("ssz_static/Checkpoint");
 }
