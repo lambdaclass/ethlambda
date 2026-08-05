@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use ethlambda_types::block::SignedBlock;
+use ethlambda_types::genesis::{GenesisMismatch, verify_state_genesis};
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::state::{State, Validator, anchor_pair_is_consistent};
 use libssz::{DecodeError, SszDecode};
@@ -45,20 +46,13 @@ pub enum CheckpointSyncError {
     SlotIsZero,
     #[error("checkpoint state has no validators")]
     NoValidators,
-    #[error("genesis time mismatch: expected {expected}, got {got}")]
-    GenesisTimeMismatch { expected: u64, got: u64 },
-    #[error("validator count mismatch: expected {expected}, got {got}")]
-    ValidatorCountMismatch { expected: usize, got: usize },
-    #[error(
-        "validator at position {position} has non-sequential index (expected {expected}, got {got})"
-    )]
-    NonSequentialValidatorIndex {
-        position: usize,
-        expected: u64,
-        got: u64,
-    },
-    #[error("validator {index} pubkey mismatch (attestation or proposal key)")]
-    ValidatorPubkeyMismatch { index: usize },
+    #[error("checkpoint state does not match the configured genesis: {0}")]
+    Genesis(#[from] GenesisMismatch),
+    /// Reading the persisted store failed, including the case where the data
+    /// directory holds another network's chain. Startup aborts: the operator
+    /// has to point at the right data directory or remove it.
+    #[error("failed to load persisted DB state: {0}")]
+    DbState(#[from] ethlambda_storage::Error),
     #[error("finalized slot cannot exceed state slot")]
     FinalizedExceedsStateSlot,
     #[error("justified slot cannot precede finalized slot")]
@@ -197,7 +191,8 @@ fn verify_checkpoint_state(
     expected_genesis_time: u64,
     expected_validators: &[Validator],
 ) -> Result<(), CheckpointSyncError> {
-    // Slot sanity check
+    // Slot sanity check. Checkpoint-specific: unlike a state loaded from our
+    // own data directory, a downloaded anchor at genesis is never legitimate.
     if state.slot == 0 {
         return Err(CheckpointSyncError::SlotIsZero);
     }
@@ -207,46 +202,10 @@ fn verify_checkpoint_state(
         return Err(CheckpointSyncError::NoValidators);
     }
 
-    // Genesis time matches
-    if state.config.genesis_time != expected_genesis_time {
-        return Err(CheckpointSyncError::GenesisTimeMismatch {
-            expected: expected_genesis_time,
-            got: state.config.genesis_time,
-        });
-    }
-
-    // Validator count matches
-    if state.validators.len() != expected_validators.len() {
-        return Err(CheckpointSyncError::ValidatorCountMismatch {
-            expected: expected_validators.len(),
-            got: state.validators.len(),
-        });
-    }
-
-    // Validator indices are sequential (0, 1, 2, ...)
-    for (position, validator) in state.validators.iter().enumerate() {
-        if validator.index != position as u64 {
-            return Err(CheckpointSyncError::NonSequentialValidatorIndex {
-                position,
-                expected: position as u64,
-                got: validator.index,
-            });
-        }
-    }
-
-    // Validator pubkeys match (critical security check)
-    for (i, (state_val, expected_val)) in state
-        .validators
-        .iter()
-        .zip(expected_validators.iter())
-        .enumerate()
-    {
-        if state_val.attestation_pubkey != expected_val.attestation_pubkey
-            || state_val.proposal_pubkey != expected_val.proposal_pubkey
-        {
-            return Err(CheckpointSyncError::ValidatorPubkeyMismatch { index: i });
-        }
-    }
+    // Genesis time and the full validator registry match our config. Shared
+    // with the resume-from-disk path so both entry points agree on what makes a
+    // state ours.
+    verify_state_genesis(state, expected_genesis_time, expected_validators)?;
 
     // Finalized slot sanity
     if state.latest_finalized.slot > state.slot {

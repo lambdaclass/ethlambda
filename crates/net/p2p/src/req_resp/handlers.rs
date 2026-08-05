@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -321,7 +322,7 @@ async fn handle_blocks_by_root_response(
 
         if let Some(ref blockchain) = server.blockchain {
             let _ = blockchain
-                .new_block(block)
+                .new_block(block, BlockSource::Sync)
                 .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
         }
     }
@@ -357,7 +358,7 @@ async fn handle_blocks_by_range_response(
         }
 
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(block) {
+        if let Err(err) = blockchain.new_block(block, BlockSource::Sync) {
             error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),

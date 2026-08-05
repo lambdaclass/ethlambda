@@ -89,7 +89,6 @@ make test                                    # All tests + forkchoice spec tests
 
 ### Common Operations
 ```bash
-.claude/skills/test-pr-devnet/scripts/test-branch.sh    # Test branch in multi-client devnet
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
@@ -97,7 +96,9 @@ make run-devnet                                          # Run local devnet with
 
 ### Testing with Local Devnet
 
-See `.claude/skills/test-pr-devnet/SKILL.md` for multi-client devnet testing workflows.
+See `.claude/skills/devnet-runner/SKILL.md` for running a local multi-client devnet
+(node roster, image tags, pause/unpause instability testing) and
+`.claude/skills/devnet-log-review/SKILL.md` for analyzing the dumped logs.
 
 ## Important Patterns & Idioms
 
@@ -288,7 +289,10 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ## HTTP Servers (API + Metrics)
 
-The RPC crate runs two independent Axum servers (API on `:5052`, metrics/debug on `:5054`). See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
+The RPC crate serves the API router (`--api-port`, default 5052) and the metrics/debug routers
+(`--metrics-port`, default 5054). When the two ports differ it binds two independent Axum servers;
+when they are equal it merges all three routers onto a single listener, so pointing both flags at
+one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Configuration Files
 
