@@ -62,11 +62,12 @@ A node restarted against a populated data directory resumes from disk rather tha
 
 | State in data directory | `--checkpoint-sync-url` | Result |
 | ------------------------- | ------------------------- | -------- |
-| None, or from another network (`GENESIS_TIME` differs) | omitted | Initialize from genesis |
-| None, or from another network | set | Checkpoint sync |
+| None | omitted | Initialize from genesis |
+| None | set | Checkpoint sync |
 | Present, head within the resume window | either | Resume from disk (no download) |
 | Present, head beyond the resume window | set | Checkpoint sync |
 | Present, head beyond the resume window | omitted | Resume from disk anyway, with a warning |
+| **From another network** | either | **Startup aborts** (see [Foreign State](#foreign-state)) |
 
 The resume window is `MAX_RESUMABLE_DB_STATE_AGE` (450 slots, ~30 minutes at 4-second slots) measured as `current_slot - head_slot`. Staleness is measured against the head, not the finalized checkpoint, so a node whose head is current still resumes during a finality stall.
 
@@ -76,18 +77,26 @@ When a checkpoint URL *is* set and every URL fails, the node exits rather than f
 
 To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.
 
+### Foreign State
+
+Persisted state is accepted only after it is verified against the local genesis config: same `GENESIS_TIME` and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.
+
+If the data directory belongs to a different network, startup **aborts** with `persisted state does not match the configured genesis: …`. It is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain's rows in place, and the slot-indexed reads behind `BlocksByRange` would then serve those blocks to peers. Point `--data-dir` at the right directory, or remove it.
+
+Note that a genesis time comparison alone would not catch a network that was regenerated with the same `GENESIS_TIME` but a different validator set, which is why the whole registry is compared.
+
 ## Verification Checks
 
-All checks are performed before the state is accepted:
+All checks are performed before a downloaded checkpoint state is accepted. The genesis-identity subset (marked below) is shared with the resume-from-disk path:
 
 | Check | What it catches |
 | ------- | ----------------- |
 | Slot > 0 | Checkpoint state cannot be genesis (slot 0) |
 | Validators non-empty | State must contain validators |
-| Genesis time matches | Wrong network or misconfigured peer |
-| Validator count matches | Validator set size differs from genesis config |
-| Sequential validator indices | Indices must be 0, 1, 2, ... in order |
-| Validator pubkeys match | Validator identity differs from genesis config |
+| Genesis time matches *(shared)* | Wrong network or misconfigured peer |
+| Validator count matches *(shared)* | Validator set size differs from genesis config |
+| Sequential validator indices *(shared)* | Indices must be 0, 1, 2, ... in order |
+| Validator pubkeys match *(shared)* | Validator identity differs from genesis config |
 | Finalized slot <= state slot | Finalized checkpoint cannot be in the future |
 | Justified slot >= finalized slot | Justified must be at or after finalized |
 | Same-slot checkpoints have matching roots | If justified and finalized are at the same slot, they must agree on the root |

@@ -1,3 +1,4 @@
+use ethlambda_network_api::BlockSource;
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
@@ -59,7 +60,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             );
             if let Some(ref blockchain) = server.blockchain {
                 let _ = blockchain
-                    .new_block(signed_block)
+                    .new_block(signed_block, BlockSource::Gossip)
                     .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
             }
         }
