@@ -5,6 +5,22 @@ use std::path::PathBuf;
 
 use crate::version;
 
+/// How ethlambda drives the execution layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum ExecutionMode {
+    /// Out-of-process: talk to a separate EL binary over the Engine API
+    /// (requires `--execution-endpoint` + `--execution-jwt-secret`).
+    #[default]
+    External,
+    /// In-process: run an embedded ethrex execution layer, driven by direct
+    /// library calls (requires `--el-genesis`). No Engine API / JSON-RPC hop.
+    ///
+    /// Spelled `inprocess` on the CLI (clap would otherwise derive
+    /// `in-process` from the variant name).
+    #[value(name = "inprocess")]
+    InProcess,
+}
+
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
 pub(crate) struct CliOptions {
@@ -81,6 +97,31 @@ pub(crate) struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
+    /// URL of the ethrex (or other EL) Engine API auth endpoint, e.g.
+    /// `http://127.0.0.1:8551`. When unset, Engine API integration is disabled
+    /// and ethlambda runs as a consensus-only node. When set,
+    /// `--execution-jwt-secret` is required.
+    #[arg(long, requires = "execution_jwt_secret")]
+    pub(crate) execution_endpoint: Option<String>,
+    /// Path to a file containing the 32-byte JWT secret shared with the EL, as
+    /// a single line of hex (optionally `0x`-prefixed). Same format used by
+    /// Lighthouse/Teku/Prysm/ethrex.
+    #[arg(long, requires = "execution_endpoint")]
+    pub(crate) execution_jwt_secret: Option<PathBuf>,
+    /// 32-byte hex hash of the EL's genesis block. Seeds
+    /// `state.latest_execution_payload_header.block_hash` so the first
+    /// `forkchoiceUpdated` carries a head the EL recognizes. Only meaningful
+    /// alongside `--execution-endpoint`.
+    #[arg(long, requires = "execution_endpoint")]
+    pub(crate) execution_genesis_block_hash: Option<String>,
+    /// Execution-layer integration mode: `external` (Engine API to a separate
+    /// EL process) or `inprocess` (embedded ethrex, driven in-process).
+    #[arg(long, value_enum, default_value_t = ExecutionMode::External)]
+    pub(crate) execution_mode: ExecutionMode,
+    /// Path to the EL genesis JSON for `--execution-mode inprocess`
+    /// (ethrex/geth genesis format).
+    #[arg(long)]
+    pub(crate) el_genesis: Option<PathBuf>,
     /// Disable the sync-gate's suppression of validator duties.
     ///
     /// By default a node that judges itself to be syncing (local head lagging

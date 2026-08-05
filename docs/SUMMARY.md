@@ -14,3 +14,7 @@
 - [Checkpoint Sync](./checkpoint_sync.md)
 - [Fork Choice Visualization](./fork_choice_visualization.md)
 - [Data Storage](./data_storage.md)
+
+# Execution Layer
+
+- [Integrating ethrex In-Process](./ethrex-inprocess-integration.md)

@@ -324,6 +324,18 @@ impl From<&ethlambda_state_transition::Error> for RejectionReason {
             Error::AggregationBitsOutOfBounds { .. } => Self::ValidatorIndexOutOfRange,
             Error::JustifiedSlotOutOfRange { .. } => Self::JustifiedSlotOutOfRange,
             Error::TooManyAttestationData { .. } => Self::TooManyAttestationData,
+            // The execution-payload checks run ahead of leanSpec: it has no
+            // executionPayload schema yet, so no fixture can name these and
+            // there is no canonical spelling to map onto. Reported as `Unknown`
+            // rather than inventing a `RejectionReason` variant that upstream
+            // might spell differently. Revisit alongside
+            // `FIXTURES_AWAIT_M6_REGEN` when the schema lands.
+            Error::InvalidPayloadParentHash { .. } => {
+                Self::Unknown("INVALID_PAYLOAD_PARENT_HASH".to_string())
+            }
+            Error::InvalidPayloadTimestamp { .. } => {
+                Self::Unknown("INVALID_PAYLOAD_TIMESTAMP".to_string())
+            }
         }
     }
 }
