@@ -741,7 +741,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -951,9 +951,9 @@ dependencies = [
 
 [[package]]
 name = "c-kzg"
-version = "2.1.7"
+version = "2.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6648ed1e4ea8e8a1a4a2c78e1cda29a3fd500bc622899c340d8525ea9a76b24a"
+checksum = "38d04308254695569fdb9bfe3bacc1c91837a670d0806605eb82d63748fbd3a6"
 dependencies = [
  "blst",
  "cc",
@@ -1568,7 +1568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2032,6 +2032,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vergen-git2",
+]
+
+[[package]]
+name = "ethlambda-beacon"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "c-kzg",
+ "ethereum-types",
+ "hex",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
+ "num-bigint 0.4.6",
+ "serde",
+ "serde_yaml_ng",
+ "sha2",
+ "snap",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -4527,6 +4548,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
 dependencies = [
+ "ethereum-types",
  "smallvec",
 ]
 
@@ -4547,6 +4569,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
 dependencies = [
+ "ethereum-types",
  "libssz",
  "sha2",
 ]
@@ -4843,7 +4866,7 @@ source = "git+https://github.com/leanEthereum/leanVM.git?rev=e2592df#e2592df4e30
 dependencies = [
  "itertools 0.14.0",
  "mt-utils",
- "num-bigint 0.3.3",
+ "num-bigint 0.4.6",
  "parallel",
  "paste",
  "rand 0.10.1",
@@ -4859,7 +4882,7 @@ dependencies = [
  "itertools 0.14.0",
  "mt-field",
  "mt-utils",
- "num-bigint 0.3.3",
+ "num-bigint 0.4.6",
  "paste",
  "rand 0.10.1",
  "serde",
@@ -6042,7 +6065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7565,7 +7588,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

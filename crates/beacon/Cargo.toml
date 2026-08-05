@@ -1,0 +1,53 @@
+[package]
+name = "ethlambda-beacon"
+description = "Ethereum Beacon Chain state transition and fork choice, phase0 through fulu"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+# Compile against the minimal preset instead of mainnet.
+#
+# Container shapes are compile-time constants (SSZ list and vector bounds), so
+# the preset cannot be selected at runtime. Mainnet is the implicit default;
+# enabling this feature switches every constant to the minimal preset. The test
+# target builds the crate twice, once per preset, and each build walks only its
+# own fixture tree.
+preset-minimal = []
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+
+libssz = { workspace = true, features = ["ethereum_types"] }
+libssz-derive.workspace = true
+libssz-merkle = { workspace = true, features = ["ethereum_types"] }
+libssz-types.workspace = true
+
+# Matches the version ethrex uses, and the version libssz's `ethereum_types`
+# feature is built against.
+ethereum-types = "0.15.1"
+
+sha2 = "0.10.9"
+
+# BLS12-381. Assembly-optimized, and the canonical consensus-layer backend.
+blst = "0.3.16"
+
+# KZG, including the EIP-7594 cell and column proofs that fulu needs. Same
+# version and feature set ethrex uses, plus the embedded mainnet trusted setup.
+c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
+
+# Reduction modulo the BLS field order, for the two Fiat-Shamir challenge
+# functions that c-kzg does not export.
+num-bigint = "0.4.6"
+
+[dev-dependencies]
+serde.workspace = true
+serde_yaml_ng.workspace = true
+snap = "1.1.1"
