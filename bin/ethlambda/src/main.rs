@@ -742,7 +742,7 @@ async fn fetch_initial_state(
     // Initialize the store from state + anchor block body, then persist the
     // signatures so we can serve the anchor on BlocksByRoot. `insert_signed_block`
     // overlaps with what `get_forkchoice_store` already wrote, but it's
-    // idempotent and the only path that also stores `BlockSignatures`.
+    // idempotent and the only path that also stores `BlockProof`.
     let anchor_root = signed_block.message.header().hash_tree_root();
     let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))

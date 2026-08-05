@@ -164,10 +164,7 @@ impl BlockChain {
 
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
-        let genesis_time = store
-            .config()
-            .expect("failed to load config: config missing or database error")
-            .genesis_time;
+        let genesis_time = store.config().genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Catch XMSS keys up to the current slot before the first tick
@@ -288,7 +285,7 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
@@ -522,7 +519,7 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
-        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
         let t2_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL;
         // Interval-2 boundary as a wall-clock instant; the worker holds each
         // produced aggregate until this before sending it back, so nothing
@@ -591,7 +588,7 @@ impl BlockChainServer {
         // Only fire inside the early-aggregation window
         // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
         // slot's interval-2 boundary; the slot is derived from the wall clock.
-        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
         let Some(ms_since_genesis) = unix_now_ms().checked_sub(genesis_time_ms) else {
             return;
         };
@@ -721,7 +718,7 @@ impl BlockChainServer {
     async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
         let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
 
         // Build the block. `produce_block_with_signatures` advances the store to
@@ -949,7 +946,7 @@ impl BlockChainServer {
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
         // compute the wall-clock slot fresh for the head-recency gate.
-        let genesis_time_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
         let wall_clock_slot = unix_now_ms().saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
         pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
 
@@ -1320,7 +1317,7 @@ impl BlockChainServer {
         let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
 
-        let genesis_time_ms = self.store.config().expect("Config exists").genesis_time * 1000;
+        let genesis_time_ms = self.store.config().genesis_time * 1000;
         let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
         let now_after_tick = unix_now_ms();
         let elapsed = now_after_tick.saturating_sub(now_ms);
@@ -1396,7 +1393,7 @@ impl Handler<NewBlock> for BlockChainServer {
                 slot,
                 block: msg.block.message.hash_tree_root(),
             });
-            let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+            let genesis_ms = self.store.config().genesis_time * 1000;
             metrics::observe_gossip_block_arrival(arrival_ms, genesis_ms, slot);
         }
         self.on_block(msg.block);
@@ -1406,7 +1403,7 @@ impl Handler<NewBlock> for BlockChainServer {
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_ms = self.store.config().genesis_time * 1000;
         metrics::observe_gossip_attestation_arrival(
             arrival_ms,
             genesis_ms,
@@ -1426,7 +1423,7 @@ impl Handler<NewAttestation> for BlockChainServer {
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_ms = self.store.config().genesis_time * 1000;
         metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
         self.on_gossip_aggregated_attestation(msg.attestation);
     }
@@ -1461,7 +1458,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // and costs little in practice: a late aggregate is late for every node
         // at once, so both populations are dominated by production time rather
         // than propagation and their distributions look alike.
-        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        let genesis_ms = self.store.config().genesis_time * 1000;
         metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
 
         // Publish alignment is enforced upstream: the worker delays delivery of
