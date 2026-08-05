@@ -1,6 +1,25 @@
 use serde::Deserialize;
 
-use crate::state::{Validator, ValidatorPubkeyBytes};
+use crate::state::{State, Validator, ValidatorPubkeyBytes};
+
+/// Ways a state can fail to belong to the configured genesis.
+///
+/// Raised for any state whose provenance we have not established ourselves:
+/// one downloaded through checkpoint sync, or one loaded from a data directory
+/// that may have been written by a different network.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GenesisMismatch {
+    #[error("genesis time mismatch: expected {expected}, got {got}")]
+    GenesisTime { expected: u64, got: u64 },
+    #[error("validator count mismatch: expected {expected}, got {got}")]
+    ValidatorCount { expected: usize, got: usize },
+    #[error(
+        "validator at position {position} has non-sequential index (expected {position}, got {got})"
+    )]
+    NonSequentialIndex { position: usize, got: u64 },
+    #[error("validator {index} pubkey mismatch (attestation or proposal key)")]
+    ValidatorPubkey { index: usize },
+}
 
 /// A single validator entry in the genesis config with dual public keys.
 #[derive(Debug, Clone, Deserialize)]
@@ -31,6 +50,65 @@ impl GenesisConfig {
             })
             .collect()
     }
+
+    /// Verify `state` was produced by this genesis.
+    ///
+    /// Compares the genesis time and the full validator registry: count,
+    /// sequential indices, and both pubkeys per validator. The validator set is
+    /// fixed at genesis (nothing in the state transition mutates it), so any
+    /// state of a chain started from this config must carry exactly this
+    /// registry, whatever slot it sits at.
+    ///
+    /// This is a network-identity check, not a consistency check: it says
+    /// nothing about whether the state is internally coherent. Callers that
+    /// accept a state from an untrusted source pair it with their own sanity
+    /// checks.
+    pub fn verify_state(&self, state: &State) -> Result<(), GenesisMismatch> {
+        verify_state_genesis(state, self.genesis_time, &self.validators())
+    }
+}
+
+/// Verify `state` was produced by the genesis described by `genesis_time` and
+/// `expected_validators`.
+///
+/// The implementation behind [`GenesisConfig::verify_state`], for callers that
+/// hold the genesis time and validator registry separately rather than as a
+/// parsed config.
+pub fn verify_state_genesis(
+    state: &State,
+    genesis_time: u64,
+    expected_validators: &[Validator],
+) -> Result<(), GenesisMismatch> {
+    if state.config.genesis_time != genesis_time {
+        return Err(GenesisMismatch::GenesisTime {
+            expected: genesis_time,
+            got: state.config.genesis_time,
+        });
+    }
+
+    if state.validators.len() != expected_validators.len() {
+        return Err(GenesisMismatch::ValidatorCount {
+            expected: expected_validators.len(),
+            got: state.validators.len(),
+        });
+    }
+
+    let pairs = state.validators.iter().zip(expected_validators.iter());
+    for (position, (actual, expected)) in pairs.enumerate() {
+        if actual.index != position as u64 {
+            return Err(GenesisMismatch::NonSequentialIndex {
+                position,
+                got: actual.index,
+            });
+        }
+        if actual.attestation_pubkey != expected.attestation_pubkey
+            || actual.proposal_pubkey != expected.proposal_pubkey
+        {
+            return Err(GenesisMismatch::ValidatorPubkey { index: position });
+        }
+    }
+
+    Ok(())
 }
 
 fn deser_pubkey_hex<'de, D>(d: D) -> Result<ValidatorPubkeyBytes, D::Error>
@@ -159,5 +237,83 @@ GENESIS_VALIDATORS:
                 .unwrap(),
         );
         assert_eq!(block_root, expected_block_root, "block root mismatch");
+    }
+
+    fn test_config() -> GenesisConfig {
+        serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap()
+    }
+
+    /// State of a chain started from `config`, advanced past genesis so the
+    /// check is exercised on something other than the anchor itself.
+    fn state_of(config: &GenesisConfig) -> State {
+        let mut state = State::from_genesis(config.genesis_time, config.validators());
+        state.slot = 42;
+        state
+    }
+
+    #[test]
+    fn verify_state_accepts_state_from_same_genesis() {
+        let config = test_config();
+        assert_eq!(config.verify_state(&state_of(&config)), Ok(()));
+    }
+
+    #[test]
+    fn verify_state_rejects_different_genesis_time() {
+        let config = test_config();
+        let mut other = test_config();
+        other.genesis_time = config.genesis_time + 1;
+
+        assert_eq!(
+            config.verify_state(&state_of(&other)),
+            Err(GenesisMismatch::GenesisTime {
+                expected: config.genesis_time,
+                got: config.genesis_time + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn verify_state_rejects_different_validator_count() {
+        let config = test_config();
+        let mut other = test_config();
+        other.genesis_validators.pop();
+
+        assert_eq!(
+            config.verify_state(&state_of(&other)),
+            Err(GenesisMismatch::ValidatorCount {
+                expected: 3,
+                got: 2,
+            })
+        );
+    }
+
+    /// Same validator count and same genesis time, different keys: the case a
+    /// genesis-time-only check cannot see.
+    #[test]
+    fn verify_state_rejects_different_validator_keys() {
+        let config = test_config();
+        let mut other = test_config();
+        other.genesis_validators.swap(0, 1);
+
+        assert_eq!(
+            config.verify_state(&state_of(&other)),
+            Err(GenesisMismatch::ValidatorPubkey { index: 0 })
+        );
+    }
+
+    #[test]
+    fn verify_state_rejects_non_sequential_validator_indices() {
+        let config = test_config();
+        let mut validators = config.validators();
+        validators[1].index = 7;
+        let state = State::from_genesis(config.genesis_time, validators);
+
+        assert_eq!(
+            config.verify_state(&state),
+            Err(GenesisMismatch::NonSequentialIndex {
+                position: 1,
+                got: 7,
+            })
+        );
     }
 }
