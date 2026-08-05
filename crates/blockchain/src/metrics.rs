@@ -35,6 +35,39 @@ pub const ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS: &[&str] = &["block_onl
 pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
     &["select_payloads", "compact", "stf_simulate"];
 
+/// Where a gossip message landed relative to the interval it was due in.
+///
+/// Kept private to the module: unlike [`SyncStatus`] (which the RPC layer
+/// reads for `/lean/v0/node/syncing`), this label is only ever produced and
+/// consumed inside the gossip arrival-timing helpers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotPosition {
+    /// Arrived before the interval began.
+    Before,
+    /// Arrived within the interval.
+    Inside,
+    /// Arrived after the interval ended.
+    After,
+}
+
+impl SlotPosition {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SlotPosition::Before => "before",
+            SlotPosition::Inside => "inside",
+            SlotPosition::After => "after",
+        }
+    }
+
+    /// Every position reachable from a signed delta.
+    const ALL: &[&str] = &["before", "inside", "after"];
+
+    /// Positions reachable when the anchor cannot follow the arrival, so the
+    /// delta is never negative. Used by the aggregate counter, which must not
+    /// export an unreachable `before` series.
+    const NON_NEGATIVE: &[&str] = &["inside", "after"];
+}
+
 // --- Gauges ---
 
 static LEAN_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
@@ -507,6 +540,174 @@ static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+// --- Gossip Arrival Timing ---
+
+/// Bucket boundaries shared by the three gossip arrival-delay histograms,
+/// aligned to the interval and slot durations (see
+/// [`crate::MILLISECONDS_PER_INTERVAL`], [`crate::MILLISECONDS_PER_SLOT`]).
+fn gossip_arrival_delay_buckets() -> Vec<f64> {
+    vec![0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4.0, 8.0, 16.0]
+}
+
+static LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_gossip_block_arrival_delay_seconds",
+            "Absolute delay between a gossip block's arrival and the start of the interval it \
+             was due in",
+            gossip_arrival_delay_buckets()
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_gossip_attestation_arrival_delay_seconds",
+            "Absolute delay between a gossip attestation's arrival and the start of the interval \
+             it was due in",
+            gossip_arrival_delay_buckets()
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_gossip_aggregation_arrival_delay_seconds",
+            "Absolute delay between an aggregate becoming available, whether received on gossip \
+             or produced locally, and the most recent aggregation-interval boundary at or before \
+             it. A locally produced aggregate is held until that boundary, so it normally lands \
+             near zero and only registers a delay when proving overran its interval",
+            gossip_arrival_delay_buckets()
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_BLOCK_ARRIVAL_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_block_arrival_total",
+            "Gossip blocks by arrival position relative to the interval they were due in",
+            &["position"]
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_ATTESTATION_ARRIVAL_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_attestation_arrival_total",
+            "Gossip attestations by arrival position relative to the interval they were due in",
+            &["position"]
+        )
+        .unwrap()
+    });
+
+static LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_aggregation_arrival_total",
+            "Aggregates, received on gossip or produced locally, by arrival position relative to \
+             the most recent aggregation-interval boundary. Anchored to the latest such boundary \
+             rather than the aggregate's own data slot, so an arrival can never precede it: only \
+             `inside` and `after` occur, never `before`.",
+            &["position"]
+        )
+        .unwrap()
+    });
+
+/// Signed milliseconds from the start of `interval` in `anchor_slot` to
+/// `arrival_ms`. Negative means the message arrived before it was due.
+fn interval_delta_ms(
+    arrival_ms: u64,
+    genesis_ms: u64,
+    anchor_slot: u64,
+    interval: crate::SlotInterval,
+) -> i64 {
+    let expected_ms = genesis_ms + interval.to_ms_since_genesis(anchor_slot);
+    arrival_ms as i64 - expected_ms as i64
+}
+
+/// Milliseconds since the most recent `interval` boundary at or before
+/// `arrival_ms`. Always in `[0, MILLISECONDS_PER_SLOT)`, so it never reports
+/// a negative delta.
+fn latest_interval_delta_ms(
+    arrival_ms: u64,
+    genesis_ms: u64,
+    interval: crate::SlotInterval,
+) -> i64 {
+    let since_genesis = arrival_ms.saturating_sub(genesis_ms) as i64;
+    // Slot 0 makes `to_ms_since_genesis` yield just the offset within a slot.
+    let anchor_offset = interval.to_ms_since_genesis(0) as i64;
+    (since_genesis - anchor_offset).rem_euclid(crate::MILLISECONDS_PER_SLOT as i64)
+}
+
+/// Classify a signed delta against the interval width: `inside` is the
+/// half-open range from the interval's start up to its end.
+fn position_from_delta(delta_ms: i64) -> SlotPosition {
+    if delta_ms < 0 {
+        SlotPosition::Before
+    } else if delta_ms < crate::MILLISECONDS_PER_INTERVAL as i64 {
+        SlotPosition::Inside
+    } else {
+        SlotPosition::After
+    }
+}
+
+/// Observe a gossip block's arrival against the start of its own slot's
+/// [`crate::SlotInterval::BlockPublication`] interval. Zero point: `block_slot`'s
+/// slot boundary.
+pub fn observe_gossip_block_arrival(arrival_ms: u64, genesis_ms: u64, block_slot: u64) {
+    let delta_ms = interval_delta_ms(
+        arrival_ms,
+        genesis_ms,
+        block_slot,
+        crate::SlotInterval::BlockPublication,
+    );
+    LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS
+        .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
+    LEAN_GOSSIP_BLOCK_ARRIVAL_TOTAL
+        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .inc();
+}
+
+/// Observe a gossip attestation's arrival against its data slot's
+/// [`crate::SlotInterval::AttestationProduction`] interval. Zero point:
+/// `data_slot`'s interval-1 boundary.
+pub fn observe_gossip_attestation_arrival(arrival_ms: u64, genesis_ms: u64, data_slot: u64) {
+    let delta_ms = interval_delta_ms(
+        arrival_ms,
+        genesis_ms,
+        data_slot,
+        crate::SlotInterval::AttestationProduction,
+    );
+    LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS
+        .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
+    LEAN_GOSSIP_ATTESTATION_ARRIVAL_TOTAL
+        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .inc();
+}
+
+/// Observe a gossip aggregate's arrival against the most recent
+/// [`crate::SlotInterval::Aggregation`] boundary at or before `arrival_ms`.
+/// Zero point: that boundary — not the aggregate's own `data.slot`.
+///
+/// Deliberately takes no slot argument. An aggregate published at interval 2
+/// of slot N can carry `data.slot < N` (the stale-group catch-up path in
+/// `aggregation.rs`), so anchoring to `data.slot` would fill the histogram
+/// with large values that are not a health problem. Assuming the latest
+/// aggregation interval bounds the value to one slot.
+pub fn observe_gossip_aggregation_arrival(arrival_ms: u64, genesis_ms: u64) {
+    let delta_ms =
+        latest_interval_delta_ms(arrival_ms, genesis_ms, crate::SlotInterval::Aggregation);
+    LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS
+        .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
+    LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL
+        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .inc();
+}
+
 // --- Sync Status ---
 
 /// Node synchronization status.
@@ -649,6 +850,24 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED);
+    // Gossip arrival timing
+    std::sync::LazyLock::force(&LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS);
+    std::sync::LazyLock::force(&LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS);
+    std::sync::LazyLock::force(&LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS);
+    std::sync::LazyLock::force(&LEAN_GOSSIP_BLOCK_ARRIVAL_TOTAL);
+    std::sync::LazyLock::force(&LEAN_GOSSIP_ATTESTATION_ARRIVAL_TOTAL);
+    std::sync::LazyLock::force(&LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL);
+    // Seed every reachable position so the series exist at zero from startup,
+    // mirroring AGGREGATOR_SKIP_REASONS above. The aggregate counter seeds
+    // only the non-negative positions: its anchor never follows the arrival,
+    // so `before` is unreachable and must not appear as a zero series.
+    for &position in SlotPosition::ALL {
+        LEAN_GOSSIP_BLOCK_ARRIVAL_TOTAL.with_label_values(&[position]);
+        LEAN_GOSSIP_ATTESTATION_ARRIVAL_TOTAL.with_label_values(&[position]);
+    }
+    for &position in SlotPosition::NON_NEGATIVE {
+        LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL.with_label_values(&[position]);
+    }
     // Sync status
     std::sync::LazyLock::force(&LEAN_NODE_SYNC_STATUS);
     // Aggregator skip counter: instantiate every cross-client reason so the

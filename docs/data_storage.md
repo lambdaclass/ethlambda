@@ -97,7 +97,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
    │   ┌─────────────────────┐         ┌──────────────────────┐    │
    │   │ BlockHeaders        │         │ new_payloads         │    │
    │   │ BlockBodies         │         │  (pending aggregated │    │
-   │   │ BlockSignatures     │         │   attestations)      │    │
+   │   │ BlockProof          │         │   attestations)      │    │
    │   │ BlockRoots          │         │ known_payloads       │    │
    │   │ States              │         │  (fork-choice-active │    │
    │   │ StateDiffs          │         │   attestations)      │    │
@@ -120,7 +120,7 @@ The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | ----------------- | ----------- | ----------------------------------------- | -------------------------------- |
 | `BlockHeaders`    | root        | `BlockHeader`                             | never                            |
 | `BlockBodies`     | root        | `BlockBody`                               | never                            |
-| `BlockSignatures` | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockProof`      | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
 | `BlockRoots`      | slot        | block root (`H256`)                       | never                            |
 | `States`          | root        | full `State` snapshot                     | never                            |
 | `StateDiffs`      | root        | `StateDiff`                               | never                            |
@@ -133,7 +133,7 @@ Three key layouts are used:
 
 - **Root-keyed** tables use the 32-byte SSZ encoding of the block root
   (`root.to_ssz()`).
-- **Slot-prefixed** tables (`BlockSignatures`, `LiveChain`) use
+- **Slot-prefixed** tables (`BlockProof`, `LiveChain`) use
   `encode_slot_root_key`: an 8-byte **big-endian** slot followed by the
   32-byte root. Big-endian means lexicographic key order equals numeric slot
   order, so pruning can iterate from the start of the table and stop at the
@@ -158,13 +158,11 @@ body: if `header.body_root == EMPTY_BODY_ROOT` (the hash tree root of
 `BlockBody::default()`. This covers the genesis block and checkpoint sync
 anchors, whose bodies are either empty or unavailable. Never pruned.
 
-### BlockSignatures
+### BlockProof
 
-`slot ‖ root → MultiMessageAggregate`. Despite the name, this table stores the
-block's **merged aggregate proof blob**, not individual signatures — the name
-is historical and kept to avoid a RocksDB column-family migration (renaming to
-`BlockProof` is a follow-up). It is keyed by `slot ‖ root` (not plain root)
-precisely so that pruning can scan in slot order and stop early.
+`slot ‖ root → MultiMessageAggregate`. This table stores the block's **merged
+aggregate proof blob**. It is keyed by `slot ‖ root` so that pruning can scan in
+slot order and stop early.
 
 Stored separately from headers/bodies because the genesis block has no proof.
 `get_signed_block` synthesizes an empty proof for the slot-0 anchor only; for
@@ -334,7 +332,7 @@ sequence of independent write batches:
    │
    ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
    │                            │            BlockBodies[root]    (if non-empty)
-   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            ├─one batch─ BlockProof[slot‖root]
    │                            │            LiveChain[slot‖root]
    │                            ┘
    │
@@ -379,8 +377,8 @@ a deferred heavy phase.
 **Deferred** (`prune_old_data`, called after a batch of blocks has been
 processed):
 
-- `prune_old_block_signatures`: deletes `BlockSignatures` entries below
-  `cutoff = tip_slot − SIGNATURE_PRUNING_RANGE` (21,600 slots, ~1 day at
+- `prune_old_block_proofs`: deletes `BlockProof` entries below
+  `cutoff = tip_slot − BLOCK_PROOF_PRUNING_RANGE` (21,600 slots, ~1 day at
   4-second slots) — but **only** when `cutoff ≤ finalized_slot`, i.e. the
   entire pruned range lies within finalized history. Non-finalized proofs
   are never touched. Finalized blocks can never revert, so their proofs are

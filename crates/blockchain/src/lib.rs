@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
-use ethlambda_network_api::{BlockChainToP2PRef, InitP2P};
+use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
@@ -108,6 +108,20 @@ impl SlotInterval {
             4 => Self::EndOfSlot,
             _ => unreachable!("slots only have 5 intervals"),
         }
+    }
+
+    /// Milliseconds from genesis to the start of this interval in `slot`.
+    ///
+    /// Inverse of [`Self::from_ms_since_genesis`].
+    pub(crate) fn to_ms_since_genesis(self, slot: u64) -> u64 {
+        let interval = match self {
+            Self::BlockPublication => 0,
+            Self::AttestationProduction => 1,
+            Self::Aggregation => 2,
+            Self::SafeTargetUpdate => 3,
+            Self::EndOfSlot => 4,
+        };
+        slot * MILLISECONDS_PER_SLOT + interval * MILLISECONDS_PER_INTERVAL
     }
 }
 
@@ -1367,16 +1381,37 @@ impl Handler<InitP2P> for BlockChainServer {
 
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
-        self.events.emit(ChainEvent::BlockGossip {
-            slot: msg.block.message.slot,
-            block: msg.block.message.hash_tree_root(),
-        });
+        let arrival_ms = unix_now_ms();
+        // Gate both the event and the arrival metric on BlockSource::Gossip for
+        // two reasons: `ChainEvent::BlockGossip` is documented (events.rs) as "a
+        // block seen on gossip, before import", yet without this gate it also
+        // fired for req/resp sync blocks; and sync backfill delivers blocks many
+        // slots after they were due, which would swamp the arrival histogram
+        // with stale deltas that reflect catch-up speed, not gossip timeliness.
+        // `self.on_block(msg.block)` still runs for every source below: it is
+        // the import path and must not be gated.
+        if msg.source == BlockSource::Gossip {
+            let slot = msg.block.message.slot;
+            self.events.emit(ChainEvent::BlockGossip {
+                slot,
+                block: msg.block.message.hash_tree_root(),
+            });
+            let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+            metrics::observe_gossip_block_arrival(arrival_ms, genesis_ms, slot);
+        }
         self.on_block(msg.block);
     }
 }
 
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
+        let arrival_ms = unix_now_ms();
+        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        metrics::observe_gossip_attestation_arrival(
+            arrival_ms,
+            genesis_ms,
+            msg.attestation.data.slot,
+        );
         self.on_gossip_attestation(&msg.attestation);
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
@@ -1390,6 +1425,9 @@ impl Handler<NewAttestation> for BlockChainServer {
 
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
+        let arrival_ms = unix_now_ms();
+        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
         self.on_gossip_aggregated_attestation(msg.attestation);
     }
 }
@@ -1400,6 +1438,8 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 
 impl Handler<AggregateProduced> for BlockChainServer {
     async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
+        let arrival_ms = unix_now_ms();
+
         // Drop results from a prior session (or from an unexpected late worker).
         // Current session may be None if the actor already cleaned it up; accept
         // the message only when ids match.
@@ -1412,6 +1452,17 @@ impl Handler<AggregateProduced> for BlockChainServer {
             );
             return;
         }
+
+        // Count our own aggregate in the same series as gossip-received ones,
+        // so an aggregator does not report an empty aggregate arrival profile.
+        // Delivery of this message is held to the interval-2 boundary upstream,
+        // so a local aggregate lands near zero unless proving overran the
+        // interval. Sharing one series with received aggregates is deliberate
+        // and costs little in practice: a late aggregate is late for every node
+        // at once, so both populations are dominated by production time rather
+        // than propagation and their distributions look alike.
+        let genesis_ms = self.store.config().expect("config exists").genesis_time * 1000;
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
 
         // Publish alignment is enforced upstream: the worker delays delivery of
         // this message until the interval-2 boundary, so by the time it lands
