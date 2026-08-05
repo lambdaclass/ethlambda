@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d4d48dfc.js";
+            window.path_to_searchindex_js = "searchindex-56366715.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -2183,7 +2183,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    │   ┌─────────────────────┐         ┌──────────────────────┐    │
    │   │ BlockHeaders        │         │ new_payloads         │    │
    │   │ BlockBodies         │         │  (pending aggregated │    │
-   │   │ BlockSignatures     │         │   attestations)      │    │
+   │   │ BlockProof          │         │   attestations)      │    │
    │   │ States              │         │ known_payloads       │    │
    │   │ StateDiffs          │         │  (fork-choice-active │    │
    │   │ Metadata            │         │   attestations)      │    │
@@ -2198,7 +2198,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    └───────────────────────────────────────────────────────────────┘
 </code></pre>
 <h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
-<p>The seven variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<p>The eight variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -2207,7 +2207,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tbody>
 <tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code></td><td>never</td></tr>
 <tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code></td><td>never</td></tr>
-<tr><td><code>BlockSignatures</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
+<tr><td><code>BlockProof</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
 <tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
 <tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
 <tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
@@ -2220,7 +2220,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <ul>
 <li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
 (<code>root.to_ssz()</code>).</li>
-<li><strong>Slot-prefixed</strong> tables (<code>BlockSignatures</code>, <code>LiveChain</code>) use
+<li><strong>Slot-prefixed</strong> tables (<code>BlockProof</code>, <code>LiveChain</code>) use
 <code>encode_slot_root_key</code>: an 8-byte <strong>big-endian</strong> slot followed by the
 32-byte root. Big-endian means lexicographic key order equals numeric slot
 order, so pruning can iterate from the start of the table and stop at the
@@ -2237,12 +2237,10 @@ body: if <code>header.body_root == EMPTY_BODY_ROOT</code> (the hash tree root of
 <code>BlockBody::default()</code>), nothing is stored and reads synthesize
 <code>BlockBody::default()</code>. This covers the genesis block and checkpoint sync
 anchors, whose bodies are either empty or unavailable. Never pruned.</p>
-<h3 id="blocksignatures"><a class="header" href="#blocksignatures">BlockSignatures</a></h3>
-<p><code>slot ‖ root → MultiMessageAggregate</code>. Despite the name, this table stores the
-block’s <strong>merged aggregate proof blob</strong>, not individual signatures — the name
-is historical and kept to avoid a RocksDB column-family migration (renaming to
-<code>BlockProof</code> is a follow-up). It is keyed by <code>slot ‖ root</code> (not plain root)
-precisely so that pruning can scan in slot order and stop early.</p>
+<h3 id="blockproof"><a class="header" href="#blockproof">BlockProof</a></h3>
+<p><code>slot ‖ root → MultiMessageAggregate</code>. This table stores the block’s <strong>merged
+aggregate proof blob</strong>. It is keyed by <code>slot ‖ root</code> so that pruning can scan in
+slot order and stop early.</p>
 <p>Stored separately from headers/bodies because the genesis block has no proof.
 <code>get_signed_block</code> synthesizes an empty proof for the slot-0 anchor only; for
 any other block a missing entry (a pruned finalized block) surfaces as <code>None</code>
@@ -2363,7 +2361,7 @@ sequence of independent write batches:</p>
    │
    ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
    │                            │            BlockBodies[root]    (if non-empty)
-   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            ├─one batch─ BlockProof[slot‖root]
    │                            │            LiveChain[slot‖root]
    │                            ┘
    │
@@ -2403,8 +2401,8 @@ slot.</li>
 <p><strong>Deferred</strong> (<code>prune_old_data</code>, called after a batch of blocks has been
 processed):</p>
 <ul>
-<li><code>prune_old_block_signatures</code>: deletes <code>BlockSignatures</code> entries below
-<code>cutoff = tip_slot − SIGNATURE_PRUNING_RANGE</code> (21,600 slots, ~1 day at
+<li><code>prune_old_block_proofs</code>: deletes <code>BlockProof</code> entries below
+<code>cutoff = tip_slot − BLOCK_PROOF_PRUNING_RANGE</code> (21,600 slots, ~1 day at
 4-second slots) — but <strong>only</strong> when <code>cutoff ≤ finalized_slot</code>, i.e. the
 entire pruned range lies within finalized history. Non-finalized proofs
 are never touched. Finalized blocks can never revert, so their proofs are
