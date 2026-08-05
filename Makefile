@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test test-beacon consensus-spec-tests docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -12,7 +12,16 @@ lint: ## 🔍 Run clippy on all workspace crates
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during
 	# signature verification/aggregation, without paying for LTO on every rebuild
-	cargo test --workspace --profile release-fast
+	#
+	# ethlambda-beacon is excluded and has its own target: its fixtures are a
+	# separate multi-gigabyte download, and it has to be built once per preset.
+	cargo test --workspace --exclude ethlambda-beacon --profile release-fast
+
+test-beacon: consensus-spec-tests ## 🧪 Run the Beacon Chain spec tests, both presets
+	# The preset fixes SSZ container bounds at compile time, so each preset needs
+	# its own build of the crate. Each run walks only its own fixture tree.
+	cargo test -p ethlambda-beacon --profile release-fast
+	cargo test -p ethlambda-beacon --profile release-fast --features preset-minimal
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
@@ -56,6 +65,27 @@ leanSpec/fixtures:
 	rm -rf leanSpec/fixtures; \
 	mkdir -p leanSpec/fixtures; \
 	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
+
+# Beacon Chain spec test fixtures, for crates/beacon.
+#
+# Pinned rather than tracking the latest release: this fixture tree *is* the
+# definition of correctness for that crate, so it should move only when we choose
+# to move it. The release publishes no checksums for these assets, so unlike the
+# leanSpec bundle below there is nothing to verify against.
+CONSENSUS_SPEC_TESTS_VERSION ?= v1.6.1
+CONSENSUS_SPEC_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_TESTS_VERSION)
+
+consensus-spec-tests: consensus-spec-tests/tests/general consensus-spec-tests/tests/minimal consensus-spec-tests/tests/mainnet ## ⬇️ Download the Beacon Chain spec test fixtures
+
+# Every tarball unpacks to `tests/<name>/...`, so all three extract into the same
+# directory and land side by side.
+consensus-spec-tests/tests/%:
+	@mkdir -p consensus-spec-tests
+	@echo "Downloading $* spec test fixtures ($(CONSENSUS_SPEC_TESTS_VERSION))"
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	curl -L -f -o "$$tmpdir/$*.tar.gz" "$(CONSENSUS_SPEC_TESTS_BASE_URL)/$*.tar.gz"; \
+	tar -xzf "$$tmpdir/$*.tar.gz" -C consensus-spec-tests
 
 lean-quickstart:
 	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
