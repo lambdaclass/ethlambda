@@ -38,11 +38,7 @@ async fn get_syncing(
     State(store): State<Store>,
     Extension(sync_status): Extension<SyncStatusController>,
 ) -> impl IntoResponse {
-    let genesis_ms = store
-        .config()
-        .expect("config exists")
-        .genesis_time
-        .saturating_mul(1000);
+    let genesis_ms = store.config().genesis_time.saturating_mul(1000);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
