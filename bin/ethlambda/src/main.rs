@@ -688,7 +688,7 @@ async fn fetch_initial_state(
     // have. Tried before the checkpoint-sync and genesis paths so that a restart
     // without `--checkpoint-sync-url` keeps the chain instead of writing a
     // slot-0 anchor over it.
-    if let Ok(Some(store)) = Store::from_db_state(backend.clone(), genesis.genesis_time) {
+    if let Some(store) = Store::from_db_state(backend.clone(), genesis)? {
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
@@ -742,7 +742,7 @@ async fn fetch_initial_state(
     // Initialize the store from state + anchor block body, then persist the
     // signatures so we can serve the anchor on BlocksByRoot. `insert_signed_block`
     // overlaps with what `get_forkchoice_store` already wrote, but it's
-    // idempotent and the only path that also stores `BlockSignatures`.
+    // idempotent and the only path that also stores `BlockProof`.
     let anchor_root = signed_block.message.header().hash_tree_root();
     let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
@@ -978,26 +978,50 @@ validators:
         );
     }
 
-    /// A DB from another network is not resumable, so the no-URL path still
-    /// falls back to genesis.
-    ///
-    /// This pins current behavior, not a desired one. `from_db_state` treats a
-    /// `GENESIS_TIME` mismatch as an empty DB and only warns, so with no
-    /// checkpoint URL the node writes a genesis anchor over a populated
-    /// foreign-network directory: the same data loss the resume ordering
-    /// removes everywhere else. Left as-is deliberately, and this test is here
-    /// to make the change visible when someone fixes it.
+    /// A DB from another network aborts startup rather than being re-anchored:
+    /// writing genesis on top would leave the foreign blocks in place, and
+    /// slot-indexed reads would serve them to peers.
     #[tokio::test]
-    async fn initializes_from_genesis_when_db_genesis_time_differs() {
+    async fn fails_when_db_genesis_time_differs() {
         let seeded_genesis = test_genesis(now_secs());
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &seeded_genesis);
 
         let other_genesis = test_genesis(seeded_genesis.genesis_time + 1);
-        let store = fetch_initial_state(&[], &other_genesis, backend)
-            .await
-            .unwrap();
+        // `Store` is not `Debug`, so unwrap the error by pattern.
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend.clone()).await else {
+            panic!("a foreign DB must not be silently re-anchored");
+        };
 
-        assert_eq!(store.head_slot(), 0);
+        assert!(
+            matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
+            "unexpected error: {err}"
+        );
+        // The foreign chain is left untouched, not overwritten with a new anchor.
+        let store = Store::from_db_state(backend, &seeded_genesis)
+            .expect("original DB still loads under its own genesis")
+            .expect("store exists");
+        assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
+    }
+
+    /// Same genesis time, different validator registry: the case the previous
+    /// `genesis_time`-only check could not see.
+    #[tokio::test]
+    async fn fails_when_db_validator_set_differs() {
+        let genesis_time = now_secs();
+        let seeded_genesis = test_genesis(genesis_time);
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &seeded_genesis);
+
+        let mut other_genesis = test_genesis(genesis_time);
+        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
+            panic!("a foreign validator set must not be silently re-anchored");
+        };
+
+        assert!(
+            matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
+            "unexpected error: {err}"
+        );
     }
 }

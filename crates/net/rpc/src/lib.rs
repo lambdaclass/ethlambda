@@ -532,7 +532,7 @@ mod tests {
         use libssz::SszEncode;
 
         // Genesis-anchored store: `init_store` writes the header + state but no
-        // `BlockSignatures` (proof) row. `get_signed_block` synthesizes an empty
+        // `BlockProof` (proof) row. `get_signed_block` synthesizes an empty
         // proof so peers can still receive the genesis block on BlocksByRoot;
         // the HTTP endpoint stays consistent and returns 200 rather than 404.
         let state = create_test_state();
