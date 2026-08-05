@@ -1,21 +1,32 @@
 //! Committee-signature aggregation: off-thread worker orchestration and the
 //! pure functions it runs.
 //!
-//! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
-//! threshold is met — via
+//! The blockchain actor fires one aggregation session per slot via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
 //! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
+//!
+//! Two roles trigger a session, and either can start it at interval 2 or up to
+//! [`EARLY_AGGREGATION_WINDOW`] early once its own threshold is met:
+//!
+//! - a **committee aggregator**, whose threshold is 2/3 of the signatures expected
+//!   from its subscribed subnets, and which selects up to [`MAX_AGGREGATION_JOBS`]
+//!   jobs from the subnet pool;
+//! - the **next slot's proposer**, whose threshold is the safe target's
+//!   `ceil(3K'/4)` of the heartbeat committee, and which runs exactly one job over
+//!   those heartbeat votes (see [`crate::heartbeat_fold`]).
+//!
+//! Both job kinds share this worker, deadline, and result path, so a folded
+//! heartbeat aggregate reaches the block builder through the ordinary payload pool
+//! rather than a private channel.
 //!
 //! [`snapshot_aggregation_inputs`] builds the session's job list with a tiered
 //! greedy selector modeled on `block_builder::select_attestations`: an
 //! up-front store pass resolves every candidate `AttestationData`'s
 //! aggregation material once (raw-first + trim, see [`resolve_job`]), then a
 //! pure in-memory loop scores and orders candidates by consensus value
-//! (current-slot before stale, then Finalize > Justify > Build), emitting at
-//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to a
-//! single job in the slot before one of our validators proposes.
+//! (Finalize > Justify > Build, with this slot's groups jumping the queue only
+//! for the proposer — see [`SlotOrdering`]), emitting at most `max_jobs` jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -45,7 +56,10 @@ use crate::{MILLISECONDS_PER_INTERVAL, metrics};
 /// started early (see `maybe_start_early_aggregation`) ends correspondingly
 /// earlier. The deadline only stops new jobs from starting — a job mid-proof
 /// finishes and publishes right after.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
+///
+/// Derived from the interval width rather than written as a literal so it keeps
+/// meaning "one interval" across changes to the interval grid.
+pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(MILLISECONDS_PER_INTERVAL);
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
@@ -66,6 +80,46 @@ const _: () = assert!(
     "EARLY_AGGREGATION_WINDOW must not exceed one interval"
 );
 
+/// Where a job's raw signatures came from.
+///
+/// Only affects which histogram the prover time lands in: the heartbeat fold has
+/// its own deadline pressure (it must finish before the proposer's interval-3
+/// build), so merging its timing into the committee session's would hide exactly
+/// the signal that tells you whether a chosen `K` still fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobSource {
+    /// Gossip signatures and payload-only merges from the attestation subnets.
+    Subnet,
+    /// Raw committee signatures from the global heartbeat topic.
+    Heartbeat,
+}
+
+/// How a session ranks this slot's candidate groups against stale ones.
+///
+/// This slot's groups are the committee's view-merge payload: the next slot's
+/// proposer needs them, and every other node already receives them raw on the
+/// global heartbeat topic. So recency is worth a queue jump only to the proposer,
+/// which is why the two roles order candidates differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotOrdering {
+    /// Current-slot groups precede stale ones; tier decides within a bucket.
+    ///
+    /// The next slot's proposer's ordering. It reaches the subnet pool only as a
+    /// fallback (nothing foldable from the heartbeat topic), and the one job it
+    /// spends there is still meant to cover this slot's committee, since that is
+    /// what `Tier::Heartbeat` packs into the block it is about to build.
+    CurrentSlotFirst,
+    /// Tier alone decides: Finalize > Justify > Build, no recency bucket.
+    ///
+    /// A committee aggregator that does not propose the next slot. Its scarce
+    /// resource is leanVM time, and its contribution to the network is pushing
+    /// targets over 2/3 — not re-publishing votes the heartbeat topic already
+    /// delivered. Under this ordering a current-slot group is aggregated only when
+    /// it wins on consensus value: it finalizes, it justifies, or it adds coverage
+    /// no other candidate does.
+    TierOnly,
+}
+
 /// A single pre-prepared aggregation group.
 ///
 /// Built on the actor thread from a store snapshot; consumed by an off-thread
@@ -83,6 +137,7 @@ pub struct AggregationJob {
     pub(crate) raw_ids: Vec<u64>,
     /// Gossip-signature keys to delete on successful aggregation.
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
+    pub(crate) source: JobSource,
 }
 
 impl AggregationJob {
@@ -177,6 +232,10 @@ impl Message for EarlyAggregationCheck {
 /// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
+///
+/// A session run because we propose the next slot uses one job instead, spent on
+/// the heartbeat committee's votes; see
+/// `BlockChainServer::start_aggregation_session`.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
@@ -193,20 +252,24 @@ pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 ///    at least two existing proofs to merge).
 /// 2. **Greedy loop**, at most `max_jobs` rounds: each round
 ///    scores every unselected candidate against the projected state and
-///    keeps the lowest ordering key (current-slot before stale, then
-///    Finalize > Justify > Build, mirroring the block builder). The winning
-///    [`AggregationJob`] is emitted as-is; the projection is updated with its
-///    realized coverage.
+///    keeps the lowest ordering key (Finalize > Justify > Build, mirroring the
+///    block builder, behind whatever recency bucket `slot_ordering` asks for).
+///    The winning [`AggregationJob`] is emitted as-is; the projection is updated
+///    with its realized coverage.
 ///
 /// Stops early when no remaining candidate scores (converged).
 ///
-/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
-/// the caller is about to build a block at interval 4 (see
-/// `BlockChainServer::start_aggregation_session`).
+/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session, run with
+/// [`SlotOrdering::TierOnly`]. A session run because we propose the next slot
+/// prefers a single heartbeat job instead
+/// ([`crate::heartbeat_fold::heartbeat_aggregation_snapshot`]) and only falls back
+/// here, with `max_jobs = 1` and [`SlotOrdering::CurrentSlotFirst`], when nothing
+/// is foldable.
 pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
     max_jobs: usize,
+    slot_ordering: SlotOrdering,
 ) -> Option<AggregationSnapshot> {
     let gossip_groups = store.iter_gossip_signatures();
     let new_payload_keys = store.new_payload_keys();
@@ -284,6 +347,7 @@ pub fn snapshot_aggregation_inputs(
             &extended_historical_block_hashes,
             current_slot,
             validator_count,
+            slot_ordering,
         ) else {
             trace!(
                 jobs_selected = jobs.len(),
@@ -312,7 +376,7 @@ pub fn snapshot_aggregation_inputs(
         // Fold the job's realized coverage into the shared projection so
         // same-target candidates re-tier across rounds exactly as the block
         // builder's post-state would.
-        projected.advance(score.tier, att_data, coverage.iter().copied());
+        projected.advance(score.effect, att_data, coverage.iter().copied());
 
         jobs.push(job);
     }
@@ -334,8 +398,8 @@ pub fn snapshot_aggregation_inputs(
 /// voters (relative to the candidate's realized [`AggregationJob::coverage`],
 /// not the full proof union — see [`resolve_job`]). Among the rest, returns
 /// `(data_root, score)` for the entry with the lowest composite key:
-/// current-slot groups precede stale ones, then `EntryScore::ordering_key`
-/// (tier, then tier-dependent dims, then `data_root`) decides.
+/// `slot_ordering`'s recency bucket, then `EntryScore::ordering_key` (tier, then
+/// tier-dependent dims, then `data_root`).
 fn pick_best_candidate(
     candidates: &HashMap<H256, AggregationJob>,
     projected: &block_builder::ProjectedState,
@@ -343,6 +407,7 @@ fn pick_best_candidate(
     extended_historical_block_hashes: &[H256],
     current_slot: u64,
     validator_count: usize,
+    slot_ordering: SlotOrdering,
 ) -> Option<(H256, EntryScore)> {
     let mut best: Option<(H256, EntryScore)> = None;
     let mut best_key: Option<(u8, block_builder::OrderingKey)> = None;
@@ -365,11 +430,11 @@ fn pick_best_candidate(
             continue;
         };
 
-        // Current-slot groups always precede stale ones (goal: consider
-        // current-slot signatures first); within a bucket, `EntryScore`
-        // decides.
-        let slot_bucket: u8 = if att_data.slot == current_slot { 0 } else { 1 };
-        let candidate_key = candidate_ordering_key(slot_bucket, &score, *data_root);
+        let candidate_key = candidate_ordering_key(
+            slot_bucket(slot_ordering, att_data.slot, current_slot),
+            &score,
+            *data_root,
+        );
         if best_key.as_ref().is_none_or(|k| candidate_key < *k) {
             best = Some((*data_root, score));
             best_key = Some(candidate_key);
@@ -379,9 +444,21 @@ fn pick_best_candidate(
     best
 }
 
-/// Composite ordering key (lower is better): current-slot groups (`0`)
-/// precede stale ones (`1`); within a bucket, `EntryScore::ordering_key`
-/// (tier, then tier-dependent dims, then `data_root`) decides.
+/// Recency bucket for a candidate (lower is better), per [`SlotOrdering`].
+///
+/// [`SlotOrdering::TierOnly`] collapses every candidate into bucket `0`, so the
+/// composite key degenerates to `EntryScore::ordering_key` alone and a current-slot
+/// group has to out-tier a stale one to be picked.
+fn slot_bucket(slot_ordering: SlotOrdering, att_slot: u64, current_slot: u64) -> u8 {
+    match slot_ordering {
+        SlotOrdering::CurrentSlotFirst => u8::from(att_slot != current_slot),
+        SlotOrdering::TierOnly => 0,
+    }
+}
+
+/// Composite ordering key (lower is better): the [`slot_bucket`] leads; within a
+/// bucket, `EntryScore::ordering_key` (tier, then tier-dependent dims, then
+/// `data_root`) decides.
 fn candidate_ordering_key(
     slot_bucket: u8,
     score: &EntryScore,
@@ -480,6 +557,7 @@ fn resolve_job(
         raw_sigs,
         raw_ids,
         keys_to_delete,
+        source: JobSource::Subnet,
     })
 }
 
@@ -530,7 +608,10 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     let data_root = job.hashed.root();
 
     let proof_data = {
-        let _timing = metrics::time_pq_sig_aggregated_signatures_building();
+        let _timing = match job.source {
+            JobSource::Subnet => metrics::time_pq_sig_aggregated_signatures_building(),
+            JobSource::Heartbeat => metrics::time_heartbeat_fold(),
+        };
         aggregate_mixed(
             job.children,
             job.raw_pubkeys,
@@ -964,16 +1045,27 @@ mod tests {
 
     // ---- ordering ----
 
-    /// The slot bucket dominates the within-bucket score: a current-slot
-    /// candidate is picked ahead of a stale candidate that has *more* new
-    /// voters (which, absent the bucket, would win the Build-tier
-    /// `new_voters` dimension). Exercises `candidate_ordering_key` through the
-    /// real `pick_best_candidate` path rather than constructing an
-    /// `EntryScore` directly.
-    #[test]
-    fn pick_best_candidate_prefers_current_slot_over_higher_stale_score() {
-        const NUM_VALIDATORS: usize = 100;
-        const CURRENT_SLOT: u64 = 3;
+    const ORDERING_NUM_VALIDATORS: usize = 100;
+    const ORDERING_CURRENT_SLOT: u64 = 3;
+
+    /// Everything `pick_best_candidate` needs for the two ordering tests.
+    struct OrderingFixture {
+        candidates: HashMap<H256, AggregationJob>,
+        projected: block_builder::ProjectedState,
+        known_block_roots: HashSet<H256>,
+        historical_block_hashes: Vec<H256>,
+        root_current: H256,
+        root_stale: H256,
+    }
+
+    /// One current-slot candidate with a single new voter against one stale
+    /// candidate with five, on independent target roots so their voter buckets
+    /// never interact. Both score `Tier::Build`, so the stale one wins the
+    /// within-tier `new_voters` dimension and only the recency bucket can flip
+    /// the outcome — which is exactly what the two [`SlotOrdering`] variants
+    /// disagree about.
+    fn ordering_fixture() -> OrderingFixture {
+        const CURRENT_SLOT: u64 = ORDERING_CURRENT_SLOT;
 
         let genesis_root = H256([1u8; 32]);
         let target_root = H256([7u8; 32]);
@@ -1026,6 +1118,7 @@ mod tests {
                 raw_sigs: Vec::new(),
                 raw_ids: coverage.into_iter().collect(),
                 keys_to_delete: Vec::new(),
+                source: JobSource::Subnet,
             }
         };
 
@@ -1047,20 +1140,69 @@ mod tests {
             current_votes: HashMap::new(),
         };
 
+        OrderingFixture {
+            candidates,
+            projected,
+            known_block_roots,
+            historical_block_hashes,
+            root_current,
+            root_stale,
+        }
+    }
+
+    /// Under [`SlotOrdering::CurrentSlotFirst`] the recency bucket dominates the
+    /// within-bucket score: the current-slot candidate is picked ahead of a stale
+    /// candidate that has *more* new voters. Exercises `candidate_ordering_key`
+    /// through the real `pick_best_candidate` path rather than constructing an
+    /// `EntryScore` directly.
+    #[test]
+    fn pick_best_candidate_prefers_current_slot_over_higher_stale_score() {
+        let fixture = ordering_fixture();
+
         let (picked_root, score) = pick_best_candidate(
-            &candidates,
-            &projected,
-            &known_block_roots,
-            &historical_block_hashes,
-            CURRENT_SLOT,
-            NUM_VALIDATORS,
+            &fixture.candidates,
+            &fixture.projected,
+            &fixture.known_block_roots,
+            &fixture.historical_block_hashes,
+            ORDERING_CURRENT_SLOT,
+            ORDERING_NUM_VALIDATORS,
+            SlotOrdering::CurrentSlotFirst,
         )
         .expect("both candidates are viable Build-tier entries");
 
         assert_eq!(score.tier, block_builder::Tier::Build);
         assert_eq!(
-            picked_root, root_current,
+            picked_root, fixture.root_current,
             "the current-slot group must be picked ahead of a stale group with more new voters"
+        );
+    }
+
+    /// Under [`SlotOrdering::TierOnly`] recency buys nothing: the same pool picks
+    /// the stale candidate, because it wins Build tier's `new_voters` dimension.
+    ///
+    /// This is what keeps a non-proposing aggregator's jobs on consensus value
+    /// rather than on the committee's view-merge payload — those votes reach every
+    /// peer raw on the global heartbeat topic, so re-proving them buys the network
+    /// nothing an aggregator alone could provide.
+    #[test]
+    fn pick_best_candidate_tier_only_ignores_slot_recency() {
+        let fixture = ordering_fixture();
+
+        let (picked_root, score) = pick_best_candidate(
+            &fixture.candidates,
+            &fixture.projected,
+            &fixture.known_block_roots,
+            &fixture.historical_block_hashes,
+            ORDERING_CURRENT_SLOT,
+            ORDERING_NUM_VALIDATORS,
+            SlotOrdering::TierOnly,
+        )
+        .expect("both candidates are viable Build-tier entries");
+
+        assert_eq!(score.tier, block_builder::Tier::Build);
+        assert_eq!(
+            picked_root, fixture.root_stale,
+            "with no recency bucket the higher-coverage group wins, current-slot or not"
         );
     }
 
@@ -1119,6 +1261,7 @@ mod tests {
                 raw_sigs: Vec::new(),
                 raw_ids: coverage.into_iter().collect(),
                 keys_to_delete: Vec::new(),
+                source: JobSource::Subnet,
             }
         };
 
@@ -1147,6 +1290,7 @@ mod tests {
             &historical_block_hashes,
             999,
             NUM_VALIDATORS,
+            SlotOrdering::TierOnly,
         )
         .expect("round 1 should find a candidate");
         assert_eq!(picked_root, root_a);
@@ -1170,6 +1314,7 @@ mod tests {
             &historical_block_hashes,
             999,
             NUM_VALIDATORS,
+            SlotOrdering::TierOnly,
         )
         .expect("round 2 should find B");
         assert_eq!(picked_root, root_b);
@@ -1188,7 +1333,9 @@ mod tests {
     fn snapshot_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
+        let snapshot =
+            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, SlotOrdering::TierOnly);
+        assert!(snapshot.is_none());
     }
 
     /// A single gossip signature with no other material to merge is dropped
@@ -1217,7 +1364,9 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
+        let snapshot =
+            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, SlotOrdering::TierOnly);
+        assert!(snapshot.is_none());
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -1260,7 +1409,8 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS).is_none(),
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, SlotOrdering::TierOnly)
+                .is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -1316,8 +1466,13 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let snapshot = snapshot_aggregation_inputs(&store, HEAD_SLOT, MAX_AGGREGATION_JOBS)
-            .expect("a vote for the current head must produce a job (chain view covers the tip)");
+        let snapshot = snapshot_aggregation_inputs(
+            &store,
+            HEAD_SLOT,
+            MAX_AGGREGATION_JOBS,
+            SlotOrdering::TierOnly,
+        )
+        .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(
             snapshot.jobs[0].hashed.data().target.slot,
@@ -1377,8 +1532,9 @@ mod tests {
     fn snapshot_caps_jobs_at_max_aggregation_jobs() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS)
-            .expect("should produce jobs");
+        let snapshot =
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, SlotOrdering::TierOnly)
+                .expect("should produce jobs");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
         assert_eq!(snapshot.jobs.len(), MAX_AGGREGATION_JOBS);
 
@@ -1403,7 +1559,8 @@ mod tests {
     fn snapshot_caps_jobs_at_one_for_proposer() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, 1).expect("should produce a job");
+        let snapshot = snapshot_aggregation_inputs(&store, 999, 1, SlotOrdering::CurrentSlotFirst)
+            .expect("should produce a job");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
         assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(

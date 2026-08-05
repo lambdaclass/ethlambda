@@ -17,8 +17,8 @@ use std::{
 
 use ethlambda_crypto::{aggregate_proofs, signature::ValidatorPublicKey};
 use ethlambda_state_transition::{
-    attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
-    slot_is_justifiable_after,
+    attestation_data_matches_chain, is_heartbeat_committee_member, justified_slots_ops,
+    process_block, process_slots, slot_is_justifiable_after,
 };
 use ethlambda_types::{
     ShortRoot,
@@ -56,6 +56,10 @@ pub struct ProposerConfig {
     /// Proposer-side self-limit only; clamped to `MAX_ATTESTATIONS_DATA` during
     /// selection so the block never exceeds the cap `on_block` enforces.
     pub max_attestations_per_block: usize,
+    /// The network's `K`. Used only to classify entries into
+    /// [`Tier::Heartbeat`], never to validate anything, so a stale value builds a
+    /// worse block rather than an invalid one.
+    pub heartbeat_committee_size: u64,
 }
 
 /// Build a valid block on top of this state.
@@ -91,6 +95,7 @@ pub(crate) fn build_block(
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
     config: ProposerConfig,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
+    let heartbeat_committee_size = config.heartbeat_committee_size;
     info!(slot, proposer_index, "Building block");
 
     let select_start = Instant::now();
@@ -100,6 +105,7 @@ pub(crate) fn build_block(
         parent_root,
         known_block_roots,
         aggregated_payloads,
+        heartbeat_committee_size,
         config.max_attestations_per_block,
     );
     metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
@@ -174,6 +180,7 @@ fn select_attestations(
     parent_root: H256,
     known_block_roots: &HashSet<H256>,
     aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    heartbeat_committee_size: u64,
     max_attestations_per_block: usize,
 ) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
     let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
@@ -192,11 +199,13 @@ fn select_attestations(
     extended_historical_block_hashes.push(parent_root);
     extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
 
+    let validator_count = head_state.validators.len();
     let chain = ChainContext {
         aggregated_payloads,
         known_block_roots,
         extended_historical_block_hashes: &extended_historical_block_hashes,
-        validator_count: head_state.validators.len(),
+        validator_count,
+        heartbeat: HeartbeatTier::for_block(slot, validator_count as u64, heartbeat_committee_size),
     };
 
     // Running per-target-root voter set, seeded from state and updated
@@ -204,6 +213,7 @@ fn select_attestations(
     // participation flags in Prysm/Lighthouse-style packing.
     let mut projected = ProjectedState::from_head_state(head_state);
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
+    let mut heartbeat_entries = 0usize;
 
     // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
     // (`on_block` rejects more), so the proposer-side limit never exceeds it.
@@ -227,8 +237,14 @@ fn select_attestations(
         extend_proofs_greedily(proofs, &mut selected, att_data);
 
         let target_root = att_data.target.root;
+        if score.tier == Tier::Heartbeat {
+            heartbeat_entries += 1;
+        }
+
         trace!(
             tier = ?score.tier,
+            effect = ?score.effect,
+            committee_voters = score.committee_voters,
             new_voters = score.new_voters,
             target_slot = score.target_slot,
             target_root = %ShortRoot(&target_root.0),
@@ -237,8 +253,12 @@ fn select_attestations(
             "selected"
         );
 
-        projected.advance(score.tier, att_data, new_voters);
+        projected.advance(score.effect, att_data, new_voters);
     }
+
+    // Cap-pressure signal: at MAX_ATTESTATIONS_DATA the committee votes are being
+    // truncated and `Tier::Finalize` is being starved of entry slots.
+    metrics::observe_heartbeat_entries_in_block(heartbeat_entries);
 
     selected
 }
@@ -275,9 +295,12 @@ fn pick_best_candidate(
             .iter()
             .flat_map(|proof| proof.participant_indices())
             .collect();
-        let Some((score, new_voters)) =
-            projected.score_entry(att_data, &coverage, chain.validator_count)
-        else {
+        let Some((score, new_voters)) = projected.score_entry_with_heartbeat(
+            att_data,
+            &coverage,
+            chain.validator_count,
+            Some(&chain.heartbeat),
+        ) else {
             trace_skipped_attestation("zero_new_voters", att_data, data_root);
             continue;
         };
@@ -300,6 +323,9 @@ struct ChainContext<'a> {
     known_block_roots: &'a HashSet<H256>,
     extended_historical_block_hashes: &'a [H256],
     validator_count: usize,
+    /// Committee context for [`Tier::Heartbeat`], derived from the block being
+    /// built rather than from the store clock.
+    heartbeat: HeartbeatTier,
 }
 
 /// Mutable projection of the post-state that a tiered greedy selector
@@ -337,7 +363,7 @@ impl ProjectedState {
     /// resulting per-target voter set is the same union either way.
     pub(crate) fn advance(
         &mut self,
-        tier: Tier,
+        effect: EntryEffect,
         att_data: &AttestationData,
         new_voters: impl IntoIterator<Item = u64>,
     ) {
@@ -349,7 +375,7 @@ impl ProjectedState {
 
         // Finalize implies Justify (target is justified, AND source is
         // finalized).
-        if tier <= Tier::Justify {
+        if effect <= EntryEffect::Justifies {
             justified_slots_ops::extend_to_slot(
                 &mut self.justified_slots,
                 self.finalized_slot,
@@ -364,7 +390,7 @@ impl ProjectedState {
             // scoring (no further entry can target it: filter rejects).
             self.current_votes.remove(&target_root);
         }
-        if tier == Tier::Finalize {
+        if effect == EntryEffect::Finalizes {
             let new_finalized = att_data.source.slot;
             let delta = new_finalized.saturating_sub(self.finalized_slot) as usize;
             justified_slots_ops::shift_window(&mut self.justified_slots, delta);
@@ -393,6 +419,28 @@ impl ProjectedState {
         coverage: &HashSet<u64>,
         validator_count: usize,
     ) -> Option<(EntryScore, HashSet<u64>)> {
+        self.score_entry_with_heartbeat(att_data, coverage, validator_count, None)
+    }
+
+    /// [`Self::score_entry`], plus the proposer-side heartbeat tier.
+    ///
+    /// When `heartbeat` is `Some` and the entry qualifies (its data slot is
+    /// exactly the committee slot and it covers at least one committee member),
+    /// the entry sorts into [`Tier::Heartbeat`] and the zero-new-voters drop is
+    /// bypassed. The drop is about *justification*, and a committee vote whose
+    /// signers are already justification-covered still has to reach other nodes'
+    /// heartbeat vote store via the body, so a positive `committee_voters` is
+    /// itself the positive score.
+    ///
+    /// The entry's consensus [`EntryEffect`] is computed identically either way:
+    /// the tier reorders packing, it never changes what applying the entry does.
+    pub(crate) fn score_entry_with_heartbeat(
+        &self,
+        att_data: &AttestationData,
+        coverage: &HashSet<u64>,
+        validator_count: usize,
+        heartbeat: Option<&HeartbeatTier>,
+    ) -> Option<(EntryScore, HashSet<u64>)> {
         let prior_voters = self.current_votes.get(&att_data.target.root);
         let prior_count = prior_voters.map_or(0, HashSet::len);
 
@@ -401,7 +449,12 @@ impl ProjectedState {
             .copied()
             .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
             .collect();
-        if new_voters.is_empty() {
+
+        let committee_voters = heartbeat
+            .filter(|hb| hb.covers(att_data))
+            .map_or(0, |hb| hb.count_members(coverage));
+
+        if new_voters.is_empty() && committee_voters == 0 {
             return None;
         }
 
@@ -419,16 +472,28 @@ impl ProjectedState {
             && (att_data.source.slot + 1..att_data.target.slot)
                 .all(|s| !slot_is_justifiable_after(s, self.finalized_slot));
 
-        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
-            Tier::Build
+        let effect = if is_genesis_self_vote(att_data) || !crosses_2_3 {
+            EntryEffect::Builds
         } else if finalizes {
-            Tier::Finalize
+            EntryEffect::Finalizes
         } else {
-            Tier::Justify
+            EntryEffect::Justifies
+        };
+
+        let tier = if committee_voters > 0 {
+            Tier::Heartbeat
+        } else {
+            match effect {
+                EntryEffect::Finalizes => Tier::Finalize,
+                EntryEffect::Justifies => Tier::Justify,
+                EntryEffect::Builds => Tier::Build,
+            }
         };
 
         let score = EntryScore {
             tier,
+            effect,
+            committee_voters,
             new_voters: new_voters.len(),
             target_slot: att_data.target.slot,
             att_slot: att_data.slot,
@@ -508,9 +573,22 @@ impl ProjectedState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub(crate) enum Tier {
-    /// Applying the entry crosses 2/3 on target AND finalizes the source
-    /// (no slot strictly between source.slot and target.slot is still
-    /// justifiable given projected finalized_slot).
+    /// Carries committee bits for exactly `block.slot - 1`: the view-merge
+    /// payload the next slot's fast head is computed from.
+    ///
+    /// Outranks everything, so arbitrary eviction of the view-merge payload in
+    /// favour of older aggregates — the fast head silently losing its evidence
+    /// for reasons that look like a network problem — cannot happen. The cost is
+    /// the mirror-image risk: a wide committee split can starve
+    /// [`Self::Finalize`] of entry slots and delay finality by a slot. That is a
+    /// bounded, self-clearing cost (the split resolves, the tier empties) against
+    /// an unbounded one, which is why the ordering is this way round.
+    ///
+    /// Classification is proposer-side only. No validity rule reads it, so a
+    /// proposer with a stale committee size builds a worse block, not an invalid
+    /// one — the one place where committee-membership disagreement is harmless.
+    Heartbeat = 0,
+    /// Applying the entry crosses 2/3 on target AND finalizes the source.
     Finalize = 1,
     /// Applying the entry crosses 2/3 on target but does not finalize.
     Justify = 2,
@@ -518,13 +596,92 @@ pub(crate) enum Tier {
     Build = 3,
 }
 
+/// What applying an entry does to the projected post-state.
+///
+/// Split from [`Tier`] because [`Tier::Heartbeat`] reorders packing without
+/// having any consensus effect of its own: a heartbeat entry may well be a plain
+/// [`Self::Builds`] entry. Keying [`ProjectedState::advance`] off the sort tier
+/// would let a heartbeat entry that never crosses 2/3 mark its target justified
+/// in the projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum EntryEffect {
+    /// Crosses 2/3 on target and finalizes the source.
+    Finalizes = 0,
+    /// Crosses 2/3 on target without finalizing.
+    Justifies = 1,
+    /// Adds marginal voters only.
+    Builds = 2,
+}
+
+/// Committee context for the proposer's heartbeat tier.
+///
+/// Built from the block *being built*, never from the clock: `propose_block`
+/// advances the store to the next slot's interval 0 before building, so a builder
+/// reading "current slot" from `store.time()` mid-build sees `S+1` and would gate
+/// on an empty set — a silently empty payload with no error anywhere.
+pub(crate) struct HeartbeatTier {
+    /// Exactly `block.slot - 1`. `None` for a block at slot 0.
+    cttee_slot: Option<u64>,
+    num_validators: u64,
+    committee_size: u64,
+}
+
+impl HeartbeatTier {
+    pub(crate) fn for_block(block_slot: u64, num_validators: u64, committee_size: u64) -> Self {
+        Self {
+            cttee_slot: block_slot.checked_sub(1),
+            num_validators,
+            committee_size,
+        }
+    }
+
+    /// Whether this entry is in the tier's slot: `data.slot == block.slot - 1`,
+    /// strictly. No window and no fallback on a skipped slot, so this is an exact
+    /// mirror of `store::extract_heartbeat_votes`'s gate — whatever the builder
+    /// puts in the tier is exactly what import reads back out.
+    fn covers(&self, att_data: &AttestationData) -> bool {
+        self.cttee_slot == Some(att_data.slot)
+    }
+
+    /// Committee members within `coverage`.
+    ///
+    /// Committee members only: a non-committee signer contributes nothing to the
+    /// tier ordering, because non-committee bits are invisible to the fast head.
+    /// Nothing is lost by ignoring them here — they still count via `new_voters`
+    /// lower in the same ordering key, and via the other tiers for every other
+    /// purpose.
+    fn count_members(&self, coverage: &HashSet<u64>) -> usize {
+        let Some(cttee_slot) = self.cttee_slot else {
+            return 0;
+        };
+        coverage
+            .iter()
+            .filter(|vid| {
+                is_heartbeat_committee_member(
+                    **vid,
+                    cttee_slot,
+                    self.num_validators,
+                    self.committee_size,
+                )
+            })
+            .count()
+    }
+}
+
 /// Tiered score for a candidate `AttestationData` entry during block building.
 ///
-/// Lower `tier` wins. Entries with zero new voters relative to the running
-/// per-target-root voter set are dropped (returned as `None`).
+/// Lower `tier` wins. Entries that add no new voters relative to the running
+/// per-target-root voter set are dropped (returned as `None`) — except in
+/// [`Tier::Heartbeat`], where positive committee coverage is itself the score.
 ///
 /// The within-tier ordering is tier-dependent (leanSpec PR #1149):
 ///
+/// - **Heartbeat**: committee coverage leads, then newer target, then
+///   `new_voters` (which is where non-committee bits get their say). Under cap
+///   pressure the rounds that survive are the highest-coverage ones, so the fast
+///   head keeps the votes carrying the most tie-breaking weight and loses only
+///   the thinnest fragments.
 /// - **Finalize / Justify**: the entry already crosses 2/3 on its target, so
 ///   newer chain progress leads: larger `target_slot`, then larger `att_slot`,
 ///   then more `new_voters`. Pushing the justified slot as far forward as
@@ -533,10 +690,15 @@ pub(crate) enum Tier {
 ///   coverage leads: more `new_voters`, then larger `target_slot`, then larger
 ///   `att_slot`.
 ///
-/// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
+/// In every tier `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryScore {
     pub(crate) tier: Tier,
+    /// What applying the entry does to the projection, independent of `tier`.
+    pub(crate) effect: EntryEffect,
+    /// Committee members covered, counted only when the entry is in the
+    /// heartbeat tier's slot. Zero for every non-heartbeat entry.
+    pub(crate) committee_voters: usize,
     pub(crate) new_voters: usize,
     /// Read only inside [`EntryScore::ordering_key`]; kept private.
     target_slot: u64,
@@ -555,9 +717,17 @@ impl EntryScore {
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
     pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
         let more_new_voters = Reverse(self.new_voters as u64);
+        let more_committee_voters = Reverse(self.committee_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
         match self.tier {
+            Tier::Heartbeat => (
+                self.tier,
+                more_committee_voters,
+                newer_target,
+                more_new_voters,
+                data_root,
+            ),
             Tier::Build => (
                 self.tier,
                 more_new_voters,
@@ -890,6 +1060,7 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::constants::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{ByteList512KiB, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
@@ -913,6 +1084,386 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         bits
+    }
+
+    // ============ Tier::Heartbeat Tests ============
+
+    /// `n = 8, K = 4`, so the committee for slot `s` is `{s%8, .., s%8+3}`.
+    /// At the committee slot 7 used below that is `{7, 0, 1, 2}`.
+    const HB_VALIDATORS: u64 = 8;
+    const HB_COMMITTEE: u64 = 4;
+    /// Block slot 8, so the committee slot is 7.
+    const HB_BLOCK_SLOT: u64 = 8;
+
+    fn hb_tier() -> HeartbeatTier {
+        HeartbeatTier::for_block(HB_BLOCK_SLOT, HB_VALIDATORS, HB_COMMITTEE)
+    }
+
+    fn empty_projection() -> ProjectedState {
+        ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+        }
+    }
+
+    fn score(
+        tier: Tier,
+        committee_voters: usize,
+        new_voters: usize,
+        target_slot: u64,
+    ) -> EntryScore {
+        EntryScore {
+            tier,
+            effect: EntryEffect::Builds,
+            committee_voters,
+            new_voters,
+            target_slot,
+            att_slot: 0,
+        }
+    }
+
+    #[test]
+    fn heartbeat_tier_outranks_every_other_tier() {
+        let root = H256([0u8; 32]);
+        let heartbeat = score(Tier::Heartbeat, 1, 1, 0).ordering_key(root);
+        for other in [Tier::Finalize, Tier::Justify, Tier::Build] {
+            // A maximally attractive entry in another tier still loses: nothing
+            // outranks the view-merge payload.
+            let rival = score(other, 0, usize::MAX, u64::MAX).ordering_key(root);
+            assert!(
+                heartbeat < rival,
+                "Tier::Heartbeat must outrank {other:?}, so the payload is never evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_tier_orders_by_committee_coverage_first() {
+        let root = H256([0u8; 32]);
+        // Thicker committee coverage wins even against a much newer target.
+        let thick = score(Tier::Heartbeat, 4, 0, 1).ordering_key(root);
+        let thin = score(Tier::Heartbeat, 3, 0, 999).ordering_key(root);
+        assert!(thick < thin);
+    }
+
+    #[test]
+    fn heartbeat_tier_falls_through_to_target_then_new_voters() {
+        let root = H256([0u8; 32]);
+        // Equal committee coverage: newer target leads.
+        assert!(
+            score(Tier::Heartbeat, 4, 0, 9).ordering_key(root)
+                < score(Tier::Heartbeat, 4, 0, 8).ordering_key(root)
+        );
+        // Equal coverage and target: non-committee bits get their say here.
+        assert!(
+            score(Tier::Heartbeat, 4, 10, 9).ordering_key(root)
+                < score(Tier::Heartbeat, 4, 2, 9).ordering_key(root)
+        );
+        // Fully equal: deterministic tiebreak on data_root, ascending.
+        let low = score(Tier::Heartbeat, 4, 2, 9).ordering_key(H256([1u8; 32]));
+        let high = score(Tier::Heartbeat, 4, 2, 9).ordering_key(H256([2u8; 32]));
+        assert!(low < high);
+    }
+
+    #[test]
+    fn heartbeat_coverage_counts_committee_members_only() {
+        let projected = empty_projection();
+        let tier = hb_tier();
+        let data = make_att_data(HB_BLOCK_SLOT - 1);
+
+        // Committee at slot 7 is {7, 0, 1, 2}. Three members plus two outsiders.
+        let three_members: HashSet<u64> = HashSet::from([7, 0, 1, 3, 4]);
+        let (three, _) = projected
+            .score_entry_with_heartbeat(&data, &three_members, HB_VALIDATORS as usize, Some(&tier))
+            .expect("covers committee members");
+        assert_eq!(three.committee_voters, 3, "outsiders must not be counted");
+
+        // Four members and no outsiders at all.
+        let four_members: HashSet<u64> = HashSet::from([7, 0, 1, 2]);
+        let (four, _) = projected
+            .score_entry_with_heartbeat(&data, &four_members, HB_VALIDATORS as usize, Some(&tier))
+            .expect("covers committee members");
+        assert_eq!(four.committee_voters, 4);
+
+        // And the thicker committee coverage wins despite fewer total voters.
+        let root = H256([0u8; 32]);
+        assert!(four.ordering_key(root) < three.ordering_key(root));
+    }
+
+    #[test]
+    fn heartbeat_tier_gate_is_strictly_the_previous_slot() {
+        let projected = empty_projection();
+        let tier = hb_tier();
+        let coverage: HashSet<u64> = HashSet::from([7, 0, 1, 2]);
+
+        // Exactly block.slot - 1 enters the tier.
+        let (on_slot, _) = projected
+            .score_entry_with_heartbeat(
+                &make_att_data(HB_BLOCK_SLOT - 1),
+                &coverage,
+                HB_VALIDATORS as usize,
+                Some(&tier),
+            )
+            .unwrap();
+        assert_eq!(on_slot.tier, Tier::Heartbeat);
+
+        // block.slot - 2 does not, even though its signers are committee members
+        // for *that* slot too. No window, no fallback: this mirrors
+        // `store::extract_heartbeat_votes` exactly.
+        let (two_back, _) = projected
+            .score_entry_with_heartbeat(
+                &make_att_data(HB_BLOCK_SLOT - 2),
+                &coverage,
+                HB_VALIDATORS as usize,
+                Some(&tier),
+            )
+            .unwrap();
+        assert_ne!(two_back.tier, Tier::Heartbeat);
+        assert_eq!(two_back.committee_voters, 0);
+
+        // A block at the block's own slot is not the previous slot either.
+        let (same_slot, _) = projected
+            .score_entry_with_heartbeat(
+                &make_att_data(HB_BLOCK_SLOT),
+                &coverage,
+                HB_VALIDATORS as usize,
+                Some(&tier),
+            )
+            .unwrap();
+        assert_ne!(same_slot.tier, Tier::Heartbeat);
+    }
+
+    #[test]
+    fn heartbeat_tier_gate_derives_from_the_block_not_the_clock() {
+        // `propose_block` advances the store to the next slot's interval 0 before
+        // building, so a gate read from `store.time()` would see S+1 and match
+        // nothing. `HeartbeatTier` only ever sees the block slot, and this pins
+        // that: building block T gates on T-1 for every T.
+        for block_slot in 1..12u64 {
+            let tier = HeartbeatTier::for_block(block_slot, HB_VALIDATORS, HB_COMMITTEE);
+            assert!(tier.covers(&make_att_data(block_slot - 1)));
+            assert!(!tier.covers(&make_att_data(block_slot)));
+        }
+        // Slot 0 has no predecessor committee and must not panic.
+        let genesis_tier = HeartbeatTier::for_block(0, HB_VALIDATORS, HB_COMMITTEE);
+        assert!(!genesis_tier.covers(&make_att_data(0)));
+        assert_eq!(genesis_tier.count_members(&HashSet::from([0, 1])), 0);
+    }
+
+    #[test]
+    fn heartbeat_tier_bypasses_the_zero_new_voters_drop() {
+        let data = make_att_data(HB_BLOCK_SLOT - 1);
+        let coverage: HashSet<u64> = HashSet::from([7, 0, 1, 2]);
+
+        // Every signer is already justification-covered for this target root.
+        let mut current_votes = HashMap::new();
+        current_votes.insert(data.target.root, coverage.clone());
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes,
+        };
+
+        // Without the heartbeat tier the entry has no marginal justification value
+        // and is dropped.
+        assert!(
+            projected
+                .score_entry(&data, &coverage, HB_VALIDATORS as usize)
+                .is_none(),
+            "the zero-new-voters drop should still apply outside the tier"
+        );
+
+        // With it, positive committee coverage is itself the score: the vote has to
+        // reach other nodes' heartbeat store via the body regardless of whether it
+        // adds anything to justification. This is the regression that would
+        // silently empty view-merge while every other test stayed green.
+        let (score, new_voters) = projected
+            .score_entry_with_heartbeat(&data, &coverage, HB_VALIDATORS as usize, Some(&hb_tier()))
+            .expect("heartbeat entries bypass the drop");
+        assert_eq!(score.tier, Tier::Heartbeat);
+        assert_eq!(score.committee_voters, 4);
+        assert!(new_voters.is_empty(), "genuinely adds no new voters");
+    }
+
+    #[test]
+    fn heartbeat_tier_does_not_justify_the_projection_by_itself() {
+        // `Tier::Heartbeat = 0` sorts below `Tier::Justify`, so keying `advance`
+        // off the sort tier would let a thin committee vote mark its target
+        // justified. `EntryEffect` is what `advance` reads, and it is computed
+        // independently of the tier.
+        //
+        // Target slot 5 against finalized slot 0, so "is the target justified" is
+        // a real question — slot 0 would be trivially justified as the finalized
+        // slot itself.
+        let data = AttestationData {
+            slot: HB_BLOCK_SLOT - 1,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                slot: 5,
+                root: H256([5u8; 32]),
+            },
+            source: Checkpoint::default(),
+        };
+        // One of eight validators: nowhere near 2/3.
+        let coverage: HashSet<u64> = HashSet::from([7]);
+
+        let (score, new_voters) = empty_projection()
+            .score_entry_with_heartbeat(&data, &coverage, HB_VALIDATORS as usize, Some(&hb_tier()))
+            .unwrap();
+        assert_eq!(score.tier, Tier::Heartbeat);
+        assert_eq!(
+            score.effect,
+            EntryEffect::Builds,
+            "a thin committee vote justifies nothing"
+        );
+
+        let mut advanced = empty_projection();
+        advanced.advance(score.effect, &data, new_voters);
+        assert!(
+            !justified_slots_ops::is_slot_justified(
+                &advanced.justified_slots,
+                advanced.finalized_slot,
+                data.target.slot,
+            )
+            // Same reading as the packer's pre-filter: a slot the projection
+            // window does not track is not justified yet.
+            .unwrap_or(false),
+            "a heartbeat entry must not justify its target on tier alone"
+        );
+
+        // Contrast: the same entry carrying a real justifying effect does advance
+        // the projection, so the assertion above is about the effect and not about
+        // `advance` being inert.
+        let mut justified = empty_projection();
+        justified.advance(EntryEffect::Justifies, &data, HashSet::from([7]));
+        assert!(
+            justified_slots_ops::is_slot_justified(
+                &justified.justified_slots,
+                justified.finalized_slot,
+                data.target.slot,
+            )
+            .unwrap_or(false)
+        );
+    }
+
+    /// Under cap pressure the surviving heartbeat entries must be the
+    /// *highest-coverage* ones, not an arbitrary subset. That is what turns risk 5
+    /// from "the fast head silently loses its evidence" into "the fast head loses
+    /// the thinnest fragments": the assertion is on *which* entries survive, not
+    /// just how many.
+    #[test]
+    fn select_attestations_under_cap_keeps_the_thickest_committee_coverage() {
+        use ethlambda_types::{
+            block::BlockHeader,
+            state::{ChainConfig, JustificationValidators, JustifiedSlots, Validator},
+        };
+        use libssz_types::SszList;
+
+        // n = 8, K = 4, block slot 8 -> committee slot 7 -> committee {7, 0, 1, 2}.
+        const NUM_VALIDATORS: usize = 8;
+        const HEAD_SLOT: u64 = 7;
+        const BLOCK_SLOT: u64 = 8;
+        const LIMIT: usize = 2;
+
+        let validators: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|i| Validator {
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
+                index: i as u64,
+            })
+            .collect();
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let head_header = BlockHeader {
+            slot: HEAD_SLOT,
+            proposer_index: 0,
+            parent_root: H256::ZERO,
+            state_root: H256::ZERO,
+            body_root: BlockBody::default().hash_tree_root(),
+        };
+        let head_state = State {
+            config: ChainConfig { genesis_time: 1000 },
+            slot: HEAD_SLOT,
+            latest_block_header: head_header,
+            latest_justified: Checkpoint::default(),
+            latest_finalized: Checkpoint::default(),
+            historical_block_hashes: SszList::try_from(hashes.clone()).unwrap(),
+            justified_slots: JustifiedSlots::new(),
+            validators: SszList::try_from(validators).unwrap(),
+            justifications_roots: Default::default(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        let mut header_for_root = head_state.latest_block_header.clone();
+        header_for_root.state_root = head_state.hash_tree_root();
+        let parent_root = header_for_root.hash_tree_root();
+
+        // Source == target == slot 0 makes each entry a genesis self-vote, which is
+        // exempt from the already-justified filter; varying `head` across chain
+        // slots is what makes the four datas distinct while all staying on the
+        // committee slot.
+        let anchor = Checkpoint {
+            root: hashes[0],
+            slot: 0,
+        };
+        let mut known_block_roots = HashSet::new();
+        known_block_roots.insert(parent_root);
+
+        // Committee subsets of decreasing size, each with a distinct `head`.
+        let cohorts: [&[usize]; 4] = [&[7, 0, 1, 2], &[7, 0, 1], &[7, 0], &[7]];
+        let mut aggregated_payloads: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> =
+            HashMap::new();
+        let mut expected_by_coverage: Vec<(usize, H256)> = Vec::new();
+
+        for (i, signers) in cohorts.iter().enumerate() {
+            let head = Checkpoint {
+                root: hashes[i],
+                slot: i as u64,
+            };
+            known_block_roots.insert(head.root);
+            let att_data = AttestationData {
+                slot: HEAD_SLOT,
+                head,
+                target: anchor,
+                source: anchor,
+            };
+            let data_root = att_data.hash_tree_root();
+            let proof_data = SszList::try_from(vec![0xABu8; 8]).expect("proof fits");
+            let proof = SingleMessageAggregate::new(make_bits(signers), proof_data);
+            aggregated_payloads.insert(data_root, (att_data, vec![proof]));
+            expected_by_coverage.push((signers.len(), data_root));
+        }
+
+        let selected = select_attestations(
+            &head_state,
+            BLOCK_SLOT,
+            parent_root,
+            &known_block_roots,
+            &aggregated_payloads,
+            HB_COMMITTEE,
+            LIMIT,
+        );
+
+        let picked: HashSet<H256> = selected
+            .iter()
+            .map(|(att, _)| att.data.hash_tree_root())
+            .collect();
+        assert_eq!(picked.len(), LIMIT, "the limit should bind");
+
+        expected_by_coverage.sort_by_key(|(coverage, _)| std::cmp::Reverse(*coverage));
+        for (coverage, data_root) in &expected_by_coverage[..LIMIT] {
+            assert!(
+                picked.contains(data_root),
+                "entry with {coverage} committee members should survive the cap"
+            );
+        }
+        for (coverage, data_root) in &expected_by_coverage[LIMIT..] {
+            assert!(
+                !picked.contains(data_root),
+                "entry with only {coverage} committee members should be dropped first"
+            );
+        }
     }
 
     /// Regression (leanSpec #802): a supermajority entry whose source sits at
@@ -1088,6 +1639,7 @@ mod tests {
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -1234,6 +1786,7 @@ mod tests {
                 ProposerConfig {
                     enable_proposer_aggregation: false,
                     max_attestations_per_block: limit,
+                    heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
                 },
             )
             .expect("build_block should succeed")
@@ -1360,6 +1913,7 @@ mod tests {
             ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -1666,6 +2220,7 @@ mod tests {
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");
@@ -1802,6 +2357,7 @@ mod tests {
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+                heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             },
         )
         .expect("build_block should succeed");

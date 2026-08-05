@@ -431,8 +431,12 @@ static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
         register_histogram!(
             "lean_tick_interval_duration_seconds",
             "Elapsed time between clock ticks in seconds",
+            // Clustered tightly just above the interval width so ordinary jitter
+            // is still resolvable: the old buckets were centred on 0.8 s and
+            // would collapse every healthy sample into one bucket now that an
+            // interval is 1000 ms.
             vec![
-                0.4, 0.6, 0.75, 0.8, 0.805, 0.81, 0.815, 0.82, 0.825, 0.85, 0.9, 1.0, 1.2, 1.6
+                0.5, 0.75, 0.9, 1.0, 1.005, 1.01, 1.015, 1.02, 1.025, 1.05, 1.1, 1.25, 1.5, 2.0
             ]
         )
         .unwrap()
@@ -690,8 +694,9 @@ pub fn observe_gossip_attestation_arrival(arrival_ms: u64, genesis_ms: u64, data
 }
 
 /// Observe a gossip aggregate's arrival against the most recent
-/// [`crate::SlotInterval::Aggregation`] boundary at or before `arrival_ms`.
-/// Zero point: that boundary — not the aggregate's own `data.slot`.
+/// [`crate::SlotInterval::SafeTargetUpdate`] boundary at or before `arrival_ms`:
+/// the interval-2 boundary aggregation sessions are anchored to.
+/// Zero point: that boundary, not the aggregate's own `data.slot`.
 ///
 /// Deliberately takes no slot argument. An aggregate published at interval 2
 /// of slot N can carry `data.slot < N` (the stale-group catch-up path in
@@ -699,8 +704,11 @@ pub fn observe_gossip_attestation_arrival(arrival_ms: u64, genesis_ms: u64, data
 /// with large values that are not a health problem. Assuming the latest
 /// aggregation interval bounds the value to one slot.
 pub fn observe_gossip_aggregation_arrival(arrival_ms: u64, genesis_ms: u64) {
-    let delta_ms =
-        latest_interval_delta_ms(arrival_ms, genesis_ms, crate::SlotInterval::Aggregation);
+    let delta_ms = latest_interval_delta_ms(
+        arrival_ms,
+        genesis_ms,
+        crate::SlotInterval::SafeTargetUpdate,
+    );
     LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS
         .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
     LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL
@@ -911,6 +919,166 @@ pub fn update_validators_count(count: u64) {
 
 pub fn update_safe_target_slot(slot: u64) {
     LEAN_SAFE_TARGET_SLOT.set(slot.try_into().unwrap());
+}
+
+// --- Heartbeat / two-tier fork choice ---
+
+/// Set the lagging-head gauge: the RLMD-window tree base.
+///
+/// A frozen lagging head under a moving fast head is the RLMD-window failure
+/// signature, so this is the panel to pair with `lean_fast_head_slot`.
+pub fn update_lagging_head_slot(slot: u64) {
+    static LEAN_LAGGING_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_lagging_head_slot",
+            "Lagging head slot (RLMD window base)"
+        )
+        .unwrap()
+    });
+    LEAN_LAGGING_HEAD_SLOT.set(slot.try_into().unwrap());
+}
+
+/// Effective committee size `K' = min(K, n)`, so a config disagreement across a
+/// network is visible without reading configs.
+pub fn update_heartbeat_committee_size(size: u64) {
+    static LEAN_HEARTBEAT_COMMITTEE_SIZE: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_heartbeat_committee_size",
+                "Effective heartbeat committee size (min of configured size and validator count)"
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_COMMITTEE_SIZE.set(size.try_into().unwrap());
+}
+
+/// Distinct committee voters seen for a slot. Read against `ceil(3K'/4)` this is
+/// the safe-target stall predictor.
+pub fn update_heartbeat_committee_participation(voters: u64) {
+    static LEAN_HEARTBEAT_COMMITTEE_PARTICIPATION: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_heartbeat_committee_participation",
+                "Distinct committee voters holding a heartbeat vote for the last slot"
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_COMMITTEE_PARTICIPATION.set(voters.try_into().unwrap());
+}
+
+/// Count a heartbeat vote by where it came from.
+///
+/// Paired with `lean_fast_head_window_slots` this tells you whether view-merge is
+/// actually merging: `source="gossip"` winning means gossip beat the block.
+pub fn inc_heartbeat_votes_received(source: HeartbeatVoteSource) {
+    static LEAN_HEARTBEAT_VOTES_RECEIVED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_heartbeat_votes_received_total",
+                "Heartbeat votes recorded, by source",
+                &["source"]
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_VOTES_RECEIVED_TOTAL
+        .with_label_values(&[source.as_str()])
+        .inc();
+}
+
+/// Where a heartbeat vote entered the store.
+#[derive(Clone, Copy, Debug)]
+pub enum HeartbeatVoteSource {
+    /// The global heartbeat gossip topic, in-slot.
+    Gossip,
+    /// Extracted from an imported block's body.
+    Block,
+}
+
+impl HeartbeatVoteSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gossip => "gossip",
+            Self::Block => "block",
+        }
+    }
+}
+
+/// Committee bits found in a block's slot-`S-1` entries. Recovers the
+/// observability a dedicated body field would have given.
+pub fn observe_heartbeat_votes_in_block(votes: usize) {
+    static LEAN_HEARTBEAT_VOTES_IN_BLOCK: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_heartbeat_votes_in_block",
+                "Committee bits extracted from an imported block",
+                vec![0.0, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0]
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_VOTES_IN_BLOCK.observe(votes as f64);
+}
+
+/// Distinct `Tier::Heartbeat` entries packed into a block.
+///
+/// The cap-pressure signal: at `MAX_ATTESTATIONS_DATA` committee votes are being
+/// truncated and `Tier::Finalize` is being starved of entry slots. Note it is the
+/// *entry* count that matters here, not the bit count.
+pub fn observe_heartbeat_entries_in_block(entries: usize) {
+    static LEAN_HEARTBEAT_ENTRIES_IN_BLOCK: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_heartbeat_entries_in_block",
+                "Distinct heartbeat-tier attestation entries packed into a block",
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_ENTRIES_IN_BLOCK.observe(entries as f64);
+}
+
+/// How far the fast head's expanding fallback had to walk back. Greater than 1
+/// means slots were missed.
+pub fn observe_fast_head_window_slots(slots: u64) {
+    static LEAN_FAST_HEAD_WINDOW_SLOTS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_fast_head_window_slots",
+                "Slots the fast head's expanding vote window had to walk back",
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0]
+            )
+            .unwrap()
+        });
+    LEAN_FAST_HEAD_WINDOW_SLOTS.observe(slots as f64);
+}
+
+/// `aggregate_mixed` cost inside the heartbeat fold, kept separate from the
+/// committee session's timing. This is what tells you whether a chosen `K` still
+/// fits inside interval 1.
+pub fn time_heartbeat_fold() -> TimingGuard {
+    static LEAN_HEARTBEAT_FOLD_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_heartbeat_fold_time_seconds",
+                "Time spent folding raw heartbeat signatures into a type-1 aggregate",
+                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+            )
+            .unwrap()
+        });
+    TimingGuard::new(&LEAN_HEARTBEAT_FOLD_TIME_SECONDS)
+}
+
+/// Count a fold that was skipped because every buffered signer was already
+/// covered by an existing type-1 (`B \ A` empty) — the free path.
+pub fn inc_heartbeat_fold_skipped() {
+    static LEAN_HEARTBEAT_FOLD_SKIPPED_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_heartbeat_fold_skipped_total",
+                "Heartbeat folds skipped because no signer was uncovered"
+            )
+            .unwrap()
+        });
+    LEAN_HEARTBEAT_FOLD_SKIPPED_TOTAL.inc();
 }
 
 pub fn set_node_info(name: &str, version: &str) {

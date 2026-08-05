@@ -213,9 +213,21 @@ async fn main() -> eyre::Result<()> {
         .filter(|url| !url.is_empty())
         .collect();
 
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+    let mut store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
         .await
         .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+
+    // Adopt the genesis config's HEARTBEAT_COMMITTEE_SIZE on first boot only; a
+    // persisted value wins thereafter, because committee membership decides which
+    // bits of an imported block count as heartbeat votes and a restart must not
+    // change that silently. A mismatch is warned about, not applied.
+    store
+        .reconcile_heartbeat_committee_size(genesis_config.heartbeat_committee_size)
+        .inspect_err(|err| error!(%err, "Failed to persist heartbeat committee size"))?;
+    info!(
+        heartbeat_committee_size = store.heartbeat_committee_size(),
+        "Heartbeat committee configured"
+    );
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -258,6 +270,9 @@ async fn main() -> eyre::Result<()> {
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
+            // Read once here rather than per build: the persisted value is
+            // authoritative from first boot and cannot change at runtime.
+            heartbeat_committee_size: store.heartbeat_committee_size(),
         },
     };
 
@@ -771,6 +786,7 @@ async fn fetch_initial_state(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
@@ -897,6 +913,7 @@ validators:
     fn test_genesis(genesis_time: u64) -> GenesisConfig {
         GenesisConfig {
             genesis_time,
+            heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             genesis_validators: vec![GenesisValidatorEntry {
                 attestation_pubkey: [1u8; PUBLIC_KEY_SIZE],
                 proposal_pubkey: [2u8; PUBLIC_KEY_SIZE],

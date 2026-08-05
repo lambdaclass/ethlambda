@@ -48,19 +48,26 @@ The handler emits a fixed, compact body (no whitespace):
 
 ### `GET /lean/v0/config/spec`
 
-Protocol constants the node was built with. Keys mirror the leanSpec constant names:
+Protocol constants the node runs with. Keys mirror the leanSpec constant names:
 
 ```json
 {
   "MILLISECONDS_PER_SLOT": 4000,
-  "INTERVALS_PER_SLOT": 5,
-  "MILLISECONDS_PER_INTERVAL": 800,
+  "INTERVALS_PER_SLOT": 4,
+  "MILLISECONDS_PER_INTERVAL": 1000,
   "HISTORICAL_ROOTS_LIMIT": 262144,
+  "HEARTBEAT_COMMITTEE_SIZE": 16,
   "FORK_DIGEST": "12345678"
 }
 ```
 
 `FORK_DIGEST` is the 4-byte hex string (no `0x` prefix) embedded in gossipsub topic names.
+
+`HEARTBEAT_COMMITTEE_SIZE` is the network's configured `K`, read from the persisted
+store rather than from the config file on disk — the value is adopted once at first
+boot and a later config edit is warned about, not applied. It is served here because
+a mismatched `K` across a network is a fork-choice divergence that produces no
+error, only disagreement, so this endpoint is how you check for agreement.
 
 ### `GET /lean/v0/genesis`
 

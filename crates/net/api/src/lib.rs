@@ -13,6 +13,10 @@ use spawned_concurrency::protocol;
 pub trait BlockChainToP2P: Send + Sync {
     fn publish_block(&self, block: SignedBlock) -> Result<(), ActorError>;
     fn publish_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    fn publish_heartbeat_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<(), ActorError>;
     fn publish_aggregated_attestation(
         &self,
         attestation: SignedAggregatedAttestation,
@@ -39,6 +43,13 @@ pub enum BlockSource {
 pub trait P2PToBlockChain: Send + Sync {
     fn new_block(&self, block: SignedBlock, source: BlockSource) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
+    /// A vote received on the global heartbeat topic.
+    ///
+    /// Separate from [`Self::new_attestation`] because heartbeat votes take a
+    /// different admission path: committee membership and an in-slot recency
+    /// check on top of the usual validation, and unconditional storage of both
+    /// the vote and its raw signature regardless of the aggregator role.
+    fn new_heartbeat_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
         &self,
         attestation: SignedAggregatedAttestation,

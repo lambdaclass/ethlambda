@@ -14,6 +14,7 @@ use ethlambda_types::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
+    constants::{DEFAULT_HEARTBEAT_COMMITTEE_SIZE, INTERVALS_PER_SLOT, RLMD_LOOKBACK_LIMIT},
     genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
     state::{ChainConfig, State, anchor_pair_is_consistent},
@@ -22,7 +23,7 @@ use libssz::{SszDecode, SszEncode};
 
 use crate::state_diff::StateDiff;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -85,6 +86,20 @@ const KEY_CONFIG: &[u8] = b"config";
 const KEY_HEAD: &[u8] = b"head";
 /// Key for "safe_target" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
 const KEY_SAFE_TARGET: &[u8] = b"safe_target";
+/// Key for "lagging_head" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
+///
+/// The RLMD-window head that the fast head is computed on top of. Persisted
+/// alongside `safe_target` so a restart starts from a real tree base rather than
+/// from the justified checkpoint.
+const KEY_LAGGING_HEAD: &[u8] = b"lagging_head";
+/// Key for the network's heartbeat committee size. Its value has type [`u64`] and
+/// it's SSZ-encoded.
+///
+/// Seeded from the genesis config at first boot and thereafter authoritative: a
+/// restart must not silently adopt a different `K` from an edited config file,
+/// because committee membership decides which bits of an imported block are
+/// heartbeat votes.
+const KEY_HEARTBEAT_COMMITTEE_SIZE: &[u8] = b"heartbeat_committee_size";
 /// Key for "latest_justified" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
 /// Key for "latest_finalized" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
@@ -127,6 +142,15 @@ const NEW_PAYLOAD_CAP: usize = 64;
 /// With 4 validators and 4-second slots, 2048 signatures covers ~512 slots (~34 min).
 /// Each XMSS signature is ~3KB, so worst-case memory is ~6 MB.
 const GOSSIP_SIGNATURE_CAP: usize = 2048;
+
+/// Hard cap for the heartbeat signature buffer, in individual signatures.
+///
+/// Sized against what the heartbeat fold can ever consume: at most one committee
+/// per slot within the retention window, so `RLMD_LOOKBACK_LIMIT *
+/// MAX_HEARTBEAT_COMMITTEE_SIZE` bounds it even at the largest configurable
+/// committee. Slot-scoped pruning does the real work; this only bounds a
+/// pathological flood of distinct `AttestationData` before pruning next runs.
+const HEARTBEAT_SIGNATURE_CAP: usize = 1024;
 
 /// An entry in the payload buffer: attestation data + set of proofs.
 #[derive(Clone)]
@@ -513,6 +537,78 @@ impl GossipSignatureBuffer {
     }
 }
 
+/// Raw heartbeat XMSS signatures awaiting the proposer's fold, keyed by slot then
+/// `data_root` then validator.
+///
+/// Separate from [`GossipSignatureBuffer`] on purpose: these are stored by every
+/// node (not just aggregators), they are keyed by slot so pruning is a window
+/// operation rather than a scan, and they are consumed by the heartbeat fold
+/// session rather than by committee aggregation.
+#[derive(Default)]
+struct HeartbeatSignatureBuffer {
+    /// slot -> data_root -> validator -> signature. `BTreeMap` on the validator
+    /// level because XMSS aggregation requires ascending signer order.
+    by_slot: BTreeMap<u64, HashMap<H256, BTreeMap<u64, ValidatorSignature>>>,
+    total_signatures: usize,
+}
+
+impl HeartbeatSignatureBuffer {
+    /// Insert one raw heartbeat signature. Last-write-wins per
+    /// `(slot, data_root, validator)`.
+    fn insert(
+        &mut self,
+        slot: u64,
+        data_root: H256,
+        validator_id: u64,
+        signature: ValidatorSignature,
+    ) {
+        let is_new = self
+            .by_slot
+            .entry(slot)
+            .or_default()
+            .entry(data_root)
+            .or_default()
+            .insert(validator_id, signature)
+            .is_none();
+        if is_new {
+            self.total_signatures += 1;
+        }
+        // Bound a pathological flood of distinct data by dropping whole oldest
+        // slots: the fold only ever reads the current slot, so the oldest slot is
+        // always the least useful thing to evict.
+        while self.total_signatures > HEARTBEAT_SIGNATURE_CAP {
+            let Some((&oldest, _)) = self.by_slot.iter().next() else {
+                break;
+            };
+            self.remove_slot(oldest);
+        }
+    }
+
+    fn remove_slot(&mut self, slot: u64) {
+        if let Some(by_root) = self.by_slot.remove(&slot) {
+            self.total_signatures -= by_root.values().map(BTreeMap::len).sum::<usize>();
+        }
+    }
+
+    /// All buffered signatures for `slot`, grouped by `data_root`.
+    fn at_slot(&self, slot: u64) -> HashMap<H256, BTreeMap<u64, ValidatorSignature>> {
+        self.by_slot.get(&slot).cloned().unwrap_or_default()
+    }
+
+    /// Drop every slot strictly below `retain_from`. Returns slots pruned.
+    fn prune_below(&mut self, retain_from: u64) -> usize {
+        let stale: Vec<u64> = self
+            .by_slot
+            .range(..retain_from)
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in &stale {
+            self.remove_slot(*slot);
+        }
+        stale.len()
+    }
+}
+
 /// Encode a LiveChain key (slot, root) to bytes.
 /// Layout: slot (8 bytes big-endian) || root (32 bytes)
 /// Big-endian ensures lexicographic ordering matches numeric ordering.
@@ -565,6 +661,16 @@ pub struct Store {
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
+    /// Heartbeat votes by slot, then validator.
+    ///
+    /// Written from two sources: heartbeat gossip (current slot) and block import
+    /// (the block's slot minus one). Read by all three fork-choice values. The
+    /// per-validator insert is last-write-wins, which makes block import a
+    /// *union* with whatever gossip already delivered rather than a replacement —
+    /// a lazy or byzantine proposer cannot blank the fast head's evidence.
+    votes_per_slot: Arc<Mutex<BTreeMap<u64, HashMap<u64, AttestationData>>>>,
+    /// Raw heartbeat XMSS signatures awaiting the proposer's fold.
+    heartbeat_signatures: Arc<Mutex<HeartbeatSignatureBuffer>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     /// Avoids reconstructing recent states from diffs on every read.
     state_cache: Arc<Mutex<LruCache<H256, State>>>,
@@ -655,6 +761,8 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
+            votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
+            heartbeat_signatures: Arc::new(Mutex::new(HeartbeatSignatureBuffer::default())),
             state_cache: new_state_cache(),
         };
 
@@ -725,6 +833,15 @@ impl Store {
                 (KEY_CONFIG.to_vec(), anchor_state.config.to_ssz()),
                 (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_SAFE_TARGET.to_vec(), anchor_block_root.to_ssz()),
+                // The anchor is the only block there is, so it is trivially the
+                // RLMD-window head as well.
+                (KEY_LAGGING_HEAD.to_vec(), anchor_block_root.to_ssz()),
+                // Seeded at the default; the node overwrites it once from the
+                // genesis config via `reconcile_heartbeat_committee_size`.
+                (
+                    KEY_HEARTBEAT_COMMITTEE_SIZE.to_vec(),
+                    DEFAULT_HEARTBEAT_COMMITTEE_SIZE.to_ssz(),
+                ),
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
             ];
@@ -789,11 +906,24 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
+            votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
+            heartbeat_signatures: Arc::new(Mutex::new(HeartbeatSignatureBuffer::default())),
             state_cache: new_state_cache(),
         })
     }
 
     // ============ Metadata Helpers ============
+
+    /// Read a metadata key that may be absent.
+    ///
+    /// Unlike [`Self::get_metadata`], a missing key is `None` rather than a
+    /// panic, so keys introduced after a database was written can carry a
+    /// default instead of forcing a resync.
+    fn get_optional_metadata<T: SszDecode>(&self, key: &[u8]) -> Option<T> {
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view.get(Table::Metadata, key).expect("get")?;
+        Some(T::from_ssz_bytes(&bytes).expect("valid encoding"))
+    }
 
     fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
         let view = self.backend.begin_read().expect("read view");
@@ -817,11 +947,16 @@ impl Store {
 
     /// Returns the current store time in interval counts since genesis.
     ///
-    /// Each increment represents one 800ms interval. Derive slot/interval as:
+    /// Each increment represents one interval. Derive slot/interval as:
     ///   slot     = time() / INTERVALS_PER_SLOT
     ///   interval = time() % INTERVALS_PER_SLOT
     pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
+    }
+
+    /// The current slot, derived from the store clock.
+    pub fn current_slot(&self) -> u64 {
+        self.time().expect("store time exists") / INTERVALS_PER_SLOT
     }
 
     /// Sets the current store time.
@@ -837,6 +972,41 @@ impl Store {
     /// so this never reads the backend.
     pub fn config(&self) -> &ChainConfig {
         &self.config
+    }
+
+    /// The network's heartbeat committee size, `K`.
+    ///
+    /// Falls back to [`DEFAULT_HEARTBEAT_COMMITTEE_SIZE`] for databases written
+    /// before the key existed, so an in-place upgrade keeps loading.
+    ///
+    /// Callers wanting a threshold denominator want the *effective* size
+    /// `min(K, n)` instead — see
+    /// `ethlambda_state_transition::effective_heartbeat_committee_size`.
+    pub fn heartbeat_committee_size(&self) -> u64 {
+        self.get_optional_metadata(KEY_HEARTBEAT_COMMITTEE_SIZE)
+            .unwrap_or(DEFAULT_HEARTBEAT_COMMITTEE_SIZE)
+    }
+
+    /// Adopt the genesis config's `HEARTBEAT_COMMITTEE_SIZE` on first boot.
+    ///
+    /// The persisted value wins on every later boot: committee membership feeds
+    /// the fork-choice extraction that runs over every imported block, so a
+    /// restart must not quietly change which bits of a block count as heartbeat
+    /// votes. A mismatch against the config file is logged rather than applied.
+    pub fn reconcile_heartbeat_committee_size(&mut self, configured: u64) -> Result<(), Error> {
+        match self.get_optional_metadata::<u64>(KEY_HEARTBEAT_COMMITTEE_SIZE) {
+            Some(persisted) if persisted == configured => Ok(()),
+            Some(persisted) => {
+                warn!(
+                    persisted,
+                    configured,
+                    "HEARTBEAT_COMMITTEE_SIZE in the config file differs from the persisted value; \
+                     keeping the persisted one. Wipe the datadir to adopt the new size."
+                );
+                Ok(())
+            }
+            None => self.set_metadata(KEY_HEARTBEAT_COMMITTEE_SIZE, &configured),
+        }
     }
 
     // ============ Head ============
@@ -856,6 +1026,25 @@ impl Store {
     /// Sets the safe target block root.
     pub fn set_safe_target(&mut self, safe_target: H256) -> Result<(), Error> {
         self.set_metadata(KEY_SAFE_TARGET, &safe_target)
+    }
+
+    // ============ Lagging Head ============
+
+    /// Returns the lagging head: the RLMD-window head the fast head builds on.
+    ///
+    /// Falls back to the current head for databases written before the key
+    /// existed, which is the same value `update_lagging_head` would converge to
+    /// on the next interval-3 tick.
+    pub fn lagging_head(&self) -> Result<H256, Error> {
+        match self.get_optional_metadata(KEY_LAGGING_HEAD) {
+            Some(root) => Ok(root),
+            None => self.head(),
+        }
+    }
+
+    /// Sets the lagging head block root.
+    pub fn set_lagging_head(&mut self, lagging_head: H256) -> Result<(), Error> {
+        self.set_metadata(KEY_LAGGING_HEAD, &lagging_head)
     }
 
     // ============ Checkpoints ============
@@ -920,10 +1109,18 @@ impl Store {
 
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
-            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
+            // Window-bounded, not finalized-bounded: see `prune_heartbeat_votes`.
+            let current_slot = self.current_slot();
+            let pruned_heartbeat = self.prune_heartbeat_votes(finalized.slot, current_slot);
+
+            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 || pruned_heartbeat > 0 {
                 info!(
                     finalized_slot = finalized.slot,
-                    pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
+                    pruned_chain,
+                    pruned_sigs,
+                    pruned_payloads,
+                    pruned_heartbeat,
+                    "Pruned finalized data"
                 );
             }
         }
@@ -1451,6 +1648,167 @@ impl Store {
         Ok(())
     }
 
+    // ============ Heartbeat Votes ============
+
+    /// Record one heartbeat vote.
+    ///
+    /// Last-write-wins per `(data.slot, validator)`. Block import therefore
+    /// overwrites a gossip copy for the same validator while validators known
+    /// only from gossip keep theirs: `V <- V union V_block`. A conflict means the
+    /// validator signed two different datas for one slot, i.e. it equivocated;
+    /// block-wins is then a deterministic tie-break, not a judgement.
+    pub fn insert_heartbeat_vote(&self, validator_id: u64, data: AttestationData) {
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .entry(data.slot)
+            .or_default()
+            .insert(validator_id, data);
+    }
+
+    /// Buffer one raw heartbeat XMSS signature for the proposer's fold.
+    pub fn insert_heartbeat_signature(
+        &self,
+        slot: u64,
+        data_root: H256,
+        validator_id: u64,
+        signature: ValidatorSignature,
+    ) {
+        self.heartbeat_signatures
+            .lock()
+            .unwrap()
+            .insert(slot, data_root, validator_id, signature);
+    }
+
+    /// Buffered heartbeat signatures for `slot`, grouped by `data_root`.
+    pub fn heartbeat_signatures_at(
+        &self,
+        slot: u64,
+    ) -> HashMap<H256, BTreeMap<u64, ValidatorSignature>> {
+        self.heartbeat_signatures.lock().unwrap().at_slot(slot)
+    }
+
+    /// Heartbeat votes recorded for exactly `slot`.
+    ///
+    /// The safe target reads this and nothing wider on purpose: its whole job is
+    /// to say "this branch is backed *right now*", so evidence from an earlier
+    /// slot would keep the clamp open on a branch the current committee has
+    /// stopped voting for.
+    pub fn heartbeat_votes_at(&self, slot: u64) -> HashMap<u64, AttestationData> {
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .get(&slot)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Heartbeat votes for slot `current_slot - 1`, widening the window one slot
+    /// at a time while it yields nothing, up to `cap` slots back.
+    ///
+    /// This is what makes an empty slot, an offline proposer, or a silent
+    /// committee degrade gracefully instead of blanking the fast head: the window
+    /// widens until it finds evidence, and after `cap` slots of nothing it
+    /// returns empty so the fast head collapses to its base.
+    ///
+    /// Also returns how many slots back the walk had to go (0 when nothing was
+    /// found at all), for the `lean_fast_head_window_slots` histogram.
+    pub fn heartbeat_votes_expanding_back(
+        &self,
+        current_slot: u64,
+        cap: u64,
+    ) -> (HashMap<u64, AttestationData>, u64) {
+        let votes_per_slot = self.votes_per_slot.lock().unwrap();
+        for back in 1..=cap {
+            let Some(slot) = current_slot.checked_sub(back) else {
+                break;
+            };
+            if let Some(votes) = votes_per_slot.get(&slot).filter(|v| !v.is_empty()) {
+                return (votes.clone(), back);
+            }
+        }
+        (HashMap::new(), 0)
+    }
+
+    /// Latest message per validator over the half-open slot range, merging the
+    /// heartbeat votes with the known (fork-choice-active) aggregate pool.
+    ///
+    /// Explicitly latest-per-validator rather than relying on ascending map
+    /// iteration to overwrite: a higher `data.slot` always wins, and on an equal
+    /// slot the heartbeat copy wins because it is the block-merged, canonical
+    /// one. The known-payload half is not optional — consecutive committees
+    /// overlap in `K' - 1` members, so the heartbeat pool alone covers only
+    /// `min(N + K' - 1, n)` distinct validators and can never reach a
+    /// `ceil(2n/3)` threshold at realistic `n`.
+    pub fn latest_message_per_validator(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> HashMap<u64, AttestationData> {
+        let mut latest: HashMap<u64, AttestationData> = HashMap::new();
+
+        // Aggregate pool first, so an equal-slot heartbeat vote overwrites it.
+        for (validator, data) in self.extract_latest_known_attestations() {
+            if range.contains(&data.slot) {
+                Self::keep_later_vote(&mut latest, validator, data, false);
+            }
+        }
+        for (_, votes) in self.votes_per_slot.lock().unwrap().range(range.clone()) {
+            for (validator, data) in votes {
+                Self::keep_later_vote(&mut latest, *validator, data.clone(), true);
+            }
+        }
+        latest
+    }
+
+    /// Keep `candidate` for `validator` if it is later than what is held, or if
+    /// it ties on slot and comes from the heartbeat pool.
+    fn keep_later_vote(
+        latest: &mut HashMap<u64, AttestationData>,
+        validator: u64,
+        candidate: AttestationData,
+        from_heartbeat: bool,
+    ) {
+        match latest.get(&validator) {
+            Some(held)
+                if held.slot > candidate.slot
+                    || (held.slot == candidate.slot && !from_heartbeat) => {}
+            _ => {
+                latest.insert(validator, candidate);
+            }
+        }
+    }
+
+    /// Distinct validators holding a heartbeat vote for `slot`.
+    pub fn heartbeat_voter_count_at(&self, slot: u64) -> usize {
+        self.votes_per_slot
+            .lock()
+            .unwrap()
+            .get(&slot)
+            .map_or(0, HashMap::len)
+    }
+
+    /// Drop heartbeat votes and signatures below `max(finalized_slot,
+    /// current_slot - RLMD_LOOKBACK_LIMIT)`.
+    ///
+    /// Retaining only down to the finalized boundary is unbounded during a
+    /// finality stall, and RLMD never reads further back than the window, so the
+    /// window is the correct retention bound. Returns the number of slots pruned
+    /// from the vote store.
+    pub fn prune_heartbeat_votes(&mut self, finalized_slot: u64, current_slot: u64) -> usize {
+        let retain_from = finalized_slot.max(current_slot.saturating_sub(RLMD_LOOKBACK_LIMIT));
+        let pruned = {
+            let mut votes_per_slot = self.votes_per_slot.lock().unwrap();
+            let before = votes_per_slot.len();
+            votes_per_slot.retain(|slot, _| *slot >= retain_from);
+            before - votes_per_slot.len()
+        };
+        self.heartbeat_signatures
+            .lock()
+            .unwrap()
+            .prune_below(retain_from);
+        pruned
+    }
+
     // ============ Attestation Extraction ============
 
     /// Extract per-validator latest attestations from known (fork-choice-active) payloads.
@@ -1692,6 +2050,17 @@ impl Store {
             .slot
     }
 
+    /// Returns the slot of the current lagging head.
+    ///
+    /// A frozen lagging head under a moving fast head is the RLMD-window failure
+    /// signature, so this is exported as its own gauge.
+    pub fn lagging_head_slot(&self) -> u64 {
+        self.get_block_header(&self.lagging_head().expect("lagging head exists"))
+            .expect("lagging head exists")
+            .unwrap()
+            .slot
+    }
+
     /// Returns a clone of the head state.
     pub fn head_state(&self) -> State {
         self.get_state(&self.head().expect("head block exists"))
@@ -1744,6 +2113,7 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_HEARTBEAT_COMMITTEE_SIZE;
     use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
@@ -1762,6 +2132,7 @@ mod tests {
     fn genesis_config(genesis_time: u64, validators: &[Validator]) -> GenesisConfig {
         GenesisConfig {
             genesis_time,
+            heartbeat_committee_size: DEFAULT_HEARTBEAT_COMMITTEE_SIZE,
             genesis_validators: validators
                 .iter()
                 .map(|v| GenesisValidatorEntry {
@@ -1872,6 +2243,8 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
+                votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
+                heartbeat_signatures: Arc::new(Mutex::new(HeartbeatSignatureBuffer::default())),
                 state_cache: new_state_cache(),
             }
         }
@@ -1887,6 +2260,8 @@ mod tests {
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
+                votes_per_slot: Arc::new(Mutex::new(BTreeMap::new())),
+                heartbeat_signatures: Arc::new(Mutex::new(HeartbeatSignatureBuffer::default())),
                 state_cache: new_state_cache(),
             }
         }
@@ -2219,6 +2594,203 @@ mod tests {
             target: Checkpoint::default(),
             source: Checkpoint::default(),
         }
+    }
+
+    // ============ Heartbeat Vote Store Tests ============
+
+    /// Attestation data distinguishable by both slot and target root, so tests can
+    /// tell *which* vote survived a merge rather than only how many did.
+    fn heartbeat_data(slot: u64, target_marker: u8) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                root: H256([target_marker; 32]),
+                slot,
+            },
+            source: Checkpoint::default(),
+        }
+    }
+
+    #[test]
+    fn heartbeat_votes_are_last_write_wins_per_validator() {
+        let store = Store::test_store();
+        store.insert_heartbeat_vote(7, heartbeat_data(5, 0xAA));
+        // Same (slot, validator) again: the later write wins. This is what makes
+        // block import a union over gossip rather than a replacement.
+        store.insert_heartbeat_vote(7, heartbeat_data(5, 0xBB));
+        // A different validator in the same slot is untouched.
+        store.insert_heartbeat_vote(8, heartbeat_data(5, 0xCC));
+
+        let votes = store.heartbeat_votes_at(5);
+        assert_eq!(votes.len(), 2);
+        assert_eq!(votes[&7].target.root, H256([0xBB; 32]));
+        assert_eq!(votes[&8].target.root, H256([0xCC; 32]));
+    }
+
+    #[test]
+    fn heartbeat_votes_at_is_exact_slot_only() {
+        let store = Store::test_store();
+        store.insert_heartbeat_vote(1, heartbeat_data(4, 0x11));
+        store.insert_heartbeat_vote(2, heartbeat_data(5, 0x22));
+
+        // The safe target reads this: an earlier slot's evidence must not leak in.
+        assert_eq!(store.heartbeat_votes_at(5).len(), 1);
+        assert!(store.heartbeat_votes_at(6).is_empty());
+    }
+
+    #[test]
+    fn expanding_window_finds_the_nearest_populated_slot() {
+        let store = Store::test_store();
+        // Nothing at slot 9 (= S-1 for S=10) or 8; evidence sits at slot 7.
+        store.insert_heartbeat_vote(3, heartbeat_data(7, 0x33));
+
+        let (votes, back) = store.heartbeat_votes_expanding_back(10, RLMD_LOOKBACK_LIMIT);
+        assert_eq!(votes.len(), 1);
+        assert_eq!(back, 3, "should report how far it walked");
+    }
+
+    #[test]
+    fn expanding_window_prefers_the_previous_slot() {
+        let store = Store::test_store();
+        store.insert_heartbeat_vote(3, heartbeat_data(7, 0x33));
+        store.insert_heartbeat_vote(4, heartbeat_data(9, 0x44));
+
+        let (votes, back) = store.heartbeat_votes_expanding_back(10, RLMD_LOOKBACK_LIMIT);
+        assert_eq!(back, 1);
+        assert_eq!(votes.len(), 1);
+        assert!(votes.contains_key(&4));
+    }
+
+    #[test]
+    fn expanding_window_respects_the_cap_and_gives_up_empty() {
+        let store = Store::test_store();
+        // Evidence exists, but further back than the cap allows.
+        store.insert_heartbeat_vote(3, heartbeat_data(1, 0x33));
+
+        let (votes, back) = store.heartbeat_votes_expanding_back(10, 3);
+        assert!(
+            votes.is_empty(),
+            "beyond the cap the fast head must collapse to its base"
+        );
+        assert_eq!(back, 0);
+
+        // And it does not underflow near genesis.
+        let (votes, back) = store.heartbeat_votes_expanding_back(0, RLMD_LOOKBACK_LIMIT);
+        assert!(votes.is_empty());
+        assert_eq!(back, 0);
+    }
+
+    #[test]
+    fn latest_message_per_validator_is_half_open_and_latest_wins() {
+        let store = Store::test_store();
+        // Below the window, inside it (twice for one validator), and at the
+        // excluded upper bound.
+        store.insert_heartbeat_vote(1, heartbeat_data(1, 0x01));
+        store.insert_heartbeat_vote(2, heartbeat_data(3, 0x03));
+        store.insert_heartbeat_vote(2, heartbeat_data(5, 0x05));
+        store.insert_heartbeat_vote(3, heartbeat_data(8, 0x08));
+
+        let latest = store.latest_message_per_validator(2..8);
+        assert!(!latest.contains_key(&1), "slot 1 is below the window start");
+        assert!(
+            !latest.contains_key(&3),
+            "slot 8 is the excluded upper bound"
+        );
+        // Validator 2 voted at both 3 and 5 inside the window; the later wins.
+        assert_eq!(latest[&2].slot, 5);
+    }
+
+    #[test]
+    fn latest_message_per_validator_prefers_heartbeat_on_an_equal_slot() {
+        let mut store = Store::test_store();
+        // Same validator, same slot, different target: once via the aggregate pool
+        // and once via heartbeat. The heartbeat copy is the block-merged canonical
+        // one, so it must win the tie.
+        let aggregate_vote = heartbeat_data(4, 0xEE);
+        let mut bits = AggregationBits::with_length(6).unwrap();
+        bits.set(5, true).unwrap();
+        store.insert_known_aggregated_payload(
+            HashedAttestationData::new(aggregate_vote),
+            SingleMessageAggregate::empty(bits),
+        );
+        store.insert_heartbeat_vote(5, heartbeat_data(4, 0xFF));
+
+        let latest = store.latest_message_per_validator(0..8);
+        assert_eq!(latest[&5].target.root, H256([0xFF; 32]));
+    }
+
+    #[test]
+    fn latest_message_per_validator_includes_the_aggregate_pool() {
+        let mut store = Store::test_store();
+        // The known-payload half is not optional: without it a ceil(2n/3)
+        // threshold is unreachable from committee votes alone.
+        let mut bits = AggregationBits::with_length(4).unwrap();
+        bits.set(0, true).unwrap();
+        bits.set(3, true).unwrap();
+        store.insert_known_aggregated_payload(
+            HashedAttestationData::new(heartbeat_data(4, 0xEE)),
+            SingleMessageAggregate::empty(bits),
+        );
+
+        let latest = store.latest_message_per_validator(0..8);
+        assert_eq!(latest.len(), 2);
+        assert!(latest.contains_key(&0) && latest.contains_key(&3));
+    }
+
+    #[test]
+    fn prune_heartbeat_votes_uses_the_window_not_just_finalization() {
+        let mut store = Store::test_store();
+        for slot in 0..=20 {
+            store.insert_heartbeat_vote(1, heartbeat_data(slot, 0x01));
+        }
+
+        // Finality is stalled at 0, so a finalized-only bound would retain
+        // everything. The window bound must still prune.
+        store.prune_heartbeat_votes(0, 20);
+        for slot in 0..20 - RLMD_LOOKBACK_LIMIT {
+            assert!(
+                store.heartbeat_votes_at(slot).is_empty(),
+                "slot {slot} should be outside the retention window"
+            );
+        }
+        assert!(!store.heartbeat_votes_at(20).is_empty());
+        assert!(
+            !store
+                .heartbeat_votes_at(20 - RLMD_LOOKBACK_LIMIT)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prune_heartbeat_votes_keeps_everything_above_finalization() {
+        let mut store = Store::test_store();
+        for slot in 10..=14 {
+            store.insert_heartbeat_vote(1, heartbeat_data(slot, 0x01));
+        }
+        // current_slot - RLMD_LOOKBACK_LIMIT would be below 10 here, so the
+        // finalized bound is the tighter one and wins.
+        store.prune_heartbeat_votes(12, 14);
+        assert!(store.heartbeat_votes_at(11).is_empty());
+        assert!(!store.heartbeat_votes_at(12).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_committee_size_defaults_and_reconciles_once() {
+        let mut store = Store::test_store();
+        // A store built without going through `init_store` has no key: the getter
+        // falls back rather than panicking, so pre-existing databases keep loading.
+        assert_eq!(
+            store.heartbeat_committee_size(),
+            DEFAULT_HEARTBEAT_COMMITTEE_SIZE
+        );
+
+        store.reconcile_heartbeat_committee_size(32).unwrap();
+        assert_eq!(store.heartbeat_committee_size(), 32);
+
+        // A later boot with a different config file must NOT change it.
+        store.reconcile_heartbeat_committee_size(8).unwrap();
+        assert_eq!(store.heartbeat_committee_size(), 32);
     }
 
     #[test]
