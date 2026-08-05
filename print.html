@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-56366715.js";
+            window.path_to_searchindex_js = "searchindex-5077ab31.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -2095,7 +2095,7 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
 <p>This doc explains how ethlambda saves data. Especially,
 the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
-what each of the seven tables holds, and which data is in-memory only.</p>
+what each of the eight tables holds, and which data is in-memory only.</p>
 <h2 id="overview-1"><a class="header" href="#overview-1">Overview</a></h2>
 <p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
 (<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
@@ -2184,14 +2184,14 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    │   │ BlockHeaders        │         │ new_payloads         │    │
    │   │ BlockBodies         │         │  (pending aggregated │    │
    │   │ BlockProof          │         │   attestations)      │    │
-   │   │ States              │         │ known_payloads       │    │
-   │   │ StateDiffs          │         │  (fork-choice-active │    │
-   │   │ Metadata            │         │   attestations)      │    │
-   │   │ LiveChain           │         │ gossip_signatures    │    │
-   │   └─────────────────────┘         │  (raw XMSS sigs      │    │
-   │                                   │   awaiting           │    │
-   │   Survives restarts.              │   aggregation)       │    │
-   │                                   │ state_cache (LRU)    │    │
+   │   │ BlockRoots          │         │ known_payloads       │    │
+   │   │ States              │         │  (fork-choice-active │    │
+   │   │ StateDiffs          │         │   attestations)      │    │
+   │   │ Metadata            │         │ gossip_signatures    │    │
+   │   │ LiveChain           │         │  (raw XMSS sigs      │    │
+   │   └─────────────────────┘         │   awaiting           │    │
+   │                                   │   aggregation)       │    │
+   │   Survives restarts.              │ state_cache (LRU)    │    │
    │                                   └──────────────────────┘    │
    │                                                               │
    │                                   Lost on restart.            │
@@ -2208,6 +2208,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 <tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code></td><td>never</td></tr>
 <tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code></td><td>never</td></tr>
 <tr><td><code>BlockProof</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
+<tr><td><code>BlockRoots</code></td><td>slot</td><td>block root (<code>H256</code>)</td><td>never</td></tr>
 <tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
 <tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
 <tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
@@ -2216,7 +2217,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 </table>
 </div>
 <h3 id="key-encoding"><a class="header" href="#key-encoding">Key encoding</a></h3>
-<p>Two key layouts are used:</p>
+<p>Three key layouts are used:</p>
 <ul>
 <li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
 (<code>root.to_ssz()</code>).</li>
@@ -2225,6 +2226,10 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 32-byte root. Big-endian means lexicographic key order equals numeric slot
 order, so pruning can iterate from the start of the table and stop at the
 first key past its cutoff instead of scanning everything.</li>
+<li><strong>Slot-only</strong> (<code>BlockRoots</code>) uses <code>encode_block_root_key</code>: just the 8-byte
+big-endian slot, since the value already holds the root. This table is
+never pruned, so the ordering buys nothing here; it is kept only for
+consistency with the other slot-prefixed keys.</li>
 </ul>
 <h3 id="blockheaders"><a class="header" href="#blockheaders">BlockHeaders</a></h3>
 <p><code>root → BlockHeader</code>. Written for every block, including the genesis/anchor
@@ -2246,11 +2251,30 @@ slot order and stop early.</p>
 any other block a missing entry (a pruned finalized block) surfaces as <code>None</code>
 rather than a fabricated block.</p>
 <p>This is the one block table that <strong>is</strong> pruned; see <a href="#pruning">Pruning</a>.</p>
+<h3 id="blockroots"><a class="header" href="#blockroots">BlockRoots</a></h3>
+<p><code>slot → H256</code>, the canonical block root at each slot. Rewritten on every head
+update inside <code>update_checkpoints</code>: <code>block_root_index_changes</code> walks the old
+and new head’s branches back to their common ancestor, deleting the slots
+that leave the canonical chain and writing the ones that join it. A reorg
+therefore touches only the affected slot range, not the whole table. Never
+pruned.</p>
+<p>Backs <code>get_signed_blocks_by_slot_range</code>, which serves BlocksByRange requests
+over req/resp (<code>crates/net/p2p/src/req_resp/handlers.rs</code>). It does <strong>not</strong>
+back the RPC <code>GET /lean/v0/blocks/:slot</code> endpoint: that handler resolves a
+slot through the head state’s <code>historical_block_hashes</code> instead
+(<code>resolve_slot</code> in <code>crates/net/rpc/src/blocks.rs</code>), so a block on a side fork
+is reachable there only by root, never by slot.</p>
 <h3 id="states"><a class="header" href="#states">States</a></h3>
 <p><code>root → State</code> (full SSZ snapshot). Holds full-state snapshots <strong>only</strong>: the
 bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a 1024-slot boundary. Never pruned — these anchors are the base every
-diff chain resolves against, so reconstruction always terminates.</p>
+crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code>-slot boundary. Never pruned — these
+anchors are the base every diff chain resolves against, so reconstruction
+always terminates.</p>
+<p>The genesis validator registry is constant for the life of the chain
+(<code>validators</code> is fixed at genesis; the lean STF never mutates it), but it has
+no table of its own: it rides inside every <code>States</code> snapshot alongside
+<code>config</code>, which <code>StateDiff</code> reconstruction relies on (see
+<a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
 <h3 id="statediffs"><a class="header" href="#statediffs">StateDiffs</a></h3>
 <p><code>root → StateDiff</code>. A parent-linked diff written for <strong>every</strong> non-genesis
 state. Never pruned, so together with the snapshots this preserves the full
@@ -2266,7 +2290,7 @@ fields:</p>
 </thead>
 <tbody>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
-<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (genesis time, validator count)</td></tr>
+<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (currently just <code>genesis_time</code>)</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
 <tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a>)</td></tr>
 <tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
@@ -2274,6 +2298,13 @@ fields:</p>
 </tbody>
 </table>
 </div>
+<p><code>config</code> is the odd one out: <code>init_store</code> writes it once at bootstrap and
+nothing ever rewrites it afterward (it has a getter, <code>Store::config</code>, but no
+setter). Because it never changes, the <code>Store</code> keeps a copy in memory and
+reads of it never reach the backend. It is also part of the DB’s fingerprint:
+<code>from_db_state</code> refuses to resume a data directory belonging to another
+network (see <a href="#startup-and-restore">Startup and Restore</a>). Every other
+<code>Metadata</code> key is mutated in place as the chain progresses.</p>
 <h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
 <p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
 <code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
@@ -2293,9 +2324,9 @@ or change predictably. Instead, <code>insert_state</code> writes:</p>
 <li><strong>Always</strong> a <code>StateDiff</code> keyed by the block root, linked to its parent via
 <code>base_root</code> (the block’s <code>parent_root</code>).</li>
 <li><strong>Only at anchors</strong> a full snapshot into <code>States</code>. A block is an anchor
-when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL = 1024</code> slot boundary relative
+when it crosses a <code>SNAPSHOT_ANCHOR_INTERVAL</code> slot boundary relative
 to its parent (~68 minutes at 4-second slots). This bounds any
-reconstruction walk to at most 1024 diff applications.</li>
+reconstruction walk to at most <code>SNAPSHOT_ANCHOR_INTERVAL</code> diff applications.</li>
 </ol>
 <p>A <code>StateDiff</code> stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
@@ -2310,10 +2341,16 @@ small under healthy finality). The rest is deliberately omitted:</p>
 <tbody>
 <tr><td><code>config</code>, <code>validators</code></td><td>The snapshot (they never change)</td></tr>
 <tr><td><code>latest_block_header</code></td><td>The <code>BlockHeaders</code> table</td></tr>
-<tr><td><code>historical_block_hashes</code></td><td>Regenerated from <code>base_root</code> + the slot gap (the state transition appends the parent root plus one zero per skipped slot, so the append is fully predictable)</td></tr>
+<tr><td><code>historical_block_hashes</code></td><td>Regenerated from <code>base_root</code> + the slot gap</td></tr>
 </tbody>
 </table>
 </div>
+<p>The <code>historical_block_hashes</code> append is checked rather
+than trusted blindly: <code>validate_history_append</code>
+(<code>crates/storage/src/state_diff.rs</code>) rejects a diff whose appended hashes
+don’t match the expected slot gap or aren’t zero-filled for skipped slots,
+so a broken append surfaces at diff-creation time instead of corrupting a
+later reconstruction.</p>
 <p>Reads go through <code>get_state</code>, which tries three levels:</p>
 <ol>
 <li>An in-memory LRU cache (<code>STATE_CACHE_CAPACITY = 32</code> states, keyed by block
@@ -2371,6 +2408,7 @@ sequence of independent write batches:</p>
    │
    └─ 4. update_head()                 Metadata: head
           (re-runs fork choice)        (+ justified/finalized if advanced,
+                                          + BlockRoots diff (canonical index),
                                           + pruning on finalization)
 </code></pre>
 <p>Each numbered step is atomic on its own, but the import as a whole is <strong>not</strong>
@@ -2409,10 +2447,10 @@ are never touched. Finalized blocks can never revert, so their proofs are
 not needed for fork choice, reorg safety, or re-aggregation once outside
 the window.</li>
 </ul>
-<p><strong>Never pruned:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>States</code>, <code>StateDiffs</code>, and
-<code>Metadata</code>. Headers, bodies, and the snapshot+diff chain are the full
-historical record; only the proof blobs and the fork choice index are
-disposable.</p>
+<p><strong>Never pruned:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>, <code>States</code>,
+<code>StateDiffs</code>, and <code>Metadata</code>. Headers, bodies, the canonical slot index, and
+the snapshot+diff chain are the full historical record; only the proof blobs
+and the (non-finalized) fork choice index are disposable.</p>
 <h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
 <p>Four <code>Store</code> fields never touch the backend. All are bounded buffers shared
 across <code>Store</code> clones:</p>
@@ -2439,7 +2477,7 @@ section of <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a> for how 
 pools.</p>
 <p>After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the seven tables survives.</p>
+network. Everything persisted in the eight tables survives.</p>
 <h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
 <p>A <code>Store</code> is created through one of three constructors in
 <code>crates/storage/src/store.rs</code>:</p>
@@ -2458,11 +2496,15 @@ network. Everything persisted in the seven tables survives.</p>
 <p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
 atomic batch</strong>: all six <code>Metadata</code> keys (time = 0, config, head = safe_target
 = anchor root, justified = finalized = anchor checkpoint), the anchor header,
-the body if non-empty, a full snapshot into <code>States</code> (the base of every future
-diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
+its <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code>
+(the base of every future diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
-from <code>Metadata</code>, returning <code>None</code> for an empty DB or a <code>genesis_time</code>
-mismatch (wrong network). At startup the node prefers this path but only
+from <code>Metadata</code>, returning <code>None</code> for an empty DB. A populated DB from another
+network is fatal instead: the finalized state’s genesis time and validator
+registry are compared against the genesis config, and a mismatch fails with
+<code>Error::GenesisMismatch</code> rather than being treated as empty, since writing a
+fresh anchor would leave the foreign chain’s rows in place to be served to
+peers. At startup the node prefers this path but only
 accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 <h2 id="key-files-1"><a class="header" href="#key-files-1">Key Files</a></h2>
