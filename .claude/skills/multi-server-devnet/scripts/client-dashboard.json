@@ -3319,7 +3319,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Blocks anchor to interval 0 of their own slot. Only gossip arrivals are sampled; blocks fetched over req/resp during sync are excluded. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them.",
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Blocks anchor to interval 0 of their own slot. Only gossip arrivals are sampled; blocks fetched over req/resp during sync are excluded. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -3378,19 +3378,32 @@
             "overrides": [
               {
                 "matcher": {
-                  "id": "byRegexp",
-                  "options": ".*p50.*"
+                  "id": "byName",
+                  "options": "fleet"
                 },
                 "properties": [
                   {
-                    "id": "custom.lineStyle",
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
                     "value": {
-                      "dash": [
-                        10,
-                        10
-                      ],
-                      "fill": "dash"
+                      "mode": "fixed",
+                      "fixedColor": "text"
                     }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
                   }
                 ]
               }
@@ -3424,9 +3437,9 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p99",
+              "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
             },
@@ -3436,14 +3449,14 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p50",
+              "legendFormat": "fleet",
               "range": true,
-              "refId": "B"
+              "refId": "Z"
             }
           ],
-          "title": "Gossip block arrival delay",
+          "title": "Gossip block arrival delay (p50)",
           "type": "timeseries"
         },
         {
@@ -3451,7 +3464,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Attestations anchor to interval 1 (AttestationProduction) of their data slot. An attestation that lands in its own slot's aggregation interval missed the interval it was due in, so it reads `after`, not `inside`. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them.",
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Attestations anchor to interval 1 (AttestationProduction) of their data slot. An attestation that lands in its own slot's aggregation interval missed the interval it was due in, so it reads `after`, not `inside`. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -3510,19 +3523,32 @@
             "overrides": [
               {
                 "matcher": {
-                  "id": "byRegexp",
-                  "options": ".*p50.*"
+                  "id": "byName",
+                  "options": "fleet"
                 },
                 "properties": [
                   {
-                    "id": "custom.lineStyle",
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
                     "value": {
-                      "dash": [
-                        10,
-                        10
-                      ],
-                      "fill": "dash"
+                      "mode": "fixed",
+                      "fixedColor": "text"
                     }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
                   }
                 ]
               }
@@ -3556,9 +3582,9 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p99",
+              "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
             },
@@ -3568,14 +3594,14 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p50",
+              "legendFormat": "fleet",
               "range": true,
-              "refId": "B"
+              "refId": "Z"
             }
           ],
-          "title": "Gossip attestation arrival delay",
+          "title": "Gossip attestation arrival delay (p50)",
           "type": "timeseries"
         },
         {
@@ -3583,7 +3609,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Aggregates anchor to the most recent aggregation-interval boundary at or before arrival, not to their own data slot (a stale-group catch-up aggregate can carry a data slot several slots back). The delay is therefore bounded below one slot and `before` is unreachable. Includes an aggregator's own locally produced aggregates. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them.",
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Aggregates anchor to the most recent aggregation-interval boundary at or before arrival, not to their own data slot (a stale-group catch-up aggregate can carry a data slot several slots back). The delay is therefore bounded below one slot and `before` is unreachable. Includes an aggregator's own locally produced aggregates. The dashed line is one interval (0.8s): above it the typical message misses the interval it was due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -3642,19 +3668,32 @@
             "overrides": [
               {
                 "matcher": {
-                  "id": "byRegexp",
-                  "options": ".*p50.*"
+                  "id": "byName",
+                  "options": "fleet"
                 },
                 "properties": [
                   {
-                    "id": "custom.lineStyle",
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
                     "value": {
-                      "dash": [
-                        10,
-                        10
-                      ],
-                      "fill": "dash"
+                      "mode": "fixed",
+                      "fixedColor": "text"
                     }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
                   }
                 ]
               }
@@ -3688,9 +3727,9 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p99",
+              "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
             },
@@ -3700,14 +3739,449 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.50, \n  sum by (le, job) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "expr": "histogram_quantile(0.50, \n  sum by (le) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
               "interval": "",
-              "legendFormat": "{{job}} p50",
+              "legendFormat": "fleet",
               "range": true,
-              "refId": "B"
+              "refId": "Z"
             }
           ],
-          "title": "Gossip aggregate arrival delay",
+          "title": "Gossip aggregate arrival delay (p50)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Blocks anchor to interval 0 of their own slot. Only gossip arrivals are sampled; blocks fetched over req/resp during sync are excluded. The dashed line is one interval (0.8s): above it the slowest 1% of messages miss the interval they were due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "dashed"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.8
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 35
+          },
+          "id": 212,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "12.3.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "interval": "",
+              "legendFormat": "{{job}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le) (rate(lean_gossip_block_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
+            }
+          ],
+          "title": "Gossip block arrival delay (p99)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Attestations anchor to interval 1 (AttestationProduction) of their data slot. An attestation that lands in its own slot's aggregation interval missed the interval it was due in, so it reads `after`, not `inside`. The dashed line is one interval (0.8s): above it the slowest 1% of messages miss the interval they were due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "dashed"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.8
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 35
+          },
+          "id": 213,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "12.3.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "interval": "",
+              "legendFormat": "{{job}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le) (rate(lean_gossip_attestation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
+            }
+          ],
+          "title": "Gossip attestation arrival delay (p99)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Absolute distance between arrival and the start of the interval the message was due in, per node. Aggregates anchor to the most recent aggregation-interval boundary at or before arrival, not to their own data slot (a stale-group catch-up aggregate can carry a data slot several slots back). The delay is therefore bounded below one slot and `before` is unreachable. Includes an aggregator's own locally produced aggregates. The dashed line is one interval (0.8s): above it the slowest 1% of messages miss the interval they were due in. Because the histogram observes the absolute delta, an arrival 300ms early shares a bucket with one 300ms late; the arrival position panel below is what separates them. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 0,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "showValues": false,
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "dashed"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": 0
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.8
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 35
+          },
+          "id": 214,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "12.3.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le, job) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))\n)",
+              "interval": "",
+              "legendFormat": "{{job}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.99, \n  sum by (le) (rate(lean_gossip_aggregation_arrival_delay_seconds_bucket{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))\n)",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
+            }
+          ],
+          "title": "Gossip aggregate arrival delay (p99)",
           "type": "timeseries"
         },
         {
@@ -3732,7 +4206,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 35
+            "y": 43
           },
           "id": 203,
           "options": {
@@ -3813,7 +4287,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 35
+            "y": 43
           },
           "id": 204,
           "options": {
@@ -3894,7 +4368,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 35
+            "y": 43
           },
           "id": 205,
           "options": {
@@ -4062,7 +4536,7 @@
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 43
+            "y": 51
           },
           "id": 206,
           "options": {
@@ -4205,7 +4679,7 @@
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 43
+            "y": 51
           },
           "id": 207,
           "options": {
@@ -4333,7 +4807,7 @@
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 43
+            "y": 51
           },
           "id": 208,
           "options": {
@@ -4372,7 +4846,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Share of arrivals that landed inside the interval they were due in, per node. Blocks anchor to interval 0 of their own slot. Only gossip arrivals are sampled; blocks fetched over req/resp during sync are excluded. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem.",
+          "description": "Share of arrivals that landed inside the interval they were due in, per node. Blocks anchor to interval 0 of their own slot. Only gossip arrivals are sampled; blocks fetched over req/resp during sync are excluded. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -4428,13 +4902,45 @@
               },
               "unit": "percentunit"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
           },
           "gridPos": {
             "h": 8,
             "w": 8,
             "x": 0,
-            "y": 51
+            "y": 59
           },
           "id": 209,
           "options": {
@@ -4463,6 +4969,18 @@
               "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "sum (rate(lean_gossip_block_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\", position=\"inside\"}[15m]))\n/ sum (rate(lean_gossip_block_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
             }
           ],
           "title": "Gossip block on-time fraction",
@@ -4473,7 +4991,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Share of arrivals that landed inside the interval they were due in, per node. Attestations anchor to interval 1 (AttestationProduction) of their data slot. An attestation that lands in its own slot's aggregation interval missed the interval it was due in, so it reads `after`, not `inside`. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem.",
+          "description": "Share of arrivals that landed inside the interval they were due in, per node. Attestations anchor to interval 1 (AttestationProduction) of their data slot. An attestation that lands in its own slot's aggregation interval missed the interval it was due in, so it reads `after`, not `inside`. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -4529,13 +5047,45 @@
               },
               "unit": "percentunit"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
           },
           "gridPos": {
             "h": 8,
             "w": 8,
             "x": 8,
-            "y": 51
+            "y": 59
           },
           "id": 210,
           "options": {
@@ -4564,6 +5114,18 @@
               "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "sum (rate(lean_gossip_attestation_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\", position=\"inside\"}[15m]))\n/ sum (rate(lean_gossip_attestation_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
             }
           ],
           "title": "Gossip attestation on-time fraction",
@@ -4574,7 +5136,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Share of arrivals that landed inside the interval they were due in, per node. Aggregates anchor to the most recent aggregation-interval boundary at or before arrival, not to their own data slot (a stale-group catch-up aggregate can carry a data slot several slots back). The delay is therefore bounded below one slot and `before` is unreachable. Includes an aggregator's own locally produced aggregates. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem.",
+          "description": "Share of arrivals that landed inside the interval they were due in, per node. Aggregates anchor to the most recent aggregation-interval boundary at or before arrival, not to their own data slot (a stale-group catch-up aggregate can carry a data slot several slots back). The delay is therefore bounded below one slot and `before` is unreachable. Includes an aggregator's own locally produced aggregates. A node well below its peers is late on its own (clock skew or a starved CPU); the whole fleet dropping together is a chain-wide production or propagation problem. The thick `fleet` line is the same statistic computed over the whole fleet at once (no per-node split, 15m rate window), smoothed: a trend baseline for the jagged per-node lines.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -4630,13 +5192,45 @@
               },
               "unit": "percentunit"
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "fleet"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineWidth",
+                    "value": 3
+                  },
+                  {
+                    "id": "custom.lineInterpolation",
+                    "value": "smooth"
+                  },
+                  {
+                    "id": "custom.spanNulls",
+                    "value": true
+                  },
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "text"
+                    }
+                  },
+                  {
+                    "id": "custom.showPoints",
+                    "value": "never"
+                  }
+                ]
+              }
+            ]
           },
           "gridPos": {
             "h": 8,
             "w": 8,
             "x": 16,
-            "y": 51
+            "y": 59
           },
           "id": 211,
           "options": {
@@ -4665,6 +5259,18 @@
               "legendFormat": "{{job}}",
               "range": true,
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "sum (rate(lean_gossip_aggregation_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\", position=\"inside\"}[15m]))\n/ sum (rate(lean_gossip_aggregation_arrival_total{network=~\"$network\", job=~\"$job\", instance=~\"$instance\"}[15m]))",
+              "interval": "",
+              "legendFormat": "fleet",
+              "range": true,
+              "refId": "Z"
             }
           ],
           "title": "Gossip aggregate on-time fraction",
