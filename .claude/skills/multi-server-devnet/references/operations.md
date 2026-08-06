@@ -175,7 +175,7 @@ node_exporter (`<host>:9122`) and cadvisor (`172.17.0.1:9098`). It
 prometheus**, which must run with `--web.enable-remote-write-receiver` and is
 bound to a routable address + distinct port (e.g. `:9099`). Grafana reads the
 central prometheus; the dashboards have a `network` template variable to pick a
-devnet (`scripts/finality-dashboard.json` = head/justified/finalized;
+devnet (`scripts/devnet-overview-dashboard.json` = head/justified/finalized;
 `scripts/resources-dashboard.json` = per-node CPU + memory from cAdvisor). The
 cAdvisor scrape job already exists in each host's prometheus.yml (target
 `172.17.0.1:9098`, per-node `client_type` via `metric_relabel` on the container

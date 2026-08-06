@@ -268,7 +268,7 @@ Relabel gotcha: that file is a single-file bind-mount — edit by full overwrite
 `references/operations.md`). The central Prometheus needs
 `--web.enable-remote-write-receiver`; Grafana groups by **job name**, so a
 converted node must be relabelled (both `job_name:` and `client_type:`).
-`scripts/finality-dashboard.json` is a ready Grafana dashboard (head / justified
+`scripts/devnet-overview-dashboard.json` is a ready Grafana dashboard (head / justified
 / finalized per devnet, one series per `network`) — copy it to the central
 Grafana's **dashboards dir** and it auto-loads. `scripts/client-dashboard.json` is
 the main per-node dashboard for the same dir (see the inventory below). Every
@@ -296,16 +296,24 @@ version bumps on each sweep that reads a changed file).
 **Ship a dashboard under the same FILENAME the skill uses, and keep exactly one
 `.json` per uid in that dir.** Grafana keys a provisioned dashboard on its `uid`,
 not its filename, so a copy left behind under an old name is invisible in the UI
-yet still claims the uid: adding the correctly-named file next to it makes two
-provider files fight over one uid, which Grafana resolves by logging an error and
-dropping one. The failure looks like "my update did not land". This bit us once
-already: the finality dashboard sat on the server as `devnet-overview-dashboard.json`
-for weeks, so the documented `cp finality-dashboard.json` would have collided
-rather than updated it. To retire a stale copy, rename it to `<name>.json.bak-<ts>`
-in the same step that writes the new file — the provider only reads `*.json`, which
-is also why the `.bak-*` backups already in that dir are inert. Audit with
-`md5sum` of every server `.json` against `scripts/*.json`; the names AND the
-digests should match.
+yet still claims the uid: adding a second file next to it makes two provider files
+fight over one uid, which Grafana resolves by logging an error and dropping one.
+The failure looks like "my update did not land". This bit us once already: the
+finality dashboard was `scripts/finality-dashboard.json` here but had been
+deployed as `devnet-overview-dashboard.json`, so copying it under the skill's name
+would have collided rather than updated it. The two names are now reconciled on
+`devnet-overview-dashboard.json` (the deployed one, since the server is what
+operators actually look at). To retire a stale copy, rename it to
+`<name>.json.bak-<ts>` in the same step that writes the new file — the provider
+only reads `*.json`, which is also why the `.bak-*` backups already in that dir
+are inert. Audit with `md5sum` of every server `.json` against `scripts/*.json`;
+the names AND the digests should match.
+
+Filenames are for humans; only the `uid` inside the JSON is load-bearing. Do not
+"fix" a filename to look more like its uid — `devnet-overview-dashboard.json`
+carries uid `devnet-finality-overview` and that mismatch is harmless, whereas
+renaming a live file costs a provisioner re-add (the dashboard's `version` resets
+to 1, same uid, so links and alerts survive).
 
 Gotcha: that dir is
 bind-mounted **read-only** into the container, so Grafana UI edits are reverted on
@@ -473,7 +481,7 @@ pick their datasource through a template variable, so no editing):
 | File | uid | Content |
 |---|---|---|
 | `client-dashboard.json` | `lean-ethereum-clients-dashboard` | The main per-node dashboard: Overview (start time, validators, committees, head/justified/finalized, slot + finality-delay graphs) plus 14 collapsed sections (config, sync, peers, req/resp + mesh, gossip, gossip arrival timing, PQ signatures, aggregation coverage, block production, proposal internals, fork choice, attestations, state transition, storage + tick health). Filters `network`/`job`/`instance` — `instance` is the **host**, not the node. The config section's **Image build** table answers "which commit is this node running" for **every** client, from the image's OCI `revision`/`ref.name` labels re-exported by cAdvisor as `container_label_*` (see `references/operations.md`) — ethlambda's own `lean_node_info{version}` already embeds its short SHA, partner clients' usually do not |
-| `finality-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
+| `devnet-overview-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
 | `resources-dashboard.json` | `devnet-resources` | Per-node CPU cores + memory working set (+ limit + %-of-limit for OOM watch), OOM kills, restart events, current uptime, and the same **Image build** commit-per-node table as the client dashboard — all from cAdvisor, so read a fresh uptime next to an unchanged commit as "came back on the same build" |
 | `logs-dashboard.json` | `devnet-logs` | Loki logs panel + log-volume-by-level, filtered `network`/`node`/`stream`/`search` |
 | `node-exporter-full.json` | `rYdddlPWk` | The upstream community **Node Exporter Full** dashboard (grafana.com id 1860), vendored verbatim so the dashboards dir is fully reproducible from this skill. Host-level CPU/RAM/disk/net for the `<host>:9122` systemd node_exporter — the counterpart to the container-level resources dashboard. Its own `ds_prometheus` datasource variable, with the saved selection blanked so it falls back to the default |
