@@ -148,10 +148,7 @@ pub fn update_head(store: &mut Store) -> HeadUpdate {
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
-    let head_state = store
-        .get_state(&store.head().unwrap())
-        .expect("head state exists");
-    let num_validators = head_state.unwrap().validators.len() as u64;
+    let num_validators = store.head_state().validators.len() as u64;
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
