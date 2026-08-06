@@ -274,7 +274,7 @@ async fn main() -> eyre::Result<()> {
     // RPC `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
-    let p2p = P2P::spawn(built, store.clone(), node_names);
+    let p2p = P2P::spawn(built, store.clone(), node_names, None);
 
     // Wire actors together via protocol refs
     blockchain
