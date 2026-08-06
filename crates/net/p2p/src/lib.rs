@@ -48,6 +48,7 @@ use crate::{
 };
 
 mod gossipsub;
+pub mod discovery;
 pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
