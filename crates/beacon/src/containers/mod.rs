@@ -92,14 +92,29 @@ impl BeaconState {
 
 /// Generates read and write accessors for state fields that every fork shares.
 ///
-/// Two rules, because returning a reference to a `u64` would make the state
-/// transition noisier than it needs to be: `copy` fields are returned by value,
-/// `reference` fields by reference. Both rules also generate a `_mut` accessor.
+/// The `copy` and `reference` lists are this crate's statement of which state
+/// fields are fork-invariant. A fork that changes one of them moves it out of the
+/// list and gains an explicit match at each use site.
 ///
-/// The write accessor is named explicitly rather than derived from the field
-/// name, since `macro_rules!` cannot concatenate identifiers on stable Rust.
+/// Two field lists rather than one, because returning a reference to a `u64`
+/// would make the state transition noisier than it needs to be: `copy` fields are
+/// returned by value, `reference` fields by reference. Both also get a `_mut`
+/// accessor, and both names are given explicitly, since `macro_rules!` cannot
+/// concatenate identifiers on stable Rust.
+///
+/// # Adding a fork
+///
+/// Add one match arm to each of the four accessor bodies below. The variant list
+/// cannot be a macro parameter: `macro_rules!` zips two repetitions at the same
+/// nesting depth rather than nesting them, so a `variants: [...]` list would be
+/// iterated in lockstep with the field list instead of once per field. Spelling
+/// the arms out is the simpler of the two ways around that, and it keeps the
+/// expansion something you can read.
 macro_rules! shared_state_accessors {
-    (copy: [$(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?]) => {
+    (
+        copy: [$(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?],
+        reference: [$(($ref_field:ident, $ref_field_mut:ident, $ref_ty:ty)),* $(,)?],
+    ) => {
         impl BeaconState {
             $(
                 pub fn $field(&self) -> $ty {
@@ -114,20 +129,17 @@ macro_rules! shared_state_accessors {
                     }
                 }
             )*
-        }
-    };
-    (reference: [$(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?]) => {
-        impl BeaconState {
+
             $(
-                pub fn $field(&self) -> &$ty {
+                pub fn $ref_field(&self) -> &$ref_ty {
                     match self {
-                        BeaconState::Phase0(state) => &state.$field,
+                        BeaconState::Phase0(state) => &state.$ref_field,
                     }
                 }
 
-                pub fn $field_mut(&mut self) -> &mut $ty {
+                pub fn $ref_field_mut(&mut self) -> &mut $ref_ty {
                     match self {
-                        BeaconState::Phase0(state) => &mut state.$field,
+                        BeaconState::Phase0(state) => &mut state.$ref_field,
                     }
                 }
             )*
@@ -135,30 +147,31 @@ macro_rules! shared_state_accessors {
     };
 }
 
-shared_state_accessors!(copy: [
-    (genesis_time, genesis_time_mut, u64),
-    (genesis_validators_root, genesis_validators_root_mut, Root),
-    (slot, slot_mut, Slot),
-    (eth1_deposit_index, eth1_deposit_index_mut, u64),
-    (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
-    (current_justified_checkpoint, current_justified_checkpoint_mut, Checkpoint),
-    (finalized_checkpoint, finalized_checkpoint_mut, Checkpoint),
-]);
-
-shared_state_accessors!(reference: [
-    (fork, fork_mut, Fork),
-    (latest_block_header, latest_block_header_mut, BeaconBlockHeader),
-    (block_roots, block_roots_mut, BlockRoots),
-    (state_roots, state_roots_mut, StateRoots),
-    (historical_roots, historical_roots_mut, HistoricalRoots),
-    (eth1_data, eth1_data_mut, Eth1Data),
-    (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
-    (validators, validators_mut, Validators),
-    (balances, balances_mut, Balances),
-    (randao_mixes, randao_mixes_mut, RandaoMixes),
-    (slashings, slashings_mut, Slashings),
-    (justification_bits, justification_bits_mut, JustificationBits),
-]);
+shared_state_accessors!(
+    copy: [
+        (genesis_time, genesis_time_mut, u64),
+        (genesis_validators_root, genesis_validators_root_mut, Root),
+        (slot, slot_mut, Slot),
+        (eth1_deposit_index, eth1_deposit_index_mut, u64),
+        (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
+        (current_justified_checkpoint, current_justified_checkpoint_mut, Checkpoint),
+        (finalized_checkpoint, finalized_checkpoint_mut, Checkpoint),
+    ],
+    reference: [
+        (fork, fork_mut, Fork),
+        (latest_block_header, latest_block_header_mut, BeaconBlockHeader),
+        (block_roots, block_roots_mut, BlockRoots),
+        (state_roots, state_roots_mut, StateRoots),
+        (historical_roots, historical_roots_mut, HistoricalRoots),
+        (eth1_data, eth1_data_mut, Eth1Data),
+        (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
+        (validators, validators_mut, Validators),
+        (balances, balances_mut, Balances),
+        (randao_mixes, randao_mixes_mut, RandaoMixes),
+        (slashings, slashings_mut, Slashings),
+        (justification_bits, justification_bits_mut, JustificationBits),
+    ],
+);
 
 impl BeaconState {
     /// The validator at `index`.
