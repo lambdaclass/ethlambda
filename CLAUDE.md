@@ -294,6 +294,26 @@ The RPC crate serves the API router (`--api-port`, default 5052) and the metrics
 when they are equal it merges all three routers onto a single listener, so pointing both flags at
 one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Beacon Chain crate (`crates/beacon`)
+
+`ethlambda-beacon` implements the **Ethereum Beacon Chain** consensus specs
+(phase0 through fulu), which is a different protocol from the Lean consensus the
+rest of this repo implements. It depends on no other `ethlambda-*` crate and
+nothing depends on it.
+
+- Tests: `make test-beacon` (builds once per preset). `make test` deliberately
+  excludes it, so the Lean workflow needs no fixture download.
+- Fixtures: `make consensus-spec-tests`, pinned to a `consensus-specs` release.
+- Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
+  container bounds are const-generic arguments; fork scheduling is runtime
+  because the `transition` suite moves fork epochs per case.
+- Per-fork containers are plain structs behind an enum, so SSZ stays derived. See
+  [`docs/beacon_stf.md`](docs/beacon_stf.md) for why, including the fork-by-fork
+  field counts and the merkle depth change at electra.
+- **Needs mutable element access on `SszList`/`SszVector`**, which published
+  libssz 0.2.2 lacks. Currently built against a local `[patch.crates-io]`
+  override that is intentionally not committed.
+
 ## Configuration Files
 
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)

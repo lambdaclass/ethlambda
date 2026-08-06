@@ -7,6 +7,10 @@
 - [3SF-mini: Justification & Finalization](./3sf_mini.md)
 - [LMD-GHOST Fork Choice](./lmd_ghost.md)
 
+# Beacon Chain
+
+- [Beacon Chain State Transition](./beacon_stf.md)
+
 # Operations
 
 - [HTTP API](./rpc.md)
