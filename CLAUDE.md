@@ -303,6 +303,12 @@ nothing depends on it.
 
 - Tests: `make test-beacon` (builds once per preset). `make test` deliberately
   excludes it, so the Lean workflow needs no fixture download.
+- Every fixture case is its own test, named `<runner>/<fork>/<handler>/<suite>/<case>`,
+  so a failure names the case and not the suite around it. The spec binary
+  therefore supplies its own harness (`harness = false`), since a case is only
+  known once the fixture tree is walked. A substring filter selects a whole
+  suite or one case:
+  `cargo test -p ethlambda-beacon --test spec_tests -- electra/attester_slashing`.
 - Fixtures: `make consensus-spec-tests`, pinned to a `consensus-specs` release.
 - Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
   container bounds are const-generic arguments; fork scheduling is runtime

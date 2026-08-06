@@ -30,11 +30,14 @@
 //! routes to it by name, so once [`super::HIGHEST_IMPLEMENTED_FORK`] moves
 //! past this fork, [`fork_case`] finds its `pre` and `post` shapes on its own.
 
+use std::sync::Arc;
+
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::BeaconState;
 use ethlambda_beacon::upgrade::upgrade_state;
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect, map_cases};
+use super::{Case, PRESET, collect};
 
 /// Runs one case: decode `pre` in the source fork's shape, upgrade it, and
 /// compare against `post` by `hash_tree_root`.
@@ -73,19 +76,17 @@ fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn fork() {
-    let config = Config::active();
-    let mut report = Report::new();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect(PRESET, "fork", "fork");
+    let mut trials = vec![super::discovery_trial("fork", cases.len())];
 
-    let outcomes = map_cases(&cases, |case| {
-        case.in_scope().then(|| fork_case(case, &config))
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+    for case in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("fork", case, move |case| {
+            fork_case(case, &config)
+        }));
     }
 
-    report.finish("fork");
+    trials
 }

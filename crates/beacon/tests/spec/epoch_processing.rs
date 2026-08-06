@@ -40,12 +40,15 @@
 //!   adds `proposer_lookahead` of its own, likewise with no earlier-fork
 //!   counterpart.
 
+use std::sync::Arc;
+
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::BeaconState;
 use ethlambda_beacon::stf::epoch;
+use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, Report, collect_all_handlers, map_cases};
+use super::{Case, PRESET, collect_all_handlers};
 
 /// Runs the single epoch-processing step the handler names.
 fn apply(
@@ -154,73 +157,80 @@ fn apply(
     outcome.map_err(|err| format!("{err:?}"))
 }
 
-#[test]
-fn epoch_processing() {
-    let mut report = Report::new();
-    let config = Config::active();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "epoch_processing");
+    let mut trials = vec![super::discovery_trial("epoch_processing", cases.len())];
 
-    let outcomes = map_cases(&cases, |(handler, case)| {
-        if !case.in_scope() {
-            return None;
-        }
+    for (handler, case) in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("epoch_processing", case, move |case| {
+            let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
+                .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-        let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
-            .expect("the fixture's pre-state decodes");
-
-        let outcome = apply(handler, case.fork, &mut state, &config);
-        Some(super::check_transition(case, outcome, &state))
-    });
-
-    for ((_, case), outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+            let outcome = apply(&handler, case.fork, &mut state, &config);
+            super::check_transition(case, outcome, &state)
+        }));
     }
 
-    report.finish("epoch_processing");
+    trials.push(every_shipped_handler_is_dispatched());
+
+    trials
 }
 
-/// Handlers the fixture release ships that this runner does not dispatch.
+/// Builds the trial checking that every handler the fixture release ships is
+/// dispatched by [`apply`].
 ///
 /// A missing arm in `apply` would otherwise be reported per case as a failure,
-/// which is correct but noisy. This asserts the set of handlers is the one the
+/// which is correct but noisy. This checks the set of handlers is the one the
 /// runner knows about, so a fixture release that adds a step fails here, once,
 /// with a clear message. The list is flat across forks (it does not say which
 /// handler belongs to which fork) because that is exactly what [`apply`]'s
 /// `(handler, fork)` match already encodes and enforces at run time; duplicating
 /// it here would only give the two a chance to drift apart.
-#[test]
-fn every_shipped_handler_is_dispatched() {
-    let known = [
-        "justification_and_finalization",
-        "rewards_and_penalties",
-        "registry_updates",
-        "slashings",
-        "eth1_data_reset",
-        "effective_balance_updates",
-        "slashings_reset",
-        "randao_mixes_reset",
-        "historical_roots_update",
-        "historical_summaries_update",
-        "participation_record_updates",
-        "inactivity_updates",
-        "participation_flag_updates",
-        "sync_committee_updates",
-        "pending_deposits",
-        "pending_consolidations",
-        "proposer_lookahead",
-    ];
+///
+/// Built with [`Trial::test`] directly rather than [`super::case_trial`],
+/// since it checks the whole handler set rather than one fixture case.
+fn every_shipped_handler_is_dispatched() -> Trial {
+    Trial::test(
+        "epoch_processing/every_shipped_handler_is_dispatched",
+        || {
+            let known = [
+                "justification_and_finalization",
+                "rewards_and_penalties",
+                "registry_updates",
+                "slashings",
+                "eth1_data_reset",
+                "effective_balance_updates",
+                "slashings_reset",
+                "randao_mixes_reset",
+                "historical_roots_update",
+                "historical_summaries_update",
+                "participation_record_updates",
+                "inactivity_updates",
+                "participation_flag_updates",
+                "sync_committee_updates",
+                "pending_deposits",
+                "pending_consolidations",
+                "proposer_lookahead",
+            ];
 
-    let mut unknown: Vec<String> = collect_all_handlers(PRESET, "epoch_processing")
-        .into_iter()
-        .filter(|(_, case): &(String, Case)| case.in_scope())
-        .map(|(handler, _)| handler)
-        .filter(|handler| !known.contains(&handler.as_str()))
-        .collect();
-    unknown.sort_unstable();
-    unknown.dedup();
+            let mut unknown: Vec<String> = collect_all_handlers(PRESET, "epoch_processing")
+                .into_iter()
+                .filter(|(_, case): &(String, Case)| case.in_scope())
+                .map(|(handler, _)| handler)
+                .filter(|handler| !known.contains(&handler.as_str()))
+                .collect();
+            unknown.sort_unstable();
+            unknown.dedup();
 
-    assert!(
-        unknown.is_empty(),
-        "the fixture release ships epoch steps this runner does not dispatch: {unknown:?}"
-    );
+            if !unknown.is_empty() {
+                return Err(Failed::from(format!(
+                    "the fixture release ships epoch steps this runner does not dispatch: {unknown:?}"
+                )));
+            }
+
+            Ok(())
+        },
+    )
 }

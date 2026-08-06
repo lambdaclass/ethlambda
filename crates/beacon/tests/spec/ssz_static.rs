@@ -10,13 +10,11 @@
 //! implementation for every container, and it tests nothing the other two files
 //! do not already pin down.
 //!
-//! Containers this crate has not defined yet are counted and reported rather
-//! than passed over quietly, so the output never implies more coverage than
-//! there is. `LightClient*` is a special case within that bucket: this crate
-//! deliberately does not implement it, so those pairs are counted separately
-//! from a genuine gap rather than folded into the same count.
-
-use std::collections::BTreeSet;
+//! Containers this crate has not defined yet fail their own case instead of
+//! being passed over quietly, so the output never implies more coverage than
+//! there is. `LightClient*` is a special case within that: this crate
+//! deliberately does not implement it, so those cases are marked ignored
+//! instead of failed, distinct from a genuine gap. See [`trials`] for both.
 
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::containers::{
@@ -24,8 +22,9 @@ use ethlambda_beacon::containers::{
 };
 use ethlambda_beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect_all_handlers, map_cases};
+use super::{Case, PRESET, collect_all_handlers};
 
 /// Decodes a case, then checks its root and its re-encoding.
 fn check<T>(case: &Case) -> Result<(), String>
@@ -72,293 +71,279 @@ fn parse_root(hex_root: &str) -> Root {
     Root::from_slice(&bytes)
 }
 
-#[test]
-fn ssz_static() {
-    let mut report = Report::new();
-    let mut unimplemented: BTreeSet<String> = BTreeSet::new();
-    let mut light_client: BTreeSet<String> = BTreeSet::new();
-
+pub fn trials() -> Vec<Trial> {
     let cases = collect_all_handlers(PRESET, "ssz_static");
+    let mut trials = vec![super::discovery_trial("ssz_static", cases.len())];
 
-    let outcomes = map_cases(&cases, |(handler, case)| {
-        let fork = case.fork;
-
-        // The fork-invariant containers are checked against every fork's cases,
-        // since a container that does not change shape should decode identically
-        // under all of them. That is coverage for free, and it would catch a
-        // container wrongly believed to be fork-invariant.
-        let outcome = match handler.as_str() {
-            "Fork" => check::<shared::Fork>(case),
-            "ForkData" => check::<shared::ForkData>(case),
-            "Checkpoint" => check::<shared::Checkpoint>(case),
-            "Validator" => check::<shared::Validator>(case),
-            "AttestationData" => check::<shared::AttestationData>(case),
-            "Eth1Data" => check::<shared::Eth1Data>(case),
-            "Eth1Block" => check::<shared::Eth1Block>(case),
-            "DepositMessage" => check::<shared::DepositMessage>(case),
-            "DepositData" => check::<shared::DepositData>(case),
-            "Deposit" => check::<shared::Deposit>(case),
-            "SigningData" => check::<shared::SigningData>(case),
-            "HistoricalBatch" => check::<shared::HistoricalBatch>(case),
-            "HistoricalSummary" => check::<shared::HistoricalSummary>(case),
-            "BeaconBlockHeader" => check::<shared::BeaconBlockHeader>(case),
-            "SignedBeaconBlockHeader" => check::<shared::SignedBeaconBlockHeader>(case),
-            "ProposerSlashing" => check::<shared::ProposerSlashing>(case),
-            "VoluntaryExit" => check::<shared::VoluntaryExit>(case),
-            "SignedVoluntaryExit" => check::<shared::SignedVoluntaryExit>(case),
-
-            // Electra reshapes the attestation containers, widening the
-            // aggregation bits and attesting indices from one committee to a
-            // whole slot's worth, so phase0's definitions hold only through
-            // deneb, and electra's take over from electra on. Fulu makes no
-            // further change here, so electra's types cover it too.
-            "Attestation" if fork <= ForkName::Deneb => check::<phase0::Attestation>(case),
-            "Attestation" if fork >= ForkName::Electra => check::<electra::Attestation>(case),
-            "IndexedAttestation" if fork <= ForkName::Deneb => {
-                check::<phase0::IndexedAttestation>(case)
-            }
-            "IndexedAttestation" if fork >= ForkName::Electra => {
-                check::<electra::IndexedAttestation>(case)
-            }
-            "AttesterSlashing" if fork <= ForkName::Deneb => {
-                check::<phase0::AttesterSlashing>(case)
-            }
-            "AttesterSlashing" if fork >= ForkName::Electra => {
-                check::<electra::AttesterSlashing>(case)
-            }
-            "AggregateAndProof" if fork <= ForkName::Deneb => {
-                check::<phase0::AggregateAndProof>(case)
-            }
-            "AggregateAndProof" if fork >= ForkName::Electra => {
-                check::<electra::AggregateAndProof>(case)
-            }
-            "SignedAggregateAndProof" if fork <= ForkName::Deneb => {
-                check::<phase0::SignedAggregateAndProof>(case)
-            }
-            "SignedAggregateAndProof" if fork >= ForkName::Electra => {
-                check::<electra::SignedAggregateAndProof>(case)
-            }
-            // Pre-electra, a lone attester's unaggregated vote reused
-            // Attestation itself with one bit set, since aggregation_bits was
-            // already scoped to a single committee. Electra's
-            // aggregation_bits spans a whole slot, so a lone bit no longer
-            // says which committee it belongs to, and SingleAttestation
-            // exists to carry that index explicitly instead.
-            "SingleAttestation" if fork >= ForkName::Electra => {
-                check::<electra::SingleAttestation>(case)
-            }
-            // The fixtures ship this for every fork even though no state
-            // after phase0 holds one; that is upstream's choice, and checking
-            // it costs nothing.
-            "PendingAttestation" => check::<phase0::PendingAttestation>(case),
-
-            // The state changes shape in almost every fork, so it gets one
-            // arm per fork rather than a range, unlike the block family
-            // below.
-            "BeaconState" if fork == ForkName::Phase0 => check::<phase0::BeaconState>(case),
-            "BeaconState" if fork == ForkName::Altair => check::<altair::BeaconState>(case),
-            "BeaconState" if fork == ForkName::Bellatrix => check::<bellatrix::BeaconState>(case),
-            "BeaconState" if fork == ForkName::Capella => check::<capella::BeaconState>(case),
-            "BeaconState" if fork == ForkName::Deneb => check::<deneb::BeaconState>(case),
-            "BeaconState" if fork == ForkName::Electra => check::<electra::BeaconState>(case),
-            // Fulu appends proposer_lookahead to electra's state, so unlike
-            // the block family below it needs its own type here.
-            "BeaconState" if fork == ForkName::Fulu => check::<fulu::BeaconState>(case),
-
-            "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
-            "BeaconBlockBody" if fork == ForkName::Phase0 => check::<phase0::BeaconBlockBody>(case),
-            "SignedBeaconBlock" if fork == ForkName::Phase0 => {
-                check::<phase0::SignedBeaconBlock>(case)
-            }
-
-            "BeaconBlock" if fork == ForkName::Altair => check::<altair::BeaconBlock>(case),
-            "BeaconBlockBody" if fork == ForkName::Altair => check::<altair::BeaconBlockBody>(case),
-            "SignedBeaconBlock" if fork == ForkName::Altair => {
-                check::<altair::SignedBeaconBlock>(case)
-            }
-
-            "BeaconBlock" if fork == ForkName::Bellatrix => check::<bellatrix::BeaconBlock>(case),
-            "BeaconBlockBody" if fork == ForkName::Bellatrix => {
-                check::<bellatrix::BeaconBlockBody>(case)
-            }
-            "SignedBeaconBlock" if fork == ForkName::Bellatrix => {
-                check::<bellatrix::SignedBeaconBlock>(case)
-            }
-
-            "BeaconBlock" if fork == ForkName::Capella => check::<capella::BeaconBlock>(case),
-            "BeaconBlockBody" if fork == ForkName::Capella => {
-                check::<capella::BeaconBlockBody>(case)
-            }
-            "SignedBeaconBlock" if fork == ForkName::Capella => {
-                check::<capella::SignedBeaconBlock>(case)
-            }
-
-            "BeaconBlock" if fork == ForkName::Deneb => check::<deneb::BeaconBlock>(case),
-            "BeaconBlockBody" if fork == ForkName::Deneb => check::<deneb::BeaconBlockBody>(case),
-            "SignedBeaconBlock" if fork == ForkName::Deneb => {
-                check::<deneb::SignedBeaconBlock>(case)
-            }
-
-            // Fulu does not change the block's shape: its body still carries
-            // exactly the execution_payload and execution_requests electra's
-            // does, so there is no fulu::BeaconBlock, fulu::BeaconBlockBody,
-            // or fulu::SignedBeaconBlock to define. Electra's types are
-            // checked against both forks' cases instead of being duplicated,
-            // which is the same reasoning that lets the sync committee
-            // containers below use one type across many forks.
-            "BeaconBlock" if fork >= ForkName::Electra => check::<electra::BeaconBlock>(case),
-            "BeaconBlockBody" if fork >= ForkName::Electra => {
-                check::<electra::BeaconBlockBody>(case)
-            }
-            "SignedBeaconBlock" if fork >= ForkName::Electra => {
-                check::<electra::SignedBeaconBlock>(case)
-            }
-
-            // The sync committee containers arrive in altair and, unlike the
-            // state, do not change shape again, so they are checked against every
-            // fork from altair on.
-            "SyncCommittee" if fork >= ForkName::Altair => check::<altair::SyncCommittee>(case),
-            "SyncAggregate" if fork >= ForkName::Altair => check::<altair::SyncAggregate>(case),
-            "SyncCommitteeMessage" if fork >= ForkName::Altair => {
-                check::<altair::SyncCommitteeMessage>(case)
-            }
-            "SyncCommitteeContribution" if fork >= ForkName::Altair => {
-                check::<altair::SyncCommitteeContribution>(case)
-            }
-            "ContributionAndProof" if fork >= ForkName::Altair => {
-                check::<altair::ContributionAndProof>(case)
-            }
-            "SignedContributionAndProof" if fork >= ForkName::Altair => {
-                check::<altair::SignedContributionAndProof>(case)
-            }
-            "SyncAggregatorSelectionData" if fork >= ForkName::Altair => {
-                check::<altair::SyncAggregatorSelectionData>(case)
-            }
-
-            // The execution payload pair changes shape at bellatrix, capella,
-            // and deneb, then holds steady: neither electra nor fulu touches
-            // it, since their own changes land elsewhere (the attestation and
-            // pending-queue containers above, and fulu's proposer lookahead),
-            // so deneb's definitions cover deneb, electra, and fulu alike.
-            "ExecutionPayload" if fork == ForkName::Bellatrix => {
-                check::<bellatrix::ExecutionPayload>(case)
-            }
-            "ExecutionPayloadHeader" if fork == ForkName::Bellatrix => {
-                check::<bellatrix::ExecutionPayloadHeader>(case)
-            }
-            "ExecutionPayload" if fork == ForkName::Capella => {
-                check::<capella::ExecutionPayload>(case)
-            }
-            "ExecutionPayloadHeader" if fork == ForkName::Capella => {
-                check::<capella::ExecutionPayloadHeader>(case)
-            }
-            "ExecutionPayload" if fork >= ForkName::Deneb => check::<deneb::ExecutionPayload>(case),
-            "ExecutionPayloadHeader" if fork >= ForkName::Deneb => {
-                check::<deneb::ExecutionPayloadHeader>(case)
-            }
-
-            // Transcribed from fork-choice.md rather than beacon-chain.md, and
-            // unchanged since the merge introduced it, so one type covers
-            // every fork that carries it.
-            "PowBlock" if fork >= ForkName::Bellatrix => check::<bellatrix::PowBlock>(case),
-
-            // The withdrawal machinery arrives in capella and does not change
-            // shape again through fulu.
-            "Withdrawal" if fork >= ForkName::Capella => check::<capella::Withdrawal>(case),
-            "BLSToExecutionChange" if fork >= ForkName::Capella => {
-                check::<capella::BLSToExecutionChange>(case)
-            }
-            "SignedBLSToExecutionChange" if fork >= ForkName::Capella => {
-                check::<capella::SignedBLSToExecutionChange>(case)
-            }
-
-            // Blob wire types arrive in deneb and are unchanged by fulu's data
-            // column sampling: sampling changes how the data behind a blob's
-            // commitment travels over the network, not the blob sidecar or
-            // identifier themselves, so both keep deneb's shape through fulu.
-            "BlobIdentifier" if fork >= ForkName::Deneb => check::<deneb::BlobIdentifier>(case),
-            "BlobSidecar" if fork >= ForkName::Deneb => check::<deneb::BlobSidecar>(case),
-
-            // Electra's balance-churn queues and execution-layer-triggered
-            // requests are unchanged by fulu, so one set of types covers both.
-            "DepositRequest" if fork >= ForkName::Electra => check::<electra::DepositRequest>(case),
-            "WithdrawalRequest" if fork >= ForkName::Electra => {
-                check::<electra::WithdrawalRequest>(case)
-            }
-            "ConsolidationRequest" if fork >= ForkName::Electra => {
-                check::<electra::ConsolidationRequest>(case)
-            }
-            "ExecutionRequests" if fork >= ForkName::Electra => {
-                check::<electra::ExecutionRequests>(case)
-            }
-            "PendingDeposit" if fork >= ForkName::Electra => check::<electra::PendingDeposit>(case),
-            "PendingPartialWithdrawal" if fork >= ForkName::Electra => {
-                check::<electra::PendingPartialWithdrawal>(case)
-            }
-            "PendingConsolidation" if fork >= ForkName::Electra => {
-                check::<electra::PendingConsolidation>(case)
-            }
-
-            // Data availability sampling is fulu-only: no earlier fork has
-            // these containers at all.
-            "DataColumnSidecar" if fork == ForkName::Fulu => check::<fulu::DataColumnSidecar>(case),
-            "MatrixEntry" if fork == ForkName::Fulu => check::<fulu::MatrixEntry>(case),
-            "DataColumnsByRootIdentifier" if fork == ForkName::Fulu => {
-                check::<fulu::DataColumnsByRootIdentifier>(case)
-            }
-
-            // No arm matched, so this crate has no container for the pair. Which
-            // of the two lists below it belongs in is decided in the fold, not
-            // here, since both are shared bookkeeping that a parallel closure
-            // cannot touch.
-            _ => return None,
-        };
-
-        Some(outcome)
-    });
-
-    for ((handler, case), outcome) in cases.iter().zip(outcomes) {
-        let fork = case.fork;
-        match outcome {
-            Some(outcome) => report.record(case, outcome),
-            // LightClient* is deliberately out of scope for this crate, so it
-            // is tracked apart from any other handler that falls through: a
-            // nonempty light_client set is expected, but a nonempty
-            // unimplemented set means some handler this crate should cover has
-            // gone unmapped.
-            None if handler.starts_with("LightClient") => {
-                light_client.insert(format!("{fork}/{handler}"));
-            }
-            None => {
-                unimplemented.insert(format!("{fork}/{handler}"));
-            }
+    for (handler, case) in cases {
+        // `LightClient*` is deliberately out of scope for this crate, so a
+        // pair with this prefix is marked ignored directly rather than run
+        // through `case_trial`: `case_trial`'s own ignored flag answers a
+        // different question (whether the case's *fork* is implemented), and
+        // every one of these pairs has a fork this crate does implement. The
+        // name still matches `case_trial`'s own shape so the two stay uniform
+        // in the test list.
+        if handler.starts_with("LightClient") {
+            let name = format!("ssz_static/{}", case.id());
+            trials.push(Trial::test(name, || Ok(())).with_ignored_flag(true));
+            continue;
         }
+
+        trials.push(super::case_trial("ssz_static", case, move |case| {
+            let fork = case.fork;
+
+            // The fork-invariant containers are checked against every fork's cases,
+            // since a container that does not change shape should decode identically
+            // under all of them. That is coverage for free, and it would catch a
+            // container wrongly believed to be fork-invariant.
+            match handler.as_str() {
+                "Fork" => check::<shared::Fork>(case),
+                "ForkData" => check::<shared::ForkData>(case),
+                "Checkpoint" => check::<shared::Checkpoint>(case),
+                "Validator" => check::<shared::Validator>(case),
+                "AttestationData" => check::<shared::AttestationData>(case),
+                "Eth1Data" => check::<shared::Eth1Data>(case),
+                "Eth1Block" => check::<shared::Eth1Block>(case),
+                "DepositMessage" => check::<shared::DepositMessage>(case),
+                "DepositData" => check::<shared::DepositData>(case),
+                "Deposit" => check::<shared::Deposit>(case),
+                "SigningData" => check::<shared::SigningData>(case),
+                "HistoricalBatch" => check::<shared::HistoricalBatch>(case),
+                "HistoricalSummary" => check::<shared::HistoricalSummary>(case),
+                "BeaconBlockHeader" => check::<shared::BeaconBlockHeader>(case),
+                "SignedBeaconBlockHeader" => check::<shared::SignedBeaconBlockHeader>(case),
+                "ProposerSlashing" => check::<shared::ProposerSlashing>(case),
+                "VoluntaryExit" => check::<shared::VoluntaryExit>(case),
+                "SignedVoluntaryExit" => check::<shared::SignedVoluntaryExit>(case),
+
+                // Electra reshapes the attestation containers, widening the
+                // aggregation bits and attesting indices from one committee to a
+                // whole slot's worth, so phase0's definitions hold only through
+                // deneb, and electra's take over from electra on. Fulu makes no
+                // further change here, so electra's types cover it too.
+                "Attestation" if fork <= ForkName::Deneb => check::<phase0::Attestation>(case),
+                "Attestation" if fork >= ForkName::Electra => check::<electra::Attestation>(case),
+                "IndexedAttestation" if fork <= ForkName::Deneb => {
+                    check::<phase0::IndexedAttestation>(case)
+                }
+                "IndexedAttestation" if fork >= ForkName::Electra => {
+                    check::<electra::IndexedAttestation>(case)
+                }
+                "AttesterSlashing" if fork <= ForkName::Deneb => {
+                    check::<phase0::AttesterSlashing>(case)
+                }
+                "AttesterSlashing" if fork >= ForkName::Electra => {
+                    check::<electra::AttesterSlashing>(case)
+                }
+                "AggregateAndProof" if fork <= ForkName::Deneb => {
+                    check::<phase0::AggregateAndProof>(case)
+                }
+                "AggregateAndProof" if fork >= ForkName::Electra => {
+                    check::<electra::AggregateAndProof>(case)
+                }
+                "SignedAggregateAndProof" if fork <= ForkName::Deneb => {
+                    check::<phase0::SignedAggregateAndProof>(case)
+                }
+                "SignedAggregateAndProof" if fork >= ForkName::Electra => {
+                    check::<electra::SignedAggregateAndProof>(case)
+                }
+                // Pre-electra, a lone attester's unaggregated vote reused
+                // Attestation itself with one bit set, since aggregation_bits was
+                // already scoped to a single committee. Electra's
+                // aggregation_bits spans a whole slot, so a lone bit no longer
+                // says which committee it belongs to, and SingleAttestation
+                // exists to carry that index explicitly instead.
+                "SingleAttestation" if fork >= ForkName::Electra => {
+                    check::<electra::SingleAttestation>(case)
+                }
+                // The fixtures ship this for every fork even though no state
+                // after phase0 holds one; that is upstream's choice, and checking
+                // it costs nothing.
+                "PendingAttestation" => check::<phase0::PendingAttestation>(case),
+
+                // The state changes shape in almost every fork, so it gets one
+                // arm per fork rather than a range, unlike the block family
+                // below.
+                "BeaconState" if fork == ForkName::Phase0 => check::<phase0::BeaconState>(case),
+                "BeaconState" if fork == ForkName::Altair => check::<altair::BeaconState>(case),
+                "BeaconState" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::BeaconState>(case)
+                }
+                "BeaconState" if fork == ForkName::Capella => check::<capella::BeaconState>(case),
+                "BeaconState" if fork == ForkName::Deneb => check::<deneb::BeaconState>(case),
+                "BeaconState" if fork == ForkName::Electra => check::<electra::BeaconState>(case),
+                // Fulu appends proposer_lookahead to electra's state, so unlike
+                // the block family below it needs its own type here.
+                "BeaconState" if fork == ForkName::Fulu => check::<fulu::BeaconState>(case),
+
+                "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Phase0 => {
+                    check::<phase0::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Phase0 => {
+                    check::<phase0::SignedBeaconBlock>(case)
+                }
+
+                "BeaconBlock" if fork == ForkName::Altair => check::<altair::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Altair => {
+                    check::<altair::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Altair => {
+                    check::<altair::SignedBeaconBlock>(case)
+                }
+
+                "BeaconBlock" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::BeaconBlock>(case)
+                }
+                "BeaconBlockBody" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::SignedBeaconBlock>(case)
+                }
+
+                "BeaconBlock" if fork == ForkName::Capella => check::<capella::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Capella => {
+                    check::<capella::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Capella => {
+                    check::<capella::SignedBeaconBlock>(case)
+                }
+
+                "BeaconBlock" if fork == ForkName::Deneb => check::<deneb::BeaconBlock>(case),
+                "BeaconBlockBody" if fork == ForkName::Deneb => {
+                    check::<deneb::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork == ForkName::Deneb => {
+                    check::<deneb::SignedBeaconBlock>(case)
+                }
+
+                // Fulu does not change the block's shape: its body still carries
+                // exactly the execution_payload and execution_requests electra's
+                // does, so there is no fulu::BeaconBlock, fulu::BeaconBlockBody,
+                // or fulu::SignedBeaconBlock to define. Electra's types are
+                // checked against both forks' cases instead of being duplicated,
+                // which is the same reasoning that lets the sync committee
+                // containers below use one type across many forks.
+                "BeaconBlock" if fork >= ForkName::Electra => check::<electra::BeaconBlock>(case),
+                "BeaconBlockBody" if fork >= ForkName::Electra => {
+                    check::<electra::BeaconBlockBody>(case)
+                }
+                "SignedBeaconBlock" if fork >= ForkName::Electra => {
+                    check::<electra::SignedBeaconBlock>(case)
+                }
+
+                // The sync committee containers arrive in altair and, unlike the
+                // state, do not change shape again, so they are checked against every
+                // fork from altair on.
+                "SyncCommittee" if fork >= ForkName::Altair => check::<altair::SyncCommittee>(case),
+                "SyncAggregate" if fork >= ForkName::Altair => check::<altair::SyncAggregate>(case),
+                "SyncCommitteeMessage" if fork >= ForkName::Altair => {
+                    check::<altair::SyncCommitteeMessage>(case)
+                }
+                "SyncCommitteeContribution" if fork >= ForkName::Altair => {
+                    check::<altair::SyncCommitteeContribution>(case)
+                }
+                "ContributionAndProof" if fork >= ForkName::Altair => {
+                    check::<altair::ContributionAndProof>(case)
+                }
+                "SignedContributionAndProof" if fork >= ForkName::Altair => {
+                    check::<altair::SignedContributionAndProof>(case)
+                }
+                "SyncAggregatorSelectionData" if fork >= ForkName::Altair => {
+                    check::<altair::SyncAggregatorSelectionData>(case)
+                }
+
+                // The execution payload pair changes shape at bellatrix, capella,
+                // and deneb, then holds steady: neither electra nor fulu touches
+                // it, since their own changes land elsewhere (the attestation and
+                // pending-queue containers above, and fulu's proposer lookahead),
+                // so deneb's definitions cover deneb, electra, and fulu alike.
+                "ExecutionPayload" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::ExecutionPayload>(case)
+                }
+                "ExecutionPayloadHeader" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::ExecutionPayloadHeader>(case)
+                }
+                "ExecutionPayload" if fork == ForkName::Capella => {
+                    check::<capella::ExecutionPayload>(case)
+                }
+                "ExecutionPayloadHeader" if fork == ForkName::Capella => {
+                    check::<capella::ExecutionPayloadHeader>(case)
+                }
+                "ExecutionPayload" if fork >= ForkName::Deneb => {
+                    check::<deneb::ExecutionPayload>(case)
+                }
+                "ExecutionPayloadHeader" if fork >= ForkName::Deneb => {
+                    check::<deneb::ExecutionPayloadHeader>(case)
+                }
+
+                // Transcribed from fork-choice.md rather than beacon-chain.md, and
+                // unchanged since the merge introduced it, so one type covers
+                // every fork that carries it.
+                "PowBlock" if fork >= ForkName::Bellatrix => check::<bellatrix::PowBlock>(case),
+
+                // The withdrawal machinery arrives in capella and does not change
+                // shape again through fulu.
+                "Withdrawal" if fork >= ForkName::Capella => check::<capella::Withdrawal>(case),
+                "BLSToExecutionChange" if fork >= ForkName::Capella => {
+                    check::<capella::BLSToExecutionChange>(case)
+                }
+                "SignedBLSToExecutionChange" if fork >= ForkName::Capella => {
+                    check::<capella::SignedBLSToExecutionChange>(case)
+                }
+
+                // Blob wire types arrive in deneb and are unchanged by fulu's data
+                // column sampling: sampling changes how the data behind a blob's
+                // commitment travels over the network, not the blob sidecar or
+                // identifier themselves, so both keep deneb's shape through fulu.
+                "BlobIdentifier" if fork >= ForkName::Deneb => check::<deneb::BlobIdentifier>(case),
+                "BlobSidecar" if fork >= ForkName::Deneb => check::<deneb::BlobSidecar>(case),
+
+                // Electra's balance-churn queues and execution-layer-triggered
+                // requests are unchanged by fulu, so one set of types covers both.
+                "DepositRequest" if fork >= ForkName::Electra => {
+                    check::<electra::DepositRequest>(case)
+                }
+                "WithdrawalRequest" if fork >= ForkName::Electra => {
+                    check::<electra::WithdrawalRequest>(case)
+                }
+                "ConsolidationRequest" if fork >= ForkName::Electra => {
+                    check::<electra::ConsolidationRequest>(case)
+                }
+                "ExecutionRequests" if fork >= ForkName::Electra => {
+                    check::<electra::ExecutionRequests>(case)
+                }
+                "PendingDeposit" if fork >= ForkName::Electra => {
+                    check::<electra::PendingDeposit>(case)
+                }
+                "PendingPartialWithdrawal" if fork >= ForkName::Electra => {
+                    check::<electra::PendingPartialWithdrawal>(case)
+                }
+                "PendingConsolidation" if fork >= ForkName::Electra => {
+                    check::<electra::PendingConsolidation>(case)
+                }
+
+                // Data availability sampling is fulu-only: no earlier fork has
+                // these containers at all.
+                "DataColumnSidecar" if fork == ForkName::Fulu => {
+                    check::<fulu::DataColumnSidecar>(case)
+                }
+                "MatrixEntry" if fork == ForkName::Fulu => check::<fulu::MatrixEntry>(case),
+                "DataColumnsByRootIdentifier" if fork == ForkName::Fulu => {
+                    check::<fulu::DataColumnsByRootIdentifier>(case)
+                }
+
+                // No arm matched, so this crate has no container for this
+                // handler/fork pair, and this is not `LightClient*` (that
+                // prefix is filtered out above before this trial is even
+                // built). That makes this a genuine gap: a handler this crate
+                // should cover has gone unmapped, so the case fails loudly
+                // instead of being silently skipped.
+                _ => Err(format!("no container is mapped for {fork}/{handler}")),
+            }
+        }));
     }
 
-    if !light_client.is_empty() {
-        println!(
-            "ssz_static: {} LightClient* container/fork pairs skipped, out of \
-             scope for this crate:\n  {}",
-            light_client.len(),
-            light_client
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
-    }
-
-    if !unimplemented.is_empty() {
-        println!(
-            "ssz_static: {} container/fork pairs not implemented yet:\n  {}",
-            unimplemented.len(),
-            unimplemented
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
-    }
-
-    report.finish("ssz_static");
+    trials
 }

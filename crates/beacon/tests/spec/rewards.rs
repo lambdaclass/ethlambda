@@ -35,6 +35,8 @@
 //! functions that produce them, serve every fork through fulu; the fixture
 //! directories confirm this, shipping the same four files from altair on.
 
+use std::sync::Arc;
+
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::constants::{
@@ -47,8 +49,9 @@ use ethlambda_beacon::stf::epoch::rewards;
 use libssz::SszDecode;
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
+use libtest_mimic::Trial;
 
-use super::{PRESET, Report, collect_all_handlers, map_cases};
+use super::{PRESET, collect_all_handlers};
 
 /// One component's reward and penalty per validator, as the fixtures encode it.
 ///
@@ -159,21 +162,17 @@ fn components(
         .collect()
 }
 
-#[test]
-fn rewards() {
-    let mut report = Report::new();
-    let config = Config::active();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "rewards");
+    let mut trials = vec![super::discovery_trial("rewards", cases.len())];
 
-    let outcomes = map_cases(&cases, |(_handler, case)| {
-        if !case.in_scope() {
-            return None;
-        }
+    for (_handler, case) in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("rewards", case, move |case| {
+            let state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
+                .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-        let state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
-            .expect("the fixture's pre-state decodes");
-
-        Some((|| {
             for (name, computed) in components(case.fork, &state, &config)? {
                 let bytes = case.ssz_bytes(name);
                 let expected = Deltas::from_ssz_bytes(&bytes)
@@ -182,12 +181,8 @@ fn rewards() {
             }
 
             Ok(())
-        })())
-    });
-
-    for ((_, case), outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+        }));
     }
 
-    report.finish("rewards");
+    trials
 }

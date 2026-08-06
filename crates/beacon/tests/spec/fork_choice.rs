@@ -93,6 +93,8 @@
 //! [`decode_signed_block`] just decodes it directly through
 //! [`SignedBeaconBlock::from_ssz`].
 
+use std::sync::Arc;
+
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::{
@@ -104,8 +106,9 @@ use ethlambda_beacon::preset;
 use ethlambda_beacon::primitives::{KzgProof, Root};
 use libssz::SszDecode;
 use libssz_types::SszList;
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect_all_handlers, map_cases};
+use super::{Case, PRESET, collect_all_handlers};
 
 // ---------------------------------------------------------------------------
 // `steps.yaml` deserialization
@@ -838,19 +841,20 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn fork_choice() {
-    let config = Config::active();
-    let mut report = Report::new();
+/// The handler half of [`collect_all_handlers`]'s pair is discarded: every
+/// case in this suite runs through [`run_case`] the same way regardless of
+/// which handler it came from, unlike `ssz_static`, which dispatches on it.
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "fork_choice");
+    let mut trials = vec![super::discovery_trial("fork_choice", cases.len())];
 
-    let outcomes = map_cases(&cases, |(_handler, case)| {
-        case.in_scope().then(|| run_case(case, &config))
-    });
-
-    for ((_, case), outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+    for (_handler, case) in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("fork_choice", case, move |case| {
+            run_case(case, &config)
+        }));
     }
 
-    report.finish("fork_choice");
+    trials
 }

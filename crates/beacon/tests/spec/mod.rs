@@ -28,27 +28,25 @@
     reason = "each runner uses a different part of this harness"
 )]
 
-mod epoch_processing;
-mod fork;
-mod fork_choice;
-mod genesis;
-mod harness;
-mod operations;
-mod rewards;
-mod sanity;
-mod shuffling;
-mod ssz_static;
-mod transition;
+pub mod epoch_processing;
+pub mod fork;
+pub mod fork_choice;
+pub mod genesis;
+pub mod harness;
+pub mod operations;
+pub mod rewards;
+pub mod sanity;
+pub mod shuffling;
+pub mod ssz_static;
+pub mod transition;
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::containers::BeaconState;
 use libssz::SszDecode;
-use rayon::prelude::*;
+use libtest_mimic::{Failed, Trial};
 use serde::de::DeserializeOwned;
 
 /// The configuration directory whose fixtures match the compiled-in preset.
@@ -60,14 +58,14 @@ pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
 
 /// The newest fork whose state transition this crate implements.
 ///
-/// Every runner gates on this and *counts and reports* the cases it skips, so
-/// the output can never imply more coverage than exists. Turning on a fork is
-/// a one-line change here once its state transition lands: bump this constant
-/// and every runner that uses [`Case::in_scope`] (or [`Report::skip`]) picks up
-/// that fork's cases on its own, with no other edit required to the gate
-/// itself. A runner may still need its own edit to *map* a fork's new or
-/// changed handlers to the right function, since that mapping is specific to
-/// each runner; only the gate is one line.
+/// Every runner gates on this, and a case past it becomes an ignored test
+/// rather than a missing one, so the output can never imply more coverage than
+/// exists. Turning on a fork is a one-line change here once its state
+/// transition lands: bump this constant and every runner picks up that fork's
+/// cases on its own, since [`case_trial`] reads the gate itself. A runner may
+/// still need its own edit to *map* a fork's new or changed handlers to the
+/// right function, since that mapping is specific to each runner; only the gate
+/// is one line.
 pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Fulu;
 
 /// The root of the extracted fixture tree.
@@ -169,8 +167,8 @@ impl Case {
     /// Whether this case's fork has a state transition this crate implements.
     ///
     /// The one gate every runner checks before running a case. Forks after
-    /// [`HIGHEST_IMPLEMENTED_FORK`] fail this and must be routed to
-    /// [`Report::skip`] rather than run, so a fixture release this crate has
+    /// [`HIGHEST_IMPLEMENTED_FORK`] fail this, and [`case_trial`] marks such a
+    /// case ignored rather than running it, so a fixture release this crate has
     /// only partially caught up with is never misreported as fully covered.
     pub fn in_scope(&self) -> bool {
         self.fork <= HIGHEST_IMPLEMENTED_FORK
@@ -264,30 +262,61 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
     entries
 }
 
-/// Runs `run` over every case at once, returning the outcomes in fixture order.
+/// Wraps one fixture case as a test of its own.
 ///
-/// Every runner is a loop over independent cases: each is a directory of inputs
-/// and one expected output, sharing no state with its neighbours, so the loop was
-/// the only thing holding a whole suite to a single core. The test harness does
-/// run the suites concurrently, but that parallelism is as coarse as the suites
-/// are uneven, and the slowest one alone sets the wall clock.
+/// Each case becomes a separate entry in the test binary, named for the case
+/// rather than for the suite around it, so a failure points at the one case that
+/// failed and every other case in that suite still reports its own result. The
+/// suites used to be one test apiece, aggregating outcomes and failing as a
+/// whole, which meant a single bad case marked thousands of passing ones as part
+/// of a failed test and the name in the output was the suite's.
 ///
-/// Rayon's pool is process-wide, and relying on that is the point rather than an
-/// incidental detail: several suites call this at the same time, and one shared
-/// pool keeps the total number of cases in flight at the core count however many
-/// of them are running, where a pool per suite would oversubscribe by the number
-/// of suites and multiply peak memory by it too, since a case in flight holds
-/// whole beacon states.
+/// The name is prefixed with `runner` so that a filter can select a whole suite
+/// (`cargo test --test spec_tests -- operations`) as well as one case. The
+/// runner name is not part of [`Case::id`], which starts at the fork, so nothing
+/// is repeated here.
 ///
-/// Outcomes come back in the input order, which is the order the sequential loop
-/// reported them in, so a failure list stays comparable between runs for the
-/// same reason [`read_dir_sorted`] sorts.
-pub fn map_cases<C, R>(cases: &[C], run: impl Fn(&C) -> R + Send + Sync) -> Vec<R>
-where
-    C: Send + Sync,
-    R: Send,
-{
-    cases.par_iter().map(run).collect()
+/// A case whose fork this crate does not implement is marked ignored rather than
+/// run, which is what [`Case::in_scope`] gates. The harness used to tally those
+/// itself and print the count; the test harness counts ignored tests already,
+/// and names each one, which is strictly more than the tally said.
+///
+/// A panic inside `run` fails this case alone: the harness catches it per test.
+/// So a fixture that will not decode takes its own case down and no other.
+pub fn case_trial(
+    runner: &str,
+    case: Case,
+    run: impl FnOnce(&Case) -> Result<(), String> + Send + 'static,
+) -> Trial {
+    let ignored = !case.in_scope();
+    let name = format!("{runner}/{}", case.id());
+    Trial::test(name, move || run(&case).map_err(Failed::from)).with_ignored_flag(ignored)
+}
+
+/// Asserts a suite matched at least one fixture case.
+///
+/// The aggregate each suite used to report through carried this check, and
+/// dropping it along with that aggregate would have quietly given up the thing
+/// it guarded: a suite whose
+/// fixtures moved, or whose runner or handler name went stale upstream, matches
+/// nothing, and a run of no cases at all passes. Per-case tests make that worse
+/// rather than better, since a suite that matches nothing now contributes no
+/// tests to even look for. Hence one test per suite whose whole job is to fail
+/// when the suite is empty.
+///
+/// A case that matched but was skipped still counts as matching: the fixture
+/// layout is fine, this crate just does not implement that fork yet, which is
+/// what the ignored tests report.
+pub fn discovery_trial(runner: &str, matched: usize) -> Trial {
+    let runner = runner.to_string();
+    Trial::test(format!("{runner}/matched_fixture_cases"), move || {
+        if matched == 0 {
+            return Err(Failed::from(format!(
+                "{runner} matched no fixture cases; the fixture layout or the suite name is wrong"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Judges a state transition against what the case expects.
@@ -328,125 +357,5 @@ pub fn check_transition(
             Err("accepted, but the case has no post-state, so it must be rejected".to_string())
         }
         (false, Err(_)) => Ok(()),
-    }
-}
-
-/// Accumulates per-case results so one run reports every failure instead of
-/// stopping at the first, and so a suite that matched no case fails loudly.
-///
-/// Also accumulates skips, through [`Report::skip`], so that "not yet
-/// implemented" and "matched nothing at all" stay distinguishable in
-/// [`finish`](Report::finish)'s output: the former is expected and printed,
-/// the latter is the "fixture layout or the suite name is wrong" failure this
-/// harness has always guarded against.
-pub struct Report {
-    /// When the runner started, so [`finish`](Report::finish) can report how
-    /// long the suite took. Printed per suite rather than left to the harness's
-    /// one total, because that total cannot say which suite to look at.
-    started: Instant,
-    passed: usize,
-    skipped: usize,
-    /// Which forks the skipped cases came from, for the summary line.
-    /// A set rather than a count per fork, since the count is rarely
-    /// interesting and the *names* are what tell a reader how far behind the
-    /// suite still is.
-    skipped_forks: BTreeSet<ForkName>,
-    failures: Vec<String>,
-}
-
-impl Default for Report {
-    fn default() -> Self {
-        Self {
-            started: Instant::now(),
-            passed: 0,
-            skipped: 0,
-            skipped_forks: BTreeSet::new(),
-            failures: Vec::new(),
-        }
-    }
-}
-
-impl Report {
-    /// Starts a report, and with it the clock the suite is timed against, so a
-    /// runner should build one before discovering its cases rather than after.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records the outcome of one case.
-    pub fn record(&mut self, case: &Case, outcome: Result<(), String>) {
-        match outcome {
-            Ok(()) => self.passed += 1,
-            Err(message) => self.failures.push(format!("{}: {message}", case.id())),
-        }
-    }
-
-    /// Records that `case` was not run because its fork is not yet
-    /// implemented (see [`Case::in_scope`] and [`HIGHEST_IMPLEMENTED_FORK`]).
-    ///
-    /// Counting the skip, rather than just `continue`-ing past the case
-    /// unrecorded, is what keeps a fixture release this crate has only
-    /// partially caught up with from silently looking like full coverage:
-    /// [`finish`](Report::finish) prints this count, and the forks it came
-    /// from, alongside the pass/fail tally.
-    pub fn skip(&mut self, case: &Case) {
-        self.skipped += 1;
-        self.skipped_forks.insert(case.fork);
-    }
-
-    /// Records one case's outcome, where `None` means the case was skipped.
-    ///
-    /// The half of [`map_cases`] that runs back on one thread. A runner's
-    /// parallel closure cannot call [`record`](Report::record) or
-    /// [`skip`](Report::skip) itself, since both need `&mut Report` and the
-    /// closure is shared across the pool, so it returns what happened instead
-    /// and this folds the sequence afterwards. Folding is cheap next to running
-    /// the cases, and it keeps failure ordering deterministic.
-    pub fn record_or_skip(&mut self, case: &Case, outcome: Option<Result<(), String>>) {
-        match outcome {
-            Some(outcome) => self.record(case, outcome),
-            None => self.skip(case),
-        }
-    }
-
-    /// Fails the test if any case failed, or if no case was even matched.
-    ///
-    /// A case that matched but was skipped still counts toward "matched
-    /// something": the fixture layout and suite name are fine, this crate
-    /// just is not caught up with every fork yet, and that is what the skip
-    /// line below reports.
-    pub fn finish(self, suite: &str) {
-        assert!(
-            self.passed > 0 || !self.failures.is_empty() || self.skipped > 0,
-            "{suite} matched no fixture cases; the fixture layout or the suite name is wrong"
-        );
-
-        // Printed before the failure assert, not after. Panicking first would
-        // throw away the pass and skip counts in exactly the situation they are
-        // most useful: working out whether a suite failed on two cases or on two
-        // hundred, and how much of the tree it even reached, without first
-        // reading through every failure line.
-        if self.skipped > 0 {
-            let forks: Vec<String> = self.skipped_forks.iter().map(ForkName::to_string).collect();
-            println!(
-                "{suite}: {} cases skipped, from forks after {HIGHEST_IMPLEMENTED_FORK}: {}",
-                self.skipped,
-                forks.join(", ")
-            );
-        }
-        println!(
-            "{suite}: {} of {} cases passed in {:.1?}",
-            self.passed,
-            self.passed + self.failures.len(),
-            self.started.elapsed()
-        );
-
-        assert!(
-            self.failures.is_empty(),
-            "{} of {} {suite} cases failed:\n{}",
-            self.failures.len(),
-            self.failures.len() + self.passed,
-            self.failures.join("\n")
-        );
     }
 }

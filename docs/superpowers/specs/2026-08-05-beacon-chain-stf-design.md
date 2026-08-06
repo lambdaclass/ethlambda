@@ -245,12 +245,22 @@ The mainnet spec suite went from 1576s to about 106s. Two causes:
    `sha2` compiles the portable scalar backend on aarch64 regardless of what
    the CPU supports, and merkleization is almost entirely SHA-256
    compressions.
-2. `map_cases` (`tests/spec/mod.rs`) runs each suite's independent cases on
-   rayon's pool. The pool is process-wide on purpose: the harness runs suites
-   concurrently, and one shared pool keeps the number of cases in flight at
-   the core count regardless of how many suites are running. A pool per suite
-   would oversubscribe by the number of suites, and multiply peak memory by
-   it too, since a case in flight holds a whole beacon state.
+2. Every fixture case is its own test, so the harness runs them concurrently at
+   one case per work item, which is finer-grained than a suite-per-test layout
+   could balance.
+
+CPU time separates the two, since parallelism cannot reduce it: 3041s to 928s
+is 3.3x from the hashing change alone, and the wall clock's 14.9x leaves 4.9x
+for the parallelism.
+
+The spec binary supplies its own harness for this (`harness = false`, with
+`libtest_mimic`), because a fixture case is not known until the fixture tree is
+walked and `#[test]` needs its tests at compile time. Each case is named,
+counted, filtered, and attributed on its own, so a failure names the case rather
+than the suite around it. See `docs/beacon_stf.md` for what that arrangement has
+to be careful about: an out-of-scope fork becomes an ignored test, and a
+`<runner>/matched_fixture_cases` test per suite preserves the guard against a
+suite that matches nothing.
 
 ### Differential fuzzing
 
@@ -330,7 +340,7 @@ Chosen to match ethrex where ethrex has made the choice.
 | `snap` | 1.1.1 | Fixture decompression |
 | `num-bigint` | 0.4.6 | Reduction mod r in the Fiat-Shamir challenges |
 | `serde`, `serde_yaml_ng`, `hex`, `thiserror`, `tracing` | workspace | Existing workspace versions |
-| `rayon` | workspace, dev-dependency only | Runs each suite's fixture cases concurrently (see "Performance" above) |
+| `libtest-mimic` | 0.8.2, dev-dependency only | Supplies the spec binary's harness, so each fixture case is its own test (see "Performance" above) |
 
 `c-kzg` does not export `compute_challenge` or the cell-proof batch challenge,
 both of which have their own fixture handlers, so `kzg.rs` implements those two

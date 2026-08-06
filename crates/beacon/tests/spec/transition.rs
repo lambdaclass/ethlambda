@@ -64,14 +64,17 @@
 //! boundary slot for that case, which is the same thing a real chain does when
 //! it produces no block for the epoch a fork activates in.
 
+use std::sync::Arc;
+
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_beacon::helpers::misc::compute_start_slot_at_epoch;
 use ethlambda_beacon::primitives::Epoch;
 use ethlambda_beacon::stf::{self, ExecutionEngine};
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect, map_cases};
+use super::{Case, PRESET, collect};
 
 /// One case's `meta.yaml`.
 ///
@@ -150,48 +153,43 @@ fn apply_blocks(
     Ok(())
 }
 
-#[test]
-fn transition() {
-    let mut report = Report::new();
-    let config = Config::active();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect(PRESET, "transition", "core");
+    let mut trials = vec![super::discovery_trial("transition", cases.len())];
 
-    let outcomes = map_cases(&cases, |case| {
-        if !case.in_scope() {
-            return None;
-        }
+    for case in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("transition", case, move |case| {
+            let meta: Meta = case.yaml("meta");
+            let post_fork = ForkName::parse(&meta.post_fork).unwrap_or_else(|| {
+                panic!(
+                    "{}: meta.yaml's post_fork ({}) is not a fork this crate recognizes",
+                    case.id(),
+                    meta.post_fork
+                )
+            });
+            // The case directory encodes `post_fork` too (see the module doc), so
+            // this checks the harness's own assumption about the fixture layout
+            // rather than anything about this crate's state transition. A panic
+            // here fails this one case, same as everywhere else in this closure.
+            assert_eq!(
+                post_fork,
+                case.fork,
+                "{}: meta.yaml's post_fork does not match the case's own directory",
+                case.id()
+            );
+            let pre_fork = post_fork
+                .previous()
+                .unwrap_or_else(|| panic!("{}: post_fork can never be phase0", case.id()));
 
-        let meta: Meta = case.yaml("meta");
-        let post_fork = ForkName::parse(&meta.post_fork).unwrap_or_else(|| {
-            panic!(
-                "{}: meta.yaml's post_fork ({}) is not a fork this crate recognizes",
-                case.id(),
-                meta.post_fork
-            )
-        });
-        // The case directory encodes `post_fork` too (see the module doc), so
-        // this checks the harness's own assumption about the fixture layout
-        // rather than anything about this crate's state transition.
-        assert_eq!(
-            post_fork,
-            case.fork,
-            "{}: meta.yaml's post_fork does not match the case's own directory",
-            case.id()
-        );
-        let pre_fork = post_fork
-            .previous()
-            .unwrap_or_else(|| panic!("{}: post_fork can never be phase0", case.id()));
+            let mut state = BeaconState::from_ssz(pre_fork, &case.ssz_bytes("pre"))
+                .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-        let mut state = BeaconState::from_ssz(pre_fork, &case.ssz_bytes("pre"))
-            .expect("the fixture's pre-state decodes");
-
-        let outcome = apply_blocks(case, &meta, pre_fork, post_fork, &mut state, &config);
-        Some(super::check_transition(case, outcome, &state))
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+            let outcome = apply_blocks(case, &meta, pre_fork, post_fork, &mut state, &config);
+            super::check_transition(case, outcome, &state)
+        }));
     }
 
-    report.finish("transition");
+    trials
 }

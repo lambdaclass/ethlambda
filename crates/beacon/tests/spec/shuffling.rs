@@ -12,8 +12,9 @@
 
 use ethlambda_beacon::helpers::shuffling::compute_shuffled_index;
 use ethlambda_beacon::primitives::Root;
+use libtest_mimic::Trial;
 
-use super::{PRESET, Report, collect, map_cases};
+use super::{PRESET, collect};
 
 #[derive(serde::Deserialize)]
 struct Mapping {
@@ -22,20 +23,21 @@ struct Mapping {
     mapping: Vec<u64>,
 }
 
-#[test]
-fn shuffling() {
-    let mut report = Report::new();
-
+/// This suite is not gated here: [`super::case_trial`] applies
+/// [`super::Case::in_scope`]'s gate itself, so every case collected below is
+/// simply handed to it.
+pub fn trials() -> Vec<Trial> {
     let cases = collect(PRESET, "shuffling", "core");
+    let mut trials = vec![super::discovery_trial("shuffling", cases.len())];
 
-    let outcomes = map_cases(&cases, |case| {
-        let mapping: Mapping = case.yaml("mapping");
+    for case in cases {
+        trials.push(super::case_trial("shuffling", case, move |case| {
+            let mapping: Mapping = case.yaml("mapping");
 
-        let stripped = mapping.seed.strip_prefix("0x").unwrap_or(&mapping.seed);
-        let seed_bytes = hex::decode(stripped).expect("the seed is a hex string");
-        let seed = Root::from_slice(&seed_bytes);
+            let stripped = mapping.seed.strip_prefix("0x").unwrap_or(&mapping.seed);
+            let seed_bytes = hex::decode(stripped).expect("the seed is a hex string");
+            let seed = Root::from_slice(&seed_bytes);
 
-        (|| {
             if mapping.mapping.len() as u64 != mapping.count {
                 return Err(format!(
                     "fixture claims count {} but lists {} entries",
@@ -61,12 +63,8 @@ fn shuffling() {
             }
 
             Ok(())
-        })()
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record(case, outcome);
+        }));
     }
 
-    report.finish("shuffling");
+    trials
 }

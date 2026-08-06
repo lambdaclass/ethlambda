@@ -63,6 +63,11 @@ serde.workspace = true
 serde_yaml_ng.workspace = true
 snap = "1.1.1"
 
-# Runs each fixture suite's cases across every core. See `map_cases` in
-# `tests/spec/mod.rs` for why the pool has to be process-wide.
-rayon.workspace = true
+# Supplies the spec-test binary's harness. A fixture case is only known once the
+# fixture tree is walked, which `#[test]` cannot express, so the tests are built
+# at run time instead. See `tests/spec_tests.rs` for the full reasoning.
+libtest-mimic = "0.8.2"
+
+[[test]]
+name = "spec_tests"
+harness = false

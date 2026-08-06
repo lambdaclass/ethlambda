@@ -224,13 +224,51 @@ The mainnet spec suite went from 1576s to about 106s. Two causes:
    the CPU supports, and merkleization is almost entirely SHA-256
    compressions, so a spec fixture case running two whole-state
    merkleizations feels the difference more than anything else does.
-2. `map_cases` (`tests/spec/mod.rs`) runs each suite's independent cases on
-   rayon's pool. The pool is process-wide **on purpose**, not an incidental
-   detail: the harness runs suites concurrently, and one shared pool keeps the
-   number of cases in flight at the core count regardless of how many suites
-   are running at once. A pool per suite would oversubscribe by the number of
-   suites, and multiply peak memory by it too, since a case in flight holds a
-   whole beacon state.
+2. Every fixture case is its own test, so the harness runs them concurrently at
+   one case per work item. That is finer-grained than a suite-per-test layout
+   could balance, where the slowest suite alone set the wall clock.
+
+CPU time and wall clock separate the two cleanly, since running work in
+parallel cannot reduce the total CPU time it takes:
+
+| Measure | Before | After | Factor |
+| --- | --- | --- | --- |
+| CPU time | 3041s | 928s | 3.3x, the hardware SHA-256 |
+| Wall clock | 1576s | 106s | 14.9x, both causes together |
+
+So parallelism accounts for the remaining 4.9x, taking the run from two of
+eleven cores busy to about eight. The 3.3x understates the hashing change,
+because the later run does strictly more work: `transition` went from failing
+immediately to running every case.
+
+## One test per fixture case
+
+The suites were once one test apiece, each looping over its own cases and
+aggregating outcomes. That made every failure a failure of the whole suite: the
+name in the output was the suite's, and a single bad case marked thousands of
+passing ones as part of one failed test.
+
+A fixture case is not known until the fixture tree is walked, and `#[test]`
+needs its tests at compile time, so the spec binary supplies its own harness
+(`harness = false`, with `libtest_mimic`) and builds its test list at run time.
+Each case is then named, counted, filtered, and attributed on its own, and
+`--test-threads`, `--ignored`, `--list`, and substring filters all keep working.
+A filter selects a whole suite as readily as one case, since a test's name is
+its runner followed by `Case::id`:
+
+```text
+operations/electra/attester_slashing/pyspec_tests/basic_double
+```
+
+Two things that arrangement has to be careful about:
+
+- A case whose fork this crate does not implement becomes an **ignored** test
+  rather than a missing one. The harness counts and names ignored tests, which
+  says more than the tally the old aggregate printed.
+- A suite that matches no case at all would otherwise contribute no tests, and a
+  run of nothing passes. The aggregate used to assert it had matched something;
+  that check survives as one `<runner>/matched_fixture_cases` test per suite, so
+  a stale runner or handler name still fails loudly.
 
 ## Status
 

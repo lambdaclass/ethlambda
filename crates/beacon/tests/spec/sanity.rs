@@ -13,11 +13,14 @@
 //! Unlike the `operations` suite, these run the full [`state_transition`], so
 //! they check the proposer signature and the committed `state_root` too.
 
+use std::sync::Arc;
+
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_beacon::stf::{self, ExecutionEngine};
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect, map_cases};
+use super::{Case, PRESET, collect};
 
 #[derive(serde::Deserialize)]
 struct BlocksMeta {
@@ -57,51 +60,34 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
     stf::process_slots(state, target, config).map_err(|err| format!("{err:?}"))
 }
 
-/// Runs one runner and handler pair, since all four share this body.
-fn run(runner: &str, handler: &str, slots: bool) {
-    let mut report = Report::new();
-    let config = Config::active();
+/// Builds one runner and handler pair's trials, since all four share this shape.
+fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect(PRESET, runner, handler);
+    let mut trials = vec![super::discovery_trial(runner, cases.len())];
 
-    let outcomes = map_cases(&cases, |case| {
-        if !case.in_scope() {
-            return None;
-        }
+    for case in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial(runner, case, move |case| {
+            let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
+                .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-        let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
-            .expect("the fixture's pre-state decodes");
-
-        let outcome = if slots {
-            apply_slots(case, &mut state, &config)
-        } else {
-            apply_blocks(case, &mut state, &config)
-        };
-        Some(super::check_transition(case, outcome, &state))
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+            let outcome = if slots {
+                apply_slots(case, &mut state, &config)
+            } else {
+                apply_blocks(case, &mut state, &config)
+            };
+            super::check_transition(case, outcome, &state)
+        }));
     }
 
-    report.finish(&format!("{runner}/{handler}"));
+    trials
 }
 
-#[test]
-fn sanity_blocks() {
-    run("sanity", "blocks", false);
-}
-
-#[test]
-fn sanity_slots() {
-    run("sanity", "slots", true);
-}
-
-#[test]
-fn finality() {
-    run("finality", "finality", false);
-}
-
-#[test]
-fn random() {
-    run("random", "random", false);
+pub fn trials() -> Vec<Trial> {
+    let mut trials = run("sanity", "blocks", false);
+    trials.extend(run("sanity", "slots", true));
+    trials.extend(run("finality", "finality", false));
+    trials.extend(run("random", "random", false));
+    trials
 }

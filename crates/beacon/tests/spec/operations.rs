@@ -84,6 +84,8 @@
 //!   `process_deposit`, and `process_voluntary_exit`; fulu's specification
 //!   lists none of the seven as modified again, so electra's functions serve
 //!   fulu's cases too.
+use std::sync::Arc;
+
 use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::{
@@ -97,8 +99,9 @@ use ethlambda_beacon::stf::deneb as deneb_stf;
 use ethlambda_beacon::stf::electra as electra_stf;
 use ethlambda_beacon::stf::fulu as fulu_stf;
 use ethlambda_beacon::stf::{ExecutionEngine, block, operations};
+use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, Report, collect_all_handlers, map_cases};
+use super::{Case, PRESET, collect_all_handlers};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -420,29 +423,28 @@ fn apply(
     outcome.map_err(|err| format!("{err:?}"))
 }
 
-#[test]
-fn operations() {
-    let mut report = Report::new();
-    let config = Config::active();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "operations");
+    let mut trials = vec![super::discovery_trial("operations", cases.len())];
 
-    let outcomes = map_cases(&cases, |(handler, case)| {
-        if !case.in_scope() {
-            return None;
-        }
+    for (handler, case) in cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("operations", case, move |case| {
+            let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
+                .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-        let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
-            .expect("the fixture's pre-state decodes");
-
-        let outcome = apply(handler, case, &mut state, &config);
-        Some(super::check_transition(case, outcome, &state))
-    });
-
-    for ((_, case), outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+            let outcome = apply(&handler, case, &mut state, &config);
+            super::check_transition(case, outcome, &state)
+        }));
     }
 
-    report.finish("operations");
+    trials.push(Trial::test(
+        "operations/every_shipped_handler_is_dispatched",
+        every_shipped_handler_is_dispatched,
+    ));
+
+    trials
 }
 
 /// Handlers the fixture release ships that this runner does not dispatch.
@@ -455,8 +457,7 @@ fn operations() {
 /// is exactly what [`apply`]'s per-handler, per-fork match already encodes
 /// and enforces at run time; duplicating it here would only give the two a
 /// chance to drift apart.
-#[test]
-fn every_shipped_handler_is_dispatched() {
+fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
     let known = [
         "attestation",
         "attester_slashing",
@@ -482,8 +483,11 @@ fn every_shipped_handler_is_dispatched() {
     unknown.sort_unstable();
     unknown.dedup();
 
-    assert!(
-        unknown.is_empty(),
-        "the fixture release ships operations this runner does not dispatch: {unknown:?}"
-    );
+    if !unknown.is_empty() {
+        return Err(Failed::from(format!(
+            "the fixture release ships operations this runner does not dispatch: {unknown:?}"
+        )));
+    }
+
+    Ok(())
 }

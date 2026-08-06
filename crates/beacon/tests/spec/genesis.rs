@@ -10,19 +10,22 @@
 //! This release's fixtures ship `genesis` cases for the `minimal` preset only
 //! (there is no `genesis` directory anywhere under `mainnet` in the extracted
 //! tree), so this whole runner is gated on the `preset-minimal` feature. That
-//! keeps the mainnet build from failing [`Report::finish`]'s "matched no
-//! fixture cases" check over a suite the release never populates for it,
+//! keeps the mainnet build from failing [`super::discovery_trial`]'s "matched
+//! no fixture cases" check over a suite the release never populates for it,
 //! without having to teach the shared harness a new kind of "expected empty"
 //! outcome for one runner.
 #![cfg(feature = "preset-minimal")]
+
+use std::sync::Arc;
 
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::{BeaconState, phase0, shared};
 use ethlambda_beacon::genesis::{initialize_beacon_state_from_eth1, is_valid_genesis_state};
 use ethlambda_beacon::primitives::{HashTreeRoot as _, Root};
 use libssz::SszDecode as _;
+use libtest_mimic::Trial;
 
-use super::{Case, PRESET, Report, collect, map_cases};
+use super::{Case, PRESET, collect};
 
 #[derive(serde::Deserialize)]
 struct Eth1 {
@@ -95,44 +98,42 @@ fn validity_case(case: &Case, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
-fn initialization() {
-    let config = Config::minimal();
-    let mut report = Report::new();
+pub fn trials() -> Vec<Trial> {
+    let config = Arc::new(Config::minimal());
 
-    let cases = collect(PRESET, "genesis", "initialization");
+    let initialization_cases = collect(PRESET, "genesis", "initialization");
+    let mut trials = vec![super::discovery_trial(
+        "genesis/initialization",
+        initialization_cases.len(),
+    )];
 
-    // Only phase0 has a genesis-construction fixture suite in this release; a
-    // later fork adding one would need its own state type here rather than
-    // silently being decoded as phase0's. Gating through the shared
-    // `in_scope`/`skip` pair rather than a bespoke phase0 check keeps this
-    // runner consistent with the rest even though, today, there is nothing
-    // after phase0 for it to skip.
-    let outcomes = map_cases(&cases, |case| {
-        case.in_scope().then(|| initialization_case(case, &config))
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+    for case in initialization_cases {
+        let config = Arc::clone(&config);
+        // Only phase0 has a genesis-construction fixture suite in this
+        // release; a later fork adding one would need its own state type
+        // here rather than silently being decoded as phase0's. Gated through
+        // [`super::case_trial`]'s own `in_scope` check rather than a bespoke
+        // phase0 check here, which keeps this runner consistent with the rest
+        // even though, today, there is nothing after phase0 for it to skip.
+        trials.push(super::case_trial(
+            "genesis/initialization",
+            case,
+            move |case| initialization_case(case, &config),
+        ));
     }
 
-    report.finish("genesis/initialization");
-}
+    let validity_cases = collect(PRESET, "genesis", "validity");
+    trials.push(super::discovery_trial(
+        "genesis/validity",
+        validity_cases.len(),
+    ));
 
-#[test]
-fn validity() {
-    let config = Config::minimal();
-    let mut report = Report::new();
-
-    let cases = collect(PRESET, "genesis", "validity");
-
-    let outcomes = map_cases(&cases, |case| {
-        case.in_scope().then(|| validity_case(case, &config))
-    });
-
-    for (case, outcome) in cases.iter().zip(outcomes) {
-        report.record_or_skip(case, outcome);
+    for case in validity_cases {
+        let config = Arc::clone(&config);
+        trials.push(super::case_trial("genesis/validity", case, move |case| {
+            validity_case(case, &config)
+        }));
     }
 
-    report.finish("genesis/validity");
+    trials
 }
