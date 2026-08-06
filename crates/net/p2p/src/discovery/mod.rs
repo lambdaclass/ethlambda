@@ -2,4 +2,5 @@
 //!
 //! See `docs/discovery.md` for the operator-facing description.
 
+pub mod admission;
 pub mod enr;
