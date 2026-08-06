@@ -727,6 +727,31 @@ pub struct Bootnode {
     pub(crate) public_key: PublicKey,
 }
 
+impl Bootnode {
+    /// This bootnode as a discv5 seed, or `None` when its ENR advertises no
+    /// `udp` port and it therefore cannot be reached by discovery.
+    ///
+    /// `tcp_port` is 0: ethrex reads that as "no TCP listener".
+    pub(crate) fn as_discovery_node(&self) -> Option<ethrex_p2p::types::Node> {
+        let udp_port = self.udp_port?;
+        // libp2p and ethrex hold the same key in different representations:
+        // ethrex wants the 65-byte uncompressed SEC1 form with its leading 0x04
+        // tag stripped.
+        let uncompressed = self
+            .public_key
+            .clone()
+            .try_into_secp256k1()
+            .ok()?
+            .to_bytes_uncompressed();
+        Some(ethrex_p2p::types::Node::new(
+            self.ip,
+            udp_port,
+            0,
+            ethrex_common::H512::from_slice(&uncompressed[1..]),
+        ))
+    }
+}
+
 /// Decode `enr:`-prefixed records into dialable bootnodes.
 ///
 /// Records that cannot be decoded, or that lack a QUIC port, an IP or a public
