@@ -44,6 +44,9 @@ pub struct DiscoverySpawnConfig {
     pub subscription_subnets: HashSet<u64>,
     pub attestation_committee_count: u64,
     pub bootnodes: Vec<Bootnode>,
+    /// IP address to advertise in the ENR. Defaults to `bind_ip` when unset,
+    /// which is undialable if `bind_ip` is the wildcard `0.0.0.0`.
+    pub advertise_ip: Option<IpAddr>,
 }
 
 /// What the P2P actor needs from a running discovery server.
@@ -81,7 +84,7 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
 
     let params = LocalEnrParams {
         signer: config.node_key,
-        ip: config.bind_ip,
+        ip: config.advertise_ip.unwrap_or(config.bind_ip),
         discovery_port: bound.port(),
         quic_port: config.quic_port,
         subscription_subnets: config.subscription_subnets,
@@ -160,6 +163,7 @@ mod tests {
             subscription_subnets: HashSet::from([0u64]),
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
+            advertise_ip: None,
         })
         .await
         .expect("discovery spawns");
@@ -185,6 +189,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_advertises_a_different_ip_than_it_binds() {
+        // Bind the loopback address but advertise a distinct, non-dialable-from-
+        // here address, mimicking an operator setting `--discovery.advertise-ip`
+        // to their host's public IP while still binding the wildcard/loopback
+        // locally. The ENR must reflect the advertised address, not the bind
+        // address.
+        let advertised = Ipv4Addr::new(203, 0, 113, 7);
+        let handle = spawn_discovery(DiscoverySpawnConfig {
+            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 0,
+            quic_port: 9001,
+            subscription_subnets: HashSet::from([0u64]),
+            attestation_committee_count: 4,
+            bootnodes: Vec::new(),
+            advertise_ip: Some(IpAddr::from(advertised)),
+        })
+        .await
+        .expect("discovery spawns");
+
+        assert_eq!(handle.bound_addr.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+
+        let record = NodeRecord::decode(&ethrex_common::base64::decode(
+            handle
+                .local_enr
+                .strip_prefix("enr:")
+                .expect("enr: prefix")
+                .as_bytes(),
+        ))
+        .expect("local ENR decodes");
+        assert_eq!(record.pairs().ip, Some(advertised));
+    }
+
+    #[tokio::test]
     async fn spawn_fails_loudly_on_a_busy_port() {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let busy = socket.local_addr().unwrap().port();
@@ -197,6 +235,7 @@ mod tests {
             subscription_subnets: HashSet::new(),
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
+            advertise_ip: None,
         })
         .await;
 

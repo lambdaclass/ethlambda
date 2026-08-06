@@ -138,6 +138,14 @@ pub(crate) struct DiscoveryConfig {
     /// default to 9000, so enabling discovery means changing one of them.
     #[arg(long = "discovery.port", default_value = "9000")]
     pub(crate) port: u16,
+    /// IP address to advertise in the ENR.
+    ///
+    /// Defaults to the bind address, which is the wildcard `0.0.0.0` and is not
+    /// dialable as published. Set this to the address peers should reach this
+    /// node on: `127.0.0.1` for a local devnet, or the host's public address.
+    /// discv5's PONG-based IP voting may still replace it at runtime.
+    #[arg(long = "discovery.advertise-ip")]
+    pub(crate) advertise_ip: Option<std::net::IpAddr>,
 }
 
 impl CliOptions {
@@ -260,5 +268,22 @@ mod tests {
         let opts = CliOptions::parse_from(base_args());
         assert_eq!(opts.discovery.port, opts.gossipsub_port);
         assert!(opts.validate_discovery().is_ok());
+    }
+
+    #[test]
+    fn advertise_ip_defaults_to_none() {
+        let opts = CliOptions::parse_from(base_args());
+        assert_eq!(opts.discovery.advertise_ip, None);
+    }
+
+    #[test]
+    fn advertise_ip_parses_an_explicit_address() {
+        let mut args = base_args();
+        args.extend(["--discovery.advertise-ip", "203.0.113.7"]);
+        let opts = CliOptions::parse_from(args);
+        assert_eq!(
+            opts.discovery.advertise_ip,
+            Some(std::net::IpAddr::from([203, 0, 113, 7]))
+        );
     }
 }

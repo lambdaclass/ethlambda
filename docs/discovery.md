@@ -23,10 +23,19 @@ ethlambda \
 | --- | --- | --- |
 | `--discovery.enable` | `false` | Run the discv5 server and the dial loop |
 | `--discovery.port` | `9000` | UDP port for the discv5 socket |
+| `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
 
 Both `--discovery.port` and `--gossipsub-port` default to 9000 and both bind
 UDP, so they cannot share a port. Enabling discovery without changing one of
 them is rejected at startup.
+
+The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
+listen, not where peers should dial us. Without `--discovery.advertise-ip` the
+published ENR inherits that same `0.0.0.0`, which is not a dialable address:
+set the flag to `127.0.0.1` for a local devnet or to the host's public address
+so the ENR is usable as soon as it is published. discv5's PONG-based IP voting
+may still replace the advertised address later, once a peer's response tells
+the node what its external address looks like.
 
 ## The ENR
 
@@ -36,7 +45,7 @@ The layout follows the discovery domain of the beacon-chain
 | Entry | Value |
 | --- | --- |
 | `id` | `v4` |
-| `ip` | advertised address |
+| `ip` | `--discovery.advertise-ip`, or the bind address (`0.0.0.0`) if unset |
 | `udp` | `--discovery.port` |
 | `quic` | `--gossipsub-port`, the libp2p QUIC listener |
 | `secp256k1` | compressed public key from `--node-key` |
@@ -75,6 +84,14 @@ or not discovery is on. A bootnode additionally seeds the discv5 routing table
 only if its ENR advertises a `udp` port. The ENRs `lean-quickstart` generates
 today carry only `ip`/`quic`/`secp256k1`, so they remain reachable but
 contribute nothing to discovery.
+
+The ENR reported by `GET /lean/v0/node/identity` is only useful to a peer if
+the node that published it was started with a real `--discovery.advertise-ip`.
+Copying an ENR built from the default `0.0.0.0` into another node's bootnode
+list produces a `udp`/`quic` target that cannot be dialed, since `0.0.0.0`
+names no reachable host. Set `--discovery.advertise-ip` before pointing other
+nodes at this one's ENR: `127.0.0.1` on a local devnet, or the host's public
+address otherwise.
 
 ## Known limitation
 
