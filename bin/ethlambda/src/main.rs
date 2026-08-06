@@ -81,6 +81,9 @@ async fn main() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")?;
 
     let options = CliOptions::parse();
+    options
+        .validate_discovery()
+        .map_err(|err| eyre::eyre!(err))?;
 
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
@@ -127,6 +130,8 @@ async fn main() -> eyre::Result<()> {
         )
     })?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let discovery_enabled = options.discovery.enable;
+    let discovery_port = options.discovery.port;
 
     #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
@@ -182,6 +187,9 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
     let bootnodes = read_bootnodes(&bootnodes_path)?;
+    // `build_swarm` consumes `bootnodes` below; discovery needs its own list,
+    // so the file is read twice rather than cloning the non-`Clone` `Bootnode`.
+    let discovery_bootnodes = read_bootnodes(&bootnodes_path)?;
 
     let validator_keys =
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
@@ -261,12 +269,12 @@ async fn main() -> eyre::Result<()> {
     );
 
     let built = build_swarm(SwarmConfig {
-        node_key: node_p2p_key,
+        node_key: node_p2p_key.clone(),
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        subscription_subnets: subscribed_subnets,
+        subscription_subnets: subscribed_subnets.clone(),
     })
     .wrap_err("failed to build swarm")?;
 
@@ -274,7 +282,44 @@ async fn main() -> eyre::Result<()> {
     // RPC `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
-    let p2p = P2P::spawn(built, store.clone(), node_names, None);
+    let bind_ip = IpAddr::from([0, 0, 0, 0]);
+    let discovery = if discovery_enabled {
+        let node_key = secp256k1::SecretKey::from_slice(&node_p2p_key)
+            .wrap_err("node key is not a valid secp256k1 secret key")?;
+        let handle = ethlambda_p2p::discovery::spawn_discovery(
+            ethlambda_p2p::discovery::DiscoverySpawnConfig {
+                node_key,
+                bind_ip,
+                discovery_port,
+                quic_port: p2p_socket.port(),
+                subscription_subnets: subscribed_subnets,
+                attestation_committee_count,
+                bootnodes: discovery_bootnodes,
+            },
+        )
+        .await
+        .map_err(|err| eyre::eyre!(err))
+        .wrap_err("failed to start discv5 discovery")?;
+        // `bind_ip` is unspecified, so the ENR advertises 0.0.0.0 until discv5's
+        // PONG-based IP voting learns and substitutes our real external address.
+        // Peers can still find and dial us via discovery in the meantime; only
+        // the ENR as published right now is not directly dialable.
+        if bind_ip.is_unspecified() {
+            warn!(
+                enr = %handle.local_enr,
+                "Local ENR advertises an unspecified IP; peers can still reach us once \
+                 discv5 IP voting resolves our external address, but this ENR is not \
+                 directly dialable as published"
+            );
+        }
+        Some(handle)
+    } else {
+        info!("discv5 discovery disabled; peering from the static bootnode list only");
+        None
+    };
+    let local_enr = discovery.as_ref().map(|handle| handle.local_enr.clone());
+
+    let p2p = P2P::spawn(built, store.clone(), node_names, discovery);
 
     // Wire actors together via protocol refs
     blockchain
@@ -301,7 +346,7 @@ async fn main() -> eyre::Result<()> {
             aggregator,
             sync_status,
             local_peer_id,
-            None,
+            local_enr,
             events,
             rpc_shutdown,
         )
