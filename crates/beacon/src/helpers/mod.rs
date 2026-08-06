@@ -12,6 +12,7 @@
 //! spec line by line.
 
 pub mod accessors;
+pub mod attestation;
 pub mod math;
 pub mod misc;
 pub mod mutators;
