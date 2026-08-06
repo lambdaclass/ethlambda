@@ -301,6 +301,7 @@ async fn main() -> eyre::Result<()> {
             aggregator,
             sync_status,
             local_peer_id,
+            None,
             events,
             rpc_shutdown,
         )
