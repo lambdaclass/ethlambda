@@ -29,6 +29,7 @@
 )]
 
 mod epoch_processing;
+mod fork;
 mod genesis;
 mod harness;
 mod operations;

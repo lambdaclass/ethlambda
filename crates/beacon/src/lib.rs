@@ -56,6 +56,7 @@ pub mod kzg;
 pub mod preset;
 pub mod primitives;
 pub mod stf;
+pub mod upgrade;
 
 mod error;
 
