@@ -9,7 +9,9 @@
 //! `discv5.find_node_predicate`. ethrex's `IterativeLookup` takes no ENR
 //! predicate, so ethlambda applies them one layer later, at dial selection. The
 //! visible behavior matches; the cost is that non-matching ENRs occupy peer
-//! table slots until `set_unwanted` sidelines them.
+//! table slots until `set_unwanted` sidelines them — and only permanent
+//! rejections (see [`RejectReason::is_permanent`]) get sidelined at all, since
+//! ethrex never clears that flag.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -39,15 +41,18 @@ pub struct DiscoveredPeer {
     pub label: String,
 }
 
-/// Why a discovered peer was turned away. Each variant is permanent for the
-/// record as published, so the caller marks the contact unwanted.
+/// Why a discovered peer was turned away. Whether a reason is permanent for
+/// the record as published, rather than just for the moment we happen to
+/// evaluate it, is captured separately by [`RejectReason::is_permanent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// No `eth2` entry, or one that does not decode. Cannot be our network.
     MissingForkId,
     /// On a different network.
     ForkDigestMismatch,
-    /// Discoverable over discv5, but advertises no libp2p QUIC port.
+    /// Discoverable over discv5, but advertises no libp2p QUIC port (or one
+    /// that is `0`, which is undialable and RLP-decodes the same way an
+    /// absent entry does).
     NoQuicPort,
     /// No `secp256k1` entry, or one that is not a valid key.
     BadPublicKey,
@@ -65,10 +70,41 @@ impl RejectReason {
             Self::MissingAddress => "no ip or ip6 entry",
         }
     }
+
+    /// Whether this rejection is a permanent property of the peer rather than
+    /// of the record we happen to hold.
+    ///
+    /// ethrex's peer table never clears `unwanted`, so marking a contact is
+    /// irreversible for the life of the process. Only do it for reasons a new
+    /// ENR sequence cannot fix.
+    pub fn is_permanent(self) -> bool {
+        match self {
+            // Not our network, or not a lean node at all.
+            Self::MissingForkId | Self::ForkDigestMismatch => true,
+            // A record we cannot derive a peer id from is unusable whoever sent it.
+            Self::BadPublicKey => true,
+            // Both can be fixed by a later ENR: a node can add a quic entry, and
+            // discv5's own IP voting can fill in an address that was missing.
+            Self::NoQuicPort | Self::MissingAddress => false,
+        }
+    }
 }
 
 /// Apply the spec's admission checks to a discovered ENR.
-pub fn admit(record: &NodeRecord, local: &EnrForkId) -> Result<DiscoveredPeer, RejectReason> {
+///
+/// `attestation_committee_count` bounds [`DiscoveredPeer::subnets`]: a
+/// decoded subnet id `>= attestation_committee_count` is dropped before it
+/// ever reaches the result. The peer's `attnets` is self-reported and
+/// unauthenticated, so trusting it verbatim lets a hostile ENR pack an
+/// oversized bitfield (e.g. ~290 bytes of `0xFF`) that decodes to thousands
+/// of subnets, dominating `rank_by_uncovered_subnets` forever. A subnet we
+/// have no committee for cannot be useful to us regardless, so the clamp is
+/// correct on the merits, not just a mitigation.
+pub fn admit(
+    record: &NodeRecord,
+    local: &EnrForkId,
+    attestation_committee_count: u64,
+) -> Result<DiscoveredPeer, RejectReason> {
     let raw = read_extra(record, ETH2_ENR_KEY).ok_or(RejectReason::MissingForkId)?;
     let remote = EnrForkId::from_ssz_bytes(&raw).map_err(|_| RejectReason::MissingForkId)?;
 
@@ -87,7 +123,13 @@ pub fn admit(record: &NodeRecord, local: &EnrForkId) -> Result<DiscoveredPeer, R
         );
     }
 
-    let quic_port = read_quic_port(record).ok_or(RejectReason::NoQuicPort)?;
+    // `None` and `Some(0)` are the same failure: no dialable quic port. They
+    // also coincide by construction, since an absent entry RLP-decodes to
+    // `0u16` via left-padding.
+    let quic_port = match read_quic_port(record) {
+        None | Some(0) => return Err(RejectReason::NoQuicPort),
+        Some(port) => port,
+    };
 
     let pairs = record.pairs();
     let public_key_bytes = pairs.secp256k1.ok_or(RejectReason::BadPublicKey)?;
@@ -111,7 +153,10 @@ pub fn admit(record: &NodeRecord, local: &EnrForkId) -> Result<DiscoveredPeer, R
 
     let subnets = read_extra(record, ATTNETS_ENR_KEY)
         .map(|bits| decode_attnets(&bits))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|subnet| *subnet < attestation_committee_count)
+        .collect();
 
     Ok(DiscoveredPeer {
         peer_id,
@@ -194,8 +239,22 @@ mod tests {
         pair(ATTNETS_ENR_KEY, Bytes::from(bits).encode_to_vec())
     }
 
+    /// `attnets_pair` above encodes against a committee count of 8, so this
+    /// matches it: subnets in the tests below are all meant to be in-range.
+    const TEST_COMMITTEE_COUNT: u64 = 8;
+
     fn admit_record(record: &NodeRecord) -> Result<DiscoveredPeer, RejectReason> {
-        admit(record, &EnrForkId::local())
+        admit(record, &EnrForkId::local(), TEST_COMMITTEE_COUNT)
+    }
+
+    /// Build a record whose pairs are fully controlled, bypassing
+    /// `from_node_with_extra_pairs`'s automatic `ip`/`secp256k1` population.
+    /// `admit` never checks the signature, so an all-zero one is fine; this
+    /// is the only way to reach a record with a missing/invalid public key or
+    /// with neither `ip` nor `ip6`, both of which `record_with` always fills
+    /// in from the `Node` it wraps.
+    fn raw_record(pairs: ethrex_p2p::types::NodeRecordPairs) -> NodeRecord {
+        NodeRecord::new(ethrex_common::H512::zero(), 1, pairs)
     }
 
     #[test]
@@ -247,12 +306,73 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_peer_with_a_quic_port_of_zero() {
+        // A port of 0 is undialable, and this is also how an absent entry
+        // decodes (left-padded to 0u16), so it must hit the same reason as
+        // `rejects_a_peer_with_no_quic_port` rather than sail through as
+        // "accepted" with an unusable `/udp/0/quic-v1` multiaddr.
+        let record = record_with(vec![eth2_pair(EnrForkId::local()), quic_pair(0)]);
+        assert_eq!(admit_record(&record), Err(RejectReason::NoQuicPort));
+    }
+
+    #[test]
+    fn rejects_a_peer_with_an_invalid_public_key() {
+        let pairs = ethrex_p2p::types::NodeRecordPairs {
+            // `0xff` is not a valid compressed secp256k1 point tag (`02`/`03`).
+            secp256k1: Some(ethrex_common::H264([0xff; 33])),
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(9010),
+            other: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
+            ..Default::default()
+        };
+        assert_eq!(
+            admit_record(&raw_record(pairs)),
+            Err(RejectReason::BadPublicKey)
+        );
+    }
+
+    #[test]
+    fn rejects_a_peer_with_neither_ip_nor_ip6() {
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let public_key_bytes =
+            secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &signer).serialize();
+        let pairs = ethrex_p2p::types::NodeRecordPairs {
+            secp256k1: Some(ethrex_common::H264(public_key_bytes)),
+            udp_port: Some(9010),
+            other: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
+            ..Default::default()
+        };
+        assert_eq!(
+            admit_record(&raw_record(pairs)),
+            Err(RejectReason::MissingAddress)
+        );
+    }
+
+    #[test]
     fn accepts_a_peer_with_no_attnets() {
         // subnet_predicate treats a missing bitfield as covering no subnets, but
         // that never excludes a peer from general discovery.
         let record = record_with(vec![eth2_pair(EnrForkId::local()), quic_pair(9001)]);
         let peer = admit_record(&record).expect("accepted");
         assert!(peer.subnets.is_empty());
+    }
+
+    #[test]
+    fn drops_subnets_at_or_beyond_the_local_committee_count() {
+        // A peer (hostile or just differently configured) can advertise
+        // subnet ids our own committee count has no room for. `admit` must
+        // silently drop those rather than surface them: a subnet we do not
+        // have is never useful to us, and (per the ranking exploit this
+        // guards against) letting them through would let a Sybil ENR packing
+        // a huge `attnets` bitfield dominate `rank_by_uncovered_subnets`.
+        let bits = encode_attnets(&HashSet::from([2u64, 8, 40]), 64);
+        let record = record_with(vec![
+            pair(ATTNETS_ENR_KEY, Bytes::from(bits).encode_to_vec()),
+            eth2_pair(EnrForkId::local()),
+            quic_pair(9001),
+        ]);
+        let peer = admit_record(&record).expect("accepted");
+        assert_eq!(peer.subnets, vec![2]);
     }
 
     #[test]

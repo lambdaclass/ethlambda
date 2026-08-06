@@ -14,7 +14,7 @@ use ethlambda_network_api::{
 use ethlambda_storage::Store;
 use ethlambda_types::enr::EnrForkId;
 use ethlambda_types::primitives::H256;
-use ethrex_p2p::peer_table::{PeerTable, PeerTableServerProtocol as _};
+use ethrex_p2p::peer_table::{Contact, PeerTable, PeerTableServerProtocol as _};
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
@@ -582,25 +582,10 @@ impl P2PServer {
                 .await
                 .unwrap_or_default();
 
-            let mut admitted = Vec::with_capacity(contacts.len());
-            for contact in contacts {
-                let Some(record) = contact.record.as_ref() else {
-                    // Discovered by node id but its ENR has not arrived yet;
-                    // leave it in the table for a later round.
-                    continue;
-                };
-                match admit(record, &local_fork_id) {
-                    Ok(peer) => admitted.push(peer),
-                    Err(reason) => {
-                        debug!(
-                            node_id = %contact.node.node_id(),
-                            reason = reason.as_str(),
-                            "Rejecting discovered peer"
-                        );
-                        // Permanent for this record: keep it out of future batches.
-                        let _ = peer_table.set_unwanted(contact.node.node_id());
-                    }
-                }
+            let (mut admitted, unwanted) =
+                select_candidates(contacts, &local_fork_id, self.attestation_committee_count);
+            for node_id in unwanted {
+                let _ = peer_table.set_unwanted(node_id);
             }
 
             let Some(discovery) = self.discovery.as_mut() else {
@@ -807,6 +792,18 @@ async fn handle_swarm_event(
             );
             warn!(?peer_id, %error, "Outgoing connection error");
 
+            // A dial that never establishes ends up here rather than in
+            // `ConnectionClosed`, so this is the only place a discovery-fed
+            // `peer_attnets` entry can be removed for a peer we dialed but
+            // never actually connected to. Leaving it would grow the map
+            // without bound and make `covered_subnets` credit a subnet to a
+            // peer that isn't connected.
+            if let Some(pid) = peer_id
+                && let Some(discovery) = server.discovery.as_mut()
+            {
+                discovery.peer_attnets.remove(&pid);
+            }
+
             // Schedule redial if this was a bootnode
             if let Some(pid) = peer_id
                 && server.bootnode_addrs.contains_key(&pid)
@@ -953,6 +950,49 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 }
 
 // --- Utility functions ---
+
+/// Split discovered contacts into peers worth dialing and node ids to blacklist.
+///
+/// Pure so the admission policy can be tested without an actor, a socket or a
+/// peer table. Contacts whose ENR has not arrived yet are skipped without being
+/// blacklisted, and only permanent rejections are reported as unwanted.
+///
+/// The returned ids are `ethrex_common::H256` (discv5 node ids, i.e.
+/// `PeerTable::set_unwanted`'s currency), not the ethlambda `H256` this module
+/// otherwise uses for block/state roots; the two are unrelated types that
+/// happen to share a name, so the crate path is spelled out here.
+fn select_candidates(
+    contacts: Vec<Contact>,
+    local_fork_id: &EnrForkId,
+    attestation_committee_count: u64,
+) -> (Vec<DiscoveredPeer>, Vec<ethrex_common::H256>) {
+    let mut admitted = Vec::with_capacity(contacts.len());
+    let mut unwanted = Vec::new();
+    for contact in contacts {
+        let Some(record) = contact.record.as_ref() else {
+            // ethrex's `get_contacts_to_initiate` already added this node id
+            // to `already_tried_peers` when it drew this contact, regardless
+            // of what we do with it here. That set is only cleared once a
+            // full pool scan finds nothing eligible, so skipping it now does
+            // not make it any more or less likely to be redrawn soon.
+            continue;
+        };
+        match admit(record, local_fork_id, attestation_committee_count) {
+            Ok(peer) => admitted.push(peer),
+            Err(reason) => {
+                debug!(
+                    node_id = %contact.node.node_id(),
+                    reason = reason.as_str(),
+                    "Rejecting discovered peer"
+                );
+                if reason.is_permanent() {
+                    unwanted.push(contact.node.node_id());
+                }
+            }
+        }
+    }
+    (admitted, unwanted)
+}
 
 /// Attestation subnets covered by peers we are currently connected to.
 ///
@@ -1155,5 +1195,183 @@ mod tests {
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, 9001);
         assert_eq!(bootnodes[0].udp_port, Some(9010));
+    }
+
+    #[test]
+    fn parse_enrs_skips_malformed_records_but_keeps_the_valid_one() {
+        // The rewrite's whole point is that one bad line in the bootnode file
+        // must not take the others down with it. Feed it a mix of the ways an
+        // entry can be malformed, plus one genuinely valid ENR (reused from
+        // `parse_enrs_extracts_ip_port_and_public_key`), and check the valid
+        // one survives and nothing panics along the way.
+        let enrs = vec![
+            "not-an-enr-at-all".to_string(), // missing "enr:" prefix
+            "enr:not valid base64!!!".to_string(), // non-base64 garbage
+            "enr:AAAAAAAAAAAAAAAA".to_string(), // valid base64, not valid RLP
+            "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys".to_string(),
+        ];
+
+        let bootnodes = parse_enrs(enrs);
+
+        assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
+        assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(bootnodes[0].quic_port, 9001);
+    }
+
+    /// Build a signed ENR carrying `eth2` + (optionally) `quic` + `attnets`,
+    /// for [`select_candidates`] tests. `attnets_bits` is written verbatim,
+    /// bypassing `encode_attnets`'s own committee-count clamp, the way a
+    /// hostile peer crafting the bytes by hand would.
+    fn enr_for(fork_id: EnrForkId, quic_port: Option<u16>, attnets_bits: Vec<u8>) -> NodeRecord {
+        use ::secp256k1 as raw_secp256k1;
+        use ethrex_rlp::encode::RLPEncode;
+        use libssz::SszEncode;
+
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let public_key = ethrex_common::H512::from_slice(
+            &raw_secp256k1::PublicKey::from_secret_key(raw_secp256k1::SECP256K1, &signer)
+                .serialize_uncompressed()[1..],
+        );
+        let node =
+            ethrex_p2p::types::Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
+        let mut extra = vec![
+            (
+                bytes::Bytes::from_static(crate::discovery::enr::ATTNETS_ENR_KEY),
+                bytes::Bytes::from(bytes::Bytes::from(attnets_bits).encode_to_vec()),
+            ),
+            (
+                bytes::Bytes::from_static(crate::discovery::enr::ETH2_ENR_KEY),
+                bytes::Bytes::from(bytes::Bytes::from(fork_id.to_ssz()).encode_to_vec()),
+            ),
+        ];
+        if let Some(port) = quic_port {
+            extra.push((
+                bytes::Bytes::from_static(crate::discovery::enr::QUIC_ENR_KEY),
+                bytes::Bytes::from(port.encode_to_vec()),
+            ));
+        }
+        NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap()
+    }
+
+    /// Wrap a record in a `Contact` the way `PeerTable::get_contacts_to_initiate`
+    /// would once the ENR has arrived.
+    fn contact_with_record(record: NodeRecord) -> Contact {
+        let node =
+            ethrex_p2p::types::Node::from_enr(&record).expect("record is a valid discv5 node");
+        let mut contact = Contact::new(node, ethrex_p2p::peer_table::DiscoveryProtocol::Discv5);
+        contact.record = Some(record);
+        contact
+    }
+
+    #[test]
+    fn select_candidates_admits_a_well_formed_contact() {
+        let record = enr_for(
+            EnrForkId::local(),
+            Some(9001),
+            ethlambda_types::enr::encode_attnets(&HashSet::from([2u64]), 8),
+        );
+
+        let (admitted, unwanted) =
+            select_candidates(vec![contact_with_record(record)], &EnrForkId::local(), 8);
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].subnets, vec![2]);
+        assert!(unwanted.is_empty());
+    }
+
+    #[test]
+    fn select_candidates_skips_a_pending_enr_without_blacklisting_it() {
+        // Discovered by node id, but the ENR request/response round trip
+        // hasn't completed yet.
+        let node = ethrex_p2p::types::Node::new(
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            9010,
+            0,
+            ethrex_common::H512::zero(),
+        );
+        let contact = Contact::new(node, ethrex_p2p::peer_table::DiscoveryProtocol::Discv5);
+        assert!(contact.record.is_none());
+
+        let (admitted, unwanted) = select_candidates(vec![contact], &EnrForkId::local(), 8);
+
+        assert!(admitted.is_empty());
+        assert!(unwanted.is_empty());
+    }
+
+    #[test]
+    fn select_candidates_blacklists_a_fork_digest_mismatch() {
+        let mut foreign = EnrForkId::local();
+        foreign.fork_digest = [0xde, 0xad, 0xbe, 0xef];
+        let record = enr_for(foreign, Some(9001), Vec::new());
+        let expected_node_id = ethrex_p2p::types::Node::from_enr(&record)
+            .unwrap()
+            .node_id();
+
+        let (admitted, unwanted) =
+            select_candidates(vec![contact_with_record(record)], &EnrForkId::local(), 8);
+
+        assert!(admitted.is_empty());
+        assert_eq!(
+            unwanted,
+            vec![expected_node_id],
+            "a different network is a permanent rejection (fix 3)"
+        );
+    }
+
+    #[test]
+    fn select_candidates_does_not_blacklist_a_missing_quic_port() {
+        // NoQuicPort is not permanent (fix 3): a later ENR can add one, so
+        // blacklisting it in ethrex's peer table (which never un-blacklists)
+        // would be irreversible for no good reason.
+        let record = enr_for(EnrForkId::local(), None, Vec::new());
+
+        let (admitted, unwanted) =
+            select_candidates(vec![contact_with_record(record)], &EnrForkId::local(), 8);
+
+        assert!(admitted.is_empty());
+        assert!(unwanted.is_empty());
+    }
+
+    #[test]
+    fn select_candidates_clamps_a_hostile_oversized_attnets_out_of_the_ranking() {
+        // Mirrors fix 2's exploit. The honest peer claims one real subnet.
+        // The hostile peer claims none of the real subnets but pads its
+        // `attnets` bytes with ~290 bytes of 0xFF, decoding to thousands of
+        // subnet ids that do not exist for an 8-subnet committee. Pre-fix,
+        // that raw count would dominate `rank_by_uncovered_subnets` forever;
+        // post-fix, `admit` drops every id >= the committee count before
+        // ranking ever sees it, leaving the hostile peer with nothing real to
+        // claim.
+        const COMMITTEE_COUNT: u64 = 8;
+        let mut hostile_bits = vec![0u8; COMMITTEE_COUNT.div_ceil(8) as usize];
+        hostile_bits.extend(vec![0xffu8; 290]);
+
+        let honest = enr_for(
+            EnrForkId::local(),
+            Some(9001),
+            ethlambda_types::enr::encode_attnets(&HashSet::from([3u64]), COMMITTEE_COUNT),
+        );
+        let hostile = enr_for(EnrForkId::local(), Some(9002), hostile_bits);
+
+        let (mut admitted, unwanted) = select_candidates(
+            vec![contact_with_record(honest), contact_with_record(hostile)],
+            &EnrForkId::local(),
+            COMMITTEE_COUNT,
+        );
+        assert!(unwanted.is_empty());
+        assert_eq!(admitted.len(), 2);
+        assert!(
+            admitted
+                .iter()
+                .all(|peer| peer.subnets.iter().all(|&s| s < COMMITTEE_COUNT)),
+            "no admitted peer may advertise a subnet outside the local committee"
+        );
+
+        rank_by_uncovered_subnets(&mut admitted, &HashSet::new());
+        assert_eq!(
+            admitted[0].subnets,
+            vec![3],
+            "the honest peer's real subnet must outrank the hostile peer's fabricated ones"
+        );
     }
 }
