@@ -93,7 +93,9 @@ names no reachable host. Set `--discovery.advertise-ip` before pointing other
 nodes at this one's ENR: `127.0.0.1` on a local devnet, or the host's public
 address otherwise.
 
-## Known limitation
+## Known limitations
+
+### One lean devnet is not separated from another
 
 The spec's `fork_digest` is derived from genesis, so it separates one chain from
 another. ethlambda's is the hardcoded cross-client dummy `0x12345678`, and lean
@@ -102,6 +104,29 @@ check therefore separates lean from non-lean but **not one lean devnet from
 another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
+
+### A beacon-chain client cannot discover us, and `tcp` is why
+
+Beyond the fork digest never matching a real beacon network, there is a second,
+independent blocker. Lighthouse's discovery predicate is stricter than the spec
+text: alongside the `fork_digest` comparison it requires
+`enr.tcp4().is_some() || enr.tcp6().is_some()`, and it applies that as a
+discv5 query filter, so a `tcp`-less record is dropped before lighthouse's dial
+logic ever sees it. Our records deliberately carry no `tcp`, so they would be
+filtered out even if the digests did match. That is the right trade for a
+QUIC-only client, but it means the omission is a real interop cost and not a
+free simplification.
+
+### `attnets` is not a fixed-width SSZ `Bitvector`
+
+The spec's `attnets` is `Bitvector[ATTESTATION_SUBNET_COUNT]`, a constant every
+conformant client shares, which is what makes an undelimited bitfield decodable.
+ethlambda derives the width from `attestation_committee_count`, which is runtime
+configuration, so two nodes can legitimately exchange bitfields of different
+lengths. The bit-packing convention is identical to the spec's; only the width
+is negotiable. Readers tolerate a foreign length by treating bits past the end
+as unset, and a peer's advertised subnets are clamped to the local committee
+count before they influence anything.
 
 ## Metrics
 
