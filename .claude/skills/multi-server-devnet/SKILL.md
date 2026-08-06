@@ -307,7 +307,8 @@ operators actually look at). To retire a stale copy, rename it to
 `<name>.json.bak-<ts>` in the same step that writes the new file — the provider
 only reads `*.json`, which is also why the `.bak-*` backups already in that dir
 are inert. Audit with `md5sum` of every server `.json` against `scripts/*.json`;
-the names AND the digests should match.
+the names AND the digests should match, with `node-exporter-full.json` the one
+expected exception (see the note under the inventory: it is owned upstream).
 
 Filenames are for humans; only the `uid` inside the JSON is load-bearing. Do not
 "fix" a filename to look more like its uid — `devnet-overview-dashboard.json`
@@ -484,8 +485,26 @@ pick their datasource through a template variable, so no editing):
 | `devnet-overview-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
 | `resources-dashboard.json` | `devnet-resources` | Per-node CPU cores + memory working set (+ limit + %-of-limit for OOM watch), OOM kills, restart events, current uptime, and the same **Image build** commit-per-node table as the client dashboard — all from cAdvisor, so read a fresh uptime next to an unchanged commit as "came back on the same build" |
 | `logs-dashboard.json` | `devnet-logs` | Loki logs panel + log-volume-by-level, filtered `network`/`node`/`stream`/`search` |
-| `node-exporter-full.json` | `rYdddlPWk` | The upstream community **Node Exporter Full** dashboard (grafana.com id 1860), vendored verbatim so the dashboards dir is fully reproducible from this skill. Host-level CPU/RAM/disk/net for the `<host>:9122` systemd node_exporter — the counterpart to the container-level resources dashboard. Its own `ds_prometheus` datasource variable, with the saved selection blanked so it falls back to the default |
 | `grafana-finality-alert.yaml.template` | — | Unified-alerting provisioning for the per-devnet "lost finality" rule + Slack contact point; placeholders filled by the deploy script |
+
+**One dashboard in that dir is NOT ours: `node-exporter-full.json` (uid `rYdddlPWk`).**
+It is host-level CPU/RAM/disk/net for the systemd node_exporter on `<host>:9122`,
+the counterpart to the container-level resources dashboard, and it comes from the
+same repo the node_exporter itself does — `lambdaclass/monitoring-stack`, as
+`ansible/files/infra-dashboard.json` (its `ansible/grafana.yml` installs it). That
+repo in turn tracks the community **Node Exporter Full** dashboard, `gnetId: 1860`,
+maintained at `github.com/rfmoz/grafana-dashboards`. Deliberately **not** vendored
+here: it is ~460 KB of generated JSON we do not maintain, it would go stale against
+its source, and this skill has no business owning it. Refresh it from the source
+instead, which needs no edit (its `ds_prometheus` variable already ships with an
+empty `current`, so it falls back to the default datasource):
+```bash
+gh repo clone lambdaclass/monitoring-stack /tmp/monitoring-stack -- --depth 1
+cat /tmp/monitoring-stack/ansible/files/infra-dashboard.json \
+  | ssh "$METRICS_HOST" "sudo tee $GRAFANA_DASHBOARDS_DIR/node-exporter-full.json >/dev/null"
+```
+So it is the one file the `md5sum` audit below must skip: every OTHER server
+`.json` has a `scripts/` counterpart, this one has an upstream instead.
 
 **References.** `node-health.md` — per-node "all is good" checklist (chain follow,
 valid+useful attestations, non-empty proposals, aggregate+publish, on-time duties,

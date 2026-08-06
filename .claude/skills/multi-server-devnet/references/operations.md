@@ -239,12 +239,15 @@ to the first; dashboards go to the second. A JSON dropped in
 then `make node_exporter`), binds `<tailscale_ip>:9122`, and `Requires=
 tailscaled.service`. The per-host prometheus scrapes it at `<host>:9122` (the
 host's tailscale IP — reachable from the bridge container, same path as the
-remote_write target). A "Node Exporter Full" Grafana dashboard (uid `rYdddlPWk`,
-originally the monitoring-stack repo's `ansible/files/infra-dashboard.json`) sits in
-the central grafana dashboards dir; it is now vendored as
-`scripts/node-exporter-full.json` so that dir is reproducible from this skill alone,
-with its `ds_prometheus` var's saved selection blanked so it falls back to the
-default datasource instead of pinning one deployment's uid.
+remote_write target). A "Node Exporter Full" Grafana dashboard (uid `rYdddlPWk`)
+sits in the central grafana dashboards dir as `node-exporter-full.json`. It is NOT
+vendored into this skill: it belongs to the same monitoring-stack repo the
+node_exporter comes from (`ansible/files/infra-dashboard.json`, installed by that
+repo's `ansible/grafana.yml`), which itself tracks the community dashboard
+`gnetId: 1860` from `github.com/rfmoz/grafana-dashboards`. Copy it from there when
+it needs refreshing — the source needs no edit, since its `ds_prometheus` variable
+ships with an empty `current` and so resolves to the default datasource. It is the
+one dashboard in that dir with no `scripts/` counterpart.
 The monitoring-stack can also deploy grafana/prometheus/loki/promtail/alloy/
 pyroscope, but those would collide with this docker-based stack — install ONLY
 node_exporter from it.
