@@ -34,7 +34,18 @@ libssz-types.workspace = true
 # feature is built against.
 ethereum-types = "0.15.1"
 
-sha2 = "0.10.9"
+# `asm` selects the CPU's SHA-256 instructions where it has them: the ARMv8
+# crypto extensions on aarch64, and an assembly fallback on x86 for cores
+# without SHA-NI. Without it `sha2` compiles the portable scalar backend on
+# aarch64 no matter what the CPU supports, which merkleization feels directly,
+# since `hash_tree_root` of a state is almost entirely SHA-256 compressions.
+# Selection is at run time, through `cpufeatures`, so a build stays portable to
+# hardware lacking the extensions.
+#
+# `libssz-merkle` depends on `sha2` too and asks for no features of its own;
+# enabling one here reaches its copy as well, since Cargo unifies features
+# across a version.
+sha2 = { version = "0.10.9", features = ["asm"] }
 
 # BLS12-381. Assembly-optimized, and the canonical consensus-layer backend.
 blst = "0.3.16"
@@ -51,3 +62,7 @@ num-bigint = "0.4.6"
 serde.workspace = true
 serde_yaml_ng.workspace = true
 snap = "1.1.1"
+
+# Runs each fixture suite's cases across every core. See `map_cases` in
+# `tests/spec/mod.rs` for why the pool has to be process-wide.
+rayon.workspace = true
