@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::constants::FAR_FUTURE_EPOCH;
 use crate::containers::BeaconState;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, ValidatorIndex};
 
@@ -75,7 +75,17 @@ pub fn initiate_validator_exit(
         exit_queue_epoch += 1;
     }
 
-    let withdrawable = exit_queue_epoch + config.min_validator_withdrawability_delay;
+    // A validator already in the queue with an exit epoch just short of
+    // `FAR_FUTURE_EPOCH` drags `exit_queue_epoch` up with it, and adding the
+    // withdrawability delay to that overflows. The specification treats a `uint64`
+    // overflow as invalid rather than wrapping, and wrapping here would be worse
+    // than a rejection: it would produce a withdrawable epoch in the past and let
+    // the validator withdraw immediately.
+    let withdrawable = exit_queue_epoch
+        .checked_add(config.min_validator_withdrawability_delay)
+        .ok_or(Error::ArithmeticOverflow(
+            "exit_queue_epoch + MIN_VALIDATOR_WITHDRAWABILITY_DELAY",
+        ))?;
     let validator = state.validator_mut(index)?;
     validator.exit_epoch = exit_queue_epoch;
     validator.withdrawable_epoch = withdrawable;
