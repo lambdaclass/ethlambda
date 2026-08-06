@@ -23,9 +23,13 @@
 //! State and container files are `.ssz_snappy`: SSZ, compressed with *raw*
 //! snappy, not the framed format. Everything else is YAML.
 
-#![allow(dead_code, reason = "each runner uses a different part of this harness")]
+#![allow(
+    dead_code,
+    reason = "each runner uses a different part of this harness"
+)]
 
 mod harness;
+mod shuffling;
 mod ssz_static;
 
 use std::fs;
@@ -92,8 +96,8 @@ impl Case {
     /// which knows the fork, so this stops at the bytes.
     pub fn ssz_bytes(&self, name: &str) -> Vec<u8> {
         let path = self.path.join(format!("{name}.ssz_snappy"));
-        let compressed = fs::read(&path)
-            .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+        let compressed =
+            fs::read(&path).unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
         snap::raw::Decoder::new()
             .decompress_vec(&compressed)
             .unwrap_or_else(|err| panic!("decompressing {}: {err}", path.display()))
@@ -140,11 +144,7 @@ pub fn collect(config: &str, runner: &str, handler: &str) -> Vec<Case> {
     let mut cases = Vec::new();
 
     for fork_entry in read_dir_sorted(&root) {
-        let Some(fork) = fork_entry
-            .file_name()
-            .to_str()
-            .and_then(ForkName::parse)
-        else {
+        let Some(fork) = fork_entry.file_name().to_str().and_then(ForkName::parse) else {
             continue;
         };
 

@@ -229,7 +229,10 @@ mod tests {
         };
 
         let bytes = attestation.to_ssz();
-        assert_eq!(PendingAttestation::from_ssz_bytes(&bytes).unwrap(), attestation);
+        assert_eq!(
+            PendingAttestation::from_ssz_bytes(&bytes).unwrap(),
+            attestation
+        );
     }
 
     #[test]

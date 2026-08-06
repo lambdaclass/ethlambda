@@ -142,7 +142,11 @@ fn ssz_static() {
         println!(
             "ssz_static: {} container/fork pairs not implemented yet:\n  {}",
             unimplemented.len(),
-            unimplemented.iter().cloned().collect::<Vec<_>>().join("\n  ")
+            unimplemented
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ")
         );
     }
 

@@ -36,7 +36,11 @@ fn discovery_finds_a_known_suite() {
     assert!(!cases.is_empty(), "no ssz_static/Checkpoint cases found");
 
     for case in &cases {
-        assert!(case.has("serialized"), "{} has no serialized file", case.id());
+        assert!(
+            case.has("serialized"),
+            "{} has no serialized file",
+            case.id()
+        );
         assert!(case.has("roots"), "{} has no roots file", case.id());
     }
 }

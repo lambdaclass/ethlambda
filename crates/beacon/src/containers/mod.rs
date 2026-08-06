@@ -42,9 +42,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 
 use crate::error::{Error, Result};
 use crate::fork::ForkName;
-use crate::primitives::{
-    Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
-};
+use crate::primitives::{Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
 /// The beacon state, in whichever fork's shape it currently has.
 #[derive(Debug, Clone, PartialEq)]

@@ -13,8 +13,8 @@ use libssz_types::{SszBitvector, SszList, SszVector};
 use crate::constants;
 use crate::preset;
 use crate::primitives::{
-    BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei, ParticipationFlags, Root,
-    Slot, ValidatorIndex, Version,
+    BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei, ParticipationFlags,
+    Root, Slot, ValidatorIndex, Version,
 };
 
 // ---------------------------------------------------------------------------

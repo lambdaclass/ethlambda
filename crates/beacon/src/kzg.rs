@@ -96,7 +96,9 @@ fn proof_from_c_kzg(raw: c_kzg::KzgProof) -> KzgProof {
 /// keeping the result on the heap throughout (`CELLS_PER_EXT_BLOB` proofs of
 /// `KZG_POINT_SIZE` bytes each is small, but there is no reason to round-trip
 /// it through the stack).
-fn proofs_from_c_kzg(raw: Box<[c_kzg::KzgProof; c_kzg::CELLS_PER_EXT_BLOB]>) -> Box<ProofsPerExtBlob> {
+fn proofs_from_c_kzg(
+    raw: Box<[c_kzg::KzgProof; c_kzg::CELLS_PER_EXT_BLOB]>,
+) -> Box<ProofsPerExtBlob> {
     let converted: Vec<KzgProof> = raw.iter().map(|proof| proof_from_c_kzg(*proof)).collect();
     converted
         .into_boxed_slice()
@@ -214,8 +216,10 @@ pub fn verify_blob_kzg_proof_batch(
         .iter()
         .map(|commitment| c_kzg::Bytes48::new(commitment.0))
         .collect();
-    let proof_bytes: Vec<c_kzg::Bytes48> =
-        proofs.iter().map(|proof| c_kzg::Bytes48::new(proof.0)).collect();
+    let proof_bytes: Vec<c_kzg::Bytes48> = proofs
+        .iter()
+        .map(|proof| c_kzg::Bytes48::new(proof.0))
+        .collect();
     KZG_SETTINGS
         .verify_blob_kzg_proof_batch(&c_kzg_blobs, &commitment_bytes, &proof_bytes)
         .map_err(|_| Error::SpecAssert("blobs, commitments, and proofs have equal, valid entries"))
@@ -285,11 +289,15 @@ pub fn verify_cell_kzg_proof_batch(
         .iter()
         .map(|commitment| c_kzg::Bytes48::new(commitment.0))
         .collect();
-    let proof_bytes: Vec<c_kzg::Bytes48> =
-        proofs.iter().map(|proof| c_kzg::Bytes48::new(proof.0)).collect();
+    let proof_bytes: Vec<c_kzg::Bytes48> = proofs
+        .iter()
+        .map(|proof| c_kzg::Bytes48::new(proof.0))
+        .collect();
     KZG_SETTINGS
         .verify_cell_kzg_proof_batch(&commitment_bytes, cell_indices, cells, &proof_bytes)
-        .map_err(|_| Error::SpecAssert("commitments, cell_indices, cells, and proofs are consistent"))
+        .map_err(|_| {
+            Error::SpecAssert("commitments, cell_indices, cells, and proofs are consistent")
+        })
 }
 
 /// Domain separator for `compute_challenge`: the deneb spec's
@@ -339,10 +347,14 @@ fn hash_to_bls_field(data: &[u8]) -> Bytes32 {
 /// `commitment`: the transcript is their raw bytes, hashed, with no
 /// curve-point or field-element validation performed along the way.
 pub fn compute_challenge(blob: &[u8], commitment: &KzgCommitment) -> Result<Bytes32> {
-    verify(blob.len() == c_kzg::BYTES_PER_BLOB, "len(blob) == BYTES_PER_BLOB")?;
+    verify(
+        blob.len() == c_kzg::BYTES_PER_BLOB,
+        "len(blob) == BYTES_PER_BLOB",
+    )?;
 
-    let mut data =
-        Vec::with_capacity(FIAT_SHAMIR_PROTOCOL_DOMAIN.len() + 16 + blob.len() + commitment.0.len());
+    let mut data = Vec::with_capacity(
+        FIAT_SHAMIR_PROTOCOL_DOMAIN.len() + 16 + blob.len() + commitment.0.len(),
+    );
     data.extend_from_slice(FIAT_SHAMIR_PROTOCOL_DOMAIN);
     // The degree of the polynomial, as a domain separator. The spec encodes
     // it as a 16-byte big-endian integer here (`int.to_bytes(FIELD_ELEMENTS_PER_BLOB, 16, KZG_ENDIANNESS)`);
@@ -385,8 +397,14 @@ pub fn compute_verify_cell_kzg_proof_batch_challenge(
         commitment_indices.len() == cosets_evals.len(),
         "commitment_indices has one entry per coset",
     )?;
-    verify(cell_indices.len() == cosets_evals.len(), "cell_indices has one entry per coset")?;
-    verify(proofs.len() == cosets_evals.len(), "proofs has one entry per coset")?;
+    verify(
+        cell_indices.len() == cosets_evals.len(),
+        "cell_indices has one entry per coset",
+    )?;
+    verify(
+        proofs.len() == cosets_evals.len(),
+        "proofs has one entry per coset",
+    )?;
     for coset_evals in cosets_evals {
         verify(
             coset_evals.len() == c_kzg::FIELD_ELEMENTS_PER_CELL,
@@ -469,8 +487,12 @@ mod tests {
     /// every hex field in this test module is decoded.
     fn hex_bytes(value: &Value) -> Vec<u8> {
         let hex_str = value.as_str().expect("value is a hex string");
-        hex::decode(hex_str.strip_prefix("0x").expect("hex string has a 0x prefix"))
-            .expect("value is valid hex")
+        hex::decode(
+            hex_str
+                .strip_prefix("0x")
+                .expect("hex string has a 0x prefix"),
+        )
+        .expect("value is valid hex")
     }
 
     /// Decodes a 32-byte hex string, or `None` if it is not exactly 32 bytes.
@@ -509,7 +531,10 @@ mod tests {
     #[test]
     fn blob_to_kzg_commitment_matches_fixtures() {
         let cases = cases("deneb", "blob_to_kzg_commitment");
-        assert!(!cases.is_empty(), "no blob_to_kzg_commitment fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no blob_to_kzg_commitment fixtures found"
+        );
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
             let expected = &case["output"];
@@ -549,7 +574,10 @@ mod tests {
     #[test]
     fn compute_blob_kzg_proof_matches_fixtures() {
         let cases = cases("deneb", "compute_blob_kzg_proof");
-        assert!(!cases.is_empty(), "no compute_blob_kzg_proof fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no compute_blob_kzg_proof fixtures found"
+        );
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
             let expected = &case["output"];
@@ -597,9 +625,10 @@ mod tests {
             let expected = &case["output"];
             let input = &case["input"];
             let blob = hex_bytes(&input["blob"]);
-            let (Some(commitment), Some(proof)) =
-                (hex_commitment(&input["commitment"]), hex_proof(&input["proof"]))
-            else {
+            let (Some(commitment), Some(proof)) = (
+                hex_commitment(&input["commitment"]),
+                hex_proof(&input["proof"]),
+            ) else {
                 assert!(expected.is_null());
                 continue;
             };
@@ -614,7 +643,10 @@ mod tests {
     #[test]
     fn verify_blob_kzg_proof_batch_matches_fixtures() {
         let cases = cases("deneb", "verify_blob_kzg_proof_batch");
-        assert!(!cases.is_empty(), "no verify_blob_kzg_proof_batch fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no verify_blob_kzg_proof_batch fixtures found"
+        );
         for case in &cases {
             let expected = &case["output"];
             let input = &case["input"];
@@ -675,7 +707,10 @@ mod tests {
     #[test]
     fn compute_cells_and_kzg_proofs_matches_fixtures() {
         let cases = cases("fulu", "compute_cells_and_kzg_proofs");
-        assert!(!cases.is_empty(), "no compute_cells_and_kzg_proofs fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no compute_cells_and_kzg_proofs fixtures found"
+        );
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
             let expected = &case["output"];
@@ -700,7 +735,10 @@ mod tests {
     #[test]
     fn recover_cells_and_kzg_proofs_matches_fixtures() {
         let cases = cases("fulu", "recover_cells_and_kzg_proofs");
-        assert!(!cases.is_empty(), "no recover_cells_and_kzg_proofs fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no recover_cells_and_kzg_proofs fixtures found"
+        );
         for case in &cases {
             let expected = &case["output"];
             let input = &case["input"];
@@ -742,7 +780,10 @@ mod tests {
     #[test]
     fn verify_cell_kzg_proof_batch_matches_fixtures() {
         let cases = cases("fulu", "verify_cell_kzg_proof_batch");
-        assert!(!cases.is_empty(), "no verify_cell_kzg_proof_batch fixtures found");
+        assert!(
+            !cases.is_empty(),
+            "no verify_cell_kzg_proof_batch fixtures found"
+        );
         for case in &cases {
             let expected = &case["output"];
             let input = &case["input"];
@@ -771,7 +812,8 @@ mod tests {
                 .iter()
                 .map(hex_proof)
                 .collect();
-            let (Some(commitments), Some(cells), Some(proofs)) = (commitments, cells, proofs) else {
+            let (Some(commitments), Some(cells), Some(proofs)) = (commitments, cells, proofs)
+            else {
                 assert!(expected.is_null());
                 continue;
             };
