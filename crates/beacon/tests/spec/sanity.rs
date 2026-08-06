@@ -13,12 +13,11 @@
 //! Unlike the `operations` suite, these run the full [`state_transition`], so
 //! they check the proposer signature and the committed `state_root` too.
 
-use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
-use ethlambda_beacon::containers::{BeaconState, phase0};
-use ethlambda_beacon::stf;
+use ethlambda_beacon::containers::{BeaconState, SignedBeaconBlock};
+use ethlambda_beacon::stf::{self, ExecutionEngine};
 
-use super::{Case, PRESET, Report, collect};
+use super::{Case, PRESET, Report, collect, map_cases};
 
 #[derive(serde::Deserialize)]
 struct BlocksMeta {
@@ -29,12 +28,20 @@ struct BlocksMeta {
 fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result<(), String> {
     let meta: BlocksMeta = case.yaml("meta");
 
+    // `sanity/blocks`, `finality`, and `random` ship no `execution.yaml`
+    // (unlike the fork suites from bellatrix on that exercise
+    // `notify_new_payload`), so there is no engine answer to read from the
+    // case. A valid engine is the right default here: these cases are
+    // testing consensus-layer rules, not execution-payload rejection, so an
+    // engine that never objects keeps that variable out of the result.
+    let engine = ExecutionEngine::valid();
+
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
-        let block = phase0::SignedBeaconBlock::from_ssz_bytes(&bytes)
+        let block = SignedBeaconBlock::from_ssz(case.fork, &bytes)
             .map_err(|err| format!("block {index} does not decode: {err:?}"))?;
 
-        stf::state_transition(state, &block, true, config)
+        stf::state_transition(state, &block, true, config, &engine)
             .map_err(|err| format!("block {index} rejected: {err:?}"))?;
     }
 
@@ -54,33 +61,30 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
 fn run(runner: &str, handler: &str, slots: bool) {
     let mut report = Report::new();
     let config = Config::active();
-    let mut skipped = 0usize;
+    let cases = collect(PRESET, runner, handler);
 
-    for case in collect(PRESET, runner, handler) {
-        if case.fork != ForkName::Phase0 {
-            skipped += 1;
-            continue;
+    let outcomes = map_cases(&cases, |case| {
+        if !case.in_scope() {
+            return None;
         }
 
         let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
             .expect("the fixture's pre-state decodes");
 
         let outcome = if slots {
-            apply_slots(&case, &mut state, &config)
+            apply_slots(case, &mut state, &config)
         } else {
-            apply_blocks(&case, &mut state, &config)
+            apply_blocks(case, &mut state, &config)
         };
-        report.record(&case, super::check_transition(&case, outcome, &state));
+        Some(super::check_transition(case, outcome, &state))
+    });
+
+    for (case, outcome) in cases.iter().zip(outcomes) {
+        report.record_or_skip(case, outcome);
     }
 
-    let name = format!("{runner}/{handler}");
-    if skipped > 0 {
-        println!("{name}: {skipped} cases skipped, from forks after phase0");
-    }
-    report.finish(&name);
+    report.finish(&format!("{runner}/{handler}"));
 }
-
-use libssz::SszDecode as _;
 
 #[test]
 fn sanity_blocks() {

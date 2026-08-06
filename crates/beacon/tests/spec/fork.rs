@@ -5,28 +5,36 @@
 //! of the irregular state change itself. `case.fork` names the target fork
 //! (the directory this crate's harness walks is `tests/<config>/<fork>/...`,
 //! where `<fork>` is the one the case upgrades *to*), matching every case's
-//! `meta.yaml`, which carries the same name under its own `fork` key.
+//! `meta.yaml`, which carries the same name under its own `fork` key. The
+//! source fork is not carried anywhere in the fixture beyond that: it is
+//! always `ForkName::previous` of the target, since every upgrade in the
+//! specification is defined from the one fork immediately before it.
 //!
-//! Only altair's cases are runnable so far, since [`ethlambda_beacon::upgrade`]
-//! implements only the phase0-to-altair upgrade. Cases for later forks are
-//! counted as unimplemented rather than silently skipped, the way
-//! `ssz_static` counts container/fork pairs it does not decode, so a fixture
-//! release that this crate has partially caught up with is never reported as
-//! fully covered.
+//! Gated on [`super::HIGHEST_IMPLEMENTED_FORK`] like every other runner, so
+//! cases whose target this crate does not implement yet are counted as
+//! skipped rather than silently dropped, the way `ssz_static` counts
+//! container/fork pairs it does not decode. [`super::HIGHEST_IMPLEMENTED_FORK`]
+//! is now fulu, and [`ethlambda_beacon::upgrade::upgrade_state`] routes every
+//! fork through its own `upgrade_to_*` function, so the two agree by
+//! construction all the way to fulu; the two are still checking different
+//! things, though: this gate is "has this crate's state transition caught up
+//! to this fork at all," which is deliberately conservative, since running a
+//! fork's upgrade before its state transition exists would let this suite go
+//! green on a fork nothing else here can actually process yet.
 //!
-//! This exercises [`ethlambda_beacon::upgrade::upgrade_state`] rather than
-//! [`ethlambda_beacon::upgrade::upgrade_to_altair`] directly, so the dispatch
-//! by [`ForkName`] gets fixture coverage too, not just the per-fork function
-//! it delegates to.
+//! This exercises [`ethlambda_beacon::upgrade::upgrade_state`] rather than each
+//! fork's own `upgrade_to_*` function directly, so the dispatch by
+//! `ForkName` gets fixture coverage too, not just the per-fork function it
+//! delegates to. That is also what makes picking up a later fork here a
+//! one-line change once its own `upgrade_to_*` lands: `upgrade_state` already
+//! routes to it by name, so once [`super::HIGHEST_IMPLEMENTED_FORK`] moves
+//! past this fork, [`fork_case`] finds its `pre` and `post` shapes on its own.
 
-use std::collections::BTreeSet;
-
-use ethlambda_beacon::ForkName;
 use ethlambda_beacon::config::Config;
 use ethlambda_beacon::containers::BeaconState;
 use ethlambda_beacon::upgrade::upgrade_state;
 
-use super::{Case, PRESET, Report, collect};
+use super::{Case, PRESET, Report, collect, map_cases};
 
 /// Runs one case: decode `pre` in the source fork's shape, upgrade it, and
 /// compare against `post` by `hash_tree_root`.
@@ -35,13 +43,15 @@ use super::{Case, PRESET, Report, collect};
 /// post-state has the same fork as the pre-state, which is exactly what a
 /// fork-upgrade case never does, so it is reimplemented here without the
 /// `has("post")` branch that a rejection-capable runner needs. Every case in
-/// this handler ships a `post`; the specification's `upgrade_to_altair` has
-/// no assertion that can fail on a wellformed pre-state, so there is no
-/// rejection case to model.
+/// this handler ships a `post`; none of the specification's `upgrade_to_*`
+/// functions have an assertion that can fail on a wellformed pre-state, so
+/// there is no rejection case to model.
 fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
-    // The caller only reaches this function for `case.fork == ForkName::Altair`,
-    // so `pre` is always shaped like the fork altair upgrades from: phase0.
-    let pre = BeaconState::from_ssz(ForkName::Phase0, &case.ssz_bytes("pre"))
+    let source = case
+        .fork
+        .previous()
+        .ok_or_else(|| format!("fork `{}` has no previous fork to upgrade from", case.fork))?;
+    let pre = BeaconState::from_ssz(source, &case.ssz_bytes("pre"))
         .map_err(|err| format!("decoding the fixture's pre-state: {err:?}"))?;
 
     let actual =
@@ -67,28 +77,14 @@ fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
 fn fork() {
     let config = Config::active();
     let mut report = Report::new();
-    let mut skipped = 0usize;
-    let mut unimplemented_targets: BTreeSet<ForkName> = BTreeSet::new();
+    let cases = collect(PRESET, "fork", "fork");
 
-    for case in collect(PRESET, "fork", "fork") {
-        if case.fork != ForkName::Altair {
-            skipped += 1;
-            unimplemented_targets.insert(case.fork);
-            continue;
-        }
+    let outcomes = map_cases(&cases, |case| {
+        case.in_scope().then(|| fork_case(case, &config))
+    });
 
-        report.record(&case, fork_case(&case, &config));
-    }
-
-    if skipped > 0 {
-        let targets: Vec<String> = unimplemented_targets
-            .iter()
-            .map(ForkName::to_string)
-            .collect();
-        println!(
-            "fork: {skipped} cases skipped, from upgrades this crate does not implement yet: {}",
-            targets.join(", ")
-        );
+    for (case, outcome) in cases.iter().zip(outcomes) {
+        report.record_or_skip(case, outcome);
     }
 
     report.finish("fork");

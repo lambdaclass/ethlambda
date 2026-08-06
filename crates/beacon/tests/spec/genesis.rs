@@ -22,7 +22,7 @@ use ethlambda_beacon::genesis::{initialize_beacon_state_from_eth1, is_valid_gene
 use ethlambda_beacon::primitives::{HashTreeRoot as _, Root};
 use libssz::SszDecode as _;
 
-use super::{Case, PRESET, Report, collect};
+use super::{Case, PRESET, Report, collect, map_cases};
 
 #[derive(serde::Deserialize)]
 struct Eth1 {
@@ -100,14 +100,20 @@ fn initialization() {
     let config = Config::minimal();
     let mut report = Report::new();
 
-    for case in collect(PRESET, "genesis", "initialization") {
-        // Only phase0 has a genesis-construction fixture suite in this
-        // release; a later fork adding one would need its own state type
-        // here rather than silently being decoded as phase0's.
-        if case.fork != ethlambda_beacon::ForkName::Phase0 {
-            continue;
-        }
-        report.record(&case, initialization_case(&case, &config));
+    let cases = collect(PRESET, "genesis", "initialization");
+
+    // Only phase0 has a genesis-construction fixture suite in this release; a
+    // later fork adding one would need its own state type here rather than
+    // silently being decoded as phase0's. Gating through the shared
+    // `in_scope`/`skip` pair rather than a bespoke phase0 check keeps this
+    // runner consistent with the rest even though, today, there is nothing
+    // after phase0 for it to skip.
+    let outcomes = map_cases(&cases, |case| {
+        case.in_scope().then(|| initialization_case(case, &config))
+    });
+
+    for (case, outcome) in cases.iter().zip(outcomes) {
+        report.record_or_skip(case, outcome);
     }
 
     report.finish("genesis/initialization");
@@ -118,11 +124,14 @@ fn validity() {
     let config = Config::minimal();
     let mut report = Report::new();
 
-    for case in collect(PRESET, "genesis", "validity") {
-        if case.fork != ethlambda_beacon::ForkName::Phase0 {
-            continue;
-        }
-        report.record(&case, validity_case(&case, &config));
+    let cases = collect(PRESET, "genesis", "validity");
+
+    let outcomes = map_cases(&cases, |case| {
+        case.in_scope().then(|| validity_case(case, &config))
+    });
+
+    for (case, outcome) in cases.iter().zip(outcomes) {
+        report.record_or_skip(case, outcome);
     }
 
     report.finish("genesis/validity");

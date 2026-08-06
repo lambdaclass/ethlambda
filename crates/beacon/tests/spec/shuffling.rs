@@ -13,7 +13,7 @@
 use ethlambda_beacon::helpers::shuffling::compute_shuffled_index;
 use ethlambda_beacon::primitives::Root;
 
-use super::{PRESET, Report, collect};
+use super::{PRESET, Report, collect, map_cases};
 
 #[derive(serde::Deserialize)]
 struct Mapping {
@@ -26,14 +26,16 @@ struct Mapping {
 fn shuffling() {
     let mut report = Report::new();
 
-    for case in collect(PRESET, "shuffling", "core") {
+    let cases = collect(PRESET, "shuffling", "core");
+
+    let outcomes = map_cases(&cases, |case| {
         let mapping: Mapping = case.yaml("mapping");
 
         let stripped = mapping.seed.strip_prefix("0x").unwrap_or(&mapping.seed);
         let seed_bytes = hex::decode(stripped).expect("the seed is a hex string");
         let seed = Root::from_slice(&seed_bytes);
 
-        let outcome = (|| {
+        (|| {
             if mapping.mapping.len() as u64 != mapping.count {
                 return Err(format!(
                     "fixture claims count {} but lists {} entries",
@@ -59,9 +61,11 @@ fn shuffling() {
             }
 
             Ok(())
-        })();
+        })()
+    });
 
-        report.record(&case, outcome);
+    for (case, outcome) in cases.iter().zip(outcomes) {
+        report.record(case, outcome);
     }
 
     report.finish("shuffling");
