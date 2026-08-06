@@ -53,6 +53,7 @@ pub mod helpers;
 pub mod kzg;
 pub mod preset;
 pub mod primitives;
+pub mod stf;
 
 mod error;
 
