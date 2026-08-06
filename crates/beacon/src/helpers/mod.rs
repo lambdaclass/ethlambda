@@ -14,6 +14,7 @@
 pub mod accessors;
 pub mod altair;
 pub mod attestation;
+pub mod finality;
 pub mod math;
 pub mod misc;
 pub mod mutators;

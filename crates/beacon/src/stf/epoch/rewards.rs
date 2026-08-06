@@ -43,11 +43,13 @@ use crate::error::{Error, Result};
 use crate::helpers::accessors::{
     get_current_epoch, get_previous_epoch, get_total_active_balance, get_total_balance,
 };
+use crate::helpers::finality::{
+    get_eligible_validator_indices, get_finality_delay, is_in_inactivity_leak,
+};
 use crate::helpers::math::integer_squareroot;
 use crate::helpers::mutators::{decrease_balance, increase_balance};
-use crate::helpers::predicates::is_active_validator;
 use crate::preset;
-use crate::primitives::{Epoch, Gwei, ValidatorIndex};
+use crate::primitives::{Gwei, ValidatorIndex};
 
 use super::{
     get_matching_head_attestations, get_matching_source_attestations,
@@ -77,47 +79,6 @@ pub fn get_base_reward(state: &BeaconState, index: ValidatorIndex) -> Result<Gwe
 /// attestation.
 pub fn get_proposer_reward(state: &BeaconState, attesting_index: ValidatorIndex) -> Result<Gwei> {
     Ok(get_base_reward(state, attesting_index)? / preset::PROPOSER_REWARD_QUOTIENT)
-}
-
-/// How many epochs finality has lagged behind the previous epoch.
-///
-/// Zero whenever finality is keeping pace with attestation processing; grows
-/// by one every further epoch the chain fails to finalize, which is what lets
-/// [`is_in_inactivity_leak`] and the inactivity penalty scale with how long the
-/// stall has lasted rather than firing at a fixed severity.
-pub fn get_finality_delay(state: &BeaconState) -> Epoch {
-    get_previous_epoch(state) - state.finalized_checkpoint().epoch
-}
-
-/// Whether the chain has gone long enough without finalizing that inactive
-/// validators' balances should start leaking away.
-///
-/// The leak exists so a large inactive or adversarial minority cannot stall
-/// finality forever while keeping its stake intact: the longer finality
-/// stalls, the faster an inactive validator's share of the active set shrinks,
-/// until the honest, active minority eventually clears the two-thirds
-/// threshold on its own.
-pub fn is_in_inactivity_leak(state: &BeaconState) -> bool {
-    get_finality_delay(state) > preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY
-}
-
-/// Validators whose participation this epoch's rewards and penalties account
-/// for: every currently active validator, plus one already exited but not yet
-/// past its withdrawable epoch, so a validator that leaves the active set
-/// still pays (or earns) whatever this epoch's accounting owes it up to that
-/// point.
-pub fn get_eligible_validator_indices(state: &BeaconState) -> Vec<ValidatorIndex> {
-    let previous_epoch = get_previous_epoch(state);
-    state
-        .validators()
-        .iter()
-        .enumerate()
-        .filter(|(_, validator)| {
-            is_active_validator(validator, previous_epoch)
-                || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch)
-        })
-        .map(|(index, _)| index as ValidatorIndex)
-        .collect()
 }
 
 /// Shared accounting for the source, target, and head components of the

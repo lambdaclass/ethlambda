@@ -10,14 +10,30 @@ use crate::containers::BeaconState;
 use crate::containers::phase0;
 use crate::containers::shared::Validator;
 use crate::preset;
-use crate::primitives::{Bytes32, Root};
+use crate::primitives::{BlsPubkey, Bytes32, Root};
+
+/// A deterministic but genuinely valid BLS public key for validator `index`.
+///
+/// A zero pubkey is not a curve point, so anything that aggregates or validates
+/// keys rejects it. That makes the all-default validator unusable for the sync
+/// committee, which aggregates its members' keys, and it would silently limit
+/// every later fork's tests in the same way. Deriving a real key from the index
+/// keeps the state reproducible while letting the BLS paths run.
+fn pubkey_for(index: usize) -> BlsPubkey {
+    let mut ikm = [0u8; 32];
+    ikm[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+    let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[])
+        .expect("32 bytes of input material is enough for key generation");
+    BlsPubkey(secret.sk_to_pk().to_bytes())
+}
 
 /// A phase0 state with `count` fully active, full-balance validators, positioned
 /// one epoch in so that the previous epoch exists and the block root window has
 /// entries behind it.
 pub fn with_validators(count: usize) -> BeaconState {
     let validators: Vec<Validator> = (0..count)
-        .map(|_| Validator {
+        .map(|index| Validator {
+            pubkey: pubkey_for(index),
             effective_balance: preset::MAX_EFFECTIVE_BALANCE,
             activation_eligibility_epoch: 0,
             activation_epoch: 0,

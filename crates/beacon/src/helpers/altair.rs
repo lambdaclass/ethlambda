@@ -14,8 +14,8 @@
 //! [`get_inactivity_penalty_deltas`] are the epoch-boundary reward and penalty
 //! accounting that reads those flags back.
 //!
-//! [`get_eligible_validator_indices`](crate::stf::epoch::rewards::get_eligible_validator_indices)
-//! and [`is_in_inactivity_leak`](crate::stf::epoch::rewards::is_in_inactivity_leak)
+//! [`get_eligible_validator_indices`](super::finality::get_eligible_validator_indices)
+//! and [`is_in_inactivity_leak`](super::finality::is_in_inactivity_leak)
 //! are reused from phase0's rewards module rather than redefined here: the
 //! specification does not modify either of them in altair, and both are
 //! already written against `BeaconState`'s fork-invariant accessors rather
@@ -31,6 +31,7 @@
 //! without changing the shape of any SSZ container. That is the only function
 //! below that takes a [`Config`]; the rest need nothing a network could vary.
 
+use super::finality::{get_eligible_validator_indices, is_in_inactivity_leak};
 use crate::bls;
 use crate::config::Config;
 use crate::constants;
@@ -40,7 +41,6 @@ use crate::error::{Error, Result};
 use crate::hash::hash;
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
-use crate::stf::epoch::rewards::{get_eligible_validator_indices, is_in_inactivity_leak};
 
 use super::accessors::{
     get_active_validator_indices, get_block_root, get_block_root_at_slot, get_current_epoch,
