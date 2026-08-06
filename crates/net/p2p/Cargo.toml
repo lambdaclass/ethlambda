@@ -33,9 +33,17 @@ tracing.workspace = true
 rand = "0.8"
 
 # Required for NodeEnr parsing
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+# TEMPORARY: absolute path dependency on an unpushed local ethrex branch
+# (feat/lean-discovery-hooks). Builds only on this machine — CI and any other
+# checkout will fail to resolve it. Restore the git + rev form before opening a
+# PR; see the plan's "Reverting the path dependency" section.
+ethrex-p2p = { path = "/Users/mega/execution/ethrex/crates/networking/p2p" }
+ethrex-rlp = { path = "/Users/mega/execution/ethrex/crates/common/rlp" }
+ethrex-common = { path = "/Users/mega/execution/ethrex/crates/common" }
+
+# Versions pinned to ethrex's workspace: these types cross the API boundary.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }
+bytes = "1.6.0"
 
 # SSZ
 libssz.workspace = true
