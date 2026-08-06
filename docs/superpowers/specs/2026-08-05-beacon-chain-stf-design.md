@@ -235,16 +235,19 @@ Each stage is at least one commit, and lands only when its fixture gate is
 green. Work fans out to parallel agents by file ownership: one agent per file,
 never a shared file.
 
-| # | Stage | Fixture gate |
-|---|-------|--------------|
-| 1 | Scaffold: preset, config, fork, primitives, hash, bls, kzg | `general/bls`, `general/kzg` |
-| 2 | Fixture harness: download, loader, runner skeleton | harness self-tests |
-| 3 | phase0 containers, the enum, accessors | `ssz_static` phase0 |
-| 4 | Helpers: accessors, predicates, math, committees, shuffling | `shuffling` |
-| 5 | phase0 blocks and operations | `operations` phase0 |
-| 6 | phase0 epoch processing | `epoch_processing`, `finality`, `sanity`, `random`, `rewards` |
-| 7 | phase0 fork choice | `fork_choice` phase0 |
-| 8 | altair: sync committees, participation flags, inactivity | altair suites |
+`Status` records where the work actually got to, since the gate column turned out
+to be wrong in one place.
+
+| # | Stage | Fixture gate | Status |
+|---|-------|--------------|--------|
+| 1 | Scaffold: preset, config, fork, primitives, hash, bls, kzg | `general/bls`, `general/kzg` | done |
+| 2 | Fixture harness: download, loader, runner skeleton | harness self-tests | done |
+| 3 | phase0 containers, the enum, accessors | `ssz_static` phase0 | done |
+| 4 | Helpers: accessors, predicates, math, committees, shuffling | `shuffling` | done |
+| 5 | phase0 blocks and operations | `operations` phase0 | done |
+| 6 | phase0 epoch processing | `epoch_processing`, `finality`, `sanity`, `random`, `rewards` | done, plus `genesis` |
+| 7 | phase0 fork choice | ~~`fork_choice` phase0~~ | **written, not gated** |
+| 8 | altair: sync committees, participation flags, inactivity | altair suites | containers and `fork` only |
 | 9 | bellatrix: execution payload, merge transition | bellatrix suites |
 | 10 | capella: withdrawals, BLS-to-execution changes | capella suites |
 | 11 | deneb: blob commitments | deneb suites |
@@ -255,6 +258,20 @@ never a shared file.
 
 Stages 3 and 4 must complete before the state transition fan-out, because
 everything downstream depends on those types and helpers.
+
+### The stage 7 gate does not exist
+
+This plan assumed a phase0 `fork_choice` suite. There is none: the release ships
+`fork_choice` from altair onward, because the suite's cases are built from states
+that only later forks have. So stage 7's code is written but cannot be verified
+until stage 8's state transition lands, and stage 7 should have been sequenced
+after it. Anything relying on the store before then is relying on unit tests.
+
+### Genesis was missing from the plan
+
+`initialize_beacon_state_from_eth1` and the `genesis` suite appear in no stage
+above. They were folded into stage 6. The suite ships only under `minimal`, so
+the mainnet build has no genesis coverage at all.
 
 ## Dependencies
 
