@@ -217,112 +217,16 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
 mod tests {
     use super::*;
     use crate::constants::FAR_FUTURE_EPOCH;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::deneb;
-    use crate::containers::shared::Validator;
-    use crate::primitives::{
-        BlsPubkey, Bytes32, ExecutionAddress, ExecutionBlockHash, Root, Uint256,
-    };
 
     /// A deneb state with `count` fully active, full-balance validators,
     /// positioned one epoch in, the same shape
     /// [`crate::helpers::test_state::with_validators`] builds for phase0.
     ///
-    /// Not added to that shared builder, which only ever constructs a phase0
-    /// state: this module is the first of the two this crate's file
-    /// ownership gives it a reason to build a deneb state for a test, so the
-    /// builder lives here rather than growing a module this file does not
-    /// own into a fork-dispatching helper for one caller. Every field past
-    /// `validators` and `balances` is a placeholder [`activation_churn_limit`]
-    /// and [`process_registry_updates`] never read.
+    /// A thin wrapper around the shared fork-parameterised builder: see
+    /// [`crate::helpers::test_state::with_validators_at`] for the construction
+    /// this and every other fork's test module used to duplicate.
     fn deneb_state_with_validators(count: usize) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                pubkey: BlsPubkey::default(),
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: FAR_FUTURE_EPOCH,
-                withdrawable_epoch: FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        };
-
-        BeaconState::Deneb(deneb::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: deneb::ExecutionPayloadHeader {
-                parent_hash: ExecutionBlockHash::zero(),
-                fee_recipient: ExecutionAddress::zero(),
-                state_root: Bytes32::zero(),
-                receipts_root: Bytes32::zero(),
-                logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
-                    .try_into()
-                    .expect("the vector is built at its exact length"),
-                prev_randao: Bytes32::zero(),
-                block_number: 0,
-                gas_limit: 0,
-                gas_used: 0,
-                timestamp: 0,
-                extra_data: Default::default(),
-                base_fee_per_gas: Uint256::zero(),
-                block_hash: ExecutionBlockHash::zero(),
-                transactions_root: Root::zero(),
-                withdrawals_root: Root::zero(),
-                blob_gas_used: 0,
-                excess_blob_gas: 0,
-            },
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-        })
+        crate::helpers::test_state::with_validators_at(ForkName::Deneb, count)
     }
 
     /// Deneb's EIP-7514 cap must bind even when the plain validator-count

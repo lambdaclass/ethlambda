@@ -95,136 +95,22 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::bellatrix::LogsBloom;
-    use crate::containers::deneb::ExecutionPayloadHeader;
-    use crate::containers::electra::{
-        PendingConsolidations, PendingDeposits, PendingPartialWithdrawals,
-    };
-    use crate::containers::fulu;
-    use crate::containers::shared::Validator;
+    use crate::fork::ForkName;
     use crate::helpers::fulu::initialize_proposer_lookahead;
-    use crate::primitives::{
-        BlsPubkey, Bytes32, ExecutionAddress, ExecutionBlockHash, Root, Uint256,
-    };
-
-    /// An all-zero execution payload header, standing in for the genesis
-    /// payload: nothing in this module inspects it.
-    fn empty_execution_payload_header() -> ExecutionPayloadHeader {
-        ExecutionPayloadHeader {
-            parent_hash: ExecutionBlockHash::zero(),
-            fee_recipient: ExecutionAddress::zero(),
-            state_root: Bytes32::zero(),
-            receipts_root: Bytes32::zero(),
-            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
-            prev_randao: Bytes32::zero(),
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::zero(),
-            block_hash: ExecutionBlockHash::zero(),
-            transactions_root: Root::zero(),
-            withdrawals_root: Root::zero(),
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        }
-    }
 
     /// A fulu state with `count` fully active, full-balance validators and a
     /// `proposer_lookahead` filled by
     /// [`crate::helpers::fulu::initialize_proposer_lookahead`], one epoch past
     /// genesis.
     ///
-    /// Duplicated from `crate::helpers::fulu::tests::fulu_state_with_validators`,
-    /// which is private to that module and therefore not reachable from here;
-    /// see that function's own doc comment for why these per-fork test
-    /// builders stay local to whichever module first needs one rather than
-    /// growing `crate::helpers::test_state` into a fork-dispatching helper.
+    /// The shared builder leaves `proposer_lookahead` zeroed, since that
+    /// field is fulu-specific and most of this crate's per-fork test states
+    /// never touch it; this module's own tests are exactly the ones that do,
+    /// so this runs the real computation on top before handing the state
+    /// back, the same override
+    /// `crate::helpers::fulu::tests::fulu_state_with_validators` applies.
     fn fulu_state_with_validators(count: usize) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: constants::FAR_FUTURE_EPOCH,
-                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        };
-
-        let mut state = BeaconState::Fulu(fulu::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: empty_execution_payload_header(),
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
-            deposit_balance_to_consume: 0,
-            exit_balance_to_consume: 0,
-            earliest_exit_epoch: 0,
-            consolidation_balance_to_consume: 0,
-            earliest_consolidation_epoch: 0,
-            pending_deposits: PendingDeposits::default(),
-            pending_partial_withdrawals: PendingPartialWithdrawals::default(),
-            pending_consolidations: PendingConsolidations::default(),
-            // Overwritten below by `initialize_proposer_lookahead`; built here
-            // only to give the struct literal a value of the right length.
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-        });
-
+        let mut state = crate::helpers::test_state::with_validators_at(ForkName::Fulu, count);
         let lookahead = initialize_proposer_lookahead(&state).unwrap();
         if let BeaconState::Fulu(fulu_state) = &mut state {
             fulu_state.proposer_lookahead = lookahead.try_into().expect(

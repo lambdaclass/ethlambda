@@ -1,7 +1,8 @@
 # Beacon Chain state transition and Store: design
 
 **Date:** 2026-08-05
-**Status:** approved, implementation staged
+**Status:** implemented; every stage below has landed, and every fixture gate
+is green on both presets
 
 ## Goal
 
@@ -43,7 +44,7 @@ rule; a version-pinned Beacon fixture tree fails only when we change something.
 
 ```
 crates/beacon/
-  Cargo.toml           features: preset-mainnet (default) | preset-minimal
+  Cargo.toml           features: preset-minimal (mainnet is the implicit default)
   src/
     lib.rs             module graph, crate documentation
     preset.rs          compile-time constants, cfg-selected per preset
@@ -54,7 +55,8 @@ crates/beacon/
     bls.rs             blst wrapper
     kzg.rs             c-kzg wrapper plus the two Fiat-Shamir challenge functions
     containers/
-      mod.rs           the BeaconState / BeaconBlock / BeaconBlockBody enums
+      mod.rs           the BeaconState / SignedBeaconBlock enums; no block-body
+                       enum (see "Fork representation" below)
       phase0.rs ... fulu.rs    per-fork container structs
       shared.rs        fork-invariant containers
     helpers/           accessors, predicates, math, committees, shuffling
@@ -95,11 +97,16 @@ per-fork field lists are not a growing tail:
   phase0. From altair on they are absent from both the encoding and the merkle
   tree, replaced in position by `previous_epoch_participation` and
   `current_epoch_participation`, which have a different type.
-- `latest_execution_payload_header` keeps its name but is a different container
-  in bellatrix, capella, deneb, electra, and fulu.
+- `latest_execution_payload_header` keeps its name, but is a different
+  container only in bellatrix, capella, and deneb; electra and fulu reuse
+  deneb's shape unchanged.
 - The field count crosses a power of two at electra, so the state's merkle tree
   is 5 levels deep through deneb and 6 from electra on. The same logical field
   has a different generalized index in different forks.
+- `SignedBeaconBlock::Fulu` wraps `electra::SignedBeaconBlock` rather than a
+  `fulu` type of its own: fulu changes no field of a block, only how one is
+  processed (blob limits become epoch-dependent), so it still needs its own
+  variant to keep those two cases distinguishable.
 
 | Fork | State fields | HTR leaves | Depth |
 |------|--------------|------------|-------|
@@ -145,6 +152,21 @@ function seven times. Two mechanisms prevent that:
 Functions that are inherently fork-specific, such as `process_sync_aggregate`
 (altair and later) or `process_consolidation_request` (electra and later),
 return an error for forks that do not have them.
+
+### No block-body enum
+
+Deliberately absent from `containers/mod.rs` is a `BeaconBlockBody` enum, a
+body reference type, or a trait over bodies. Such a type would have to grow a
+method or match arm per fork-specific field or operation list, which defeats
+the point of dispatching on the fork once: a caller of
+`body.attester_slashings()` would still have to know which fork it is dealing
+with to make sense of what comes back, since electra's attester slashings are
+not phase0's. What lets one function serve every fork instead is narrower:
+`process_block_header`, `process_randao`, and `process_eth1_data` each take
+the handful of fields they read directly, rather than a whole body, so
+validating a header does not care whether the body it came from also carries
+a sync aggregate or an execution payload. A shared step earns its genericity
+by needing less, not by being handed a bigger abstraction to see through.
 
 ### Presets
 
@@ -215,6 +237,21 @@ from needing serde implementations.
 `ssz_generic` exercises the SSZ library rather than our containers, so it is a
 stretch goal, not a gate.
 
+### Performance
+
+The mainnet spec suite went from 1576s to about 106s. Two causes:
+
+1. `sha2`'s `asm` feature selects the CPU's SHA-256 instructions. Without it,
+   `sha2` compiles the portable scalar backend on aarch64 regardless of what
+   the CPU supports, and merkleization is almost entirely SHA-256
+   compressions.
+2. `map_cases` (`tests/spec/mod.rs`) runs each suite's independent cases on
+   rayon's pool. The pool is process-wide on purpose: the harness runs suites
+   concurrently, and one shared pool keeps the number of cases in flight at
+   the core count regardless of how many suites are running. A pool per suite
+   would oversubscribe by the number of suites, and multiply peak memory by
+   it too, since a case in flight holds a whole beacon state.
+
 ### Differential fuzzing
 
 A `fuzz/` crate outside the workspace, so Lighthouse's dependency tree never
@@ -246,26 +283,33 @@ to be wrong in one place.
 | 4 | Helpers: accessors, predicates, math, committees, shuffling | `shuffling` | done |
 | 5 | phase0 blocks and operations | `operations` phase0 | done |
 | 6 | phase0 epoch processing | `epoch_processing`, `finality`, `sanity`, `random`, `rewards` | done, plus `genesis` |
-| 7 | phase0 fork choice | ~~`fork_choice` phase0~~ | **written, not gated** |
-| 8 | altair: sync committees, participation flags, inactivity | altair suites | containers and `fork` only |
-| 9 | bellatrix: execution payload, merge transition | bellatrix suites |
-| 10 | capella: withdrawals, BLS-to-execution changes | capella suites |
-| 11 | deneb: blob commitments | deneb suites |
-| 12 | electra: max EB, deposit and withdrawal requests, consolidations, committee bits | electra suites |
-| 13 | fulu: proposer lookahead, blob schedule | fulu suites |
-| 14 | Differential fuzzing | corpus replay |
-| 15 | Documentation | mdbook builds |
+| 7 | phase0 fork choice | `fork_choice` altair onward | done, once stage 8 landed |
+| 8 | altair: sync committees, participation flags, inactivity | altair suites | done |
+| 9 | bellatrix: execution payload, merge transition | bellatrix suites | done |
+| 10 | capella: withdrawals, BLS-to-execution changes | capella suites | done |
+| 11 | deneb: blob commitments | deneb suites | done |
+| 12 | electra: max EB, deposit and withdrawal requests, consolidations, committee bits | electra suites | done |
+| 13 | fulu: proposer lookahead, blob schedule | fulu suites | done |
+| 14 | Differential fuzzing | corpus replay | done |
+| 15 | Documentation | mdbook builds | done |
 
-Stages 3 and 4 must complete before the state transition fan-out, because
-everything downstream depends on those types and helpers.
+Every fixture suite now passes on both presets: mainnet is 20 suites green
+plus 244 lib tests; minimal is 22 suites green. `fork_choice` alone accounts
+for 150 mainnet cases.
 
-### The stage 7 gate does not exist
+Stages 3 and 4 had to complete before the state transition fan-out, because
+everything downstream depended on those types and helpers.
+
+### The stage 7 gate did not exist yet
 
 This plan assumed a phase0 `fork_choice` suite. There is none: the release ships
 `fork_choice` from altair onward, because the suite's cases are built from states
-that only later forks have. So stage 7's code is written but cannot be verified
-until stage 8's state transition lands, and stage 7 should have been sequenced
-after it. Anything relying on the store before then is relying on unit tests.
+that only later forks have. So stage 7's code was written before it could be
+verified, and stage 7 should have been sequenced after stage 8 rather than
+before it. Landing altair's state transition (stage 8) is what let the suite
+start running at all; it is green now, 150 mainnet cases, covering bellatrix's
+`on_merge_block`/terminal-PoW validation, `should_override_forkchoice_update`,
+deneb's blob data availability, and fulu's column data availability.
 
 ### Genesis was missing from the plan
 
@@ -282,10 +326,11 @@ Chosen to match ethrex where ethrex has made the choice.
 | `libssz`, `libssz-derive`, `libssz-merkle`, `libssz-types` | workspace | SSZ, already used by this repository |
 | `blst` | 0.3.16 | BLS12-381 signatures |
 | `c-kzg` | 2.1.8, `eip-7594` + `ethereum_kzg_settings` | KZG, including fulu cell proofs |
-| `sha2` | 0.10.9 | Hashing |
+| `sha2` | 0.10.9, `asm` | Hashing; `asm` selects the CPU's SHA-256 instructions at run time (see "Performance" above) |
 | `snap` | 1.1.1 | Fixture decompression |
 | `num-bigint` | 0.4.6 | Reduction mod r in the Fiat-Shamir challenges |
-| `serde`, `serde_yaml_ng`, `hex`, `thiserror`, `tracing`, `rayon` | workspace | Existing workspace versions |
+| `serde`, `serde_yaml_ng`, `hex`, `thiserror`, `tracing` | workspace | Existing workspace versions |
+| `rayon` | workspace, dev-dependency only | Runs each suite's fixture cases concurrently (see "Performance" above) |
 
 `c-kzg` does not export `compute_challenge` or the cell-proof batch challenge,
 both of which have their own fixture handlers, so `kzg.rs` implements those two
@@ -299,8 +344,9 @@ preset-dependent, so the embedded mainnet setup is correct under both presets.
 
 Each is documented where it is implemented.
 
-- `verify_and_notify_new_payload` returns the fixture's `execution_valid`. There
-  is no execution client.
+- `verify_and_notify_new_payload` returns the fixture's `execution_valid`
+  through `stf::ExecutionEngine`, a struct holding just that one boolean.
+  There is no execution client.
 - `is_data_available` trusts blobs and columns supplied by the fixture. Sampling
   is a networking concern.
 - Light client suites are skipped, as light client objects are out of scope.

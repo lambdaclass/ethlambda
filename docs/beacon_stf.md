@@ -57,6 +57,30 @@ scheduling is not a preset.
 
 **Constants** (`constants`) are fixed by the specification and vary by neither.
 
+## Retuning a value without redefining a function
+
+The specification expresses a retuned constant as a fresh name per fork
+(`MIN_SLASHING_PENALTY_QUOTIENT`, then `..._ALTAIR`, then `..._BELLATRIX`) and
+redefines the function that reads it, so each fork carries its own copy of
+that function differing in one identifier. `preset::retuned`
+(`crates/beacon/src/preset.rs`) selects the value by fork instead, in four
+functions, so `slash_validator` and its neighbors stay a single copy each
+rather than one per fork.
+
+This is the one place in the crate where a preset value is chosen at runtime.
+It is sound because none of these values bound a container: they are divisors
+and multipliers in balance arithmetic, not container shape.
+
+The minimal preset is **not** a uniformly scaled mainnet: it overrides only
+*phase0's* retuned values and inherits every later fork's from mainnet
+unchanged. So a value can move one way across a fork boundary under mainnet
+and the other way under minimal: `INACTIVITY_PENALTY_QUOTIENT` falls from
+phase0 to altair under mainnet and rises under minimal. A test asserting that
+slashing gets uniformly harsher across the forks holds under mainnet and is
+false under minimal, so `preset::retuned`'s own tests pin the fork-to-constant
+mapping directly, which holds under both presets, rather than any numeric
+relationship, which does not.
+
 ## How forks are represented
 
 Containers that change between forks are defined once per fork as plain structs
@@ -78,11 +102,18 @@ per-fork field lists are not a growing tail:
   phase0. From altair on they are absent from both the encoding and the merkle
   tree, replaced in position by `previous_epoch_participation` and
   `current_epoch_participation`, which have a different type.
-- `latest_execution_payload_header` keeps its name from bellatrix on but is a
-  different container in bellatrix, capella, deneb, electra, and fulu.
+- `latest_execution_payload_header` keeps its name from bellatrix on, but is a
+  different container only in bellatrix, capella, and deneb; electra and fulu
+  reuse deneb's shape unchanged.
 - The field count crosses a power of two at electra, so the state's merkle tree is
   five levels deep through deneb and six from electra on. The same logical field
   has a different generalized index in different forks.
+- `SignedBeaconBlock::Fulu` wraps `electra::SignedBeaconBlock` rather than a
+  `fulu` type of its own, since fulu changes no field of a block. It still
+  needs to be its own variant: fulu changes how a block is *processed*, since
+  the blob commitment limit becomes epoch-dependent, so code that dispatches
+  on fork still has to tell a fulu block from an electra one even though both
+  carry the identical payload.
 
 | Fork | State fields | HTR leaves | Depth |
 |------|--------------|------------|-------|
@@ -115,6 +146,34 @@ function once per fork. Two things prevent that:
 2. **Matching only where the spec diverges.** Functions take the enum and use
    accessors, matching on the fork only where the specification itself changes
    behavior, so a match arm can be reviewed against the spec's own diff.
+
+### No block-body enum
+
+`BeaconState` and `SignedBeaconBlock` are the only enums; there is no
+`BeaconBlockBody` enum or a body trait. Such a type would have to grow a
+method or match arm per fork-specific field or operation list, which defeats
+the point of dispatching once: a caller of `body.attester_slashings()` would
+still have to know which fork it is dealing with to make sense of what comes
+back, since electra's attester slashings are not phase0's. What actually lets
+one function serve every fork is narrower and cheaper: `process_block_header`,
+`process_randao`, and `process_eth1_data` each take the handful of fields they
+read directly, rather than a whole body, so validating a header does not care
+whether the body it came from also carries a sync aggregate or an execution
+payload. A shared step earns its genericity by needing less, not by being
+handed a bigger abstraction to see through. See `stf/mod.rs`'s module doc for
+the full reasoning.
+
+### Crossing a fork boundary
+
+`process_slots` performs the fork-boundary state upgrade itself, inside its
+slot loop, at the first slot of the activation epoch, looping again in case a
+single configuration activates two forks at the same epoch. `state_transition`
+checks the block's fork against the state's own only *after* calling
+`process_slots`, not before: a block at the first slot of an activation epoch
+is legitimately post-fork shaped while the state arriving there is still
+pre-fork, which is exactly what a fork transition consists of. Checking first
+would reject every legitimate fork-boundary block and make crossing a fork
+impossible.
 
 ## Macros and traits
 
@@ -156,46 +215,60 @@ over silently, so the output never implies more coverage than exists.
 implementation for every container and would pin down nothing that the serialized
 bytes and expected root do not already.
 
+## Performance
+
+The mainnet spec suite went from 1576s to about 106s. Two causes:
+
+1. `sha2`'s `asm` feature selects the CPU's SHA-256 instructions. Without it,
+   `sha2` compiles the portable scalar backend on aarch64 regardless of what
+   the CPU supports, and merkleization is almost entirely SHA-256
+   compressions, so a spec fixture case running two whole-state
+   merkleizations feels the difference more than anything else does.
+2. `map_cases` (`tests/spec/mod.rs`) runs each suite's independent cases on
+   rayon's pool. The pool is process-wide **on purpose**, not an incidental
+   detail: the harness runs suites concurrently, and one shared pool keeps the
+   number of cases in flight at the core count regardless of how many suites
+   are running at once. A pool per suite would oversubscribe by the number of
+   suites, and multiply peak memory by it too, since a case in flight holds a
+   whole beacon state.
+
 ## Status
 
-Phase0 is complete and green against every phase0 fixture suite the release
-ships. Altair has its containers and its fork upgrade; its state transition is
-not written yet. Bellatrix through fulu have nothing beyond the preset and
-configuration values.
+All seven forks, phase0 through fulu, have containers, fork upgrades, state
+transitions, and epoch processing. Every fixture suite passes on both presets:
 
-Case counts below are per preset, `minimal` first:
+| Preset | Suites | Lib tests |
+|--------|--------|-----------|
+| mainnet | 20, all green | 244 |
+| minimal | 22, all green | 245 |
 
-| Suite | State |
-|-------|-------|
-| `general/bls` | green, 20 cases |
-| `general/kzg` | green, 344 cases across all 12 handlers |
-| `ssz_static` | green, 25,215 / 1,025 cases |
-| `shuffling` | green, 300 cases |
-| `operations` | green, 119 / 118 phase0 cases |
-| `epoch_processing` | green, 56 / 52 phase0 cases |
-| `sanity/blocks` | green, 45 / 40 phase0 cases |
-| `sanity/slots` | green, 7 phase0 cases |
-| `finality` | green, 5 phase0 cases |
-| `random` | green, 16 phase0 cases |
-| `rewards` | green, 49 phase0 cases |
-| `genesis` | green, 10 cases (minimal only: the release ships no mainnet genesis fixtures) |
-| `fork` | altair only |
-| `fork_choice` | **implemented but not gated**, see below |
-| `transition` | not implemented |
+Minimal runs two more suites than mainnet: `genesis`'s `initialization` and
+`validity`. The release ships no mainnet `genesis` fixtures, so that whole
+runner is gated behind the `preset-minimal` feature (`tests/spec/genesis.rs`).
 
-The fork-invariant containers are verified against every fork's `ssz_static`
-cases, and phase0's attestation containers through deneb, since electra is where
-the aggregation bits widen from one committee to a slot's worth. The state and
-block containers exist for phase0 and altair; the sync committee containers are
-checked from altair onward, since they do not change shape again.
+| Suite | Covers |
+|-------|--------|
+| `general/bls` | Cryptography, fork- and preset-independent |
+| `general/kzg` | Cryptography, fork- and preset-independent |
+| `ssz_static` | Every fork's containers |
+| `shuffling` | Committee helpers |
+| `operations`, `epoch_processing` | Every fork's operation and epoch sub-function |
+| `sanity/blocks`, `sanity/slots`, `finality`, `random`, `rewards` | Whole blocks and slots, end to end |
+| `fork`, `transition` | Fork upgrades, standalone and mid-chain |
+| `genesis` | Genesis initialization (minimal only, see above) |
+| `fork_choice` | The `Store`; see below |
 
-### The fork choice store is not fixture-verified
+### Fork choice is fixture-verified
 
-`fork_choice.rs` implements the whole of `specs/phase0/fork-choice.md`, but the
-release ships **no phase0 `fork_choice` suite**: it starts at altair. So the store
-is covered only by unit tests until altair's state transition lands, and should be
-treated as unverified against the specification's own cases. This is the largest
-piece of the crate carrying that caveat.
+150 mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
+terminal-PoW validation, `should_override_forkchoice_update`, deneb's blob
+data availability, and fulu's column data availability.
+
+The release still ships no phase0 `fork_choice` suite: the earliest is
+altair's, built from altair-shaped states even though altair changes nothing
+about fork choice itself (`Store` accepts a block from any fork this crate
+implements; see `fork_choice.rs`'s own module doc). Landing altair's state
+transition is what let this suite start running at all.
 
 ### A note on earlier case counts
 
@@ -204,6 +277,27 @@ Counts reported before the runners landed were too high by roughly sevenfold.
 `collect`, which walks them again, so every case was emitted once per fork
 shipping that runner. The cases were always being *run*; they were counted many
 times over. Both collectors now share one suite walk.
+
+## A recurring bug: projecting when an accessor was needed
+
+Reach for a concrete per-fork projection, such as `altair_state(state)`, only
+when the return type must be that fork's own. Reach through a `BeaconState`
+accessor when the fields involved are shared. The trap is that a projection
+like `altair_state(state)` matches only `BeaconState::Altair`, so it compiles
+cleanly, passes the fork that introduced the field, and returns
+`UnsupportedForFork` for every later fork that shares the exact same field
+through a different variant.
+
+This caused five separate bugs during implementation:
+
+- Capella's withdrawal sweep, projected to capella's own state.
+- Deneb reusing that same sweep, still projected to capella's state.
+- Altair's participation fields, projected to altair's state, so every one of
+  the five later forks that also carries participation failed.
+- Deneb's `process_attestation`, projected to deneb's state.
+- `slash_validator` calling phase0's `initiate_validator_exit` at electra,
+  which also left electra's EIP-7251 churn cursor unadvanced, mispricing every
+  later exit processed in the same epoch.
 
 ## Deliberate simplifications
 
@@ -214,6 +308,9 @@ times over. Both collectors now share one suite walk.
   passed to `state_transition` is left partly modified when a block turns out to
   be invalid. Callers that need the pre-state clone it first, which is what the
   fixture runners do.
+- `ExecutionEngine` (`stf::mod`) stands in for a real execution client: just
+  `execution_valid: bool`, read straight from a fixture's `execution.yaml`
+  rather than a payload actually validated.
 
 ## What the fixture format asserts by omission
 

@@ -1690,50 +1690,7 @@ pub fn process_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::shared::Fork;
-    use crate::primitives::{BlsPubkey, ExecutionBlockHash, Root, Uint256};
-
-    /// An all-zero execution payload header, standing in for the genesis
-    /// payload: nothing under test here inspects it beyond
-    /// `process_execution_payload`'s continuity check, which no test in this
-    /// module exercises (fixture suites are the real gate for the full block
-    /// pipeline; see this crate's own task list for why unit tests here focus
-    /// on the request functions' silent-return paths instead).
-    fn empty_execution_payload_header() -> deneb::ExecutionPayloadHeader {
-        deneb::ExecutionPayloadHeader {
-            parent_hash: ExecutionBlockHash::zero(),
-            fee_recipient: ExecutionAddress::zero(),
-            state_root: Bytes32::zero(),
-            receipts_root: Bytes32::zero(),
-            logs_bloom: crate::containers::bellatrix::LogsBloom::try_from(vec![
-                0u8;
-                preset::BYTES_PER_LOGS_BLOOM
-            ])
-            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
-            prev_randao: Bytes32::zero(),
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::zero(),
-            block_hash: ExecutionBlockHash::zero(),
-            transactions_root: Root::zero(),
-            withdrawals_root: Root::zero(),
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        }
-    }
-
-    fn empty_sync_committee() -> SyncCommittee {
-        SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        }
-    }
+    use crate::fork::ForkName;
 
     /// An electra state with `count` fully active validators, each with
     /// [`preset::MIN_ACTIVATION_BALANCE`] and an eth1 withdrawal credential,
@@ -1741,110 +1698,42 @@ mod tests {
     /// below) so the previous epoch and the block-root history window both
     /// have entries.
     ///
-    /// A near-duplicate of `crate::helpers::electra::tests::electra_state_with_validators`,
-    /// which builds the same shape of state; that builder is private to its
-    /// own module (and this task's own instructions note the duplication is
-    /// expected rather than something to resolve by reaching into
-    /// `helpers::electra`'s test module, which this file does not own). The
-    /// two differ in two ways: every validator here starts with a real,
-    /// distinguishable eth1 credential (`ETH1_ADDRESS_WITHDRAWAL_PREFIX`
-    /// followed by the validator's own index, so [`source_address`] can
-    /// build a request that matches it), where `helpers::electra`'s builder
-    /// leaves every validator's credentials at their default (all-zero,
-    /// BLS-form) value; and this state sits far more than
-    /// `SHARD_COMMITTEE_PERIOD` epochs past genesis, since
+    /// Built on the shared fork-parameterised builder (see
+    /// [`crate::helpers::test_state::with_validators_at`]) and then given the
+    /// two overrides this module's own tests need beyond that default: every
+    /// validator here gets a real, distinguishable eth1 credential
+    /// (`ETH1_ADDRESS_WITHDRAWAL_PREFIX` followed by the validator's own
+    /// index, so [`source_address`] can build a request that matches it),
+    /// where the shared builder leaves every validator's credentials at
+    /// their default (all-zero, BLS-form) value; and this state sits far
+    /// more than `SHARD_COMMITTEE_PERIOD` epochs past genesis, since
     /// [`process_withdrawal_request`] and [`process_consolidation_request`]
-    /// both gate on a validator having been active that long, where
-    /// `helpers::electra`'s own tests never need to clear that bar.
+    /// both gate on a validator having been active that long, where the
+    /// shared builder's own default callers never need to clear that bar.
     fn electra_state_with_validators(count: usize) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|index| {
-                let mut withdrawal_credentials = Bytes32::zero();
-                withdrawal_credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
-                withdrawal_credentials.0[31] = index as u8;
-                Validator {
-                    // Distinct per validator: `Validator::default()`'s
-                    // all-zero pubkey would otherwise make every validator
-                    // indistinguishable to a pubkey lookup, which is exactly
-                    // how the request functions under test resolve
-                    // `validator_pubkey`/`source_pubkey`/`target_pubkey`
-                    // into an index.
-                    pubkey: BlsPubkey([index as u8; 48]),
-                    withdrawal_credentials,
-                    effective_balance: preset::MIN_ACTIVATION_BALANCE,
-                    activation_eligibility_epoch: 0,
-                    activation_epoch: 0,
-                    exit_epoch: FAR_FUTURE_EPOCH,
-                    withdrawable_epoch: FAR_FUTURE_EPOCH,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        let balances: Vec<Gwei> = vec![preset::MIN_ACTIVATION_BALANCE; count];
+        let mut state = crate::helpers::test_state::with_validators_at(ForkName::Electra, count);
 
         // Comfortably past `SHARD_COMMITTEE_PERIOD` for both mainnet (256
-        // epochs) and minimal (64 epochs) configs, so every validator built
-        // with `activation_epoch: 0` above is already eligible for an exit
-        // or a consolidation by the time a test runs one against it.
+        // epochs) and minimal (64 epochs) configs, so every validator
+        // (active since genesis by the shared builder's own construction) is
+        // already eligible for an exit or a consolidation by the time a test
+        // runs one against it.
         const EPOCHS_PAST_GENESIS: u64 = 300;
+        *state.slot_mut() = EPOCHS_PAST_GENESIS * preset::SLOTS_PER_EPOCH;
 
-        BeaconState::Electra(electra::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: EPOCHS_PAST_GENESIS * preset::SLOTS_PER_EPOCH,
-            fork: Fork::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: balances
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: empty_execution_payload_header(),
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
-            deposit_balance_to_consume: 0,
-            exit_balance_to_consume: 0,
-            earliest_exit_epoch: 0,
-            consolidation_balance_to_consume: 0,
-            earliest_consolidation_epoch: 0,
-            pending_deposits: Default::default(),
-            pending_partial_withdrawals: Default::default(),
-            pending_consolidations: Default::default(),
-        })
+        for index in 0..count as ValidatorIndex {
+            let validator = state.validator_mut(index).unwrap();
+            // Distinct per validator: the shared builder's all-zero pubkey
+            // would otherwise make every validator indistinguishable to a
+            // pubkey lookup, which is exactly how the request functions
+            // under test resolve
+            // `validator_pubkey`/`source_pubkey`/`target_pubkey` into an
+            // index.
+            validator.pubkey = BlsPubkey([index as u8; 48]);
+            validator.withdrawal_credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
+            validator.withdrawal_credentials.0[31] = index as u8;
+        }
+        state
     }
 
     /// The execution address [`electra_state_with_validators`] derived

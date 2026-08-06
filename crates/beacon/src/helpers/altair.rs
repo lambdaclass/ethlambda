@@ -457,82 +457,17 @@ pub(crate) fn altair_state_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::shared::Validator;
-    use crate::primitives::{BlsPubkey, Bytes32, Root};
 
     /// An altair state with `count` fully active, full-balance validators,
     /// positioned the same way `crate::helpers::test_state::with_validators`
     /// positions its phase0 state: one epoch in, so the previous epoch and the
     /// block-root history window both have entries.
     ///
-    /// Not added to `test_state`, which only ever builds phase0 states: this
-    /// module is the first to need an altair state in a test, so the builder
-    /// lives here rather than growing that module into a fork-dispatching
-    /// helper for a single caller.
+    /// A thin wrapper around the shared fork-parameterised builder: see
+    /// [`crate::helpers::test_state::with_validators_at`] for the construction
+    /// this and every other fork's test module used to duplicate.
     fn altair_state_with_validators(count: usize) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: constants::FAR_FUTURE_EPOCH,
-                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        };
-
-        BeaconState::Altair(altair::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-        })
+        crate::helpers::test_state::with_validators_at(ForkName::Altair, count)
     }
 
     #[test]

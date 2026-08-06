@@ -501,7 +501,7 @@ mod tests {
     use blst::min_pk::SecretKey;
 
     use super::*;
-    use crate::containers::altair::SyncCommittee;
+    use crate::fork::ForkName;
     use crate::primitives::{
         BlsPubkey, BlsSignature, ExecutionBlockHash, Gwei, Root, Uint256, ValidatorIndex,
     };
@@ -518,96 +518,11 @@ mod tests {
     /// needs a registry larger than `MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP`,
     /// would buy nothing.
     ///
-    /// Modeled on `crate::stf::bellatrix::tests::bellatrix_state_with_validators`,
-    /// which builds the same shape of state one fork earlier; this crate still
-    /// has no shared per-fork test-state builder, so each fork's own test
-    /// module grows another near-duplicate of the last one.
+    /// A thin wrapper around the shared fork-parameterised builder: see
+    /// [`crate::helpers::test_state::with_validators_at`] for the construction
+    /// this and every other fork's test module used to duplicate.
     fn capella_state_with_validators(count: usize) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: constants::FAR_FUTURE_EPOCH,
-                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        };
-
-        let latest_execution_payload_header = capella::ExecutionPayloadHeader {
-            parent_hash: ExecutionBlockHash::zero(),
-            fee_recipient: ExecutionAddress::zero(),
-            state_root: Root::zero(),
-            receipts_root: Root::zero(),
-            logs_bloom: SszVector::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
-                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
-            prev_randao: Root::zero(),
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::zero(),
-            block_hash: ExecutionBlockHash::zero(),
-            transactions_root: Root::zero(),
-            withdrawals_root: Root::zero(),
-        };
-
-        BeaconState::Capella(capella::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Root::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header,
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-        })
+        crate::helpers::test_state::with_validators_at(ForkName::Capella, count)
     }
 
     /// Marks validator `index` fully withdrawable: an eth1 credential, a

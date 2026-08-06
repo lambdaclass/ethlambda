@@ -189,11 +189,8 @@ pub fn process_execution_payload(
 mod tests {
     use super::*;
     use crate::config::BlobScheduleEntry;
-    use crate::constants;
-    use crate::containers::altair::SyncCommittee;
     use crate::containers::bellatrix::LogsBloom;
-    use crate::containers::fulu;
-    use crate::containers::shared::Validator;
+    use crate::fork::ForkName;
     use crate::helpers::accessors::{get_current_epoch, get_randao_mix};
     use crate::preset;
     use crate::primitives::{ExecutionAddress, ExecutionBlockHash, KzgCommitment, Root, Uint256};
@@ -227,95 +224,21 @@ mod tests {
     /// epoch in (so the block-root history window already has entries), and
     /// `header` as its `latest_execution_payload_header`.
     ///
-    /// Modeled on `crate::stf::bellatrix::tests::bellatrix_state_with_validators`
-    /// and duplicated, in shape, from
-    /// `crate::helpers::fulu::tests::fulu_state_with_validators` (private to
-    /// that module) and `crate::stf::epoch::fulu::tests::fulu_state_with_validators`
-    /// (this crate's other copy, built for a different set of tests); see
-    /// either's own doc comment for why these per-fork, per-module test
-    /// builders are expected to duplicate each other rather than share one.
+    /// A thin wrapper around the shared fork-parameterised builder, which has
+    /// no header to take as a parameter, so this overrides the placeholder it
+    /// builds with the one every real caller here actually wants under test.
+    /// See [`crate::helpers::test_state::with_validators_at`] for the
+    /// construction this and every other fork's test module used to
+    /// duplicate.
     fn fulu_state_with_validators(
         count: usize,
         header: deneb::ExecutionPayloadHeader,
     ) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: constants::FAR_FUTURE_EPOCH,
-                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![crate::primitives::BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: crate::primitives::BlsPubkey::default(),
-        };
-
-        BeaconState::Fulu(fulu::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: header,
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
-            deposit_balance_to_consume: 0,
-            exit_balance_to_consume: 0,
-            earliest_exit_epoch: 0,
-            consolidation_balance_to_consume: 0,
-            earliest_consolidation_epoch: 0,
-            pending_deposits: Default::default(),
-            pending_partial_withdrawals: Default::default(),
-            pending_consolidations: Default::default(),
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-        })
+        let mut state = crate::helpers::test_state::with_validators_at(ForkName::Fulu, count);
+        if let BeaconState::Fulu(inner) = &mut state {
+            inner.latest_execution_payload_header = header;
+        }
+        state
     }
 
     /// A block body carrying `commitment_count` blob commitments and an

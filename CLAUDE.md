@@ -314,11 +314,13 @@ nothing depends on it.
   libssz 0.2.2 lacks. Currently built against a local `[patch.crates-io]`
   override that is intentionally not committed, so the crate builds only where
   that override exists.
-- **Status:** phase0 is complete and green against every phase0 suite. Altair has
-  containers and the fork upgrade, not its state transition. Bellatrix through
-  fulu have only preset and config values. The fork choice store is implemented in
-  full but is **not fixture-verified**: the release ships no phase0 `fork_choice`
-  suite, so it waits on altair's state transition.
+- **Status:** all seven forks (phase0 through fulu) have containers, fork
+  upgrades, state transitions, and epoch processing. Every fixture suite
+  passes on both presets: mainnet is 20 suites green plus 244 lib tests;
+  minimal is 22 suites green. Fork choice is fixture-verified too: 150
+  mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
+  terminal-PoW validation, `should_override_forkchoice_update`, deneb's blob
+  data availability, and fulu's column data availability.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 

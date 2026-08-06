@@ -353,86 +353,27 @@ fn default_execution_payload() -> Result<bellatrix::ExecutionPayload> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::shared::Validator;
-    use crate::primitives::BlsPubkey;
+    use crate::fork::ForkName;
 
     /// A bellatrix state with `count` fully active, full-balance validators,
     /// one epoch in (so the block-root history window already has entries),
     /// and `header` as its `latest_execution_payload_header`.
     ///
-    /// Modeled on `crate::helpers::altair::tests::altair_state_with_validators`,
-    /// which builds the same shape of state one fork earlier; this crate has
-    /// no shared per-fork test-state builder yet, so each fork's own test
-    /// module grows a near-duplicate of the last one, the same way this one
-    /// does.
+    /// A thin wrapper around the shared fork-parameterised builder, which has
+    /// no header to take as a parameter, so this overrides the placeholder it
+    /// builds with the one every real caller here actually wants under test.
+    /// See [`crate::helpers::test_state::with_validators_at`] for the
+    /// construction this and every other fork's test module used to
+    /// duplicate.
     fn bellatrix_state_with_validators(
         count: usize,
         header: bellatrix::ExecutionPayloadHeader,
     ) -> BeaconState {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: constants::FAR_FUTURE_EPOCH,
-                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-
-        let empty_sync_committee = || SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        };
-
-        BeaconState::Bellatrix(bellatrix::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: header,
-        })
+        let mut state = crate::helpers::test_state::with_validators_at(ForkName::Bellatrix, count);
+        if let BeaconState::Bellatrix(inner) = &mut state {
+            inner.latest_execution_payload_header = header;
+        }
+        state
     }
 
     /// A payload that is not the all-default placeholder: distinct from

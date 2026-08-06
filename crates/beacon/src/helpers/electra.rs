@@ -932,195 +932,26 @@ pub(crate) fn electra_state_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::altair::SyncCommittee;
-    use crate::containers::bellatrix::LogsBloom;
-    use crate::containers::deneb::ExecutionPayloadHeader;
     use crate::containers::shared::AttestationData;
-    use crate::primitives::{BlsPubkey, ExecutionAddress, ExecutionBlockHash, Root, Uint256};
-
-    /// An all-zero execution payload header, standing in for the genesis
-    /// payload: nothing in this module inspects it, so only its presence
-    /// (not its contents) matters for building a state.
-    fn empty_execution_payload_header() -> ExecutionPayloadHeader {
-        ExecutionPayloadHeader {
-            parent_hash: ExecutionBlockHash::zero(),
-            fee_recipient: ExecutionAddress::zero(),
-            state_root: Bytes32::zero(),
-            receipts_root: Bytes32::zero(),
-            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
-            prev_randao: Bytes32::zero(),
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::zero(),
-            block_hash: ExecutionBlockHash::zero(),
-            transactions_root: Root::zero(),
-            withdrawals_root: Root::zero(),
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        }
-    }
-
-    fn empty_sync_committee() -> SyncCommittee {
-        SyncCommittee {
-            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
-                .try_into()
-                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
-            aggregate_pubkey: BlsPubkey::default(),
-        }
-    }
-
-    fn validators_with_full_balance(count: usize) -> crate::containers::shared::Validators {
-        let validators: Vec<Validator> = (0..count)
-            .map(|_| Validator {
-                effective_balance: preset::MIN_ACTIVATION_BALANCE,
-                activation_eligibility_epoch: 0,
-                activation_epoch: 0,
-                exit_epoch: FAR_FUTURE_EPOCH,
-                withdrawable_epoch: FAR_FUTURE_EPOCH,
-                ..Default::default()
-            })
-            .collect();
-        validators
-            .try_into()
-            .expect("count is far below VALIDATOR_REGISTRY_LIMIT")
-    }
+    use crate::fork::ForkName;
 
     /// An electra state with `count` fully active, full-balance validators,
     /// positioned the same way `crate::helpers::test_state::with_validators`
     /// positions its phase0 state: one epoch in, so the previous epoch and
     /// the block-root history window both have entries.
     ///
-    /// Not added to `test_state`, which only ever builds phase0 states, and
-    /// modeled on `crate::helpers::altair::tests::altair_state_with_validators`
-    /// and `crate::helpers::fulu::tests::fulu_state_with_validators`. These
-    /// per-fork test builders are accumulating one per fork now (this is the
-    /// third); sharing the fork-invariant field setup between them would be
-    /// worth doing once a fourth one shows up.
+    /// A thin wrapper around the shared fork-parameterised builder: see
+    /// [`crate::helpers::test_state::with_validators_at`] for the construction
+    /// this and every other fork's test module used to duplicate.
     fn electra_state_with_validators(count: usize) -> BeaconState {
-        let count_balances: Vec<Gwei> = vec![preset::MIN_ACTIVATION_BALANCE; count];
-        BeaconState::Electra(electra::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators_with_full_balance(count),
-            balances: count_balances
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: empty_execution_payload_header(),
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
-            deposit_balance_to_consume: 0,
-            exit_balance_to_consume: 0,
-            earliest_exit_epoch: 0,
-            consolidation_balance_to_consume: 0,
-            earliest_consolidation_epoch: 0,
-            pending_deposits: Default::default(),
-            pending_partial_withdrawals: Default::default(),
-            pending_consolidations: Default::default(),
-        })
+        crate::helpers::test_state::with_validators_at(ForkName::Electra, count)
     }
 
     /// A fulu state, otherwise identical to [`electra_state_with_validators`],
     /// used only to prove [`electra_state`]/[`electra_state_ref`] accept fulu
     /// too and are not accidentally scoped to `BeaconState::Electra` alone.
     fn fulu_state_with_validators(count: usize) -> BeaconState {
-        let count_balances: Vec<Gwei> = vec![preset::MIN_ACTIVATION_BALANCE; count];
-        BeaconState::Fulu(fulu::BeaconState {
-            genesis_time: 0,
-            genesis_validators_root: Root::zero(),
-            slot: preset::SLOTS_PER_EPOCH,
-            fork: Default::default(),
-            latest_block_header: Default::default(),
-            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            historical_roots: Default::default(),
-            eth1_data: Default::default(),
-            eth1_data_votes: Default::default(),
-            eth1_deposit_index: 0,
-            validators: validators_with_full_balance(count),
-            balances: count_balances
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-            previous_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_epoch_participation: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            justification_bits: Default::default(),
-            previous_justified_checkpoint: Default::default(),
-            current_justified_checkpoint: Default::default(),
-            finalized_checkpoint: Default::default(),
-            inactivity_scores: vec![0; count]
-                .try_into()
-                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
-            current_sync_committee: empty_sync_committee(),
-            next_sync_committee: empty_sync_committee(),
-            latest_execution_payload_header: empty_execution_payload_header(),
-            next_withdrawal_index: 0,
-            next_withdrawal_validator_index: 0,
-            historical_summaries: Default::default(),
-            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
-            deposit_balance_to_consume: 0,
-            exit_balance_to_consume: 0,
-            earliest_exit_epoch: 0,
-            consolidation_balance_to_consume: 0,
-            earliest_consolidation_epoch: 0,
-            pending_deposits: Default::default(),
-            pending_partial_withdrawals: Default::default(),
-            pending_consolidations: Default::default(),
-            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
-                .try_into()
-                .expect("the vector is built at its exact length"),
-        })
+        crate::helpers::test_state::with_validators_at(ForkName::Fulu, count)
     }
 
     // -- Predicates ---------------------------------------------------------
