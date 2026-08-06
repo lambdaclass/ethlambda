@@ -129,12 +129,6 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
 ///
 /// Functions whose body is specific to phase0's state shape start here rather
 /// than matching inline, so the fork check reads the same in each of them.
-#[allow(
-    unreachable_patterns,
-    reason = "phase0 is currently the enum's only variant, so the fallback arm \
-              cannot be reached yet; it becomes live with the first later fork, \
-              and dropping it now would only mean adding it back then"
-)]
 pub(crate) fn phase0_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
@@ -149,11 +143,6 @@ pub(crate) fn phase0_state<'a>(
 }
 
 /// The phase0 state, immutably.
-#[allow(
-    unreachable_patterns,
-    reason = "see the note on `phase0_state`: the fallback arm is not reachable \
-              until a later fork adds a variant"
-)]
 pub(crate) fn phase0_state_ref<'a>(
     state: &'a BeaconState,
     function: &'static str,

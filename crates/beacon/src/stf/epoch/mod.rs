@@ -182,15 +182,27 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
     const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
 
-    let state = phase0_state(state, "process_effective_balance_updates")?;
-    for (index, validator) in state.validators.iter_mut().enumerate() {
-        let balance = state.balances[index];
+    // Decided in one pass and applied in another. The state is an enum over
+    // per-fork structs, so the accessors hand out a borrow of the whole state
+    // rather than of one field, and there is no way to hold `validators` mutably
+    // while reading `balances`. Collecting the decisions first keeps this
+    // fork-independent, which matters because every fork runs this step
+    // unchanged.
+    let mut updates = Vec::new();
+    for (index, validator) in state.validators().iter().enumerate() {
+        let balance = state.balances()[index];
         if balance + DOWNWARD_THRESHOLD < validator.effective_balance
             || validator.effective_balance + UPWARD_THRESHOLD < balance
         {
-            validator.effective_balance = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
+            let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
+            updates.push((index, effective));
         }
+    }
+
+    let validators = state.validators_mut();
+    for (index, effective) in updates {
+        validators[index].effective_balance = effective;
     }
     Ok(())
 }

@@ -17,7 +17,7 @@
 use std::collections::BTreeSet;
 
 use ethlambda_beacon::ForkName;
-use ethlambda_beacon::containers::{phase0, shared};
+use ethlambda_beacon::containers::{altair, phase0, shared};
 use ethlambda_beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
 
@@ -127,6 +127,36 @@ fn ssz_static() {
             }
             "SignedBeaconBlock" if fork == ForkName::Phase0 => {
                 check::<phase0::SignedBeaconBlock>(&case)
+            }
+
+            "BeaconState" if fork == ForkName::Altair => check::<altair::BeaconState>(&case),
+            "BeaconBlock" if fork == ForkName::Altair => check::<altair::BeaconBlock>(&case),
+            "BeaconBlockBody" if fork == ForkName::Altair => {
+                check::<altair::BeaconBlockBody>(&case)
+            }
+            "SignedBeaconBlock" if fork == ForkName::Altair => {
+                check::<altair::SignedBeaconBlock>(&case)
+            }
+
+            // The sync committee containers arrive in altair and, unlike the
+            // state, do not change shape again, so they are checked against every
+            // fork from altair on.
+            "SyncCommittee" if fork >= ForkName::Altair => check::<altair::SyncCommittee>(&case),
+            "SyncAggregate" if fork >= ForkName::Altair => check::<altair::SyncAggregate>(&case),
+            "SyncCommitteeMessage" if fork >= ForkName::Altair => {
+                check::<altair::SyncCommitteeMessage>(&case)
+            }
+            "SyncCommitteeContribution" if fork >= ForkName::Altair => {
+                check::<altair::SyncCommitteeContribution>(&case)
+            }
+            "ContributionAndProof" if fork >= ForkName::Altair => {
+                check::<altair::ContributionAndProof>(&case)
+            }
+            "SignedContributionAndProof" if fork >= ForkName::Altair => {
+                check::<altair::SignedContributionAndProof>(&case)
+            }
+            "SyncAggregatorSelectionData" if fork >= ForkName::Altair => {
+                check::<altair::SyncAggregatorSelectionData>(&case)
             }
 
             _ => {

@@ -33,6 +33,7 @@
 //! fork only where the specification itself changes behavior, so a match arm can
 //! be reviewed against the spec's own diff.
 
+pub mod altair;
 pub mod phase0;
 pub mod shared;
 
@@ -48,6 +49,7 @@ use crate::primitives::{Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, Val
 #[derive(Debug, Clone, PartialEq)]
 pub enum BeaconState {
     Phase0(phase0::BeaconState),
+    Altair(altair::BeaconState),
 }
 
 impl BeaconState {
@@ -55,6 +57,7 @@ impl BeaconState {
     pub fn fork_name(&self) -> ForkName {
         match self {
             BeaconState::Phase0(_) => ForkName::Phase0,
+            BeaconState::Altair(_) => ForkName::Altair,
         }
     }
 
@@ -68,6 +71,9 @@ impl BeaconState {
             ForkName::Phase0 => Ok(BeaconState::Phase0(phase0::BeaconState::from_ssz_bytes(
                 bytes,
             )?)),
+            ForkName::Altair => Ok(BeaconState::Altair(altair::BeaconState::from_ssz_bytes(
+                bytes,
+            )?)),
             _ => Err(Error::UnsupportedForFork {
                 function: "BeaconState::from_ssz",
                 fork,
@@ -79,6 +85,7 @@ impl BeaconState {
     pub fn to_ssz(&self) -> Vec<u8> {
         match self {
             BeaconState::Phase0(state) => state.to_ssz(),
+            BeaconState::Altair(state) => state.to_ssz(),
         }
     }
 
@@ -86,6 +93,7 @@ impl BeaconState {
     pub fn hash_tree_root(&self) -> Root {
         match self {
             BeaconState::Phase0(state) => state.hash_tree_root(),
+            BeaconState::Altair(state) => state.hash_tree_root(),
         }
     }
 }
@@ -120,12 +128,14 @@ macro_rules! shared_state_accessors {
                 pub fn $field(&self) -> $ty {
                     match self {
                         BeaconState::Phase0(state) => state.$field,
+                        BeaconState::Altair(state) => state.$field,
                     }
                 }
 
                 pub fn $field_mut(&mut self) -> &mut $ty {
                     match self {
                         BeaconState::Phase0(state) => &mut state.$field,
+                        BeaconState::Altair(state) => &mut state.$field,
                     }
                 }
             )*
@@ -134,12 +144,14 @@ macro_rules! shared_state_accessors {
                 pub fn $ref_field(&self) -> &$ref_ty {
                     match self {
                         BeaconState::Phase0(state) => &state.$ref_field,
+                        BeaconState::Altair(state) => &state.$ref_field,
                     }
                 }
 
                 pub fn $ref_field_mut(&mut self) -> &mut $ref_ty {
                     match self {
                         BeaconState::Phase0(state) => &mut state.$ref_field,
+                        BeaconState::Altair(state) => &mut state.$ref_field,
                     }
                 }
             )*
