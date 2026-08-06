@@ -113,11 +113,48 @@ pub(crate) struct CliOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
+    #[command(flatten)]
+    pub(crate) discovery: DiscoveryConfig,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]
     #[command(flatten)]
     pub(crate) shadow: ShadowOptions,
+}
+
+/// discv5 peer discovery. Off by default: nothing else on the lean network
+/// speaks discv5 yet, so enabling it only finds other ethlambda nodes.
+#[derive(Debug, clap::Args)]
+pub(crate) struct DiscoveryConfig {
+    /// Enable discv5 peer discovery.
+    ///
+    /// Requires `--discovery.port` to differ from `--gossipsub-port`: both are
+    /// UDP sockets and they cannot share one port.
+    #[arg(long = "discovery.enable", default_value = "false")]
+    pub(crate) enable: bool,
+    /// UDP port for the discv5 socket.
+    ///
+    /// Independent of `--gossipsub-port`, which carries libp2p QUIC. Both
+    /// default to 9000, so enabling discovery means changing one of them.
+    #[arg(long = "discovery.port", default_value = "9000")]
+    pub(crate) port: u16,
+}
+
+impl CliOptions {
+    /// Reject a discovery port that collides with the QUIC port.
+    ///
+    /// Both are UDP. Without this the collision surfaces at bind time as an
+    /// opaque `EADDRINUSE` on whichever socket loses the race.
+    pub(crate) fn validate_discovery(&self) -> Result<(), String> {
+        if self.discovery.enable && self.discovery.port == self.gossipsub_port {
+            return Err(format!(
+                "--discovery.port ({}) must differ from --gossipsub-port ({}): \
+                 both bind UDP and cannot share a port",
+                self.discovery.port, self.gossipsub_port
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
@@ -155,4 +192,66 @@ pub(crate) struct ShadowOptions {
         value_parser = clap::value_parser!(u64).range(1..=524_288)
     )]
     pub(crate) shadow_xmss_fake_proof_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The smallest argv that satisfies every required flag.
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "ethlambda",
+            "--genesis", "config.yaml",
+            "--validators", "validators.yaml",
+            "--bootnodes", "nodes.yaml",
+            "--validator-config", "validator-config.yaml",
+            "--hash-sig-keys-dir", "keys",
+            "--node-key", "node.key",
+            "--node-id", "ethlambda_0",
+        ]
+    }
+
+    #[test]
+    fn discovery_is_disabled_by_default_on_port_9000() {
+        let opts = CliOptions::parse_from(base_args());
+        assert!(!opts.discovery.enable);
+        assert_eq!(opts.discovery.port, 9000);
+    }
+
+    #[test]
+    fn discovery_flags_use_a_dotted_prefix() {
+        let mut args = base_args();
+        args.extend(["--discovery.enable", "--discovery.port", "9010"]);
+        let opts = CliOptions::parse_from(args);
+        assert!(opts.discovery.enable);
+        assert_eq!(opts.discovery.port, 9010);
+    }
+
+    #[test]
+    fn discovery_port_may_equal_gossipsub_port_until_validated() {
+        // Both default to 9000. Parsing accepts it; validate_discovery rejects it
+        // so the failure names the real problem instead of surfacing as EADDRINUSE.
+        let mut args = base_args();
+        args.push("--discovery.enable");
+        let opts = CliOptions::parse_from(args);
+        assert_eq!(opts.discovery.port, opts.gossipsub_port);
+        assert!(opts.validate_discovery().is_err());
+    }
+
+    #[test]
+    fn distinct_ports_validate() {
+        let mut args = base_args();
+        args.extend(["--discovery.enable", "--discovery.port", "9010"]);
+        let opts = CliOptions::parse_from(args);
+        assert!(opts.validate_discovery().is_ok());
+    }
+
+    #[test]
+    fn colliding_ports_are_fine_while_discovery_is_off() {
+        let opts = CliOptions::parse_from(base_args());
+        assert_eq!(opts.discovery.port, opts.gossipsub_port);
+        assert!(opts.validate_discovery().is_ok());
+    }
 }
