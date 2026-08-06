@@ -106,7 +106,7 @@ impl SlotInterval {
             2 => Self::Aggregation,
             3 => Self::SafeTargetUpdate,
             4 => Self::EndOfSlot,
-            _ => unreachable!("slots only have 5 intervals"),
+            _ => unreachable!("slots only have {INTERVALS_PER_SLOT} intervals"),
         }
     }
 
