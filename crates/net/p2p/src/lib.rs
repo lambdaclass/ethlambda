@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     ops::Range,
     time::Duration,
 };
@@ -13,7 +13,6 @@ use ethlambda_network_api::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
-use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
@@ -718,60 +717,69 @@ pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<Pee
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
     pub(crate) quic_port: u16,
+    /// The discv5 UDP port, when the ENR advertises one.
+    ///
+    /// `None` for the ENRs lean-quickstart generates today, which carry only
+    /// `ip`/`quic`/`secp256k1`. Such a bootnode is still dialed statically over
+    /// QUIC; it just cannot seed the discv5 routing table.
+    pub(crate) udp_port: Option<u16>,
     pub(crate) public_key: PublicKey,
 }
 
+/// Decode `enr:`-prefixed records into dialable bootnodes.
+///
+/// Records that cannot be decoded, or that lack a QUIC port, an IP or a public
+/// key, are skipped with a warning rather than aborting startup: one malformed
+/// entry in the bootnode file should not stop the node from booting.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
-    let mut bootnodes = vec![];
+    enrs.into_iter()
+        .filter_map(|enr_str| match parse_enr(&enr_str) {
+            Ok(bootnode) => Some(bootnode),
+            Err(reason) => {
+                warn!(%reason, enr = %enr_str, "Skipping unusable bootnode ENR");
+                None
+            }
+        })
+        .collect()
+}
 
-    // File is YAML, but we try to avoid pulling a full YAML parser just for this
-    for enr_str in enrs {
-        let base64_decoded = ethrex_common::base64::decode(&enr_str.as_bytes()[4..]);
-        let record = NodeRecord::decode(&base64_decoded).unwrap();
-        let (_, quic_port_bytes) = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"quic")
-            .expect("node doesn't support QUIC");
+fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
+    let stripped = enr_str
+        .strip_prefix("enr:")
+        .ok_or_else(|| "missing enr: prefix".to_string())?;
+    let decoded = ethrex_common::base64::decode(stripped.as_bytes());
+    let record = NodeRecord::decode(&decoded).map_err(|err| format!("RLP decode failed: {err}"))?;
+    let pairs = record.pairs();
 
-        let (_, public_key_rlp) = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"secp256k1")
-            .expect("node record missing public key");
+    let quic_port = pairs
+        .other
+        .iter()
+        .find(|(key, _)| key.as_ref() == b"quic")
+        .ok_or_else(|| "node doesn't support QUIC".to_string())
+        .and_then(|(_, value)| {
+            u16::decode(value.as_ref()).map_err(|err| format!("bad quic port: {err}"))
+        })?;
 
-        let public_key_bytes = H264::decode(public_key_rlp).unwrap();
-        let public_key =
-            libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
-                .unwrap();
+    let public_key_bytes = pairs
+        .secp256k1
+        .ok_or_else(|| "node record missing public key".to_string())?;
+    let public_key =
+        libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
+            .map_err(|err| format!("bad secp256k1 key: {err}"))?;
 
-        let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
+    // Prefer IPv4 if both are present.
+    let ip = pairs
+        .ip
+        .map(IpAddr::from)
+        .or_else(|| pairs.ip6.map(IpAddr::from))
+        .ok_or_else(|| "node record missing IP address".to_string())?;
 
-        let ipv4 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv4Addr::decode(bytes.as_ref()).expect("invalid IPv4 address"))
-            });
-        let ipv6 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip6")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv6Addr::decode(bytes.as_ref()).expect("invalid IPv6 address"))
-            });
-
-        // Prefer IPv4 if both are present
-        let ip = ipv4.or(ipv6).expect("node record missing IP address");
-
-        bootnodes.push(Bootnode {
-            ip,
-            quic_port,
-            public_key: public_key.into(),
-        });
-    }
-    bootnodes
+    Ok(Bootnode {
+        ip,
+        quic_port,
+        udp_port: pairs.udp_port,
+        public_key: public_key.into(),
+    })
 }
 
 // --- Utility functions ---
@@ -808,6 +816,7 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
@@ -907,5 +916,49 @@ mod tests {
             let expected_key: PublicKey = secp_key.into();
             assert_eq!(bootnode.public_key, expected_key);
         }
+
+        // Devnet ENRs from lean-quickstart carry no `udp` entry, so they cannot
+        // seed discv5 even though they remain dialable over QUIC.
+        for bootnode in &bootnodes {
+            assert_eq!(bootnode.udp_port, None);
+        }
+    }
+
+    #[test]
+    fn parse_enrs_extracts_the_udp_port_when_present() {
+        use bytes::Bytes;
+        use ethrex_rlp::encode::RLPEncode;
+        // `secp256k1` is already bound in this module to `libp2p::identity::secp256k1`
+        // (see the top-of-file `use`), so reach the raw `secp256k1` crate that
+        // `ethrex_p2p::types::NodeRecord::from_node_with_extra_pairs` expects via an
+        // explicit crate-root path instead of the shadowed name.
+        use ::secp256k1 as raw_secp256k1;
+
+        // Build an ENR the way ethlambda will once discovery is enabled: udp for
+        // discv5, quic for libp2p, no tcp.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let public_key = ethrex_common::H512::from_slice(
+            &raw_secp256k1::PublicKey::from_secret_key(raw_secp256k1::SECP256K1, &signer)
+                .serialize_uncompressed()[1..],
+        );
+        let node = ethrex_p2p::types::Node::new(
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            9010,
+            0,
+            public_key,
+        );
+        let extra = vec![(
+            Bytes::from_static(b"quic"),
+            Bytes::from(9001u16.encode_to_vec()),
+        )];
+        let record =
+            NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap();
+
+        let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
+
+        assert_eq!(bootnodes.len(), 1);
+        assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(bootnodes[0].quic_port, 9001);
+        assert_eq!(bootnodes[0].udp_port, Some(9010));
     }
 }
