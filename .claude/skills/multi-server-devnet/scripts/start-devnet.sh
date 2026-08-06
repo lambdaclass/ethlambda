@@ -2,7 +2,9 @@
 # Launch a full INDEPENDENT single-host devnet on THIS host (fresh start, no
 # checkpoint sync — every node boots from the genesis already in /config).
 # Nodes 0..NODES-1, ports gossip 9000+n / api 5052+n / metrics 9200+n.
-# Aggregators: nodes 0..SUBNETS-1, node k aggregates subnet k.
+# Aggregators: nodes 0..SUBNETS-1 by default, each covering subnet n % SUBNETS
+# (i.e. its own index). Override the SET with AGG_NODES when the default lands
+# them all on one client — see below.
 # Three-layer naming: node identity = node_N (node-id, node_N.key, data-dir,
 # genesis validator name); container/display = <client>_N (docker name, cAdvisor
 # `name`, promtail `node`); ports = index N. All genesis artifacts key off node_N.
@@ -12,6 +14,15 @@
 #   SUBNETS   ATTESTATION_COMMITTEE_COUNT (= number of aggregators)
 #   N:client  optional: run node N as client in zeam|ream|qlean|gean|lantern|grandine
 #             (everything else runs ethlambda)
+#
+# AGG_NODES="0 4 8"  which node indices aggregate (default: 0..SUBNETS-1). The
+#   subnet a node covers is always n % SUBNETS — never passed separately, because
+#   a node must aggregate the subnet its OWN validators attest on (a client
+#   subscribes to that one subnet, so aggregating a different one listens to a
+#   mesh it is not in). The set must therefore cover every subnet exactly once,
+#   which is checked below. Use this to spread the aggregators across clients on a
+#   mixed devnet: the default 0..SUBNETS-1 is a contiguous prefix, so on a layout
+#   whose first SUBNETS nodes are one client it hands that client every subnet.
 set -u
 NODES=$1; SUBNETS=$2; shift 2
 # Paths are env-overridable (same as cs-restart.sh) so the launch can be
@@ -62,6 +73,27 @@ for spec in "$@"; do
   CANARY[$n]=$client
 done
 
+# map node index -> aggregator (subnet covered is always index % SUBNETS)
+declare -A IS_AGG
+AGG_NODES=${AGG_NODES:-$(seq 0 $((SUBNETS-1)))}
+declare -A SEEN_SUBNET
+for n in $AGG_NODES; do
+  case "$n" in ''|*[!0-9]*) log "ERROR: bad node index '$n' in AGG_NODES"; exit 1;; esac
+  [ "$n" -lt "$NODES" ] || { log "ERROR: AGG_NODES has node $n but NODES=$NODES"; exit 1; }
+  s=$((n % SUBNETS))
+  # Two aggregators on one subnet leaves another with none: attestations there
+  # verify but nobody stores them, blocks go out with attestation_count=0 and
+  # finality dies quietly. Cheaper to catch here than in Grafana an hour later.
+  [ -z "${SEEN_SUBNET[$s]:-}" ] || {
+    log "ERROR: AGG_NODES has both node ${SEEN_SUBNET[$s]} and node $n on subnet $s"
+    log "  (subnet = index % SUBNETS), which leaves some subnet unaggregated."
+    exit 1; }
+  SEEN_SUBNET[$s]=$n; IS_AGG[$n]=1
+done
+for s in $(seq 0 $((SUBNETS-1))); do
+  [ -n "${SEEN_SUBNET[$s]:-}" ] || { log "ERROR: no aggregator for subnet $s in AGG_NODES=[$AGG_NODES]"; exit 1; }
+done
+
 # --- preflight: the two mistakes that cost a whole devnet ---------------------
 cfg_val(){ sudo awk -v k="$1:" '$1==k{print $2}' "$GENESIS/config.yaml" 2>/dev/null; }
 GT=$(cfg_val GENESIS_TIME); GACC=$(cfg_val ATTESTATION_COMMITTEE_COUNT)
@@ -92,7 +124,7 @@ if [ "$gt_delta" -lt -3600 ]; then
   log "  nodes will boot thousands of slots behind and sit in the sync gate. Stale genesis dir?"
 fi
 
-log "=== start-devnet NODES=$NODES SUBNETS=$SUBNETS canaries=[$*] GT=$GT (genesis in ${gt_delta}s) ==="
+log "=== start-devnet NODES=$NODES SUBNETS=$SUBNETS canaries=[$*] aggregators=[$(echo $AGG_NODES)] GT=$GT (genesis in ${gt_delta}s) ==="
 
 for n in $(seq 0 $((NODES-1))); do
   G=$((9000+n)); A=$((5052+n)); M=$((9200+n))
@@ -102,11 +134,11 @@ for n in $(seq 0 $((NODES-1))); do
   # remove any prior container for this node index, whatever client it ran
   cids=$(sudo docker ps -aq --filter "name=_${n}$"); [ -n "$cids" ] && sudo docker rm -f $cids >/dev/null 2>&1
   sudo mkdir -p "$DATA/$NAME"
-  # aggregator if node index < SUBNETS; subnet covered = its own index
-  aggflags=""; lim="$MEM"
-  if [ "$n" -lt "$SUBNETS" ]; then
+  # aggregator per $AGG_NODES; subnet covered = the one its own validators attest on
+  aggflags=""; lim="$MEM"; sub=$((n % SUBNETS))
+  if [ -n "${IS_AGG[$n]:-}" ]; then
     lim="$MEM_AGG"; aggflags="--is-aggregator"
-    [ "$client" != qlean ] && aggflags="$aggflags --aggregate-subnet-ids $n"
+    [ "$client" != qlean ] && aggflags="$aggflags --aggregate-subnet-ids $sub"
   fi
   case "$client" in
     ethlambda)
@@ -118,7 +150,7 @@ for n in $(seq 0 $((NODES-1))); do
         --gossipsub-port "$G" --node-id "$NAME" --node-key /config/"$NAME".key \
         --http-address 0.0.0.0 --api-port "$A" --metrics-port "$M" \
         --attestation-committee-count "$SUBNETS" $aggflags $EXTRA_ETH_FLAGS >/dev/null \
-        && log "$NAME ethlambda started${aggflags:+ (agg subnet $n)}" || log "FAIL $NAME ethlambda";;
+        && log "$NAME ethlambda started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME ethlambda";;
     zeam)
       # console_log_level=info exposes zeam's own duty publishes (attestation /
       # block) on stdout so the duty-timing profiler (reads `docker logs`) can see
@@ -132,7 +164,7 @@ for n in $(seq 0 $((NODES-1))); do
         --node-id "$NAME" --node-key /config/"$NAME".key --metrics-enable \
         --api-port "$A" --metrics-port "$M" --attestation-committee-count "$SUBNETS" \
         $aggflags --db-backend lmdb >/dev/null \
-        && log "$NAME zeam started${aggflags:+ (agg)}" || log "FAIL $NAME zeam";;
+        && log "$NAME zeam started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME zeam";;
     ream)
       sudo docker run -d --restart unless-stopped --name "$CNAME" --network host $lim $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$NAME":/data "$REAM_IMG" \
@@ -143,7 +175,7 @@ for n in $(seq 0 $((NODES-1))); do
         --metrics --metrics-address 0.0.0.0 --metrics-port "$M" \
         --http-address 0.0.0.0 --http-port "$A" \
         --attestation-committee-count "$SUBNETS" $aggflags >/dev/null \
-        && log "$NAME ream started${aggflags:+ (agg)}" || log "FAIL $NAME ream";;
+        && log "$NAME ream started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME ream";;
     qlean)
       sudo docker run -d --restart unless-stopped --name "$CNAME" --network host $lim $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$NAME":/data "$QLEAN_IMG" \
@@ -153,15 +185,15 @@ for n in $(seq 0 $((NODES-1))); do
         --metrics-host 0.0.0.0 --metrics-port "$M" \
         --api-host 0.0.0.0 --api-port "$A" \
         --attestation-committee-count "$SUBNETS" $aggflags -linfo >/dev/null \
-        && log "$NAME qlean started${aggflags:+ (agg)}" || log "FAIL $NAME qlean";;
+        && log "$NAME qlean started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME qlean";;
     gean)
       sudo docker run -d --restart unless-stopped --name "$CNAME" --network host $lim $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$NAME":/data "$GEAN_IMG" \
-        --custom-network-config-dir /config \
+        --custom-network-config-dir /config --data-dir /data \
         --gossipsub-port "$G" --node-id "$NAME" --node-key /config/"$NAME".key \
         --http-address 0.0.0.0 --api-port "$A" --metrics-port "$M" \
         --attestation-committee-count "$SUBNETS" $aggflags >/dev/null \
-        && log "$NAME gean started${aggflags:+ (agg)}" || log "FAIL $NAME gean";;
+        && log "$NAME gean started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME gean";;
     lantern)
       sudo docker run -d --restart unless-stopped --name "$CNAME" --network host $lim $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$NAME":/data "$LANTERN_IMG" \
@@ -173,7 +205,7 @@ for n in $(seq 0 $((NODES-1))); do
         --http-port "$A" --metrics-port "$M" \
         --hash-sig-key-dir /config/hash-sig-keys --attestation-committee-count "$SUBNETS" \
         --devnet 12345678 $aggflags >/dev/null \
-        && log "$NAME lantern started${aggflags:+ (agg)}" || log "FAIL $NAME lantern";;
+        && log "$NAME lantern started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME lantern";;
     grandine)
       sudo docker run -d --restart unless-stopped --name "$CNAME" --network host $lim $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$NAME":/data "$GRANDINE_IMG" \
@@ -183,7 +215,7 @@ for n in $(seq 0 $((NODES-1))); do
         --metrics --metrics-address 0.0.0.0 --metrics-port "$M" \
         --hash-sig-key-dir /config/hash-sig-keys --attestation-committee-count "$SUBNETS" \
         $aggflags >/dev/null \
-        && log "$NAME grandine started${aggflags:+ (agg)}" || log "FAIL $NAME grandine";;
+        && log "$NAME grandine started${aggflags:+ (agg subnet $sub)}" || log "FAIL $NAME grandine";;
     *) log "ERROR unknown client '$client' for $NAME";;
   esac
 done

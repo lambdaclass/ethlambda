@@ -121,9 +121,12 @@ grandine — `--port` for QUIC, `--hash-sig-key-dir` (singular):
 ```
 
 gean — Go client. `--custom-network-config-dir` is the genesis dir; gossip port flag
-like ethlambda:
+like ethlambda. **`--data-dir` is not optional in practice**: it defaults to a
+container-relative `./data` (= `/app/data`), so without it the Pebble DB lives
+inside the container instead of the `/data` mount — a host-side `rm -rf
+data/node_*` then silently wipes nothing, and the DB dies with the container:
 ```
---custom-network-config-dir /config --gossipsub-port G --node-id node_N \
+--custom-network-config-dir /config --data-dir /data --gossipsub-port G --node-id node_N \
   --node-key /config/node_N.key --http-address 0.0.0.0 --api-port A --metrics-port M \
   --attestation-committee-count ACC [--is-aggregator --aggregate-subnet-ids <subnet>] [--checkpoint-sync-url URL]
 ```

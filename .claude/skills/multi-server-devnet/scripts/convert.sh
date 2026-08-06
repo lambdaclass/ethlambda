@@ -131,7 +131,7 @@ convert_node(){  # $1 = N:client[:agg]
         $MEMLIMITS $LOGOPT \
         -v "$GENESIS":/config -v "$DATA/$name":/data \
         "$GEAN_IMG" \
-        --custom-network-config-dir /config \
+        --custom-network-config-dir /config --data-dir /data \
         --gossipsub-port "$G" --node-id "$name" --node-key /config/"$name".key \
         --http-address 0.0.0.0 --api-port "$A" --metrics-port "$M" \
         --attestation-committee-count "$ACC" $aggflags \
