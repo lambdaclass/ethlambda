@@ -101,6 +101,12 @@ pub fn initiate_validator_exit(
 /// balance in `slashings` here is what lets that later computation see it.
 ///
 /// `whistleblower_index` defaults to the current proposer when not given.
+///
+/// One copy of this function serves every fork. The immediate penalty's divisor
+/// falls at altair, bellatrix, and electra, and the reporter's divisor rises at
+/// electra, all without changing anything else here, so both are selected by
+/// fork through [`preset::retuned`] rather than by redefining the function per
+/// fork the way the specification does.
 pub fn slash_validator(
     state: &mut BeaconState,
     slashed_index: ValidatorIndex,
@@ -122,15 +128,14 @@ pub fn slash_validator(
     let slashings = state.slashings_mut();
     slashings[slot] = slashings[slot].saturating_add(effective_balance);
 
-    decrease_balance(
-        state,
-        slashed_index,
-        effective_balance / preset::MIN_SLASHING_PENALTY_QUOTIENT,
-    )?;
+    let fork = state.fork_name();
+    let penalty_quotient = preset::retuned::min_slashing_penalty_quotient(fork);
+    decrease_balance(state, slashed_index, effective_balance / penalty_quotient)?;
 
     let proposer_index = get_beacon_proposer_index(state)?;
     let whistleblower_index = whistleblower_index.unwrap_or(proposer_index);
-    let whistleblower_reward = effective_balance / preset::WHISTLEBLOWER_REWARD_QUOTIENT;
+    let reward_quotient = preset::retuned::whistleblower_reward_quotient(fork);
+    let whistleblower_reward = effective_balance / reward_quotient;
     let proposer_reward = whistleblower_reward / preset::PROPOSER_REWARD_QUOTIENT;
 
     increase_balance(state, proposer_index, proposer_reward)?;

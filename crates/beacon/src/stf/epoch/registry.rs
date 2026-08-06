@@ -100,6 +100,11 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
 /// [`super::process_epoch`]'s pipeline is called with; the specification's
 /// version of this function takes no configuration, since the multiplier and
 /// the slashings window are both presets, not chain configuration.
+///
+/// One copy of this function serves every fork. Altair and bellatrix each raise
+/// the proportional multiplier and nothing else, which the specification
+/// expresses by redefining the whole function around a new constant; here the
+/// value is selected by fork through [`preset::retuned`] instead.
 pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()> {
     let epoch = get_current_epoch(state);
     let total_balance = get_total_active_balance(state)?;
@@ -110,8 +115,9 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
             .checked_add(slashing)
             .ok_or(Error::ArithmeticOverflow("summing the slashings vector"))?;
     }
+    let multiplier = preset::retuned::proportional_slashing_multiplier(state.fork_name());
     let scaled_slashings = slashed_sum
-        .checked_mul(preset::PROPORTIONAL_SLASHING_MULTIPLIER)
+        .checked_mul(multiplier)
         .ok_or(Error::ArithmeticOverflow(
             "scaling the summed slashings by the proportional multiplier",
         ))?;

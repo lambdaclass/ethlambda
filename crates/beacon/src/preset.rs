@@ -962,6 +962,168 @@ pub use mainnet::*;
 #[cfg(feature = "preset-minimal")]
 pub use minimal::*;
 
+/// Preset values that a later fork retunes without changing any container's
+/// shape.
+///
+/// The specification expresses these as a fresh constant per fork
+/// (`MIN_SLASHING_PENALTY_QUOTIENT`, then `..._ALTAIR`, then `..._BELLATRIX`)
+/// and redefines the function that reads it, so that each fork's copy of the
+/// function reads its own constant. Reproducing that here would mean one copy of
+/// `process_slashings` and `slash_validator` per fork, differing in a single
+/// identifier. Selecting the value by fork instead keeps one copy of each
+/// function, and puts the whole fork-to-value mapping in one place where it can
+/// be read against the specification's own tables.
+///
+/// This is the one place in the crate where a preset value is chosen at runtime.
+/// It is sound because none of these bound a container: they are divisors and
+/// multipliers in balance arithmetic, so nothing about them has to be known at
+/// compile time.
+pub mod retuned {
+    use crate::fork::ForkName;
+
+    /// How much the summed slashings are scaled by before being capped at the
+    /// total active balance.
+    ///
+    /// Rises with each fork, so slashing together with a larger fraction of the
+    /// validator set costs proportionally more than it used to.
+    pub fn proportional_slashing_multiplier(fork: ForkName) -> u64 {
+        match fork {
+            ForkName::Phase0 => super::PROPORTIONAL_SLASHING_MULTIPLIER,
+            ForkName::Altair => super::PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
+            _ => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+        }
+    }
+
+    /// The divisor setting the immediate penalty a slashed validator pays, before
+    /// the epoch boundary's proportional penalty.
+    ///
+    /// Falls through altair and bellatrix, so the immediate penalty grows, and
+    /// then rises steeply at electra. That reversal is not a relaxation: electra
+    /// raises the ceiling on a validator's effective balance, so leaving the
+    /// divisor where bellatrix put it would have made the immediate penalty on a
+    /// maximally consolidated validator far larger in absolute terms than the
+    /// penalty bellatrix intended. The divisor grows roughly in step with the
+    /// balance ceiling.
+    pub fn min_slashing_penalty_quotient(fork: ForkName) -> u64 {
+        match fork {
+            ForkName::Phase0 => super::MIN_SLASHING_PENALTY_QUOTIENT,
+            ForkName::Altair => super::MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR,
+            ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => {
+                super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
+            }
+            ForkName::Electra | ForkName::Fulu => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
+        }
+    }
+
+    /// The divisor setting the reporter's cut of a slashed validator's effective
+    /// balance.
+    ///
+    /// Electra raises the divisor, which lowers the reward, because the same
+    /// fork raises the maximum effective balance: leaving the divisor alone would
+    /// have made reporting a large validator far more lucrative than reporting a
+    /// small one.
+    pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
+        match fork {
+            ForkName::Electra | ForkName::Fulu => super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+            _ => super::WHISTLEBLOWER_REWARD_QUOTIENT,
+        }
+    }
+
+    /// The divisor setting how fast an inactive validator's balance leaks while
+    /// the chain is failing to finalize.
+    ///
+    /// Falls with each fork, so the leak bites sooner. Altair and later read it
+    /// through `inactivity_scores` rather than directly, so this is consulted
+    /// only by phase0's own inactivity penalty.
+    pub fn inactivity_penalty_quotient(fork: ForkName) -> u64 {
+        match fork {
+            ForkName::Phase0 => super::INACTIVITY_PENALTY_QUOTIENT,
+            ForkName::Altair => super::INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
+            _ => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Both of these move in one direction across every fork, so a
+        /// transcription slip that swapped two arms would most likely break the
+        /// monotonicity. Asserting the shape rather than the values keeps the test
+        /// meaningful under both presets.
+        #[test]
+        fn slashing_gets_harsher_and_the_leak_bites_sooner_at_every_fork() {
+            for pair in ForkName::ALL.windows(2) {
+                let (earlier, later) = (pair[0], pair[1]);
+                assert!(
+                    proportional_slashing_multiplier(earlier)
+                        <= proportional_slashing_multiplier(later),
+                    "the slashing multiplier must not fall from {earlier} to {later}",
+                );
+                assert!(
+                    inactivity_penalty_quotient(earlier) >= inactivity_penalty_quotient(later),
+                    "the inactivity penalty quotient must not rise from {earlier} to {later}",
+                );
+            }
+        }
+
+        /// The immediate slashing penalty's divisor is the one retuned value that
+        /// does *not* move in a single direction: it falls through bellatrix, then
+        /// rises steeply at electra because that fork raises the ceiling on a
+        /// validator's effective balance. Pinning the reversal here means a future
+        /// edit that "tidies" it into a monotonic sequence fails instead of
+        /// silently changing what a slashed validator pays.
+        #[test]
+        fn the_slashing_penalty_divisor_falls_then_jumps_at_electra() {
+            let through_bellatrix = [ForkName::Phase0, ForkName::Altair, ForkName::Bellatrix];
+            for pair in through_bellatrix.windows(2) {
+                assert!(
+                    min_slashing_penalty_quotient(pair[0]) > min_slashing_penalty_quotient(pair[1]),
+                    "the penalty divisor must fall from {} to {}",
+                    pair[0],
+                    pair[1],
+                );
+            }
+
+            for fork in [ForkName::Bellatrix, ForkName::Capella, ForkName::Deneb] {
+                assert_eq!(
+                    min_slashing_penalty_quotient(fork),
+                    MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX,
+                    "{fork} must still use bellatrix's penalty divisor",
+                );
+            }
+
+            assert!(
+                min_slashing_penalty_quotient(ForkName::Electra)
+                    > min_slashing_penalty_quotient(ForkName::Deneb),
+                "electra raises the penalty divisor rather than lowering it further",
+            );
+            assert_eq!(
+                min_slashing_penalty_quotient(ForkName::Fulu),
+                min_slashing_penalty_quotient(ForkName::Electra),
+                "fulu does not retune the penalty divisor again",
+            );
+        }
+
+        #[test]
+        fn electra_is_where_the_whistleblower_reward_changes() {
+            assert_eq!(
+                whistleblower_reward_quotient(ForkName::Deneb),
+                WHISTLEBLOWER_REWARD_QUOTIENT
+            );
+            assert_eq!(
+                whistleblower_reward_quotient(ForkName::Electra),
+                WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA
+            );
+        }
+
+        use super::super::{
+            MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX, WHISTLEBLOWER_REWARD_QUOTIENT,
+            WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{mainnet, minimal};
