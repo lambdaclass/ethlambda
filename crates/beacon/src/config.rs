@@ -15,13 +15,6 @@
 //!   limits, subnet counts, `MAX_PAYLOAD_SIZE`, and so on): this crate
 //!   implements the state transition and fork choice, not the wire protocol,
 //!   so nothing here would ever read them.
-//! - **Genesis construction parameters** (`MIN_GENESIS_ACTIVE_VALIDATOR_COUNT`,
-//!   `MIN_GENESIS_TIME`, `GENESIS_DELAY`): the specification reads these only
-//!   once, inside `initialize_beacon_state_from_eth1`/`is_valid_genesis_state`,
-//!   to decide when and how to build the genesis `BeaconState` from Eth1
-//!   deposit history. Nothing in the per-slot state transition or fork choice
-//!   reads them again afterward; a genesis state, once built, no longer needs
-//!   to know the rule that produced it.
 //! - **Deposit contract identity** (`DEPOSIT_CHAIN_ID`, `DEPOSIT_NETWORK_ID`,
 //!   `DEPOSIT_CONTRACT_ADDRESS`): these tell a validator client which Eth1
 //!   chain and contract to watch for deposits. The state transition only ever
@@ -29,9 +22,13 @@
 //!   `Eth1Data` votes or, from electra onward, execution layer requests); it
 //!   never itself looks the deposit contract up.
 //!
-//! `GENESIS_FORK_VERSION` is the one genesis-section value that *is* included:
-//! unlike the others, [`Config::fork_version`] reads it on every phase0-era
-//! signature, so it is fork scheduling, not genesis construction.
+//! The genesis-section values are all included. `GENESIS_FORK_VERSION` is fork
+//! scheduling rather than genesis construction, since [`Config::fork_version`]
+//! reads it on every phase0-era signature. The other three
+//! (`MIN_GENESIS_ACTIVE_VALIDATOR_COUNT`, `MIN_GENESIS_TIME`, `GENESIS_DELAY`)
+//! are read only while building a genesis state from Eth1 deposit history, and
+//! never again once that state exists, but [`crate::genesis`] needs them and the
+//! `genesis` fixture suite checks them.
 
 use crate::constants;
 use crate::fork::ForkName;
@@ -60,6 +57,19 @@ pub struct BlobScheduleEntry {
 /// [`Config::with_fork_epoch`] for fixture-driven tests that need one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    // -- Genesis construction ---------------------------------------------
+    /// How many active validators the chain needs before it may start.
+    pub min_genesis_active_validator_count: u64,
+    /// The earliest wall-clock time the chain may start at, whatever the Eth1
+    /// deposit history says.
+    pub min_genesis_time: u64,
+    /// How long after the Eth1 block that satisfies the genesis conditions the
+    /// chain actually starts.
+    ///
+    /// The delay exists so that validators who deposited just before the
+    /// threshold was crossed still have time to get their nodes running.
+    pub genesis_delay: u64,
+
     // -- Fork scheduling --------------------------------------------------
     /// The `Fork.current_version` a phase0 block or attestation signs under,
     /// and the value every later fork's version is a successor to. Also
@@ -236,6 +246,9 @@ impl Config {
     /// specification version's `configs/mainnet.yaml`.
     pub fn mainnet() -> Self {
         Config {
+            min_genesis_active_validator_count: 16_384,
+            min_genesis_time: 1_606_824_000,
+            genesis_delay: 604_800,
             genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
             altair_fork_version: [0x01, 0x00, 0x00, 0x00],
             altair_fork_epoch: 74_240,
@@ -310,6 +323,9 @@ impl Config {
     /// [`Config::with_fork_epoch`] rather than inheriting a fixed schedule.
     pub fn minimal() -> Self {
         Config {
+            min_genesis_active_validator_count: 64,
+            min_genesis_time: 1_578_009_600,
+            genesis_delay: 300,
             genesis_fork_version: [0x00, 0x00, 0x00, 0x01],
             altair_fork_version: [0x01, 0x00, 0x00, 0x01],
             altair_fork_epoch: constants::FAR_FUTURE_EPOCH,
