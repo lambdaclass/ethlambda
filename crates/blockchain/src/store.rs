@@ -348,7 +348,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             .set_time(store.time().unwrap() + 1)
             .expect("set_time should succeed");
 
-        let slot = store.time().unwrap() / INTERVALS_PER_SLOT;
+        let slot = store.current_slot();
         let interval = SlotInterval::from_intervals_since_genesis(store.time().unwrap());
 
         trace!(%slot, ?interval, "processing tick");
@@ -637,7 +637,7 @@ fn on_block_core(
     // Horizon is the current slot plus one whole slot of margin, so an intended
     // early block still imports (mirrors the attestation future-slot guard, but
     // with a whole-slot rather than one-interval margin).
-    let current_slot = store.time().expect("DB read should succeed") / INTERVALS_PER_SLOT;
+    let current_slot = store.current_slot();
     if slot > current_slot + 1 {
         return Err(StoreError::BlockTooFarInFuture {
             block_slot: slot,
