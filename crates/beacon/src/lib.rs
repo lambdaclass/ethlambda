@@ -48,6 +48,7 @@ pub mod config;
 pub mod constants;
 pub mod containers;
 pub mod fork;
+pub mod fork_choice;
 pub mod genesis;
 pub mod hash;
 pub mod helpers;
