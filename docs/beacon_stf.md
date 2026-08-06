@@ -34,6 +34,10 @@ without the fixture download.
 | `kzg` | KZG via `c-kzg`, plus the two challenge functions c-kzg does not export |
 | `containers` | The `BeaconState` enum, fork-invariant containers, per-fork containers |
 | `helpers` | The spec's helper functions |
+| `stf` | The state transition: slots, blocks, operations, epoch processing |
+| `genesis` | Building a genesis state from Eth1 deposits |
+| `upgrade` | Fork upgrades between per-fork state shapes |
+| `fork_choice` | The LMD GHOST store |
 
 ## Three kinds of parameter
 
@@ -154,23 +158,96 @@ bytes and expected root do not already.
 
 ## Status
 
+Phase0 is complete and green against every phase0 fixture suite the release
+ships. Altair has its containers and its fork upgrade; its state transition is
+not written yet. Bellatrix through fulu have nothing beyond the preset and
+configuration values.
+
+Case counts below are per preset, `minimal` first:
+
 | Suite | State |
 |-------|-------|
 | `general/bls` | green, 20 cases |
 | `general/kzg` | green, 344 cases across all 12 handlers |
-| `ssz_static` | green: 5,505 cases (mainnet), 135,423 (minimal) |
+| `ssz_static` | green, 25,215 / 1,025 cases |
 | `shuffling` | green, 300 cases |
-| `operations`, `epoch_processing`, `sanity`, `finality`, `random`, `rewards`, `fork_choice`, `genesis`, `transition` | not yet implemented |
+| `operations` | green, 119 / 118 phase0 cases |
+| `epoch_processing` | green, 56 / 52 phase0 cases |
+| `sanity/blocks` | green, 45 / 40 phase0 cases |
+| `sanity/slots` | green, 7 phase0 cases |
+| `finality` | green, 5 phase0 cases |
+| `random` | green, 16 phase0 cases |
+| `rewards` | green, 49 phase0 cases |
+| `genesis` | green, 10 cases (minimal only: the release ships no mainnet genesis fixtures) |
+| `fork` | altair only |
+| `fork_choice` | **implemented but not gated**, see below |
+| `transition` | not implemented |
 
 The fork-invariant containers are verified against every fork's `ssz_static`
 cases, and phase0's attestation containers through deneb, since electra is where
-the aggregation bits widen from one committee to a slot's worth. Fork-specific
-state and block containers are implemented for phase0 only so far.
+the aggregation bits widen from one committee to a slot's worth. The state and
+block containers exist for phase0 and altair; the sync committee containers are
+checked from altair onward, since they do not change shape again.
+
+### The fork choice store is not fixture-verified
+
+`fork_choice.rs` implements the whole of `specs/phase0/fork-choice.md`, but the
+release ships **no phase0 `fork_choice` suite**: it starts at altair. So the store
+is covered only by unit tests until altair's state transition lands, and should be
+treated as unverified against the specification's own cases. This is the largest
+piece of the crate carrying that caveat.
+
+### A note on earlier case counts
+
+Counts reported before the runners landed were too high by roughly sevenfold.
+`collect_all_handlers` walked the fork directories and then delegated to
+`collect`, which walks them again, so every case was emitted once per fork
+shipping that runner. The cases were always being *run*; they were counted many
+times over. Both collectors now share one suite walk.
 
 ## Deliberate simplifications
 
 - Light client containers and suites are out of scope.
 - `ssz_generic` exercises the SSZ library rather than this crate's containers, so
   it is not a gate.
+- The state transition mutates in place, as the specification does, so a state
+  passed to `state_transition` is left partly modified when a block turns out to
+  be invalid. Callers that need the pre-state clone it first, which is what the
+  fixture runners do.
+
+## What the fixture format asserts by omission
+
+A case with a `post` state must succeed and land exactly on it. A case *without*
+one must be **rejected**. The second half is what keeps the suites honest: an
+implementation that accepted everything would otherwise pass every case that
+ships a post-state. That rule lives in one place, `check_transition`, and every
+state-comparing runner goes through it.
+
+Two consequences worth knowing:
+
+- Roughly a quarter of the phase0 `operations` cases are rejection cases, so the
+  invalid path gets as much coverage as the valid one.
+- The `rewards` suite is the exception to state comparison: it compares the five
+  per-component delta vectors directly. That is sharper, because the components
+  are summed into balances, so a sign error in one component and a compensating
+  error in another would produce correct balances from incorrect deltas.
+
+## Where the specification's Python does more than it appears to
+
+Two places where a faithful-looking transcription is wrong, both found by the
+fixtures rather than by reading:
+
+- `get_matching_target_attestations` evaluates `get_block_root` **inside** a list
+  comprehension, so it never runs when there are no attestations. That call has
+  its own range assertion, which fails for the epoch a state sits at the start of.
+  Hoisting it out of the loop rejects states the specification accepts.
+- `get_attesting_indices` returns an unordered set, and `get_indexed_attestation`
+  sorts it. A committee is a *shuffled* slice of the registry, so filtering it in
+  position order yields attesters in shuffle order, which is almost never
+  ascending. `is_valid_indexed_attestation` requires sorted indices, so skipping
+  the sort rejects every valid attestation.
+
+Both are cases where the Python reads as if order or evaluation point does not
+matter, and both change the result.
 
 [specs]: https://github.com/ethereum/consensus-specs
