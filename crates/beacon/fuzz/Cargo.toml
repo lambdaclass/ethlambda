@@ -1,0 +1,102 @@
+[package]
+name = "ethlambda-beacon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A `cargo-fuzz` crate is conventionally its own workspace, not a member of the
+# repository's. Two reasons: `libfuzzer-sys` and the lighthouse git dependency
+# below have no business influencing the main workspace's dependency
+# resolution or `Cargo.lock`, and the main workspace's root `Cargo.toml` is
+# off limits to this crate's own changes (it belongs to whichever agent is
+# editing `crates/beacon/src` right now), so there is no `exclude` entry to
+# add there even if that were the preferred mechanism. An empty `[workspace]`
+# table here is sufficient on its own: Cargo treats a crate that declares one
+# as its own workspace root regardless of where it sits in the directory tree,
+# so nothing needs to happen on the other side for the detachment to hold.
+[workspace]
+
+[features]
+# Forwards to the crate under test. See `ethlambda-beacon`'s own
+# `preset-minimal` feature and this crate's `src/lib.rs` for how the matching
+# lighthouse `EthSpec` type is picked to go with it.
+preset-minimal = ["ethlambda-beacon/preset-minimal"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# As of this writing, building this against `ethlambda-beacon` at all (not
+# just these fuzz targets) additionally needs the same local
+# `[patch.crates-io]` override the repository root's `Cargo.toml` currently
+# carries for `libssz`/`libssz-types` (mutable `SszList`/`SszVector` access
+# that published `libssz-types` 0.2.2 lacks). A `[patch]` section only
+# applies within the workspace that declares it, so this crate's own
+# `[workspace]` above means it does not inherit the root's patch and needs
+# its own copy, added locally, to build at all today. That patch is not
+# included here because it is a `DO NOT COMMIT` local-machine path override
+# in the root `Cargo.toml` too; see `README.md`'s feasibility section for
+# the exact block to copy and why it is not checked in.
+ethlambda-beacon = { path = ".." }
+
+# lighthouse's consensus crates are not published to crates.io (see the
+# feasibility notes in `README.md`), so they can only be pulled in as git
+# dependencies. Pinned to a tag, not a branch, so a fuzz run today and one run
+# months from now compare against the same lighthouse behavior; `main` moves
+# and would silently change what "disagreement" means between runs.
+#
+# `package = "..."` is not strictly required here (the dependency name already
+# matches the package name), but it is written out anyway: lighthouse's
+# repository is a ~90-member workspace, and naming the package explicitly is
+# the difference between "this is a deliberate reference to one crate in a
+# monorepo" and something that merely happens to resolve.
+types = { git = "https://github.com/sigp/lighthouse", tag = "v8.2.1", package = "types" }
+state_processing = { git = "https://github.com/sigp/lighthouse", tag = "v8.2.1", package = "state_processing" }
+
+# `ssz_roundtrip` calls the `Encode` trait directly (`as_ssz_bytes`) on
+# lighthouse's own containers, so the trait needs to be in scope, which means
+# this crate needs to be a direct dependency, not just reachable transitively
+# through `types`. Its crates.io package is named
+# `ethereum_ssz`, matching the version lighthouse's own workspace pins, but the
+# package sets its own library name to `ssz`; code imports it as `ssz::...`
+# (matching lighthouse's own source, e.g. `beacon_node/store/src/hot_cold_store.rs`),
+# not `ethereum_ssz::...`. Left unpinned beyond the minor version so Cargo
+# unifies it with whichever patch version the lighthouse git dependency itself
+# resolves to, rather than risking two incompatible copies of the trait in the
+# dependency graph.
+ethereum_ssz = "0.10"
+
+# Keeps line numbers in sanitizer stack traces useful without paying for a full
+# debug build; the standard `cargo fuzz init` template sets the same thing for
+# the same reason.
+[profile.release]
+debug = 1
+
+[dev-dependencies]
+# Used only by `examples/seed_corpus.rs`, to decompress the fixtures'
+# `.ssz_snappy` files. Matches the version `ethlambda-beacon`'s own tests pin
+# for the same job.
+snap = "1.1.1"
+
+[[bin]]
+name = "state_transition"
+path = "fuzz_targets/state_transition.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "epoch_processing"
+path = "fuzz_targets/epoch_processing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssz_roundtrip"
+path = "fuzz_targets/ssz_roundtrip.rs"
+test = false
+doc = false
+bench = false
