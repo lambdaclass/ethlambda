@@ -200,6 +200,27 @@ dashboard can safely use `.*` because promtail only ships
 emits the per-host file; `scripts/start-observability.sh` creates the per-host
 `prometheus` + `cadvisor` containers (it refuses to touch existing ones without
 `RECREATE=1`, since a live scraper's flags may not be the ones it would use).
+
+**cAdvisor also carries the image's OCI labels**, which is the only cross-client
+way to see *which commit a node is actually running*: docker copies an image's
+`LABEL`s onto every container created from it, and cAdvisor (default
+`--store_container_labels=true`) re-exports them on every `container_*` series as
+`container_label_<label_with_underscores>`. So
+`container_label_org_opencontainers_image_revision` = the full 40-char SHA and
+`..._ref_name` = the branch/tag — for partner clients too, whose own
+`lean_node_info{version=…}` is often just a release string (`lantern` reports
+`v0.0.5`) while ethlambda's already embeds the short SHA. It reflects the image
+the container was **created** with, so it stays honest after a `docker pull` that
+was not followed by a recreate — unlike the mutable tag in `image`. The client
+dashboard's "Image build" table consumes it; if `Commit` is empty for a client,
+that client's Dockerfile simply does not set the label (ethlambda's does, fed by
+`GIT_COMMIT`/`GIT_BRANCH` build args from `docker_publish.yaml`). Two matcher
+gotchas when writing such a panel: cAdvisor's `job` is `cadvisor` and its
+`instance` is the **host**, so neither the `$job` nor the `$instance` filter of
+the node panels applies — match the node through cAdvisor's `name` instead
+(`name=~"$job"`, since the container name IS the node's job label), and AND a
+`name=~".+_[0-9]+"` guard onto it so "All" (`.*`) does not drag the infra
+containers in, per the gotcha above.
 The **central** stack is a separate one-time deployment: a prometheus started with
 `--web.enable-remote-write-receiver` on a routable address + distinct port (e.g.
 `:9099`), a Loki with `allow_structured_metadata: true` + schema v13/tsdb and

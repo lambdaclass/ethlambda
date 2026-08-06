@@ -1677,6 +1677,184 @@
               }
             }
           ]
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Which build each node is actually running, read from the OCI labels baked into its container image (`org.opencontainers.image.revision` / `.ref.name`) and exported by cAdvisor as `container_label_*`. This is the label of the image the container was CREATED with, so it stays correct after a `docker pull` that has not been followed by a recreate -- unlike the image tag, which is mutable.\n\nCoverage depends on the client's Dockerfile setting the labels; a client that does not leaves Commit empty. Filtered by $network and $job only: cAdvisor's `instance` is the HOST and its `job` is `cadvisor`, so neither the $job nor the $instance matcher of the other panels applies -- the node is matched through cAdvisor's `name` (the container name, same string as the node's `job`).",
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto",
+                "cellOptions": {
+                  "type": "auto"
+                },
+                "filterable": true,
+                "footer": {
+                  "reducers": []
+                },
+                "inspect": false
+              },
+              "mappings": [],
+              "noValue": "No cAdvisor data for this network -- is its cadvisor container scraped?"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Node"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 130
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Client"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 110
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Commit"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 350
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Branch / tag"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 230
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Image built"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 230
+                  }
+                ]
+              }
+            ]
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 24,
+            "x": 0,
+            "y": 47
+          },
+          "id": 215,
+          "options": {
+            "cellHeight": "sm",
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": false,
+                "displayName": "Node"
+              }
+            ]
+          },
+          "pluginVersion": "12.3.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "last_over_time(container_last_seen{network=~\"$network\", name=~\"$job\", name=~\".+_[0-9]+\"}[5m])",
+              "instant": true,
+              "legendFormat": "__auto",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Image build (commit per node)",
+          "transformations": [
+            {
+              "id": "labelsToFields",
+              "options": {
+                "keepLabels": [
+                  "name",
+                  "client_type",
+                  "container_label_org_opencontainers_image_revision",
+                  "container_label_org_opencontainers_image_ref_name",
+                  "image",
+                  "container_label_org_opencontainers_image_created"
+                ]
+              }
+            },
+            {
+              "id": "merge",
+              "options": {}
+            },
+            {
+              "id": "filterFieldsByName",
+              "options": {
+                "include": {
+                  "names": [
+                    "name",
+                    "client_type",
+                    "container_label_org_opencontainers_image_revision",
+                    "container_label_org_opencontainers_image_ref_name",
+                    "image",
+                    "container_label_org_opencontainers_image_created"
+                  ]
+                }
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {},
+                "includeByName": {},
+                "indexByName": {
+                  "name": 0,
+                  "client_type": 1,
+                  "container_label_org_opencontainers_image_revision": 2,
+                  "container_label_org_opencontainers_image_ref_name": 3,
+                  "image": 4,
+                  "container_label_org_opencontainers_image_created": 5
+                },
+                "renameByName": {
+                  "name": "Node",
+                  "client_type": "Client",
+                  "container_label_org_opencontainers_image_revision": "Commit",
+                  "container_label_org_opencontainers_image_ref_name": "Branch / tag",
+                  "image": "Image",
+                  "container_label_org_opencontainers_image_created": "Image built"
+                }
+              }
+            }
+          ],
+          "type": "table"
         }
       ],
       "title": "Devnet configuration",
