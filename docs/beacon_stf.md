@@ -273,16 +273,44 @@ Two things that arrangement has to be careful about:
 ## Status
 
 All seven forks, phase0 through fulu, have containers, fork upgrades, state
-transitions, and epoch processing. Every fixture suite passes on both presets:
+transitions, and epoch processing. Every fixture case passes on both presets:
 
-| Preset | Suites | Lib tests |
-|--------|--------|-----------|
-| mainnet | 20, all green | 244 |
-| minimal | 22, all green | 245 |
+| Preset | Fixture cases | Ignored | Lib tests |
+|--------|---------------|---------|-----------|
+| mainnet | 5705, all green | 152 | 244 |
+| minimal | 40009, all green | 3692 | 245 |
 
-Minimal runs two more suites than mainnet: `genesis`'s `initialization` and
-`validity`. The release ships no mainnet `genesis` fixtures, so that whole
-runner is gated behind the `preset-minimal` feature (`tests/spec/genesis.rs`).
+Minimal runs more cases because the release ships more fixtures for it, and it
+runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
+The release ships no mainnet `genesis` fixtures, so that whole runner is gated
+behind the `preset-minimal` feature (`tests/spec/genesis.rs`).
+
+Nothing is ignored for being unimplemented. Every ignored case is one of two
+deliberate exclusions:
+
+- `LightClient*` containers under `ssz_static`, 5 container types across altair
+  through fulu. The light-client sync protocol is a different layer from the
+  state transition and fork choice, and is not in this crate's scope.
+- The `gloas` and `eip7805` fixture trees, one ignored entry each. See
+  "Accounting for every fork directory" below.
+
+## Accounting for every fork directory
+
+`collect` identifies a fork by parsing the directory name into a `ForkName`, and
+a name that does not parse is skipped. That skip is silent in a way the
+`HIGHEST_IMPLEMENTED_FORK` gate is not: the cases never become tests, so they are
+not counted as ignored either, and nothing in the output says they exist.
+
+The release does ship two such trees. `gloas` is the fork after fulu, and
+`eip7805` is not a fork in the sequence at all, being one of the per-EIP trees
+generated against a variant of some fork's rules. Between them they hold 1898
+mainnet and 17539 minimal cases, all of which were previously dropped without a
+trace, which is the opposite of what this harness promises.
+
+So `UNMODELED_FORKS` names them, each reports as one ignored test, and
+`fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
+directory that is neither parseable nor listed. A release that adds a fork now
+forces a decision instead of quietly widening the gap.
 
 | Suite | Covers |
 |-------|--------|

@@ -32,6 +32,9 @@ fn main() {
 
     let mut trials = Vec::new();
     trials.extend(spec::harness::trials());
+    trials.extend(spec::fixture_fork_trials());
+    trials.extend(spec::bls::trials());
+    trials.extend(spec::kzg::trials());
     trials.extend(spec::epoch_processing::trials());
     trials.extend(spec::fork::trials());
     trials.extend(spec::fork_choice::trials());

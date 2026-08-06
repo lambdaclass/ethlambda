@@ -28,11 +28,13 @@
     reason = "each runner uses a different part of this harness"
 )]
 
+pub mod bls;
 pub mod epoch_processing;
 pub mod fork;
 pub mod fork_choice;
 pub mod genesis;
 pub mod harness;
+pub mod kzg;
 pub mod operations;
 pub mod rewards;
 pub mod sanity;
@@ -40,6 +42,7 @@ pub mod shuffling;
 pub mod ssz_static;
 pub mod transition;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -260,6 +263,80 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
     };
     entries.sort_by_key(fs::DirEntry::file_name);
     entries
+}
+
+/// Fixture fork directories this crate deliberately does not model.
+///
+/// `gloas` is the fork after fulu, and this crate stops at fulu. `eip7805` is not
+/// a fork in the sequence at all: the release ships a directory per in-flight EIP
+/// whose cases are generated against a variant of some fork's rules, so there is
+/// no [`ForkName`] for it to parse as.
+///
+/// Naming them is not bookkeeping for its own sake. A directory [`ForkName::parse`]
+/// does not recognize is how [`collect`] skips a fork, and that skip is *silent*
+/// in a way [`Case::in_scope`] is not: the cases never become tests at all, so
+/// they are not counted as ignored either, and nothing in the output says they
+/// exist. This module's own doc promises the opposite, that a suite which stops
+/// matching fails rather than reporting green, and an unparsed fork slips past
+/// [`HIGHEST_IMPLEMENTED_FORK`] entirely because the gate never sees the case.
+/// So [`fixture_fork_trials`] checks this list against the tree instead.
+pub const UNMODELED_FORKS: &[&str] = &["gloas", "eip7805"];
+
+/// Accounts for every fork directory the fixture release ships.
+///
+/// Reports each directory in [`UNMODELED_FORKS`] as an ignored test, so a
+/// deliberate exclusion is visible in the output rather than inferred from its
+/// absence, and fails when the tree holds a fork directory that is neither
+/// parseable nor listed. That failure is the point: a release that adds a fork
+/// would otherwise have its cases skipped without a trace, and someone has to
+/// decide whether to implement it or name it here.
+pub fn fixture_fork_trials() -> Vec<Trial> {
+    let mut unknown: Vec<String> = Vec::new();
+    let mut unmodeled: BTreeSet<String> = BTreeSet::new();
+
+    // Both trees, since `collect` is called with `general` for the
+    // configuration-independent suites as well as with the preset's own name.
+    for config in [PRESET, "general"] {
+        for entry in read_dir_sorted(&fixture_root().join(config)) {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ForkName::parse(&name).is_some() {
+                continue;
+            }
+            if UNMODELED_FORKS.contains(&name.as_str()) {
+                unmodeled.insert(name);
+            } else {
+                unknown.push(format!("{config}/{name}"));
+            }
+        }
+    }
+
+    let mut trials: Vec<Trial> = unmodeled
+        .into_iter()
+        .map(|name| {
+            Trial::test(format!("fixture_forks/unmodeled/{name}"), || Ok(()))
+                .with_ignored_flag(true)
+        })
+        .collect();
+
+    trials.push(Trial::test(
+        "fixture_forks/every_directory_is_accounted_for",
+        move || {
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(Failed::from(format!(
+                "the fixture release ships fork directories this harness neither parses nor \
+                 lists in UNMODELED_FORKS, so every case under them is skipped without \
+                 appearing anywhere in the output: {}",
+                unknown.join(", ")
+            )))
+        },
+    ));
+
+    trials
 }
 
 /// Wraps one fixture case as a test of its own.

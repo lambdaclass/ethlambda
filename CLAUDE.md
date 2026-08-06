@@ -321,12 +321,18 @@ nothing depends on it.
   override that is intentionally not committed, so the crate builds only where
   that override exists.
 - **Status:** all seven forks (phase0 through fulu) have containers, fork
-  upgrades, state transitions, and epoch processing. Every fixture suite
-  passes on both presets: mainnet is 20 suites green plus 244 lib tests;
-  minimal is 22 suites green. Fork choice is fixture-verified too: 150
-  mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
-  terminal-PoW validation, `should_override_forkchoice_update`, deneb's blob
-  data availability, and fulu's column data availability.
+  upgrades, state transitions, and epoch processing. Every fixture case passes
+  on both presets: mainnet is 5705 cases plus 244 lib tests, minimal is 40009
+  cases plus 245. Fork choice is fixture-verified too: 150 mainnet
+  `fork_choice` cases pass, covering bellatrix's `on_merge_block`/terminal-PoW
+  validation, `should_override_forkchoice_update`, deneb's blob data
+  availability, and fulu's column data availability.
+- Nothing is ignored for being unimplemented. Ignored cases are the
+  `LightClient*` containers (a different layer, out of scope) and the `gloas`
+  and `eip7805` fixture trees. Those two do not parse as a `ForkName`, so
+  `collect` would skip them silently; `UNMODELED_FORKS` names them and
+  `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
+  that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That
   rule lives in `check_transition`; do not add a runner that ignores it.
 
