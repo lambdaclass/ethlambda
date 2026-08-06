@@ -291,7 +291,23 @@ cat scripts/client-dashboard.json | ssh "$METRICS_HOST" "cat > $GRAFANA_DASHBOAR
 ```
 Verify it landed with
 `curl -s $GRAFANA_BASE_URL/api/dashboards/uid/<uid> | jq '.dashboard.version'` (the
-version bumps on each sweep that reads a changed file). Gotcha: that dir is
+version bumps on each sweep that reads a changed file).
+
+**Ship a dashboard under the same FILENAME the skill uses, and keep exactly one
+`.json` per uid in that dir.** Grafana keys a provisioned dashboard on its `uid`,
+not its filename, so a copy left behind under an old name is invisible in the UI
+yet still claims the uid: adding the correctly-named file next to it makes two
+provider files fight over one uid, which Grafana resolves by logging an error and
+dropping one. The failure looks like "my update did not land". This bit us once
+already: the finality dashboard sat on the server as `devnet-overview-dashboard.json`
+for weeks, so the documented `cp finality-dashboard.json` would have collided
+rather than updated it. To retire a stale copy, rename it to `<name>.json.bak-<ts>`
+in the same step that writes the new file — the provider only reads `*.json`, which
+is also why the `.bak-*` backups already in that dir are inert. Audit with
+`md5sum` of every server `.json` against `scripts/*.json`; the names AND the
+digests should match.
+
+Gotcha: that dir is
 bind-mounted **read-only** into the container, so Grafana UI edits are reverted on
 the next provisioner sweep (~30s) despite `allowUiUpdates: true`. Edit the JSON and
 re-copy; treat the repo copy as the source of truth and keep it in sync, since
@@ -460,6 +476,7 @@ pick their datasource through a template variable, so no editing):
 | `finality-dashboard.json` | `devnet-finality-overview` | head / justified / finalized per devnet, one series per `network` |
 | `resources-dashboard.json` | `devnet-resources` | Per-node CPU cores + memory working set (+ limit + %-of-limit for OOM watch), OOM kills, restart events, current uptime, and the same **Image build** commit-per-node table as the client dashboard — all from cAdvisor, so read a fresh uptime next to an unchanged commit as "came back on the same build" |
 | `logs-dashboard.json` | `devnet-logs` | Loki logs panel + log-volume-by-level, filtered `network`/`node`/`stream`/`search` |
+| `node-exporter-full.json` | `rYdddlPWk` | The upstream community **Node Exporter Full** dashboard (grafana.com id 1860), vendored verbatim so the dashboards dir is fully reproducible from this skill. Host-level CPU/RAM/disk/net for the `<host>:9122` systemd node_exporter — the counterpart to the container-level resources dashboard. Its own `ds_prometheus` datasource variable, with the saved selection blanked so it falls back to the default |
 | `grafana-finality-alert.yaml.template` | — | Unified-alerting provisioning for the per-devnet "lost finality" rule + Slack contact point; placeholders filled by the deploy script |
 
 **References.** `node-health.md` — per-node "all is good" checklist (chain follow,
