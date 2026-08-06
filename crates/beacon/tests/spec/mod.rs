@@ -26,6 +26,7 @@
 #![allow(dead_code, reason = "each runner uses a different part of this harness")]
 
 mod harness;
+mod ssz_static;
 
 use std::fs;
 use std::path::{Path, PathBuf};
