@@ -7,6 +7,7 @@
 use crate::config::Config;
 use crate::containers::BeaconState;
 use crate::error::{Error, Result};
+use crate::fork::ForkName;
 use crate::helpers::accessors::{
     get_current_epoch, get_total_active_balance, get_validator_churn_limit,
 };
@@ -18,6 +19,37 @@ use crate::helpers::predicates::{
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, ValidatorIndex};
 
+/// The cap on how many validators may newly activate this epoch.
+///
+/// Phase0 through capella cap activations only indirectly, as part of the
+/// combined activation/exit churn limit ([`get_validator_churn_limit`]).
+/// Deneb adds a second, independent ceiling on activations specifically
+/// (EIP-7514, `MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT` in [`Config`]), so that a
+/// single epoch's whole churn budget cannot be spent activating new
+/// validators and leave none of it for the exits already in flight.
+///
+/// Electra replaces [`process_registry_updates`] wholesale with a
+/// balance-denominated version (`get_balance_churn_limit`), which belongs to
+/// whichever module implements electra rather than here, and the
+/// specification never revives a validator-count churn limit for fulu after
+/// that. Calling this for electra or fulu would silently apply deneb's rule
+/// where the specification no longer has one at all, so both are refused
+/// outright rather than guessed at; see [`process_registry_updates`]'s own
+/// documentation for exactly which forks that leaves this serving.
+fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
+    let churn_limit = get_validator_churn_limit(state, config);
+    match state.fork_name() {
+        ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
+            Ok(churn_limit)
+        }
+        ForkName::Deneb => Ok(config.max_per_epoch_activation_churn_limit.min(churn_limit)),
+        fork @ (ForkName::Electra | ForkName::Fulu) => Err(Error::UnsupportedForFork {
+            function: "process_registry_updates",
+            fork,
+        }),
+    }
+}
+
 /// Moves validators between activation and exit states.
 ///
 /// Three passes, and the order between them matters. The first marks
@@ -27,6 +59,17 @@ use crate::primitives::{Epoch, Gwei, ValidatorIndex};
 /// anything. The second builds the activation queue from eligibility as it
 /// stands after that pass, so a validator ejected and a validator freshly
 /// eligible in the same epoch are both accounted for before anyone activates.
+///
+/// One copy of this function serves phase0 through deneb. Deneb's own change
+/// (EIP-7514) is confined to which cap the third pass dequeues against, so it
+/// is selected by fork through [`activation_churn_limit`] rather than
+/// duplicating the three passes around it, the same reuse-by-value pattern
+/// [`super::process_slashings`] already uses for its own per-fork multiplier.
+/// Electra redefines every pass, not just the cap, so it is a wholly separate
+/// function the crate's electra module owns, and fulu never revives a
+/// validator-count rule after that; [`activation_churn_limit`] refuses to run
+/// for either, so this function does too, rather than letting an electra or
+/// fulu state silently activate validators under deneb's superseded rule.
 pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     let current_epoch = get_current_epoch(state);
     let validator_count = state.validators().len() as ValidatorIndex;
@@ -77,7 +120,7 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
     });
 
     // Dequeue validators for activation up to the churn limit.
-    let churn_limit = get_validator_churn_limit(state, config) as usize;
+    let churn_limit = activation_churn_limit(state, config)? as usize;
     let activation_epoch = compute_activation_exit_epoch(current_epoch);
     for &index in activation_queue.iter().take(churn_limit) {
         state.validator_mut(index)?.activation_epoch = activation_epoch;
@@ -101,10 +144,26 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
 /// version of this function takes no configuration, since the multiplier and
 /// the slashings window are both presets, not chain configuration.
 ///
-/// One copy of this function serves every fork. Altair and bellatrix each raise
-/// the proportional multiplier and nothing else, which the specification
-/// expresses by redefining the whole function around a new constant; here the
-/// value is selected by fork through [`preset::retuned`] instead.
+/// One copy of this function serves phase0 through deneb. Altair and
+/// bellatrix each raise the proportional multiplier and nothing else, which
+/// the specification expresses by redefining the whole function around a new
+/// constant; here the value is selected by fork through [`preset::retuned`]
+/// instead, the same reuse-by-value pattern [`process_registry_updates`] uses
+/// for its own deneb-only change.
+///
+/// Electra (EIP-7251) is not another multiplier swap: it restructures the
+/// division itself, so this copy stops being correct there. Where this
+/// function divides `effective_balance_increments * adjusted_total_slashing_balance`
+/// by the raw `total_balance` and multiplies the result back up by
+/// `increment` at the end, electra's version divides
+/// `adjusted_total_slashing_balance` by `total_balance / increment` once, up
+/// front, and multiplies that shared quotient by each validator's own
+/// `effective_balance_increments` instead. The two orders are not equivalent
+/// under integer division, and electra's own copy in
+/// [`super::electra::process_slashings`] is where that difference is worked
+/// through with a concrete example; fulu never mentions this function again,
+/// so it reuses electra's copy the same way it reuses everything else electra
+/// last redefined.
 pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()> {
     let epoch = get_current_epoch(state);
     let total_balance = get_total_active_balance(state)?;
@@ -158,6 +217,164 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
 mod tests {
     use super::*;
     use crate::constants::FAR_FUTURE_EPOCH;
+    use crate::containers::altair::SyncCommittee;
+    use crate::containers::deneb;
+    use crate::containers::shared::Validator;
+    use crate::primitives::{
+        BlsPubkey, Bytes32, ExecutionAddress, ExecutionBlockHash, Root, Uint256,
+    };
+
+    /// A deneb state with `count` fully active, full-balance validators,
+    /// positioned one epoch in, the same shape
+    /// [`crate::helpers::test_state::with_validators`] builds for phase0.
+    ///
+    /// Not added to that shared builder, which only ever constructs a phase0
+    /// state: this module is the first of the two this crate's file
+    /// ownership gives it a reason to build a deneb state for a test, so the
+    /// builder lives here rather than growing a module this file does not
+    /// own into a fork-dispatching helper for one caller. Every field past
+    /// `validators` and `balances` is a placeholder [`activation_churn_limit`]
+    /// and [`process_registry_updates`] never read.
+    fn deneb_state_with_validators(count: usize) -> BeaconState {
+        let validators: Vec<Validator> = (0..count)
+            .map(|_| Validator {
+                pubkey: BlsPubkey::default(),
+                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
+                activation_eligibility_epoch: 0,
+                activation_epoch: 0,
+                exit_epoch: FAR_FUTURE_EPOCH,
+                withdrawable_epoch: FAR_FUTURE_EPOCH,
+                ..Default::default()
+            })
+            .collect();
+
+        let empty_sync_committee = || SyncCommittee {
+            pubkeys: vec![BlsPubkey::default(); preset::SYNC_COMMITTEE_SIZE]
+                .try_into()
+                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
+            aggregate_pubkey: BlsPubkey::default(),
+        };
+
+        BeaconState::Deneb(deneb::BeaconState {
+            genesis_time: 0,
+            genesis_validators_root: Root::zero(),
+            slot: preset::SLOTS_PER_EPOCH,
+            fork: Default::default(),
+            latest_block_header: Default::default(),
+            block_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            state_roots: vec![Root::zero(); preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            historical_roots: Default::default(),
+            eth1_data: Default::default(),
+            eth1_data_votes: Default::default(),
+            eth1_deposit_index: 0,
+            validators: validators
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            randao_mixes: vec![Bytes32::zero(); preset::EPOCHS_PER_HISTORICAL_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            previous_epoch_participation: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            current_epoch_participation: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            justification_bits: Default::default(),
+            previous_justified_checkpoint: Default::default(),
+            current_justified_checkpoint: Default::default(),
+            finalized_checkpoint: Default::default(),
+            inactivity_scores: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            current_sync_committee: empty_sync_committee(),
+            next_sync_committee: empty_sync_committee(),
+            latest_execution_payload_header: deneb::ExecutionPayloadHeader {
+                parent_hash: ExecutionBlockHash::zero(),
+                fee_recipient: ExecutionAddress::zero(),
+                state_root: Bytes32::zero(),
+                receipts_root: Bytes32::zero(),
+                logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                    .try_into()
+                    .expect("the vector is built at its exact length"),
+                prev_randao: Bytes32::zero(),
+                block_number: 0,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::zero(),
+                block_hash: ExecutionBlockHash::zero(),
+                transactions_root: Root::zero(),
+                withdrawals_root: Root::zero(),
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+            },
+            next_withdrawal_index: 0,
+            next_withdrawal_validator_index: 0,
+            historical_summaries: Default::default(),
+        })
+    }
+
+    /// Deneb's EIP-7514 cap must bind even when the plain validator-count
+    /// churn limit alone would let more validators through: enough of these
+    /// validators are already active that [`get_validator_churn_limit`]
+    /// exceeds [`Config::max_per_epoch_activation_churn_limit`], so a state
+    /// still running phase0's rule would activate more of the queued
+    /// validators below than deneb's is allowed to.
+    #[test]
+    fn deneb_caps_activation_churn_below_the_validator_count_limit() {
+        let config = Config::minimal();
+        let active_count = 200;
+        let queued_count = 10;
+        let mut state = deneb_state_with_validators(active_count + queued_count);
+
+        // Everyone from `active_count` on is eligible for activation but not
+        // yet active; everyone before them already is, active from genesis
+        // by `deneb_state_with_validators`'s own construction.
+        for index in active_count..(active_count + queued_count) {
+            let validator = state.validator_mut(index as ValidatorIndex).unwrap();
+            validator.activation_epoch = FAR_FUTURE_EPOCH;
+            validator.activation_eligibility_epoch = 0;
+        }
+
+        let churn_limit = get_validator_churn_limit(&state, &config);
+        assert!(
+            churn_limit > config.max_per_epoch_activation_churn_limit,
+            "the active set must be large enough that the plain churn limit \
+             alone exceeds deneb's cap, or this test is not exercising it"
+        );
+        assert_eq!(
+            activation_churn_limit(&state, &config).unwrap(),
+            config.max_per_epoch_activation_churn_limit,
+            "the smaller of the two limits must win"
+        );
+
+        process_registry_updates(&mut state, &config).unwrap();
+
+        let activated = (active_count..(active_count + queued_count))
+            .filter(|&index| {
+                state
+                    .validator(index as ValidatorIndex)
+                    .unwrap()
+                    .activation_epoch
+                    != FAR_FUTURE_EPOCH
+            })
+            .count();
+        assert_eq!(
+            activated, config.max_per_epoch_activation_churn_limit as usize,
+            "only the deneb cap's worth of queued validators should have activated this epoch"
+        );
+    }
 
     /// Validators becoming eligible for activation in the same epoch must
     /// dequeue in index order, since every client has to agree on which ones

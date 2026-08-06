@@ -14,6 +14,10 @@
 //! - Registry updates run before slashings, so a validator that exits this epoch
 //!   is already exiting when the slashing penalty is scaled.
 
+pub mod altair;
+pub mod capella;
+pub mod electra;
+pub mod fulu;
 pub mod justification;
 pub mod registry;
 pub mod rewards;
@@ -21,6 +25,7 @@ pub mod rewards;
 use crate::containers::phase0::PendingAttestation;
 use crate::containers::{BeaconState, HistoricalBatch};
 use crate::error::{Result, verify};
+use crate::fork::ForkName;
 use crate::helpers::accessors::{
     get_block_root, get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
     get_total_balance,
@@ -31,8 +36,13 @@ use crate::{config::Config, constants};
 
 use super::phase0_state;
 
-/// Runs every epoch-boundary step, in the specification's order.
-pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
+/// Phase0's epoch-boundary driver, in the specification's order.
+///
+/// Named explicitly, unlike [`altair::process_epoch`] and every later fork's
+/// own driver, only because this one predates [`process_epoch`] below: phase0
+/// has no module of its own elsewhere in [`crate::stf`] the way every later
+/// fork does, so its driver stays here rather than moving to one.
+pub fn process_epoch_phase0(state: &mut BeaconState, config: &Config) -> Result<()> {
     justification::process_justification_and_finalization(state, config)?;
     rewards::process_rewards_and_penalties(state, config)?;
     registry::process_registry_updates(state, config)?;
@@ -44,6 +54,61 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
     process_historical_roots_update(state)?;
     process_participation_record_updates(state)?;
     Ok(())
+}
+
+/// Runs every epoch-boundary step, dispatching on the state's own fork.
+///
+/// Phase0 and altair each have a driver of their own already; every later
+/// fork either reuses an earlier one unchanged or gets a stub of its own here,
+/// to be filled in once that fork's own epoch-processing steps are written.
+/// Which is which is settled by `beacon-chain.md`'s "Epoch processing" section
+/// for each fork, not assumed:
+///
+/// - Bellatrix's section only modifies `get_inactivity_penalty_deltas` and
+///   `slash_validator`, two helpers the driver calls into, and never redefines
+///   `process_epoch` itself, so this reuses altair's driver unchanged.
+/// - Capella's section gives a full, modified `process_epoch` (it swaps
+///   `process_historical_roots_update` for `process_historical_summaries_update`),
+///   so it gets its own stub.
+/// - Deneb's section only modifies `process_registry_updates` (EIP-7514's
+///   activation churn limit), a helper the driver already calls uniformly
+///   across forks, and never redefines `process_epoch` itself, so this reuses
+///   capella's driver.
+/// - Electra's and fulu's sections each give a full, modified `process_epoch`
+///   (electra adds the pending-deposit and pending-consolidation steps;
+///   fulu appends the proposer-lookahead step), so each gets its own stub.
+pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
+    match state.fork_name() {
+        ForkName::Phase0 => process_epoch_phase0(state, config),
+        ForkName::Altair => altair::process_epoch(state, config),
+        ForkName::Bellatrix => altair::process_epoch(state, config),
+        ForkName::Capella => capella::process_epoch(state, config),
+        ForkName::Deneb => capella::process_epoch(state, config),
+        ForkName::Electra => electra::process_epoch(state, config),
+        ForkName::Fulu => fulu::process_epoch(state, config),
+    }
+}
+
+/// Updates justification and finality, dispatching on the state's own fork.
+///
+/// Every fork's driver already reaches its own version of this step directly,
+/// so this dispatcher exists for the one caller that runs the step *outside* a
+/// driver: [`crate::fork_choice::compute_pulled_up_tip`], which advances a
+/// throwaway copy of a block's post-state just far enough to learn what
+/// justification and finality that chain is heading towards. Fork choice has no
+/// business knowing which fork's rules to reach for, so it asks here.
+///
+/// Altair rewrote the step to read participation flags instead of replaying
+/// stored attestations, and no later fork changes it again, so altair's version
+/// serves everything from altair on.
+pub fn process_justification_and_finalization(
+    state: &mut BeaconState,
+    config: &Config,
+) -> Result<()> {
+    match state.fork_name() {
+        ForkName::Phase0 => justification::process_justification_and_finalization(state, config),
+        _ => altair::process_justification_and_finalization(state),
+    }
 }
 
 // ---------------------------------------------------------------------------

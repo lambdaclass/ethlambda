@@ -1,7 +1,11 @@
-//! The phase0 fork choice store: LMD GHOST, with FFG-derived justification and
+//! The fork choice store: LMD GHOST, with FFG-derived justification and
 //! finalization gating which branches are even eligible to be head.
 //!
-//! Implements `specs/phase0/fork-choice.md`. `Store` tracks the block tree,
+//! Implements `specs/phase0/fork-choice.md`, which is also every later fork's
+//! fork choice through at least altair: none of them change anything here.
+//! `Store` therefore accepts a block from any fork this crate implements (see
+//! [`Store::blocks`]), even though the algorithm applied to it is
+//! unconditionally phase0's. `Store` tracks the block tree,
 //! attester votes, and the checkpoints fork choice reasons about; the four
 //! handlers at the bottom of this file ([`on_tick`], [`on_block`],
 //! [`on_attestation`], [`on_attester_slashing`]) are the only supported ways to
@@ -50,22 +54,114 @@
 //! ties, and the winner is the same regardless of which order the underlying
 //! map happened to yield its entries in. Nothing else in this file examines a
 //! map's keys as a whole, so no map here needs an order of its own.
+//!
+//! # `Store::blocks` holds signed blocks, not the specification's unsigned ones
+//!
+//! The specification's `store.blocks: Dict[Root, BeaconBlock]` holds the
+//! unsigned message. This file holds [`SignedBeaconBlock`] instead: it is
+//! what every caller already has in hand (a fixture case, a gossiped block, a
+//! `BlocksByRoot` response), the extra signature is small next to a full
+//! body, and the map stays keyed on the *unsigned* message's root
+//! ([`SignedBeaconBlock::message_hash_tree_root`]), so nothing about lookup or
+//! ancestry changes. [`get_forkchoice_store`]'s `anchor_block` is signed for
+//! the same reason, even though a trusted anchor's own signature is never
+//! actually checked.
+//!
+//! Holding the fork-generic enum here, rather than a concrete per-fork
+//! struct, is what lets [`on_block`] accept a block from any fork this crate
+//! implements: every place in this file that reads a field off a stored block
+//! goes through the enum's shared accessors (`slot()`, `parent_root()`, and
+//! so on) rather than a phase0-specific field.
+//!
+//! # `on_block`'s execution engine
+//!
+//! [`stf::state_transition`] takes an [`stf::ExecutionEngine`] from bellatrix
+//! on, for the one call a real client would route to its execution layer.
+//! [`on_block`] always passes [`stf::ExecutionEngine::valid`]: no released
+//! `fork_choice` fixture, at any fork or preset, ships an `execution.yaml` or
+//! an `on_payload_info` step, so there is nothing yet for a caller to supply
+//! a different answer for. `on_payload_info` is also a standing registry
+//! keyed by block hash and updated over the course of a case, not a single
+//! value fixed at construction time, so when a fixture exercising it does
+//! arrive, threading it through will need more than a parameter on this
+//! function.
+//!
+//! # [`Attestation`] and [`AttesterSlashing`]: a second fork-generic enum
+//!
+//! [`phase0::Attestation`] and [`phase0::AttesterSlashing`] keep the same
+//! shape from phase0 through deneb, so [`on_attestation`] and
+//! [`on_attester_slashing`] could stay phase0-typed through every fork this
+//! crate implemented before electra. EIP-7549 breaks that: electra widens
+//! `aggregation_bits` from one committee's worth to a whole slot's and adds
+//! `committee_bits`, so [`electra::Attestation`] (and, following from it,
+//! [`electra::IndexedAttestation`] and [`electra::AttesterSlashing`]) is a
+//! different concrete type, not just a wider bound on the same one.
+//!
+//! [`Attestation`] and [`AttesterSlashing`] mirror [`SignedBeaconBlock`]'s own
+//! answer to that problem: an enum over the two shapes, with two variants
+//! rather than one per fork for the same reason `SignedBeaconBlock` has only
+//! seven, not one per fork through fulu. But fork choice reads far less out
+//! of an attestation than a block: `data.slot`, `data.target`,
+//! `data.beacon_block_root`, and the attesting indices, per the module
+//! documentation above. `AttestationData` (`crate::containers::shared`) is
+//! already fork-invariant, so every function below except the two enums'
+//! own methods reads it directly rather than matching on a fork tag it does
+//! not need: [`validate_on_attestation`] and [`update_latest_messages`] take
+//! `AttestationData` and a resolved `&[ValidatorIndex]`, not an
+//! [`Attestation`]. The one place a fork's own shape actually matters is
+//! resolving an [`Attestation`] into the attesters it names and checking
+//! their aggregate signature, which needs the fork-specific
+//! `get_indexed_attestation`/`is_valid_indexed_attestation` pair
+//! ([`crate::helpers::attestation`] for phase0, [`crate::helpers::electra`]
+//! for electra); [`Attestation::verified_attesting_indices`] and
+//! [`AttesterSlashing::verified_attesting_indices`] are where that dispatch
+//! happens, once, so [`on_attestation`] and [`on_attester_slashing`]
+//! themselves never match on a fork at all.
+//!
+//! # Bellatrix's merge check, and data availability from deneb on
+//!
+//! [`on_block`] gains two more fork-conditional steps beyond `phase0/fork-
+//! choice.md`, both because a later fork's own `fork-choice.md` modifies
+//! `on_block` directly rather than leaving it to state transition:
+//!
+//! - Bellatrix requires a transitioning block's parent execution payload to
+//!   sit on a valid terminal PoW block ([`validate_merge_block`]), checked
+//!   against [`Store::pow_blocks`] rather than a real execution client, the
+//!   same way [`stf::ExecutionEngine`] stands in for one elsewhere in this
+//!   crate. Capella's own `fork-choice.md` removes this check outright
+//!   ("deletion of the verification of merge transition block conditions"),
+//!   so it applies to bellatrix alone.
+//! - Deneb, electra, and fulu each require `is_data_available` to hold
+//!   before a block with blob commitments is even considered
+//!   ([`is_data_available_blobs`] for deneb/electra's blob-and-proof shape,
+//!   [`is_data_available_columns`] for fulu's column-sidecar shape). Both
+//!   read `retrieve_blobs_and_proofs`/`retrieve_column_sidecars`'s answer out
+//!   of [`DataAvailability`], a parameter on [`on_block`] rather than a
+//!   `Store` field: unlike a PoW block, this evidence is scoped to the one
+//!   block being considered right now, not a registry looked up by hash
+//!   later. Both helpers are also "implementation and context dependent" in
+//!   the specification's own words, exactly the class of thing
+//!   [`stf::ExecutionEngine`] already collapses to whatever the fixture
+//!   suites supply directly.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
 use crate::constants;
-use crate::containers::phase0;
-use crate::containers::{BeaconState, Checkpoint};
+use crate::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
+use crate::containers::{bellatrix, deneb, electra, fulu, phase0};
 use crate::error::{Error, Result, verify};
 use crate::helpers::accessors::{
-    get_active_validator_indices, get_current_epoch, get_total_active_balance,
+    get_active_validator_indices, get_beacon_proposer_index, get_current_epoch,
+    get_total_active_balance,
 };
-use crate::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
+use crate::helpers::attestation as phase0_attestation;
+use crate::helpers::electra as electra_helpers;
 use crate::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::helpers::predicates::is_slashable_attestation_data;
+use crate::kzg;
 use crate::preset;
-use crate::primitives::{Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex};
+use crate::primitives::{Epoch, Gwei, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex};
 use crate::stf;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +177,222 @@ use crate::stf;
 pub struct LatestMessage {
     pub epoch: Epoch,
     pub root: Root,
+}
+
+// ---------------------------------------------------------------------------
+// Attestation, AttesterSlashing
+// ---------------------------------------------------------------------------
+
+/// An attestation, in whichever fork's shape it currently has. See the module
+/// documentation for why this exists and what it lets the rest of this file
+/// stay generic over.
+///
+/// Two variants, not one per fork: every fork through deneb shares
+/// [`phase0::Attestation`] outright, and fulu shares [`electra::Attestation`]
+/// the same way [`SignedBeaconBlock::Fulu`] shares
+/// [`electra::SignedBeaconBlock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attestation {
+    Phase0(phase0::Attestation),
+    Electra(electra::Attestation),
+}
+
+impl Attestation {
+    /// The fork-invariant half of an attestation: everything
+    /// [`validate_on_attestation`] and [`update_latest_messages`] need, which
+    /// is why neither of them takes an [`Attestation`] at all.
+    pub fn data(&self) -> AttestationData {
+        match self {
+            Attestation::Phase0(attestation) => attestation.data,
+            Attestation::Electra(attestation) => attestation.data,
+        }
+    }
+
+    /// The attesters this attestation names, once its aggregate signature and
+    /// index ordering have both been checked against `state`.
+    ///
+    /// The one place this enum's two shapes actually matter: building the
+    /// indexed form and checking it needs the fork-specific
+    /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair, so this
+    /// dispatches once here rather than leaving that match to every caller.
+    pub fn verified_attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
+        match self {
+            Attestation::Phase0(attestation) => {
+                let indexed = phase0_attestation::get_indexed_attestation(state, attestation)?;
+                verify(
+                    phase0_attestation::is_valid_indexed_attestation(state, &indexed),
+                    "is_valid_indexed_attestation(target_state, indexed_attestation)",
+                )?;
+                Ok(indexed.attesting_indices.into_inner())
+            }
+            Attestation::Electra(attestation) => {
+                let indexed = electra_helpers::get_indexed_attestation(state, attestation)?;
+                verify(
+                    electra_helpers::is_valid_indexed_attestation(state, &indexed),
+                    "is_valid_indexed_attestation(target_state, indexed_attestation)",
+                )?;
+                Ok(indexed.attesting_indices.into_inner())
+            }
+        }
+    }
+}
+
+/// Evidence that a set of validators made two conflicting attestations, in
+/// whichever fork's shape it currently has. See [`Attestation`] for why this
+/// has the same two variants and no more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttesterSlashing {
+    Phase0(phase0::AttesterSlashing),
+    Electra(electra::AttesterSlashing),
+}
+
+impl AttesterSlashing {
+    /// The fork-invariant half of both attestations `self` accuses of
+    /// equivocating: what [`on_attester_slashing`] needs to check
+    /// [`is_slashable_attestation_data`] before it looks at either half's
+    /// attesters at all.
+    pub fn data(&self) -> (AttestationData, AttestationData) {
+        match self {
+            AttesterSlashing::Phase0(slashing) => {
+                (slashing.attestation_1.data, slashing.attestation_2.data)
+            }
+            AttesterSlashing::Electra(slashing) => {
+                (slashing.attestation_1.data, slashing.attestation_2.data)
+            }
+        }
+    }
+
+    /// The attesting indices of both halves, once each has been checked as
+    /// an individually valid indexed attestation against `state`. See
+    /// [`Attestation::verified_attesting_indices`] for why this is where the
+    /// fork-specific dispatch happens.
+    pub fn verified_attesting_indices(
+        &self,
+        state: &BeaconState,
+    ) -> Result<(Vec<ValidatorIndex>, Vec<ValidatorIndex>)> {
+        match self {
+            AttesterSlashing::Phase0(slashing) => {
+                verify(
+                    phase0_attestation::is_valid_indexed_attestation(
+                        state,
+                        &slashing.attestation_1,
+                    ),
+                    "is_valid_indexed_attestation(state, attestation_1)",
+                )?;
+                verify(
+                    phase0_attestation::is_valid_indexed_attestation(
+                        state,
+                        &slashing.attestation_2,
+                    ),
+                    "is_valid_indexed_attestation(state, attestation_2)",
+                )?;
+                Ok((
+                    slashing
+                        .attestation_1
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                    slashing
+                        .attestation_2
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                ))
+            }
+            AttesterSlashing::Electra(slashing) => {
+                verify(
+                    electra_helpers::is_valid_indexed_attestation(state, &slashing.attestation_1),
+                    "is_valid_indexed_attestation(state, attestation_1)",
+                )?;
+                verify(
+                    electra_helpers::is_valid_indexed_attestation(state, &slashing.attestation_2),
+                    "is_valid_indexed_attestation(state, attestation_2)",
+                )?;
+                Ok((
+                    slashing
+                        .attestation_1
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                    slashing
+                        .attestation_2
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                ))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PowBlock
+// ---------------------------------------------------------------------------
+
+/// The execution chain's own block header, as far as bellatrix's merge
+/// transition check needs it: `specs/bellatrix/fork-choice.md`'s `PowBlock`.
+///
+/// The specification's own `get_pow_block(hash) -> Optional[PowBlock]` is
+/// "implementation and context dependent": a real client would ask its
+/// execution engine. [`Store::pow_blocks`] and [`insert_pow_block`] are what
+/// stand in for that here, populated directly by the fixture suites' own
+/// `on_merge_block` step rather than a real PoW chain.
+///
+/// Defined in its own module, rather than inline here like [`LatestMessage`],
+/// purely to keep its `SszDecode` derive out of the scope of this file's own
+/// `use crate::error::Result;`: that alias and the derive macro's
+/// generated code (which expects the standard library's own two-parameter
+/// `Result`) would otherwise collide.
+mod pow_block {
+    use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
+
+    use crate::primitives::{Root, Uint256};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+    pub struct PowBlock {
+        pub block_hash: Root,
+        pub parent_hash: Root,
+        /// The total work behind `block_hash`, compared against
+        /// [`crate::config::Config::terminal_total_difficulty`] to decide
+        /// whether this is the one PoW block the merge transitioned at.
+        pub total_difficulty: Uint256,
+    }
+}
+pub use pow_block::PowBlock;
+
+// ---------------------------------------------------------------------------
+// DataAvailability
+// ---------------------------------------------------------------------------
+
+/// What [`on_block`] needs from `retrieve_blobs_and_proofs` (deneb, electra)
+/// or `retrieve_column_sidecars` (fulu) to decide `is_data_available`.
+///
+/// Both are "implementation and context dependent" in the specification's
+/// own words, exactly like [`stf::ExecutionEngine`]'s execution-payload
+/// validity call; this collapses the same way, to whatever the fixture
+/// suites supply directly for the one block being considered right now. A
+/// `Store` field would be the wrong shape for that: unlike [`PowBlock`],
+/// this evidence is never looked up again by some other hash later, so
+/// [`on_block`] takes it as a parameter instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataAvailability {
+    /// The block carries no blob commitments, or predates deneb: nothing for
+    /// [`on_block`]'s data-availability check to do.
+    NotRequired,
+    /// Deneb and electra's shape: every blob and its proof, in
+    /// `block.body.blob_kzg_commitments`'s own order. A length mismatch
+    /// against the block's own commitments is not checked here; it is
+    /// exactly what [`is_data_available_blobs`] rejects.
+    Blobs {
+        blobs: Vec<deneb::Blob>,
+        proofs: Vec<KzgProof>,
+    },
+    /// Fulu's shape: the column sidecars sampled for this block.
+    Columns(Vec<fulu::DataColumnSidecar>),
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +438,10 @@ pub struct Store {
     /// rather than letting an equivocator's [`LatestMessage`] count for either
     /// side of the fork it created.
     pub equivocating_indices: HashSet<ValidatorIndex>,
-    pub blocks: HashMap<Root, phase0::BeaconBlock>,
+    /// Keyed on the unsigned message's root, matching the specification's own
+    /// `store.blocks`, even though the value held here is signed. See the
+    /// module documentation for why.
+    pub blocks: HashMap<Root, SignedBeaconBlock>,
     /// The post-state resulting from applying each block in
     /// [`Store::blocks`].
     pub block_states: HashMap<Root, BeaconState>,
@@ -149,6 +464,12 @@ pub struct Store {
     /// [`get_voting_source`] can "pull up" an older block's effective vote
     /// without replaying epoch processing on every lookup.
     pub unrealized_justifications: HashMap<Root, Checkpoint>,
+    /// PoW blocks known to this store, keyed by [`PowBlock::block_hash`]. See
+    /// [`PowBlock`]'s documentation for why this stands in for
+    /// `get_pow_block` rather than this file calling out to a real execution
+    /// client. Read through [`get_pow_block`], written through
+    /// [`insert_pow_block`].
+    pub pow_blocks: HashMap<Root, PowBlock>,
 }
 
 impl Store {
@@ -185,15 +506,24 @@ impl Store {
 /// whatever finalized state and block it fetched instead.
 pub fn get_forkchoice_store(
     anchor_state: BeaconState,
-    anchor_block: phase0::BeaconBlock,
+    anchor_block: SignedBeaconBlock,
     config: &Config,
 ) -> Result<Store> {
+    // The specification's `BeaconState` and `BeaconBlock` are already one
+    // fork's own types, so a mismatch between them cannot even be expressed
+    // there; here both are enums, so this crate has to enforce the invariant
+    // by hand, the same way `stf::state_transition` does for every later
+    // block.
     verify(
-        anchor_block.state_root == anchor_state.hash_tree_root(),
+        anchor_block.fork_name() == anchor_state.fork_name(),
+        "anchor_block's fork matches anchor_state's",
+    )?;
+    verify(
+        anchor_block.state_root() == anchor_state.hash_tree_root(),
         "anchor_block.state_root == hash_tree_root(anchor_state)",
     )?;
 
-    let anchor_root = anchor_block.hash_tree_root();
+    let anchor_root = anchor_block.message_hash_tree_root();
     let anchor_epoch = get_current_epoch(&anchor_state);
     let justified_checkpoint = Checkpoint {
         epoch: anchor_epoch,
@@ -251,6 +581,7 @@ pub fn get_forkchoice_store(
         checkpoint_states,
         latest_messages: HashMap::new(),
         unrealized_justifications,
+        pow_blocks: HashMap::new(),
     })
 }
 
@@ -294,8 +625,8 @@ pub fn get_ancestor(store: &Store, root: Root, slot: Slot) -> Result<Root> {
             .blocks
             .get(&root)
             .ok_or(Error::SpecAssert("root in store.blocks"))?;
-        if block.slot > slot {
-            root = block.parent_root;
+        if block.slot() > slot {
+            root = block.parent_root();
         } else {
             return Ok(root);
         }
@@ -358,7 +689,7 @@ pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
         .blocks
         .get(&root)
         .ok_or(Error::SpecAssert("root in store.blocks"))?
-        .slot;
+        .slot();
 
     let mut attestation_score: Gwei = 0;
     for index in get_active_validator_indices(state, current_epoch) {
@@ -399,7 +730,7 @@ pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Re
         .blocks
         .get(&block_root)
         .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot;
+        .slot();
     let current_epoch = get_current_store_epoch(store, config);
     let block_epoch = compute_epoch_at_slot(block_slot);
 
@@ -435,12 +766,12 @@ pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Re
 /// justified checkpoint, which stays shallow in ordinary operation.
 ///
 /// Borrows `blocks` for the whole walk instead of the specification's owned
-/// output dict, so this never clones a [`phase0::BeaconBlock`] just to hand a
+/// output dict, so this never clones a [`SignedBeaconBlock`] just to hand a
 /// second reference to it to the caller.
 pub fn filter_block_tree<'store>(
     store: &'store Store,
     block_root: Root,
-    blocks: &mut HashMap<Root, &'store phase0::BeaconBlock>,
+    blocks: &mut HashMap<Root, &'store SignedBeaconBlock>,
     config: &Config,
 ) -> Result<bool> {
     let block = store
@@ -451,7 +782,7 @@ pub fn filter_block_tree<'store>(
     let children: Vec<Root> = store
         .blocks
         .iter()
-        .filter(|(_, candidate)| candidate.parent_root == block_root)
+        .filter(|(_, candidate)| candidate.parent_root() == block_root)
         .map(|(root, _)| *root)
         .collect();
 
@@ -501,7 +832,7 @@ pub fn filter_block_tree<'store>(
 pub fn get_filtered_block_tree<'store>(
     store: &'store Store,
     config: &Config,
-) -> Result<HashMap<Root, &'store phase0::BeaconBlock>> {
+) -> Result<HashMap<Root, &'store SignedBeaconBlock>> {
     let base = store.justified_checkpoint.root;
     let mut blocks = HashMap::new();
     filter_block_tree(store, base, &mut blocks, config)?;
@@ -516,7 +847,7 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
     loop {
         let children: Vec<Root> = blocks
             .iter()
-            .filter(|(_, block)| block.parent_root == head)
+            .filter(|(_, block)| block.parent_root() == head)
             .map(|(root, _)| *root)
             .collect();
         if children.is_empty() {
@@ -723,13 +1054,13 @@ pub fn get_proposer_head(
         .blocks
         .get(&head_root)
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let parent_root = head_block.parent_root;
-    let head_slot = head_block.slot;
+    let parent_root = head_block.parent_root();
+    let head_slot = head_block.slot();
     let parent_block = store
         .blocks
         .get(&parent_root)
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_slot = parent_block.slot;
+    let parent_slot = parent_block.slot();
 
     // Only re-org the head block if it arrived later than the attestation
     // deadline.
@@ -778,6 +1109,273 @@ pub fn get_proposer_head(
     }
 }
 
+/// Whether a proposer confident it will build the next block should ask its
+/// execution engine to build on `head_root`'s parent instead of `head_root`
+/// itself, suppressing the `notify_forkchoice_updated` call bellatrix's
+/// `ExecutionEngine` protocol would otherwise make right away.
+///
+/// `validator_is_connected` stands in for the specification's own
+/// `validator_is_connected(validator_index: ValidatorIndex) -> bool`, "a
+/// function that indicates whether the validator ... is connected to the
+/// node (e.g. has sent an unexpired proposer preparation message)"
+/// (`specs/bellatrix/fork-choice.md`). Every real answer is
+/// implementation-specific, so a caller supplies its own policy here rather
+/// than this crate guessing at one; the fixture suites that exercise this
+/// supply a fixed answer directly, the same way [`stf::ExecutionEngine`]
+/// stands in for a real execution client elsewhere in this crate.
+///
+/// Shares [`get_proposer_head`]'s own reorg conditions
+/// (`is_head_late`/`is_shuffling_stable`/`is_ffg_competitive`/`is_finalization_ok`),
+/// but evaluated against `proposal_slot` (`head_root`'s slot plus one)
+/// rather than the caller's own current slot: this asks about the block a
+/// confident proposer is *about* to build, one slot ahead of `head_root`,
+/// not about reorging a block already received.
+pub fn should_override_forkchoice_update(
+    store: &Store,
+    head_root: Root,
+    validator_is_connected: impl Fn(ValidatorIndex) -> bool,
+    config: &Config,
+) -> Result<bool> {
+    let head_block = store
+        .blocks
+        .get(&head_root)
+        .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
+    let parent_root = head_block.parent_root();
+    let head_slot = head_block.slot();
+    let parent_block = store
+        .blocks
+        .get(&parent_root)
+        .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
+    let parent_slot = parent_block.slot();
+    let current_slot = get_current_slot(store, config);
+    let proposal_slot = head_slot.saturating_add(1);
+
+    // Only re-org the head block if it arrived later than the attestation
+    // deadline.
+    let head_late = is_head_late(store, head_root)?;
+    // Shuffling stable.
+    let shuffling_stable = is_shuffling_stable(proposal_slot);
+    // FFG information of the new head block will be competitive with the
+    // current head.
+    let ffg_competitive = is_ffg_competitive(store, head_root, parent_root)?;
+    // Do not re-org if the chain is not finalizing with acceptable frequency.
+    let finalization_ok = is_finalization_ok(store, proposal_slot, config);
+
+    // Only suppress the fork choice update if we are confident that we will
+    // propose the next block. A clone, matching the specification's own
+    // `.copy()`: advancing it to `proposal_slot` is only how this samples the
+    // proposer that slot would draw, not a change
+    // `store.block_states[parent_root]` should keep.
+    let mut parent_state_advanced = store
+        .block_states
+        .get(&parent_root)
+        .ok_or(Error::SpecAssert("parent_root in store.block_states"))?
+        .clone();
+    stf::process_slots(&mut parent_state_advanced, proposal_slot, config)?;
+    let proposer_index = get_beacon_proposer_index(&parent_state_advanced)?;
+    let proposing_reorg_slot = validator_is_connected(proposer_index);
+
+    // Single slot re-org.
+    let parent_slot_ok = parent_slot.checked_add(1) == Some(head_slot);
+    let proposing_on_time = is_proposing_on_time(store, config);
+    // Note that this condition is different from `get_proposer_head`.
+    let current_time_ok =
+        head_slot == current_slot || (proposal_slot == current_slot && proposing_on_time);
+    let single_slot_reorg = parent_slot_ok && current_time_ok;
+
+    // Check the head weight only if the attestations from the head slot have
+    // already been applied; before then, both conditions default to true
+    // rather than judging the head on attestations that have not arrived
+    // yet.
+    let (head_weak, parent_strong) = if current_slot > head_slot {
+        (
+            is_head_weak(store, head_root, config)?,
+            is_parent_strong(store, parent_root, config)?,
+        )
+    } else {
+        (true, true)
+    };
+
+    Ok(head_late
+        && shuffling_stable
+        && ffg_competitive
+        && finalization_ok
+        && proposing_reorg_slot
+        && single_slot_reorg
+        && head_weak
+        && parent_strong)
+}
+
+// ---------------------------------------------------------------------------
+// Merge transition helpers (bellatrix)
+// ---------------------------------------------------------------------------
+
+/// Looks up a PoW block by hash, matching the specification's own
+/// `get_pow_block`. See [`PowBlock`]'s documentation for why this reads
+/// [`Store::pow_blocks`] rather than calling out to a real execution client.
+pub fn get_pow_block(store: &Store, hash: Root) -> Option<PowBlock> {
+    store.pow_blocks.get(&hash).copied()
+}
+
+/// Records `pow_block` so later [`get_pow_block`] lookups by its own hash can
+/// find it. Not one of the four handlers at the bottom of this file: there is
+/// no validity condition to check first, since this only ever adds data a
+/// fixture suite's `on_merge_block` step already trusts.
+pub fn insert_pow_block(store: &mut Store, pow_block: PowBlock) {
+    store.pow_blocks.insert(pow_block.block_hash, pow_block);
+}
+
+/// Whether `block` is the one PoW block where this chain's proof-of-work
+/// history ends and its proof-of-stake history begins: its own total
+/// difficulty has crossed [`Config::terminal_total_difficulty`], but its
+/// parent's had not yet.
+pub fn is_valid_terminal_pow_block(block: &PowBlock, parent: &PowBlock, config: &Config) -> bool {
+    let is_total_difficulty_reached = block.total_difficulty >= config.terminal_total_difficulty;
+    let is_parent_total_difficulty_valid =
+        parent.total_difficulty < config.terminal_total_difficulty;
+    is_total_difficulty_reached && is_parent_total_difficulty_valid
+}
+
+/// Checks that a bellatrix block's parent execution payload really does sit
+/// on a valid terminal PoW block, the one condition [`on_block`] adds for
+/// bellatrix and never again afterward: capella's own `fork-choice.md` drops
+/// it outright ("deletion of the verification of merge transition block
+/// conditions").
+///
+/// [`Config::terminal_block_hash`] is an emergency override that, if ever
+/// set, replaces the PoW-chain lookup with a direct hash comparison; every
+/// network that shipped the Merge left it unset, so the common path is the
+/// `get_pow_block` chain below.
+pub fn validate_merge_block(
+    store: &Store,
+    block: &bellatrix::BeaconBlock,
+    config: &Config,
+) -> Result<()> {
+    let parent_hash = block.body.execution_payload.parent_hash;
+
+    if !config.terminal_block_hash.is_zero() {
+        verify(
+            compute_epoch_at_slot(block.slot) >= config.terminal_block_hash_activation_epoch,
+            "compute_epoch_at_slot(block.slot) >= TERMINAL_BLOCK_HASH_ACTIVATION_EPOCH",
+        )?;
+        verify(
+            parent_hash == config.terminal_block_hash,
+            "block.body.execution_payload.parent_hash == TERMINAL_BLOCK_HASH",
+        )?;
+        return Ok(());
+    }
+
+    let pow_block = get_pow_block(store, parent_hash).ok_or(Error::SpecAssert(
+        "get_pow_block(block.body.execution_payload.parent_hash) is not None",
+    ))?;
+    let pow_parent = get_pow_block(store, pow_block.parent_hash).ok_or(Error::SpecAssert(
+        "get_pow_block(pow_block.parent_hash) is not None",
+    ))?;
+    verify(
+        is_valid_terminal_pow_block(&pow_block, &pow_parent, config),
+        "is_valid_terminal_pow_block(pow_block, pow_parent)",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Data availability helpers (deneb, electra, fulu)
+// ---------------------------------------------------------------------------
+
+/// The specification's `is_data_available` for deneb and electra
+/// (`specs/deneb/fork-choice.md`): every commitment the block claims must
+/// come with a blob and a proof that verify against it.
+///
+/// `retrieve_blobs_and_proofs` is "implementation and context dependent"
+/// there; [`DataAvailability::Blobs`] is what a caller supplies in its place.
+/// A length mismatch between `commitments` and the evidence's own blobs or
+/// proofs is not checked separately here: `kzg::verify_blob_kzg_proof_batch`
+/// already rejects it, which is exactly what deneb's own
+/// `invalid_wrong_blobs_length`/`invalid_wrong_proofs_length` fixture cases
+/// exercise.
+pub fn is_data_available_blobs(
+    commitments: &[KzgCommitment],
+    evidence: &DataAvailability,
+) -> Result<bool> {
+    let (blobs, proofs) = match evidence {
+        DataAvailability::Blobs { blobs, proofs } => (blobs.as_slice(), proofs.as_slice()),
+        _ => (&[][..], &[][..]),
+    };
+    let blob_slices: Vec<&[u8]> = blobs.iter().map(|blob| &blob[..]).collect();
+    kzg::verify_blob_kzg_proof_batch(&blob_slices, commitments, proofs)
+}
+
+/// The specification's `verify_data_column_sidecar`
+/// (`specs/fulu/p2p-interface.md`): the structural checks a column sidecar
+/// must pass before its KZG proofs are even worth checking.
+pub fn verify_data_column_sidecar(sidecar: &fulu::DataColumnSidecar, config: &Config) -> bool {
+    // The sidecar index must be within the valid range.
+    if sidecar.index as usize >= preset::NUMBER_OF_COLUMNS {
+        return false;
+    }
+    // A sidecar for zero blobs is invalid.
+    if sidecar.kzg_commitments.is_empty() {
+        return false;
+    }
+    // Check that the sidecar respects the blob limit.
+    let epoch = compute_epoch_at_slot(sidecar.signed_block_header.message.slot);
+    if sidecar.kzg_commitments.len() as u64 > config.max_blobs_per_block(epoch) {
+        return false;
+    }
+    // The column length must be equal to the number of commitments/proofs.
+    sidecar.column.len() == sidecar.kzg_commitments.len()
+        && sidecar.column.len() == sidecar.kzg_proofs.len()
+}
+
+/// The specification's `verify_data_column_sidecar_kzg_proofs`
+/// (`specs/fulu/p2p-interface.md`): batch-verifies every cell in `sidecar`'s
+/// column against its own commitment and proof. Every cell shares
+/// `sidecar.index` as its cell index, since a column names one cell position
+/// across every blob in the block.
+pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &fulu::DataColumnSidecar) -> Result<bool> {
+    let cell_indices = vec![sidecar.index; sidecar.column.len()];
+    let mut cells = Vec::with_capacity(sidecar.column.len());
+    for cell in sidecar.column.iter() {
+        cells.push(
+            c_kzg::Cell::from_bytes(&cell[..])
+                .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
+        );
+    }
+    kzg::verify_cell_kzg_proof_batch(
+        &sidecar.kzg_commitments,
+        &cell_indices,
+        &cells,
+        &sidecar.kzg_proofs,
+    )
+}
+
+/// The specification's `is_data_available` for fulu
+/// (`specs/fulu/fork-choice.md`): every column sidecar sampled for this
+/// block must be individually valid.
+///
+/// Unlike deneb's version, this takes no commitments of its own: fulu's
+/// `is_data_available` does not either, since sampling checks each sidecar
+/// against the commitment list it itself carries
+/// ([`verify_data_column_sidecar`]) rather than the caller cross-checking a
+/// separate list. An evidence value with no sidecars is vacuously
+/// available, matching the specification's `all(... for ... in
+/// column_sidecars)` over an empty sequence; a caller simulating "not all
+/// required columns have been sampled" must reject the block itself rather
+/// than relying on this to do it, since nothing about an empty list is
+/// distinguishable here from "this block needed no sampling at all".
+pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
+    let DataAvailability::Columns(sidecars) = evidence else {
+        return Ok(true);
+    };
+    for sidecar in sidecars {
+        if !(verify_data_column_sidecar(sidecar, config)
+            && verify_data_column_sidecar_kzg_proofs(sidecar)?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Pull-up tip helper
 // ---------------------------------------------------------------------------
@@ -801,7 +1399,12 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
         .ok_or(Error::SpecAssert("block_root in store.block_states"))?
         .clone();
 
-    stf::epoch::justification::process_justification_and_finalization(&mut state, config)?;
+    // Through the fork-dispatching wrapper rather than phase0's version
+    // directly. Altair rewrote this step to read participation flags instead of
+    // replaying stored attestations, so calling phase0's against an altair or
+    // later state fails outright, which is what made every `fork_choice` case
+    // that crosses an epoch boundary fail.
+    stf::epoch::process_justification_and_finalization(&mut state, config)?;
 
     let current_justified = state.current_justified_checkpoint();
     let finalized = state.finalized_checkpoint();
@@ -816,7 +1419,7 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
         .blocks
         .get(&block_root)
         .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot;
+        .slot();
     let block_epoch = compute_epoch_at_slot(block_slot);
     let current_epoch = get_current_store_epoch(store, config);
     if block_epoch < current_epoch {
@@ -868,12 +1471,18 @@ pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
 /// Only checked for attestations arriving directly (not inside a block):
 /// a block-borne attestation may target an epoch that has since passed, since
 /// the block itself is being processed after the fact.
+///
+/// Takes `data` directly rather than an [`Attestation`]: this and
+/// [`validate_on_attestation`] read nothing from an attestation besides its
+/// fork-invariant `data`, so neither needs to know which of
+/// [`Attestation`]'s two shapes the caller actually has. See the module
+/// documentation.
 pub fn validate_target_epoch_against_current_time(
     store: &Store,
-    attestation: &phase0::Attestation,
+    data: AttestationData,
     config: &Config,
 ) -> Result<()> {
-    let target = attestation.data.target;
+    let target = data.target;
     let current_epoch = get_current_store_epoch(store, config);
     // Use GENESIS_EPOCH for previous when genesis to avoid underflow.
     let previous_epoch = if current_epoch > constants::GENESIS_EPOCH {
@@ -888,24 +1497,25 @@ pub fn validate_target_epoch_against_current_time(
 }
 
 /// Every check `on_attestation` requires before it may look up or update
-/// anything in `store`.
+/// anything in `store`. See [`validate_target_epoch_against_current_time`]
+/// for why this takes `data` rather than an [`Attestation`].
 pub fn validate_on_attestation(
     store: &Store,
-    attestation: &phase0::Attestation,
+    data: AttestationData,
     is_from_block: bool,
     config: &Config,
 ) -> Result<()> {
-    let target = attestation.data.target;
+    let target = data.target;
 
     // If the given attestation is not from a beacon block message, we have to
     // check the target epoch scope.
     if !is_from_block {
-        validate_target_epoch_against_current_time(store, attestation, config)?;
+        validate_target_epoch_against_current_time(store, data, config)?;
     }
 
     // Check that the epoch number and slot number are matching.
     verify(
-        target.epoch == compute_epoch_at_slot(attestation.data.slot),
+        target.epoch == compute_epoch_at_slot(data.slot),
         "target.epoch == compute_epoch_at_slot(attestation.data.slot)",
     )?;
 
@@ -920,21 +1530,20 @@ pub fn validate_on_attestation(
     // consideration until the block is found.
     let head_block_slot = store
         .blocks
-        .get(&attestation.data.beacon_block_root)
+        .get(&data.beacon_block_root)
         .ok_or(Error::SpecAssert(
             "attestation.data.beacon_block_root in store.blocks",
         ))?
-        .slot;
+        .slot();
     // Attestations must not be for blocks in the future. If not, the
     // attestation should not be considered.
     verify(
-        head_block_slot <= attestation.data.slot,
+        head_block_slot <= data.slot,
         "store.blocks[attestation.data.beacon_block_root].slot <= attestation.data.slot",
     )?;
 
     // LMD vote must be consistent with FFG vote target.
-    let checkpoint_block =
-        get_checkpoint_block(store, attestation.data.beacon_block_root, target.epoch)?;
+    let checkpoint_block = get_checkpoint_block(store, data.beacon_block_root, target.epoch)?;
     verify(
         target.root == checkpoint_block,
         "target.root == get_checkpoint_block(store, attestation.data.beacon_block_root, target.epoch)",
@@ -943,7 +1552,7 @@ pub fn validate_on_attestation(
     // Attestations can only affect the fork choice of subsequent slots. Delay
     // consideration in the fork choice until their slot is in the past.
     verify(
-        get_current_slot(store, config) >= attestation.data.slot.saturating_add(1),
+        get_current_slot(store, config) >= data.slot.saturating_add(1),
         "get_current_slot(store) >= attestation.data.slot + 1",
     )?;
 
@@ -981,19 +1590,23 @@ pub fn store_target_checkpoint_state(
     Ok(())
 }
 
-/// Records `attestation` as each attester's latest message, for every
+/// Records an attestation as each attester's latest message, for every
 /// attesting index that is not a known equivocator.
 ///
 /// An attester's latest message only ever moves to a later target epoch: an
 /// attestation for an epoch already superseded by that attester's own later
 /// vote is simply not the freshest thing known about them anymore.
+///
+/// Takes `attesting_indices` and `data` rather than an [`Attestation`]: by
+/// the time [`on_attestation`] calls this, [`Attestation::verified_attesting_indices`]
+/// has already resolved the one fork-specific fact this needed out of it.
 pub fn update_latest_messages(
     store: &mut Store,
     attesting_indices: &[ValidatorIndex],
-    attestation: &phase0::Attestation,
+    data: AttestationData,
 ) {
-    let target = attestation.data.target;
-    let beacon_block_root = attestation.data.beacon_block_root;
+    let target = data.target;
+    let beacon_block_root = data.beacon_block_root;
 
     for &index in attesting_indices {
         if store.equivocating_indices.contains(&index) {
@@ -1044,18 +1657,26 @@ pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
 ///
 /// Takes `signed_block` by value rather than by reference (a departure from
 /// the specification's own signature, which makes no such distinction in
-/// Python): a `BeaconBlock` carries the block's whole body, and taking
-/// ownership lets the block move directly into [`Store::blocks`] on success
-/// instead of being cloned there. A caller that still needs its own copy
-/// afterward clones before calling, same as [`Store::block_states`]'s entries
-/// do explicitly inside this function.
+/// Python): every fork's block carries its whole body, and taking ownership
+/// lets it move directly into [`Store::blocks`] on success instead of being
+/// cloned there. A caller that still needs its own copy afterward clones
+/// before calling, same as [`Store::block_states`]'s entries do explicitly
+/// inside this function.
+///
+/// `blob_evidence` is this crate's own addition, beyond the specification's
+/// two-argument `on_block(store, signed_block)`: see [`DataAvailability`]'s
+/// documentation for why deneb, electra, and fulu's data-availability check
+/// needs one. A pre-deneb block, or one with no blob commitments, never
+/// reads it; [`DataAvailability::NotRequired`] is the right value to pass in
+/// that case.
 pub fn on_block(
     store: &mut Store,
-    signed_block: phase0::SignedBeaconBlock,
+    signed_block: SignedBeaconBlock,
     config: &Config,
+    blob_evidence: &DataAvailability,
 ) -> Result<()> {
-    let block_root = signed_block.message.hash_tree_root();
-    let parent_root = signed_block.message.parent_root;
+    let block_root = signed_block.message_hash_tree_root();
+    let parent_root = signed_block.parent_root();
 
     // Parent block must be known.
     verify(
@@ -1074,7 +1695,7 @@ pub fn on_block(
     // Blocks cannot be in the future. If they are, their consideration must
     // be delayed until they are in the past.
     verify(
-        get_current_slot(store, config) >= signed_block.message.slot,
+        get_current_slot(store, config) >= signed_block.slot(),
         "get_current_slot(store) >= block.slot",
     )?;
 
@@ -1082,7 +1703,7 @@ pub fn on_block(
     // to reduce calls to get_ancestor).
     let finalized_slot = compute_start_slot_at_epoch(store.finalized_checkpoint.epoch);
     verify(
-        signed_block.message.slot > finalized_slot,
+        signed_block.slot() > finalized_slot,
         "block.slot > finalized_slot",
     )?;
     // Check block is a descendant of the finalized block at the checkpoint
@@ -1094,14 +1715,63 @@ pub fn on_block(
         "store.finalized_checkpoint.root == finalized_checkpoint_block",
     )?;
 
-    // Check the block is valid and compute the post-state.
-    stf::state_transition(&mut state, &signed_block, true, config)?;
+    // [New in Deneb/Electra] Check if blob data is available. [New in Fulu]
+    // The same check, over column sidecars instead of blobs. Both run before
+    // `state_transition`, matching the specification's own ordering: an
+    // unavailable block is not even worth transitioning.
+    match &signed_block {
+        SignedBeaconBlock::Deneb(block) => {
+            verify(
+                is_data_available_blobs(&block.message.body.blob_kzg_commitments, blob_evidence)?,
+                "is_data_available(hash_tree_root(block), block.body.blob_kzg_commitments)",
+            )?;
+        }
+        SignedBeaconBlock::Electra(block) => {
+            verify(
+                is_data_available_blobs(&block.message.body.blob_kzg_commitments, blob_evidence)?,
+                "is_data_available(hash_tree_root(block), block.body.blob_kzg_commitments)",
+            )?;
+        }
+        SignedBeaconBlock::Fulu(_) => {
+            verify(
+                is_data_available_columns(blob_evidence, config)?,
+                "is_data_available(hash_tree_root(block))",
+            )?;
+        }
+        _ => {}
+    }
+
+    // Check the block is valid and compute the post-state. See the module
+    // documentation for why this always passes `ExecutionEngine::valid`.
+    stf::state_transition(
+        &mut state,
+        &signed_block,
+        true,
+        config,
+        &stf::ExecutionEngine::valid(),
+    )?;
+
+    // [New in Bellatrix] Check the merge transition block conditions.
+    // Capella's own `fork-choice.md` removes this check outright, so it
+    // applies to bellatrix alone. Reads `store.block_states[parent_root]`
+    // rather than `state`: that entry is still exactly the parent's own
+    // post-state, since `state_transition` above mutated the *clone* this
+    // function made of it, not the store's own copy.
+    if let SignedBeaconBlock::Bellatrix(block) = &signed_block {
+        let pre_state = store.block_states.get(&parent_root).expect("checked above");
+        if stf::bellatrix::is_merge_transition_block(
+            pre_state,
+            &block.message.body.execution_payload,
+        )? {
+            validate_merge_block(store, &block.message, config)?;
+        }
+    }
 
     // Add new block to the store, and the new state for this block to the
-    // store. `block_slot` is copied out first since `signed_block.message`
-    // moves into `store.blocks` next.
-    let block_slot = signed_block.message.slot;
-    store.blocks.insert(block_root, signed_block.message);
+    // store. `block_slot` is copied out first since `signed_block` moves into
+    // `store.blocks` next.
+    let block_slot = signed_block.slot();
+    store.blocks.insert(block_root, signed_block);
     store.block_states.insert(block_root, state);
 
     // Add block timeliness to the store.
@@ -1151,35 +1821,30 @@ pub fn on_block(
 /// attestation for an epoch that has since passed.
 pub fn on_attestation(
     store: &mut Store,
-    attestation: &phase0::Attestation,
+    attestation: &Attestation,
     is_from_block: bool,
     config: &Config,
 ) -> Result<()> {
-    validate_on_attestation(store, attestation, is_from_block, config)?;
+    let data = attestation.data();
+    validate_on_attestation(store, data, is_from_block, config)?;
 
-    store_target_checkpoint_state(store, attestation.data.target, config)?;
+    store_target_checkpoint_state(store, data.target, config)?;
 
     // Get state at the `target` to fully validate attestation. The attesting
     // indices are collected into an owned `Vec` before the block ends, so the
     // borrow of `store.checkpoint_states` (via `target_state`) is released
     // before `update_latest_messages` needs `store` mutably.
     let attesting_indices = {
-        let target_state =
-            store
-                .checkpoint_state(&attestation.data.target)
-                .ok_or(Error::SpecAssert(
-                    "attestation.data.target in store.checkpoint_states",
-                ))?;
-        let indexed_attestation = get_indexed_attestation(target_state, attestation)?;
-        verify(
-            is_valid_indexed_attestation(target_state, &indexed_attestation),
-            "is_valid_indexed_attestation(target_state, indexed_attestation)",
-        )?;
-        indexed_attestation.attesting_indices.into_inner()
+        let target_state = store
+            .checkpoint_state(&data.target)
+            .ok_or(Error::SpecAssert(
+                "attestation.data.target in store.checkpoint_states",
+            ))?;
+        attestation.verified_attesting_indices(target_state)?
     };
 
     // Update latest messages for attesting indices.
-    update_latest_messages(store, &attesting_indices, attestation);
+    update_latest_messages(store, &attesting_indices, data);
 
     Ok(())
 }
@@ -1193,43 +1858,31 @@ pub fn on_attestation(
 /// function does not enforce on its own; a caller replaying history is
 /// responsible for calling this for every attester slashing it encounters
 /// rather than only recent ones.
-pub fn on_attester_slashing(
-    store: &mut Store,
-    attester_slashing: &phase0::AttesterSlashing,
-) -> Result<()> {
-    let attestation_1 = &attester_slashing.attestation_1;
-    let attestation_2 = &attester_slashing.attestation_2;
+pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlashing) -> Result<()> {
+    let (data_1, data_2) = attester_slashing.data();
 
     verify(
-        is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
+        is_slashable_attestation_data(&data_1, &data_2),
         "is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
     )?;
 
-    // Scoped so the borrow of `store.block_states` (via `state`) ends before
-    // `store.equivocating_indices` needs to be mutated below.
-    {
+    // The attesting indices are collected into owned `Vec`s before the block
+    // ends, so the borrow of `store.block_states` (via `state`) is released
+    // before `store.equivocating_indices` needs to be mutated below.
+    let (indices_1, indices_2) = {
         let state = store
             .block_states
             .get(&store.justified_checkpoint.root)
             .ok_or(Error::SpecAssert(
                 "store.justified_checkpoint.root in store.block_states",
             ))?;
+        attester_slashing.verified_attesting_indices(state)?
+    };
 
-        verify(
-            is_valid_indexed_attestation(state, attestation_1),
-            "is_valid_indexed_attestation(state, attestation_1)",
-        )?;
-        verify(
-            is_valid_indexed_attestation(state, attestation_2),
-            "is_valid_indexed_attestation(state, attestation_2)",
-        )?;
-    }
-
-    let indices_1: HashSet<ValidatorIndex> =
-        attestation_1.attesting_indices.iter().copied().collect();
-    for index in attestation_2.attesting_indices.iter() {
-        if indices_1.contains(index) {
-            store.equivocating_indices.insert(*index);
+    let indices_1: HashSet<ValidatorIndex> = indices_1.into_iter().collect();
+    for index in indices_2 {
+        if indices_1.contains(&index) {
+            store.equivocating_indices.insert(index);
         }
     }
 
@@ -1259,28 +1912,33 @@ mod tests {
             checkpoint_states: HashMap::new(),
             latest_messages: HashMap::new(),
             unrealized_justifications: HashMap::new(),
+            pow_blocks: HashMap::new(),
         }
     }
 
-    /// A block with an empty body, for tests that only care about `slot` and
-    /// `parent_root`.
-    fn block(slot: Slot, parent_root: Root) -> phase0::BeaconBlock {
-        phase0::BeaconBlock {
-            slot,
-            proposer_index: 0,
-            parent_root,
-            state_root: Root::zero(),
-            body: phase0::BeaconBlockBody {
-                randao_reveal: Default::default(),
-                eth1_data: Default::default(),
-                graffiti: Root::zero(),
-                proposer_slashings: Default::default(),
-                attester_slashings: Default::default(),
-                attestations: Default::default(),
-                deposits: Default::default(),
-                voluntary_exits: Default::default(),
+    /// A signed block with an empty body and a zero signature, for tests that
+    /// only care about `slot` and `parent_root`. Phase0-shaped since nothing
+    /// under test here reads anything fork-specific.
+    fn block(slot: Slot, parent_root: Root) -> SignedBeaconBlock {
+        SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: Root::zero(),
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Root::zero(),
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
             },
-        }
+            signature: Default::default(),
+        })
     }
 
     #[test]

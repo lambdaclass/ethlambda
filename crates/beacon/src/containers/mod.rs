@@ -56,6 +56,7 @@ use crate::error::{Error, Result};
 use crate::fork::ForkName;
 use crate::primitives::{
     BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
+    WithdrawalIndex,
 };
 
 /// The beacon state, in whichever fork's shape it currently has.
@@ -280,6 +281,274 @@ impl BeaconState {
     pub fn randao_mix(&self, epoch: Epoch) -> Bytes32 {
         let mixes = self.randao_mixes();
         mixes[epoch as usize % mixes.len()]
+    }
+
+    /// The withdrawal sweep's cursor: how many withdrawals the chain has ever
+    /// made, and which validator the next sweep resumes from.
+    ///
+    /// Both exist from capella on, so they cannot join
+    /// [`shared_state_accessors`]' fork-invariant lists, and they are read
+    /// through here rather than through a per-fork projection to a concrete
+    /// state struct because the sweep that reads them is genuinely shared: deneb
+    /// reuses capella's `get_expected_withdrawals` unchanged, and a projection
+    /// returning `&capella::BeaconState` cannot serve a deneb state at all. That
+    /// mistake was made once here and cost a runtime `UnsupportedForFork` on
+    /// every deneb block carrying a withdrawal.
+    pub fn withdrawal_cursor(&self) -> Result<(WithdrawalIndex, ValidatorIndex)> {
+        match self {
+            BeaconState::Capella(state) => Ok((
+                state.next_withdrawal_index,
+                state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Deneb(state) => Ok((
+                state.next_withdrawal_index,
+                state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Electra(state) => Ok((
+                state.next_withdrawal_index,
+                state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Fulu(state) => Ok((
+                state.next_withdrawal_index,
+                state.next_withdrawal_validator_index,
+            )),
+            other => Err(Error::UnsupportedForFork {
+                function: "BeaconState::withdrawal_cursor",
+                fork: other.fork_name(),
+            }),
+        }
+    }
+
+    /// The withdrawal sweep's cursor, mutably. See [`Self::withdrawal_cursor`].
+    pub fn withdrawal_cursor_mut(&mut self) -> Result<(&mut WithdrawalIndex, &mut ValidatorIndex)> {
+        match self {
+            BeaconState::Capella(state) => Ok((
+                &mut state.next_withdrawal_index,
+                &mut state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Deneb(state) => Ok((
+                &mut state.next_withdrawal_index,
+                &mut state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Electra(state) => Ok((
+                &mut state.next_withdrawal_index,
+                &mut state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Fulu(state) => Ok((
+                &mut state.next_withdrawal_index,
+                &mut state.next_withdrawal_validator_index,
+            )),
+            BeaconState::Phase0(_) | BeaconState::Altair(_) | BeaconState::Bellatrix(_) => {
+                Err(Error::UnsupportedForFork {
+                    function: "BeaconState::withdrawal_cursor_mut",
+                    fork: match self {
+                        BeaconState::Phase0(_) => ForkName::Phase0,
+                        BeaconState::Altair(_) => ForkName::Altair,
+                        _ => ForkName::Bellatrix,
+                    },
+                })
+            }
+        }
+    }
+
+    /// The three per-validator lists that exist from altair on, by reference and
+    /// all at once.
+    ///
+    /// These cannot join [`shared_state_accessors`]' lists, since phase0 has
+    /// none of them, and a per-fork projection to a concrete state struct (the
+    /// way [`crate::helpers::altair::altair_state_ref`] reaches them) cannot
+    /// serve every fork that carries them: bellatrix, capella, deneb, electra,
+    /// and fulu all keep the identical three fields, but each is a distinct
+    /// Rust type, so a projection typed to return `&altair::BeaconState` can
+    /// only ever answer for an altair state.
+    ///
+    /// Handed back together rather than one accessor per field for the same
+    /// reason [`Self::altair_validator_lists_mut`] does: the fork condition
+    /// that gates all three is identical, so one match serves every caller,
+    /// including one that only needs one or two of the three and destructures
+    /// the rest away with `_`.
+    pub fn altair_validator_lists(
+        &self,
+    ) -> Result<(&EpochParticipation, &EpochParticipation, &InactivityScores)> {
+        match self {
+            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
+                function: "BeaconState::altair_validator_lists",
+                fork: ForkName::Phase0,
+            }),
+            BeaconState::Altair(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+            BeaconState::Bellatrix(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+            BeaconState::Capella(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+            BeaconState::Deneb(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+            BeaconState::Electra(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+            BeaconState::Fulu(state) => Ok((
+                &state.previous_epoch_participation,
+                &state.current_epoch_participation,
+                &state.inactivity_scores,
+            )),
+        }
+    }
+
+    /// The three per-validator lists that exist from altair on, mutably and all
+    /// at once. See [`Self::altair_validator_lists`] for why this cannot be a
+    /// per-fork projection instead.
+    ///
+    /// Handed back together for two reasons that stack:
+    /// [`crate::stf::operations::add_validator_to_registry`] genuinely needs
+    /// all three, since they are positionally parallel with `validators` and
+    /// `balances`, so a validator entering the registry has to grow all five
+    /// or leave the state internally inconsistent in a way nothing else would
+    /// notice until a `hash_tree_root` came out wrong; and every caller that
+    /// needs fewer than three still reaches them through this one accessor,
+    /// discarding what it does not need, rather than a matching per-field
+    /// accessor that would need the identical fork match written out again.
+    ///
+    /// Borrowing three fields of one struct at once is what the tuple is for.
+    /// Rust permits it because the fields are disjoint, whereas three successive
+    /// accessor calls would each borrow the whole enum.
+    pub fn altair_validator_lists_mut(
+        &mut self,
+    ) -> Result<(
+        &mut EpochParticipation,
+        &mut EpochParticipation,
+        &mut InactivityScores,
+    )> {
+        match self {
+            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
+                function: "BeaconState::altair_validator_lists_mut",
+                fork: ForkName::Phase0,
+            }),
+            BeaconState::Altair(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+            BeaconState::Bellatrix(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+            BeaconState::Capella(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+            BeaconState::Deneb(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+            BeaconState::Electra(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+            BeaconState::Fulu(state) => Ok((
+                &mut state.previous_epoch_participation,
+                &mut state.current_epoch_participation,
+                &mut state.inactivity_scores,
+            )),
+        }
+    }
+
+    /// The current and next sync committee, by reference.
+    ///
+    /// Both exist from altair on, byte-for-byte the same field in every later
+    /// fork (see, for instance, bellatrix's own state doc), so they cannot
+    /// join [`shared_state_accessors`]' lists, since phase0 predates sync
+    /// committees entirely. A per-fork projection cannot serve here either:
+    /// [`crate::stf::altair::process_sync_aggregate`] is called for every
+    /// fork from altair through fulu (see that function's own documentation),
+    /// and a projection typed to return `&altair::BeaconState` can only ever answer
+    /// for an altair state, not for the bellatrix, capella, deneb, electra, or
+    /// fulu ones the same call site also has to serve.
+    pub fn sync_committees(&self) -> Result<(&altair::SyncCommittee, &altair::SyncCommittee)> {
+        match self {
+            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
+                function: "BeaconState::sync_committees",
+                fork: ForkName::Phase0,
+            }),
+            BeaconState::Altair(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+            BeaconState::Bellatrix(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+            BeaconState::Capella(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+            BeaconState::Deneb(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+            BeaconState::Electra(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+            BeaconState::Fulu(state) => {
+                Ok((&state.current_sync_committee, &state.next_sync_committee))
+            }
+        }
+    }
+
+    /// The current and next sync committee, mutably. See
+    /// [`Self::sync_committees`] for why this cannot be a per-fork projection.
+    ///
+    /// Handed back together, rather than as two separate accessors, because
+    /// [`crate::stf::epoch::altair::process_sync_committee_updates`] rotates
+    /// the pair by replacing one with the other at each sync committee period
+    /// boundary, which needs both mutable borrows alive for the one
+    /// `core::mem::replace` that does it.
+    pub fn sync_committees_mut(
+        &mut self,
+    ) -> Result<(&mut altair::SyncCommittee, &mut altair::SyncCommittee)> {
+        match self {
+            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
+                function: "BeaconState::sync_committees_mut",
+                fork: ForkName::Phase0,
+            }),
+            BeaconState::Altair(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+            BeaconState::Bellatrix(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+            BeaconState::Capella(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+            BeaconState::Deneb(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+            BeaconState::Electra(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+            BeaconState::Fulu(state) => Ok((
+                &mut state.current_sync_committee,
+                &mut state.next_sync_committee,
+            )),
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 //! These are the specification's four functions that change a state in place:
 //! the two balance adjustments, and the two ways a validator leaves.
 
+use crate::ForkName;
 use crate::config::Config;
 use crate::constants::FAR_FUTURE_EPOCH;
 use crate::containers::BeaconState;
@@ -107,6 +108,44 @@ pub fn initiate_validator_exit(
 /// electra, all without changing anything else here, so both are selected by
 /// fork through [`preset::retuned`] rather than by redefining the function per
 /// fork the way the specification does.
+///
+/// Altair does also restate `proposer_reward` as
+/// `whistleblower_reward * PROPOSER_WEIGHT / WEIGHT_DENOMINATOR` in place of
+/// phase0's division by `PROPOSER_REWARD_QUOTIENT`. Those two agree exactly for
+/// every input, since `PROPOSER_WEIGHT / WEIGHT_DENOMINATOR` reduces to the same
+/// fraction, so this keeps phase0's spelling for all forks rather than selecting
+/// between two expressions that cannot disagree.
+///
+/// The exit it starts, however, is genuinely fork-dependent, which is what
+/// [`initiate_validator_exit_for_fork`] exists to resolve.
+/// Starts `index`'s exit under the rules of the state's own fork.
+///
+/// Electra replaces [`initiate_validator_exit`] outright
+/// ([`crate::helpers::electra::initiate_validator_exit`], EIP-7251): the exit
+/// epoch comes from a balance-denominated churn budget rather than from
+/// counting how many validators are already queued. Every other caller of
+/// either version sits in a module that belongs to one fork and so names the
+/// version it wants directly. [`slash_validator`] is the exception, being one
+/// function that serves all seven forks, so it is the one place that has to
+/// ask the state which rule applies.
+///
+/// Reaching for phase0's version here instead is not a quiet inaccuracy: a
+/// slashing at electra would set a different `exit_epoch`, and leave the
+/// state's churn cursor unadvanced, so every subsequent exit in the same epoch
+/// would queue wrongly too.
+fn initiate_validator_exit_for_fork(
+    state: &mut BeaconState,
+    index: ValidatorIndex,
+    config: &Config,
+) -> Result<()> {
+    match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => {
+            crate::helpers::electra::initiate_validator_exit(state, index, config)
+        }
+        _ => initiate_validator_exit(state, index, config),
+    }
+}
+
 pub fn slash_validator(
     state: &mut BeaconState,
     slashed_index: ValidatorIndex,
@@ -114,7 +153,7 @@ pub fn slash_validator(
     config: &Config,
 ) -> Result<()> {
     let epoch = get_current_epoch(state);
-    initiate_validator_exit(state, slashed_index, config)?;
+    initiate_validator_exit_for_fork(state, slashed_index, config)?;
 
     let effective_balance = state.validator(slashed_index)?.effective_balance;
 

@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::constants;
 use crate::containers::BeaconState;
 use crate::error::Result;
+use crate::fork::ForkName;
 use crate::hash::hash;
 use crate::preset;
 use crate::primitives::{
@@ -19,7 +20,7 @@ use super::misc::{
     compute_domain, compute_epoch_at_slot, compute_start_slot_at_epoch, fork_version_at_epoch,
 };
 use super::predicates::is_active_validator;
-use super::shuffling::{compute_committee, compute_proposer_index};
+use super::shuffling::compute_committee;
 
 /// The epoch the state is currently in.
 pub fn get_current_epoch(state: &BeaconState) -> Epoch {
@@ -138,8 +139,34 @@ pub fn get_beacon_committee(
     )
 }
 
-/// The proposer for the state's current slot.
+/// The proposer for the state's current slot, dispatching on fork for the
+/// two places `compute_proposer_index` (`beacon-chain.md`'s "Misc" section)
+/// changes: the acceptance test electra widens (EIP-7251), and fulu's move to
+/// a precomputed lookahead window instead of a shuffle run on demand
+/// (EIP-7917).
+///
+/// Every fork-invariant caller in this crate (block header validation,
+/// RANDAO, slashing's proposer reward, and every driver in [`crate::stf`]
+/// that reads a block's proposer) reaches this function unconditionally, with
+/// no fork of its own to dispatch on, so the dispatch has to live here rather
+/// than at each of those call sites. That is also why this cannot simply stay
+/// [`super::shuffling::compute_proposer_index`] called with a different
+/// `max_effective_balance`: electra's own version
+/// ([`super::electra::compute_proposer_index`]) changes the width of the
+/// random draw itself, not only the ceiling it is weighed against, and fulu's
+/// version ([`super::fulu::get_beacon_proposer_index`]) does not shuffle at
+/// all.
 pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> {
+    // Fulu moves this off the read path entirely: `process_proposer_lookahead`
+    // (an epoch-processing step, not implemented in this module) precomputes
+    // the whole window ahead of time, so this becomes a lookup into it rather
+    // than a shuffle run now. See `crate::helpers::fulu`'s own module docs for
+    // why a seed, and therefore a proposer, is only ever knowable that far
+    // ahead of time in the first place.
+    if state.fork_name() == ForkName::Fulu {
+        return super::fulu::get_beacon_proposer_index(state);
+    }
+
     let epoch = get_current_epoch(state);
 
     let seed_base = get_seed(state, epoch, constants::DOMAIN_BEACON_PROPOSER);
@@ -149,9 +176,18 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
     let seed = hash(&input);
 
     let indices = get_active_validator_indices(state, epoch);
-    compute_proposer_index(&indices, seed, preset::MAX_EFFECTIVE_BALANCE, |index| {
-        Ok(state.validator(index)?.effective_balance)
-    })
+    if state.fork_name() == ForkName::Electra {
+        super::electra::compute_proposer_index(&indices, seed, |index| {
+            Ok(state.validator(index)?.effective_balance)
+        })
+    } else {
+        super::shuffling::compute_proposer_index(
+            &indices,
+            seed,
+            preset::MAX_EFFECTIVE_BALANCE,
+            |index| Ok(state.validator(index)?.effective_balance),
+        )
+    }
 }
 
 /// The combined effective balance of `indices`.

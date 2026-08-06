@@ -21,6 +21,7 @@ use crate::containers::shared::{
     Deposit, DepositMessage, ProposerSlashing, SignedVoluntaryExit, Validator,
 };
 use crate::error::{Error, Result, verify};
+use crate::fork::ForkName;
 use crate::helpers::accessors::{
     get_beacon_committee, get_beacon_proposer_index, get_committee_count_per_slot,
     get_current_epoch, get_domain, get_previous_epoch,
@@ -36,15 +37,27 @@ use crate::helpers::predicates::{
 use crate::preset;
 use crate::primitives::{Gwei, HashTreeRoot as _, ValidatorIndex};
 
-/// Runs every operation in a block body, in the specification's order.
+/// Runs every operation in a block, in the specification's order.
 ///
-/// The deposit count check comes first and covers the whole body rather than
-/// any one operation: a block must include exactly as many deposits as are
+/// Takes each operation list as a slice rather than a whole body, which is
+/// what lets this one function serve every fork through deneb even though
+/// their body types are all distinct: nothing here needs to know what else a
+/// fork's body carries alongside these five lists. Capella's body adds a sixth
+/// list (BLS-to-execution changes), and electra reshapes the attestation types
+/// this signature assumes, so both get their own `process_operations` once that
+/// work lands, rather than this one growing parameters to cover them.
+///
+/// The deposit count check comes first and covers every deposit at once rather
+/// than any one operation: a block must include exactly as many deposits as are
 /// outstanding, up to the per-block cap, so a proposer cannot fall behind the
 /// deposit contract by including too few, nor claim more than exist.
 pub fn process_operations(
     state: &mut BeaconState,
-    body: &phase0::BeaconBlockBody,
+    proposer_slashings: &[ProposerSlashing],
+    attester_slashings: &[phase0::AttesterSlashing],
+    attestations: &[phase0::Attestation],
+    deposits: &[Deposit],
+    voluntary_exits: &[SignedVoluntaryExit],
     config: &Config,
 ) -> Result<()> {
     // `eth1_deposit_index` only ever advances by one per processed deposit,
@@ -60,23 +73,36 @@ pub fn process_operations(
             "eth1_data.deposit_count - eth1_deposit_index",
         ))?;
     verify(
-        body.deposits.len() as u64 == outstanding.min(preset::MAX_DEPOSITS as u64),
+        deposits.len() as u64 == outstanding.min(preset::MAX_DEPOSITS as u64),
         "len(body.deposits) == min(MAX_DEPOSITS, eth1_data.deposit_count - eth1_deposit_index)",
     )?;
 
-    for proposer_slashing in body.proposer_slashings.iter() {
+    for proposer_slashing in proposer_slashings {
         process_proposer_slashing(state, proposer_slashing, config)?;
     }
-    for attester_slashing in body.attester_slashings.iter() {
+    for attester_slashing in attester_slashings {
         process_attester_slashing(state, attester_slashing, config)?;
     }
-    for attestation in body.attestations.iter() {
-        process_attestation(state, attestation, config)?;
+    for attestation in attestations {
+        // Phase0 defers an attestation's reward to the epoch boundary, so it
+        // needs its own version of this step (below); altair scores one the
+        // moment it is processed instead, and nothing about that changed
+        // through deneb, so every later fork this signature serves shares
+        // altair's version rather than getting one of its own. This is the
+        // same coexisting-by-fork pattern `crate::helpers::altair` and
+        // `crate::stf::epoch::rewards` already use for the two
+        // `get_base_reward` implementations: neither is renamed, and the call
+        // site picks between them by fully-qualified path.
+        if state.fork_name() == ForkName::Phase0 {
+            process_attestation(state, attestation, config)?;
+        } else {
+            crate::stf::altair::process_attestation(state, attestation)?;
+        }
     }
-    for deposit in body.deposits.iter() {
+    for deposit in deposits {
         process_deposit(state, deposit, config)?;
     }
-    for voluntary_exit in body.voluntary_exits.iter() {
+    for voluntary_exit in voluntary_exits {
         process_voluntary_exit(state, voluntary_exit, config)?;
     }
 
@@ -335,9 +361,25 @@ pub fn get_validator_from_deposit(
 
 /// Appends a brand-new validator and its starting balance.
 ///
-/// The two lists are positionally parallel and must be grown together;
-/// nothing about this operation should ever be run for a `pubkey` already in
-/// the registry (see [`apply_deposit`], the only caller).
+/// Every per-validator list is positionally parallel and must be grown
+/// together; nothing about this operation should ever be run for a `pubkey`
+/// already in the registry (see [`apply_deposit`], the only caller).
+///
+/// From altair on there are five such lists, not two. Altair adds
+/// `previous_epoch_participation`, `current_epoch_participation`, and
+/// `inactivity_scores`, each indexed by validator, and its specification grows
+/// all three here alongside `validators` and `balances`. Missing them does not
+/// fail loudly: every later read is bounds-checked, so the state simply carries
+/// lists one entry short of the registry and produces a `hash_tree_root` that
+/// disagrees with every other client. That is exactly how it showed up here,
+/// as seven altair `deposit` cases failing on a post-state root with no other
+/// symptom.
+///
+/// Electra replaces this function outright, since a deposit there is queued
+/// rather than credited, so `crate::stf::electra` has its own; this one serves
+/// phase0 through deneb. The altair branch still covers every later fork
+/// anyway, because being conservative here costs nothing and a silent
+/// length mismatch costs a great deal.
 pub fn add_validator_to_registry(
     state: &mut BeaconState,
     pubkey: crate::primitives::BlsPubkey,
@@ -350,6 +392,13 @@ pub fn add_validator_to_registry(
         amount,
     ))?;
     state.balances_mut().push(amount)?;
+
+    if state.fork_name() >= ForkName::Altair {
+        let (previous, current, scores) = state.altair_validator_lists_mut()?;
+        previous.push(0)?;
+        current.push(0)?;
+        scores.push(0)?;
+    }
     Ok(())
 }
 

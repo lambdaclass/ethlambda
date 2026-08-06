@@ -38,6 +38,7 @@ use crate::constants;
 use crate::containers::shared::AttestationData;
 use crate::containers::{BeaconState, altair};
 use crate::error::{Error, Result};
+use crate::fork::ForkName;
 use crate::hash::hash;
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
@@ -83,6 +84,10 @@ pub fn has_flag(flags: ParticipationFlags, flag_index: usize) -> bool {
 /// scale with effective balance, and giving a heavy validator more than one
 /// seat (in expectation) is how that happens without the committee itself
 /// tracking per-seat weights.
+///
+/// Altair's own version of the draw, unmodified through deneb.
+/// [`get_next_sync_committee`] is what chooses between this and electra's
+/// widened draw, so nothing here needs to know that a later fork changes it.
 pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
     let epoch = get_current_epoch(state) + 1;
 
@@ -132,8 +137,28 @@ pub fn get_next_sync_committee_indices(state: &BeaconState) -> Result<Vec<Valida
 /// upgrading a state to altair): calling it at any other slot still returns
 /// an answer, but not one anything reads, since `current_sync_committee` and
 /// `next_sync_committee` only change at that boundary.
+///
+/// Electra's specification modifies the indices draw itself (widening the
+/// acceptance test's random value from one byte to two, and swapping in
+/// [`preset::MAX_EFFECTIVE_BALANCE_ELECTRA`]) rather than anything in this
+/// function, so [`crate::helpers::electra::get_next_sync_committee_indices`]
+/// coexists with this file's own version instead of replacing it, the same
+/// way `crate::helpers::accessors::get_beacon_proposer_index` is where
+/// [`crate::helpers::shuffling::compute_proposer_index`] and
+/// [`crate::helpers::electra::compute_proposer_index`] are chosen between.
+/// This function is that dispatch point for the sync committee draw: it is
+/// the one caller every fork reaches unconditionally at the period boundary
+/// (see [`crate::stf::epoch::altair::process_sync_committee_updates`]), so
+/// picking the fork-appropriate indices function here, rather than in that
+/// caller, is what lets fulu (which reuses this whole function) draw a
+/// correctly weighted committee too.
 pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommittee> {
-    let indices = get_next_sync_committee_indices(state)?;
+    let indices = match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => {
+            crate::helpers::electra::get_next_sync_committee_indices(state)?
+        }
+        _ => get_next_sync_committee_indices(state)?,
+    };
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in &indices {
         pubkeys.push(state.validator(*index)?.pubkey);
@@ -201,11 +226,12 @@ pub fn get_unslashed_participating_indices(
         "epoch in (get_previous_epoch(state), get_current_epoch(state))",
     )?;
 
-    let altair_state = altair_state_ref(state, "get_unslashed_participating_indices")?;
+    let (previous_epoch_participation, current_epoch_participation, _) =
+        state.altair_validator_lists()?;
     let epoch_participation = if epoch == get_current_epoch(state) {
-        &altair_state.current_epoch_participation
+        current_epoch_participation
     } else {
-        &altair_state.previous_epoch_participation
+        previous_epoch_participation
     };
 
     let mut participating_indices = Vec::new();
@@ -340,6 +366,12 @@ pub fn get_flag_index_deltas(
 /// altair (not implemented in this file) updates. A validator's score rises
 /// without bound the longer it stays offline through a leak, so the balance
 /// scaling below is checked rather than left to wrap.
+///
+/// The quotient in the penalty's denominator is retuned once more after
+/// altair: bellatrix's own specification modifies this exact function to
+/// swap in `INACTIVITY_PENALTY_QUOTIENT_BELLATRIX`, and no fork after
+/// bellatrix retunes it again, so [`preset::retuned::inactivity_penalty_quotient`]
+/// is what tells altair's own value apart from every later fork's.
 pub fn get_inactivity_penalty_deltas(
     state: &BeaconState,
     config: &Config,
@@ -355,25 +387,26 @@ pub fn get_inactivity_penalty_deltas(
         previous_epoch,
     )?;
 
-    let altair_state = altair_state_ref(state, "get_inactivity_penalty_deltas")?;
+    let (_, _, inactivity_scores) = state.altair_validator_lists()?;
 
     for index in get_eligible_validator_indices(state) {
         if matching_target_indices.binary_search(&index).is_err() {
             let effective_balance = state.validator(index)?.effective_balance;
-            let inactivity_score = altair_state
-                .inactivity_scores
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: altair_state.inactivity_scores.len(),
-                })?;
+            let inactivity_score =
+                inactivity_scores
+                    .get(index as usize)
+                    .copied()
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: index as usize,
+                        len: inactivity_scores.len(),
+                    })?;
 
             let penalty_numerator = effective_balance.checked_mul(inactivity_score).ok_or(
                 Error::ArithmeticOverflow("effective_balance * inactivity_scores[index]"),
             )?;
-            let penalty_denominator =
-                config.inactivity_score_bias * preset::INACTIVITY_PENALTY_QUOTIENT_ALTAIR;
+            let inactivity_penalty_quotient =
+                preset::retuned::inactivity_penalty_quotient(state.fork_name());
+            let penalty_denominator = config.inactivity_score_bias * inactivity_penalty_quotient;
             penalties[index as usize] += penalty_numerator / penalty_denominator;
         }
     }
@@ -385,35 +418,29 @@ pub fn get_inactivity_penalty_deltas(
 // Fork projection
 // ---------------------------------------------------------------------------
 
-/// The altair state, mutably, or an error naming the function that needs one.
+/// The altair state, immutably, or an error naming the function that needs one.
 ///
-/// This module is the first to need a field
-/// (`previous_epoch_participation`/`current_epoch_participation`) that exists
-/// only from altair on and has no fork-invariant accessor on [`BeaconState`],
-/// so the projection lives here rather than alongside `crate::stf::phase0_state`,
-/// which it is otherwise modeled exactly on.
+/// There is no mutable sibling, and the reason is worth recording, because it
+/// was a real bug and a tempting one. The fields altair introduces
+/// (`previous_epoch_participation`, `current_epoch_participation`,
+/// `inactivity_scores`, and the two sync committees) exist unchanged through
+/// fulu, so a projection to a concrete `altair::BeaconState` rejects every one
+/// of bellatrix through fulu with [`Error::UnsupportedForFork`]: precisely the
+/// states that matter. Every reader of those fields goes through
+/// [`BeaconState::altair_validator_lists`] or [`BeaconState::sync_committees`]
+/// instead, which answer for every fork that carries them.
 ///
-/// Every accessor in this file only reads those fields, so nothing here calls
-/// this particular projection; it is kept alongside [`altair_state_ref`] for
-/// altair's rewrite of `process_attestation` and
-/// `process_participation_flag_updates` (in `crate::stf`, not this file),
-/// both of which assign through `previous_epoch_participation` and
-/// `current_epoch_participation` directly.
-#[allow(dead_code)]
-pub(crate) fn altair_state<'a>(
-    state: &'a mut BeaconState,
-    function: &'static str,
-) -> Result<&'a mut altair::BeaconState> {
-    match state {
-        BeaconState::Altair(state) => Ok(state),
-        other => Err(Error::UnsupportedForFork {
-            function,
-            fork: other.fork_name(),
-        }),
-    }
-}
-
-/// The altair state, immutably. See [`altair_state`].
+/// This immutable one survives for a genuinely different reason:
+/// [`crate::upgrade::upgrade_to_bellatrix`] reads an actual, concrete altair
+/// state to build the bellatrix state that succeeds it. That is a real need for
+/// `altair::BeaconState` specifically, and a fork-upgrade function is exactly
+/// the case a per-fork projection is right for, since it only ever runs on the
+/// one fork it upgrades from.
+///
+/// The distinction generalises: project to a concrete per-fork state when the
+/// *return type* has to be that fork's, and reach through a `BeaconState`
+/// accessor when the *fields* are shared. Confusing the two produced three
+/// separate bugs in this crate.
 pub(crate) fn altair_state_ref<'a>(
     state: &'a BeaconState,
     function: &'static str,

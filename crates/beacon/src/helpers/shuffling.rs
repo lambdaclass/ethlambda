@@ -96,6 +96,19 @@ pub fn compute_committee(
 ///
 /// `effective_balance_of` returns the effective balance for a validator index, so
 /// this stays independent of which fork's state it is reading.
+///
+/// Serves phase0 through deneb only. Electra widens the acceptance test's
+/// random draw from one byte to two and weighs against
+/// [`preset::MAX_EFFECTIVE_BALANCE_ELECTRA`] rather than a caller-supplied
+/// ceiling (EIP-7251: a compounding validator's effective balance can now
+/// reach values an 8-bit draw no longer discriminates finely enough between),
+/// so from electra on the acceptance test itself changes, not only the
+/// ceiling passed in here: [`crate::helpers::electra::compute_proposer_index`]
+/// is electra's (and fulu's) own copy, not a caller of this one with a
+/// different `max_effective_balance`.
+/// [`crate::helpers::accessors::get_beacon_proposer_index`] is where the two
+/// are dispatched between by fork; do not call this one directly for a state
+/// that might be electra or later.
 pub fn compute_proposer_index(
     indices: &[ValidatorIndex],
     seed: Bytes32,

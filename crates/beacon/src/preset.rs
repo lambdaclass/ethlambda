@@ -968,11 +968,23 @@ pub use minimal::*;
 /// The specification expresses these as a fresh constant per fork
 /// (`MIN_SLASHING_PENALTY_QUOTIENT`, then `..._ALTAIR`, then `..._BELLATRIX`)
 /// and redefines the function that reads it, so that each fork's copy of the
-/// function reads its own constant. Reproducing that here would mean one copy of
-/// `process_slashings` and `slash_validator` per fork, differing in a single
-/// identifier. Selecting the value by fork instead keeps one copy of each
-/// function, and puts the whole fork-to-value mapping in one place where it can
-/// be read against the specification's own tables.
+/// function reads its own constant. Reproducing that here would mean one copy
+/// of `slash_validator` per fork, differing in a single identifier (and,
+/// through deneb, one copy of `process_slashings` the same way). Selecting
+/// the value by fork instead keeps one copy of each function, and puts the
+/// whole fork-to-value mapping in one place where it can be read against the
+/// specification's own tables.
+///
+/// Electra breaks that pattern for `process_slashings` specifically
+/// (EIP-7251): its own copy restructures the division around the constant
+/// rather than only swapping the constant in, so from electra on a value
+/// selected here is no longer enough on its own to keep one shared copy of
+/// that function correct. `crate::stf::epoch::electra::process_slashings` is
+/// a separate function for exactly that reason; see its own doc for the
+/// arithmetic. `slash_validator` never breaks the pattern this module
+/// describes, so it keeps reading [`min_slashing_penalty_quotient`] and
+/// [`whistleblower_reward_quotient`] from here through every fork this crate
+/// implements.
 ///
 /// This is the one place in the crate where a preset value is chosen at runtime.
 /// It is sound because none of these bound a container: they are divisors and
