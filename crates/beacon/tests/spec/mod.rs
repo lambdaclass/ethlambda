@@ -28,7 +28,12 @@
     reason = "each runner uses a different part of this harness"
 )]
 
+mod epoch_processing;
+mod genesis;
 mod harness;
+mod operations;
+mod rewards;
+mod sanity;
 mod shuffling;
 mod ssz_static;
 
@@ -36,6 +41,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ethlambda_beacon::ForkName;
+use ethlambda_beacon::containers::BeaconState;
 use libssz::SszDecode;
 use serde::de::DeserializeOwned;
 
@@ -77,8 +83,18 @@ pub struct Case {
 
 impl Case {
     /// A human-readable identifier for failure messages.
+    ///
+    /// Includes the two directory levels above the case, since case names repeat
+    /// across handlers and a bare name would not say which one failed.
     pub fn id(&self) -> String {
-        format!("{}/{}/{}", self.fork, self.suite, self.name)
+        let handler = self
+            .path
+            .parent()
+            .and_then(|suite| suite.parent())
+            .and_then(|handler| handler.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!("{}/{}/{}/{}", self.fork, handler, self.suite, self.name)
     }
 
     /// Whether the case carries the named file.
@@ -149,21 +165,7 @@ pub fn collect(config: &str, runner: &str, handler: &str) -> Vec<Case> {
         };
 
         let handler_dir = fork_entry.path().join(runner).join(handler);
-        if !handler_dir.is_dir() {
-            continue;
-        }
-
-        for suite_entry in read_dir_sorted(&handler_dir) {
-            let suite = suite_entry.file_name().to_string_lossy().into_owned();
-            for case_entry in read_dir_sorted(&suite_entry.path()) {
-                cases.push(Case {
-                    path: case_entry.path(),
-                    fork,
-                    suite: suite.clone(),
-                    name: case_entry.file_name().to_string_lossy().into_owned(),
-                });
-            }
-        }
+        collect_suites(&handler_dir, fork, &mut |case| cases.push(case));
     }
 
     cases
@@ -178,22 +180,49 @@ pub fn collect_all_handlers(config: &str, runner: &str) -> Vec<(String, Case)> {
     let mut out = Vec::new();
 
     for fork_entry in read_dir_sorted(&root) {
-        let Some(_fork) = fork_entry.file_name().to_str().and_then(ForkName::parse) else {
+        let Some(fork) = fork_entry.file_name().to_str().and_then(ForkName::parse) else {
             continue;
         };
         let runner_dir = fork_entry.path().join(runner);
         if !runner_dir.is_dir() {
             continue;
         }
+
         for handler_entry in read_dir_sorted(&runner_dir) {
             let handler = handler_entry.file_name().to_string_lossy().into_owned();
-            for case in collect(config, runner, &handler) {
-                out.push((handler.clone(), case));
-            }
+            // Walk this fork's handler directory directly. Delegating to
+            // `collect` here would be wrong: `collect` walks every fork itself,
+            // so nesting it inside this fork loop would yield each case once per
+            // fork that happens to ship the runner.
+            collect_suites(&handler_entry.path(), fork, &mut |case| {
+                out.push((handler.clone(), case))
+            });
         }
     }
 
     out
+}
+
+/// Walks the suite and case directories under one fork's handler directory.
+///
+/// Shared by both collectors so there is one definition of what a case directory
+/// is, and so neither can drift from the other.
+fn collect_suites(handler_dir: &Path, fork: ForkName, emit: &mut impl FnMut(Case)) {
+    if !handler_dir.is_dir() {
+        return;
+    }
+
+    for suite_entry in read_dir_sorted(handler_dir) {
+        let suite = suite_entry.file_name().to_string_lossy().into_owned();
+        for case_entry in read_dir_sorted(&suite_entry.path()) {
+            emit(Case {
+                path: case_entry.path(),
+                fork,
+                suite: suite.clone(),
+                name: case_entry.file_name().to_string_lossy().into_owned(),
+            });
+        }
+    }
 }
 
 /// Directory entries, sorted, so a failing run is reproducible and its output
@@ -205,6 +234,47 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
     };
     entries.sort_by_key(fs::DirEntry::file_name);
     entries
+}
+
+/// Judges a state transition against what the case expects.
+///
+/// The rule the whole fixture format rests on: a case with a `post` state must
+/// succeed and land exactly on it, and a case *without* one must be rejected.
+/// Getting the second half right is what keeps the suites honest, since an
+/// implementation that accepted everything would otherwise pass every case that
+/// ships a `post`.
+///
+/// Comparison is by `hash_tree_root` rather than field by field, because that is
+/// the value consensus actually agrees on, and a mismatch anywhere in the state
+/// changes it.
+pub fn check_transition(
+    case: &Case,
+    outcome: Result<(), String>,
+    state: &BeaconState,
+) -> Result<(), String> {
+    match (case.has("post"), outcome) {
+        (true, Ok(())) => {
+            let expected = BeaconState::from_ssz(case.fork, &case.ssz_bytes("post"))
+                .map_err(|err| format!("the fixture's post-state does not decode: {err:?}"))?;
+            let actual_root = state.hash_tree_root();
+            let expected_root = expected.hash_tree_root();
+            if actual_root != expected_root {
+                return Err(format!(
+                    "post-state root 0x{} != expected 0x{}",
+                    hex::encode(actual_root.0),
+                    hex::encode(expected_root.0)
+                ));
+            }
+            Ok(())
+        }
+        (true, Err(err)) => Err(format!(
+            "rejected, but the case expects a post-state: {err}"
+        )),
+        (false, Ok(())) => {
+            Err("accepted, but the case has no post-state, so it must be rejected".to_string())
+        }
+        (false, Err(_)) => Ok(()),
+    }
 }
 
 /// Accumulates per-case results so one run reports every failure instead of
