@@ -312,7 +312,15 @@ nothing depends on it.
   field counts and the merkle depth change at electra.
 - **Needs mutable element access on `SszList`/`SszVector`**, which published
   libssz 0.2.2 lacks. Currently built against a local `[patch.crates-io]`
-  override that is intentionally not committed.
+  override that is intentionally not committed, so the crate builds only where
+  that override exists.
+- **Status:** phase0 is complete and green against every phase0 suite. Altair has
+  containers and the fork upgrade, not its state transition. Bellatrix through
+  fulu have only preset and config values. The fork choice store is implemented in
+  full but is **not fixture-verified**: the release ships no phase0 `fork_choice`
+  suite, so it waits on altair's state transition.
+- A fixture case with no `post` state asserts the input must be **rejected**. That
+  rule lives in `check_transition`; do not add a runner that ignores it.
 
 ## Configuration Files
 
