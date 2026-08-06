@@ -49,6 +49,7 @@ pub mod constants;
 pub mod containers;
 pub mod fork;
 pub mod hash;
+pub mod helpers;
 pub mod kzg;
 pub mod preset;
 pub mod primitives;
