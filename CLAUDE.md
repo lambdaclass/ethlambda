@@ -84,11 +84,16 @@ Two roles trigger it:
 
 The proposer's job is built by `heartbeat_fold::heartbeat_aggregation_snapshot`,
 which picks the `AttestationData` with the most buffered committee signers and
-reduces the raw signer set to `B \ A` (signers not already covered by an existing
-type-1) before calling `aggregate_mixed`. It falls back to a single subnet job when
-nothing is foldable. The result flows through the ordinary `AggregateProduced` path
-into `new_payloads`, is promoted at interval 3, and reaches the builder as one
-candidate among many; `Tier::Heartbeat` is what makes it win.
+aggregates **raw signatures only** — it never recurses into an existing type-1, so
+the job's `children` list is always empty and its coverage is exactly the buffered
+signer set. The one existing-proof check left is dominance: when a *single* type-1
+for that data already covers every buffered signer the fold is skipped
+(`lean_heartbeat_fold_skipped_total`), since with proposer aggregation off the
+builder keeps one best-coverage proof per data rather than merging them. It falls
+back to a single subnet job when nothing is foldable. The result flows through the
+ordinary `AggregateProduced` path into `new_payloads`, is promoted at interval 3,
+and reaches the builder as one candidate among many; `Tier::Heartbeat` is what
+makes it win.
 
 Heartbeat signatures are the proposer's alone: `heartbeat_aggregation_snapshot` is
 the only reader of that buffer. An aggregator that does not propose the next slot

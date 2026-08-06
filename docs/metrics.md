@@ -76,8 +76,8 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_heartbeat_committee_participation` | Gauge | Distinct committee voters holding a vote for the last slot. Against `ceil(3K'/4)` this is the safe-target stall predictor | On heartbeat vote insert | | | ❌ |
 | `lean_heartbeat_committee_size` | Gauge | Effective committee size `K' = min(K, n)`, so a config disagreement across a network is visible without reading configs | On safe target update | | | ❌ |
 | `lean_fast_head_window_slots` | Histogram | Slots the fast head's expanding vote window had to walk back. Greater than 1 means slots were missed | On head update | | 0, 1, 2, 3, 4, 6, 8 | ❌ |
-| `lean_heartbeat_fold_time_seconds` | Histogram | `aggregate_mixed` cost in the heartbeat fold, separate from the committee session. This is what tells you whether a chosen `K` still fits inside interval 1 | On heartbeat fold | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2 | ❌ |
-| `lean_heartbeat_fold_skipped_total` | Counter | Folds skipped because every buffered signer was already covered (`B \ A` empty) — the free path | On heartbeat fold snapshot | | | ❌ |
+| `lean_heartbeat_fold_time_seconds` | Histogram | Raw-signature aggregation cost in the heartbeat fold, separate from the committee session. This is what tells you whether a chosen `K` still fits inside interval 1 | On heartbeat fold | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2 | ❌ |
+| `lean_heartbeat_fold_skipped_total` | Counter | Folds skipped because a single existing type-1 already covers every buffered signer — the free path | On heartbeat fold snapshot | | | ❌ |
 
 ## State Transition Metrics
 

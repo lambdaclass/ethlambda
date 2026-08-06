@@ -548,8 +548,8 @@ impl BlockChainServer {
         // group, because the view-merge payload is what the block we are about to
         // build most needs and the proposer's scarce resource is leanVM time before
         // its interval-3 build. When nothing is foldable (no buffered heartbeat
-        // signature, or every signer already covered by an existing type-1) we fall
-        // back to an ordinary single subnet job, still preferring this slot's
+        // signature, or a single existing type-1 already covers every signer) we
+        // fall back to an ordinary single subnet job, still preferring this slot's
         // groups since the block wants this slot's committee covered.
         //
         // Not proposing means the committee's votes are worth no queue jump: this

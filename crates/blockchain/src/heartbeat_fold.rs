@@ -17,9 +17,19 @@
 //! reaches fork choice directly from the gossip topic, so folding them would be
 //! prover work with no consumer.
 //!
-//! The common case is free. Honest committee members with the same view produce
-//! byte-identical `AttestationData`, and their subnet aggregate usually already
-//! covers them, so `B \ A` is empty and no job is emitted at all.
+//! **Raw signatures only: the fold never recurses into an existing type-1.** The
+//! job it emits carries an empty `children` list, which degenerates the shared
+//! `aggregate_mixed` call to a plain single-message aggregation over raw XMSS, and
+//! its coverage is exactly the buffered signers it was handed. The cost is that
+//! the fold cannot union its buffer with a partially-overlapping existing proof:
+//! both become separate candidates for the same `AttestationData`, and the
+//! builder's per-data pick (`keep_best_proof_per_data`) keeps whichever covers
+//! more.
+//!
+//! The common case is still free. Honest committee members with the same view
+//! produce byte-identical `AttestationData`, so when a single existing type-1
+//! already covers every buffered signer the fold would only reproduce coverage the
+//! block can already pack, and no job is emitted at all.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -28,7 +38,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::{
     ShortRoot,
     attestation::{AttestationData, HashedAttestationData},
-    block::{ByteList512KiB, SingleMessageAggregate},
+    block::SingleMessageAggregate,
     primitives::H256,
     state::Validator,
 };
@@ -36,10 +46,6 @@ use tracing::trace;
 
 use crate::aggregation::{AggregationJob, AggregationSnapshot, JobSource};
 use crate::metrics;
-
-/// Upper bound on existing type-1s recursed into per fold, mirroring the
-/// committee session's child cap.
-const MAX_FOLD_CHILDREN: usize = 4;
 
 /// Build the next-slot proposer's single aggregation job over `slot`'s heartbeat
 /// committee votes. Runs on the actor thread; touches the store, does no heavy
@@ -52,8 +58,8 @@ const MAX_FOLD_CHILDREN: usize = 4;
 /// block most wants. Ties break on `data_root` ascending for determinism.
 ///
 /// Returns `None` when nothing is foldable, either because no heartbeat signature
-/// is buffered or because every buffered signer is already covered by an existing
-/// type-1. The caller falls back to an ordinary subnet job in that case.
+/// is buffered or because a single existing type-1 already covers every buffered
+/// signer. The caller falls back to an ordinary subnet job in that case.
 pub fn heartbeat_aggregation_snapshot(store: &Store, slot: u64) -> Option<AggregationSnapshot> {
     let buffered = store.heartbeat_signatures_at(slot);
     if buffered.is_empty() {
@@ -82,19 +88,24 @@ pub fn heartbeat_aggregation_snapshot(store: &Store, slot: u64) -> Option<Aggreg
             // signature is unusable without its data.
             continue;
         };
-        let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
+        // Cheap pre-check: with no existing proof for this data there is nothing
+        // the fold could be dominated by, so skip the clone of every proof blob.
+        let existing_proofs = if store.proof_count_for_data(data_root) == 0 {
+            Vec::new()
+        } else {
+            let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
+            new_proofs.into_iter().chain(known_proofs).collect()
+        };
         if let Some(job) = resolve_fold_job(
             HashedAttestationData::new(data.clone()),
             sigs_by_validator,
-            &new_proofs,
-            &known_proofs,
+            &existing_proofs,
             &validators,
         ) {
             trace!(
                 %slot,
                 data_root = %ShortRoot(&data_root.0),
                 raw_count = job.raw_ids.len(),
-                children = job.children.len(),
                 "Heartbeat fold job selected"
             );
             return Some(AggregationSnapshot {
@@ -107,36 +118,28 @@ pub fn heartbeat_aggregation_snapshot(store: &Store, slot: u64) -> Option<Aggreg
     None
 }
 
-/// Build one fold job, or `None` when there is nothing uncovered to fold.
+/// Build one raw-only fold job, or `None` when there is nothing worth proving.
 ///
-/// `A` = participants of the greedily chosen existing type-1s. `B` = the
-/// buffered heartbeat signers. **`B` must be reduced to `B \ A` before the
-/// `aggregate_mixed` call**: lean-multisig's aggregator tracks duplicate
-/// pubkeys, and a validator present both in a child aggregate and in the raw list
-/// is a duplicate.
+/// Every buffered signature the validator registry can resolve to a pubkey goes in
+/// raw, in ascending validator order (XMSS aggregation requires it, which the
+/// `BTreeMap` iteration order already gives us). `children` stays empty by
+/// construction, so `aggregate_mixed`'s "at least one raw signature OR at least two
+/// children" precondition reduces to "at least one resolvable signature" — the
+/// exact condition under which a job is emitted.
 ///
-/// `aggregate_mixed`'s "at least one raw signature OR at least two children"
-/// precondition is satisfied by construction: a job is only emitted when
-/// `B \ A` is non-empty.
+/// A lone raw signature is still a job, unlike on the subnet path: a committee
+/// vote can only enter a block as a type-1, so a 1-of-1 aggregate is the cheapest
+/// form in which the proposer can pack it.
 fn resolve_fold_job(
     hashed: HashedAttestationData,
     sigs_by_validator: &BTreeMap<u64, ValidatorSignature>,
-    new_proofs: &[SingleMessageAggregate],
-    known_proofs: &[SingleMessageAggregate],
+    existing_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
 ) -> Option<AggregationJob> {
-    let (children, accepted_child_ids) = select_fold_children(new_proofs, known_proofs, validators);
-    let covered: HashSet<u64> = accepted_child_ids.iter().copied().collect();
-
-    // B \ A, in ascending validator order (XMSS aggregation requires it, which
-    // the BTreeMap iteration order already gives us).
     let mut raw_pubkeys = Vec::new();
     let mut raw_sigs = Vec::new();
     let mut raw_ids = Vec::new();
     for (validator_id, signature) in sigs_by_validator {
-        if covered.contains(validator_id) {
-            continue;
-        }
         let Some(validator) = validators.get(*validator_id as usize) else {
             continue;
         };
@@ -148,13 +151,22 @@ fn resolve_fold_job(
         raw_ids.push(*validator_id);
     }
 
-    // Every buffered signer is already covered: reuse the existing type-1
-    // unchanged. This is the common case and it costs nothing.
     if raw_ids.is_empty() {
+        return None;
+    }
+
+    // A single existing type-1 covering every buffered signer already carries
+    // everything a raw-only fold could produce, so proving it again buys the block
+    // nothing. Dominance has to come from *one* proof: with proposer aggregation
+    // off (the default) the builder keeps the single best-coverage proof per data
+    // rather than merging them, so coverage spread across two proofs is not
+    // coverage the block can pack.
+    if is_dominated(&raw_ids, existing_proofs) {
         metrics::inc_heartbeat_fold_skipped();
         trace!(
             data_root = %ShortRoot(&hashed.root().0),
-            "Heartbeat fold skipped: no uncovered signers"
+            raw_count = raw_ids.len(),
+            "Heartbeat fold skipped: an existing type-1 already covers every buffered signer"
         );
         return None;
     }
@@ -163,8 +175,10 @@ fn resolve_fold_job(
     Some(AggregationJob {
         hashed,
         slot,
-        children,
-        accepted_child_ids,
+        // Raw signatures only — see the module docs. Empty children make the
+        // shared `aggregate_mixed` call a plain single-message aggregation.
+        children: Vec::new(),
+        accepted_child_ids: Vec::new(),
         raw_pubkeys,
         raw_sigs,
         raw_ids,
@@ -176,70 +190,12 @@ fn resolve_fold_job(
     })
 }
 
-/// Greedily pick existing type-1s to recurse into, resolving their pubkeys.
-///
-/// Greedy rather than "take them all" so children never overlap each other,
-/// which would feed lean-multisig the same duplicate pubkeys the `B \ A`
-/// reduction exists to avoid. Drops any child whose pubkeys cannot be fully
-/// resolved: passing fewer pubkeys than the proof expects yields an invalid
-/// aggregate.
-fn select_fold_children(
-    new_proofs: &[SingleMessageAggregate],
-    known_proofs: &[SingleMessageAggregate],
-    validators: &[Validator],
-) -> (Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>, Vec<u64>) {
-    let mut covered: HashSet<u64> = HashSet::new();
-    let mut children = Vec::new();
-    let mut child_ids: Vec<u64> = Vec::new();
-
-    for proof_set in [new_proofs, known_proofs] {
-        let mut remaining: Vec<&SingleMessageAggregate> = proof_set.iter().collect();
-
-        while children.len() < MAX_FOLD_CHILDREN && !remaining.is_empty() {
-            let best_idx = remaining
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, p)| {
-                    p.participant_indices()
-                        .filter(|vid| !covered.contains(vid))
-                        .count()
-                })
-                .map(|(i, _)| i)
-                .expect("remaining is non-empty");
-
-            let participant_ids: Vec<u64> = remaining[best_idx].participant_indices().collect();
-            if participant_ids.iter().all(|vid| covered.contains(vid)) {
-                break;
-            }
-
-            let proof = remaining.swap_remove(best_idx);
-            let pubkeys: Vec<ValidatorPublicKey> = participant_ids
-                .iter()
-                .filter_map(|&vid| {
-                    let validator = validators.get(vid as usize)?;
-                    ValidatorPublicKey::from_bytes(&validator.attestation_pubkey).ok()
-                })
-                .collect();
-            if pubkeys.len() != participant_ids.len() {
-                trace!(
-                    expected = participant_ids.len(),
-                    resolved = pubkeys.len(),
-                    "Skipping heartbeat fold child: could not resolve all participant pubkeys"
-                );
-                continue;
-            }
-
-            covered.extend(&participant_ids);
-            child_ids.extend(&participant_ids);
-            children.push((pubkeys, proof.proof.clone()));
-        }
-
-        if children.len() >= MAX_FOLD_CHILDREN {
-            break;
-        }
-    }
-
-    (children, child_ids)
+/// Whether some single existing type-1's participants are a superset of `raw_ids`.
+fn is_dominated(raw_ids: &[u64], existing_proofs: &[SingleMessageAggregate]) -> bool {
+    existing_proofs.iter().any(|proof| {
+        let participants: HashSet<u64> = proof.participant_indices().collect();
+        raw_ids.iter().all(|vid| participants.contains(vid))
+    })
 }
 
 #[cfg(test)]
@@ -267,8 +223,8 @@ mod tests {
         })
     }
 
-    /// A type-1 covering exactly `signers`.
-    fn child_proof(signers: &[usize]) -> SingleMessageAggregate {
+    /// An existing type-1 covering exactly `signers`.
+    fn existing_proof(signers: &[usize]) -> SingleMessageAggregate {
         let max = signers.iter().copied().max().unwrap_or(0);
         let mut bits = ethlambda_types::attestation::AggregationBits::with_length(max + 1).unwrap();
         for &i in signers {
@@ -304,25 +260,23 @@ mod tests {
     }
 
     #[test]
-    fn fold_reduces_raw_signers_to_b_minus_a() {
-        // A child already covers {0, 1}; the buffer holds {0, 1, 2}. Only 2 may
-        // reach `aggregate_mixed` as a raw signature — lean-multisig's aggregator
-        // tracks duplicate pubkeys, and a validator present both in a child and in
-        // the raw list is a duplicate.
+    fn fold_keeps_every_buffered_signer_raw() {
+        // An existing type-1 covers {0, 1} and the buffer holds {0, 1, 2}. The fold
+        // does not recurse into it, so all three signatures go in raw and the
+        // resulting aggregate covers exactly the buffer.
         let job = resolve_fold_job(
             hashed(7),
             &buffered(&[0, 1, 2]),
-            &[child_proof(&[0, 1])],
-            &[],
+            &[existing_proof(&[0, 1])],
             &validators(4),
         )
-        .expect("an uncovered signer remains");
+        .expect("the existing proof does not cover 2, so the fold runs");
 
-        assert_eq!(job.raw_ids, vec![2], "covered signers must be dropped");
-        assert_eq!(job.children.len(), 1);
-        let mut child_ids = job.accepted_child_ids.clone();
-        child_ids.sort_unstable();
-        assert_eq!(child_ids, vec![0, 1]);
+        assert_eq!(job.raw_ids, vec![0, 1, 2], "no signer is dropped");
+        assert!(
+            job.children.is_empty() && job.accepted_child_ids.is_empty(),
+            "raw signatures only: no existing type-1 is recursed into"
+        );
         // The pubkey and signature lists stay aligned with raw_ids; a mismatch is
         // an `aggregate_mixed` CountMismatch error.
         assert_eq!(job.raw_pubkeys.len(), job.raw_ids.len());
@@ -335,26 +289,42 @@ mod tests {
     }
 
     #[test]
-    fn fold_is_skipped_when_every_signer_is_already_covered() {
-        // The common case: the subnet aggregate already covers the whole
-        // committee, so there is nothing to fold and the existing type-1 is reused
-        // unchanged.
+    fn fold_is_skipped_when_one_proof_covers_every_signer() {
+        // The common case: a subnet aggregate for the same data already covers the
+        // whole buffer, so a raw-only fold would only reproduce coverage the block
+        // can already pack.
         let job = resolve_fold_job(
             hashed(7),
             &buffered(&[0, 1]),
-            &[child_proof(&[0, 1, 2])],
-            &[],
+            &[existing_proof(&[0, 1, 2])],
             &validators(4),
         );
-        assert!(job.is_none(), "B \\ A empty means no work");
+        assert!(job.is_none(), "a dominating type-1 means no work");
     }
 
     #[test]
-    fn fold_with_no_children_uses_raw_signatures_alone() {
-        // A committee member whose data no aggregate covers still folds: raw-only
-        // satisfies `aggregate_mixed`'s "at least one raw signature" precondition,
-        // and the resulting entry is a real finality vote.
-        let job = resolve_fold_job(hashed(7), &buffered(&[3]), &[], &[], &validators(4))
+    fn fold_runs_when_coverage_is_split_across_proofs() {
+        // Two proofs jointly cover {0, 1, 2}, but neither covers it alone. Their
+        // union is only reachable by recursion, which the fold does not do, and the
+        // builder keeps one proof per data rather than merging them — so the raw
+        // fold is what gets the whole buffer into a single packable entry.
+        let job = resolve_fold_job(
+            hashed(7),
+            &buffered(&[0, 1, 2]),
+            &[existing_proof(&[0, 1]), existing_proof(&[2])],
+            &validators(4),
+        )
+        .expect("no single proof dominates the buffer");
+        assert_eq!(job.raw_ids, vec![0, 1, 2]);
+        assert!(job.children.is_empty());
+    }
+
+    #[test]
+    fn fold_with_no_existing_proof_aggregates_raw_signatures() {
+        // A committee member whose data no aggregate covers still folds: a lone raw
+        // signature satisfies `aggregate_mixed`'s "at least one raw signature"
+        // precondition, and the resulting entry is a real finality vote.
+        let job = resolve_fold_job(hashed(7), &buffered(&[3]), &[], &validators(4))
             .expect("raw-only fold is valid");
         assert!(job.children.is_empty());
         assert_eq!(job.raw_ids, vec![3]);
@@ -364,7 +334,7 @@ mod tests {
     fn fold_skips_signers_outside_the_registry() {
         // A signature from an index the registry does not have cannot be resolved
         // to a pubkey; dropping it beats passing a short pubkey list to the prover.
-        let job = resolve_fold_job(hashed(7), &buffered(&[1, 99]), &[], &[], &validators(4))
+        let job = resolve_fold_job(hashed(7), &buffered(&[1, 99]), &[], &validators(4))
             .expect("validator 1 is resolvable");
         assert_eq!(job.raw_ids, vec![1]);
     }

@@ -1051,9 +1051,9 @@ pub fn observe_fast_head_window_slots(slots: u64) {
     LEAN_FAST_HEAD_WINDOW_SLOTS.observe(slots as f64);
 }
 
-/// `aggregate_mixed` cost inside the heartbeat fold, kept separate from the
-/// committee session's timing. This is what tells you whether a chosen `K` still
-/// fits inside interval 1.
+/// Raw-signature aggregation cost inside the heartbeat fold, kept separate from
+/// the committee session's timing. This is what tells you whether a chosen `K`
+/// still fits inside interval 1.
 pub fn time_heartbeat_fold() -> TimingGuard {
     static LEAN_HEARTBEAT_FOLD_TIME_SECONDS: std::sync::LazyLock<Histogram> =
         std::sync::LazyLock::new(|| {
@@ -1067,14 +1067,14 @@ pub fn time_heartbeat_fold() -> TimingGuard {
     TimingGuard::new(&LEAN_HEARTBEAT_FOLD_TIME_SECONDS)
 }
 
-/// Count a fold that was skipped because every buffered signer was already
-/// covered by an existing type-1 (`B \ A` empty) — the free path.
+/// Count a fold that was skipped because a single existing type-1 already covers
+/// every buffered signer — the free path.
 pub fn inc_heartbeat_fold_skipped() {
     static LEAN_HEARTBEAT_FOLD_SKIPPED_TOTAL: std::sync::LazyLock<IntCounter> =
         std::sync::LazyLock::new(|| {
             register_int_counter!(
                 "lean_heartbeat_fold_skipped_total",
-                "Heartbeat folds skipped because no signer was uncovered"
+                "Heartbeat folds skipped because an existing type-1 already covers every signer"
             )
             .unwrap()
         });
