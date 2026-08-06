@@ -59,10 +59,7 @@ impl LocalEnrParams {
     /// ENR entries outside the EIP-778 predefined dictionary. Values are
     /// RLP-encoded, matching how `NodeRecordPairs::other` is decoded.
     pub fn extra_pairs(&self) -> Vec<(Bytes, Bytes)> {
-        let attnets = encode_attnets(
-            &self.subscription_subnets,
-            self.attestation_committee_count,
-        );
+        let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         vec![
             (
                 Bytes::from_static(ATTNETS_ENR_KEY),
@@ -157,10 +154,7 @@ mod tests {
     fn local_enr_carries_the_fork_id() {
         let record = build();
         let raw = read_extra(&record, b"eth2").expect("eth2 entry present");
-        assert_eq!(
-            EnrForkId::from_ssz_bytes(&raw).unwrap(),
-            EnrForkId::local()
-        );
+        assert_eq!(EnrForkId::from_ssz_bytes(&raw).unwrap(), EnrForkId::local());
     }
 
     #[test]

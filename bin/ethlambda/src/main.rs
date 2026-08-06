@@ -345,8 +345,10 @@ async fn main() -> eyre::Result<()> {
             store,
             aggregator,
             sync_status,
-            local_peer_id,
-            local_enr,
+            ethlambda_rpc::NodeIdentity {
+                peer_id: local_peer_id,
+                enr: local_enr,
+            },
             events,
             rpc_shutdown,
         )

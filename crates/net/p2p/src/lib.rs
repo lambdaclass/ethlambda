@@ -54,8 +54,8 @@ use crate::{
     swarm_adapter::SwarmHandle,
 };
 
-mod gossipsub;
 pub mod discovery;
+mod gossipsub;
 pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
@@ -1141,18 +1141,13 @@ mod tests {
             &raw_secp256k1::PublicKey::from_secret_key(raw_secp256k1::SECP256K1, &signer)
                 .serialize_uncompressed()[1..],
         );
-        let node = ethrex_p2p::types::Node::new(
-            IpAddr::from(Ipv4Addr::LOCALHOST),
-            9010,
-            0,
-            public_key,
-        );
+        let node =
+            ethrex_p2p::types::Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
         let extra = vec![(
             Bytes::from_static(b"quic"),
             Bytes::from(9001u16.encode_to_vec()),
         )];
-        let record =
-            NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap();
+        let record = NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap();
 
         let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
 

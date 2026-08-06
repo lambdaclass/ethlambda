@@ -203,13 +203,20 @@ mod tests {
     fn base_args() -> Vec<&'static str> {
         vec![
             "ethlambda",
-            "--genesis", "config.yaml",
-            "--validators", "validators.yaml",
-            "--bootnodes", "nodes.yaml",
-            "--validator-config", "validator-config.yaml",
-            "--hash-sig-keys-dir", "keys",
-            "--node-key", "node.key",
-            "--node-id", "ethlambda_0",
+            "--genesis",
+            "config.yaml",
+            "--validators",
+            "validators.yaml",
+            "--bootnodes",
+            "nodes.yaml",
+            "--validator-config",
+            "validator-config.yaml",
+            "--hash-sig-keys-dir",
+            "keys",
+            "--node-key",
+            "node.key",
+            "--node-id",
+            "ethlambda_0",
         ]
     }
 
