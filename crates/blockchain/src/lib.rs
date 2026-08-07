@@ -3,7 +3,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
-use ethlambda_state_transition::is_proposer;
+use ethlambda_state_transition::{
+    effective_heartbeat_committee_size, is_heartbeat_committee_member, is_proposer,
+};
 use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -16,8 +18,9 @@ use ethlambda_types::{
 use crate::aggregation::{
     AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
     AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
-    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    PRIOR_WORKER_JOIN_TIMEOUT, SlotOrdering, run_aggregation_worker,
 };
+use crate::heartbeat_fold::heartbeat_aggregation_snapshot;
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
@@ -38,6 +41,7 @@ pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
 pub(crate) mod fork_choice_tree;
+pub mod heartbeat_fold;
 pub mod key_manager;
 pub mod metrics;
 pub mod reaggregate;
@@ -73,24 +77,37 @@ pub struct BlockChainConfig {
 // consensus-critical constant.
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 pub use ethlambda_types::constants::{
-    INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+    INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, RLMD_LOOKBACK_LIMIT,
 };
 pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
-/// vote whose slot has not yet started locally. One interval is roughly 800 ms,
+/// vote whose slot has not yet started locally. One interval is 1000 ms,
 /// the lean analogue of mainnet's `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
+/// The four ticks inside a slot.
+///
+/// Declared in wall-clock order; the discriminant is the interval index within
+/// the slot. The 5-interval grid's `Aggregation` tick is gone: committee
+/// aggregation is now anchored to the interval-2 boundary rather than occupying
+/// a tick of its own, so its duties fold into [`Self::SafeTargetUpdate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
+    /// 0 ms. The slot's block arrives; import merges committee bits into the
+    /// heartbeat vote store and promotes new payloads to known.
     BlockPublication,
+    /// 1000 ms. Every validator attests to its subnet; committee members also
+    /// republish that same signature to the global heartbeat topic.
     AttestationProduction,
-    Aggregation,
+    /// 2000 ms. `safe_target` is recomputed from current-slot heartbeat votes;
+    /// committee aggregates begin publishing.
     SafeTargetUpdate,
+    /// 3000 ms. `lagging_head` then `fast_head`; promote payloads, log the tree,
+    /// and build + publish the next slot's block aligned to its slot boundary.
     EndOfSlot,
 }
 
@@ -103,10 +120,9 @@ impl SlotInterval {
         match intervals_since_genesis % INTERVALS_PER_SLOT {
             0 => Self::BlockPublication,
             1 => Self::AttestationProduction,
-            2 => Self::Aggregation,
-            3 => Self::SafeTargetUpdate,
-            4 => Self::EndOfSlot,
-            _ => unreachable!("slots only have 5 intervals"),
+            2 => Self::SafeTargetUpdate,
+            3 => Self::EndOfSlot,
+            _ => unreachable!("slots only have {INTERVALS_PER_SLOT} intervals"),
         }
     }
 
@@ -117,9 +133,8 @@ impl SlotInterval {
         let interval = match self {
             Self::BlockPublication => 0,
             Self::AttestationProduction => 1,
-            Self::Aggregation => 2,
-            Self::SafeTargetUpdate => 3,
-            Self::EndOfSlot => 4,
+            Self::SafeTargetUpdate => 2,
+            Self::EndOfSlot => 3,
         };
         slot * MILLISECONDS_PER_SLOT + interval * MILLISECONDS_PER_INTERVAL
     }
@@ -166,6 +181,11 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let genesis_time = store.config().genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
+
+        // Rebuild the in-memory heartbeat vote set from stored blocks before the
+        // first tick, so fork choice is not blind for a full RLMD window after a
+        // restart.
+        store::replay_heartbeat_votes(&store);
 
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
@@ -262,7 +282,7 @@ pub struct BlockChainServer {
     proposer_config: ProposerConfig,
 
     /// Pre-merge `new_payloads` snapshot for the attestation aggregate coverage
-    /// report. Captured at the end-of-slot promote (interval 4), read at the
+    /// report. Captured at the last promote of the slot (interval 3), read at the
     /// next slot boundary. Owned solely by the actor and only touched from the
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
@@ -330,16 +350,16 @@ impl BlockChainServer {
         let is_aggregator = self.aggregator.is_enabled();
         metrics::set_is_aggregator(is_aggregator);
 
-        // ==== interval 4 (pre-tick) ====
+        // ==== interval 3 (pre-tick) ====
 
-        // Snapshot the pre-merge `new_payloads` set at the end-of-slot promote
-        // (interval 4), so the post-block report for this round sees its
+        // Snapshot the pre-merge `new_payloads` set at the last promote of the
+        // slot (interval 3), so the post-block report for this round sees its
         // "timely" cohort just before it is promoted out of `new_payloads`.
         //
-        // Only interval 4 — not the proposer's interval-0 promote. By interval 0
+        // Only interval 3 — not the proposer's interval-0 promote. By interval 0
         // the round's votes have already been promoted at the previous slot's
-        // interval 4; `new_payloads` then holds only stragglers, and snapshotting
-        // them here would overwrite the good interval-4 snapshot the report still
+        // interval 3; `new_payloads` then holds only stragglers, and snapshotting
+        // them here would overwrite the good interval-3 snapshot the report still
         // needs (those stragglers surface in the `late` section instead). Skip
         // empty snapshots so a missed round keeps the last set we saw. Pure
         // observability.
@@ -365,15 +385,15 @@ impl BlockChainServer {
         // at tick time), so it doubles as the wall-clock slot for the gate.
         pre_tick.diff_and_emit(&self.store, &self.events, slot);
 
-        // Per-interval duties for this tick. Intervals 0 (block publish) and 3
-        // (safe-target update) are driven inside `store::on_tick` above, so they
-        // carry only a note below.
+        // Per-interval duties for this tick. Interval 0 (block publish) and the
+        // fork-choice half of interval 2 / interval 3 are driven inside
+        // `store::on_tick` above, so they carry only a note below.
         match interval {
             // ==== interval 0 ====
             //
             // No actor work at interval 0. The block is published here
             // conceptually (at the slot boundary), but the build+publish code
-            // path runs at interval 4 of the previous slot — where it also
+            // path runs at interval 3 of the previous slot — where it also
             // advances the store to this slot's interval 0 before building (see
             // `propose_block`). The real interval-0 tick is then skipped by the
             // idempotency guard above, since the store clock is already here.
@@ -407,7 +427,13 @@ impl BlockChainServer {
                 // Schedule the early-aggregation window check. This tick is
                 // one interval before T2, so the timer fires right as the
                 // window opens at T2 - EARLY_AGGREGATION_WINDOW.
-                if is_aggregator {
+                //
+                // Scheduled for the next slot's proposer as well as for
+                // aggregators. Without it a non-aggregator proposer would have no
+                // early-start opportunity at all: its heartbeat votes arrive
+                // during interval 1, before the window opens, so the per-insert
+                // checks all fall outside it and nothing would re-check.
+                if is_aggregator || self.proposes_next_slot(slot) {
                     send_after(
                         Duration::from_millis(MILLISECONDS_PER_INTERVAL) - EARLY_AGGREGATION_WINDOW,
                         ctx.clone(),
@@ -417,8 +443,16 @@ impl BlockChainServer {
             }
 
             // ==== interval 2 ====
-            SlotInterval::Aggregation => {
-                if is_aggregator {
+            //
+            // The safe-target update itself is handled inside `store::on_tick`.
+            // Committee aggregation is anchored to this boundary: the session
+            // publishes from here, so its proofs are ready before the interval-3
+            // build snapshots them.
+            SlotInterval::SafeTargetUpdate => {
+                // Two reasons to run a session: the committee-aggregator role, or
+                // proposing the next slot (which needs this slot's heartbeat votes
+                // folded into a packable type-1 before the interval-3 build).
+                if is_aggregator || self.proposes_next_slot(slot) {
                     // The early trigger may have already started this slot's
                     // session (running or finished) — it IS the slot's session,
                     // so don't start a second one.
@@ -436,18 +470,14 @@ impl BlockChainServer {
 
             // ==== interval 3 ====
             //
-            // Safe-target update is handled inside `store::on_tick`.
-            SlotInterval::SafeTargetUpdate => {}
-
-            // ==== interval 4 ====
-            //
             // Build and publish the NEXT slot's block here, one interval early,
             // so the heavy leanVM work happens during this otherwise-idle
             // interval. `propose_block` blocks the actor for the build and aligns
             // publication to the slot boundary. Doing the whole proposal here —
             // rather than stashing it for the interval-0 tick — keeps it robust:
             // `on_tick` skips the interval-0 tick whenever this build overruns
-            // its interval.
+            // its interval. The head update itself runs inside `store::on_tick`
+            // above, so the build sees this slot's `fast_head` as its parent.
             SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
@@ -460,13 +490,24 @@ impl BlockChainServer {
             }
         }
 
-        // Update safe target slot metric (updated by store.on_tick at interval 3)
+        // Update safe target slot metric (updated by store.on_tick at interval 2)
         metrics::update_safe_target_slot(self.store.safe_target_slot());
-        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
+        // Update head slot metrics (head may change when attestations are promoted at intervals 0/3)
         metrics::update_head_slot(self.store.head_slot());
+        metrics::update_lagging_head_slot(self.store.lagging_head_slot());
 
         // Advance XMSS keys for next slot so the signing paths don't have to
         self.key_manager.advance_keys_to((slot + 1) as u32);
+    }
+
+    /// Whether one of our validators proposes the slot after `slot`, and duties
+    /// are not suppressed by the sync gate.
+    ///
+    /// At slot `S` the block for `S+1` is what carries slot-`S` committee bits, so
+    /// "the next slot's proposer" is exactly the node that needs this slot's
+    /// heartbeat votes folded.
+    fn proposes_next_slot(&self, slot: u64) -> bool {
+        self.sync_status.duties_allowed() && self.get_our_proposer(slot + 1).is_some()
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -501,20 +542,41 @@ impl BlockChainServer {
 
         coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
 
-        // Limit ourselves to a single round of aggregation if we propose next round.
-        // This buys us time to build the block before the next slot's interval-0 tick.
-        let next_proposer = self
-            .get_our_proposer(slot + 1)
-            .filter(|_| self.sync_status.duties_allowed());
-        let max_jobs = if next_proposer.is_some() {
-            1
+        // Proposing next round means one job, not `MAX_AGGREGATION_JOBS`: it buys
+        // time to build the block before the next slot's interval-0 tick. That one
+        // job is spent on the heartbeat committee's votes rather than on a subnet
+        // group, because the view-merge payload is what the block we are about to
+        // build most needs and the proposer's scarce resource is leanVM time before
+        // its interval-3 build. When nothing is foldable (no buffered heartbeat
+        // signature, or a single existing type-1 already covers every signer) we
+        // fall back to an ordinary single subnet job, still preferring this slot's
+        // groups since the block wants this slot's committee covered.
+        //
+        // Not proposing means the committee's votes are worth no queue jump: this
+        // node folds nothing, and every peer already has those votes raw off the
+        // global heartbeat topic. `TierOnly` therefore aggregates a current-slot
+        // group only when it wins on consensus value (finalizes, justifies, or
+        // adds coverage nothing else does), leaving the jobs for the finality
+        // progress only an aggregator can produce.
+        let snapshot = if self.proposes_next_slot(slot) {
+            heartbeat_aggregation_snapshot(&self.store, slot).or_else(|| {
+                aggregation::snapshot_aggregation_inputs(
+                    &self.store,
+                    slot,
+                    1,
+                    SlotOrdering::CurrentSlotFirst,
+                )
+            })
         } else {
-            MAX_AGGREGATION_JOBS
+            aggregation::snapshot_aggregation_inputs(
+                &self.store,
+                slot,
+                MAX_AGGREGATION_JOBS,
+                SlotOrdering::TierOnly,
+            )
         };
-
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
-        else {
-            // No current-slot gossip sigs — nothing to aggregate this slot.
+        let Some(snapshot) = snapshot else {
+            // Nothing to aggregate this slot.
             return;
         };
 
@@ -572,19 +634,26 @@ impl BlockChainServer {
 
     /// Early-aggregation trigger: start the slot's session ahead of the
     /// interval-2 tick when, inside the window `[T2 - EARLY_AGGREGATION_WINDOW, T2)`,
-    /// a single attestation-data group already holds 2/3 of the signatures
-    /// expected from this node's aggregation subnets. Called after every
-    /// stored current-slot gossip signature and once at the window opening via
-    /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started
-    /// session stays in `current_aggregation` (running or finished) until the
-    /// next session replaces it. The latch has one hole: if the snapshot
-    /// yields no jobs (possible only when no signer's pubkey resolves, i.e. a
-    /// corrupted validator registry), no session is installed and the check
-    /// retries on later inserts — each retry is a no-op session attempt.
+    /// enough evidence is already in. There are two independent reasons to fire,
+    /// whichever comes first:
+    ///
+    /// - **Next slot's proposer**: this slot's heartbeat votes have reached the
+    ///   safe-target threshold, `ceil(3K'/4)` of the committee. Same threshold the
+    ///   safe target itself uses, and for the same reason: it is the point at which
+    ///   the committee has spoken clearly enough to act on. Starting here is what
+    ///   gives the fold room to finish before the interval-3 build.
+    /// - **Aggregator**: a single attestation-data group already holds 2/3 of the
+    ///   signatures expected from this node's subscribed subnets.
+    ///
+    /// Called after every stored current-slot gossip signature, after every
+    /// accepted heartbeat vote, and once at the window opening via
+    /// [`EarlyAggregationCheck`]. Fires at most once per slot: the started session
+    /// stays in `current_aggregation` (running or finished) until the next session
+    /// replaces it. The latch has one hole: if the snapshot yields no jobs
+    /// (possible only when no signer's pubkey resolves, i.e. a corrupted validator
+    /// registry), no session is installed and the check retries on later inserts —
+    /// each retry is a no-op session attempt.
     async fn maybe_start_early_aggregation(&mut self, ctx: &Context<Self>) {
-        if !self.aggregator.is_enabled() {
-            return;
-        }
         // Only fire inside the early-aggregation window
         // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
         // slot's interval-2 boundary; the slot is derived from the wall clock.
@@ -598,6 +667,10 @@ impl BlockChainServer {
         if ms_into_slot < t2_offset - window_ms || ms_into_slot >= t2_offset {
             return;
         }
+        // Everything below is denominated in this slot, including the proposer
+        // check: reading it from `store.time()` instead could disagree by one at a
+        // boundary, and then we would test the wrong slot's proposer against this
+        // slot's votes.
         let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
         if self
             .current_aggregation
@@ -606,6 +679,18 @@ impl BlockChainServer {
         {
             return;
         }
+        // Heartbeat trigger. Checked first because it is the cheaper test and,
+        // for the proposer, the one that matters: the committee publishes at
+        // interval 1, so this is typically satisfied well before any subnet
+        // aggregate could be.
+        if self.proposes_next_slot(slot) && self.heartbeat_threshold_met(slot) {
+            self.start_aggregation_session(slot, ctx).await;
+            return;
+        }
+        if !self.aggregator.is_enabled() {
+            return;
+        }
+
         let max_group = self.store.max_gossip_group_count_for_slot(slot);
         // Trigger once the largest current-slot group holds two-thirds of the
         // votes we expect it to collect, rounded up. Groups are keyed by
@@ -644,6 +729,36 @@ impl BlockChainServer {
         self.start_aggregation_session(slot, ctx).await;
     }
 
+    /// Whether `slot`'s heartbeat votes have reached the safe-target threshold,
+    /// `ceil(3K'/4)` distinct committee voters.
+    ///
+    /// Denominated in the effective committee size `K' = min(K, n)`, never the raw
+    /// configured `K`: at `K > n` a raw denominator would demand more votes than
+    /// there are validators to cast them and the threshold could never be met.
+    fn heartbeat_threshold_met(&self, slot: u64) -> bool {
+        let num_validators = self.store.head_state().validators.len() as u64;
+        let committee_size = effective_heartbeat_committee_size(
+            self.store.heartbeat_committee_size(),
+            num_validators,
+        );
+        if committee_size == 0 {
+            return false;
+        }
+        let threshold = (3 * committee_size).div_ceil(4);
+        let voters = self.store.heartbeat_voter_count_at(slot) as u64;
+        if voters < threshold {
+            return false;
+        }
+        info!(
+            %slot,
+            voters,
+            threshold,
+            committee_size,
+            "Heartbeat safe-target threshold met; starting proposer aggregation early"
+        );
+        true
+    }
+
     /// Returns the validator ID if any of our validators is the proposer for this slot.
     fn get_our_proposer(&self, slot: u64) -> Option<u64> {
         let head_state = self.store.head_state();
@@ -660,6 +775,12 @@ impl BlockChainServer {
 
         // Produce attestation data once for all validators
         let attestation_data = store::produce_attestation_data(&self.store, slot);
+
+        // Committee membership is denominated in the registry at the vote's own
+        // slot; the head state's registry is that registry, since the vote is for
+        // the current slot.
+        let num_validators = self.store.head_state().validators.len() as u64;
+        let heartbeat_committee_size = self.store.heartbeat_committee_size();
 
         // For each registered validator, produce and publish attestation
         for validator_id in self.key_manager.validator_ids() {
@@ -692,6 +813,34 @@ impl BlockChainServer {
                     });
             }
 
+            // Committee members republish the *same* signature to the global
+            // heartbeat topic, so no extra XMSS epoch is consumed. Self-deliver
+            // it too: gossipsub does not echo to the sender, and unlike subnet
+            // aggregation this store is not gated on the aggregator role, so
+            // every node needs its own validators' votes locally.
+            if is_heartbeat_committee_member(
+                validator_id,
+                slot,
+                num_validators,
+                heartbeat_committee_size,
+            ) {
+                let _ = store::on_gossip_heartbeat_attestation(
+                    &mut self.store,
+                    &signed_attestation,
+                )
+                .inspect_err(|err| {
+                    warn!(%slot, %validator_id, %err, "Self-delivery of heartbeat vote failed")
+                });
+
+                if let Some(ref p2p) = self.p2p {
+                    let _ = p2p
+                        .publish_heartbeat_attestation(signed_attestation.clone())
+                        .inspect_err(|err| {
+                            error!(%slot, %validator_id, %err, "Failed to publish heartbeat vote")
+                        });
+                }
+            }
+
             // Publish to gossip network
             if let Some(ref p2p) = self.p2p {
                 let _ = p2p.publish_attestation(signed_attestation).inspect_err(
@@ -704,7 +853,7 @@ impl BlockChainServer {
 
     /// Build the target slot's block and publish it, one interval early.
     ///
-    /// Runs at the previous slot's interval 4, blocking the actor for the build
+    /// Runs at the previous slot's interval 3, blocking the actor for the build
     /// (the expensive part is the leanVM single-message → multi-message
     /// aggregate merge). It first
     /// advances the store to the target slot's interval 0 (accepting
@@ -723,7 +872,7 @@ impl BlockChainServer {
 
         // Build the block. `produce_block_with_signatures` advances the store to
         // this slot's interval 0 (accepting attestations) before building — one
-        // interval ahead of the interval-4 tick we are running in — so the block
+        // interval ahead of the interval-3 tick we are running in — so the block
         // is built on the interval-0 state rather than the previous slot's end
         // state. Building early is safe because we publish below (nothing is
         // stashed for a later tick), and the real interval-0 tick is then skipped
@@ -1366,7 +1515,7 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    NewAggregatedAttestation, NewAttestation, NewBlock,
+    NewAggregatedAttestation, NewAttestation, NewBlock, NewHeartbeatAttestation,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -1415,6 +1564,20 @@ impl Handler<NewAttestation> for BlockChainServer {
         // the check unless this attestation is for the store's current slot.
         let current_slot = self.store.time().expect("store time exists") / INTERVALS_PER_SLOT;
         if msg.attestation.data.slot == current_slot {
+            self.maybe_start_early_aggregation(ctx).await;
+        }
+    }
+}
+
+impl Handler<NewHeartbeatAttestation> for BlockChainServer {
+    async fn handle(&mut self, msg: NewHeartbeatAttestation, ctx: &Context<Self>) {
+        let accepted = store::on_gossip_heartbeat_attestation(&mut self.store, &msg.attestation)
+            .inspect_err(|err| trace!(%err, "Rejected heartbeat attestation"))
+            .is_ok();
+        // A heartbeat vote moves the next-slot proposer's early-start threshold, so
+        // re-check after each accepted one. Only current-slot votes are admitted at
+        // all, so no slot guard is needed here.
+        if accepted {
             self.maybe_start_early_aggregation(ctx).await;
         }
     }

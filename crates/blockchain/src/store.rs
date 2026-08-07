@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
-use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
+use ethlambda_state_transition::{
+    effective_heartbeat_committee_size, is_heartbeat_committee_member, is_proposer,
+    slot_is_justifiable_after,
+};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
     ShortRoot,
@@ -9,7 +12,7 @@ use ethlambda_types::{
         Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
         SignedAttestation, validator_indices,
     },
-    block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
+    block::{Block, BlockBody, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
     state::{HISTORICAL_ROOTS_LIMIT, State},
@@ -18,12 +21,140 @@ use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
+    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, RLMD_LOOKBACK_LIMIT, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
+
+/// Extract the heartbeat committee votes a block carries for its predecessor slot.
+///
+/// A block for slot `T` carries slot-`T-1` committee bits: the view-merge payload
+/// the next fast head is computed from. The gate is `data.slot == T - 1`
+/// *strictly* — no window, no fallback to an earlier slot when slots were
+/// skipped. That makes this an exact mirror of the packer's `Tier::Heartbeat`
+/// gate, so "which slot's committee bits does this block carry" has exactly one
+/// answer and never needs reconciling. Degrading on a missed slot is the fast
+/// head's job, via its expanding fallback, not the packer's or this function's.
+///
+/// This is a plain read of the body: no proofs, no filters, no cap. In particular
+/// it must **not** reuse [`crate::reaggregate`]'s candidate selection, whose
+/// filters (drop attestations whose target is already justified, skip
+/// participants already covered locally, truncate to a per-block maximum) are
+/// right for deciding what is worth a SNARK split and wrong for fork choice: the
+/// fast head needs the `head` field of every committee vote regardless of whether
+/// its target is already justified.
+///
+/// Kept standalone over `(body, slot, n, committee_size)` so the restart replay
+/// path can run the identical extraction over blocks read back from the database.
+pub fn extract_heartbeat_votes(
+    body: &BlockBody,
+    block_slot: u64,
+    num_validators: u64,
+    committee_size: u64,
+) -> Vec<(u64, AttestationData)> {
+    // Slot 0 has no predecessor, so a genesis-adjacent block carries nothing.
+    let Some(cttee_slot) = block_slot.checked_sub(1) else {
+        return Vec::new();
+    };
+
+    let mut votes = Vec::new();
+    for entry in body.attestations.iter() {
+        if entry.data.slot != cttee_slot {
+            continue;
+        }
+        for validator_id in validator_indices(&entry.aggregation_bits) {
+            if is_heartbeat_committee_member(
+                validator_id,
+                cttee_slot,
+                num_validators,
+                committee_size,
+            ) {
+                votes.push((validator_id, entry.data.clone()));
+            }
+        }
+    }
+    votes
+}
+
+/// Rebuild the heartbeat vote set from the last [`RLMD_LOOKBACK_LIMIT`] blocks
+/// on disk.
+///
+/// `votes_per_slot`, `known_payloads` and the signature buffers are all
+/// in-memory, so without this a restart blinds fork choice: `fast_head` finds
+/// nothing, expands to the full window, and collapses to `lagging_head`, which
+/// has no heartbeat evidence of its own either. Replaying the window makes a
+/// restart deterministic instead of "recovers after a few slots".
+///
+/// Cheap: at most `RLMD_LOOKBACK_LIMIT` blocks, each contributing at most `K'`
+/// votes, and no new storage. Runs the identical extraction the live import path
+/// uses, which is why [`extract_heartbeat_votes`] is factored out.
+pub fn replay_heartbeat_votes(store: &Store) {
+    let mut root = store.head().expect("head block exists");
+    let committee_size = store.heartbeat_committee_size();
+    let mut replayed = 0usize;
+
+    for _ in 0..RLMD_LOOKBACK_LIMIT {
+        let Some(block) = store.get_block(&root).expect("block read should succeed") else {
+            break;
+        };
+        // The anchor block has no parent to walk to, and a slot-0 block carries
+        // no predecessor committee.
+        if block.slot == 0 {
+            break;
+        }
+
+        // Registry as of the committee's own slot: the parent state is the
+        // closest state at or before `block.slot - 1`. Fall back to the head
+        // state when the parent predates the anchor (checkpoint-synced node).
+        let num_validators = store
+            .get_state(&block.parent_root)
+            .expect("state read should succeed")
+            .map_or_else(
+                || store.head_state().validators.len() as u64,
+                |state| state.validators.len() as u64,
+            );
+
+        for (validator_id, data) in
+            extract_heartbeat_votes(&block.body, block.slot, num_validators, committee_size)
+        {
+            store.insert_heartbeat_vote(validator_id, data);
+            replayed += 1;
+        }
+
+        root = block.parent_root;
+    }
+
+    if replayed > 0 {
+        info!(
+            replayed,
+            window_slots = RLMD_LOOKBACK_LIMIT,
+            "Replayed heartbeat votes from stored blocks"
+        );
+    }
+}
+
+/// Merge a block's heartbeat votes into the store's vote set.
+///
+/// A union, not a replacement: `insert_heartbeat_vote` is last-write-wins per
+/// `(slot, validator)`, so the block's copy overwrites a gossip copy for the same
+/// validator while validators present only via gossip keep theirs. Convergence
+/// comes from the proposer's set normally *dominating* — it had a full interval to
+/// collect — not from discarding local votes.
+fn merge_heartbeat_votes(store: &Store, body: &BlockBody, block_slot: u64, num_validators: u64) {
+    let votes = extract_heartbeat_votes(
+        body,
+        block_slot,
+        num_validators,
+        store.heartbeat_committee_size(),
+    );
+    metrics::observe_heartbeat_votes_in_block(votes.len());
+    for (validator_id, data) in votes {
+        store.insert_heartbeat_vote(validator_id, data);
+        metrics::inc_heartbeat_votes_received(metrics::HeartbeatVoteSource::Block);
+    }
+}
 
 /// Intermediate fork-choice data produced by [`update_head`], carried so the
 /// fork choice tree can be rendered without recomputing LMD GHOST.
@@ -58,7 +189,21 @@ fn accept_new_attestations(store: &mut Store) -> HeadUpdate {
     update_head(store)
 }
 
-/// Update the head based on the fork choice rule.
+/// Update the fast head (the store head) via GHOST-Eph over the previous slot's
+/// heartbeat committee votes.
+///
+/// Rooted at [`update_lagging_head`]'s output rather than at the justified
+/// checkpoint, so the two-tier structure is explicit: the lagging head is the
+/// tree base the full validator set backs, and the fast head is the fast-moving
+/// tip chosen within it.
+///
+/// `min_score = 0` is easy to misread. The GHOST walk descends while the current
+/// head has *any* child, picking `max_by_key(weight, root)`, so a freshly
+/// proposed block with zero votes still becomes head as long as it is the only
+/// child. The previous slot's committee votes do not *authorise* extension; they
+/// only break ties between competing branches. That is exactly what view-merge
+/// protects: without it, two nodes seeing different gossip could break the same
+/// tie differently.
 ///
 /// Returns the block set, block weights, and new head computed during the
 /// update so callers can render the fork choice tree without recomputing it.
@@ -66,18 +211,19 @@ pub fn update_head(store: &mut Store) -> HeadUpdate {
     let blocks = store
         .get_live_chain()
         .expect("get_live_chain should succeed");
-    let attestations = store.extract_latest_known_attestations();
     let old_head = store.head().expect("head block exists");
-    let latest_justified_root = store
-        .latest_justified()
-        .expect("latest justified checkpoint exists")
-        .root;
-    let (new_head, weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
-        latest_justified_root,
-        &blocks,
-        &attestations,
-        0,
-    );
+    let base = store.lagging_head().expect("lagging head exists");
+
+    // GHOST-Eph: the previous slot's committee votes, which the current slot's
+    // block just delivered. The window widens on an empty slot (see
+    // `heartbeat_votes_expanding_back`); after RLMD_LOOKBACK_LIMIT slots of
+    // nothing it is empty and the fast head collapses to `base`.
+    let (attestations, window_slots) =
+        store.heartbeat_votes_expanding_back(store.current_slot(), RLMD_LOOKBACK_LIMIT);
+    metrics::observe_fast_head_window_slots(window_slots);
+
+    let (new_head, weights) =
+        ethlambda_fork_choice::compute_lmd_ghost_head(base, &blocks, &attestations, 0);
     if let Some(depth) = reorg_depth(old_head, new_head, store) {
         metrics::inc_fork_choice_reorgs();
         metrics::observe_fork_choice_reorg_depth(depth);
@@ -136,29 +282,75 @@ pub fn update_head(store: &mut Store) -> HeadUpdate {
     }
 }
 
-/// Update the safe target for attestation.
+/// Update the lagging head: the RLMD-window tree base the fast head sits on.
 ///
-/// Safe target is an *availability* signal, not a durable-knowledge signal:
-/// only the "new" pool is considered. Migration from "new" to "known" runs at
-/// interval 4, strictly after this computation at interval 3. 3sf-mini chose
-/// that ordering deliberately so safe target sees only freshly received votes
-/// from the current slot and ignores what was carried over from earlier slots
-/// (block-included attestations, previously migrated gossip, self-attestations).
-/// Counting "known" would let a node keep advancing its safe target on stale
-/// evidence even when live participation has collapsed: exactly the failure
-/// mode safe target is supposed to prevent. See leanSpec PR #680.
-fn update_safe_target(store: &mut Store) {
-    let head_state = store
-        .get_state(&store.head().unwrap())
-        .expect("head state exists");
-    let num_validators = head_state.unwrap().validators.len() as u64;
+/// Recency-latest-message-driven, so it reads the latest message per validator
+/// over the half-open window `[S - N, S)` — excluding the current slot,
+/// including `S - 1`. The fast head's slot-`S-1` votes are therefore a subset of
+/// this window; that overlap is intended.
+///
+/// Both vote pools are merged. `min_score = ceil(2n/3)` is denominated in the
+/// full validator set, so the heartbeat pool alone could never reach it: the
+/// aggregate pool is what carries full-set weight, and dropping it would pin the
+/// lagging head to `latest_justified` forever.
+fn update_lagging_head(store: &mut Store) {
+    let current_slot = store.current_slot();
+    let window = current_slot.saturating_sub(RLMD_LOOKBACK_LIMIT)..current_slot;
+    let attestations = store.latest_message_per_validator(window);
 
-    let min_target_score = (num_validators * 2).div_ceil(3);
+    let num_validators = store.head_state().validators.len() as u64;
+    let min_target_score = (2 * num_validators).div_ceil(3);
 
     let blocks = store
         .get_live_chain()
         .expect("get_live_chain should succeed");
-    let attestations = store.extract_latest_new_attestations();
+    let (lagging_head, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
+        store
+            .latest_justified()
+            .expect("latest justified checkpoint exists")
+            .root,
+        &blocks,
+        &attestations,
+        min_target_score,
+    );
+    store
+        .set_lagging_head(lagging_head)
+        .expect("set_lagging_head should succeed");
+}
+
+/// Update the safe target for attestation.
+///
+/// Safe target is an *availability* signal, not a durable-knowledge signal, and
+/// under the heartbeat design it is backed by the committee rather than the full
+/// validator set. Two properties differ deliberately from the other two
+/// fork-choice values:
+///
+/// - **Current slot only.** No RLMD window, no expanding fallback. Its whole
+///   purpose is to say "this branch is backed *right now*", so evidence from
+///   slot `S-1` or earlier is not merely unhelpful, it is wrong: it would hold
+///   the clamp open on a branch the current committee has stopped voting for.
+///   Block import writes slot-`S-1` votes into the same store, so restricting to
+///   the current slot is also what keeps the block-merged copies out.
+/// - **3/4 of the committee, not 2/3.** At `K' = 16` the formulas separate
+///   (`ceil(2K'/3)` is 11, `ceil(3K'/4)` is 12). The clamp gates what every
+///   validator is allowed to target, so it asks for a strict supermajority.
+///
+/// When no branch clears the threshold, `compute_lmd_ghost_head` returns
+/// `start_root`, so the safe target falls back to `latest_justified` and the
+/// clamp degrades to "target the justified checkpoint" rather than doing
+/// something surprising. See leanSpec PR #680.
+fn update_safe_target(store: &mut Store) {
+    let attestations = store.heartbeat_votes_at(store.current_slot());
+
+    let num_validators = store.head_state().validators.len() as u64;
+    let committee_size =
+        effective_heartbeat_committee_size(store.heartbeat_committee_size(), num_validators);
+    metrics::update_heartbeat_committee_size(committee_size);
+    let min_target_score = (3 * committee_size).div_ceil(4);
+
+    let blocks = store
+        .get_live_chain()
+        .expect("get_live_chain should succeed");
     let (safe_target, _weights) = ethlambda_fork_choice::compute_lmd_ghost_head(
         store
             .latest_justified()
@@ -326,7 +518,8 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// Process a tick event.
 ///
 /// `store.time()` represents interval-count-since-genesis: each increment is one
-/// 800ms interval. Slot and interval-within-slot are derived as:
+/// [`MILLISECONDS_PER_INTERVAL`] interval. Slot and interval-within-slot are
+/// derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
@@ -358,10 +551,10 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         let should_signal_proposal = has_proposal && is_final_tick;
 
         // NOTE: here we assume on_tick never skips intervals.
-        // Interval 2 (committee-signature aggregation) is no longer handled here:
-        // the blockchain actor orchestrates the aggregation worker directly so
-        // the actor's message loop stays unblocked during the expensive XMSS
-        // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
+        // Committee-signature aggregation is not handled here: the blockchain
+        // actor orchestrates the aggregation worker directly so the actor's
+        // message loop stays unblocked during the expensive XMSS proofs. See
+        // `BlockChainServer::start_aggregation_session` in `lib.rs`.
         match interval {
             SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
@@ -372,15 +565,15 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             SlotInterval::AttestationProduction => {
                 // Vote propagation — no action
             }
-            SlotInterval::Aggregation => {
-                // Aggregation is driven by the actor (off-thread); nothing to do here.
-            }
             SlotInterval::SafeTargetUpdate => {
                 // Update safe target for validators
                 update_safe_target(store);
             }
             SlotInterval::EndOfSlot => {
-                // End of slot - accept accumulated attestations and log tree
+                // Recompute the tree base from the RLMD window, then the fast
+                // head on top of it, before promoting this slot's payloads and
+                // logging the resulting tree.
+                update_lagging_head(store);
                 let update = accept_new_attestations(store);
                 log_fork_choice_tree(store, &update);
             }
@@ -460,6 +653,115 @@ pub fn on_gossip_attestation(
         source_slot,
         source_root = %ShortRoot(&attestation.data.source.root.0),
         "Attestation processed"
+    );
+
+    Ok(())
+}
+
+/// Process a vote received on the global heartbeat topic.
+///
+/// Validation, in order:
+///
+/// 1. The existing topology / time / availability checks on the data.
+/// 2. XMSS verification against the validator's attestation pubkey in the state
+///    at `data.slot`.
+/// 3. Committee membership at `data.slot`. Without this the topic is an
+///    unmetered global attestation firehose.
+/// 4. `data.slot == current_slot` (within the gossip disparity margin).
+///    Heartbeat votes are only useful in-slot; older ones arrive via blocks.
+///
+/// On acceptance both the `AttestationData` and the raw signature are stored
+/// **unconditionally** — not gated on `is_aggregator`. A proposer that is not a
+/// committee aggregator still has to fold these signatures into its block, and it
+/// is at most `K'` signatures per slot.
+pub fn on_gossip_heartbeat_attestation(
+    store: &mut Store,
+    signed_attestation: &SignedAttestation,
+) -> Result<(), StoreError> {
+    let validator_id = signed_attestation.validator_id;
+    let data = signed_attestation.data.clone();
+
+    validate_attestation_data(store, &data).inspect_err(|_| metrics::inc_attestations_invalid())?;
+
+    // Heartbeat votes are in-slot only. Reject anything not for the current slot,
+    // allowing the same one-interval skew margin the data time check uses.
+    let current_slot = store.current_slot();
+    let slot_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
+    let too_old = data.slot < current_slot;
+    let too_new = slot_start_interval > store.time().unwrap() + GOSSIP_DISPARITY_INTERVALS;
+    if too_old || too_new {
+        metrics::inc_attestations_invalid();
+        return Err(StoreError::HeartbeatVoteOutOfSlot {
+            attestation_slot: data.slot,
+            current_slot,
+        });
+    }
+
+    let hashed = HashedAttestationData::new(data.clone());
+    let data_root = hashed.root();
+
+    // The state at the vote's own slot decides both the pubkey and the committee,
+    // so both reads agree by construction. `target.root`'s state is the closest
+    // available state at or before `data.slot`; only empty slots can lie between,
+    // so the registry is identical.
+    let target_state = store
+        .get_state(&data.target.root)
+        .expect("target state exists")
+        .ok_or(StoreError::MissingTargetState(data.target.root))?;
+    let num_validators = target_state.validators.len() as u64;
+    if validator_id >= num_validators {
+        return Err(StoreError::AttesterIndexOutOfRange {
+            validator_index: validator_id,
+            num_validators,
+        });
+    }
+
+    if !is_heartbeat_committee_member(
+        validator_id,
+        data.slot,
+        num_validators,
+        store.heartbeat_committee_size(),
+    ) {
+        metrics::inc_attestations_invalid();
+        return Err(StoreError::NotHeartbeatCommitteeMember {
+            validator_id,
+            slot: data.slot,
+        });
+    }
+
+    let validator_pubkey = ValidatorPublicKey::from_bytes(
+        &target_state.validators[validator_id as usize].attestation_pubkey,
+    )
+    .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+
+    let slot_u32: u32 = data.slot.try_into().expect("slot exceeds u32");
+    let signature = ValidatorSignature::from_bytes(&signed_attestation.signature)
+        .map_err(|_| StoreError::SignatureDecodingFailed)?;
+    let is_valid = {
+        let _timing = metrics::time_pq_sig_attestation_verification();
+        signature.is_valid(&validator_pubkey, slot_u32, &data_root)
+    };
+    if !is_valid {
+        metrics::inc_pq_sig_attestation_signatures_invalid();
+        return Err(StoreError::SignatureVerificationFailed);
+    }
+    metrics::inc_pq_sig_attestation_signatures_valid();
+
+    store.insert_heartbeat_vote(validator_id, data.clone());
+    store.insert_heartbeat_signature(data.slot, data_root, validator_id, signature);
+    metrics::inc_heartbeat_votes_received(metrics::HeartbeatVoteSource::Gossip);
+    metrics::update_heartbeat_committee_participation(
+        store.heartbeat_voter_count_at(data.slot) as u64
+    );
+
+    info!(
+        slot = data.slot,
+        validator = validator_id,
+        target_slot = data.target.slot,
+        target_root = %ShortRoot(&data.target.root.0),
+        source_slot = data.source.slot,
+        source_root = %ShortRoot(&data.source.root.0),
+        "Heartbeat attestation processed"
     );
 
     Ok(())
@@ -673,6 +975,12 @@ fn on_block_core(
 
     let block = signed_block.message.clone();
 
+    // Registry size as of the committee's own slot. The parent state is the
+    // closest state at or before `block.slot - 1`, and only empty slots can lie
+    // between them, so the registry cannot have changed in the gap. Captured
+    // before `parent_state` is consumed by the state transition.
+    let cttee_num_validators = parent_state.validators.len() as u64;
+
     // Execute state transition function to compute post-block state
     let state_transition_start = std::time::Instant::now();
     let mut post_state = parent_state;
@@ -712,6 +1020,12 @@ fn on_block_core(
     // (symmetric with `inc_attestations_invalid`), matching leanSpec. Votes
     // arriving inside a block are counted by
     // `lean_state_transition_attestations_processed_total` instead.
+
+    // View-merge: fold the block's slot-(T-1) committee bits into the heartbeat
+    // vote set before fork choice reads it. After the STF (so a rejected block
+    // never contributes) and before `update_head` (so this slot's fast head sees
+    // the payload the proposer just delivered).
+    merge_heartbeat_votes(store, &block.body, slot, cttee_num_validators);
 
     // Update forkchoice head based on new block and attestations
     update_head(store);
@@ -930,6 +1244,12 @@ pub fn produce_block_with_signatures(
     }
 
     // Get known aggregated payloads: data_root -> (AttestationData, Vec<proof>)
+    //
+    // The heartbeat-folded aggregate needs no special handling here: the fold runs
+    // as an ordinary interval-2 aggregation job, so its result was inserted into
+    // `new_payloads` at the interval-2 boundary and promoted to `known_payloads`
+    // by the promote above. It reaches the builder as one candidate among many,
+    // and `Tier::Heartbeat` is what makes it win.
     let aggregated_payloads = store.known_aggregated_payloads();
 
     let known_block_roots = store.get_block_roots().unwrap();
@@ -1080,6 +1400,17 @@ pub enum StoreError {
         attestation_slot: u64,
         store_time: u64,
     },
+
+    #[error(
+        "heartbeat vote for slot {attestation_slot} is not for the current slot {current_slot}"
+    )]
+    HeartbeatVoteOutOfSlot {
+        attestation_slot: u64,
+        current_slot: u64,
+    },
+
+    #[error("validator {validator_id} is not in the heartbeat committee for slot {slot}")]
+    NotHeartbeatCommitteeMember { validator_id: u64, slot: u64 },
 
     #[error("Aggregated signature verification failed: {0}")]
     AggregateVerificationFailed(ethlambda_crypto::VerificationError),
@@ -1310,6 +1641,141 @@ mod tests {
             bits.set(i, true).unwrap();
         }
         bits
+    }
+
+    // ============ Heartbeat Vote Extraction Tests ============
+
+    /// `n = 8, K = 4`, so the committee for slot 7 is `{7, 0, 1, 2}` and the
+    /// committee for slot 6 is `{6, 7, 0, 1}`.
+    const HB_VALIDATORS: u64 = 8;
+    const HB_COMMITTEE: u64 = 4;
+
+    fn hb_data(slot: u64, target_marker: u8) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint::default(),
+            target: Checkpoint {
+                root: H256([target_marker; 32]),
+                slot,
+            },
+            source: Checkpoint::default(),
+        }
+    }
+
+    /// A body carrying one entry per `(slot, signers, target_marker)` triple.
+    fn hb_body(entries: &[(u64, &[usize], u8)]) -> BlockBody {
+        let attestations: Vec<AggregatedAttestation> = entries
+            .iter()
+            .map(|(slot, signers, marker)| AggregatedAttestation {
+                aggregation_bits: make_bits(signers),
+                data: hb_data(*slot, *marker),
+            })
+            .collect();
+        BlockBody {
+            attestations: AggregatedAttestations::try_from(attestations).unwrap(),
+        }
+    }
+
+    #[test]
+    fn extraction_keeps_committee_members_and_drops_outsiders() {
+        // Block slot 8 -> committee slot 7 -> committee {7, 0, 1, 2}.
+        // Signers 3, 4, 5 are outsiders.
+        let body = hb_body(&[(7, &[0, 1, 3, 4, 7], 0xAA)]);
+        let votes = extract_heartbeat_votes(&body, 8, HB_VALIDATORS, HB_COMMITTEE);
+
+        let mut extracted: Vec<u64> = votes.iter().map(|(vid, _)| *vid).collect();
+        extracted.sort_unstable();
+        assert_eq!(extracted, vec![0, 1, 7], "outsider bits must be ignored");
+    }
+
+    #[test]
+    fn extraction_gate_is_strictly_the_previous_slot() {
+        // Entries for slot 6 and slot 8 must both be ignored by a slot-8 block:
+        // only slot 7 is the committee slot. This is the exact mirror of the
+        // packer's `Tier::Heartbeat` gate.
+        let body = hb_body(&[(6, &[6, 7, 0], 0xAA), (7, &[7, 0], 0xBB), (8, &[0], 0xCC)]);
+        let votes = extract_heartbeat_votes(&body, 8, HB_VALIDATORS, HB_COMMITTEE);
+
+        assert_eq!(votes.len(), 2);
+        assert!(
+            votes.iter().all(|(_, data)| data.slot == 7),
+            "only the committee slot's entries are heartbeat votes"
+        );
+    }
+
+    #[test]
+    fn extraction_survives_a_skipped_slot_without_widening() {
+        // A block at slot 12 built after slots 8..11 were skipped still gates on
+        // exactly 11, carrying nothing rather than reaching back for evidence.
+        // Degrading on a missed slot is the fast head's job, not the packer's.
+        let body = hb_body(&[(7, &[7, 0, 1], 0xAA)]);
+        assert!(
+            extract_heartbeat_votes(&body, 12, HB_VALIDATORS, HB_COMMITTEE).is_empty(),
+            "no window and no fallback"
+        );
+    }
+
+    #[test]
+    fn extraction_ignores_genesis_adjacent_blocks() {
+        let body = hb_body(&[(0, &[0], 0xAA)]);
+        assert!(extract_heartbeat_votes(&body, 0, HB_VALIDATORS, HB_COMMITTEE).is_empty());
+    }
+
+    #[test]
+    fn extraction_does_not_apply_the_reaggregate_filters() {
+        // `reaggregate::select_candidates` drops attestations whose target is
+        // already justified, skips participants already covered locally, and
+        // truncates to a per-block maximum. Those filters are right for deciding
+        // what is worth a SNARK split and wrong here: the fast head needs the
+        // `head` field of every committee vote regardless. Extraction is a plain
+        // read of the body, so a target at slot 0 (trivially justified) and a
+        // large entry count both come through untouched.
+        let body = hb_body(&[(7, &[7, 0, 1, 2], 0)]);
+        let votes = extract_heartbeat_votes(&body, 8, HB_VALIDATORS, HB_COMMITTEE);
+        assert_eq!(
+            votes.len(),
+            4,
+            "an already-justified target must still be extracted"
+        );
+
+        // Many distinct datas for the same committee slot: no cap is applied.
+        let many: Vec<(u64, &[usize], u8)> = (0..32).map(|i| (7, &[7, 0][..], i as u8)).collect();
+        let body = hb_body(&many);
+        let votes = extract_heartbeat_votes(&body, 8, HB_VALIDATORS, HB_COMMITTEE);
+        assert_eq!(votes.len(), 64, "no truncation on the fork-choice path");
+    }
+
+    #[test]
+    fn block_votes_union_with_gossip_and_win_on_conflict() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        let genesis_state = State::from_genesis(1000, vec![]);
+        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), genesis_state);
+
+        // Gossip delivered validator 0 (conflicting data) and validator 1 (which
+        // the block will not mention at all).
+        store.insert_heartbeat_vote(0, hb_data(7, 0x11));
+        store.insert_heartbeat_vote(1, hb_data(7, 0x11));
+
+        // The block carries validators 0 and 7 with different data.
+        let body = hb_body(&[(7, &[0, 7], 0x22)]);
+        merge_heartbeat_votes(&store, &body, 8, HB_VALIDATORS);
+
+        let votes = store.heartbeat_votes_at(7);
+        assert_eq!(votes.len(), 3, "union, not replacement");
+        assert_eq!(
+            votes[&0].target.root,
+            H256([0x22; 32]),
+            "block wins the conflict"
+        );
+        assert_eq!(
+            votes[&1].target.root,
+            H256([0x11; 32]),
+            "a gossip-only validator keeps its vote, so a byzantine proposer \
+             cannot blank the fast head's evidence"
+        );
+        assert_eq!(votes[&7].target.root, H256([0x22; 32]));
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use serde::Deserialize;
 
-use crate::state::{State, Validator, ValidatorPubkeyBytes};
+use crate::{
+    constants::{DEFAULT_HEARTBEAT_COMMITTEE_SIZE, MAX_HEARTBEAT_COMMITTEE_SIZE},
+    state::{State, Validator, ValidatorPubkeyBytes},
+};
 
 /// Ways a state can fail to belong to the configured genesis.
 ///
@@ -34,8 +37,51 @@ pub struct GenesisValidatorEntry {
 pub struct GenesisConfig {
     #[serde(rename = "GENESIS_TIME")]
     pub genesis_time: u64,
+    /// Heartbeat committee size, network-wide.
+    ///
+    /// Read from the genesis config rather than a CLI flag on purpose:
+    /// committee membership decides which bits of an imported block are
+    /// heartbeat votes, so two nodes disagreeing about it is a fork-choice
+    /// divergence. A per-node flag makes that a one-node misconfiguration; a
+    /// genesis value makes it impossible within a network.
+    ///
+    /// Optional so existing configs keep loading at
+    /// [`DEFAULT_HEARTBEAT_COMMITTEE_SIZE`].
+    #[serde(
+        rename = "HEARTBEAT_COMMITTEE_SIZE",
+        default = "default_heartbeat_committee_size",
+        deserialize_with = "deser_heartbeat_committee_size"
+    )]
+    pub heartbeat_committee_size: u64,
     #[serde(rename = "GENESIS_VALIDATORS")]
     pub genesis_validators: Vec<GenesisValidatorEntry>,
+}
+
+fn default_heartbeat_committee_size() -> u64 {
+    DEFAULT_HEARTBEAT_COMMITTEE_SIZE
+}
+
+/// Reject `0` (an empty committee makes every heartbeat threshold vacuous) and
+/// absurd sizes at load time, rather than letting them surface as a silently
+/// stalled safe target.
+fn deser_heartbeat_committee_size<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let size = u64::deserialize(d)?;
+    if size == 0 {
+        return Err(D::Error::custom(
+            "HEARTBEAT_COMMITTEE_SIZE must be at least 1",
+        ));
+    }
+    if size > MAX_HEARTBEAT_COMMITTEE_SIZE {
+        return Err(D::Error::custom(format!(
+            "HEARTBEAT_COMMITTEE_SIZE is {size} (maximum {MAX_HEARTBEAT_COMMITTEE_SIZE})"
+        )));
+    }
+    Ok(size)
 }
 
 impl GenesisConfig {
@@ -190,6 +236,68 @@ GENESIS_VALIDATORS:
         assert_eq!(
             config.genesis_validators[2].proposal_pubkey,
             hex::decode(PROP_PUBKEY_C).unwrap().as_slice()
+        );
+    }
+
+    /// A minimal config with one validator, so the heartbeat tests can vary only
+    /// the `HEARTBEAT_COMMITTEE_SIZE` line.
+    fn config_yaml_with(heartbeat_line: &str) -> String {
+        format!(
+            r#"GENESIS_TIME: 1770407233
+{heartbeat_line}
+GENESIS_VALIDATORS:
+    - attestation_pubkey: "{ATT_PUBKEY_A}"
+      proposal_pubkey: "{PROP_PUBKEY_A}"
+"#
+        )
+    }
+
+    #[test]
+    fn heartbeat_committee_size_defaults_when_absent() {
+        let config: GenesisConfig = serde_yaml_ng::from_str(&config_yaml_with("")).unwrap();
+        assert_eq!(
+            config.heartbeat_committee_size,
+            DEFAULT_HEARTBEAT_COMMITTEE_SIZE
+        );
+        // And the pre-existing fixture, which has no such key, still loads.
+        let legacy: GenesisConfig = serde_yaml_ng::from_str(TEST_CONFIG_YAML).unwrap();
+        assert_eq!(
+            legacy.heartbeat_committee_size,
+            DEFAULT_HEARTBEAT_COMMITTEE_SIZE
+        );
+    }
+
+    #[test]
+    fn heartbeat_committee_size_is_read_when_present() {
+        let config: GenesisConfig =
+            serde_yaml_ng::from_str(&config_yaml_with("HEARTBEAT_COMMITTEE_SIZE: 32")).unwrap();
+        assert_eq!(config.heartbeat_committee_size, 32);
+    }
+
+    #[test]
+    fn heartbeat_committee_size_rejects_zero() {
+        // An empty committee makes every heartbeat threshold vacuous, so this must
+        // fail at load rather than surface as a silently stalled safe target.
+        let err = serde_yaml_ng::from_str::<GenesisConfig>(&config_yaml_with(
+            "HEARTBEAT_COMMITTEE_SIZE: 0",
+        ))
+        .expect_err("zero committee size must be rejected");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_committee_size_rejects_absurd_values() {
+        let too_big = MAX_HEARTBEAT_COMMITTEE_SIZE + 1;
+        let err = serde_yaml_ng::from_str::<GenesisConfig>(&config_yaml_with(&format!(
+            "HEARTBEAT_COMMITTEE_SIZE: {too_big}"
+        )))
+        .expect_err("oversized committee size must be rejected");
+        assert!(
+            err.to_string().contains("maximum"),
+            "unexpected error: {err}"
         );
     }
 

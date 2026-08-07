@@ -245,6 +245,57 @@ pub fn is_proposer(validator_index: u64, slot: u64, num_validators: u64) -> bool
     current_proposer(slot, num_validators) == Some(validator_index)
 }
 
+/// Effective heartbeat committee size: the configured size clamped to the
+/// registry, `K' = min(K, n)`.
+///
+/// Load-bearing rather than defensive. The committee is built by walking
+/// `K` steps round-robin from the proposer, so once `K > n` each validator is
+/// picked `ceil(K / n)` times and the *set* is just the whole registry. A
+/// threshold denominated in the raw `K` — `ceil(3K/4)` for the safe target —
+/// would then demand more votes than there are validators to cast them, and the
+/// safe target would pin to `latest_justified` forever. At the default `K = 16`
+/// that is not hypothetical: local devnets and the spec fixtures routinely run
+/// `n <= 16`.
+///
+/// Every heartbeat threshold must be denominated in this value, never in `K`.
+pub fn effective_heartbeat_committee_size(committee_size: u64, num_validators: u64) -> u64 {
+    committee_size.min(num_validators)
+}
+
+/// Check if a validator is part of the heartbeat committee for a given slot.
+///
+/// The committee for `slot` is the proposer plus the next `K' - 1` validators,
+/// round-robin:
+///
+/// ```text
+/// proposer(slot) = slot % n
+/// committee      = { (p + i) mod n : 0 <= i < K' },  p = proposer(slot)
+/// ```
+///
+/// Membership is consumed both by heartbeat gossip admission and by the
+/// fork-choice extraction that runs on every node over every block, so two
+/// nodes disagreeing here disagree about which bits of a block are heartbeat
+/// votes. `num_validators` must therefore always come from the state at the
+/// vote's *own* slot, never from the head state.
+pub fn is_heartbeat_committee_member(
+    validator_index: u64,
+    slot: u64,
+    num_validators: u64,
+    committee_size: u64,
+) -> bool {
+    let Some(proposer) = current_proposer(slot, num_validators) else {
+        return false;
+    };
+    if validator_index >= num_validators {
+        return false;
+    }
+    // Distance from the proposer walking forward round-robin. Membership is
+    // that distance falling inside the effective committee width, which is the
+    // closed form of the `(p + i) mod n` set-builder above.
+    let offset = (validator_index + num_validators - proposer) % num_validators;
+    offset < effective_heartbeat_committee_size(committee_size, num_validators)
+}
+
 /// Apply attestations and update justification/finalization
 /// according to the Lean Consensus 3SF-mini rules.
 fn process_attestations(
@@ -654,6 +705,78 @@ mod tests {
         state::{ChainConfig, JustifiedSlots, State, Validator},
     };
     use libssz_types::SszList;
+
+    /// Collect the heartbeat committee for `slot` by asking the predicate about
+    /// every validator, so the tests exercise exactly what callers call.
+    fn committee(slot: u64, num_validators: u64, committee_size: u64) -> Vec<u64> {
+        (0..num_validators)
+            .filter(|vid| is_heartbeat_committee_member(*vid, slot, num_validators, committee_size))
+            .collect()
+    }
+
+    #[test]
+    fn committee_is_proposer_plus_next_k_minus_one() {
+        // n = 64, K = 16, slot 100 -> proposer 36, committee {36..=51}.
+        assert_eq!(committee(100, 64, 16), (36..=51).collect::<Vec<_>>());
+        // Slot 101 shifts by exactly one.
+        assert_eq!(committee(101, 64, 16), (37..=52).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn committee_wraps_around_the_registry() {
+        // Proposer 60 with K = 8 wraps past the end: {60..=63} ∪ {0..=3}.
+        let mut expected: Vec<u64> = (60..=63).collect();
+        expected.extend(0..=3);
+        expected.sort_unstable();
+        assert_eq!(committee(60, 64, 8), expected);
+    }
+
+    #[test]
+    fn committee_at_or_above_registry_size_is_everyone() {
+        // K == n and K > n both collapse to the whole registry, for every slot.
+        for slot in 0..20 {
+            assert_eq!(committee(slot, 16, 16), (0..16).collect::<Vec<_>>());
+            assert_eq!(committee(slot, 16, 64), (0..16).collect::<Vec<_>>());
+            assert_eq!(committee(slot, 8, 16), (0..8).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn committee_handles_degenerate_registries() {
+        // Single validator: always the whole committee.
+        assert_eq!(committee(0, 1, 16), vec![0]);
+        assert_eq!(committee(7, 1, 16), vec![0]);
+        // Empty registry: nobody, and no division by zero.
+        assert!(!is_heartbeat_committee_member(0, 5, 0, 16));
+        // Out-of-range index is never a member.
+        assert!(!is_heartbeat_committee_member(64, 0, 64, 16));
+    }
+
+    #[test]
+    fn effective_committee_size_keeps_thresholds_reachable() {
+        // The regression this guards: a threshold denominated in the raw K would
+        // demand more votes than there are validators, pinning the safe target to
+        // latest_justified forever.
+        for num_validators in [1u64, 4, 8, 16, 64] {
+            for configured in [1u64, 4, 16, 64, 4096] {
+                let effective = effective_heartbeat_committee_size(configured, num_validators);
+                assert!(
+                    effective <= num_validators,
+                    "K'={effective} exceeds n={num_validators}"
+                );
+                let threshold = (3 * effective).div_ceil(4);
+                assert!(
+                    threshold <= num_validators,
+                    "ceil(3K'/4)={threshold} unreachable at n={num_validators}"
+                );
+                // And it really is the size of the set the predicate yields.
+                assert_eq!(
+                    committee(0, num_validators, configured).len() as u64,
+                    effective
+                );
+            }
+        }
+    }
 
     fn make_validators(n: usize) -> Vec<Validator> {
         (0..n)
