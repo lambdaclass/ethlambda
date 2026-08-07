@@ -351,40 +351,24 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 - Signature spec tests use `on_block()` which always verifies
 - Crypto tests marked `#[ignore]` (slow leanVM operations)
 
-### Storage Architecture
-- Blocks are split into three tables: `BlockHeaders`, `BlockBodies`, `BlockSignatures`
-- Genesis/anchor blocks have empty bodies (detected via `EMPTY_BODY_ROOT`) — no entry in `BlockBodies`
-- Genesis block has no signatures — no entry in `BlockSignatures`
-- Non-genesis blocks have a `BlockSignatures` entry until finalized: once below the
-  finalized boundary, signatures are pruned (`prune_old_block_signatures`) while
-  headers and bodies are kept forever. `get_signed_block` returns `None` for a
-  pruned finalized block
-- States are stored as parent-linked diffs (`StateDiffs`, never pruned) plus
-  full-state snapshots (`States`) written only at 1024-slot anchors (and the
-  bootstrap). Neither is ever pruned. `get_state` returns an anchor snapshot or
-  reconstructs by walking diffs back to the nearest anchor; results are memoized
-  in an in-memory LRU (`STATE_CACHE_CAPACITY`) so recent reads stay hot
-- `LiveChain` table provides fast `(slot||root) → parent_root` index for fork choice
-- Storage uses trait-based API: `StorageBackend` → `StorageReadView` (reads) + `StorageWriteBatch` (atomic writes)
+### Storage
 
-### Storage Tables (7)
+Blocks split across `BlockHeaders`/`BlockBodies`/`BlockProof`; states are
+snapshot (`States`) + diff (`StateDiffs`) pairs; `BlockRoots` and `LiveChain`
+index by slot for range serving and fork choice. Attestations and gossip
+signatures are not persisted; they live in in-memory `Store` buffers consumed
+during the tick pipeline. See [`docs/data_storage.md`](docs/data_storage.md)
+for the full reference: what each of the eight tables holds and how it's
+keyed, the snapshot/diff reconstruction algorithm, the block-import write
+sequence, pruning rules, what never changes at runtime, and startup/restore
+behavior.
 
-These are the variants of the `Table` enum (`crates/storage/src/api/tables.rs`).
-
-| Table | Key → Value | Purpose |
-|-------|-------------|---------|
-| `BlockHeaders` | H256 → BlockHeader | Block headers by root |
-| `BlockBodies` | H256 → BlockBody | Block bodies (empty for genesis) |
-| `BlockSignatures` | (slot\|\|root) → BlockSignatures | Type-2 proof blob; keyed slot\|\|root so pruning scans in slot order and stops early; absent for genesis, pruned below finalized |
-| `States` | H256 → State | Full-state snapshots; bootstrap + 1024-slot anchors only; never pruned |
-| `StateDiffs` | H256 → StateDiff | Parent-linked state diff per non-genesis state; never pruned |
-| `Metadata` | string → various | Store state (head, config, checkpoints) |
-| `LiveChain` | (slot\|\|root) → parent\_root | Fast fork choice traversal index |
-
-Attestations and gossip signatures are **not** persisted tables; they live in
-in-memory `Store` buffers (`new_payloads`, `known_payloads`, `gossip_signatures`)
-and are consumed during the tick pipeline (promotion at intervals 0/4,
-aggregation at interval 2).
+- `BlockProof` is the only pruned block table (below the finalized
+  boundary); `get_signed_block` returns `None` for a pruned finalized block.
+- A `StateDiff` omits `config` and `validators`, trusting they never mutate;
+  breaking that invariant would silently corrupt every reconstructed state.
+- `Metadata["config"]` is written once at bootstrap and never rewritten; it
+  doubles as the DB's genesis-time fingerprint on resume.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition
