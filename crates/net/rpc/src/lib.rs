@@ -460,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
-            block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
+            block::{Block, BlockBody, BlockProof, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
         };
@@ -484,7 +484,7 @@ mod tests {
         let block_root = block.header().hash_tree_root();
         let signed_block = SignedBlock {
             message: block,
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
@@ -528,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_proof() {
-        use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
+        use ethlambda_types::block::{BlockProof, SignedBlock};
         use libssz::SszEncode;
 
         // Genesis-anchored store: `init_store` writes the header + state but no
@@ -553,7 +553,7 @@ mod tests {
             .unwrap();
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         let expected_ssz = expected.to_ssz();
 
