@@ -1,5 +1,12 @@
 mod codec;
-mod encoding;
+/// The beacon-chain `ssz_snappy` request/response framing: a varint
+/// uncompressed-length prefix followed by a snappy *frame*-compressed payload.
+///
+/// Public because it is the spec's wire format rather than anything specific to
+/// lean's message set, so a client speaking a different set of req/resp
+/// protocols over the same framing can reuse it. `examples/mainnet_gossip.rs`
+/// does exactly that.
+pub mod encoding;
 pub mod handlers;
 mod messages;
 

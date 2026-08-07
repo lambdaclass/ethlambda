@@ -79,11 +79,20 @@ Dialing stops once 16 peers are connected, and resumes if that drops.
 
 ## Bootnodes
 
-Bootnode ENRs are still dialed statically over QUIC exactly as before, whether
-or not discovery is on. A bootnode additionally seeds the discv5 routing table
-only if its ENR advertises a `udp` port. The ENRs `lean-quickstart` generates
-today carry only `ip`/`quic`/`secp256k1`, so they remain reachable but
-contribute nothing to discovery.
+The two entries a bootnode ENR can carry are read independently, because they
+answer different questions:
+
+| Entry | Absent means |
+| --- | --- |
+| `quic` | Not dialed statically by `build_swarm`; discv5 seed only |
+| `udp` | Not seeded into the discv5 routing table; static dial target only |
+
+Neither absence is an error, and a record carrying just one of them is still
+kept. The ENRs `lean-quickstart` generates today carry `ip`/`quic`/`secp256k1`
+and no `udp`, so they stay reachable but contribute nothing to discovery. Every
+beacon-chain bootnode published today is the mirror image: `ip`/`udp`/`tcp` and
+no `quic`, usable as a discv5 seed but never dialed. A record with neither is
+dropped with a warning, as is one missing an `ip` or a `secp256k1` key.
 
 The ENR reported by `GET /lean/v0/node/identity` is only useful to a peer if
 the node that published it was started with a real `--discovery.advertise-ip`.
@@ -92,6 +101,50 @@ list produces a `udp`/`quic` target that cannot be dialed, since `0.0.0.0`
 names no reachable host. Set `--discovery.advertise-ip` before pointing other
 nodes at this one's ENR: `127.0.0.1` on a local devnet, or the host's public
 address otherwise.
+
+## Probing a live network
+
+`cargo run -p ethlambda-p2p --example discv5_probe -- --network mainnet` joins a
+discv5 network and reports every contact it finds and what [admission](#which-peers-get-dialed)
+says about it, without dialing anything. It drives the same `parse_enrs` →
+`spawn_discovery` → `get_contacts_to_initiate` path a real node does, so it
+separates "the discv5 stack is broken" from "the discv5 stack works and these
+peers are correctly refused". Pass `--enrs <file>` for a network other than
+mainnet; one ENR per line, with `- ` prefixes and `#` comments tolerated.
+
+Against Ethereum mainnet it reaches ~1300 contacts in 60 seconds, ~250 of them
+with a full ENR, and admits none of them. The digests it reports are a useful
+sanity check that the crawl is real: the plurality carry mainnet's current
+`8c9f62fe` (Fulu + the epoch-419072 blob-schedule fork), a tail carry
+`ad532ceb` (Electra) or the long-stale `b5303f2a` (phase0, from bootnode
+records never re-published), and roughly half carry no `eth2` entry at all —
+those are execution-layer nodes, which share the DHT and answer FINDNODE just
+the same.
+
+### Proving the discovered peers are real
+
+`cargo run -p ethlambda-p2p --example mainnet_gossip --profile release-fast`
+takes the same crawl one step further: it dials the mainnet consensus clients
+it finds, completes the beacon `Status` handshake, subscribes to
+`/eth2/<digest>/beacon_block/ssz_snappy`, and snappy-decompresses the first
+block that arrives. Typical run: a block within ~30 seconds of startup, one
+second after its own slot, from two connected peers and one mesh slot.
+
+That binary is a probe, not a second client mode. Its `/eth2/…` topic names,
+beacon req/resp protocol ids and `Status` handshake are mainnet's, not lean's,
+and none of it belongs in `P2PServer`. What it *does* share with the node is
+the part worth testing against a hostile-by-default real network: discv5,
+ENR parsing and verification, and the `ssz_snappy` framing. It never publishes
+and never claims a chain of its own.
+
+Two details are worth copying if lean ever meets a real network:
+
+- The fork digest is learned by plurality vote over discovered ENRs rather than
+  hardcoded, so a fork does not strand the probe. Bootnode records are poor
+  witnesses here: mainnet's still advertise the phase0 digest.
+- Gossip message ids follow Altair's function, which inserts the topic length
+  and topic bytes between the domain and the payload. Phase0's shorter form
+  produces ids no peer agrees with, which breaks IWANT/IHAVE silently.
 
 ## Known limitations
 

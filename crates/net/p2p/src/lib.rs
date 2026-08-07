@@ -57,7 +57,7 @@ use crate::{
 pub mod discovery;
 mod gossipsub;
 pub mod metrics;
-mod req_resp;
+pub mod req_resp;
 pub(crate) mod swarm_adapter;
 
 pub use libp2p::PeerId;
@@ -320,9 +320,15 @@ pub fn build_swarm(
         if peer_id == local_peer_id {
             continue;
         }
+        // Discovery-only seed: reachable over discv5, but with no QUIC port
+        // there is nothing for the swarm to dial.
+        let Some(quic_port) = bootnode.quic_port else {
+            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no quic port, discv5 seed only");
+            continue;
+        };
         let addr = Multiaddr::empty()
             .with(bootnode.ip.into())
-            .with(Protocol::Udp(bootnode.quic_port))
+            .with(Protocol::Udp(quic_port))
             .with(Protocol::QuicV1)
             .with_p2p(peer_id)
             .expect("failed to add peer ID to multiaddr");
@@ -858,7 +864,13 @@ pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<Pee
 
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
-    pub(crate) quic_port: u16,
+    /// The libp2p QUIC port, when the ENR advertises one.
+    ///
+    /// `None` for records that are discv5-reachable but speak no transport we
+    /// have: every beacon-chain bootnode published today advertises `tcp` and
+    /// `udp` but no `quic`. Such a bootnode still seeds the discv5 routing
+    /// table; it just is never dialed statically.
+    pub(crate) quic_port: Option<u16>,
     /// The discv5 UDP port, when the ENR advertises one.
     ///
     /// `None` for the ENRs lean-quickstart generates today, which carry only
@@ -918,14 +930,21 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     let record = NodeRecord::decode(&decoded).map_err(|err| format!("RLP decode failed: {err}"))?;
     let pairs = record.pairs();
 
+    // A record with no `quic` entry is not an error: it is discv5-reachable but
+    // speaks no transport we have, which is exactly what every beacon-chain
+    // bootnode looks like. Keep it as a discovery seed and let `build_swarm`
+    // skip it when it picks static dial targets.
     let quic_port = pairs
         .other
         .iter()
         .find(|(key, _)| key.as_ref() == b"quic")
-        .ok_or_else(|| "node doesn't support QUIC".to_string())
-        .and_then(|(_, value)| {
+        .map(|(_, value)| {
             u16::decode(value.as_ref()).map_err(|err| format!("bad quic port: {err}"))
-        })?;
+        })
+        .transpose()?
+        // An absent entry RLP-decodes to 0 via left-padding, and 0 is
+        // undialable either way, so both collapse to "no quic port".
+        .filter(|port| *port != 0);
 
     let public_key_bytes = pairs
         .secp256k1
@@ -940,6 +959,13 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
         .map(IpAddr::from)
         .or_else(|| pairs.ip6.map(IpAddr::from))
         .ok_or_else(|| "node record missing IP address".to_string())?;
+
+    // `quic` and `udp` are independently optional, but a record with neither is
+    // reachable by nothing we speak: it can be neither dialed nor seeded. Drop
+    // it here rather than carry a contact that no code path can ever use.
+    if quic_port.is_none() && pairs.udp_port.is_none() {
+        return Err("node advertises neither a quic nor a udp port".to_string());
+    }
 
     Ok(Bootnode {
         ip,
@@ -1112,10 +1138,10 @@ mod tests {
         }
 
         // Each ENR encodes a distinct QUIC port
-        assert_eq!(bootnodes[0].quic_port, 9001);
-        assert_eq!(bootnodes[1].quic_port, 9002);
-        assert_eq!(bootnodes[2].quic_port, 9003);
-        assert_eq!(bootnodes[3].quic_port, 9007);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
+        assert_eq!(bootnodes[1].quic_port, Some(9002));
+        assert_eq!(bootnodes[2].quic_port, Some(9003));
+        assert_eq!(bootnodes[3].quic_port, Some(9007));
 
         // Verify the secp256k1 public keys (33-byte compressed format)
         let expected_pubkeys: Vec<[u8; 33]> = vec![
@@ -1193,8 +1219,33 @@ mod tests {
 
         assert_eq!(bootnodes.len(), 1);
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
-        assert_eq!(bootnodes[0].quic_port, 9001);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
         assert_eq!(bootnodes[0].udp_port, Some(9010));
+    }
+
+    #[test]
+    fn parse_enrs_keeps_a_quic_less_record_as_a_discovery_seed() {
+        // Some nodes advertise `tcp` and `udp` but no `quic`, so requiring
+        // `quic` here would drop the entire mainnet bootstrap list and leave
+        // discv5 with nothing to seed from. Such a record is kept, with
+        // `quic_port: None` telling `build_swarm` not to dial it.
+        //
+        // The two ENRs are from eth-clients/mainnet's `bootstrap_nodes.yaml`.
+        let enrs = vec![
+            "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo".to_string(),
+            "enr:-Le4QPUXJS2BTORXxyx2Ia-9ae4YqA_JWX3ssj4E_J-3z1A-HmFGrU8BpvpqhNabayXeOZ2Nq_sbeDgtzMJpLLnXFgAChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISsaa0Zg2lwNpAkAIkHAAAAAPA8kv_-awoTiXNlY3AyNTZrMaEDHAD2JKYevx89W0CcFJFiskdcEzkH_Wdv9iW42qLK79ODdWRwgiMohHVkcDaCI4I".to_string(),
+        ];
+
+        let bootnodes = parse_enrs(enrs);
+
+        assert_eq!(bootnodes.len(), 2, "a quic-less ENR is still a valid seed");
+        for bootnode in &bootnodes {
+            assert_eq!(bootnode.quic_port, None);
+            // The whole point of keeping them: a `udp` port means discv5 can
+            // use them, which is what `as_discovery_node` reports.
+            assert_eq!(bootnode.udp_port, Some(9000));
+            assert!(bootnode.as_discovery_node().is_some());
+        }
     }
 
     #[test]
@@ -1215,7 +1266,7 @@ mod tests {
 
         assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
-        assert_eq!(bootnodes[0].quic_port, 9001);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
     }
 
     /// Build a signed ENR carrying `eth2` + (optionally) `quic` + `attnets`,
