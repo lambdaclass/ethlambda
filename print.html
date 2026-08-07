@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5077ab31.js";
+            window.path_to_searchindex_js = "searchindex-ee57cac9.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-274da26b.js"></script>
@@ -1698,7 +1698,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 <tbody>
 <tr><td><code>lean_block_aggregated_payloads</code></td><td>Histogram</td><td>Number of <code>aggregated_payloads</code> in a block</td><td>On block production</td><td></td><td>1, 2, 4, 8, 16, 32, 64, 128</td><td>✅</td></tr>
 <tr><td><code>lean_block_building_payload_aggregation_time_seconds</code></td><td>Histogram</td><td>Time taken to build <code>aggregated_payloads</code> during block building</td><td>On block production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4</td><td>✅</td></tr>
-<tr><td><code>lean_block_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build a block</td><td>On block production</td><td></td><td>0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1</td><td>✅</td></tr>
+<tr><td><code>lean_block_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build a block</td><td>On block production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 2, 4, 8</td><td>✅</td></tr>
 <tr><td><code>lean_block_building_success_total</code></td><td>Counter</td><td>Successful block builds</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_building_failures_total</code></td><td>Counter</td><td>Failed block builds (error building the block, signing the block root, or processing it locally)</td><td>On block production failure</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_attestation_build_phase_seconds</code></td><td>Histogram</td><td>Phase-level time in block-proposal attestation selection</td><td>On block production</td><td>phase=select_payloads,compact,stf_simulate</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td><td>✅</td></tr>
@@ -1709,6 +1709,13 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 </tbody>
 </table>
 </div>
+<blockquote>
+<p><code>lean_block_building_time_seconds</code> intentionally deviates from the leanMetrics bucket
+set, which tops out at 1s. Real builds on our devnets routinely run past that, so every
+sample landed in <code>+Inf</code> and <code>histogram_quantile</code> reported a flat 1s ceiling. The range
+now covers the same span as the <code>lean_block_proposal_attestation_build_phase_seconds</code>
+phases it contains.</p>
+</blockquote>
 <h2 id="fork-choice-metrics"><a class="header" href="#fork-choice-metrics">Fork-Choice Metrics</a></h2>
 <div class="table-wrapper">
 <table>
