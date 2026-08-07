@@ -14,6 +14,7 @@ use ethlambda_types::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
+    constants::INTERVALS_PER_SLOT,
     genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
     state::{ChainConfig, State, anchor_pair_is_consistent},
@@ -817,9 +818,8 @@ impl Store {
 
     /// Returns the current store time in interval counts since genesis.
     ///
-    /// Each increment represents one 800ms interval. Derive slot/interval as:
-    ///   slot     = time() / INTERVALS_PER_SLOT
-    ///   interval = time() % INTERVALS_PER_SLOT
+    /// Each increment represents one 800ms interval. Use [`Self::current_slot`]
+    /// for the slot; the interval within it is `time() % INTERVALS_PER_SLOT`.
     pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
     }
@@ -827,6 +827,11 @@ impl Store {
     /// Sets the current store time.
     pub fn set_time(&mut self, time: u64) -> Result<(), Error> {
         self.set_metadata(KEY_TIME, &time)
+    }
+
+    /// The current slot, derived from the store clock.
+    pub fn current_slot(&self) -> u64 {
+        self.time().expect("store time exists") / INTERVALS_PER_SLOT
     }
 
     // ============ Config ============

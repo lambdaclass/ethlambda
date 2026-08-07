@@ -1413,7 +1413,7 @@ impl Handler<NewAttestation> for BlockChainServer {
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
         // the check unless this attestation is for the store's current slot.
-        let current_slot = self.store.time().expect("store time exists") / INTERVALS_PER_SLOT;
+        let current_slot = self.store.current_slot();
         if msg.attestation.data.slot == current_slot {
             self.maybe_start_early_aggregation(ctx).await;
         }
