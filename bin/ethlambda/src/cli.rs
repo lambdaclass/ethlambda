@@ -81,6 +81,14 @@ pub(crate) struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
+    /// Path to the execution-layer genesis JSON (ethrex/geth format).
+    ///
+    /// Setting this enables the embedded ethrex execution layer; omitting it
+    /// runs ethlambda as a consensus-only node. The genesis must be Cancun: a
+    /// Prague genesis requires a `requests_hash` that the Cancun-shaped
+    /// `ExecutionPayloadV3` cannot carry, and every payload would be rejected.
+    #[arg(long)]
+    pub(crate) el_genesis: Option<PathBuf>,
     /// Disable the sync-gate's suppression of validator duties.
     ///
     /// By default a node that judges itself to be syncing (local head lagging

@@ -37,6 +37,7 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
+use ethlambda_ethrex_engine::EthrexEngine;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
@@ -198,6 +199,26 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
+    // Bring the embedded execution layer up before state init: it bootstraps
+    // from `--el-genesis`, so its startup head IS the EL genesis block, and that
+    // hash has to be seeded into the consensus genesis anchor below. Without the
+    // seed the first head update names a parent the EL has never seen and it
+    // never starts building.
+    let (execution_engine, el_genesis_hash) = match options.el_genesis.as_deref() {
+        None => (None, None),
+        Some(path) => {
+            let engine = EthrexEngine::from_genesis_path(path)
+                .await
+                .map_err(|err| eyre::eyre!("failed to bootstrap embedded ethrex: {err}"))?;
+            let hash = engine
+                .head_hash()
+                .await
+                .map_err(|err| eyre::eyre!("failed to read EL genesis block hash: {err}"))?;
+            info!(genesis = %path.display(), el_genesis_hash = %hash, "Embedded ethrex enabled");
+            (Some(Arc::new(engine)), Some(hash))
+        }
+    };
+
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
         .into_iter()
@@ -205,9 +226,14 @@ async fn main() -> eyre::Result<()> {
         .filter(|url| !url.is_empty())
         .collect();
 
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
-        .await
-        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let store = fetch_initial_state(
+        &clean_checkpoint_urls,
+        &genesis_config,
+        backend.clone(),
+        el_genesis_hash,
+    )
+    .await
+    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -251,6 +277,7 @@ async fn main() -> eyre::Result<()> {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
         },
+        execution_engine,
     };
 
     let blockchain = BlockChain::spawn(
@@ -681,6 +708,7 @@ async fn fetch_initial_state(
     checkpoint_urls: &[String],
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
+    el_genesis_hash: Option<H256>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
@@ -717,8 +745,25 @@ async fn fetch_initial_state(
 
     if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
-        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+        // With an execution layer, the genesis anchor pair must carry the EL's
+        // genesis block hash in both the cached header and the genesis block
+        // body; `from_genesis_with_el_hash` owns that protocol.
+        return Ok(match el_genesis_hash {
+            Some(el_hash) => {
+                let (genesis_state, genesis_block) =
+                    State::from_genesis_with_el_hash(genesis.genesis_time, validators, el_hash);
+                Store::get_forkchoice_store(backend, genesis_state, genesis_block).map_err(
+                    |err| {
+                        error!(%err, "Failed to initialize store with EL-seeded genesis");
+                        checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch
+                    },
+                )?
+            }
+            None => Store::from_anchor_state(
+                backend,
+                State::from_genesis(genesis.genesis_time, validators),
+            ),
+        });
     }
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.
@@ -904,7 +949,9 @@ validators:
         let genesis = test_genesis(now_secs());
         let backend = Arc::new(InMemoryBackend::default());
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), 0);
     }
@@ -915,7 +962,9 @@ validators:
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &genesis);
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -929,7 +978,9 @@ validators:
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &genesis);
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -949,7 +1000,9 @@ validators:
         seed_db(backend.clone(), &genesis);
 
         let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
-        let store = fetch_initial_state(&urls, &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&urls, &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -968,7 +1021,7 @@ validators:
         let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `expect_err`.
-        let Err(err) = fetch_initial_state(&urls, &genesis, backend).await else {
+        let Err(err) = fetch_initial_state(&urls, &genesis, backend, None).await else {
             panic!("unreachable checkpoint URL must abort startup");
         };
 
@@ -989,7 +1042,7 @@ validators:
 
         let other_genesis = test_genesis(seeded_genesis.genesis_time + 1);
         // `Store` is not `Debug`, so unwrap the error by pattern.
-        let Err(err) = fetch_initial_state(&[], &other_genesis, backend.clone()).await else {
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend.clone(), None).await else {
             panic!("a foreign DB must not be silently re-anchored");
         };
 
@@ -1015,7 +1068,7 @@ validators:
 
         let mut other_genesis = test_genesis(genesis_time);
         other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
-        let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend, None).await else {
             panic!("a foreign validator set must not be silently re-anchored");
         };
 
