@@ -1009,6 +1009,20 @@ pub enum StoreError {
     #[error("Validator signature verification failed")]
     SignatureVerificationFailed,
 
+    /// Kept apart from [`Self::SignatureDecodingFailed`] because the proposer
+    /// signature is a component of the block proof, so the spec reports its
+    /// failure as an invalid block proof rather than an invalid signature.
+    #[error("Block proposer signature could not be decoded")]
+    ProposerSignatureDecodingFailed,
+
+    /// See [`Self::ProposerSignatureDecodingFailed`] for why this is distinct
+    /// from [`Self::SignatureVerificationFailed`].
+    #[error("Block proposer signature verification failed")]
+    ProposerSignatureVerificationFailed,
+
+    #[error("Block carries an attestation proof but has no attestations")]
+    UnexpectedAttestationProof,
+
     #[error("Block slot {0} exceeds u32 range")]
     SlotOutOfRange(u64),
 
@@ -1111,13 +1125,18 @@ pub enum StoreError {
     BlockTooFarInFuture { block_slot: u64, current_slot: u64 },
 }
 
-/// Full verification of a signed block's merged multi-message aggregate proof.
+/// Full verification of a signed block's proof.
 ///
-/// Structural pre-checks (fast fail) ensure the merged proof's `info` list lines
-/// up with the block body (one entry per attestation plus a trailing proposer
-/// entry; messages, slots, and participants match what the body declares).
-/// On success, the lean-multisig devnet5 `verify_type_2` primitive runs the
-/// SNARK verifier over the merged proof bytes against the resolved pubkey set.
+/// The proof has two independent parts:
+///
+/// 1. The proposer's raw XMSS signature over the block root, verified directly
+///    against the proposer's `proposal_pubkey` with the hash-based verifier.
+/// 2. The attestation aggregate: a lean-multisig Type-2 over the body
+///    attestations only. Structural pre-checks (fast fail) ensure its `info`
+///    list lines up with the block body (one entry per attestation; messages,
+///    slots, and participants match what the body declares), then the
+///    `verify_type_2` SNARK verifier runs over the proof bytes. A block with no
+///    attestations carries no aggregate.
 ///
 /// Exposed publicly so RPC handlers (notably the Hive test-driver
 /// `verify_signatures/run` endpoint) can run the exact same verification path
@@ -1157,35 +1176,20 @@ pub fn verify_block_signatures(
     }
 
     let block_root = block.hash_tree_root();
-    let structural_elapsed = total_start.elapsed();
+    // Slot narrowing is a range check, so it closes out the structural segment
+    // rather than landing between two timers and escaping both.
+    let block_slot_u32 =
+        u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
+    // One instant ends the structural segment and starts the crypto one, so the
+    // two reported components sum to `total_elapsed` with no gap between them.
+    let structural_end = std::time::Instant::now();
+    let structural_elapsed = structural_end.duration_since(total_start);
 
-    // Resolve pubkeys per multi-message aggregate component for verify_type_2 and rederive the
-    // expected (message, slot) bindings from the block body. Attestation
-    // components use each participant's attestation_pubkey; the trailing
-    // proposer component uses the proposal_pubkey of `block.proposer_index`.
-    let expected_components = attestations.len() + 1;
-    let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(expected_components);
-    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(expected_components);
-
-    for attestation in attestations.iter() {
-        let mut pubkeys = Vec::new();
-        for vid in validator_indices(&attestation.aggregation_bits) {
-            let out_of_range = StoreError::AttesterIndexOutOfRange {
-                validator_index: vid,
-                num_validators,
-            };
-            let validator = validators.get(vid as usize).ok_or(out_of_range)?;
-            let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
-                .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
-            pubkeys.push(pk);
-        }
-        pubkeys_per_component.push(pubkeys);
-        let slot_u32 = u32::try_from(attestation.data.slot)
-            .map_err(|_| StoreError::SlotOutOfRange(attestation.data.slot))?;
-        expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
-    }
-
+    // 1. Verify the proposer's raw XMSS signature over the block root. It is
+    //    carried outside the attestation aggregate, so it is checked directly
+    //    against the proposer's proposal pubkey with the hash-based verifier.
+    //    Counted in `crypto_elapsed` below along with the aggregate, so this
+    //    cost is reported rather than falling between the timers.
     let proposer_out_of_range = StoreError::ProposerIndexOutOfRange {
         proposer_index: block.proposer_index,
         num_validators,
@@ -1195,30 +1199,69 @@ pub fn verify_block_signatures(
         .ok_or(proposer_out_of_range)?;
     let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
-    pubkeys_per_component.push(vec![proposer_pubkey]);
-    let block_slot_u32 =
-        u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
-    expected_bindings.push((block_root, block_slot_u32));
+    let proposer_signature = ValidatorSignature::from_bytes(&signed_block.proof.proposer_signature)
+        .map_err(|_| StoreError::ProposerSignatureDecodingFailed)?;
+    if !proposer_signature.is_valid(&proposer_pubkey, block_slot_u32, &block_root) {
+        return Err(StoreError::ProposerSignatureVerificationFailed);
+    }
 
-    let merged_bytes = signed_block.proof.proof_bytes();
+    // 2. Verify the attestation aggregate (Type-2 over the body attestations
+    //    only). A block with no attestations carries no aggregate; reject a
+    //    stray proof rather than silently ignoring it.
+    if attestations.is_empty() {
+        if !signed_block
+            .proof
+            .attestation_proof
+            .proof_bytes()
+            .is_empty()
+        {
+            return Err(StoreError::UnexpectedAttestationProof);
+        }
+    } else {
+        // Resolve pubkeys per Type-2 component and rederive the expected
+        // (message, slot) bindings from the block body. Each component uses its
+        // participants' attestation_pubkeys.
+        let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
+            Vec::with_capacity(attestations.len());
+        let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(attestations.len());
 
-    let crypto_start = std::time::Instant::now();
-    ethlambda_crypto::verify_type_2_signature(
-        merged_bytes,
-        pubkeys_per_component,
-        &expected_bindings,
-    )
-    .map_err(StoreError::BlockProofVerificationFailed)?;
-    let crypto_elapsed = crypto_start.elapsed();
+        for attestation in attestations.iter() {
+            let mut pubkeys = Vec::new();
+            for vid in validator_indices(&attestation.aggregation_bits) {
+                let out_of_range = StoreError::AttesterIndexOutOfRange {
+                    validator_index: vid,
+                    num_validators,
+                };
+                let validator = validators.get(vid as usize).ok_or(out_of_range)?;
+                let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
+                    .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
+                pubkeys.push(pk);
+            }
+            pubkeys_per_component.push(pubkeys);
+            let slot_u32 = u32::try_from(attestation.data.slot)
+                .map_err(|_| StoreError::SlotOutOfRange(attestation.data.slot))?;
+            expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
+        }
 
-    let total_elapsed = total_start.elapsed();
+        let merged_bytes = signed_block.proof.attestation_proof.proof_bytes();
+        ethlambda_crypto::verify_type_2_signature(
+            merged_bytes,
+            pubkeys_per_component,
+            &expected_bindings,
+        )
+        .map_err(StoreError::BlockProofVerificationFailed)?;
+    }
+    let total_end = std::time::Instant::now();
+    let crypto_elapsed = total_end.duration_since(structural_end);
+    let total_elapsed = total_end.duration_since(total_start);
+
     info!(
         slot = block.slot,
         attestation_count = attestations.len(),
         ?structural_elapsed,
         ?crypto_elapsed,
         ?total_elapsed,
-        "Block multi-message aggregate proof verified"
+        "Block proof verified"
     );
 
     Ok(())
@@ -1280,24 +1323,24 @@ mod tests {
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{
-            AggregatedAttestations, BlockBody, MultiMessageAggregate, SignedBlock,
-            SingleMessageAggregate,
+            AggregatedAttestations, BlockBody, BlockProof, SignedBlock, SingleMessageAggregate,
         },
         checkpoint::Checkpoint,
         state::State,
     };
 
-    /// Test helper: placeholder block proof bytes.
+    /// Test helper: placeholder block proof.
     ///
-    /// In production the merged proof is the raw `compress_without_pubkeys()`
-    /// output of `merge_many_type_1`, which can only be built by the
-    /// lean-multisig prover. Tests that don't go through
-    /// `verify_block_signatures` use an empty blob.
+    /// In production the attestation aggregate is the raw
+    /// `compress_without_pubkeys()` output of `merge_many_type_1`, which can
+    /// only be built by the lean-multisig prover, and the proposer signature is
+    /// a real XMSS signature. Tests that don't go through
+    /// `verify_block_signatures` use an empty proof.
     fn make_signed_block_proof(
         _proposer_index: u64,
         _attestation_proofs: Vec<SingleMessageAggregate>,
-    ) -> MultiMessageAggregate {
-        MultiMessageAggregate::default()
+    ) -> BlockProof {
+        BlockProof::default()
     }
 
     fn make_bits(indices: &[usize]) -> AggregationBits {
@@ -1773,7 +1816,7 @@ mod tests {
         };
         let signed_block = SignedBlock {
             message: block,
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
 
         let result = on_block_without_verification(&mut store, signed_block);
@@ -1814,7 +1857,7 @@ mod tests {
         };
         let signed_block = SignedBlock {
             message: block,
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
 
         let result = on_block_without_verification(&mut store, signed_block);
@@ -1872,7 +1915,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody { attestations },
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         let result = verify_block_signatures(&state, &out_of_range_attester);
         assert!(
@@ -1894,7 +1937,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         let result = verify_block_signatures(&state, &out_of_range_proposer);
         assert!(
