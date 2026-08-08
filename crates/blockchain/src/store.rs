@@ -1835,8 +1835,8 @@ mod tests {
     fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
         (0..count)
             .map(|index| ethlambda_types::state::Validator {
-                attestation_pubkey: [0u8; 52],
-                proposal_pubkey: [0u8; 52],
+                attestation_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                proposal_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
                 index,
             })
             .collect()

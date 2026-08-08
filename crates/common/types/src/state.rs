@@ -84,7 +84,16 @@ where
     serializer.serialize_str(&hex::encode(pubkey))
 }
 
-pub type ValidatorPubkeyBytes = [u8; 52];
+/// Size of an SSZ-encoded XMSS public key in bytes.
+///
+/// Mirrors leanVM's `xmss::PUB_KEY_SSZ_LEN`, hardcoded so this crate stays free
+/// of the signing backend: the validator registry is a plain wire type.
+/// `ethlambda-crypto` static-asserts the two agree, so a leanVM bump that
+/// changes the scheme parameters breaks the build rather than silently
+/// producing keys of the wrong length.
+pub const PUBLIC_KEY_SIZE: usize = 32;
+
+pub type ValidatorPubkeyBytes = [u8; PUBLIC_KEY_SIZE];
 
 impl State {
     pub fn from_genesis(genesis_time: u64, validators: Vec<Validator>) -> Self {

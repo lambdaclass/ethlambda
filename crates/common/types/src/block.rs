@@ -48,12 +48,13 @@ pub type ByteList512KiB = ByteList<524_288>;
 
 /// A merged proof covering multiple messages with a single proof blob.
 ///
-/// Also known as a *type-2* proof: the lean-multisig term for an aggregate
-/// binding several distinct messages, each with its own participant set.
+/// Also known as a *type-2* proof: leanVM's term for an aggregate binding
+/// several distinct messages, each with its own participant set.
 ///
-/// The proof bytes use lean-multisig's compact public-key-free
-/// representation. SSZ encoding this container adds the offset required for
-/// its variable-length field.
+/// The proof bytes are the `to_bytes()` (postcard) form of leanVM's
+/// `MultiMessageAggregateSignature`, which embeds each component's participant
+/// pubkeys. SSZ encoding this container adds the offset required for its
+/// variable-length field.
 #[derive(Debug, Default, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct MultiMessageAggregate {
     /// Serialized multi-message aggregate proof bytes.
@@ -66,7 +67,7 @@ impl MultiMessageAggregate {
         Self { proof }
     }
 
-    /// Copy raw lean-multisig proof bytes into the bounded SSZ container.
+    /// Copy raw leanVM aggregation proof bytes into the bounded SSZ container.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MultiMessageAggregateError> {
         let len = bytes.len();
         ByteList512KiB::try_from(bytes.to_vec())
@@ -74,7 +75,7 @@ impl MultiMessageAggregate {
             .map_err(|_| MultiMessageAggregateError::ProofTooLarge(len))
     }
 
-    /// Return the raw lean-multisig proof bytes.
+    /// Return the raw leanVM aggregation proof bytes.
     pub fn proof_bytes(&self) -> &[u8] {
         self.proof.iter().as_slice()
     }
@@ -98,7 +99,7 @@ pub enum MultiMessageAggregateError {
 // from the surrounding block body (attestation `data` + slot for body
 // components, block root + slot for the proposer component).
 //
-// `MultiMessageAggregate` carries the raw lean-multisig type-2 bytes.
+// `MultiMessageAggregate` carries the raw leanVM type-2 bytes.
 // Component participant bitfields come from
 // `block.body.attestations[i].aggregation_bits` (and `block.proposer_index` for
 // the trailing proposer entry).
@@ -110,8 +111,8 @@ pub const MAX_ATTESTATIONS_DATA: usize = 8;
 
 /// A single-message proof aggregating signatures from many validators.
 ///
-/// Also known as a *type-1* proof: the lean-multisig term for an aggregate
-/// where every participant signs the same message for the same slot.
+/// Also known as a *type-1* proof: leanVM's term for an aggregate where every
+/// participant signs the same message for the same slot.
 ///
 /// Used:
 ///   - as a gossip-level `SignedAggregatedAttestation.proof`,
@@ -119,15 +120,16 @@ pub const MAX_ATTESTATIONS_DATA: usize = 8;
 ///   - as one of the components fed into `merge_type_1s_into_type_2` when
 ///     building a block proof.
 ///
-/// `participants` and `proof` are independent fields: the proof bytes are
-/// the lean-multisig `compress_without_pubkeys()` form; `participants` is
-/// the bitfield identifying which validators are bound by the proof. The
-/// verifier resolves pubkeys from `participants` at verify time.
+/// `participants` and `proof` are independent fields: the proof bytes are the
+/// `to_bytes()` form of leanVM's `SingleMessageAggregateSignature` (which
+/// embeds the participant pubkeys); `participants` is the bitfield identifying
+/// which validators are bound. The verifier resolves the expected pubkeys from
+/// `participants` and cross-checks them against the set embedded in the proof.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SingleMessageAggregate {
     /// Bitfield identifying validators bound by this proof.
     pub participants: AggregationBits,
-    /// Aggregated proof bytes in lean-multisig compact (no-pubkeys) form.
+    /// Aggregated proof bytes in leanVM's `to_bytes()` form (pubkeys embedded).
     pub proof: ByteList512KiB,
 }
 
