@@ -300,32 +300,6 @@ impl PayloadBuffer {
         }
         pruned
     }
-
-    /// Extract per-validator latest attestations from proofs' participation bits.
-    ///
-    /// An equivocator can cast two distinct votes at the same `slot`. To keep the
-    /// extracted head a pure function of pool contents (independent of arrival or
-    /// insertion order), votes are processed newest-first with an equal-slot tie
-    /// broken toward the larger canonical attestation-data root — the same rule the
-    /// block-level fork-choice tiebreak applies to block roots (leanSpec #1181). The
-    /// pool key is already `hash_tree_root(data)`, so the tie needs no extra hashing.
-    #[cfg(test)]
-    fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
-        let mut ordered: Vec<(&H256, &PayloadEntry)> = self.data.iter().collect();
-        // Descending by (slot, data_root): the larger tuple is the canonical winner.
-        ordered.sort_unstable_by(|a, b| (b.1.data.slot, b.0).cmp(&(a.1.data.slot, a.0)));
-
-        let mut result: HashMap<u64, AttestationData> = HashMap::new();
-        for (_data_root, entry) in ordered {
-            for proof in &entry.proofs {
-                for vid in proof.participant_indices() {
-                    // Descending order means the first vote seen for a validator wins.
-                    result.entry(vid).or_insert_with(|| entry.data.clone());
-                }
-            }
-        }
-        result
-    }
 }
 
 /// Gossip signatures grouped by attestation data.
@@ -492,10 +466,9 @@ impl GossipSignatureBuffer {
 
     /// Extract per-validator latest attestations from the raw signature pool.
     ///
-    /// Mirrors `PayloadBuffer::extract_latest_attestations`: votes are processed
-    /// newest-first with an equal-slot tie broken toward the larger canonical
-    /// attestation-data root, so the extracted winner is independent of arrival or
-    /// insertion order (leanSpec #1181). This matches the leanSpec
+    /// Votes are processed newest-first with an equal-slot tie broken toward the
+    /// larger canonical attestation-data root, so the extracted winner is
+    /// independent of arrival or insertion order (leanSpec #1181). This matches the leanSpec
     /// `location == "signatures"` checker, which folds `attestation_signatures`
     /// keeping each validator's canonical-precedence winner.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
@@ -1489,39 +1462,16 @@ impl Store {
         }
     }
 
-    fn record_votes<I>(votes: &mut VoteStore, data: &AttestationData, validator_ids: I)
-    where
-        I: IntoIterator<Item = u64>,
-    {
-        for validator_id in validator_ids {
-            Self::record_vote(votes, validator_id, data);
-        }
-    }
-
-    fn record_known_votes<I>(&self, data: &AttestationData, validator_ids: I)
-    where
-        I: IntoIterator<Item = u64>,
-    {
-        let mut fork_choice = self.fork_choice.lock().unwrap();
-        Self::record_votes(&mut fork_choice.known_votes, data, validator_ids);
-    }
-
-    fn record_new_votes<I>(&self, data: &AttestationData, validator_ids: I)
-    where
-        I: IntoIterator<Item = u64>,
-    {
-        let mut fork_choice = self.fork_choice.lock().unwrap();
-        Self::record_votes(&mut fork_choice.new_votes, data, validator_ids);
-    }
-
     fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
         let mut fork_choice = self.fork_choice.lock().unwrap();
         for attestation in attestations {
-            Self::record_votes(
-                &mut fork_choice.known_votes,
-                &attestation.data,
-                validator_indices(&attestation.aggregation_bits),
-            );
+            for validator_id in validator_indices(&attestation.aggregation_bits) {
+                Self::record_vote(
+                    &mut fork_choice.known_votes,
+                    validator_id,
+                    &attestation.data,
+                );
+            }
         }
     }
 
@@ -1614,8 +1564,11 @@ impl Store {
         &mut self,
         entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
         for (hashed, proof) in &entries {
-            self.record_known_votes(hashed.data(), proof.participant_indices());
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.known_votes, validator_id, hashed.data());
+            }
         }
         self.known_payloads.lock().unwrap().push_batch(entries);
     }
@@ -1631,7 +1584,12 @@ impl Store {
         hashed: HashedAttestationData,
         proof: SingleMessageAggregate,
     ) {
-        self.record_new_votes(hashed.data(), proof.participant_indices());
+        {
+            let mut fork_choice = self.fork_choice.lock().unwrap();
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.new_votes, validator_id, hashed.data());
+            }
+        }
         self.new_payloads.lock().unwrap().push(hashed, proof);
     }
 
@@ -1640,8 +1598,11 @@ impl Store {
         &mut self,
         entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
         for (hashed, proof) in &entries {
-            self.record_new_votes(hashed.data(), proof.participant_indices());
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.new_votes, validator_id, hashed.data());
+            }
         }
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
@@ -2068,6 +2029,29 @@ mod tests {
             .expect("get blocks by slot range");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+    }
+
+    #[test]
+    fn insert_signed_block_records_block_attestation_votes() {
+        let mut store = Store::test_store();
+        let data = make_att_data_for_target(8, root(8));
+        let block = signed_block_with_attestations(
+            1,
+            H256::ZERO,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validators(&[1, 3]).participants,
+                data: data.clone(),
+            }],
+        );
+        let block_root = block.message.hash_tree_root();
+
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert signed block");
+
+        let votes = store.extract_latest_known_attestations();
+        assert_eq!(votes[&1], data);
+        assert_eq!(votes[&3], data);
     }
 
     #[test]
@@ -2820,61 +2804,6 @@ mod tests {
                 slot,
             },
             source: Checkpoint::default(),
-        }
-    }
-
-    /// When two aggregations share `slot` but disagree on the target
-    /// (same-slot equivocation), the vote with the larger canonical
-    /// attestation-data root must win for the validators present in both,
-    /// regardless of arrival/insertion order. This is the deterministic
-    /// fork-choice tiebreak (leanSpec #1181): it makes the extracted head a pure
-    /// function of pool contents, so two nodes that see the same votes in
-    /// different orders agree on the same head.
-    #[test]
-    fn extract_latest_attestations_canonical_root_wins_on_slot_tie() {
-        let target_a = H256([0xaa; 32]);
-        let target_b = H256([0xbb; 32]);
-        let data_a = make_att_data_for_target(3, target_a);
-        let data_b = make_att_data_for_target(3, target_b);
-        // The pool keys the tie on `hash_tree_root(data)`, not on the target root.
-        let root_a = data_a.hash_tree_root();
-        let root_b = data_b.hash_tree_root();
-        assert_ne!(root_a, root_b);
-
-        // The larger canonical root is the deterministic winner for shared voters.
-        let winner_target = if root_a > root_b { target_a } else { target_b };
-
-        // Deliver the same equivocating votes in both arrival orders; the winner
-        // for validators present in both aggregations (0, 1) must be identical.
-        for insert_b_first in [false, true] {
-            let mut buf = PayloadBuffer::new(10);
-            if insert_b_first {
-                buf.push(
-                    HashedAttestationData::new(data_b.clone()),
-                    make_proof_for_validators(&[0, 1, 3, 4]),
-                );
-                buf.push(
-                    HashedAttestationData::new(data_a.clone()),
-                    make_proof_for_validators(&[0, 1, 2]),
-                );
-            } else {
-                buf.push(
-                    HashedAttestationData::new(data_a.clone()),
-                    make_proof_for_validators(&[0, 1, 2]),
-                );
-                buf.push(
-                    HashedAttestationData::new(data_b.clone()),
-                    make_proof_for_validators(&[0, 1, 3, 4]),
-                );
-            }
-            let extracted = buf.extract_latest_attestations();
-            // Shared validators: deterministic canonical winner, independent of order.
-            assert_eq!(extracted[&0].target.root, winner_target);
-            assert_eq!(extracted[&1].target.root, winner_target);
-            // Exclusive validators keep their only vote.
-            assert_eq!(extracted[&2].target.root, target_a);
-            assert_eq!(extracted[&3].target.root, target_b);
-            assert_eq!(extracted[&4].target.root, target_b);
         }
     }
 
