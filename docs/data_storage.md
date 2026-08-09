@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the seven tables holds, and which data is in-memory only.
+what each of the eight tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -97,15 +97,15 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
    │   ┌─────────────────────┐         ┌──────────────────────┐    │
    │   │ BlockHeaders        │         │ new_payloads         │    │
    │   │ BlockBodies         │         │  (pending aggregated │    │
-   │   │ BlockSignatures     │         │   attestations)      │    │
-   │   │ States              │         │ known_payloads       │    │
-   │   │ StateDiffs          │         │  (fork-choice-active │    │
-   │   │ Metadata            │         │   attestations)      │    │
-   │   │ LiveChain           │         │ gossip_signatures    │    │
-   │   └─────────────────────┘         │  (raw XMSS sigs      │    │
-   │                                   │   awaiting           │    │
-   │   Survives restarts.              │   aggregation)       │    │
-   │                                   │ state_cache (LRU)    │    │
+   │   │ BlockProof          │         │   attestations)      │    │
+   │   │ BlockRoots          │         │ known_payloads       │    │
+   │   │ States              │         │  (fork-choice-active │    │
+   │   │ StateDiffs          │         │   attestations)      │    │
+   │   │ Metadata            │         │ gossip_signatures    │    │
+   │   │ LiveChain           │         │  (raw XMSS sigs      │    │
+   │   └─────────────────────┘         │   awaiting           │    │
+   │                                   │   aggregation)       │    │
+   │   Survives restarts.              │ state_cache (LRU)    │    │
    │                                   └──────────────────────┘    │
    │                                                               │
    │                                   Lost on restart.            │
@@ -114,13 +114,14 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 ## The Tables
 
-The seven variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 | Table             | Key         | Value                                     | Pruned?                          |
 | ----------------- | ----------- | ----------------------------------------- | -------------------------------- |
 | `BlockHeaders`    | root        | `BlockHeader`                             | never                            |
 | `BlockBodies`     | root        | `BlockBody`                               | never                            |
-| `BlockSignatures` | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockProof`      | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockRoots`      | slot        | block root (`H256`)                       | never                            |
 | `States`          | root        | full `State` snapshot                     | never                            |
 | `StateDiffs`      | root        | `StateDiff`                               | never                            |
 | `Metadata`        | string      | SSZ scalars                               | never                            |
@@ -128,15 +129,19 @@ The seven variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 ### Key encoding
 
-Two key layouts are used:
+Three key layouts are used:
 
 - **Root-keyed** tables use the 32-byte SSZ encoding of the block root
   (`root.to_ssz()`).
-- **Slot-prefixed** tables (`BlockSignatures`, `LiveChain`) use
+- **Slot-prefixed** tables (`BlockProof`, `LiveChain`) use
   `encode_slot_root_key`: an 8-byte **big-endian** slot followed by the
   32-byte root. Big-endian means lexicographic key order equals numeric slot
   order, so pruning can iterate from the start of the table and stop at the
   first key past its cutoff instead of scanning everything.
+- **Slot-only** (`BlockRoots`) uses `encode_block_root_key`: just the 8-byte
+  big-endian slot, since the value already holds the root. This table is
+  never pruned, so the ordering buys nothing here; it is kept only for
+  consistency with the other slot-prefixed keys.
 
 ### BlockHeaders
 
@@ -153,13 +158,11 @@ body: if `header.body_root == EMPTY_BODY_ROOT` (the hash tree root of
 `BlockBody::default()`. This covers the genesis block and checkpoint sync
 anchors, whose bodies are either empty or unavailable. Never pruned.
 
-### BlockSignatures
+### BlockProof
 
-`slot ‖ root → MultiMessageAggregate`. Despite the name, this table stores the
-block's **merged aggregate proof blob**, not individual signatures — the name
-is historical and kept to avoid a RocksDB column-family migration (renaming to
-`BlockProof` is a follow-up). It is keyed by `slot ‖ root` (not plain root)
-precisely so that pruning can scan in slot order and stop early.
+`slot ‖ root → MultiMessageAggregate`. This table stores the block's **merged
+aggregate proof blob**. It is keyed by `slot ‖ root` so that pruning can scan in
+slot order and stop early.
 
 Stored separately from headers/bodies because the genesis block has no proof.
 `get_signed_block` synthesizes an empty proof for the slot-0 anchor only; for
@@ -168,12 +171,35 @@ rather than a fabricated block.
 
 This is the one block table that **is** pruned; see [Pruning](#pruning).
 
+### BlockRoots
+
+`slot → H256`, the canonical block root at each slot. Rewritten on every head
+update inside `update_checkpoints`: `block_root_index_changes` walks the old
+and new head's branches back to their common ancestor, deleting the slots
+that leave the canonical chain and writing the ones that join it. A reorg
+therefore touches only the affected slot range, not the whole table. Never
+pruned.
+
+Backs `get_signed_blocks_by_slot_range`, which serves BlocksByRange requests
+over req/resp (`crates/net/p2p/src/req_resp/handlers.rs`). It does **not**
+back the RPC `GET /lean/v0/blocks/:slot` endpoint: that handler resolves a
+slot through the head state's `historical_block_hashes` instead
+(`resolve_slot` in `crates/net/rpc/src/blocks.rs`), so a block on a side fork
+is reachable there only by root, never by slot.
+
 ### States
 
 `root → State` (full SSZ snapshot). Holds full-state snapshots **only**: the
 bootstrap anchor written at initialization, plus one anchor whenever a block
-crosses a 1024-slot boundary. Never pruned — these anchors are the base every
-diff chain resolves against, so reconstruction always terminates.
+crosses a `SNAPSHOT_ANCHOR_INTERVAL`-slot boundary. Never pruned — these
+anchors are the base every diff chain resolves against, so reconstruction
+always terminates.
+
+The genesis validator registry is constant for the life of the chain
+(`validators` is fixed at genesis; the lean STF never mutates it), but it has
+no table of its own: it rides inside every `States` snapshot alongside
+`config`, which `StateDiff` reconstruction relies on (see
+[State Storage](#state-storage-snapshots--diffs)).
 
 ### StateDiffs
 
@@ -190,11 +216,19 @@ fields:
 | Key                | Type          | Meaning                                                |
 | ------------------ | ------------- | ------------------------------------------------------ |
 | `time`             | `u64`         | Intervals elapsed since genesis (the store clock)      |
-| `config`           | `ChainConfig` | Chain configuration (genesis time, validator count)    |
+| `config`           | `ChainConfig` | Chain configuration (currently just `genesis_time`)    |
 | `head`             | `H256`        | Current fork choice head                               |
 | `safe_target`      | `H256`        | Current safe target (see [lmd_ghost.md](lmd_ghost.md)) |
 | `latest_justified` | `Checkpoint`  | Latest justified checkpoint                            |
 | `latest_finalized` | `Checkpoint`  | Latest finalized checkpoint                            |
+
+`config` is the odd one out: `init_store` writes it once at bootstrap and
+nothing ever rewrites it afterward (it has a getter, `Store::config`, but no
+setter). Because it never changes, the `Store` keeps a copy in memory and
+reads of it never reach the backend. It is also part of the DB's fingerprint:
+`from_db_state` refuses to resume a data directory belonging to another
+network (see [Startup and Restore](#startup-and-restore)). Every other
+`Metadata` key is mutated in place as the chain progresses.
 
 ### LiveChain
 
@@ -219,9 +253,9 @@ or change predictably. Instead, `insert_state` writes:
 1. **Always** a `StateDiff` keyed by the block root, linked to its parent via
    `base_root` (the block's `parent_root`).
 2. **Only at anchors** a full snapshot into `States`. A block is an anchor
-   when it crosses a `SNAPSHOT_ANCHOR_INTERVAL = 1024` slot boundary relative
+   when it crosses a `SNAPSHOT_ANCHOR_INTERVAL` slot boundary relative
    to its parent (~68 minutes at 4-second slots). This bounds any
-   reconstruction walk to at most 1024 diff applications.
+   reconstruction walk to at most `SNAPSHOT_ANCHOR_INTERVAL` diff applications.
 
 A `StateDiff` stores only what cannot be recovered elsewhere: the target slot,
 justified/finalized checkpoints, and the justification fields
@@ -233,7 +267,14 @@ small under healthy finality). The rest is deliberately omitted:
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `config`, `validators`    | The snapshot (they never change)                                                                                                                              |
 | `latest_block_header`     | The `BlockHeaders` table                                                                                                                                      |
-| `historical_block_hashes` | Regenerated from `base_root` + the slot gap (the state transition appends the parent root plus one zero per skipped slot, so the append is fully predictable) |
+| `historical_block_hashes` | Regenerated from `base_root` + the slot gap |
+
+The `historical_block_hashes` append is checked rather
+than trusted blindly: `validate_history_append`
+(`crates/storage/src/state_diff.rs`) rejects a diff whose appended hashes
+don't match the expected slot gap or aren't zero-filled for skipped slots,
+so a broken append surfaces at diff-creation time instead of corrupting a
+later reconstruction.
 
 Reads go through `get_state`, which tries three levels:
 
@@ -288,7 +329,7 @@ sequence of independent write batches:
    │
    ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
    │                            │            BlockBodies[root]    (if non-empty)
-   │                            ├─one batch─ BlockSignatures[slot‖root]
+   │                            ├─one batch─ BlockProof[slot‖root]
    │                            │            LiveChain[slot‖root]
    │                            ┘
    │
@@ -298,6 +339,7 @@ sequence of independent write batches:
    │
    └─ 4. update_head()                 Metadata: head
           (re-runs fork choice)        (+ justified/finalized if advanced,
+                                          + BlockRoots diff (canonical index),
                                           + pruning on finalization)
 ```
 
@@ -332,18 +374,18 @@ a deferred heavy phase.
 **Deferred** (`prune_old_data`, called after a batch of blocks has been
 processed):
 
-- `prune_old_block_signatures`: deletes `BlockSignatures` entries below
-  `cutoff = tip_slot − SIGNATURE_PRUNING_RANGE` (21,600 slots, ~1 day at
+- `prune_old_block_proofs`: deletes `BlockProof` entries below
+  `cutoff = tip_slot − BLOCK_PROOF_PRUNING_RANGE` (21,600 slots, ~1 day at
   4-second slots) — but **only** when `cutoff ≤ finalized_slot`, i.e. the
   entire pruned range lies within finalized history. Non-finalized proofs
   are never touched. Finalized blocks can never revert, so their proofs are
   not needed for fork choice, reorg safety, or re-aggregation once outside
   the window.
 
-**Never pruned:** `BlockHeaders`, `BlockBodies`, `States`, `StateDiffs`, and
-`Metadata`. Headers, bodies, and the snapshot+diff chain are the full
-historical record; only the proof blobs and the fork choice index are
-disposable.
+**Never pruned:** `BlockHeaders`, `BlockBodies`, `BlockRoots`, `States`,
+`StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot index, and
+the snapshot+diff chain are the full historical record; only the proof blobs
+and the (non-finalized) fork choice index are disposable.
 
 ## In-Memory Only (Lost on Restart)
 
@@ -369,7 +411,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the seven tables survives.
+network. Everything persisted in the eight tables survives.
 
 ## Startup and Restore
 
@@ -385,12 +427,16 @@ A `Store` is created through one of three constructors in
 The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: all six `Metadata` keys (time = 0, config, head = safe_target
 = anchor root, justified = finalized = anchor checkpoint), the anchor header,
-the body if non-empty, a full snapshot into `States` (the base of every future
-diff chain), and the anchor's `LiveChain` entry.
+its `BlockRoots` entry, the body if non-empty, a full snapshot into `States`
+(the base of every future diff chain), and the anchor's `LiveChain` entry.
 
 `from_db_state` is the restore path: it reads `config` and `latest_finalized`
-from `Metadata`, returning `None` for an empty DB or a `genesis_time`
-mismatch (wrong network). At startup the node prefers this path but only
+from `Metadata`, returning `None` for an empty DB. A populated DB from another
+network is fatal instead: the finalized state's genesis time and validator
+registry are compared against the genesis config, and a mismatch fails with
+`Error::GenesisMismatch` rather than being treated as empty, since writing a
+fresh anchor would leave the foreign chain's rows in place to be served to
+peers. At startup the node prefers this path but only
 accepts the on-disk store if its head is at most `MAX_RESUMABLE_DB_STATE_AGE
 = 450` slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.

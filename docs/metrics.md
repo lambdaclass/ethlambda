@@ -36,7 +36,7 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|---------|-----------|
 | `lean_block_aggregated_payloads` | Histogram | Number of `aggregated_payloads` in a block | On block production | | 1, 2, 4, 8, 16, 32, 64, 128 | ✅ |
 | `lean_block_building_payload_aggregation_time_seconds` | Histogram | Time taken to build `aggregated_payloads` during block building | On block production | | 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
-| `lean_block_building_time_seconds` | Histogram | Time taken to build a block | On block production | | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1 | ✅ |
+| `lean_block_building_time_seconds` | Histogram | Time taken to build a block | On block production | | 0.1, 0.25, 0.5, 0.75, 1, 2, 4, 8 | ✅ |
 | `lean_block_building_success_total` | Counter | Successful block builds | On block production | | | ✅ |
 | `lean_block_building_failures_total` | Counter | Failed block builds (error building the block, signing the block root, or processing it locally) | On block production failure | | | ✅ |
 | `lean_block_proposal_attestation_build_phase_seconds` | Histogram | Phase-level time in block-proposal attestation selection | On block production | phase=select_payloads,compact,stf_simulate | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 | ✅ |
@@ -44,6 +44,12 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_block_proposal_child_payloads_consumed_total` | Counter | Child aggregated payloads selected during greedy proof picking (before compaction) | On block production | | | ✅ |
 | `lean_block_proposal_attestation_data_selected` | Histogram | Distinct `AttestationData` entries in the proposal block body | On block production | | 0, 1, 2, 4, 8, 16, 32 | ✅ |
 | `lean_block_proposal_aggregates_selected` | Histogram | Aggregated signature proofs in the proposal result after compaction | On block production | | 0, 1, 2, 4, 8, 16, 32, 64, 128 | ✅ |
+
+> `lean_block_building_time_seconds` intentionally deviates from the leanMetrics bucket
+> set, which tops out at 1s. Real builds on our devnets routinely run past that, so every
+> sample landed in `+Inf` and `histogram_quantile` reported a flat 1s ceiling. The range
+> now covers the same span as the `lean_block_proposal_attestation_build_phase_seconds`
+> phases it contains.
 
 ## Fork-Choice Metrics
 
@@ -119,6 +125,27 @@ The metrics below are not part of the [leanMetrics specification](https://github
 | `lean_gossip_aggregation_size_bytes` | Histogram | Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire) | On gossip aggregation send/receive | compression=raw,snappy | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 |
 | `lean_reqresp_request_size_bytes` | Histogram | Bytes size of a req/resp request (raw SSZ or snappy on-wire) | On req/resp request send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 64, 128, 256, 512, 1024, 4096, 16384, 65536 |
 | `lean_reqresp_response_chunk_size_bytes` | Histogram | Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire) | On req/resp response chunk send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000 |
+
+### Gossip Arrival Timing
+
+These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
+
+Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a `data.slot` several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out `before` entirely.
+
+Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.
+
+The aggregate metrics do include an aggregator's own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.
+
+In practice the distribution is bimodal and dominated by production rather than propagation: a mode in the lowest bucket for aggregates that made their interval, plus a tail for those whose proving overran it. A late aggregate is late for every node at once, so that tail shows up on receivers too and is not evidence of a slow network. Read a rising tail as aggregation cost, and cross-check `lean_pq_sig_aggregated_signatures_building_time_seconds` and `lean_committee_signatures_aggregation_time_seconds` to confirm.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_gossip_block_arrival_delay_seconds` | Histogram | Absolute delay between a gossip block's arrival and the start of the interval it was due in | On gossip block receipt, before import | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
+| `lean_gossip_attestation_arrival_delay_seconds` | Histogram | Absolute delay between a gossip attestation's arrival and the start of the interval it was due in | On gossip attestation receipt | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
+| `lean_gossip_aggregation_arrival_delay_seconds` | Histogram | Absolute delay between an aggregate becoming available (gossip receipt, or local production) and the most recent aggregation-interval boundary at or before it | On gossip aggregated-attestation receipt, or on local aggregate production | | 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4, 8, 16 |
+| `lean_gossip_block_arrival_total` | Counter | Gossip blocks by arrival position relative to the interval they were due in | On gossip block receipt, before import | position=before,inside,after | |
+| `lean_gossip_attestation_arrival_total` | Counter | Gossip attestations by arrival position relative to the interval they were due in | On gossip attestation receipt | position=before,inside,after | |
+| `lean_gossip_aggregation_arrival_total` | Counter | Aggregates by arrival position relative to the most recent aggregation-interval boundary | On gossip aggregated-attestation receipt, or on local aggregate production | position=inside,after | |
 
 ### Storage
 
