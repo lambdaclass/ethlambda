@@ -301,6 +301,48 @@ The RPC crate serves the API router (`--api-port`, default 5052) and the metrics
 when they are equal it merges all three routers onto a single listener, so pointing both flags at
 one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Beacon Chain crate (`crates/beacon`)
+
+`ethlambda-beacon` implements the **Ethereum Beacon Chain** consensus specs
+(phase0 through fulu), which is a different protocol from the Lean consensus the
+rest of this repo implements. It depends on no other `ethlambda-*` crate and
+nothing depends on it.
+
+- Tests: `make test-beacon` (builds once per preset). `make test` deliberately
+  excludes it, so the Lean workflow needs no fixture download.
+- Every fixture case is its own test, named `<runner>/<fork>/<handler>/<suite>/<case>`,
+  so a failure names the case and not the suite around it. The spec binary
+  therefore supplies its own harness (`harness = false`), since a case is only
+  known once the fixture tree is walked. A substring filter selects a whole
+  suite or one case:
+  `cargo test -p ethlambda-beacon --test spec_tests -- electra/attester_slashing`.
+- Fixtures: `make consensus-spec-tests`, pinned to a `consensus-specs` release.
+- Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
+  container bounds are const-generic arguments; fork scheduling is runtime
+  because the `transition` suite moves fork epochs per case.
+- Per-fork containers are plain structs behind an enum, so SSZ stays derived. See
+  [`docs/beacon_stf.md`](docs/beacon_stf.md) for why, including the fork-by-fork
+  field counts and the merkle depth change at electra.
+- **Needs mutable element access on `SszList`/`SszVector`**, which published
+  libssz 0.2.2 lacks. Currently built against a local `[patch.crates-io]`
+  override that is intentionally not committed, so the crate builds only where
+  that override exists.
+- **Status:** all seven forks (phase0 through fulu) have containers, fork
+  upgrades, state transitions, and epoch processing. Every fixture case passes
+  on both presets: mainnet is 5705 cases plus 244 lib tests, minimal is 40009
+  cases plus 245. Fork choice is fixture-verified too: 150 mainnet
+  `fork_choice` cases pass, covering bellatrix's `on_merge_block`/terminal-PoW
+  validation, `should_override_forkchoice_update`, deneb's blob data
+  availability, and fulu's column data availability.
+- Nothing is ignored for being unimplemented. Ignored cases are the
+  `LightClient*` containers (a different layer, out of scope) and the `gloas`
+  and `eip7805` fixture trees. Those two do not parse as a `ForkName`, so
+  `collect` would skip them silently; `UNMODELED_FORKS` names them and
+  `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
+  that is neither parseable nor listed, so a new fork forces a decision.
+- A fixture case with no `post` state asserts the input must be **rejected**. That
+  rule lives in `check_transition`; do not add a runner that ignores it.
+
 ## Configuration Files
 
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)

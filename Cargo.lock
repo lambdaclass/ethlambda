@@ -1943,6 +1943,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-beacon"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "c-kzg",
+ "ethereum-types",
+ "hex",
+ "libssz",
+ "libssz-derive",
+ "libssz-merkle",
+ "libssz-types",
+ "libtest-mimic",
+ "num-bigint",
+ "serde",
+ "serde_yaml_ng",
+ "sha2",
+ "snap",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ethlambda-blockchain"
 version = "0.1.0"
 dependencies = [
@@ -2271,6 +2293,7 @@ version = "23.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
+ "async-trait",
  "bytes",
  "concat-kdf",
  "crossbeam",
@@ -4471,6 +4494,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d498c0482bba87d2647ea4601ea76cf2b498065e3958798a88f49274f3ced5e9"
 dependencies = [
+ "ethereum-types",
  "smallvec",
 ]
 
@@ -4491,6 +4515,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63c6d6d5ce5d79bba66bc98c99869eedffedf7f14f0aa0915f1a62802650bdf6"
 dependencies = [
+ "ethereum-types",
  "libssz",
  "sha2",
 ]
@@ -6849,6 +6874,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
