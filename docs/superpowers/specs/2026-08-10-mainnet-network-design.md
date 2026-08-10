@@ -23,6 +23,7 @@ This document covers sub-projects **A1** (mainnet wire and typed decode) and
 - Fork-aware SSZ decoding of every subscribed gossip topic into
   `ethlambda-beacon` containers.
 - Checkpoint sync of a finalized `BeaconState` and block from a Beacon API.
+- Forward sync from the anchor to the head over `beacon_blocks_by_range/2`.
 - Driving `on_tick` / `on_block` / `on_attestation` / `on_attester_slashing`
   against the DB-backed `Store`.
 - Beacon state persistence: finalized anchors plus forward replay.
@@ -43,7 +44,7 @@ execution-layer validation, and validator duties.
 | State storage | The existing DB-backed `Store`, extended | Beacon's in-memory `HashMap` store cannot hold mainnet states |
 | Fork digest | Computed from `Config::mainnet()`'s schedule and the anchor state's `genesis_validators_root` | No hardcoded constants, and correct across BPO forks |
 | Transport | QUIC only | Reuses the existing transport; the cost is a smaller peer pool |
-| Gossip breadth | Every mainnet topic except the 64 attestation subnets | A follower consumes aggregates; unaggregated subnets arrive with validator duties |
+| Gossip breadth | The 7 global topics, no subnet families | Subscribe only to what is consumed; each subnet family arrives with the sub-project that reads it |
 | Bootnodes | Built-in list, discovery forced on | `ethlambda beacon` must work without extra flags |
 | Publishing | Suppressed | Nothing this node can produce today would be signature-valid |
 
@@ -224,7 +225,7 @@ Re-subscribing across a boundary is sub-project E.
 | Admission | Compares against the mainnet fork id rather than `EnrForkId::local()`, and clamps `attnets` to 64 |
 | Bootnodes | Built-in `eth-clients/mainnet` ENRs; `--bootnodes` overrides |
 
-**Gossip topics**, fulu-era, 139 subscriptions:
+**Gossip topics**, fulu-era, 7 subscriptions:
 
 | Topic | Count |
 |---|---|
@@ -233,38 +234,54 @@ Re-subscribing across a boundary is sub-project E.
 | `voluntary_exit`, `proposer_slashing`, `attester_slashing` | 3 |
 | `bls_to_execution_change` | 1 |
 | `sync_committee_contribution_and_proof` | 1 |
-| `sync_committee_{0..3}` | 4 |
-| `data_column_sidecar_{0..127}` | 128 |
 
-`beacon_attestation_{0..63}` is **not** subscribed. Those carry unaggregated
-attestations, which only a validator producing or aggregating them needs. Fork
-choice is unaffected: `beacon_aggregate_and_proof` carries the same
-`AttestationData` with more attesters behind it, so `on_attestation` is fed
-entirely from aggregates. Subnet subscription arrives with validator duties in
-sub-project C, at which point it becomes the small rotating subset a real client
-subscribes to rather than all 64.
+Every subnet family is deliberately excluded. The rule is that this node
+subscribes only to what it consumes, and adds a family when the sub-project that
+consumes it lands:
 
-Because no attestation subnet is subscribed, the `attnets` ENR entry is 64 bits
-all unset. That is the honest advertisement for a node that serves no subnet, and
-costs only that subnet-gap-filling peers rank us lower.
+| Excluded | Carries | Consumer, and when |
+|---|---|---|
+| `beacon_attestation_{0..63}` | unaggregated attestations | Validator duties, sub-project C. Fork choice reads the same `AttestationData` off `beacon_aggregate_and_proof`, with more attesters behind it |
+| `sync_committee_{0..3}` | unaggregated sync committee messages | Validator duties, sub-project C |
+| `data_column_sidecar_{0..127}` | PeerDAS column sidecars | Data availability, sub-project D. Nothing checks availability today |
+| `blob_sidecar_{subnet_id}` | deneb and electra blobs | Nothing. Deprecated in fulu |
 
-`blob_sidecar_{subnet_id}` is deprecated in fulu and is not subscribed.
+That leaves 7 topics rather than 203, drops roughly 30k BLS verifications per
+epoch, and removes the column bandwidth entirely.
 
-`cgc` advertises `CUSTODY_REQUIREMENT` because peers may reject a lower value,
-while this node serves no samples until sub-project D. That is the same
-follow-before-serve tradeoff as the responder below, and is logged at startup.
+Two ENR entries now advertise less than the spec's shape suggests, both
+deliberately:
+
+- `attnets` is 64 bits all unset, which is exactly what a node subscribing to no
+  attestation subnet serves. It costs only that subnet-gap-filling peers rank us
+  lower.
+- `cgc` still advertises `CUSTODY_REQUIREMENT`, because peers may reject a lower
+  value outright and that would defeat the mode, while this node custodies and
+  serves nothing until sub-project D. This is the widest gap between what we
+  advertise and what we serve, so it is logged at startup alongside the
+  `DataAvailability` and `ExecutionEngine` stubs.
 
 The absence of `tcp` means beacon clients cannot discover us: lighthouse's
 discovery predicate requires `enr.tcp4().is_some() || enr.tcp6().is_some()` and
 applies it as a discv5 query filter. We discover them, which is what a follower
 needs. `docs/discovery.md` already records this.
 
-**Req/resp protocol ids registered:** `status/1`, `status/2`, `goodbye/1`,
-`ping/1`, `metadata/1`, `metadata/2`, `metadata/3`,
-`beacon_blocks_by_range/2`, `beacon_blocks_by_root/2`,
-`blob_sidecars_by_range/1`, `blob_sidecars_by_root/1`,
-`data_column_sidecars_by_range/1`, `data_column_sidecars_by_root/1`.
-Gloas and heze protocols are excluded, being far-future on mainnet.
+**Req/resp protocol ids**, registered by direction, following the same
+subscribe-only-what-you-consume rule as the topics:
+
+| Protocol | Direction | Why |
+|---|---|---|
+| `status/1`, `status/2` | both | Handshake on connect, in both directions |
+| `ping/1`, `metadata/1,2,3` | both | Liveness and peer metadata |
+| `goodbye/1` | inbound | Log the reason code; we never send one |
+| `beacon_blocks_by_range/2` | outbound | Fill the anchor-to-head gap, §9 |
+| `beacon_blocks_by_root/2` | outbound | Fetch a gossiped block's missing parent |
+
+`blob_sidecars_by_{range,root}/1` and `data_column_sidecars_by_{range,root}/1`
+are **not** registered: nothing consumes sidecars until sub-project D, and an
+unregistered protocol is refused at stream negotiation rather than answered with
+a lie. Inbound block serving arrives with sub-project E. Gloas and heze protocols
+are excluded, being far-future on mainnet.
 
 **Inbound responder.** The node answers only what keeps a connection alive:
 
@@ -274,15 +291,11 @@ Gloas and heze protocols are excluded, being far-future on mainnet.
 | `ping/1` | Our metadata sequence number |
 | `metadata/1,2,3` | A synthesized `MetaData` of the requested version |
 | `goodbye/1` | None; log the reason code and let the peer close |
-| everything else | `RESOURCE_UNAVAILABLE` |
 
-Serving blocks and sidecars is sub-project E. Answering
-`RESOURCE_UNAVAILABLE` costs peer score, which is the accepted price of
-following before serving.
-
-Dropping the attestation subnets removes roughly 30k unaggregated attestations
-per epoch, and their BLS verifications, from a node that consumes only
-aggregates.
+Nothing else is answered, because nothing else is registered. Peers asking for
+blocks or sidecars get a stream-negotiation refusal, and that costs peer score:
+the accepted price of following before serving. Sub-project E turns the two block
+protocols bidirectional and adds the sidecar ones.
 
 ## 8. Decode
 
@@ -309,10 +322,35 @@ carries:
 | Simplification | Consequence | Resolved by |
 |---|---|---|
 | `ExecutionEngine::valid()` | Optimistic import, no execution validation | Sub-project B |
-| `DataAvailability::NotRequired` unless columns happen to arrive on the subscribed subnets | Post-fulu DA is not enforced | Sub-project D |
+| `DataAvailability::NotRequired`, unconditionally: no column subnet is subscribed, so no evidence exists to pass | Post-fulu DA is not enforced | Sub-project D |
 
 Both are logged once at startup so a running node never implies more validation
 than it performs.
+
+### Anchor to head
+
+Checkpoint sync anchors at a **finalized** state, roughly two epochs behind the
+head, and `on_block` rejects a block whose parent is not in the store. The first
+gossiped block therefore lands on an unknown parent chain, so the gap has to be
+fetched before gossip can be applied at all:
+
+```
+anchor (finalized)                                    head (wall clock)
+   |<----------------- ~64 slots to fetch ----------------->|
+   |                                                        |
+   └─ beacon_blocks_by_range/2 from the highest-head peer ───┘
+      then apply buffered gossip blocks in slot order
+```
+
+Blocks arriving on gossip while the gap is being filled are buffered by parent
+root and applied once their parent imports; a gossiped block whose parent is
+still missing after the range fetch completes is fetched individually with
+`beacon_blocks_by_root/2`. This is the same shape as the existing lean
+`RangeSyncState` and `pending_root_requests` in `crates/net/p2p/src/lib.rs`, and
+that machinery is reused rather than rewritten.
+
+This is forward sync only, from the anchor to the head. Backfill below the
+anchor, which a node needs to serve historical requests, is sub-project E.
 
 ## 10. CLI: two subcommands, `lean` by default
 
@@ -378,10 +416,11 @@ that now resolve to `lean`.
 | Level | Test |
 |---|---|
 | Fork digest | Against three digests recorded from live crawls in `docs/discovery.md`: `8c9f62fe` (fulu with BPO 419072), `ad532ceb` (electra), `b5303f2a` (phase0). Covers both branches of `compute_fork_digest` |
-| Topics and protocols | Construction of all 139 topic names and every protocol id, and that no `beacon_attestation_*` topic is among them |
+| Topics and protocols | Construction of all 7 topic names and every protocol id, and that no `beacon_attestation_*`, `sync_committee_{id}`, `blob_sidecar_*` or `data_column_sidecar_*` topic is among them |
 | Decode | Fork-aware decode driven by the `ssz_static` fixtures already in the tree |
 | `Store` | All 150 mainnet `fork_choice` fixture cases pass against the DB-backed `Store` on the in-memory backend, and all 5705 mainnet plus 40009 minimal cases stay green after the type move |
 | Anchor and replay | Reconstruct a state above finalization by replay and compare against the directly computed post-state |
+| Anchor to head | Gossip blocks buffered while a range fetch is in flight are applied in slot order once their parent imports, and a block still orphaned afterwards triggers a by-root fetch |
 | CLI | Argv injection: bare flags resolve to `lean`, explicit subcommands pass through, help and version are never rewritten. Each subcommand rejects the other's required flags |
 | Lean regression | The full existing lean suite, unchanged, plus a devnet run driven by the current scripts with no subcommand added, proving the Docker entrypoint contract still holds |
 | Live | Against mainnet: peers connect, a `beacon_block` decodes within ~30s, and head tracks within one slot of wall clock |
