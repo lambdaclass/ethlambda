@@ -6,6 +6,7 @@
 //! under this module so both sets can coexist.
 
 pub mod constants;
+pub mod fork;
 pub mod primitives;
 
 #[cfg(test)]
@@ -24,5 +25,11 @@ mod tests {
         // epoch carries.
         assert_eq!(super::constants::FAR_FUTURE_EPOCH, u64::MAX);
         assert_eq!(crate::constants::FORK_DIGEST, "12345678");
+    }
+
+    #[test]
+    fn fork_ordering_is_reachable_from_the_namespace() {
+        use super::fork::ForkName;
+        assert!(ForkName::Fulu > ForkName::Phase0);
     }
 }

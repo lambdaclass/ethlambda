@@ -47,7 +47,7 @@ pub mod bls;
 pub mod config;
 pub use ethlambda_types::beacon::constants;
 pub mod containers;
-pub mod fork;
+pub use ethlambda_types::beacon::fork;
 pub mod fork_choice;
 pub mod genesis;
 pub mod hash;
