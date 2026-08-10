@@ -319,12 +319,11 @@ pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, Validat
 type StorageKey = Vec<u8>;
 type StorageEntry = (StorageKey, Vec<u8>);
 type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
-type VoteStore = HashMap<u64, AttestationData>;
 
 #[derive(Clone, Default)]
 struct ForkChoiceState {
-    known_votes: VoteStore,
-    new_votes: VoteStore,
+    known_votes: HashMap<u64, AttestationData>,
+    new_votes: HashMap<u64, AttestationData>,
 }
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
@@ -1453,7 +1452,11 @@ impl Store {
                 && candidate.hash_tree_root() > existing.hash_tree_root())
     }
 
-    fn record_vote(votes: &mut VoteStore, validator_id: u64, data: &AttestationData) {
+    fn record_vote(
+        votes: &mut HashMap<u64, AttestationData>,
+        validator_id: u64,
+        data: &AttestationData,
+    ) {
         let should_replace = votes
             .get(&validator_id)
             .is_none_or(|existing| Self::should_replace_vote(existing, data));
@@ -1616,10 +1619,12 @@ impl Store {
         let drained = self.new_payloads.lock().unwrap().drain();
         {
             let mut fork_choice = self.fork_choice.lock().unwrap();
-            let new_votes = std::mem::take(&mut fork_choice.new_votes);
-            for (validator_id, data) in new_votes {
+            let mut new_votes = std::mem::take(&mut fork_choice.new_votes);
+            for (validator_id, data) in new_votes.drain() {
                 Self::record_vote(&mut fork_choice.known_votes, validator_id, &data);
             }
+            // Reuse the underlying buffer to keep memory constant
+            fork_choice.new_votes = new_votes;
         }
         self.known_payloads.lock().unwrap().push_batch(drained);
     }
