@@ -43,7 +43,7 @@ execution-layer validation, and validator duties.
 | State storage | The existing DB-backed `Store`, extended | Beacon's in-memory `HashMap` store cannot hold mainnet states |
 | Fork digest | Computed from `Config::mainnet()`'s schedule and the anchor state's `genesis_validators_root` | No hardcoded constants, and correct across BPO forks |
 | Transport | QUIC only | Reuses the existing transport; the cost is a smaller peer pool |
-| Gossip breadth | Every mainnet topic | Chosen deliberately; see the caveat in §7 |
+| Gossip breadth | Every mainnet topic except the 64 attestation subnets | A follower consumes aggregates; unaggregated subnets arrive with validator duties |
 | Bootnodes | Built-in list, discovery forced on | `ethlambda beacon` must work without extra flags |
 | Publishing | Suppressed | Nothing this node can produce today would be signature-valid |
 
@@ -224,18 +224,29 @@ Re-subscribing across a boundary is sub-project E.
 | Admission | Compares against the mainnet fork id rather than `EnrForkId::local()`, and clamps `attnets` to 64 |
 | Bootnodes | Built-in `eth-clients/mainnet` ENRs; `--bootnodes` overrides |
 
-**Gossip topics**, fulu-era, 203 subscriptions:
+**Gossip topics**, fulu-era, 139 subscriptions:
 
 | Topic | Count |
 |---|---|
 | `beacon_block` | 1 |
 | `beacon_aggregate_and_proof` | 1 |
-| `beacon_attestation_{0..63}` | 64 |
 | `voluntary_exit`, `proposer_slashing`, `attester_slashing` | 3 |
 | `bls_to_execution_change` | 1 |
 | `sync_committee_contribution_and_proof` | 1 |
 | `sync_committee_{0..3}` | 4 |
 | `data_column_sidecar_{0..127}` | 128 |
+
+`beacon_attestation_{0..63}` is **not** subscribed. Those carry unaggregated
+attestations, which only a validator producing or aggregating them needs. Fork
+choice is unaffected: `beacon_aggregate_and_proof` carries the same
+`AttestationData` with more attesters behind it, so `on_attestation` is fed
+entirely from aggregates. Subnet subscription arrives with validator duties in
+sub-project C, at which point it becomes the small rotating subset a real client
+subscribes to rather than all 64.
+
+Because no attestation subnet is subscribed, the `attnets` ENR entry is 64 bits
+all unset. That is the honest advertisement for a node that serves no subnet, and
+costs only that subnet-gap-filling peers rank us lower.
 
 `blob_sidecar_{subnet_id}` is deprecated in fulu and is not subscribed.
 
@@ -269,12 +280,9 @@ Serving blocks and sidecars is sub-project E. Answering
 `RESOURCE_UNAVAILABLE` costs peer score, which is the accepted price of
 following before serving.
 
-**Caveat on breadth.** Subscribing to all 64 attestation subnets means BLS-
-verifying roughly 30k unaggregated attestations per epoch that fork choice does
-not need, since it consumes aggregates. A real client subscribes to blocks,
-aggregates, one or two attestation subnets, sync committee, and its custody
-columns. The full set is what was chosen, so it is what is specified; the
-narrower set is available as a follow-up if the CPU cost proves out.
+Dropping the attestation subnets removes roughly 30k unaggregated attestations
+per epoch, and their BLS verifications, from a node that consumes only
+aggregates.
 
 ## 8. Decode
 
@@ -288,7 +296,9 @@ variant. A decode failure is counted, logged at debug, and dropped.
 ```
 slot clock (12s)    ──► on_tick(store, unix_seconds, config)
 beacon_block        ──► decode ──► on_block(store, block, config, DataAvailability)
-aggregate + subnets ──► decode ──► on_attestation(store, attestation, is_from_block=false)
+                              └──► on_attestation(.., is_from_block=true) per
+                                   attestation carried in the block body
+aggregate_and_proof ──► decode ──► on_attestation(store, att, is_from_block=false, config)
 attester_slashing   ──► decode ──► on_attester_slashing(store, slashing)
                                       └─► get_head(store, config) ──► metrics, RPC
 ```
@@ -368,7 +378,7 @@ that now resolve to `lean`.
 | Level | Test |
 |---|---|
 | Fork digest | Against three digests recorded from live crawls in `docs/discovery.md`: `8c9f62fe` (fulu with BPO 419072), `ad532ceb` (electra), `b5303f2a` (phase0). Covers both branches of `compute_fork_digest` |
-| Topics and protocols | Construction of all 203 topic names and every protocol id |
+| Topics and protocols | Construction of all 139 topic names and every protocol id, and that no `beacon_attestation_*` topic is among them |
 | Decode | Fork-aware decode driven by the `ssz_static` fixtures already in the tree |
 | `Store` | All 150 mainnet `fork_choice` fixture cases pass against the DB-backed `Store` on the in-memory backend, and all 5705 mainnet plus 40009 minimal cases stay green after the type move |
 | Anchor and replay | Reconstruct a state above finalization by replay and compare against the directly computed post-state |
