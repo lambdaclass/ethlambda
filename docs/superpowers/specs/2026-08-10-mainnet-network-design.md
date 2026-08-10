@@ -51,28 +51,38 @@ execution-layer validation, and validator duties.
 ## 3. Type layout
 
 `ethlambda-beacon`'s containers, `primitives`, `fork`, `preset`, `config`, and
-`constants` move to `ethlambda-types`. `ethlambda-beacon` keeps `helpers`,
-`stf`, `genesis`, `upgrade`, `fork_choice`, `bls`, and `kzg`, and depends on
-`ethlambda-types`.
+`constants` move to `ethlambda-types`, **under a `beacon` module**:
+`ethlambda_types::beacon::containers::BeaconState`, and so on. The namespace is
+required, not cosmetic: `ethlambda-types` already has its own `primitives`,
+`constants`, and `checkpoint` modules, and lean's `Checkpoint` and beacon's are
+different types with the same name.
 
-`BeaconState` gains a `Lean(LeanState)` variant, and `ForkName` gains `Lean`.
+`ethlambda-beacon` keeps `helpers`, `stf`, `genesis`, `upgrade`, `fork_choice`,
+`bls`, `kzg`, and `hash`, and depends on `ethlambda-types`.
 
-**`ForkName::Lean` sorts last**, after `Gloas` and `Heze`, not immediately after
-`Fulu`. Three reasons:
+`BeaconState` gains a `Lean(crate::state::State)` variant and `ForkName` gains a
+`Lean` variant, both declared **last**, so the derived `Ord` puts `Lean` after
+every beacon fork. `fork >= ForkName::X` therefore reads as true for lean
+everywhere, which is the intent of "lean is the next fork", while leaving gloas's
+real position after fulu free for when it lands.
 
-1. `fork >= ForkName::X` gating throughout the STF reads as true for lean, which
-   is the intent of "lean is the next fork".
-2. `gloas` genuinely occupies the position after fulu. The crate already names it
-   in `UNMODELED_FORKS`, and `fixture_forks/every_directory_is_accounted_for`
-   fails if a fixture fork directory is neither parseable nor listed. Sorting
-   `Lean` last leaves gloas's real slot free.
-3. `ForkName::ALL` drives the fixture harness's test-list construction. `Lean`
-   must be excluded from that walk: the beacon fixture release ships no `lean`
-   tree, and a suite matching no case is designed to fail loudly.
+**`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
+documented as the forks this crate implements and is what `parse`, `previous`,
+and `next` search, and what the fixture harness walks. Keeping `Lean` out of it
+buys four things at once:
 
-`ForkName::Fulu.next()` stops returning `None`, so
-`neighbours_terminate_at_the_ends` needs updating to assert against the new last
-variant.
+| Behaviour | Result |
+|---|---|
+| `ForkName::parse("lean")` | `None`, so the fixture walk can never produce a lean case |
+| `Lean.next()`, `Lean.previous()` | `None`, so `upgrade` can never target or traverse it |
+| `Fulu.next()` | still `None`, so `neighbours_terminate_at_the_ends` needs no change |
+| `Lean > Fulu` | still true, since derived `Ord` follows declaration order, not `ALL` |
+
+`as_str()` matches variants directly rather than through `ALL`, so it gains a
+`Lean => "lean"` arm.
+
+Lean's `State` currently derives `Debug, Clone, SszEncode, SszDecode,
+HashTreeRoot`. `BeaconState` derives `PartialEq`, so `State` gains it too.
 
 ### `unreachable!()` in beacon accessors
 
