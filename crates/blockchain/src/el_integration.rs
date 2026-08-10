@@ -85,8 +85,15 @@ impl BlockChainServer {
         let engine = self.execution_engine.as_ref()?;
         let head_root = self.store.head().unwrap_or_default();
         let genesis_time = self.store.config().genesis_time;
+        // Build on the EL block the *consensus* chain expects to be extended —
+        // the head block's own payload hash — not whatever this node's EL happens
+        // to have as its head. The state transition checks the new payload's
+        // `parent_hash` against `state.latest_execution_payload_header.block_hash`,
+        // so a drifted EL head yields a block every peer rejects.
+        let parent_el_hash = self.el_hash_at(head_root);
         engine
             .build_payload(
+                parent_el_hash,
                 compute_time_at_slot(genesis_time, slot),
                 // Zero until Lean defines a RANDAO mix.
                 H256::ZERO,

@@ -29,6 +29,7 @@ TRACE=false
 KEEP=false
 BUILD=false
 VERIFY=true
+NO_EL=false
 
 KEYGEN_IMAGE="blockblaz/hash-sig-cli:latest"
 GENESIS_IMAGE="ethpandaops/eth-beacon-genesis:pk910-leanchain"
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --keep)        KEEP=true; shift ;;
     --build)       BUILD=true; shift ;;
     --no-verify)   VERIFY=false; shift ;;
+    --no-el)       NO_EL=true; shift ;;
     -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -279,7 +281,7 @@ for ((i = 0; i < NODES; i++)); do
     --http-address 0.0.0.0 \
     --metrics-port "$((8081 + i))" \
     --api-port "$((15052 + i))" \
-    --el-genesis /config/el-genesis.json \
+    $([[ "$NO_EL" == false ]] && echo "--el-genesis /config/el-genesis.json") \
     $([[ $i -eq 0 ]] && echo "--is-aggregator") >/dev/null || die "failed to start $NAME"
   ok "$NAME (quic $((9001 + i)), api $((15052 + i)))$([[ $i -eq 0 ]] && echo ' [aggregator]')"
 done
@@ -323,8 +325,9 @@ count1() { local n; n=$(grep -c "$1" "$2" 2>/dev/null || true); echo "${n:-0}"; 
 FAIL=0
 
 # 1. the embedded EL came up on every node
-EL_UP=$(count "In-process ethrex execution engine enabled")
-if [[ "$EL_UP" == "$NODES" ]]; then ok "in-process EL enabled on $EL_UP/$NODES node(s)"
+EL_UP=$(count "Embedded ethrex enabled")
+if [[ "$NO_EL" == true ]]; then ok "consensus-only control run (no EL expected)"
+elif [[ "$EL_UP" == "$NODES" ]]; then ok "in-process EL enabled on $EL_UP/$NODES node(s)"
 else warn "in-process EL enabled on $EL_UP/$NODES node(s)"; FAIL=1; fi
 
 # 2. blocks were produced (works with a single node, unlike the import path)
@@ -345,9 +348,11 @@ if [[ -n "$FINAL" ]]; then ok "${FINAL#*Checkpoint finalized }"
 else warn "no finalization yet (needs ~30 slots; ran $SLOTS)"; fi
 
 # 5. the EL actually built and executed payloads (trace-level: needs --trace)
-if [[ "$TRACE" == true ]]; then
+if [[ "$NO_EL" == true ]]; then
+  warn "consensus-only control run (--no-el): EL checks skipped"
+elif [[ "$TRACE" == true ]]; then
   BUILT=$(count "Built execution payload")
-  EXECD=$(( $(count "newPayload on own-built block") + $(count "newPayload ok") ))
+  EXECD=$(count "EL executed payload")
   if (( BUILT > 0 )); then ok "EL payloads built: $BUILT"
   else warn "no EL payload builds"; FAIL=1; fi
   if (( EXECD > 0 )); then ok "EL payloads submitted for execution: $EXECD"
@@ -357,7 +362,7 @@ else
 fi
 
 # 6. red flags
-BAD=$(( $(count "falling back to synthetic") + $(count "getPayload failed") + $(count "rejected payload") ))
+BAD=$(( $(count "using synthetic payload") + $(count "EL rejected payload") ))
 if (( BAD == 0 )); then ok "no synthetic fallbacks / rejected payloads"
 else warn "EL failure lines: $BAD"; FAIL=1; fi
 

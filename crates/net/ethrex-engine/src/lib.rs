@@ -112,27 +112,42 @@ impl EthrexEngine {
         Ok(self.store.get_latest_block_number().await?)
     }
 
-    /// Build the execution payload for a block being proposed on top of the
-    /// current canonical head.
+    /// Build the execution payload for a block being proposed on top of
+    /// `parent_el_hash`.
     ///
     /// One call: ethrex creates the payload skeleton and fills it synchronously,
     /// so unlike the Engine API there is no id to hold onto and no second fetch.
+    ///
+    /// `parent_el_hash` **must** be the EL block hash the consensus chain expects
+    /// to be extended — the `execution_payload.block_hash` of the Lean block
+    /// being built on. It is passed in rather than read from this engine's own
+    /// canonical head because the two can differ: every node runs its own
+    /// execution layer, and an EL head that has drifted from the consensus chain
+    /// would produce a payload whose `parent_hash` fails the state transition's
+    /// check against `state.latest_execution_payload_header.block_hash` — which
+    /// makes every peer reject the block.
     ///
     /// `beacon_root` follows the lean-parent-root convention — it is the
     /// proposed block's `parent_root`, and must be the same value later passed
     /// to [`Self::execute_payload`], or the EL's block-hash check fails.
     pub async fn build_payload(
         &self,
+        parent_el_hash: LeanH256,
         timestamp: u64,
         prev_randao: LeanH256,
         beacon_root: LeanH256,
         fee_recipient: [u8; 20],
     ) -> Result<ExecutionPayloadV3, EngineError> {
-        let parent = self
-            .store
-            .get_latest_canonical_block_hash()
-            .await?
-            .ok_or(EngineError::NoCanonicalHead)?;
+        let parent = H256(parent_el_hash.0);
+        // Make the EL treat that block as its head before building on it, so the
+        // payload is produced against the state the consensus chain expects.
+        // safe/finalized are left unset (ethrex reads zero as "not provided"):
+        // pinning them here would forbid a later build on an earlier block.
+        apply_fork_choice(&self.store, parent, H256::zero(), H256::zero())
+            .await
+            .map_err(|err| {
+                EngineError::Conversion(format!("cannot build on parent {parent:#x}: {err}"))
+            })?;
         let args = BuildPayloadArgs {
             parent,
             timestamp,
