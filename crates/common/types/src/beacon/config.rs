@@ -1,7 +1,7 @@
 //! Runtime chain configuration: the values `configs/mainnet.yaml` and
 //! `configs/minimal.yaml` set per network, as opposed to constants (fixed by
-//! the specification, see [`crate::constants`]) or preset values (compile-time
-//! container bounds, see [`crate::preset`]).
+//! the specification, see [`crate::beacon::constants`]) or preset values (compile-time
+//! container bounds, see [`crate::beacon::preset`]).
 //!
 //! Fork *scheduling* lives here rather than at compile time specifically
 //! because the `transition` fixture suite needs to move a fork's activation
@@ -27,12 +27,12 @@
 //! reads it on every phase0-era signature. The other three
 //! (`MIN_GENESIS_ACTIVE_VALIDATOR_COUNT`, `MIN_GENESIS_TIME`, `GENESIS_DELAY`)
 //! are read only while building a genesis state from Eth1 deposit history, and
-//! never again once that state exists, but [`crate::genesis`] needs them and the
+//! never again once that state exists, but [`crate::beacon::genesis`] needs them and the
 //! `genesis` fixture suite checks them.
 
-use crate::constants;
-use crate::fork::ForkName;
-use crate::primitives::{Epoch, ExecutionBlockHash, Gwei, Uint256, Version};
+use crate::beacon::constants;
+use crate::beacon::fork::ForkName;
+use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, Uint256, Version};
 
 /// One entry in fulu's blob schedule: from `epoch` onward (until a later
 /// entry takes over), a block may carry up to `max_blobs_per_block` blobs.
@@ -415,7 +415,7 @@ impl Config {
     /// mean "never", as intended.
     ///
     /// Phase0 is always scheduled (its epoch is
-    /// [`crate::constants::GENESIS_EPOCH`], never the sentinel), so this
+    /// [`crate::beacon::constants::GENESIS_EPOCH`], never the sentinel), so this
     /// always finds at least phase0 and never needs to fail.
     pub fn fork_at_epoch(&self, epoch: Epoch) -> ForkName {
         ForkName::ALL

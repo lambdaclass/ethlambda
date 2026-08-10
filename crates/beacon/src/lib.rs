@@ -44,7 +44,7 @@
 //! [specs]: https://github.com/ethereum/consensus-specs
 
 pub mod bls;
-pub mod config;
+pub use ethlambda_types::beacon::config;
 pub use ethlambda_types::beacon::constants;
 pub mod containers;
 pub use ethlambda_types::beacon::fork;

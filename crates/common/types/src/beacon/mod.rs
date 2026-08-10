@@ -5,6 +5,7 @@
 //! beacon's by the same name. Everything moved out of `ethlambda-beacon` lives
 //! under this module so both sets can coexist.
 
+pub mod config;
 pub mod constants;
 pub mod fork;
 pub mod preset;
@@ -40,5 +41,18 @@ mod tests {
         assert_eq!(super::preset::SLOTS_PER_EPOCH, 32);
         #[cfg(feature = "preset-minimal")]
         assert_eq!(super::preset::SLOTS_PER_EPOCH, 8);
+    }
+
+    #[test]
+    fn mainnet_config_carries_the_fulu_schedule() {
+        let config = super::config::Config::mainnet();
+        assert_eq!(config.fulu_fork_version, [0x06, 0x00, 0x00, 0x00]);
+        assert_eq!(config.fulu_fork_epoch, 411_392);
+        // The two blob-parameter-only forks, which perturb the fork digest.
+        assert_eq!(config.blob_schedule.len(), 2);
+        assert_eq!(config.blob_schedule[0].epoch, 412_672);
+        assert_eq!(config.blob_schedule[0].max_blobs_per_block, 15);
+        assert_eq!(config.blob_schedule[1].epoch, 419_072);
+        assert_eq!(config.blob_schedule[1].max_blobs_per_block, 21);
     }
 }
