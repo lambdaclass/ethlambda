@@ -1,6 +1,6 @@
 //! Spec constants: values the specification fixes outright, as opposed to
-//! preset values (compile-time, see [`crate::preset`]) or configuration
-//! values (runtime, per network, see [`crate::config`]).
+//! preset values (compile-time, see [`crate::beacon::preset`]) or configuration
+//! values (runtime, per network, see [`crate::beacon::config`]).
 //!
 //! A value lives here only if the spec's own `.md` files list it under a
 //! "Constants" heading (or, for domain types, wherever the fork first
@@ -14,7 +14,7 @@
 //! throughout this crate and by the SSZ codec) already commit to little-endian
 //! in the function name, so there is no value for this constant to hold.
 
-use crate::primitives::{DomainType, Epoch, Gwei, Slot};
+use crate::beacon::primitives::{DomainType, Epoch, Gwei, Slot};
 
 // ---------------------------------------------------------------------------
 // Misc (phase0)
@@ -32,7 +32,7 @@ pub const GENESIS_EPOCH: Epoch = 0;
 /// Validator lifecycle fields (`activation_eligibility_epoch`, `exit_epoch`,
 /// `withdrawable_epoch`, ...) hold this until the corresponding event is
 /// scheduled. Comparisons like `validator.exit_epoch == FAR_FUTURE_EPOCH`
-/// are how the spec asks "has this validator exited". [`crate::config`] reuses
+/// are how the spec asks "has this validator exited". [`crate::beacon::config`] reuses
 /// the same sentinel for fork epochs that have not been scheduled, so that
 /// `Config::fork_at_epoch` can skip them the same way.
 pub const FAR_FUTURE_EPOCH: Epoch = Epoch::MAX;
@@ -54,7 +54,7 @@ pub const DEPOSIT_CONTRACT_TREE_DEPTH: usize = 32;
 /// `Bitvector`, hence `usize`.
 pub const JUSTIFICATION_BITS_LENGTH: usize = 4;
 
-/// `2**64 - 1`. Used only by [`crate::state_transition`]'s `integer_squareroot`
+/// `2**64 - 1`. Used only by [`crate::beacon::state_transition`]'s `integer_squareroot`
 /// helper as the boundary past which the doubling-based Newton's method
 /// bound is replaced by a precomputed answer; unrelated to
 /// [`FAR_FUTURE_EPOCH`] despite the identical bit pattern.
@@ -188,11 +188,11 @@ pub const PARTICIPATION_FLAG_WEIGHTS: [u64; 3] = [
 /// The number of sub-slot ticks the fork choice store used to divide a slot
 /// into (attest, aggregate, and the next slot's boundary). Deprecated in
 /// favor of the millisecond-precision basis-point timings
-/// (`ATTESTATION_DUE_BPS` and friends, in [`crate::config`]), but the
+/// (`ATTESTATION_DUE_BPS` and friends, in [`crate::beacon::config`]), but the
 /// specification still lists it, and older fixtures may reference it.
 pub const INTERVALS_PER_SLOT: u64 = 3;
 
-/// The denominator the `*_DUE_BPS` configuration values (in [`crate::config`])
+/// The denominator the `*_DUE_BPS` configuration values (in [`crate::beacon::config`])
 /// are numerators over, i.e. ten thousand basis points to a whole slot.
 /// `get_slot_component_duration_ms` divides by this to turn a basis-point
 /// share into a millisecond offset into the slot.
@@ -206,7 +206,7 @@ pub const BASIS_POINTS: u64 = 10_000;
 ///
 /// A blob is a vector of field elements, so this is the factor relating a field
 /// element count to a byte length: `BYTES_PER_BLOB` and `BYTES_PER_CELL` in
-/// [`crate::preset`] are both derived from it. Fixed by the specification rather
+/// [`crate::beacon::preset`] are both derived from it. Fixed by the specification rather
 /// than by preset, since it follows from the size of the BLS12-381 scalar field
 /// and not from any network parameter. Bounds a `ByteVector`, hence `usize`.
 pub const BYTES_PER_FIELD_ELEMENT: usize = 32;
