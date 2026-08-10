@@ -53,7 +53,7 @@ pub mod genesis;
 pub mod hash;
 pub mod helpers;
 pub mod kzg;
-pub mod preset;
+pub use ethlambda_types::beacon::preset;
 pub use ethlambda_types::beacon::primitives;
 pub mod stf;
 pub mod upgrade;

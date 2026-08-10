@@ -7,6 +7,7 @@
 
 pub mod constants;
 pub mod fork;
+pub mod preset;
 pub mod primitives;
 
 #[cfg(test)]
@@ -31,5 +32,13 @@ mod tests {
     fn fork_ordering_is_reachable_from_the_namespace() {
         use super::fork::ForkName;
         assert!(ForkName::Fulu > ForkName::Phase0);
+    }
+
+    #[test]
+    fn preset_slots_per_epoch_matches_the_selected_preset() {
+        #[cfg(not(feature = "preset-minimal"))]
+        assert_eq!(super::preset::SLOTS_PER_EPOCH, 32);
+        #[cfg(feature = "preset-minimal")]
+        assert_eq!(super::preset::SLOTS_PER_EPOCH, 8);
     }
 }

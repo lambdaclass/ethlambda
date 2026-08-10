@@ -4,7 +4,7 @@
 //! The specification splits its numeric parameters into two kinds. *Configuration*
 //! values (genesis time, fork-activation epochs, network-specific limits) can
 //! differ between two networks running the same client binary, so they belong in
-//! [`crate::config`] as runtime data. *Preset* values instead fix the shape of the
+//! [`crate::beacon::config`] as runtime data. *Preset* values instead fix the shape of the
 //! SSZ containers the state transition operates on: how many slots a historical
 //! roots vector holds, how many attestations fit in a block, how many field
 //! elements make up a blob. Two networks that disagree on a preset value are
@@ -360,9 +360,9 @@ pub mod mainnet {
     ///
     /// Derived rather than transcribed, so the two cannot drift apart.
     /// `BYTES_PER_FIELD_ELEMENT` is a fixed spec constant rather than a preset
-    /// value, so it comes from [`crate::constants`].
+    /// value, so it comes from [`crate::beacon::constants`].
     pub const BYTES_PER_BLOB: usize =
-        crate::constants::BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB;
+        crate::beacon::constants::BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB;
 
     // ================================================================
     // Electra
@@ -488,10 +488,10 @@ pub mod mainnet {
     /// `FIELD_ELEMENTS_PER_CELL * BYTES_PER_FIELD_ELEMENT`, the specification's
     /// formula for the bound on the `Cell` type (`ByteVector<BYTES_PER_CELL>`).
     ///
-    /// Derived rather than transcribed, from the same [`crate::constants`] value
+    /// Derived rather than transcribed, from the same [`crate::beacon::constants`] value
     /// `BYTES_PER_BLOB` uses.
     pub const BYTES_PER_CELL: usize =
-        FIELD_ELEMENTS_PER_CELL * crate::constants::BYTES_PER_FIELD_ELEMENT;
+        FIELD_ELEMENTS_PER_CELL * crate::beacon::constants::BYTES_PER_FIELD_ELEMENT;
 
     // --- State list lengths ---
 
@@ -814,9 +814,9 @@ pub mod minimal {
     ///
     /// Derived rather than transcribed, so the two cannot drift apart.
     /// `BYTES_PER_FIELD_ELEMENT` is a fixed spec constant rather than a preset
-    /// value, so it comes from [`crate::constants`].
+    /// value, so it comes from [`crate::beacon::constants`].
     pub const BYTES_PER_BLOB: usize =
-        crate::constants::BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB;
+        crate::beacon::constants::BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB;
 
     // ================================================================
     // Electra
@@ -942,10 +942,10 @@ pub mod minimal {
     /// `FIELD_ELEMENTS_PER_CELL * BYTES_PER_FIELD_ELEMENT`, the specification's
     /// formula for the bound on the `Cell` type (`ByteVector<BYTES_PER_CELL>`).
     ///
-    /// Derived rather than transcribed, from the same [`crate::constants`] value
+    /// Derived rather than transcribed, from the same [`crate::beacon::constants`] value
     /// `BYTES_PER_BLOB` uses.
     pub const BYTES_PER_CELL: usize =
-        FIELD_ELEMENTS_PER_CELL * crate::constants::BYTES_PER_FIELD_ELEMENT;
+        FIELD_ELEMENTS_PER_CELL * crate::beacon::constants::BYTES_PER_FIELD_ELEMENT;
 
     // --- State list lengths ---
 
@@ -979,7 +979,7 @@ pub use minimal::*;
 /// (EIP-7251): its own copy restructures the division around the constant
 /// rather than only swapping the constant in, so from electra on a value
 /// selected here is no longer enough on its own to keep one shared copy of
-/// that function correct. `crate::stf::epoch::electra::process_slashings` is
+/// that function correct. `crate::beacon::stf::epoch::electra::process_slashings` is
 /// a separate function for exactly that reason; see its own doc for the
 /// arithmetic. `slash_validator` never breaks the pattern this module
 /// describes, so it keeps reading [`min_slashing_penalty_quotient`] and
@@ -1005,7 +1005,7 @@ pub use minimal::*;
 /// pin the fork-to-constant mapping, which holds under both presets, rather than
 /// any numeric relationship, which does not.
 pub mod retuned {
-    use crate::fork::ForkName;
+    use crate::beacon::fork::ForkName;
 
     /// How much the summed slashings are scaled by before being capped at the
     /// total active balance.
@@ -1258,11 +1258,11 @@ mod tests {
 
         assert_eq!(
             mainnet::BYTES_PER_CELL,
-            mainnet::FIELD_ELEMENTS_PER_CELL * crate::constants::BYTES_PER_FIELD_ELEMENT
+            mainnet::FIELD_ELEMENTS_PER_CELL * crate::beacon::constants::BYTES_PER_FIELD_ELEMENT
         );
         assert_eq!(
             minimal::BYTES_PER_CELL,
-            minimal::FIELD_ELEMENTS_PER_CELL * crate::constants::BYTES_PER_FIELD_ELEMENT
+            minimal::FIELD_ELEMENTS_PER_CELL * crate::beacon::constants::BYTES_PER_FIELD_ELEMENT
         );
 
         assert_eq!(

@@ -18,7 +18,7 @@ version.workspace = true
 # enabling this feature switches every constant to the minimal preset. The test
 # target builds the crate twice, once per preset, and each build walks only its
 # own fixture tree.
-preset-minimal = []
+preset-minimal = ["ethlambda-types/preset-minimal"]
 
 [dependencies]
 thiserror.workspace = true
