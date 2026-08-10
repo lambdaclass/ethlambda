@@ -1,9 +1,9 @@
-# `--network mainnet`: following the Ethereum Beacon Chain
+# `ethlambda beacon`: following the Ethereum Beacon Chain
 
-Design for a `--network <lean|mainnet>` flag that turns ethlambda into a
+Design for an `ethlambda beacon` subcommand that turns ethlambda into a
 follower of the Ethereum Beacon Chain, reusing the spec-verified
 `ethlambda-beacon` crate for consensus and the existing DB-backed `Store` for
-persistence.
+persistence. `ethlambda lean` keeps today's behavior and stays the default.
 
 Branch: `feat/mainnet-network`, off `feat/discv5-discovery`, with
 `feat/beacon-chain-stf` merged in.
@@ -15,7 +15,8 @@ This document covers sub-projects **A1** (mainnet wire and typed decode) and
 
 **In scope**
 
-- `--network <lean|mainnet>`, defaulting to `lean`. Lean behavior is unchanged.
+- `lean` and `beacon` subcommands, with `lean` as the default so existing
+  invocations keep working. Lean behavior is unchanged.
 - Beacon-chain gossip topics, req/resp protocol ids, ENR entries, discv5
   admission, and a built-in mainnet bootnode list.
 - Fork digest computed from the fork schedule and the anchor state.
@@ -37,12 +38,13 @@ execution-layer validation, and validator duties.
 |---|---|---|
 | Consensus implementation | Reuse `ethlambda-beacon` unchanged | phase0 through fulu, 5705 mainnet fixture cases green, 150 of them `fork_choice` |
 | Type location | Move `ethlambda-beacon`'s containers into `ethlambda-types` | Lets `BeaconState` gain a `Lean` variant without `ethlambda-beacon` depending on lean crates |
+| CLI shape | `lean` and `beacon` subcommands, `lean` default | Each subcommand declares its own required flags, instead of `Option<T>` plus hand-rolled validation |
 | Chain dispatch | One `BlockChainServer`, single `match` on the state variant at the top of each handler | No traits, no generics through the actor system |
 | State storage | The existing DB-backed `Store`, extended | Beacon's in-memory `HashMap` store cannot hold mainnet states |
 | Fork digest | Computed from `Config::mainnet()`'s schedule and the anchor state's `genesis_validators_root` | No hardcoded constants, and correct across BPO forks |
 | Transport | QUIC only | Reuses the existing transport; the cost is a smaller peer pool |
 | Gossip breadth | Every mainnet topic | Chosen deliberately; see the caveat in §7 |
-| Bootnodes | Built-in list, discovery forced on | `--network mainnet` must work without extra flags |
+| Bootnodes | Built-in list, discovery forced on | `ethlambda beacon` must work without extra flags |
 | Publishing | Suppressed | Nothing this node can produce today would be signature-valid |
 
 ## 3. Type layout
@@ -197,7 +199,7 @@ fetch anchor state + block (Beacon API)
                       └─► gossip topics, ENR `eth2` entry, discv5 admission
 ```
 
-This is fulu's `compute_fork_digest` verbatim (EIP-7892). `--network mainnet`
+This is fulu's `compute_fork_digest` verbatim (EIP-7892). `ethlambda beacon`
 therefore requires `--checkpoint-sync-url`, which matches every production
 client and removes both constants that would otherwise need maintaining.
 
@@ -302,30 +304,64 @@ carries:
 Both are logged once at startup so a running node never implies more validation
 than it performs.
 
-## 10. Configuration
+## 10. CLI: two subcommands, `lean` by default
 
-| Flag | Default | Behavior |
+```
+ethlambda [lean]   <common> <lean-only>      today's client, unchanged
+ethlambda  beacon  <common> <beacon-only>    the mainnet follower
+```
+
+Each subcommand declares its own required flags, so nothing is `Option<T>` for
+the sole purpose of being validated by hand afterwards.
+
+| Group | Flags |
+|---|---|
+| Common | `--node-key`, `--node-id`, `--data-dir`, `--gossipsub-port`, `--bootnodes`, `--http-address`, `--api-port`, `--metrics-port`, `--discovery.*` |
+| `lean` only | `--genesis`, `--validators`, `--validator-config`, `--hash-sig-keys-dir` (all required), `--is-aggregator`, `--aggregate-subnet-ids`, `--attestation-committee-count`, `--enable-proposer-aggregation`, `--max-attestations-per-block`, `--disable-duty-sync-gate`, `--checkpoint-sync-url` |
+| `beacon` only | `--checkpoint-sync-url` (required) |
+
+`--checkpoint-sync-url` is declared per subcommand rather than shared, because
+its meaning differs: on lean it is an optional fallback used only when there is
+no resumable state on disk, and on beacon it is the mandatory source of the
+anchor state, the `genesis_validators_root`, and therefore the fork digest.
+
+Defaults that differ per subcommand fall out of the split instead of needing
+resolution logic:
+
+| Flag | `lean` | `beacon` |
 |---|---|---|
-| `--network` | `lean` | `lean` or `mainnet` |
-| `--discovery.port` | `9000` on lean, `--gossipsub-port + 1` on mainnet | Becomes `Option<u16>`; resolution is explicit rather than a clap default, so the mainnet default cannot collide with the QUIC port out of the box |
-| `--checkpoint-sync-url` | none | Required when `--network mainnet` |
-| `--discovery.enable` | `false` on lean, forced `true` on mainnet | Mainnet peering is impossible without a crawl: published mainnet bootnode ENRs carry no `quic` |
+| `--discovery.enable` | `false` | `true`, not overridable |
+| `--discovery.port` | `9000` | `--gossipsub-port + 1` |
 
-Four flags are `required` in clap today and describe lean artifacts that do not
-exist on mainnet: `--genesis` (a lean `config.yaml`), `--validators`,
-`--validator-config`, and `--hash-sig-keys-dir`. All four become
-`Option<PathBuf>`, required only when `--network lean`, validated in
-`CliOptions::validate` alongside the existing discovery-port check. `main.rs`
-skips genesis parsing, validator-registry loading, and XMSS key loading entirely
-on mainnet, the way it already skips the whole consensus stack under
-`HIVE_LEAN_TEST_DRIVER`.
+`--discovery.enable` is forced on for `beacon` because mainnet peering is
+impossible without a crawl: published mainnet bootnode ENRs carry no `quic`
+entry, so none of them is statically dialable. The differing `--discovery.port`
+default keeps the discv5 socket from colliding with the QUIC port, which the
+existing `validate_discovery` check would otherwise reject out of the box.
 
-`--node-key` and `--node-id` stay required on both networks: the first is the
-libp2p and discv5 identity, the second labels metrics.
+### Making `lean` the default subcommand
 
-`--is-aggregator`, `--aggregate-subnet-ids`, `--attestation-committee-count`,
-`--enable-proposer-aggregation`, and `--max-attestations-per-block` stay accepted
-and are ignored on mainnet, since nothing publishes.
+`Dockerfile`'s `ENTRYPOINT ["/usr/local/bin/ethlambda"]` takes flags appended by
+the caller, and every devnet script, `lean-quickstart` profile, Hive client
+wrapper, and `shadow/build.sh` invocation passes bare flags with no subcommand.
+All of them must keep working untouched.
+
+clap has no native default subcommand, so `main` preprocesses argv: if the first
+argument is neither a known subcommand nor a help or version flag, `lean` is
+inserted ahead of it. This is one small function with its own tests, and it keeps
+`--help` output free of the duplicated argument groups that clap's
+`args_conflicts_with_subcommands` pattern would produce.
+
+```
+ethlambda --genesis c.yaml ...   ->  ethlambda lean --genesis c.yaml ...
+ethlambda lean --genesis c.yaml  ->  unchanged
+ethlambda beacon --checkpoint-sync-url ...  ->  unchanged
+ethlambda --help / --version / -h / -V      ->  unchanged, no injection
+```
+
+`HIVE_LEAN_TEST_DRIVER` is unaffected: it is an environment variable checked
+after parsing and before any file is read, and the Hive shim passes bare flags
+that now resolve to `lean`.
 
 ## 11. Testing
 
@@ -336,7 +372,8 @@ and are ignored on mainnet, since nothing publishes.
 | Decode | Fork-aware decode driven by the `ssz_static` fixtures already in the tree |
 | `Store` | All 150 mainnet `fork_choice` fixture cases pass against the DB-backed `Store` on the in-memory backend, and all 5705 mainnet plus 40009 minimal cases stay green after the type move |
 | Anchor and replay | Reconstruct a state above finalization by replay and compare against the directly computed post-state |
-| Lean regression | The full existing lean suite, unchanged, plus a devnet run |
+| CLI | Argv injection: bare flags resolve to `lean`, explicit subcommands pass through, help and version are never rewritten. Each subcommand rejects the other's required flags |
+| Lean regression | The full existing lean suite, unchanged, plus a devnet run driven by the current scripts with no subcommand added, proving the Docker entrypoint contract still holds |
 | Live | Against mainnet: peers connect, a `beacon_block` decodes within ~30s, and head tracks within one slot of wall clock |
 
 ## 12. Sub-projects
