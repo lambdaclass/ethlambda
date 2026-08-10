@@ -1949,6 +1949,7 @@ dependencies = [
  "blst",
  "c-kzg",
  "ethereum-types",
+ "ethlambda-types",
  "hex",
  "libssz",
  "libssz-derive",
@@ -2133,6 +2134,7 @@ name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
  "datatest-stable",
+ "ethereum-types",
  "ethlambda-test-fixtures",
  "hex",
  "libssz",

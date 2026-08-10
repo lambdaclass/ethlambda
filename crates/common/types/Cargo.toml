@@ -14,10 +14,11 @@ thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 
-libssz.workspace = true
+libssz = { workspace = true, features = ["ethereum_types"] }
 libssz-derive.workspace = true
-libssz-merkle.workspace = true
+libssz-merkle = { workspace = true, features = ["ethereum_types"] }
 libssz-types.workspace = true
+ethereum-types.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

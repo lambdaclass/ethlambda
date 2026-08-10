@@ -25,6 +25,8 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 
+ethlambda-types.workspace = true
+
 libssz = { workspace = true, features = ["ethereum_types"] }
 libssz-derive.workspace = true
 libssz-merkle = { workspace = true, features = ["ethereum_types"] }
