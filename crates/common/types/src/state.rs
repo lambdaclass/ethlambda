@@ -12,7 +12,7 @@ use crate::{
 use primitives::HashTreeRoot as _;
 
 /// The main consensus state object
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
     /// The chain's configuration parameters
     pub config: ChainConfig,
@@ -65,7 +65,7 @@ pub type JustificationValidators =
 /// Each validator has two independent XMSS keys: one for signing attestations
 /// and one for signing block proposals. This allows signing both in the same
 /// slot without violating OTS (one-time signature) constraints.
-#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
     /// XMSS public key used for attestation signing.
     #[serde(serialize_with = "serialize_pubkey_hex")]
@@ -114,7 +114,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ChainConfig {
     pub genesis_time: u64,
 }
@@ -157,4 +157,15 @@ pub fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
     }
 
     block.state_root == computed
+}
+
+#[cfg(test)]
+mod partial_eq_tests {
+    use super::*;
+
+    #[test]
+    fn a_state_equals_its_own_clone() {
+        let state = State::from_genesis(0, Vec::new());
+        assert_eq!(state, state.clone());
+    }
 }
