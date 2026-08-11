@@ -1116,12 +1116,100 @@ it defines are used by the lean side."
 
 ## Done when
 
-- [ ] `make test-beacon` passes both presets with the counts from Task 1 Step 4
-- [ ] `make test` passes
-- [ ] `make lint` passes with no warnings
-- [ ] `make fmt` produces no diff
-- [ ] `ethlambda_types::beacon::containers::BeaconState::Lean` exists and reports `ForkName::Lean`
-- [ ] `ForkName::parse("lean")` returns `None` and `ForkName::Fulu.next()` returns `None`
+- [x] `make test-beacon` passes both presets with the fixture counts from Task 1 Step 4
+- [x] `make test` passes — **scoped**, see "What the plan got wrong" below
+- [x] `make lint` passes with no warnings — **scoped**, same reason
+- [x] `make fmt` produces no diff
+- [x] `ethlambda_types::beacon::containers::BeaconState::Lean` exists and reports `ForkName::Lean`
+- [x] `ForkName::parse("lean")` returns `None` and `ForkName::Fulu.next()` returns `None`
 - [ ] A lean devnet runs unchanged: `make run-devnet`, blocks produced and finalized
+      — **blocked**, the binary cannot link until the ethrex checkout is fixed
 
 Then start plan 2, CLI subcommands.
+
+---
+
+## Outcome
+
+Executed 2026-08-11 on `feat/mainnet-network`. Eleven commits, `0386c82`
+(the merge) through `c4f0ea2`.
+
+### What the plan got wrong
+
+**1. `feat/beacon-chain-stf` does not compile at its own tip.** Task 1's baseline
+was unreachable as written: `ethlambda-beacon` fails with 18 `E0594`/`E0596`
+errors, because the state transition mutates SSZ collections in place and
+published `libssz-types` 0.2.2 exposes only `Deref`/`Index`. The impls exist only
+on libssz's unmerged `add-deref` branch. That branch's own `Cargo.lock` pins
+0.2.2 from crates.io and carries no patch, so the counts recorded in
+`docs/beacon_stf.md` were never reproducible from a clean checkout.
+
+Fixed by commit `092180d`, a `[patch.crates-io]` pinning all four libssz crates
+to rev `30320bd`. Pin the **rev, not the branch**: `origin/add-deref`'s tip has
+merged libssz `main` and reports 0.3.0, which does not satisfy the `0.2.2`
+requirement, so Cargo would silently ignore the patch. Patch **all four**, since
+`libssz-types` depends on `libssz` and `libssz-merkle` by path inside that repo.
+Remove the whole block once `add-deref` is merged and released.
+
+**2. `make test` and `make lint` are broken by something outside this plan.**
+`crates/net/p2p` has an absolute path dependency on a local ethrex *directory*,
+and that checkout is on `feat/discovery-peer-requirements` rather than the
+`feat/lean-discovery-hooks` its comment names, so `NodeRecord::from_node_with_extra_pairs`
+and friends are missing. Pre-dates the beacon merge. The scoped substitutes used
+throughout, and the gates plans 2 to 5 should use until it is resolved:
+
+```bash
+cargo test --workspace --exclude ethlambda-beacon --exclude ethlambda-p2p --exclude ethlambda --profile release-fast
+cargo clippy --workspace --exclude ethlambda-p2p --exclude ethlambda --all-targets -- -D warnings
+```
+
+**3. Task 9 was far larger than one file.** The plan scoped it to `fork.rs`.
+Adding a `ForkName` variant makes every exhaustive match on it non-exhaustive:
+11 files, including the fixture test harness in `crates/beacon/tests/spec/`.
+Each new arm follows one of three rules, and plans 2 to 5 should keep applying
+them:
+
+| Case | Arm |
+|---|---|
+| `as_str` | the real answer, `"lean"` |
+| No `Result`, or dispatching on a `state.fork_name()` we hold | `unreachable!()` naming the function |
+| Returns `Result` **and** takes the fork from caller data | `Err(Error::UnsupportedForFork)` |
+
+`BeaconState::from_ssz` is the deliberate exception: it decodes lean's `State`
+for real, because lean has a state shape. `SignedBeaconBlock::from_ssz` does not,
+so it returns the error.
+
+**4. Task 4 must come after Task 5.** `preset.rs` has a real (non-doc)
+`use crate::fork::ForkName`, so moving `preset` before `fork` leaves
+`ethlambda-types` unable to compile, and it cannot depend back on
+`ethlambda-beacon` to resolve it. The end state is identical either way.
+
+**5. The blanket `sed` catches paths that must not be rewritten.** Three
+references named modules that stay in `ethlambda-beacon` (`genesis`, `stf`,
+`helpers::math`), which can never resolve as intra-doc links from
+`ethlambda-types`. They became plain code spans naming the crate (`247d81b`).
+`constants.rs`'s was already broken before the move: it said
+`crate::state_transition`, a module `ethlambda-beacon` never had. Check with:
+
+```bash
+grep -rho "crate::beacon::[a-z_]*" crates/common/types/src/beacon/ | sort -u
+```
+
+Every path printed must name a module that exists under
+`crates/common/types/src/beacon/`.
+
+### Verified numbers
+
+Task 1's quoted 244/245 lib tests were stale by the end, because the moves
+carried 49 unit tests out of `ethlambda-beacon` and into `ethlambda-types`. The
+fixture counts are what actually had to hold, and they did, unchanged at every
+task:
+
+| preset | fixture cases | ignored | `ethlambda-beacon` lib tests |
+|---|---|---|---|
+| mainnet | 5705 | 152 | 244 → 195 |
+| minimal | 40009 | 3692 | 245 → 196 |
+
+The lib-test drop reconciles exactly: 17 tests moved with
+`primitives`/`constants`/`preset`/`fork`/`config`, and 32 with `containers`.
+`ethlambda-types` went from 40 lib tests to 101.
