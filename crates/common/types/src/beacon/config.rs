@@ -27,8 +27,8 @@
 //! reads it on every phase0-era signature. The other three
 //! (`MIN_GENESIS_ACTIVE_VALIDATOR_COUNT`, `MIN_GENESIS_TIME`, `GENESIS_DELAY`)
 //! are read only while building a genesis state from Eth1 deposit history, and
-//! never again once that state exists, but [`crate::beacon::genesis`] needs them and the
-//! `genesis` fixture suite checks them.
+//! never again once that state exists, but `ethlambda_beacon::genesis` needs them
+//! and the `genesis` fixture suite checks them.
 
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;

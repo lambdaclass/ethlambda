@@ -54,7 +54,7 @@ pub const DEPOSIT_CONTRACT_TREE_DEPTH: usize = 32;
 /// `Bitvector`, hence `usize`.
 pub const JUSTIFICATION_BITS_LENGTH: usize = 4;
 
-/// `2**64 - 1`. Used only by [`crate::beacon::state_transition`]'s `integer_squareroot`
+/// `2**64 - 1`. Used only by `ethlambda_beacon::helpers::math`'s `integer_squareroot`
 /// helper as the boundary past which the doubling-based Newton's method
 /// bound is replaced by a precomputed answer; unrelated to
 /// [`FAR_FUTURE_EPOCH`] despite the identical bit pattern.
