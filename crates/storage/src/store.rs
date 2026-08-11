@@ -633,9 +633,6 @@ pub(crate) struct BeaconScratch {
 /// `checkpoint_state` both derive the value by replaying from the nearest anchor.
 /// That is what makes an aggressive capacity safe here, and it is why these are
 /// caches rather than the store's record of anything.
-// As with `BeaconScratch`: constructed here, read by the snapshot and cache
-// accessors that land next. Removed there.
-#[allow(dead_code)]
 pub(crate) struct BeaconCaches {
     pub(crate) states: LruCache<BeaconRoot, Arc<BeaconState>>,
     pub(crate) checkpoint_states: LruCache<(u64, BeaconRoot), Arc<BeaconState>>,
@@ -647,8 +644,6 @@ const BEACON_STATE_CACHE_CAPACITY: usize = 2;
 const BEACON_CHECKPOINT_STATE_CACHE_CAPACITY: usize = 1;
 /// Finalized anchor snapshots kept in `States`. The second is the margin that
 /// lets a replay start below the newest one.
-// Read by `push_beacon_anchor`, which lands with the anchor rule. Removed there.
-#[allow(dead_code)]
 pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
 
 impl BeaconCaches {
@@ -709,8 +704,6 @@ pub struct Store {
     #[allow(dead_code)]
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// Beacon state caches. Empty and untouched on a lean chain.
-    // Read by the beacon cache accessors, which land next. Removed there.
-    #[allow(dead_code)]
     pub(crate) beacon_cache: Arc<Mutex<BeaconCaches>>,
 }
 

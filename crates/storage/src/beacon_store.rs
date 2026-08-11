@@ -28,15 +28,18 @@
 //! else.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::{BeaconState, Checkpoint, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{Root, Slot};
 use libssz::{SszDecode, SszEncode};
 use libssz_derive::{SszDecode as SszDecodeDerive, SszEncode as SszEncodeDerive};
 
 use crate::api::Table;
-use crate::store::Store;
+use crate::store::{
+    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, Store, decode_state_value, encode_state_value,
+};
 
 /// Every block in the beacon fork-choice window, as `root -> (slot, parent_root)`.
 ///
@@ -167,12 +170,152 @@ impl Store {
             })
             .collect()
     }
+
+    /// The full-state snapshot stored under `root`, if it is one of the
+    /// finalized anchors.
+    ///
+    /// `None` for every state above finalization: those are not written at all.
+    /// Reconstructing one is `ethlambda_beacon::fork_choice::block_state`'s job,
+    /// since it needs `stf::state_transition`, which this crate cannot call.
+    pub fn beacon_state_snapshot(&self, root: Root) -> Option<BeaconState> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::States, &beacon_root_key(root))
+            .expect("get")
+            .map(|bytes| decode_state_value(&bytes))
+    }
+
+    /// Writes `state` as the snapshot for `root`, without touching the anchor
+    /// list. [`Store::promote_beacon_anchor`] is what a finalization advance
+    /// should call; this is for the bootstrap anchor, which has no predecessor
+    /// to prune against.
+    pub fn insert_beacon_state_snapshot(&mut self, root: Root, state: &BeaconState) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::States,
+                vec![(beacon_root_key(root), encode_state_value(state))],
+            )
+            .expect("put beacon state snapshot");
+        batch.commit().expect("commit");
+        self.push_beacon_anchor(root);
+    }
+
+    /// The memoized post-state for `root`, if it is still resident.
+    ///
+    /// A miss is not an error; see `BeaconCaches`. Returns an `Arc` rather
+    /// than a clone because `get_weight` reads the justified checkpoint's state
+    /// once per call and a mainnet state is ~350 MB.
+    pub fn cached_beacon_state(&self, root: Root) -> Option<Arc<BeaconState>> {
+        self.beacon_cache.lock().unwrap().states.get(&root).cloned()
+    }
+
+    /// Memoizes `state` as `root`'s post-state.
+    ///
+    /// Takes `&self`, not `&mut self`: `get_weight` and the rest of the
+    /// read-only helpers derive on a miss and must be able to record the result.
+    pub fn cache_beacon_state(&self, root: Root, state: Arc<BeaconState>) {
+        self.beacon_cache.lock().unwrap().states.put(root, state);
+    }
+
+    /// The memoized state at `checkpoint`'s epoch boundary, if it is still
+    /// resident. See [`Store::cached_beacon_state`].
+    pub fn cached_checkpoint_state(&self, checkpoint: &Checkpoint) -> Option<Arc<BeaconState>> {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .checkpoint_states
+            .get(&(checkpoint.epoch, checkpoint.root))
+            .cloned()
+    }
+
+    /// Memoizes `state` as the state at `checkpoint`'s epoch boundary.
+    pub fn cache_checkpoint_state(&self, checkpoint: Checkpoint, state: Arc<BeaconState>) {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .checkpoint_states
+            .put((checkpoint.epoch, checkpoint.root), state);
+    }
+
+    /// The roots of the finalized anchor states held in `States`, oldest first.
+    pub fn beacon_anchors(&self) -> Vec<Root> {
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view
+            .get(Table::Metadata, KEY_BEACON_ANCHORS)
+            .expect("get")
+            .expect("a beacon store always has an anchor list");
+        bytes.chunks_exact(32).map(Root::from_slice).collect()
+    }
+
+    /// Records `root` as the newest finalized anchor, writing `state` as its
+    /// snapshot and dropping everything the two-anchor rule no longer keeps.
+    ///
+    /// Three things happen together, and they have to: the new snapshot is
+    /// written, any anchor beyond [`BEACON_ANCHORS_KEPT`] has its snapshot
+    /// deleted, and `LiveChain` is pruned below the oldest anchor still kept.
+    ///
+    /// That last bound is what makes the pruning safe rather than merely
+    /// bounded. Fork choice never walks below its own finalized checkpoint, and
+    /// the finalized checkpoint is at or after the newest anchor, which is at or
+    /// after the oldest kept one. So every ancestry walk and every replay
+    /// terminates inside the retained window by construction.
+    pub fn promote_beacon_anchor(&mut self, root: Root, state: &BeaconState) {
+        if self.beacon_anchors().last() == Some(&root) {
+            return;
+        }
+        self.insert_beacon_state_snapshot(root, state);
+
+        let anchors = self.beacon_anchors();
+        let oldest = *anchors.first().expect("just pushed at least one anchor");
+        let (prune_below, _parent_root) = self
+            .beacon_block_entry(oldest)
+            .expect("an anchor's own block is always stored");
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_range(
+                Table::LiveChain,
+                &0u64.to_be_bytes(),
+                &prune_below.to_be_bytes(),
+            )
+            .expect("prune beacon live chain index");
+        batch.commit().expect("commit");
+    }
+
+    /// Appends `root` to the anchor list, deleting the snapshot of anything
+    /// that falls out of [`BEACON_ANCHORS_KEPT`].
+    fn push_beacon_anchor(&mut self, root: Root) {
+        let mut anchors = self.beacon_anchors();
+        if anchors.contains(&root) {
+            return;
+        }
+        anchors.push(root);
+
+        let mut dropped = Vec::new();
+        while anchors.len() > BEACON_ANCHORS_KEPT {
+            dropped.push(beacon_root_key(anchors.remove(0)));
+        }
+
+        let encoded: Vec<u8> = anchors.iter().flat_map(|root| root.0).collect();
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Metadata,
+                vec![(KEY_BEACON_ANCHORS.to_vec(), encoded)],
+            )
+            .expect("put beacon anchors");
+        batch
+            .delete_batch(Table::States, dropped)
+            .expect("delete superseded anchor snapshots");
+        batch.commit().expect("commit");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use ethlambda_types::beacon::containers::BeaconState;
     use ethlambda_types::beacon::containers::phase0;
 
     use super::*;
@@ -253,5 +396,94 @@ mod tests {
         assert_eq!(index[&genesis_root], (0, Root::zero()));
         assert_eq!(index[&child_root], (1, genesis_root));
         assert_eq!(index[&sibling_root], (1, Root::repeat_byte(7)));
+    }
+
+    /// A `BeaconState` whose shape is irrelevant to the test: these exercise
+    /// the snapshot, cache, and anchor machinery, none of which reads a state
+    /// field. `BeaconState::Lean` is the one variant this crate can build
+    /// without `ethlambda-beacon`'s helpers, and `encode_state_value` handles
+    /// it explicitly for exactly that reason.
+    fn state(genesis_time: u64) -> BeaconState {
+        BeaconState::Lean(ethlambda_types::state::State::from_genesis(
+            genesis_time,
+            Vec::new(),
+        ))
+    }
+
+    #[test]
+    fn a_state_snapshot_round_trips_through_the_states_table() {
+        let mut store = beacon_store();
+        let root = Root::repeat_byte(1);
+
+        assert_eq!(store.beacon_state_snapshot(root), None);
+        store.insert_beacon_state_snapshot(root, &state(42));
+        assert_eq!(store.beacon_state_snapshot(root), Some(state(42)));
+    }
+
+    #[test]
+    fn the_state_cache_is_shared_across_store_clones() {
+        // `Store` is cloned into the RPC and P2P layers, so a cache that was
+        // not shared would silently double the resident state count.
+        let store = beacon_store();
+        let clone = store.clone();
+        let root = Root::repeat_byte(2);
+
+        store.cache_beacon_state(root, Arc::new(state(42)));
+
+        assert_eq!(
+            clone.cached_beacon_state(root).map(|s| (*s).clone()),
+            Some(state(42))
+        );
+    }
+
+    #[test]
+    fn promoting_a_third_anchor_drops_the_first() {
+        let mut store = beacon_store();
+        // Three blocks in a line, each keyed under its own root, so each anchor
+        // has a real slot to prune against.
+        let mut parent = Root::zero();
+        let mut roots = Vec::new();
+        for slot in 0..3u64 {
+            let signed = block(slot, parent);
+            let root = signed.message_hash_tree_root();
+            store.insert_beacon_block(root, &signed);
+            roots.push(root);
+            parent = root;
+        }
+
+        for root in &roots {
+            store.promote_beacon_anchor(*root, &state(42));
+        }
+
+        assert_eq!(store.beacon_anchors(), vec![roots[1], roots[2]]);
+        assert_eq!(store.beacon_state_snapshot(roots[0]), None);
+        assert_eq!(store.beacon_state_snapshot(roots[1]), Some(state(42)));
+        assert_eq!(store.beacon_state_snapshot(roots[2]), Some(state(42)));
+    }
+
+    #[test]
+    fn promoting_an_anchor_prunes_the_index_below_the_oldest_kept_one() {
+        let mut store = beacon_store();
+        let mut parent = Root::zero();
+        let mut roots = Vec::new();
+        for slot in 0..5u64 {
+            let signed = block(slot, parent);
+            let root = signed.message_hash_tree_root();
+            store.insert_beacon_block(root, &signed);
+            roots.push(root);
+            parent = root;
+        }
+
+        // Anchors at slots 2 and 4: the oldest kept one is slot 2, so slots 0
+        // and 1 leave the index and slots 2 to 4 stay.
+        store.promote_beacon_anchor(roots[2], &state(42));
+        store.promote_beacon_anchor(roots[4], &state(42));
+
+        let index = store.beacon_block_index();
+        assert_eq!(index.len(), 3);
+        assert!(!index.contains_key(&roots[0]));
+        assert!(!index.contains_key(&roots[1]));
+        assert!(index.contains_key(&roots[2]));
+        assert!(index.contains_key(&roots[4]));
     }
 }
