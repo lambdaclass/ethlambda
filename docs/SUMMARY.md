@@ -20,3 +20,4 @@
 - [Fork Choice Visualization](./fork_choice_visualization.md)
 - [Data Storage](./data_storage.md)
 - [Peer discovery](./discovery.md)
+- [The mainnet wire](./beacon_wire.md)
