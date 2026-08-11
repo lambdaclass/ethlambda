@@ -37,6 +37,23 @@ pub type ByteList<const N: usize> = libssz_types::SszList<u8, N>;
 #[ssz(transparent)]
 pub struct H256(pub [u8; 32]);
 
+/// The beacon `Root` and the lean `H256` are the same 32 bytes in two types:
+/// `crate::beacon::primitives::Root` is `ethereum_types::H256`, while lean's is
+/// this crate's own newtype. Every beacon block root that reaches a store lookup
+/// crosses this line, and the conversion is total, so it lives here rather than
+/// being open-coded per call site.
+impl From<crate::beacon::primitives::Root> for H256 {
+    fn from(root: crate::beacon::primitives::Root) -> Self {
+        H256(root.0)
+    }
+}
+
+impl From<H256> for crate::beacon::primitives::Root {
+    fn from(hash: H256) -> Self {
+        crate::beacon::primitives::Root::from(hash.0)
+    }
+}
+
 impl serde::Serialize for H256 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&format!("{self}"))
@@ -151,5 +168,34 @@ mod tests {
     #[should_panic(expected = "H256::from_slice requires exactly 32 bytes")]
     fn h256_from_slice_too_long() {
         H256::from_slice(&[0u8; 33]);
+    }
+}
+
+#[cfg(test)]
+mod beacon_root_conversion_tests {
+    use super::H256;
+    use crate::beacon::primitives::Root;
+
+    #[test]
+    fn a_root_round_trips_through_the_lean_hash() {
+        let root = Root::repeat_byte(0x5a);
+        let lean: H256 = root.into();
+        let back: Root = lean.into();
+
+        assert_eq!(lean.0, root.0, "the bytes must survive unchanged");
+        assert_eq!(back, root);
+    }
+
+    #[test]
+    fn the_conversion_preserves_byte_order() {
+        // A non-palindromic value, so a reversed conversion would be visible.
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes[31] = 2;
+
+        let lean: H256 = Root::from(bytes).into();
+
+        assert_eq!(lean.0[0], 1);
+        assert_eq!(lean.0[31], 2);
     }
 }
