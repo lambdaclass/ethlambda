@@ -9,7 +9,10 @@ use crate::error::Error;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::beacon::containers::BeaconState;
+use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
 use ethlambda_types::beacon::fork::ForkName;
+use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
+use ethlambda_types::beacon::primitives::Root as BeaconRoot;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
@@ -80,7 +83,7 @@ impl ForkCheckpoints {
 // ============ Metadata Keys ============
 
 /// Key for "time" field of the Store. Its value has type [`u64`] and it's SSZ-encoded.
-const KEY_TIME: &[u8] = b"time";
+pub(crate) const KEY_TIME: &[u8] = b"time";
 /// Key for "config" field of the Store. Its value has type [`ChainConfig`] and it's SSZ-encoded.
 const KEY_CONFIG: &[u8] = b"config";
 /// Key for "head" field of the Store. Its value has type [`H256`] and it's SSZ-encoded.
@@ -91,6 +94,23 @@ const KEY_SAFE_TARGET: &[u8] = b"safe_target";
 const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
 /// Key for "latest_finalized" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
+/// Key for the beacon store's justified checkpoint. Its value has type
+/// [`BeaconCheckpoint`] and it's SSZ-encoded. Separate from
+/// [`KEY_LATEST_JUSTIFIED`] because the two chains' `Checkpoint` types carry
+/// different fields: lean's is `{root, slot}`, beacon's is `{epoch, root}`.
+pub(crate) const KEY_BEACON_JUSTIFIED: &[u8] = b"beacon_justified";
+/// Key for the beacon store's finalized checkpoint. See [`KEY_BEACON_JUSTIFIED`].
+pub(crate) const KEY_BEACON_FINALIZED: &[u8] = b"beacon_finalized";
+/// Key for the beacon store's unrealized justified checkpoint.
+pub(crate) const KEY_BEACON_UNREALIZED_JUSTIFIED: &[u8] = b"beacon_unrealized_justified";
+/// Key for the beacon store's unrealized finalized checkpoint.
+pub(crate) const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
+/// Key for the roots of the finalized anchor states held in `States`, oldest
+/// first, at most [`BEACON_ANCHORS_KEPT`]. Stored as concatenated 32-byte roots
+/// rather than SSZ: it is read on every anchor promotion and the layout is one
+/// line either way.
+pub(crate) const KEY_BEACON_ANCHORS: &[u8] = b"beacon_anchors";
+
 /// Key for the on-disk format version. Its value has type [`u64`] and it's SSZ-encoded.
 const KEY_DB_VERSION: &[u8] = b"db_version";
 /// Key for which chain this directory holds. Its value is a single
@@ -580,6 +600,71 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
     slot.to_be_bytes().to_vec()
 }
 
+/// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
+/// chain history: nothing here survives a restart, and nothing here is worth the
+/// write amplification of persisting.
+///
+/// `proposer_boost_root` resets every slot, `block_timeliness` is only read by
+/// the same-slot reorg helpers, `equivocating_indices` is rebuilt by replaying
+/// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
+/// of attestations, and `pow_blocks` stands in for a call to an execution client
+/// that a restarted node would simply make again.
+// Written by `init_beacon` but not yet read: the accessors that read these
+// land with the beacon scratch surface. Removed there.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct BeaconScratch {
+    pub(crate) proposer_boost_root: BeaconRoot,
+    pub(crate) block_timeliness: HashMap<BeaconRoot, bool>,
+    pub(crate) equivocating_indices: HashSet<u64>,
+    pub(crate) latest_messages: HashMap<u64, LatestMessage>,
+    pub(crate) pow_blocks: HashMap<BeaconRoot, PowBlock>,
+}
+
+/// The beacon state caches.
+///
+/// A mainnet `BeaconState` is ~350 MB, so these are sized for the working set
+/// the handlers need resident at once rather than for a hit rate: the latest
+/// finalized anchor and the head's post-state, plus the justified checkpoint's
+/// epoch-boundary state. Three entries, ~1 GB, which is the budget
+/// `docs/superpowers/specs/2026-08-10-mainnet-network-design.md` §5 sets.
+///
+/// A miss is never an error: `ethlambda_beacon::fork_choice::block_state` and
+/// `checkpoint_state` both derive the value by replaying from the nearest anchor.
+/// That is what makes an aggressive capacity safe here, and it is why these are
+/// caches rather than the store's record of anything.
+// As with `BeaconScratch`: constructed here, read by the snapshot and cache
+// accessors that land next. Removed there.
+#[allow(dead_code)]
+pub(crate) struct BeaconCaches {
+    pub(crate) states: LruCache<BeaconRoot, Arc<BeaconState>>,
+    pub(crate) checkpoint_states: LruCache<(u64, BeaconRoot), Arc<BeaconState>>,
+}
+
+/// Block post-states held resident. See [`BeaconCaches`].
+const BEACON_STATE_CACHE_CAPACITY: usize = 2;
+/// Epoch-boundary states held resident. See [`BeaconCaches`].
+const BEACON_CHECKPOINT_STATE_CACHE_CAPACITY: usize = 1;
+/// Finalized anchor snapshots kept in `States`. The second is the margin that
+/// lets a replay start below the newest one.
+// Read by `push_beacon_anchor`, which lands with the anchor rule. Removed there.
+#[allow(dead_code)]
+pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
+
+impl BeaconCaches {
+    pub(crate) fn new() -> Self {
+        Self {
+            states: LruCache::new(
+                NonZeroUsize::new(BEACON_STATE_CACHE_CAPACITY).expect("capacity is non-zero"),
+            ),
+            checkpoint_states: LruCache::new(
+                NonZeroUsize::new(BEACON_CHECKPOINT_STATE_CACHE_CAPACITY)
+                    .expect("capacity is non-zero"),
+            ),
+        }
+    }
+}
+
 /// Fork choice store backed by a pluggable storage backend.
 ///
 /// The Store maintains all state required for fork choice and block processing:
@@ -598,7 +683,7 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 /// - [`get_forkchoice_store`](Self::get_forkchoice_store): Initialize from state + block (stores body)
 #[derive(Clone)]
 pub struct Store {
-    backend: Arc<dyn StorageBackend>,
+    pub(crate) backend: Arc<dyn StorageBackend>,
     /// Cached copy of the persisted [`ChainConfig`].
     ///
     /// The config is written once at bootstrap and has no setter, so a plain copy
@@ -619,6 +704,14 @@ pub struct Store {
     /// LRU memoization of states by block root, shared across `Store` clones.
     /// Avoids reconstructing recent states from diffs on every read.
     state_cache: Arc<Mutex<LruCache<H256, State>>>,
+    /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
+    // Read by the beacon scratch accessors, which land next. Removed there.
+    #[allow(dead_code)]
+    pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
+    /// Beacon state caches. Empty and untouched on a lean chain.
+    // Read by the beacon cache accessors, which land next. Removed there.
+    #[allow(dead_code)]
+    pub(crate) beacon_cache: Arc<Mutex<BeaconCaches>>,
 }
 
 /// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
@@ -676,6 +769,53 @@ impl Store {
     pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
         Self::init_store(backend, anchor_state, None)
             .expect("store initialization should succeed in from_anchor_state")
+    }
+
+    /// Initialize an empty beacon-chain store.
+    ///
+    /// Writes only what every later read assumes exists: the format version,
+    /// the chain tag, the genesis time, a zero clock, and zeroed checkpoints.
+    /// The anchor block and state are written by
+    /// `ethlambda_beacon::fork_choice::get_forkchoice_store`, which is where the
+    /// spec's own construction rules live and which needs beacon helpers this
+    /// crate cannot call.
+    pub fn init_beacon(backend: Arc<dyn StorageBackend>, genesis_time: u64) -> Self {
+        let config = ChainConfig { genesis_time };
+        let zero = BeaconCheckpoint::default();
+        {
+            let mut batch = backend.begin_write().expect("write batch");
+            let metadata_entries = vec![
+                (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
+                (KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()]),
+                (KEY_TIME.to_vec(), 0u64.to_ssz()),
+                (KEY_CONFIG.to_vec(), config.to_ssz()),
+                (KEY_BEACON_JUSTIFIED.to_vec(), zero.to_ssz()),
+                (KEY_BEACON_FINALIZED.to_vec(), zero.to_ssz()),
+                (KEY_BEACON_UNREALIZED_JUSTIFIED.to_vec(), zero.to_ssz()),
+                (KEY_BEACON_UNREALIZED_FINALIZED.to_vec(), zero.to_ssz()),
+                (KEY_BEACON_ANCHORS.to_vec(), Vec::new()),
+            ];
+            batch
+                .put_batch(Table::Metadata, metadata_entries)
+                .expect("put metadata");
+            batch.commit().expect("commit");
+        }
+
+        info!(genesis_time, "Initialized beacon store");
+
+        Self {
+            backend,
+            chain: Chain::Beacon,
+            config,
+            new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
+            known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
+                GOSSIP_SIGNATURE_CAP,
+            ))),
+            state_cache: new_state_cache(),
+            beacon: Arc::new(Mutex::new(BeaconScratch::default())),
+            beacon_cache: Arc::new(Mutex::new(BeaconCaches::new())),
+        }
     }
 
     /// Initialize a Store from an anchor state and block.
@@ -775,6 +915,8 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
+            beacon: Arc::new(Mutex::new(BeaconScratch::default())),
+            beacon_cache: Arc::new(Mutex::new(BeaconCaches::new())),
         };
 
         // Compare against the finalized state rather than the persisted
@@ -915,6 +1057,8 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
+            beacon: Arc::new(Mutex::new(BeaconScratch::default())),
+            beacon_cache: Arc::new(Mutex::new(BeaconCaches::new())),
         })
     }
 
@@ -2011,6 +2155,8 @@ mod tests {
                     GOSSIP_SIGNATURE_CAP,
                 ))),
                 state_cache: new_state_cache(),
+                beacon: Arc::new(Mutex::new(BeaconScratch::default())),
+                beacon_cache: Arc::new(Mutex::new(BeaconCaches::new())),
             }
         }
 
@@ -2027,6 +2173,8 @@ mod tests {
                     GOSSIP_SIGNATURE_CAP,
                 ))),
                 state_cache: new_state_cache(),
+                beacon: Arc::new(Mutex::new(BeaconScratch::default())),
+                beacon_cache: Arc::new(Mutex::new(BeaconCaches::new())),
             }
         }
     }
