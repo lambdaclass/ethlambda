@@ -45,8 +45,8 @@ use super::shared::{
     Eth1DataVotes, Fork, HistoricalRoots, HistoricalSummaries, InactivityScores, JustificationBits,
     ProposerSlashing, RandaoMixes, SignedVoluntaryExit, Slashings, StateRoots, Validators,
 };
-use crate::preset;
-use crate::primitives::{
+use crate::beacon::preset;
+use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Slot,
     Uint256, ValidatorIndex, WithdrawalIndex,
 };

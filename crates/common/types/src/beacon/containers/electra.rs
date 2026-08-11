@@ -51,8 +51,8 @@ use super::shared::{
     InactivityScores, JustificationBits, ProposerSlashing, RandaoMixes, SignedVoluntaryExit,
     Slashings, StateRoots, Validators,
 };
-use crate::preset;
-use crate::primitives::{
+use crate::beacon::preset;
+use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionAddress, Gwei, Root, Slot,
     ValidatorIndex, WithdrawalIndex,
 };

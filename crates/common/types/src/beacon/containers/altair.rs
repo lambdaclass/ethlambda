@@ -39,8 +39,8 @@ use super::shared::{
 use super::shared::{
     BeaconBlockHeader, Checkpoint, Deposit, Eth1Data, Fork, ProposerSlashing, SignedVoluntaryExit,
 };
-use crate::preset;
-use crate::primitives::{BlsPubkey, BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
+use crate::beacon::preset;
+use crate::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
 
 /// One bit per sync committee member, recording who contributed to a
 /// [`SyncAggregate`].
@@ -59,7 +59,7 @@ pub type SyncCommitteePubkeys = SszVector<BlsPubkey, { preset::SYNC_COMMITTEE_SI
 ///
 /// This is a fixed specification constant (`validator.md`'s "Constants",
 /// mirrored the same in the mainnet and minimal presets), not a preset value,
-/// so by this crate's own convention it belongs in `crate::constants` alongside
+/// so by this crate's own convention it belongs in `crate::beacon::constants` alongside
 /// `JUSTIFICATION_BITS_LENGTH`. It is defined here instead, as a judgment call,
 /// because it does not exist anywhere in the crate yet and this file is not
 /// permitted to add it to `constants.rs`; whoever owns that module should move

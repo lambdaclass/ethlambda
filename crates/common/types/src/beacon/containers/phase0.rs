@@ -18,8 +18,8 @@ use super::shared::{
     Balances, BlockRoots, HistoricalRoots, JustificationBits, RandaoMixes, Slashings, StateRoots,
     Validators,
 };
-use crate::preset;
-use crate::primitives::{BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
+use crate::beacon::preset;
+use crate::beacon::primitives::{BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
 
 /// The attesters covered by one aggregate, as a bit per committee member.
 ///

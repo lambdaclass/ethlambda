@@ -39,8 +39,8 @@ use super::shared::{
     InactivityScores, JustificationBits, RandaoMixes, Slashings, StateRoots, Validators,
 };
 use super::shared::{BeaconBlockHeader, Checkpoint, Eth1Data, Fork, SignedBeaconBlockHeader};
-use crate::preset;
-use crate::primitives::{
+use crate::beacon::preset;
+use crate::beacon::primitives::{
     Bytes32, ColumnIndex, Epoch, Gwei, KzgProof, Root, Slot, ValidatorIndex, WithdrawalIndex,
 };
 
@@ -90,8 +90,8 @@ pub type ColumnIndices = SszList<ColumnIndex, { preset::NUMBER_OF_COLUMNS }>;
 /// block a [`MatrixEntry`] belongs to.
 ///
 /// `das-core.md` lists this as a custom type alongside
-/// [`crate::primitives::ColumnIndex`], but only [`MatrixEntry`] needs it, so it
-/// is defined here instead of in `crate::primitives`.
+/// [`crate::beacon::primitives::ColumnIndex`], but only [`MatrixEntry`] needs it, so it
+/// is defined here instead of in `crate::beacon::primitives`.
 pub type RowIndex = u64;
 
 // ---------------------------------------------------------------------------
@@ -311,7 +311,7 @@ mod tests {
         let cell = Cell::try_from(vec![7u8; preset::BYTES_PER_CELL]).unwrap();
         let entry = MatrixEntry {
             cell,
-            kzg_proof: KzgProof([1; crate::primitives::KZG_POINT_SIZE]),
+            kzg_proof: KzgProof([1; crate::beacon::primitives::KZG_POINT_SIZE]),
             column_index: 3,
             row_index: 0,
         };

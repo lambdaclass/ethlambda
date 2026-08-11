@@ -27,6 +27,7 @@ libssz-derive.workspace = true
 libssz-merkle = { workspace = true, features = ["ethereum_types"] }
 libssz-types.workspace = true
 ethereum-types.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

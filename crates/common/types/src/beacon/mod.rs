@@ -7,6 +7,8 @@
 
 pub mod config;
 pub mod constants;
+pub mod containers;
+pub mod error;
 pub mod fork;
 pub mod preset;
 pub mod primitives;
@@ -54,5 +56,15 @@ mod tests {
         assert_eq!(config.blob_schedule[0].max_blobs_per_block, 15);
         assert_eq!(config.blob_schedule[1].epoch, 419_072);
         assert_eq!(config.blob_schedule[1].max_blobs_per_block, 21);
+    }
+
+    #[test]
+    fn the_beacon_containers_are_reachable_from_the_namespace() {
+        use super::containers::{BeaconState, phase0};
+
+        // A type-level assertion: naming the variant constructor as a function
+        // proves both the enum and the per-fork struct resolve, with nothing to
+        // construct. No fork's BeaconState derives Default.
+        let _: fn(phase0::BeaconState) -> BeaconState = BeaconState::Phase0;
     }
 }

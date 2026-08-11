@@ -6,7 +6,7 @@
 //! structured variants exist for conditions worth inspecting programmatically
 //! or worth reporting with their values.
 
-use crate::fork::ForkName;
+use crate::beacon::fork::ForkName;
 
 pub type Result<T> = core::result::Result<T, Error>;
 

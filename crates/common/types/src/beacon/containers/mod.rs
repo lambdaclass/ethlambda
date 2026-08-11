@@ -52,9 +52,9 @@ pub use shared::*;
 
 use libssz::{SszDecode as _, SszEncode as _};
 
-use crate::error::{Error, Result};
-use crate::fork::ForkName;
-use crate::primitives::{
+use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
+use crate::beacon::primitives::{
     BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
     WithdrawalIndex,
 };
@@ -356,7 +356,7 @@ impl BeaconState {
     ///
     /// These cannot join [`shared_state_accessors`]' lists, since phase0 has
     /// none of them, and a per-fork projection to a concrete state struct (the
-    /// way [`crate::helpers::altair::altair_state_ref`] reaches them) cannot
+    /// way `ethlambda_beacon::helpers::altair::altair_state_ref` reaches them) cannot
     /// serve every fork that carries them: bellatrix, capella, deneb, electra,
     /// and fulu all keep the identical three fields, but each is a distinct
     /// Rust type, so a projection typed to return `&altair::BeaconState` can
@@ -413,7 +413,7 @@ impl BeaconState {
     /// per-fork projection instead.
     ///
     /// Handed back together for two reasons that stack:
-    /// [`crate::stf::operations::add_validator_to_registry`] genuinely needs
+    /// `ethlambda_beacon::stf::operations::add_validator_to_registry` genuinely needs
     /// all three, since they are positionally parallel with `validators` and
     /// `balances`, so a validator entering the registry has to grow all five
     /// or leave the state internally inconsistent in a way nothing else would
@@ -476,7 +476,7 @@ impl BeaconState {
     /// fork (see, for instance, bellatrix's own state doc), so they cannot
     /// join [`shared_state_accessors`]' lists, since phase0 predates sync
     /// committees entirely. A per-fork projection cannot serve here either:
-    /// [`crate::stf::altair::process_sync_aggregate`] is called for every
+    /// `ethlambda_beacon::stf::altair::process_sync_aggregate` is called for every
     /// fork from altair through fulu (see that function's own documentation),
     /// and a projection typed to return `&altair::BeaconState` can only ever answer
     /// for an altair state, not for the bellatrix, capella, deneb, electra, or
@@ -512,7 +512,7 @@ impl BeaconState {
     /// [`Self::sync_committees`] for why this cannot be a per-fork projection.
     ///
     /// Handed back together, rather than as two separate accessors, because
-    /// [`crate::stf::epoch::altair::process_sync_committee_updates`] rotates
+    /// `ethlambda_beacon::stf::epoch::altair::process_sync_committee_updates` rotates
     /// the pair by replacing one with the other at each sync committee period
     /// boundary, which needs both mutable borrows alive for the one
     /// `core::mem::replace` that does it.

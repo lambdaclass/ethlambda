@@ -46,7 +46,8 @@
 pub mod bls;
 pub use ethlambda_types::beacon::config;
 pub use ethlambda_types::beacon::constants;
-pub mod containers;
+pub use ethlambda_types::beacon::containers;
+pub use ethlambda_types::beacon::error;
 pub use ethlambda_types::beacon::fork;
 pub mod fork_choice;
 pub mod genesis;
@@ -57,8 +58,6 @@ pub use ethlambda_types::beacon::preset;
 pub use ethlambda_types::beacon::primitives;
 pub mod stf;
 pub mod upgrade;
-
-mod error;
 
 pub use error::{Error, Result, verify};
 pub use fork::ForkName;

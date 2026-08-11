@@ -39,8 +39,8 @@ use super::shared::{
     ProposerSlashing, RandaoMixes, SignedBeaconBlockHeader, SignedVoluntaryExit, Slashings,
     StateRoots, Validators,
 };
-use crate::preset;
-use crate::primitives::{
+use crate::beacon::preset;
+use crate::beacon::primitives::{
     BlobIndex, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, KzgCommitment,
     KzgProof, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
 };

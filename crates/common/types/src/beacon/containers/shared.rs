@@ -10,9 +10,9 @@
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
-use crate::constants;
-use crate::preset;
-use crate::primitives::{
+use crate::beacon::constants;
+use crate::beacon::preset;
+use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Domain, Epoch, Gwei, ParticipationFlags,
     Root, Slot, ValidatorIndex, Version,
 };
@@ -130,7 +130,7 @@ pub struct Validator {
     /// The key attestations and proposals are signed with.
     pub pubkey: BlsPubkey,
     /// Where a withdrawal pays out. The first byte selects how the rest is
-    /// interpreted; see the prefixes in [`crate::constants`].
+    /// interpreted; see the prefixes in [`crate::beacon::constants`].
     pub withdrawal_credentials: Bytes32,
     /// The balance actually used for voting weight and rewards, which is the
     /// real balance rounded down to a multiple of `EFFECTIVE_BALANCE_INCREMENT`
