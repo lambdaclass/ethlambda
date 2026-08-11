@@ -13,6 +13,7 @@
 
 # Operations
 
+- [Command line](./cli.md)
 - [HTTP API](./rpc.md)
 - [Metrics](./metrics.md)
 - [Checkpoint Sync](./checkpoint_sync.md)
