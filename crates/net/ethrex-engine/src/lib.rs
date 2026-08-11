@@ -1,8 +1,9 @@
 //! In-process ethrex execution engine.
 //!
-//! Wraps an ethrex [`Blockchain`] + [`Store`] and exposes the three operations
-//! the Lean consensus slot loop needs — build a payload, execute one, move the
-//! head — driven entirely in-process by direct library calls.
+//! Wraps an ethrex [`Blockchain`] + [`Store`] and exposes what the Lean
+//! consensus slot loop needs — build a payload, execute one, move the head —
+//! plus transaction submission, driven entirely in-process by direct library
+//! calls.
 //!
 //! The interface is deliberately *not* Engine-API shaped. Running in-process
 //! removes the reasons that protocol is a two-step, stateless exchange: there is
@@ -20,15 +21,16 @@ use ethlambda_types::execution_payload::ExecutionPayloadV3;
 use ethlambda_types::primitives::H256 as LeanH256;
 use ethrex_blockchain::{
     Blockchain,
-    error::{ChainError, InvalidForkChoice},
+    error::{ChainError, InvalidForkChoice, MempoolError},
     fork_choice::apply_fork_choice,
     payload::{BuildPayloadArgs, BuildPayloadArgsError, create_payload},
 };
 use ethrex_common::{
     Address, Bytes, H256,
-    types::{DEFAULT_BUILDER_GAS_CEIL, ELASTICITY_MULTIPLIER, Genesis, Withdrawal},
+    types::{DEFAULT_BUILDER_GAS_CEIL, ELASTICITY_MULTIPLIER, Genesis, Transaction, Withdrawal},
 };
 use ethrex_storage::{EngineType, Store, error::StoreError};
+use tracing::warn;
 
 use crate::conversion::{block_to_payload, payload_to_block};
 
@@ -51,6 +53,12 @@ pub enum EngineError {
     PayloadId(#[from] BuildPayloadArgsError),
     #[error("store has no canonical head block")]
     NoCanonicalHead,
+    #[error("payload build task failed: {0}")]
+    BuildTask(String),
+    #[error("transaction rejected by the mempool: {0}")]
+    Mempool(#[from] MempoolError),
+    #[error("payload claims block hash {claimed:#x} but its contents hash to {computed:#x}")]
+    BlockHashMismatch { claimed: H256, computed: H256 },
     #[error("payload conversion error: {0}")]
     Conversion(String),
     #[error("genesis load error: {0}")]
@@ -161,7 +169,19 @@ impl EthrexEngine {
             gas_ceil: self.gas_ceil,
         };
         let skeleton = create_payload(&args, &self.store, self.extra_data.clone())?;
-        let built = self.blockchain.build_payload(skeleton)?.payload;
+
+        // Filling the payload is a synchronous full EVM execution plus state
+        // merkleization, and the caller is the consensus actor's task: left
+        // inline it would block both that actor and a tokio worker for the whole
+        // build, delaying the proposal's publication alignment and the following
+        // tick. Free with today's empty blocks, not once transactions flow.
+        // ethrex wraps its own callers the same way.
+        let blockchain = Arc::clone(&self.blockchain);
+        let built = tokio::task::spawn_blocking(move || blockchain.build_payload(skeleton))
+            .await
+            .map_err(|err| EngineError::BuildTask(err.to_string()))??
+            .payload;
+
         Ok(block_to_payload(built))
     }
 
@@ -176,8 +196,63 @@ impl EthrexEngine {
         parent_beacon_block_root: LeanH256,
     ) -> Result<(), EngineError> {
         let block = payload_to_block(payload, parent_beacon_block_root)?;
+
+        // `block_hash` is the proposer's *claim*; every other header field was
+        // rebuilt from the payload's own contents, so recomputing the hash is
+        // what ties the two together. Without this check a payload whose bytes
+        // do not match its stated hash still imports, and each node's EL then
+        // stores a different block under a hash the consensus chain has already
+        // committed to — after which no node can build on it and the execution
+        // layer wedges network-wide. Deterministic across nodes (the proposer
+        // runs this same path on its own block), so every node rejects alike.
+        let claimed = H256(payload.block_hash.0);
+        let computed = block.hash();
+        if computed != claimed {
+            return Err(EngineError::BlockHashMismatch { claimed, computed });
+        }
+
+        // Held before `add_block` takes ownership; only used on success.
+        let included: Vec<H256> = block.body.transactions.iter().map(|tx| tx.hash()).collect();
+
         self.blockchain.add_block(block)?;
+
+        // Drop the now-included transactions from the mempool. ethrex does this
+        // from its Engine-API fork-choice handler, which we bypass, so nothing
+        // else would. Skipping it is not merely a leak: the payload builder
+        // fetches pooled transactions without a nonce filter, and when the
+        // stale copy fails to re-execute it discards *every* transaction from
+        // that sender, so each account could only ever land one transaction.
+        //
+        // Best-effort: the block is already imported, so a mempool bookkeeping
+        // failure must not turn into a rejection.
+        for tx_hash in included {
+            self.blockchain
+                .mempool
+                .remove_transaction(&tx_hash)
+                .inspect_err(|err| {
+                    warn!(%err, %tx_hash, "failed to evict included transaction");
+                })
+                .ok();
+        }
+
         Ok(())
+    }
+
+    /// Submit an RLP-encoded transaction to the execution layer's mempool.
+    ///
+    /// Returns the transaction hash on acceptance. ethrex validates internally —
+    /// encoded size, duplicate hash, signature recovery, nonce/balance/chain-id,
+    /// and replacement rules — so there is nothing to pre-check here; a rejection
+    /// comes back as [`EngineError::Mempool`].
+    ///
+    /// An accepted transaction is a *candidate*: it is included when some
+    /// proposer's [`Self::build_payload`] next fills a block, which for a
+    /// transaction submitted to this node means the next slot this node proposes.
+    pub async fn submit_raw_transaction(&self, raw: &[u8]) -> Result<LeanH256, EngineError> {
+        let transaction = Transaction::decode_canonical(raw)
+            .map_err(|err| EngineError::Conversion(format!("decode transaction: {err}")))?;
+        let hash = self.blockchain.add_transaction_to_pool(transaction).await?;
+        Ok(LeanH256(hash.0))
     }
 
     /// Point the execution layer at the given head / safe / finalized blocks.

@@ -19,14 +19,22 @@ use crate::BlockChainServer;
 impl BlockChainServer {
     /// Point the execution layer at the current head / safe / finalized blocks.
     ///
-    /// Fire-and-forget: the EL is informational here and never on the consensus
-    /// critical path. The hashes are the `block_hash` fields read off the
-    /// corresponding Lean blocks' execution payloads, so the EL only ever sees
-    /// blocks it has already been given.
+    /// The hashes are the `block_hash` fields read off the corresponding Lean
+    /// blocks' execution payloads, so the EL only ever sees blocks it has
+    /// already been given.
     ///
     /// At genesis all three are the EL genesis hash seeded into the anchor
     /// (see `State::from_genesis_with_el_hash`).
-    pub(crate) fn notify_execution_layer(&self) {
+    ///
+    /// Awaited rather than spawned. Every other execution-layer call already
+    /// happens on this actor's task, so awaiting this one makes the actor the
+    /// EL's single caller and removes the need for any locking: a spawned
+    /// fork-choice update could otherwise land in the middle of
+    /// `build_payload`, which now spends real time filling the block on a
+    /// blocking thread, and re-point the chain under it. `apply_fork_choice`
+    /// only relabels already-executed blocks, so the cost here is a store
+    /// write, not execution.
+    pub(crate) async fn notify_execution_layer(&self) {
         let Some(engine) = self.execution_engine.as_ref() else {
             return;
         };
@@ -41,14 +49,12 @@ impl BlockChainServer {
         let safe = self.el_hash_at(self.store.safe_target().unwrap_or_default());
         let finalized = self.el_hash_at(finalized_root);
 
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            engine
-                .set_head(head, safe, finalized)
-                .await
-                .inspect(|()| trace!("EL head updated"))
-                .inspect_err(|err| warn!(%err, "EL head update failed"))
-        });
+        engine
+            .set_head(head, safe, finalized)
+            .await
+            .inspect(|()| trace!("EL head updated"))
+            .inspect_err(|err| warn!(%err, "EL head update failed"))
+            .ok();
     }
 
     /// Resolve a Lean block root to its execution payload's `block_hash`.

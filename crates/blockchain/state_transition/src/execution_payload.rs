@@ -161,6 +161,53 @@ mod execution_payload_tests {
         );
     }
 
+    /// A pass-through payload (`block_hash == parent_hash`, the shape
+    /// `synthetic_payload` produces when no EL is configured or a build failed)
+    /// must leave the expected EL parent where it was, so the next *real* build
+    /// on that same parent is still accepted.
+    ///
+    /// The alternative — leaving `block_hash` at zero — would move the whole
+    /// network's expected parent to a block no execution layer has, and since
+    /// every later build would then fail and fall back to synthetic again, the
+    /// execution layer could never recover.
+    #[test]
+    fn process_execution_payload_pass_through_preserves_the_expected_parent() {
+        let el_block = H256([0x77; 32]);
+        let mut state = state_at_slot(1);
+        state.latest_execution_payload_header.block_hash = el_block;
+
+        // Slot 1: the EL produced nothing, so the proposer repeats the parent.
+        let pass_through = ExecutionPayloadV3 {
+            parent_hash: el_block,
+            block_hash: el_block,
+            timestamp: GENESIS_TIME + SECONDS_PER_SLOT,
+            ..Default::default()
+        };
+        process_execution_payload(&mut state, &block_with_payload(1, pass_through))
+            .expect("a pass-through payload is valid");
+
+        assert_eq!(
+            state.latest_execution_payload_header.block_hash, el_block,
+            "the expected EL parent must not move when no EL block was produced"
+        );
+
+        // Slot 2: a real payload extending the same parent must still pass.
+        state.slot = 2;
+        let real = ExecutionPayloadV3 {
+            parent_hash: el_block,
+            block_hash: H256([0x88; 32]),
+            timestamp: GENESIS_TIME + 2 * SECONDS_PER_SLOT,
+            ..Default::default()
+        };
+        process_execution_payload(&mut state, &block_with_payload(2, real))
+            .expect("the execution layer recovers on the next successful build");
+
+        assert_eq!(
+            state.latest_execution_payload_header.block_hash,
+            H256([0x88; 32])
+        );
+    }
+
     #[test]
     fn process_execution_payload_chains_forward_across_two_blocks() {
         // First block (slot 1): payload with block_hash = X. State caches X.

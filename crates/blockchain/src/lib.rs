@@ -393,8 +393,9 @@ impl BlockChainServer {
             // idempotency guard above, since the store clock is already here.
             SlotInterval::BlockPublication => {
                 // Keep the EL's head/safe/finalized in step once per slot.
-                // Fire-and-forget; the EL is never on the critical path.
-                self.notify_execution_layer();
+                // Awaited so the actor stays the execution layer's only caller
+                // (see `notify_execution_layer`).
+                self.notify_execution_layer().await;
             }
 
             // ==== interval 1 ====

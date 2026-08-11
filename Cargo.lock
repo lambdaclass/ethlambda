@@ -1945,14 +1945,16 @@ dependencies = [
 name = "ethlambda-ethrex-engine"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "ethlambda-types",
  "ethrex-blockchain",
  "ethrex-common",
+ "ethrex-rlp",
  "ethrex-storage",
+ "secp256k1 0.30.0",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -148,6 +148,11 @@ pub fn block_to_payload(block: Block) -> ExecutionPayloadV3 {
     let withdrawals =
         Withdrawals::try_from(withdrawals_vec).expect("withdrawal count fits the payload bound");
 
+    // `extra_data` is engine-controlled (`EthrexEngine::extra_data`, always
+    // empty) and Cancun caps it at 32 bytes, so the fallback is unreachable.
+    // Were it ever exceeded, the payload would no longer describe the block it
+    // came from — `execute_payload`'s block-hash check catches that loudly
+    // instead of letting a silently different payload onto the wire.
     let extra_data = ByteList::try_from(block.header.extra_data.to_vec()).unwrap_or_default();
 
     ExecutionPayloadV3 {

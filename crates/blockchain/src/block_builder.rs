@@ -60,16 +60,30 @@ pub struct ProposerConfig {
 }
 
 /// Build the EL execution payload a proposer embeds when no execution client
-/// is configured (or the `engine_getPayload` roundtrip failed). It satisfies
-/// the STF's `process_execution_payload` check for a node running without an EL.
+/// is configured (or the build failed). It satisfies the STF's
+/// `process_execution_payload` check for a node running without an EL.
 ///
-/// Sets `parent_hash` to the last cached header's `block_hash` (so the chain
-/// still links forward) and `timestamp` to `compute_time_at_slot` (so the
-/// slot-time check passes). Every other field stays zero. The real
-/// `engine_getPayload` response replaces this when an EL endpoint is wired in.
+/// Sets `timestamp` to `compute_time_at_slot` so the slot-time check passes,
+/// and makes the payload a **pass-through**: `block_hash` equals `parent_hash`,
+/// the last cached header's hash. Every other field stays zero.
+///
+/// The pass-through matters. The STF caches whatever `block_hash` the payload
+/// claims and requires the *next* payload's `parent_hash` to equal it, so a
+/// synthetic payload leaving `block_hash` at zero would move the whole
+/// network's expected EL parent to zero. Every later build would then be asked
+/// to extend a block no execution layer has, fail, fall back to synthetic
+/// again, and the execution layer would never produce another block on any node
+/// for the rest of the chain's life. Repeating the parent instead pins the
+/// expectation to the last real EL block, so the execution layer stalls for the
+/// skipped slots and resumes on the next successful build.
+///
+/// A node with no EL at all starts from a zero header and so stays all-zero,
+/// exactly as before.
 fn synthetic_payload(head_state: &State, slot: u64) -> ExecutionPayloadV3 {
+    let parent_hash = head_state.latest_execution_payload_header.block_hash;
     ExecutionPayloadV3 {
-        parent_hash: head_state.latest_execution_payload_header.block_hash,
+        parent_hash,
+        block_hash: parent_hash,
         timestamp: compute_time_at_slot(head_state.config.genesis_time, slot),
         ..Default::default()
     }

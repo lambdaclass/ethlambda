@@ -10,9 +10,19 @@ ethrex-common.workspace = true
 ethrex-storage.workspace = true
 ethrex-blockchain.workspace = true
 ethlambda-types.workspace = true
-async-trait.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Signing test transactions: the RLP encoder to build the EIP-1559 signing
+# payload, and secp256k1 to sign it. Version-matched to ethrex's own so no
+# second copy enters the graph.
+ethrex-rlp.workspace = true
+secp256k1 = { version = "0.30.0", default-features = false, features = [
+  "global-context",
+  "recovery",
+  "std",
+] }

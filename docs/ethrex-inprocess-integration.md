@@ -296,14 +296,35 @@ in your change — unknown CLI flags, a genesis schema mismatch, missing config
 fields. Update the harness first. This is why `scripts/inprocess-devnet/run.sh`
 owns its inputs end to end.
 
+### Gotcha 5: an EL-enabled node cannot be restarted
+
+The EL store is in-memory while the consensus store is RocksDB, so the two do not
+restart together. A node that comes back resumes consensus at its old slot with an
+execution layer rewound to genesis, and since block import is gated on EL
+execution, every gossiped block fails with `ParentNotFound` and is dropped —
+**the node never syncs again.** Checkpoint sync does not help: it moves the
+consensus head, which only widens the gap.
+
+The practical consequence is that the usual "stop, wipe, checkpoint-sync" restart
+recipe does not apply to an EL-enabled node. Treat a restart as requiring a full
+devnet reset until the store is persisted.
+
+Two ways out, neither implemented yet: persist the EL store alongside the
+consensus one, or replay payloads at startup. The second is appealing because the
+Lean chain already *contains* every `ExecutionPayloadV3`, so executing them in
+canonical order from EL genesis is a complete EL sync with no new wire protocol.
+
 ## 7. Design decisions
 
 | Decision | Rationale |
 |---|---|
 | A direct three-method API, not an Engine-API-shaped trait | With one implementation, the payload id, the payload cache and the build-then-fetch two-step are pure overhead — they exist only because the Engine API is stateless and networked. |
-| Build the payload synchronously at interval 4 | No latency to hide in-process, so there is nothing to pre-request or stash across intervals, and no stale-head bookkeeping. |
+| Build the payload at interval 4, in one call | No latency to hide in-process, so there is nothing to pre-request or stash across intervals, and no stale-head bookkeeping. The fill itself runs on `spawn_blocking` — it is a full EVM execution plus merkleization, and the caller is the consensus actor. |
+| Verify the payload's claimed `block_hash` on execution | Every other header field is rebuilt from the payload, so the hash is the only thing tying claim to contents. Accepting a mismatch would let each node's EL store a different block under a hash consensus already committed to. |
+| Evict included transactions from the mempool on import | ethrex does this from its Engine-API fork-choice handler, which the in-process path bypasses. Without it the builder re-fetches the stale copy and drops the sender's whole queue, so each account could send only one transaction. |
+| A failed build emits a pass-through payload, not a zero one | The STF caches whatever `block_hash` a payload claims, so a zero would move the network's expected EL parent to a block nobody has — permanently, since every later build would then fail the same way. |
 | Reimplement the payload↔block conversion | ~40 lines of field mapping versus pulling in an Axum server and the p2p stack. |
-| In-memory EL store | Simplest thing that proves the integration; EL state resets on restart. Persistence is an `ethrex-storage` feature away and pairs with EL-aware checkpoint sync. |
+| In-memory EL store | Simplest thing that proves the integration, at the cost of a node that cannot be restarted (gotcha 5). Persistence is an `ethrex-storage` feature away and pairs with EL-aware checkpoint sync. |
 | Execution failure drops the block, never stalls consensus | An unexecutable payload means the block is pointless to import; anything else (no EL, internal error) is permissive and logged. |
 | Derive the EL genesis hash instead of configuring it | The engine is the source of truth in-process, and the failure mode of forgetting it is silent. |
 | No fee-recipient config | Lean has no fee market or block rewards yet, so there is nothing to direct. Add it when that changes. |
