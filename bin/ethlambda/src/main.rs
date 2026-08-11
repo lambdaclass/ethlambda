@@ -418,6 +418,9 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
 /// parsed flag is logged, so an operator can see the configuration that was
 /// resolved, and startup stops rather than running a node that follows nothing.
 async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
+    let discovery_port = options
+        .resolve_discovery_port()
+        .map_err(|err| eyre::eyre!(err))?;
     info!(
         checkpoint_sync_url = ?options.checkpoint_sync_url,
         bootnodes = ?options.bootnodes,
@@ -427,7 +430,7 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         http_address = %options.common.http_address,
         api_port = options.common.api_port,
         metrics_port = options.common.metrics_port,
-        discovery_port = ?options.discovery.port,
+        discovery_port,
         advertise_ip = ?options.discovery.advertise_ip,
         "Resolved beacon configuration"
     );

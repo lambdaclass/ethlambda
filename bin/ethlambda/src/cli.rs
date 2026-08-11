@@ -269,6 +269,32 @@ pub(crate) struct BeaconOptions {
     pub(crate) discovery: BeaconDiscoveryConfig,
 }
 
+impl BeaconOptions {
+    /// The UDP port the discv5 socket binds.
+    ///
+    /// `--discovery.port` when given, otherwise `--gossipsub-port` + 1.
+    /// Discovery cannot be turned off on this subcommand, so unlike lean's
+    /// [`LeanOptions::validate_discovery`] the collision check is
+    /// unconditional: both sockets are UDP, and a shared port surfaces at bind
+    /// time as an opaque `EADDRINUSE` on whichever one loses the race.
+    pub(crate) fn resolve_discovery_port(&self) -> Result<u16, String> {
+        let gossipsub_port = self.common.gossipsub_port;
+        match self.discovery.port {
+            Some(port) if port == gossipsub_port => Err(format!(
+                "--discovery.port ({port}) must differ from --gossipsub-port ({gossipsub_port}): \
+                 both bind UDP and cannot share a port"
+            )),
+            Some(port) => Ok(port),
+            None => gossipsub_port.checked_add(1).ok_or_else(|| {
+                format!(
+                    "--gossipsub-port ({gossipsub_port}) leaves no port above it for the discv5 \
+                     socket; pass --discovery.port explicitly"
+                )
+            }),
+        }
+    }
+}
+
 /// discv5 peer discovery for `ethlambda beacon`.
 ///
 /// There is no `--discovery.enable` here, by design: published mainnet bootnode
@@ -648,5 +674,64 @@ mod tests {
         // struct into two subcommands is exactly the shape that trips them.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// The smallest argv that satisfies every required `beacon` flag.
+    fn beacon_args() -> Vec<&'static str> {
+        vec![
+            "ethlambda",
+            "beacon",
+            "--node-key",
+            "node.key",
+            "--checkpoint-sync-url",
+            "https://checkpointz.example",
+        ]
+    }
+
+    fn parse_beacon(args: Vec<&str>) -> BeaconOptions {
+        match Cli::parse_from(args).command {
+            Command::Beacon(options) => *options,
+            Command::Lean(_) => panic!("the beacon argv must resolve to the beacon subcommand"),
+        }
+    }
+
+    #[test]
+    fn the_beacon_discovery_port_defaults_to_one_above_gossipsub() {
+        // Both sockets are UDP. Sharing the default would make every
+        // out-of-the-box `ethlambda beacon` fail the collision check, since
+        // discovery is forced on here.
+        let options = parse_beacon(beacon_args());
+        assert_eq!(options.common.gossipsub_port, 9000);
+        assert_eq!(options.resolve_discovery_port(), Ok(9001));
+    }
+
+    #[test]
+    fn the_beacon_discovery_port_follows_the_gossipsub_port() {
+        let mut args = beacon_args();
+        args.extend(["--gossipsub-port", "9500"]);
+        assert_eq!(parse_beacon(args).resolve_discovery_port(), Ok(9501));
+    }
+
+    #[test]
+    fn an_explicit_beacon_discovery_port_wins() {
+        let mut args = beacon_args();
+        args.extend(["--discovery.port", "9100"]);
+        assert_eq!(parse_beacon(args).resolve_discovery_port(), Ok(9100));
+    }
+
+    #[test]
+    fn a_beacon_discovery_port_equal_to_gossipsub_is_rejected() {
+        let mut args = beacon_args();
+        args.extend(["--discovery.port", "9000"]);
+        assert!(parse_beacon(args).resolve_discovery_port().is_err());
+    }
+
+    #[test]
+    fn a_gossipsub_port_at_the_top_of_the_range_has_no_derived_default() {
+        // 65535 + 1 does not exist, so the operator has to pick a port rather
+        // than have the derivation wrap or panic.
+        let mut args = beacon_args();
+        args.extend(["--gossipsub-port", "65535"]);
+        assert!(parse_beacon(args).resolve_discovery_port().is_err());
     }
 }
