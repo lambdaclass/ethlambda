@@ -104,6 +104,7 @@ use ethlambda_beacon::containers::{
 use ethlambda_beacon::fork_choice::{self, DataAvailability, Store};
 use ethlambda_beacon::preset;
 use ethlambda_beacon::primitives::{KzgProof, Root};
+use ethlambda_storage::backend::InMemoryBackend;
 use libssz::SszDecode;
 use libssz_types::SszList;
 use libtest_mimic::Trial;
@@ -837,7 +838,8 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
     let anchor_block = decode_anchor_block(case)?;
 
-    let mut store = fork_choice::get_forkchoice_store(anchor_state, anchor_block, config)
+    let backend = Arc::new(InMemoryBackend::new());
+    let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
     let steps: Vec<Step> = case.yaml("steps");

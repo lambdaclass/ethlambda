@@ -27,6 +27,13 @@ hex.workspace = true
 
 ethlambda-types.workspace = true
 
+# The fork choice store. This ends the crate's isolation from the rest of the
+# workspace, deliberately: a mainnet BeaconState is ~350 MB and cannot live in
+# a HashMap. `ethlambda-storage` depends on `ethlambda-types` and nothing else
+# of ours, so there is no cycle; the cost is that this crate's build now
+# includes RocksDB.
+ethlambda-storage.workspace = true
+
 libssz = { workspace = true, features = ["ethereum_types"] }
 libssz-derive.workspace = true
 libssz-merkle = { workspace = true, features = ["ethereum_types"] }

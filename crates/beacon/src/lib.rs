@@ -5,10 +5,13 @@
 //! cryptography they need. It is verified against the spec test fixtures
 //! released with the specification, pinned at the version in the `Makefile`.
 //!
-//! This crate is unrelated to the Lean consensus protocol the rest of this
-//! repository implements. The two share no types and no code beyond the SSZ
-//! crates, so nothing here depends on another `ethlambda-*` crate, and nothing
-//! else in the workspace depends on this crate.
+//! This crate implements no part of the Lean consensus protocol the rest of this
+//! repository implements, but it no longer stands apart from it. Its containers
+//! live in `ethlambda-types` (see `ForkName::Lean` and `BeaconState::Lean` for
+//! why), and its fork choice store *is* `ethlambda_storage::Store`, because a
+//! mainnet `BeaconState` is ~350 MB and cannot live in a `HashMap`. What stays
+//! here is Beacon Chain *behavior*: `helpers`, `stf`, `genesis`, `upgrade`,
+//! `fork_choice`, `bls`, `kzg`, and `hash`.
 //!
 //! # How forks are represented
 //!

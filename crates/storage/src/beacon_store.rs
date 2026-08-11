@@ -231,6 +231,14 @@ impl Store {
             .cloned()
     }
 
+    /// Whether [`Store::cached_checkpoint_state`] would return `Some`.
+    ///
+    /// A `false` here means "not resident", never "does not exist": every caller
+    /// derives on a miss. See [`BeaconCaches`](crate::store::BeaconCaches).
+    pub fn has_checkpoint_state(&self, checkpoint: &Checkpoint) -> bool {
+        self.cached_checkpoint_state(checkpoint).is_some()
+    }
+
     /// Memoizes `state` as the state at `checkpoint`'s epoch boundary.
     pub fn cache_checkpoint_state(&self, checkpoint: Checkpoint, state: Arc<BeaconState>) {
         self.beacon_cache
