@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ee57cac9.js";
+            window.path_to_searchindex_js = "searchindex-a0050628.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-274da26b.js"></script>
+        <script src="toc-54238a3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -186,11 +186,12 @@ consensus client, written in Rust.</p>
 <p>This book collects the design notes and operator-facing references for ethlambda.
 It is split into two parts:</p>
 <ul>
-<li><strong>Consensus</strong> explains the algorithms ethlambda implements: the
-<a href="./3sf_mini.html">3SF-mini</a> justification and finalization rules, and the
-<a href="./lmd_ghost.html">LMD-GHOST</a> fork choice algorithm. Both documents are
-implementation-agnostic; ethlambda-specific behaviour is called out in
-blockquotes.</li>
+<li><strong>Consensus</strong> explains how the chain advances: the
+<a href="./slots_and_intervals.html">slot and interval structure</a> that schedules every
+validator duty, the <a href="./3sf_mini.html">3SF-mini</a> justification and finalization
+rules, and the <a href="./lmd_ghost.html">LMD-GHOST</a> fork choice algorithm. These
+documents are implementation-agnostic; ethlambda-specific behaviour is called
+out in blockquotes.</li>
 <li><strong>Operations</strong> documents observable surfaces of a running node:
 <a href="./metrics.html">Prometheus metrics</a>, <a href="./checkpoint_sync.html">checkpoint sync</a>,
 and the <a href="./fork_choice_visualization.html">fork choice visualization</a> served
@@ -231,7 +232,7 @@ For comparison and cross-client testing:</p>
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
 
-                            <a rel="next prefetch" href="3sf_mini.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="slots_and_intervals.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -242,7 +243,7 @@ For comparison and cross-client testing:</p>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
 
-                    <a rel="next prefetch" href="3sf_mini.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="slots_and_intervals.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

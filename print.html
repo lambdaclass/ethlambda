@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ee57cac9.js";
+            window.path_to_searchindex_js = "searchindex-a0050628.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-274da26b.js"></script>
+        <script src="toc-54238a3b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,11 +184,12 @@ consensus client, written in Rust.</p>
 <p>This book collects the design notes and operator-facing references for ethlambda.
 It is split into two parts:</p>
 <ul>
-<li><strong>Consensus</strong> explains the algorithms ethlambda implements: the
-<a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization rules, and the
-<a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. Both documents are
-implementation-agnostic; ethlambda-specific behaviour is called out in
-blockquotes.</li>
+<li><strong>Consensus</strong> explains how the chain advances: the
+<a href="#slots-and-intervals">slot and interval structure</a> that schedules every
+validator duty, the <a href="#3sf-mini-justification--finalization">3SF-mini</a> justification and finalization
+rules, and the <a href="#-lmd-ghost-fork-choice-algorithm">LMD-GHOST</a> fork choice algorithm. These
+documents are implementation-agnostic; ethlambda-specific behaviour is called
+out in blockquotes.</li>
 <li><strong>Operations</strong> documents observable surfaces of a running node:
 <a href="#metrics">Prometheus metrics</a>, <a href="#checkpoint-sync">checkpoint sync</a>,
 and the <a href="#fork-choice-visualization">fork choice visualization</a> served
@@ -223,6 +224,112 @@ For comparison and cross-client testing:</p>
 <li><a href="https://github.com/geanlabs/gean">gean</a> (Go)</li>
 <li><a href="https://github.com/Pier-Two/lantern">Lantern</a> (C)</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="slots-and-intervals"><a class="header" href="#slots-and-intervals">Slots and Intervals</a></h1>
+<p>A Lean Chain slot has a duration of 4 seconds and is divided in 5 intervals of 800 ms.
+Every duty a validator owes the chain is due in one of them:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Interval</th><th>Offset</th><th>Duty</th><th>Who acts</th><th>What it publishes</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>t+0 ms</td><td><a href="#interval-0-block-proposal">Block proposal</a></td><td>the slot’s proposer</td><td>the block, on the <code>block</code> topic</td></tr>
+<tr><td>1</td><td>t+800 ms</td><td><a href="#interval-1-vote-propagation">Vote propagation</a></td><td>every validator</td><td>a signed attestation, on its subnet topic</td></tr>
+<tr><td>2</td><td>t+1600 ms</td><td><a href="#interval-2-vote-aggregation">Vote aggregation</a></td><td>aggregators</td><td>an aggregated attestation, on the <code>aggregation</code> topic</td></tr>
+<tr><td>3</td><td>t+2400 ms</td><td><a href="#interval-3-safe-target-computation">Safe target computation</a></td><td>every validator</td><td>nothing: local bookkeeping</td></tr>
+<tr><td>4</td><td>t+3200 ms</td><td><a href="#interval-4-head-update">Head update</a></td><td>every validator</td><td>nothing: local bookkeeping</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-text">                             ONE SLOT (4000 ms)
+    ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+    │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
+    │  t+0 ms    │  t+800 ms  │ t+1600 ms  │ t+2400 ms  │ t+3200 ms  │
+    ├────────────┼────────────┼────────────┼────────────┼────────────┤
+    │   block    │    vote    │    vote    │safe target │    head    │
+    │  proposal  │propagation │aggregation │computation │   update   │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
+     ◄───────────── gossiped ─────────────▶ ◄───── local only ───────▶
+</code></pre>
+<p>The grid comes from a genesis timestamp every node shares, so the schedule needs no
+coordination messages: a node reads its clock, works out which interval it is in, and
+knows which duty is due. The order is a dependency chain, since each interval consumes
+what the previous one produced. A duty that overruns its interval is not rescheduled: it
+lands late, and the slot moves on without it.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
+<code>crates/blockchain/src/lib.rs</code>, and their length comes from
+<code>MILLISECONDS_PER_INTERVAL</code> and <code>INTERVALS_PER_SLOT</code> in
+<code>crates/common/types/src/constants.rs</code>.</p>
+</blockquote>
+<h2 id="interval-0-block-proposal"><a class="header" href="#interval-0-block-proposal">Interval 0: Block proposal</a></h2>
+<p>A block proposer, selected in a round-robin fashion (<code>slot % num_validators</code>), proposes a
+new block and gossips it to the network. Right before building the block, the proposer
+merges their “new attestations buffer” into their fork-choice view. They then include
+attestations that the proposer has recently seen into their block. Other validators verify
+the block and its contents, and merge the votes it includes into their fork-choice view.
+After importing a block, all validators <a href="#-lmd-ghost-fork-choice-algorithm">recompute their head</a>, and update
+the latest <a href="#3sf-mini-justification--finalization">finalized and justified checkpoints</a> according to the block’s
+post-state.</p>
+<p>A block body carries at most <code>MAX_ATTESTATIONS_DATA</code> aggregated attestations: distinct
+<code>(slot, head, target, source)</code> tuples, each paired with a bitfield naming the validators
+bound to it.
+Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot to be
+filled: a proposer that is offline or too slow leaves an empty slot, and the next block
+simply points its parent root at an older block.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> block proposal is merged into the previous slot’s head-update
+interval: the proposer advances its store to the next slot, builds the block there,
+and holds publication until the slot boundary. That buys the build one extra interval
+of headroom and leaves no actor work at the block-proposal tick itself.</p>
+</blockquote>
+<h2 id="interval-1-vote-propagation"><a class="header" href="#interval-1-vote-propagation">Interval 1: Vote propagation</a></h2>
+<p>Validators gossip their votes for the block they consider to be the head of the chain, and
+append to it a <code>(source, target)</code> <a href="#recap-attestation-anatomy">finality vote</a>.
+These votes are in aggregation subnets and are imported by aggregators. Aggregators verify
+the votes in their subnet and store them for later aggregation.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> a validator’s subnet is <code>validator_index % attestation_committee_count</code>,
+and a node only aggregates for subnets it subscribed to at startup. Aggregation is also
+gated on the aggregator role, seeded by <code>--is-aggregator</code> and flippable at runtime
+through the admin API. A chain whose validators all decline the role still gossips votes
+and logs them as processed, but no aggregate is ever produced, so every block is empty
+and the chain never justifies.</p>
+</blockquote>
+<h2 id="interval-2-vote-aggregation"><a class="header" href="#interval-2-vote-aggregation">Interval 2: Vote aggregation</a></h2>
+<p>Aggregators aggregate the votes they have received and gossip the resulting aggregated
+attestations to the network. These aggregated attestations are imported by all validators,
+who verify and store them in a “new attestations buffer”.</p>
+<p>Aggregation earns its own interval because collapsing a subnet’s worth of XMSS signatures
+into one proof is the heaviest recurring computation in the client. It is also what makes a
+block affordable, since a block carrying raw votes would need one full XMSS signature per
+voter, quickly going over the network bandwidth limit.</p>
+<blockquote>
+<p><strong>In ethlambda:</strong> the proofs run on an off-thread worker so the blockchain actor’s
+message loop stays responsive, and a session may start up to <code>EARLY_AGGREGATION_WINDOW</code>
+before the interval boundary once two thirds of the signatures are in. At the session’s
+soft deadline the actor stops handing out new jobs, but a proof already in flight
+finishes and publishes late rather than being discarded.</p>
+</blockquote>
+<h2 id="interval-3-safe-target-computation"><a class="header" href="#interval-3-safe-target-computation">Interval 3: Safe target computation</a></h2>
+<p>Validators compute the <a href="#safe-target-selection">safe target</a> they’ll use when
+deciding which finality vote to cast on the next slot. The safe target is computed based on
+the votes received in the current slot.</p>
+<p>It is LMD-GHOST again, but run over just the votes that arrived this slot and with a
+two-thirds weight threshold, where head selection applies none. The safe target therefore
+sits at or behind the head and advances only once a branch is backed by a supermajority.
+Deriving targets from it is what stops <a href="#3sf-mini-justification--finalization">3SF-mini</a> from justifying a branch
+the network has not visibly converged on.</p>
+<h2 id="interval-4-head-update"><a class="header" href="#interval-4-head-update">Interval 4: Head update</a></h2>
+<p>Validators merge the aggregated attestations they have in their “new attestations buffer”
+into their fork-choice view, and recompute their head.</p>
+<p>This is the slot’s second and last promotion point; the first is the proposer’s, just
+before it builds. Until a vote is promoted it carries no weight in head selection, which is
+what keeps a validator’s fork-choice view from shifting under it mid-slot. The safe target
+is the exception: it reads the unpromoted buffer directly, which is how it stays a view of
+this slot alone. See <a href="#why-staged-promotion">why staged promotion</a> for the
+reasoning.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="3sf-mini-justification--finalization"><a class="header" href="#3sf-mini-justification--finalization">3SF-mini: Justification &amp; Finalization</a></h1>
 <p>ethlambda uses <strong>3SF-mini</strong> (Three-Stage Finality, minimal version) for justification
@@ -1128,9 +1235,9 @@ designated moments. This ensures all validators operate on a consistent view.</p
                           fixed points
 </code></pre>
 <blockquote>
-<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, stored
-in <code>LatestNewAttestations</code> and <code>LatestKnownAttestations</code> tables respectively.
-Promotion happens at tick intervals 0 (if proposing) and 3 (end of slot).</p>
+<p><strong>In ethlambda:</strong> The two stages are called “new” and “known” attestations, held in
+the in-memory <code>new_payloads</code> and <code>known_payloads</code> buffers of the <code>Store</code> respectively.
+Promotion happens at tick intervals 0 (if proposing) and 4 (end of slot).</p>
 </blockquote>
 <h3 id="why-staged-promotion"><a class="header" href="#why-staged-promotion">Why Staged Promotion?</a></h3>
 <p>The staged design serves two purposes:</p>
@@ -1278,25 +1385,26 @@ November 2018 due to superior stability properties.</p>
 <p>This section covers ethlambda-specific details: scheduling, Beacon Chain differences,
 source code locations, and performance.</p>
 <h3 id="tick-based-scheduling"><a class="header" href="#tick-based-scheduling">Tick-Based Scheduling</a></h3>
-<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>4 intervals</strong> (1 second
-each). Fork choice operations are scheduled at specific intervals:</p>
-<pre><code class="language-text">                          ONE SLOT (4 seconds)
-    ┌──────────────┬──────────────┬──────────────┬──────────────┐
-    │  Interval 0  │  Interval 1  │  Interval 2  │  Interval 3  │
-    │   (t+0s)     │   (t+1s)     │   (t+2s)     │   (t+3s)     │
-    ├──────────────┼──────────────┼──────────────┼──────────────┤
-    │              │              │              │              │
-    │ IF PROPOSER: │ NON-PROPOSER:│ update_safe  │ accept_new   │
-    │  accept new  │  produce     │ _target()    │ _attestations│
-    │  attestations│  attestation │              │ ()           │
-    │  + propose   │              │ (2/3 vote    │              │
-    │  block       │              │  threshold)  │ update_head()│
-    │              │              │              │              │
-    │ update_head()│              │              │              │
-    │              │              │              │              │
-    └──────────────┴──────────────┴──────────────┴──────────────┘
+<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>5 intervals</strong> (800 ms
+each), as described in <a href="#slots-and-intervals">Slots and Intervals</a>. Fork choice
+operations are scheduled at specific intervals:</p>
+<pre><code class="language-text">                             ONE SLOT (4000 ms)
+    ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+    │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
+    │  t+0 ms    │  t+800 ms  │ t+1600 ms  │ t+2400 ms  │ t+3200 ms  │
+    ├────────────┼────────────┼────────────┼────────────┼────────────┤
+    │            │            │            │            │            │
+    │IF PROPOSER:│ ALL        │ aggregators│update_safe │accept_new_ │
+    │ accept new │ VALIDATORS:│ publish    │_target()   │attestations│
+    │ attestation│  produce   │ aggregated │            │()          │
+    │ + propose  │ attestation│ attestation│ (2/3 vote  │            │
+    │ block      │            │            │ threshold) │update_head │
+    │            │            │            │            │()          │
+    │update_head │            │            │            │            │
+    │()          │            │            │            │            │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
 
-    ◄─────────────── Slot N ──────────────────────────────────────►
+    ◄─────────────── Slot N ──────────────────────────────────────────►
 </code></pre>
 <p><strong>Detailed sequence:</strong></p>
 <pre><code class="language-text">    Interval 0 ─ Slot boundary
@@ -1310,20 +1418,25 @@ each). Fork choice operations are scheduled at specific intervals:</p>
     │
     Interval 1 ─ Attestation production
     │
-    ├── Non-proposers:
+    ├── All validators, proposer included:
     │   └── Create attestation with:
     │       • head   = current fork choice head (newest head)
     │       • target = derived from safe_target (for 3SF-mini)
     │       • source = latest_justified checkpoint
     │       Publish attestation to gossipsub
     │
-    Interval 2 ─ Safe target update
+    Interval 2 ─ Aggregation
+    │
+    ├── Aggregators: aggregate their subnet's gossip signatures
+    │   └── Publish the aggregated attestation to gossipsub
+    │
+    Interval 3 ─ Safe target update
     │
     ├── Recalculate safe_target using 2/3 supermajority threshold
     │   └── Only blocks with ≥ ⌈2V/3⌉ attestation weight qualify
     │       (V = total validators)
     │
-    Interval 3 ─ End of slot
+    Interval 4 ─ End of slot
     │
     ├── Promote new → known attestations
     └── Run fork choice → update_head()
