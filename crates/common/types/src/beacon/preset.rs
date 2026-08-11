@@ -1039,6 +1039,10 @@ pub mod retuned {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
             ForkName::Electra | ForkName::Fulu => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
+            ForkName::Lean => unreachable!(
+                "lean state reached a beacon accessor (min_slashing_penalty_quotient); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 

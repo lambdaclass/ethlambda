@@ -193,9 +193,11 @@ fn apply(
                     block.parent_root,
                     block.body.hash_tree_root(),
                 )
-            } // No `other` arm: the six patterns above already cover every
-              // `ForkName` this crate has, so a catch-all here would be dead
-              // code rather than a safety net.
+            }
+            // `case.fork` comes from `ForkName::parse`-ing a fixture
+            // directory name, and `Lean` is deliberately outside
+            // `ForkName::ALL`, so no fixture case can ever carry it.
+            ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
         },
         "attestation" => match case.fork {
             // Phase0 defers every attestation's reward to the epoch boundary.
@@ -223,6 +225,10 @@ fn apply(
                 let attestation: electra::Attestation = case.ssz("attestation");
                 electra_stf::process_attestation(state, &attestation)
             }
+            // `case.fork` comes from `ForkName::parse`-ing a fixture
+            // directory name, and `Lean` is deliberately outside
+            // `ForkName::ALL`, so no fixture case can ever carry it.
+            ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
         },
         "attester_slashing" => match case.fork {
             // Unchanged from phase0 through deneb, container included.
@@ -242,6 +248,10 @@ fn apply(
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
                 electra_stf::process_attester_slashing(state, &slashing, config)
             }
+            // `case.fork` comes from `ForkName::parse`-ing a fixture
+            // directory name, and `Lean` is deliberately outside
+            // `ForkName::ALL`, so no fixture case can ever carry it.
+            ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
         },
         // `ProposerSlashing` never changes shape, and no fork's specification
         // ever lists a modified `process_proposer_slashing`, so this needs no
@@ -269,6 +279,10 @@ fn apply(
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
+            // `case.fork` comes from `ForkName::parse`-ing a fixture
+            // directory name, and `Lean` is deliberately outside
+            // `ForkName::ALL`, so no fixture case can ever carry it.
+            ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
         },
         "voluntary_exit" => match case.fork {
             // Unchanged through capella.
@@ -290,6 +304,10 @@ fn apply(
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
+            // `case.fork` comes from `ForkName::parse`-ing a fixture
+            // directory name, and `Lean` is deliberately outside
+            // `ForkName::ALL`, so no fixture case can ever carry it.
+            ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
         },
         // New in altair, and never listed as modified again, so this needs no
         // further fork match.

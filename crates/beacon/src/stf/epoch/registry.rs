@@ -47,6 +47,10 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
             function: "process_registry_updates",
             fork,
         }),
+        ForkName::Lean => unreachable!(
+            "lean state reached a beacon accessor (activation_churn_limit); \
+             BlockChainServer must dispatch on fork_name() before this point"
+        ),
     }
 }
 

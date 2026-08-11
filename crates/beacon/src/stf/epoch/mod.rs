@@ -86,6 +86,10 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         ForkName::Deneb => capella::process_epoch(state, config),
         ForkName::Electra => electra::process_epoch(state, config),
         ForkName::Fulu => fulu::process_epoch(state, config),
+        ForkName::Lean => unreachable!(
+            "lean state reached a beacon accessor (process_epoch); \
+             BlockChainServer must dispatch on fork_name() before this point"
+        ),
     }
 }
 

@@ -283,6 +283,10 @@ fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, String> {
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        // `case.fork` comes from `ForkName::parse`-ing a fixture directory
+        // name, and `Lean` is deliberately outside `ForkName::ALL`, so no
+        // fixture case can ever carry it.
+        ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
     }
 }
 

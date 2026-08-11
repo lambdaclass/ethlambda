@@ -831,6 +831,13 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Deneb => upgrade_to_deneb(state, config),
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
+        // `to` comes straight from the caller, and there is no upgrade path
+        // into a lean state: lean states are decoded or built directly, never
+        // reached by walking the Beacon Chain's fork sequence.
+        ForkName::Lean => Err(Error::UnsupportedForFork {
+            function: "upgrade_state",
+            fork: to,
+        }),
     }
 }
 

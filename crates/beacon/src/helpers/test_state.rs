@@ -122,6 +122,10 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Deneb => BeaconState::Deneb(deneb_state(count)),
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
+        ForkName::Lean => unreachable!(
+            "with_validators_at was asked to build a lean state; this test \
+             helper only constructs Beacon Chain fork states"
+        ),
     }
 }
 

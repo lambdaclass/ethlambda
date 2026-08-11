@@ -113,6 +113,12 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
+            // Lean has a real shape and Task 10 gives this a genuine decode
+            // arm; until BeaconState::Lean exists there is nothing to build.
+            ForkName::Lean => Err(Error::UnsupportedForFork {
+                function: "BeaconState::from_ssz",
+                fork: ForkName::Lean,
+            }),
         }
     }
 
@@ -626,6 +632,13 @@ impl SignedBeaconBlock {
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
+            // There is no lean variant of SignedBeaconBlock, and this fork
+            // value comes straight from the caller, so a bad argument is
+            // reported rather than crashing.
+            ForkName::Lean => Err(Error::UnsupportedForFork {
+                function: "SignedBeaconBlock::from_ssz",
+                fork: ForkName::Lean,
+            }),
         }
     }
 

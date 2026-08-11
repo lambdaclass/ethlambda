@@ -151,6 +151,10 @@ fn components(
                 altair_helpers::get_inactivity_penalty_deltas(state, config),
             ),
         ],
+        // `fork` comes from `ForkName::parse`-ing a fixture directory name,
+        // and `Lean` is deliberately outside `ForkName::ALL`, so no fixture
+        // case can ever carry it.
+        ForkName::Lean => unreachable!("no fixture case is ever ForkName::Lean"),
     };
 
     raw.into_iter()
