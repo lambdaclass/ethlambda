@@ -12,6 +12,24 @@ pub mod messages;
 pub mod protocols;
 pub mod topics;
 
+use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::primitives::ForkDigest;
+
+/// Everything the beacon wire needs after startup has computed it.
+///
+/// `config` and `genesis_time` are carried rather than looked up because the
+/// fork a gossip payload decodes under is derived from its slot, and that
+/// derivation must use the same schedule the fork digest was computed from.
+pub struct BeaconWire {
+    pub fork_digest: ForkDigest,
+    pub topics: topics::BeaconTopics,
+    pub config: Config,
+    pub genesis_time: u64,
+    /// Advertised in `Ping` responses and in `MetaData`. Never bumped today:
+    /// nothing this node advertises changes at runtime.
+    pub metadata_seq_number: u64,
+}
+
 /// Beacon-chain networking constants.
 ///
 /// `ethlambda_types::beacon::config` deliberately carries no networking values

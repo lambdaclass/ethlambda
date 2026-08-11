@@ -7,7 +7,7 @@ use ethlambda_types::{
 };
 use libp2p::gossipsub::Event;
 use libssz::{SszDecode, SszEncode};
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use super::{
     encoding::{compress_message, decompress_message},
@@ -138,7 +138,11 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
 pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAttestation) {
     let slot = attestation.data.slot;
     let validator = attestation.validator_id;
-    let subnet_id = validator % server.attestation_committee_count;
+    let Some(lean) = server.wire.lean() else {
+        warn!("Publishing is suppressed on the beacon wire; dropping attestation");
+        return;
+    };
+    let subnet_id = validator % lean.attestation_committee_count;
 
     // Encode to SSZ
     let ssz_bytes = attestation.to_ssz();
@@ -149,7 +153,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
     metrics::observe_gossip_attestation_size(ssz_bytes.len(), compressed.len());
 
     // Look up subscribed topic or construct on-the-fly for gossipsub fanout
-    let topic = server
+    let topic = lean
         .attestation_topics
         .get(&subnet_id)
         .cloned()
@@ -184,9 +188,11 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
     metrics::observe_gossip_block_size(ssz_bytes.len(), compressed.len());
 
     // Publish to gossipsub
-    server
-        .swarm_handle
-        .publish(server.block_topic.clone(), compressed);
+    let Some(topic) = server.wire.lean().map(|lean| lean.block_topic.clone()) else {
+        warn!("Publishing is suppressed on the beacon wire; dropping block");
+        return;
+    };
+    server.swarm_handle.publish(topic, compressed);
     info!(
         %slot,
         proposer,
@@ -212,9 +218,15 @@ pub async fn publish_aggregated_attestation(
     metrics::observe_gossip_aggregation_size(ssz_bytes.len(), compressed.len());
 
     // Publish to the aggregation topic
-    server
-        .swarm_handle
-        .publish(server.aggregation_topic.clone(), compressed);
+    let Some(topic) = server
+        .wire
+        .lean()
+        .map(|lean| lean.aggregation_topic.clone())
+    else {
+        warn!("Publishing is suppressed on the beacon wire; dropping aggregate");
+        return;
+    };
+    server.swarm_handle.publish(topic, compressed);
     info!(
         %slot,
         target_slot = attestation.data.target.slot,

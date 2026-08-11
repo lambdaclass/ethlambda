@@ -224,16 +224,56 @@ pub fn attestation_subscription_subnets(
     subnets
 }
 
+/// Which network's wire this node speaks.
+///
+/// One `P2PServer` serves both, dispatching on this once at the top of each
+/// handler, exactly as `BlockChainServer` dispatches on the state variant.
+/// Nothing is shared below the match: the topic names, the req/resp protocol
+/// ids, the handshake and the decode are all different, and the parts that
+/// genuinely coincide (the discv5 stack, the `ssz_snappy` framing,
+/// `compute_message_id`) sit one layer down and are the beacon spec's anyway.
+pub enum Wire {
+    Lean(LeanWire),
+    /// Boxed because a `BeaconWire` carries a whole `Config` and so is four
+    /// times the size of a `LeanWire`; unboxed, every lean node would pay for
+    /// it in each `Wire` it moves.
+    Beacon(Box<beacon::BeaconWire>),
+}
+
+/// The lean network's gossip topics.
+pub struct LeanWire {
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+}
+
+impl Wire {
+    pub(crate) fn lean(&self) -> Option<&LeanWire> {
+        match self {
+            Wire::Lean(lean) => Some(lean),
+            Wire::Beacon(_) => None,
+        }
+    }
+
+    /// Allowed dead for one commit: this task is a pure lean refactor, and the
+    /// beacon gossip handler that calls this arrives with the beacon swarm.
+    #[allow(dead_code)]
+    pub(crate) fn beacon(&self) -> Option<&beacon::BeaconWire> {
+        match self {
+            Wire::Beacon(beacon) => Some(beacon),
+            Wire::Lean(_) => None,
+        }
+    }
+}
+
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
     /// This node's libp2p peer ID, derived from the node key. Exposed so the
     /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
     pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
 
@@ -385,10 +425,12 @@ pub fn build_swarm(
     Ok(BuiltSwarm {
         local_peer_id,
         swarm,
-        attestation_topics,
-        attestation_committee_count: config.attestation_committee_count,
-        block_topic,
-        aggregation_topic,
+        wire: Wire::Lean(LeanWire {
+            attestation_topics,
+            attestation_committee_count: config.attestation_committee_count,
+            block_topic,
+            aggregation_topic,
+        }),
         bootnode_addrs,
     })
 }
@@ -420,10 +462,7 @@ impl P2P {
             swarm_handle,
             store,
             blockchain: None,
-            attestation_topics: built.attestation_topics,
-            attestation_committee_count: built.attestation_committee_count,
-            block_topic: built.block_topic,
-            aggregation_topic: built.aggregation_topic,
+            wire: built.wire,
             connected_peers: HashSet::new(),
             pending_root_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
@@ -473,10 +512,7 @@ pub struct P2PServer {
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
@@ -1080,6 +1116,24 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    #[test]
+    fn a_lean_wire_reports_its_topics_and_no_beacon_wire() {
+        // The enum is what makes "subscribed to lean topics and beacon topics
+        // at once" unrepresentable. `P2PServer` dispatches on it once per
+        // handler, the same way `BlockChainServer` dispatches on the state
+        // variant.
+        let wire = Wire::Lean(LeanWire {
+            attestation_topics: HashMap::new(),
+            attestation_committee_count: 4,
+            block_topic: block_topic(),
+            aggregation_topic: aggregation_topic(),
+        });
+        assert!(wire.beacon().is_none());
+        let lean = wire.lean().expect("a lean wire");
+        assert_eq!(lean.attestation_committee_count, 4);
+        assert!(lean.block_topic.to_string().starts_with("/leanconsensus/"));
     }
 
     #[test]
