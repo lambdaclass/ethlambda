@@ -147,6 +147,8 @@ impl RangeSyncState {
 pub(crate) struct DiscoveryState {
     pub(crate) peer_table: PeerTable,
     pub(crate) local_fork_id: EnrForkId,
+    /// Subnet ids at or beyond this are dropped from a peer's `attnets`.
+    pub(crate) subnet_count: u64,
     /// Admitted candidates, best first, drained one per tick. Refilled from the
     /// peer table when empty.
     pub(crate) candidates: VecDeque<DiscoveredPeer>,
@@ -432,6 +434,7 @@ impl P2P {
             discovery: discovery.map(|handle| DiscoveryState {
                 peer_table: handle.peer_table,
                 local_fork_id: handle.local_fork_id,
+                subnet_count: handle.subnet_count,
                 candidates: VecDeque::new(),
                 peer_attnets: HashMap::new(),
             }),
@@ -571,11 +574,12 @@ impl P2PServer {
 
         // Snapshot what the refill needs before any `.await`, so no borrow of
         // `self.discovery` has to live across the async boundary.
-        let Some((peer_table, local_fork_id, needs_refill)) =
+        let Some((peer_table, local_fork_id, subnet_count, needs_refill)) =
             self.discovery.as_ref().map(|discovery| {
                 (
                     discovery.peer_table.clone(),
                     discovery.local_fork_id,
+                    discovery.subnet_count,
                     discovery.candidates.is_empty(),
                 )
             })
@@ -596,7 +600,7 @@ impl P2PServer {
             }
 
             let (mut admitted, unwanted) =
-                select_candidates(contacts, &local_fork_id, self.attestation_committee_count);
+                select_candidates(contacts, &local_fork_id, subnet_count);
             for node_id in unwanted {
                 let _ = peer_table.set_unwanted(node_id);
             }

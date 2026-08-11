@@ -310,6 +310,8 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
                 attestation_committee_count,
                 bootnodes: discovery_bootnodes,
                 advertise_ip,
+                fork_id: ethlambda_types::enr::EnrForkId::local(),
+                custody_group_count: None,
             },
         )
         .await

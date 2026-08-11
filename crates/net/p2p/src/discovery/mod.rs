@@ -48,6 +48,10 @@ pub struct DiscoverySpawnConfig {
     /// IP address to advertise in the ENR. Defaults to `bind_ip` when unset,
     /// which is undialable if `bind_ip` is the wildcard `0.0.0.0`.
     pub advertise_ip: Option<IpAddr>,
+    /// The `eth2` entry to publish and to compare discovered peers against.
+    pub fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    pub custody_group_count: Option<u64>,
 }
 
 /// What the P2P actor needs from a running discovery server.
@@ -58,6 +62,10 @@ pub struct DiscoveryHandle {
     /// number later if PONG voting changes our external IP.
     pub local_enr: String,
     pub local_fork_id: EnrForkId,
+    /// Subnet ids at or beyond this are dropped from a discovered peer's
+    /// `attnets`. Lean's attestation committee count, or
+    /// `ATTESTATION_SUBNET_COUNT` on the beacon wire.
+    pub subnet_count: u64,
     /// The discv5 socket's actual bound address. Equal to the requested
     /// `discovery_port` unless that was 0, in which case this carries the
     /// port the OS assigned — the same one baked into `local_enr`'s `udp`
@@ -90,6 +98,8 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         quic_port: config.quic_port,
         subscription_subnets: config.subscription_subnets,
         attestation_committee_count: config.attestation_committee_count,
+        fork_id: config.fork_id,
+        custody_group_count: config.custody_group_count,
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
@@ -157,7 +167,8 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
     Ok(DiscoveryHandle {
         peer_table,
         local_enr,
-        local_fork_id: EnrForkId::local(),
+        local_fork_id: params.fork_id,
+        subnet_count: config.attestation_committee_count,
         bound_addr: bound,
     })
 }
@@ -183,6 +194,8 @@ mod tests {
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip: None,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .await
         .expect("discovery spawns");
@@ -224,6 +237,8 @@ mod tests {
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip: Some(IpAddr::from(advertised)),
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .await
         .expect("discovery spawns");
@@ -255,6 +270,8 @@ mod tests {
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip: None,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .await;
 
