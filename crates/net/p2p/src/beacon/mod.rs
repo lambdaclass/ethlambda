@@ -6,6 +6,7 @@
 //! [`crate::req_resp::encoding`], and `compute_message_id` in [`crate`], all of
 //! which are the beacon spec's to begin with.
 
+pub mod messages;
 pub mod protocols;
 pub mod topics;
 
