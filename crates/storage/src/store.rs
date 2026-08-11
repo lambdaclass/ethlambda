@@ -620,25 +620,39 @@ pub(crate) struct BeaconScratch {
 
 /// The beacon state caches.
 ///
-/// A mainnet `BeaconState` is ~350 MB, so these are sized for the working set
-/// the handlers need resident at once rather than for a hit rate: the latest
-/// finalized anchor and the head's post-state, plus the justified checkpoint's
-/// epoch-boundary state. Three entries, ~1 GB, which is the budget
-/// `docs/superpowers/specs/2026-08-10-mainnet-network-design.md` §5 sets.
-///
 /// A miss is never an error: `ethlambda_beacon::fork_choice::block_state` and
 /// `checkpoint_state` both derive the value by replaying from the nearest anchor.
-/// That is what makes an aggressive capacity safe here, and it is why these are
-/// caches rather than the store's record of anything.
+/// That is what makes these caches rather than the store's record of anything,
+/// and it is why the capacity is a pure speed/memory trade with no correctness
+/// stake. Nothing here may become a consensus input: a decision that changes
+/// with cache residency is a bug, not a tuning choice.
+///
+/// Sized for the working set of a fork-choice pass rather than for a hit rate.
+/// `get_head` walks the filtered tree and needs one state per viable leaf plus
+/// the parent it descended from, so a capacity below the number of competing
+/// branches thrashes: every leaf evicts the previous one and each revisit
+/// replays from the nearest anchor. That is the whole cost, and it is why the
+/// block-state cache is the one that wants room.
 pub(crate) struct BeaconCaches {
     pub(crate) states: LruCache<BeaconRoot, Arc<BeaconState>>,
     pub(crate) checkpoint_states: LruCache<(u64, BeaconRoot), Arc<BeaconState>>,
 }
 
 /// Block post-states held resident. See [`BeaconCaches`].
-const BEACON_STATE_CACHE_CAPACITY: usize = 2;
+///
+/// A mainnet `BeaconState` is ~350 MB, so this is ~5.6 GB worst case and only
+/// reaches it under a fork wide enough to keep sixteen leaves viable at once;
+/// the steady state is one or two. The design spec's §5 budget of three entries
+/// total was set against memory, before the replay cost was measured: at three
+/// the `fork_choice` fixture suite spends 119s, almost all of it replaying
+/// states it had just evicted.
+const BEACON_STATE_CACHE_CAPACITY: usize = 16;
 /// Epoch-boundary states held resident. See [`BeaconCaches`].
-const BEACON_CHECKPOINT_STATE_CACHE_CAPACITY: usize = 1;
+///
+/// Smaller than the block-state cache because the demand is bounded by the
+/// checkpoints in play, the justified and finalized ones plus whatever a
+/// competing branch justifies, rather than by the width of the tree.
+const BEACON_CHECKPOINT_STATE_CACHE_CAPACITY: usize = 8;
 /// Finalized anchor snapshots kept in `States`. The second is the margin that
 /// lets a replay start below the newest one.
 pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
