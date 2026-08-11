@@ -86,14 +86,32 @@ pub(crate) struct RangeSyncState {
     /// Latest advertised head slot for each peer.
     pub(crate) peer_set: HashMap<PeerId, u64>,
     pub(crate) in_flight: bool,
+    /// Largest `count` a single request may ask for.
+    ///
+    /// Per-network: lean's `blocks_by_range/1` allows [`MAX_REQUEST_BLOCKS`],
+    /// while `beacon_blocks_by_range/2` has been capped at
+    /// `MAX_REQUEST_BLOCKS_DENEB` since deneb and a peer may refuse a larger
+    /// request outright. Everything else about a sync session is identical on
+    /// both chains, which is why this is a field rather than a second type.
+    pub(crate) max_batch: u64,
 }
 
 impl RangeSyncState {
     pub(crate) fn new(current_range: Range<u64>, peer: PeerId, peer_head: u64) -> Self {
+        Self::with_max_batch(current_range, peer, peer_head, MAX_REQUEST_BLOCKS)
+    }
+
+    pub(crate) fn with_max_batch(
+        current_range: Range<u64>,
+        peer: PeerId,
+        peer_head: u64,
+        max_batch: u64,
+    ) -> Self {
         Self {
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
+            max_batch,
         }
     }
 
@@ -117,7 +135,7 @@ impl RangeSyncState {
         let batch_end = self
             .current_range
             .start
-            .saturating_add(MAX_REQUEST_BLOCKS)
+            .saturating_add(self.max_batch)
             .min(self.current_range.end)
             .min(peer_end);
 
@@ -1176,6 +1194,31 @@ mod tests {
         let lean = wire.lean().expect("a lean wire");
         assert_eq!(lean.attestation_committee_count, 4);
         assert!(lean.block_topic.to_string().starts_with("/leanconsensus/"));
+    }
+
+    #[test]
+    fn range_sync_state_caps_a_batch_at_its_own_limit() {
+        // A beacon session batches 128 blocks, not lean's 1024:
+        // beacon_blocks_by_range/2 is capped at MAX_REQUEST_BLOCKS_DENEB, and a
+        // peer may reject a larger count outright.
+        let peer = random_peer();
+        let state = RangeSyncState::with_max_batch(10..3000, peer, 2999, 128);
+
+        let (selected, batch) = state.next_batch().expect("batch available");
+
+        assert_eq!(selected, peer);
+        assert_eq!(batch, 10..138);
+    }
+
+    #[test]
+    fn range_sync_state_new_keeps_leans_limit() {
+        // The existing constructor must not change behaviour for lean.
+        let peer = random_peer();
+        let state = RangeSyncState::new(10..30_000, peer, 29_999);
+
+        let (_, batch) = state.next_batch().expect("batch available");
+
+        assert_eq!(batch, 10..(10 + MAX_REQUEST_BLOCKS));
     }
 
     #[test]
