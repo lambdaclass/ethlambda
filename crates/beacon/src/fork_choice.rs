@@ -350,6 +350,10 @@ pub enum DataAvailability {
 // Store
 // ---------------------------------------------------------------------------
 
+/// Re-exported so this module's signatures name the same type the DB-backed
+/// store builds. See [`ethlambda_storage::BeaconBlockIndex`].
+pub type BeaconBlockIndex = HashMap<Root, (Slot, Root)>;
+
 /// The fork choice store.
 ///
 /// Constructed once, at genesis or at a checkpoint-sync anchor, by
@@ -392,14 +396,14 @@ pub struct Store {
     /// Keyed on the unsigned message's root, matching the specification's own
     /// `store.blocks`, even though the value held here is signed. See the
     /// module documentation for why.
-    pub blocks: HashMap<Root, SignedBeaconBlock>,
+    blocks: HashMap<Root, SignedBeaconBlock>,
     /// The post-state resulting from applying each block in
     /// [`Store::blocks`].
     pub block_states: HashMap<Root, BeaconState>,
     /// Whether each block in [`Store::blocks`] arrived before the attestation
     /// deadline of the slot fork choice was in when it was imported. Feeds
     /// [`is_head_late`], one of the inputs to a same-slot proposer reorg.
-    pub block_timeliness: HashMap<Root, bool>,
+    block_timeliness: HashMap<Root, bool>,
     /// The state advanced to the first slot of each checkpoint's epoch, cached
     /// so that [`on_attestation`] does not replay [`stf::process_slots`] for
     /// every attestation that shares a target.
@@ -491,6 +495,52 @@ impl Store {
     /// Sets [`Store::proposer_boost_root`].
     pub fn set_proposer_boost_root(&mut self, root: Root) {
         self.proposer_boost_root = root;
+    }
+
+    /// The block stored under `root`, body and all.
+    pub fn beacon_block(&self, root: Root) -> Option<SignedBeaconBlock> {
+        self.blocks.get(&root).cloned()
+    }
+
+    /// `root`'s slot and parent root, without decoding its body.
+    pub fn beacon_block_entry(&self, root: Root) -> Option<(Slot, Root)> {
+        self.blocks
+            .get(&root)
+            .map(|block| (block.slot(), block.parent_root()))
+    }
+
+    /// Whether a block is stored under `root`.
+    pub fn has_beacon_block(&self, root: Root) -> bool {
+        self.blocks.contains_key(&root)
+    }
+
+    /// Records `block` under `root`, the root of its unsigned message.
+    pub fn insert_beacon_block(&mut self, root: Root, block: &SignedBeaconBlock) {
+        self.blocks.insert(root, block.clone());
+    }
+
+    /// Every stored block as `root -> (slot, parent_root)`.
+    ///
+    /// Built once per tree walk and passed down, rather than re-read per hop:
+    /// [`get_weight`] calls [`get_ancestor`] once per active validator, so a
+    /// lookup per hop would multiply a scan the specification already writes as
+    /// naive by a backend round trip.
+    pub fn beacon_block_index(&self) -> BeaconBlockIndex {
+        self.blocks
+            .iter()
+            .map(|(root, block)| (*root, (block.slot(), block.parent_root())))
+            .collect()
+    }
+
+    /// Whether `root`'s block arrived before the attestation deadline of the
+    /// slot fork choice was in when it was imported.
+    pub fn block_timeliness(&self, root: Root) -> Option<bool> {
+        self.block_timeliness.get(&root).copied()
+    }
+
+    /// Sets [`Store::block_timeliness`].
+    pub fn set_block_timeliness(&mut self, root: Root, timely: bool) {
+        self.block_timeliness.insert(root, timely);
     }
 
     /// The cached state at `checkpoint`, if [`store_target_checkpoint_state`]
@@ -641,15 +691,15 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// specification calls out as invalid (`store.blocks[root]` would raise
 /// `KeyError` in the reference implementation), so it becomes a `SpecAssert`
 /// here rather than a panic.
-pub fn get_ancestor(store: &Store, root: Root, slot: Slot) -> Result<Root> {
+pub fn get_ancestor(index: &BeaconBlockIndex, root: Root, slot: Slot) -> Result<Root> {
     let mut root = root;
     loop {
-        let block = store
-            .blocks
+        let (block_slot, parent_root) = index
             .get(&root)
+            .copied()
             .ok_or(Error::SpecAssert("root in store.blocks"))?;
-        if block.slot() > slot {
-            root = block.parent_root();
+        if block_slot > slot {
+            root = parent_root;
         } else {
             return Ok(root);
         }
@@ -677,8 +727,8 @@ pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64)
 
 /// The checkpoint block for `epoch`, on `root`'s chain: the ancestor of `root`
 /// at that epoch's first slot.
-pub fn get_checkpoint_block(store: &Store, root: Root, epoch: Epoch) -> Result<Root> {
-    get_ancestor(store, root, compute_start_slot_at_epoch(epoch))
+pub fn get_checkpoint_block(index: &BeaconBlockIndex, root: Root, epoch: Epoch) -> Result<Root> {
+    get_ancestor(index, root, compute_start_slot_at_epoch(epoch))
 }
 
 /// The extra weight a timely, uncontested block gets over its competitors,
@@ -700,29 +750,36 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// The LMD GHOST weight of `root`: the effective balance of every
 /// non-equivocating, active, unslashed validator whose latest vote descends
 /// through `root`, plus the proposer boost if it applies.
-pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
+pub fn get_weight(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    root: Root,
+    config: &Config,
+) -> Result<Gwei> {
     let state = store
         .checkpoint_state(&store.beacon_justified_checkpoint())
         .ok_or(Error::SpecAssert(
             "store.justified_checkpoint in store.checkpoint_states",
         ))?;
     let current_epoch = get_current_epoch(state);
-    let block_slot = store
-        .blocks
+    let (block_slot, _parent_root) = index
         .get(&root)
-        .ok_or(Error::SpecAssert("root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("root in store.blocks"))?;
 
+    // `validator_index` rather than the specification's own `i`: `index` is the
+    // block index this walk takes, and shadowing it here would silently make
+    // `get_ancestor` below take the validator instead.
     let mut attestation_score: Gwei = 0;
-    for index in get_active_validator_indices(state, current_epoch) {
-        let validator = state.validator(index)?;
-        if validator.slashed || store.equivocating_indices.contains(&index) {
+    for validator_index in get_active_validator_indices(state, current_epoch) {
+        let validator = state.validator(validator_index)?;
+        if validator.slashed || store.equivocating_indices.contains(&validator_index) {
             continue;
         }
-        let Some(message) = store.latest_messages.get(&index) else {
+        let Some(message) = store.latest_messages.get(&validator_index) else {
             continue;
         };
-        if get_ancestor(store, message.root, block_slot)? == root {
+        if get_ancestor(index, message.root, block_slot)? == root {
             attestation_score = attestation_score.saturating_add(validator.effective_balance);
         }
     }
@@ -732,7 +789,7 @@ pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
     }
 
     let mut proposer_score: Gwei = 0;
-    if get_ancestor(store, store.proposer_boost_root(), block_slot)? == root {
+    if get_ancestor(index, store.proposer_boost_root(), block_slot)? == root {
         proposer_score = get_proposer_score(store, config)?;
     }
     Ok(attestation_score.saturating_add(proposer_score))
@@ -747,12 +804,16 @@ pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
 /// `current_justified_checkpoint` happened to be at the time it was
 /// processed; a block from the current epoch has no unrealized value to pull
 /// up to yet, so its own post-state's checkpoint is used directly.
-pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Result<Checkpoint> {
-    let block_slot = store
-        .blocks
+pub fn get_voting_source(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    block_root: Root,
+    config: &Config,
+) -> Result<Checkpoint> {
+    let (block_slot, _parent_root) = index
         .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
     let current_epoch = get_current_store_epoch(store, config);
     let block_epoch = compute_epoch_at_slot(block_slot);
 
@@ -790,21 +851,25 @@ pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Re
 /// Borrows `blocks` for the whole walk instead of the specification's owned
 /// output dict, so this never clones a [`SignedBeaconBlock`] just to hand a
 /// second reference to it to the caller.
-pub fn filter_block_tree<'store>(
-    store: &'store Store,
+pub fn filter_block_tree(
+    store: &Store,
+    index: &BeaconBlockIndex,
     block_root: Root,
-    blocks: &mut HashMap<Root, &'store SignedBeaconBlock>,
+    blocks: &mut HashSet<Root>,
     config: &Config,
 ) -> Result<bool> {
-    let block = store
-        .blocks
-        .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
+    // The specification indexes `store.blocks[block_root]` here, so an unknown
+    // root is its own "unhandled exception" case rather than a childless leaf.
+    // Kept explicit: without it a bad root would fall through to the leaf branch
+    // and surface as some unrelated-looking error two calls later.
+    verify(
+        index.contains_key(&block_root),
+        "block_root in store.blocks",
+    )?;
 
-    let children: Vec<Root> = store
-        .blocks
+    let children: Vec<Root> = index
         .iter()
-        .filter(|(_, candidate)| candidate.parent_root() == block_root)
+        .filter(|(_, (_, parent_root))| *parent_root == block_root)
         .map(|(root, _)| *root)
         .collect();
 
@@ -813,19 +878,19 @@ pub fn filter_block_tree<'store>(
     if !children.is_empty() {
         let mut any_viable = false;
         for child in children {
-            if filter_block_tree(store, child, blocks, config)? {
+            if filter_block_tree(store, index, child, blocks, config)? {
                 any_viable = true;
             }
         }
         if any_viable {
-            blocks.insert(block_root, block);
+            blocks.insert(block_root);
             return Ok(true);
         }
         return Ok(false);
     }
 
     let current_epoch = get_current_store_epoch(store, config);
-    let voting_source = get_voting_source(store, block_root, config)?;
+    let voting_source = get_voting_source(store, index, block_root, config)?;
 
     // The voting source should be either at the same height as the store's
     // justified checkpoint or not more than two epochs ago.
@@ -835,7 +900,7 @@ pub fn filter_block_tree<'store>(
         || voting_source.epoch.saturating_add(2) >= current_epoch;
 
     let finalized = store.beacon_finalized_checkpoint();
-    let finalized_checkpoint_block = get_checkpoint_block(store, block_root, finalized.epoch)?;
+    let finalized_checkpoint_block = get_checkpoint_block(index, block_root, finalized.epoch)?;
 
     let correct_finalized =
         finalized.epoch == constants::GENESIS_EPOCH || finalized.root == finalized_checkpoint_block;
@@ -843,7 +908,7 @@ pub fn filter_block_tree<'store>(
     // If expected finalized/justified, add to viable block-tree and signal
     // viability to parent.
     if correct_justified && correct_finalized {
-        blocks.insert(block_root, block);
+        blocks.insert(block_root);
         return Ok(true);
     }
 
@@ -852,26 +917,28 @@ pub fn filter_block_tree<'store>(
 
 /// The filtered block tree: every block, from the justified checkpoint down,
 /// whose leaf state's justified/finalized info agrees with `store`'s own.
-pub fn get_filtered_block_tree<'store>(
-    store: &'store Store,
+pub fn get_filtered_block_tree(
+    store: &Store,
+    index: &BeaconBlockIndex,
     config: &Config,
-) -> Result<HashMap<Root, &'store SignedBeaconBlock>> {
+) -> Result<HashSet<Root>> {
     let base = store.beacon_justified_checkpoint().root;
-    let mut blocks = HashMap::new();
-    filter_block_tree(store, base, &mut blocks, config)?;
+    let mut blocks = HashSet::new();
+    filter_block_tree(store, index, base, &mut blocks, config)?;
     Ok(blocks)
 }
 
 /// The LMD GHOST head: starting from the justified checkpoint, repeatedly
 /// step to the child with the greatest weight until a leaf is reached.
 pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
-    let blocks = get_filtered_block_tree(store, config)?;
+    let index = store.beacon_block_index();
+    let blocks = get_filtered_block_tree(store, &index, config)?;
     let mut head = store.beacon_justified_checkpoint().root;
     loop {
         let children: Vec<Root> = blocks
             .iter()
-            .filter(|(_, block)| block.parent_root() == head)
-            .map(|(root, _)| *root)
+            .copied()
+            .filter(|root| index.get(root).is_some_and(|(_, parent)| *parent == head))
             .collect();
         if children.is_empty() {
             return Ok(head);
@@ -884,7 +951,7 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
         // `bytes` root.
         let mut ranked = Vec::with_capacity(children.len());
         for root in children {
-            ranked.push((get_weight(store, root, config)?, root));
+            ranked.push((get_weight(store, &index, root, config)?, root));
         }
         head = ranked
             .into_iter()
@@ -980,9 +1047,7 @@ pub fn get_aggregate_due_ms(_epoch: Epoch, config: &Config) -> u64 {
 /// slot it was imported in.
 pub fn is_head_late(store: &Store, head_root: Root) -> Result<bool> {
     let timely = store
-        .block_timeliness
-        .get(&head_root)
-        .copied()
+        .block_timeliness(head_root)
         .ok_or(Error::SpecAssert("head_root in store.block_timeliness"))?;
     Ok(!timely)
 }
@@ -1036,7 +1101,12 @@ pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
 /// Whether `head_root` has few enough votes to be overpowered by the
 /// proposer's own boost, i.e. reorging it out would not be fighting an
 /// already-decisive lead.
-pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<bool> {
+pub fn is_head_weak(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    head_root: Root,
+    config: &Config,
+) -> Result<bool> {
     let justified_state = store
         .checkpoint_state(&store.beacon_justified_checkpoint())
         .ok_or(Error::SpecAssert(
@@ -1044,12 +1114,17 @@ pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<b
         ))?;
     let reorg_threshold =
         calculate_committee_fraction(justified_state, config.reorg_head_weight_threshold)?;
-    Ok(get_weight(store, head_root, config)? < reorg_threshold)
+    Ok(get_weight(store, index, head_root, config)? < reorg_threshold)
 }
 
 /// Whether `parent_root` already has enough votes of its own that the missing
 /// votes are assigned to it rather than being hoarded elsewhere.
-pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Result<bool> {
+pub fn is_parent_strong(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    parent_root: Root,
+    config: &Config,
+) -> Result<bool> {
     let justified_state = store
         .checkpoint_state(&store.beacon_justified_checkpoint())
         .ok_or(Error::SpecAssert(
@@ -1057,7 +1132,7 @@ pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Re
         ))?;
     let parent_threshold =
         calculate_committee_fraction(justified_state, config.reorg_parent_weight_threshold)?;
-    Ok(get_weight(store, parent_root, config)? > parent_threshold)
+    Ok(get_weight(store, index, parent_root, config)? > parent_threshold)
 }
 
 /// The block a proposer at `slot` should build on: `head_root`'s parent
@@ -1073,17 +1148,15 @@ pub fn get_proposer_head(
     slot: Slot,
     config: &Config,
 ) -> Result<Root> {
-    let head_block = store
-        .blocks
+    let index = store.beacon_block_index();
+    let (head_slot, parent_root) = index
         .get(&head_root)
+        .copied()
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let parent_root = head_block.parent_root();
-    let head_slot = head_block.slot();
-    let parent_block = store
-        .blocks
+    let (parent_slot, _grandparent_root) = index
         .get(&parent_root)
+        .copied()
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_slot = parent_block.slot();
 
     // Only re-org the head block if it arrived later than the attestation
     // deadline.
@@ -1110,11 +1183,11 @@ pub fn get_proposer_head(
         store.proposer_boost_root() != head_root,
         "store.proposer_boost_root != head_root",
     )?;
-    let head_weak = is_head_weak(store, head_root, config)?;
+    let head_weak = is_head_weak(store, &index, head_root, config)?;
 
     // Check that the missing votes are assigned to the parent and not being
     // hoarded.
-    let parent_strong = is_parent_strong(store, parent_root, config)?;
+    let parent_strong = is_parent_strong(store, &index, parent_root, config)?;
 
     if head_late
         && shuffling_stable
@@ -1159,17 +1232,15 @@ pub fn should_override_forkchoice_update(
     validator_is_connected: impl Fn(ValidatorIndex) -> bool,
     config: &Config,
 ) -> Result<bool> {
-    let head_block = store
-        .blocks
+    let index = store.beacon_block_index();
+    let (head_slot, parent_root) = index
         .get(&head_root)
+        .copied()
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let parent_root = head_block.parent_root();
-    let head_slot = head_block.slot();
-    let parent_block = store
-        .blocks
+    let (parent_slot, _grandparent_root) = index
         .get(&parent_root)
+        .copied()
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_slot = parent_block.slot();
     let current_slot = get_current_slot(store, config);
     let proposal_slot = head_slot.saturating_add(1);
 
@@ -1212,8 +1283,8 @@ pub fn should_override_forkchoice_update(
     // yet.
     let (head_weak, parent_strong) = if current_slot > head_slot {
         (
-            is_head_weak(store, head_root, config)?,
-            is_parent_strong(store, parent_root, config)?,
+            is_head_weak(store, &index, head_root, config)?,
+            is_parent_strong(store, &index, parent_root, config)?,
         )
     } else {
         (true, true)
@@ -1411,7 +1482,12 @@ pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -
 /// already having the checkpoint its own chain is clearly heading towards,
 /// rather than being stuck with whatever its post-state's
 /// `current_justified_checkpoint` was at the moment it was imported.
-pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Config) -> Result<()> {
+pub fn compute_pulled_up_tip(
+    store: &mut Store,
+    index: &BeaconBlockIndex,
+    block_root: Root,
+    config: &Config,
+) -> Result<()> {
     // A clone, matching the specification's own `.copy()`: this advances a
     // throwaway copy of the block's post-state to the next epoch boundary, and
     // `store.block_states[block_root]` must be left exactly as the block
@@ -1438,11 +1514,10 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
     update_unrealized_checkpoints(store, current_justified, finalized);
 
     // If the block is from a prior epoch, apply the realized values.
-    let block_slot = store
-        .blocks
+    let (block_slot, _parent_root) = index
         .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
     let block_epoch = compute_epoch_at_slot(block_slot);
     let current_epoch = get_current_store_epoch(store, config);
     if block_epoch < current_epoch {
@@ -1543,19 +1618,20 @@ pub fn validate_on_attestation(
     // Attestation target must be for a known block. If target block is
     // unknown, delay consideration until block is found.
     verify(
-        store.blocks.contains_key(&target.root),
+        store.has_beacon_block(target.root),
         "target.root in store.blocks",
     )?;
 
     // Attestations must be for a known block. If block is unknown, delay
     // consideration until the block is found.
-    let head_block_slot = store
-        .blocks
-        .get(&data.beacon_block_root)
-        .ok_or(Error::SpecAssert(
-            "attestation.data.beacon_block_root in store.blocks",
-        ))?
-        .slot();
+    let index = store.beacon_block_index();
+    let (head_block_slot, _parent_root) =
+        index
+            .get(&data.beacon_block_root)
+            .copied()
+            .ok_or(Error::SpecAssert(
+                "attestation.data.beacon_block_root in store.blocks",
+            ))?;
     // Attestations must not be for blocks in the future. If not, the
     // attestation should not be considered.
     verify(
@@ -1564,7 +1640,7 @@ pub fn validate_on_attestation(
     )?;
 
     // LMD vote must be consistent with FFG vote target.
-    let checkpoint_block = get_checkpoint_block(store, data.beacon_block_root, target.epoch)?;
+    let checkpoint_block = get_checkpoint_block(&index, data.beacon_block_root, target.epoch)?;
     verify(
         target.root == checkpoint_block,
         "target.root == get_checkpoint_block(store, attestation.data.beacon_block_root, target.epoch)",
@@ -1728,9 +1804,13 @@ pub fn on_block(
         "block.slot > finalized_slot",
     )?;
     // Check block is a descendant of the finalized block at the checkpoint
-    // finalized slot.
+    // finalized slot. One index build serves both this walk and
+    // `compute_pulled_up_tip`'s below, so a block import scans `LiveChain` once
+    // rather than twice. That scan is bounded by the unfinalized window, since
+    // anchor promotion prunes the index behind finalization.
+    let index = store.beacon_block_index();
     let finalized_checkpoint_block = get_checkpoint_block(
-        store,
+        &index,
         parent_root,
         store.beacon_finalized_checkpoint().epoch,
     )?;
@@ -1792,10 +1872,9 @@ pub fn on_block(
     }
 
     // Add new block to the store, and the new state for this block to the
-    // store. `block_slot` is copied out first since `signed_block` moves into
-    // `store.blocks` next.
+    // store.
     let block_slot = signed_block.slot();
-    store.blocks.insert(block_root, signed_block);
+    store.insert_beacon_block(block_root, &signed_block);
     store.block_states.insert(block_root, state);
 
     // Add block timeliness to the store.
@@ -1808,7 +1887,7 @@ pub fn on_block(
     let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
     let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
     let is_timely = get_current_slot(store, config) == block_slot && is_before_attesting_interval;
-    store.block_timeliness.insert(block_root, is_timely);
+    store.set_block_timeliness(block_root, is_timely);
 
     // Add proposer score boost if the block is timely and not conflicting
     // with an existing block.
@@ -1832,8 +1911,12 @@ pub fn on_block(
     };
     update_checkpoints(store, current_justified, finalized);
 
-    // Eagerly compute unrealized justification and finality.
-    compute_pulled_up_tip(store, block_root, config)?;
+    // Eagerly compute unrealized justification and finality. The index built
+    // above predates this block, so the newly imported one is added to it
+    // rather than the whole scan being repeated.
+    let mut index = index;
+    index.insert(block_root, (block_slot, parent_root));
+    compute_pulled_up_tip(store, &index, block_root, config)?;
 
     Ok(())
 }
@@ -1967,35 +2050,43 @@ mod tests {
         })
     }
 
+    /// The block index `get_ancestor` and the tree walks take, built by hand.
+    fn index(entries: &[(Root, Slot, Root)]) -> BeaconBlockIndex {
+        entries
+            .iter()
+            .map(|&(root, slot, parent_root)| (root, (slot, parent_root)))
+            .collect()
+    }
+
     #[test]
     fn get_ancestor_walks_past_an_empty_slot_gap() {
-        let mut store = empty_store();
         let genesis_root = Root::repeat_byte(1);
         let a_root = Root::repeat_byte(2);
         let b_root = Root::repeat_byte(3);
-
-        store.blocks.insert(genesis_root, block(0, Root::zero()));
-        store.blocks.insert(a_root, block(1, genesis_root));
         // Slot 2 is empty: b's parent is a, two slots later.
-        store.blocks.insert(b_root, block(3, a_root));
+        let index = index(&[
+            (genesis_root, 0, Root::zero()),
+            (a_root, 1, genesis_root),
+            (b_root, 3, a_root),
+        ]);
 
         // At b's own slot, b is its own ancestor.
-        assert_eq!(get_ancestor(&store, b_root, 3).unwrap(), b_root);
-        // Querying the empty slot, or a's own slot, must land on a rather
-        // than on b, since b's slot is strictly after both.
-        assert_eq!(get_ancestor(&store, b_root, 2).unwrap(), a_root);
-        assert_eq!(get_ancestor(&store, b_root, 1).unwrap(), a_root);
+        assert_eq!(get_ancestor(&index, b_root, 3).unwrap(), b_root);
+        // Querying the empty slot, or a's own slot, must land on a rather than
+        // on b, since b's slot is strictly after both.
+        assert_eq!(get_ancestor(&index, b_root, 2).unwrap(), a_root);
+        assert_eq!(get_ancestor(&index, b_root, 1).unwrap(), a_root);
         // Querying before a's slot must walk one hop further, to genesis.
-        assert_eq!(get_ancestor(&store, b_root, 0).unwrap(), genesis_root);
+        assert_eq!(get_ancestor(&index, b_root, 0).unwrap(), genesis_root);
     }
 
     #[test]
     fn get_ancestor_rejects_an_unknown_root() {
-        let store = empty_store();
         // The specification's own KeyError-on-unknown-root is exactly the
         // "unhandled exception" case it calls invalid, so this must be an
         // error rather than a panic.
-        assert!(get_ancestor(&store, Root::repeat_byte(9), 0).is_err());
+        let index = index(&[]);
+        assert!(get_ancestor(&index, Root::repeat_byte(9), 0).is_err());
     }
 
     #[test]
@@ -2029,9 +2120,9 @@ mod tests {
         });
         store.set_beacon_finalized_checkpoint(store.beacon_justified_checkpoint());
 
-        store.blocks.insert(genesis_root, block(0, Root::zero()));
-        store.blocks.insert(low_root, block(1, genesis_root));
-        store.blocks.insert(high_root, block(1, genesis_root));
+        store.insert_beacon_block(genesis_root, &block(0, Root::zero()));
+        store.insert_beacon_block(low_root, &block(1, genesis_root));
+        store.insert_beacon_block(high_root, &block(1, genesis_root));
 
         // `get_weight` reads the justified checkpoint's cached state only to
         // enumerate active validators; with `latest_messages` left empty,
@@ -2063,7 +2154,7 @@ mod tests {
         store.set_beacon_time(config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2);
 
         let block_root = Root::repeat_byte(5);
-        store.blocks.insert(block_root, block(0, Root::zero()));
+        store.insert_beacon_block(block_root, &block(0, Root::zero()));
 
         let unrealized = Checkpoint {
             epoch: 1,
@@ -2086,7 +2177,8 @@ mod tests {
         *state.current_justified_checkpoint_mut() = realized;
         store.block_states.insert(block_root, state);
 
-        let voting_source = get_voting_source(&store, block_root, &config).unwrap();
+        let index = store.beacon_block_index();
+        let voting_source = get_voting_source(&store, &index, block_root, &config).unwrap();
         assert_eq!(
             voting_source, unrealized,
             "a block from a prior epoch must vote its pulled-up (unrealized) checkpoint"

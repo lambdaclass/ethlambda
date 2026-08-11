@@ -718,9 +718,8 @@ fn check_head(expected: &HeadCheck, store: &Store, config: &Config) -> Result<()
     let actual_root =
         fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
     let actual_slot = store
-        .blocks
-        .get(&actual_root)
-        .map(|block| block.slot())
+        .beacon_block_entry(actual_root)
+        .map(|(slot, _parent_root)| slot)
         .ok_or_else(|| {
             format!(
                 "get_head returned 0x{}, which is not in store.blocks",
