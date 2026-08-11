@@ -1122,7 +1122,7 @@ it defines are used by the lean side."
 - [x] `make fmt` produces no diff
 - [x] `ethlambda_types::beacon::containers::BeaconState::Lean` exists and reports `ForkName::Lean`
 - [x] `ForkName::parse("lean")` returns `None` and `ForkName::Fulu.next()` returns `None`
-- [ ] A lean devnet runs unchanged: `make run-devnet`, blocks produced and finalized
+- [x] A lean devnet runs unchanged: `make run-devnet`, blocks produced and finalized
 
 Then start plan 2, CLI subcommands.
 
@@ -1213,3 +1213,13 @@ task:
 The lib-test drop reconciles exactly: 17 tests moved with
 `primitives`/`constants`/`preset`/`fork`/`config`, and 32 with `containers`.
 `ethlambda-types` went from 40 lib tests to 101.
+
+### The devnet check
+
+Two `ethlambda` nodes, two validators each, one aggregator, 30 slots on the
+`local` image. Both nodes imported 10 blocks and agreed on finalized slot 8
+(root `c384d79b`) with justified 14 and head 20, so finality tracked head at the
+expected 3SF distance. No errors or panics. This is the check that exercises the
+one thing the fixture suites cannot: that the unreleased merkleization commit
+carried in by the libssz patch does not change lean's block or state roots in
+practice.
