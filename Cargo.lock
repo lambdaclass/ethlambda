@@ -1949,6 +1949,7 @@ dependencies = [
  "blst",
  "c-kzg",
  "ethereum-types",
+ "ethlambda-storage",
  "ethlambda-types",
  "hex",
  "libssz",

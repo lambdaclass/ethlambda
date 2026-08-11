@@ -144,7 +144,10 @@
 //!   [`stf::ExecutionEngine`] already collapses to whatever the fixture
 //!   suites supply directly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use ethlambda_storage::StorageBackend;
 
 use crate::config::Config;
 use crate::constants;
@@ -163,21 +166,7 @@ use crate::kzg;
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex};
 use crate::stf;
-
-// ---------------------------------------------------------------------------
-// LatestMessage
-// ---------------------------------------------------------------------------
-
-/// One validator's most recent attestation: the epoch it targeted, and the
-/// block it attested to (the LMD GHOST vote).
-///
-/// `Copy`, matching the specification's `@dataclass(eq=True, frozen=True)`:
-/// there is nothing here worth borrowing rather than copying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LatestMessage {
-    pub epoch: Epoch,
-    pub root: Root,
-}
+pub use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
 
 // ---------------------------------------------------------------------------
 // Attestation, AttesterSlashing
@@ -330,41 +319,6 @@ impl AttesterSlashing {
 }
 
 // ---------------------------------------------------------------------------
-// PowBlock
-// ---------------------------------------------------------------------------
-
-/// The execution chain's own block header, as far as bellatrix's merge
-/// transition check needs it: `specs/bellatrix/fork-choice.md`'s `PowBlock`.
-///
-/// The specification's own `get_pow_block(hash) -> Optional[PowBlock]` is
-/// "implementation and context dependent": a real client would ask its
-/// execution engine. [`Store::pow_blocks`] and [`insert_pow_block`] are what
-/// stand in for that here, populated directly by the fixture suites' own
-/// `on_merge_block` step rather than a real PoW chain.
-///
-/// Defined in its own module, rather than inline here like [`LatestMessage`],
-/// purely to keep its `SszDecode` derive out of the scope of this file's own
-/// `use crate::error::Result;`: that alias and the derive macro's
-/// generated code (which expects the standard library's own two-parameter
-/// `Result`) would otherwise collide.
-mod pow_block {
-    use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-
-    use crate::primitives::{Root, Uint256};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
-    pub struct PowBlock {
-        pub block_hash: Root,
-        pub parent_hash: Root,
-        /// The total work behind `block_hash`, compared against
-        /// [`crate::config::Config::terminal_total_difficulty`] to decide
-        /// whether this is the one PoW block the merge transitioned at.
-        pub total_difficulty: Uint256,
-    }
-}
-pub use pow_block::PowBlock;
-
-// ---------------------------------------------------------------------------
 // DataAvailability
 // ---------------------------------------------------------------------------
 
@@ -399,101 +353,12 @@ pub enum DataAvailability {
 // Store
 // ---------------------------------------------------------------------------
 
-/// The fork choice store.
+/// The fork choice store, and the block index its tree walks take.
 ///
-/// Constructed once, at genesis or at a checkpoint-sync anchor, by
-/// [`get_forkchoice_store`], and after that changed only by the four handlers
-/// at the bottom of this file. The specification requires that an invalid
-/// call to any of them leave `store` untouched; the `Result`-returning
-/// handlers below uphold that by validating before mutating, rather than by
-/// rolling a partial mutation back.
-///
-/// Does not implement `Clone`. `block_states` and `checkpoint_states` each
-/// hold a full [`BeaconState`] per entry, and the store keeps one for every
-/// block still within the unfinalized window, so a whole-store clone would
-/// silently duplicate an unbounded amount of state on every call. Nothing in
-/// this file, or in the specification, ever needs a copy of the whole store.
-#[derive(Debug)]
-pub struct Store {
-    /// The current time, as Unix seconds. See the module documentation for how
-    /// this relates to the millisecond deadlines the reorg helpers compute.
-    pub time: u64,
-    pub genesis_time: u64,
-    pub justified_checkpoint: Checkpoint,
-    pub finalized_checkpoint: Checkpoint,
-    /// The highest justified checkpoint observed in any block's post-state,
-    /// whether or not that block's *own* chain has an on-chain epoch boundary
-    /// that has caught up to reflect it yet.
-    pub unrealized_justified_checkpoint: Checkpoint,
-    /// The finalized-checkpoint counterpart to
-    /// [`Store::unrealized_justified_checkpoint`].
-    pub unrealized_finalized_checkpoint: Checkpoint,
-    /// The most recent timely, uncontested block seen this slot, or the zero
-    /// root if none has arrived yet or a new slot has reset it. While set,
-    /// [`get_weight`] adds [`get_proposer_score`]'s boost to this block and
-    /// every ancestor of it.
-    pub proposer_boost_root: Root,
-    /// Validators caught attesting to two conflicting things, via
-    /// [`on_attester_slashing`]. [`get_weight`] excludes their vote entirely,
-    /// rather than letting an equivocator's [`LatestMessage`] count for either
-    /// side of the fork it created.
-    pub equivocating_indices: HashSet<ValidatorIndex>,
-    /// Keyed on the unsigned message's root, matching the specification's own
-    /// `store.blocks`, even though the value held here is signed. See the
-    /// module documentation for why.
-    pub blocks: HashMap<Root, SignedBeaconBlock>,
-    /// The post-state resulting from applying each block in
-    /// [`Store::blocks`].
-    pub block_states: HashMap<Root, BeaconState>,
-    /// Whether each block in [`Store::blocks`] arrived before the attestation
-    /// deadline of the slot fork choice was in when it was imported. Feeds
-    /// [`is_head_late`], one of the inputs to a same-slot proposer reorg.
-    pub block_timeliness: HashMap<Root, bool>,
-    /// The state advanced to the first slot of each checkpoint's epoch, cached
-    /// so that [`on_attestation`] does not replay [`stf::process_slots`] for
-    /// every attestation that shares a target.
-    ///
-    /// Keyed on `(Epoch, Root)` rather than [`Checkpoint`] itself; see the
-    /// module documentation. Read and write through
-    /// [`Store::checkpoint_state`], [`Store::has_checkpoint_state`], and
-    /// [`Store::insert_checkpoint_state`] rather than this field.
-    checkpoint_states: HashMap<(Epoch, Root), BeaconState>,
-    pub latest_messages: HashMap<ValidatorIndex, LatestMessage>,
-    /// The unrealized justified checkpoint observed in each block's own
-    /// post-state, kept up to date by [`compute_pulled_up_tip`] so that
-    /// [`get_voting_source`] can "pull up" an older block's effective vote
-    /// without replaying epoch processing on every lookup.
-    pub unrealized_justifications: HashMap<Root, Checkpoint>,
-    /// PoW blocks known to this store, keyed by [`PowBlock::block_hash`]. See
-    /// [`PowBlock`]'s documentation for why this stands in for
-    /// `get_pow_block` rather than this file calling out to a real execution
-    /// client. Read through [`get_pow_block`], written through
-    /// [`insert_pow_block`].
-    pub pow_blocks: HashMap<Root, PowBlock>,
-}
-
-impl Store {
-    /// The cached state at `checkpoint`, if [`store_target_checkpoint_state`]
-    /// (or [`get_forkchoice_store`], for the anchor checkpoint) has already
-    /// computed one.
-    pub fn checkpoint_state(&self, checkpoint: &Checkpoint) -> Option<&BeaconState> {
-        self.checkpoint_states
-            .get(&(checkpoint.epoch, checkpoint.root))
-    }
-
-    /// Whether [`Store::checkpoint_state`] would return `Some` for
-    /// `checkpoint`.
-    pub fn has_checkpoint_state(&self, checkpoint: &Checkpoint) -> bool {
-        self.checkpoint_states
-            .contains_key(&(checkpoint.epoch, checkpoint.root))
-    }
-
-    /// Caches `state` as the state at `checkpoint`.
-    pub fn insert_checkpoint_state(&mut self, checkpoint: Checkpoint, state: BeaconState) {
-        self.checkpoint_states
-            .insert((checkpoint.epoch, checkpoint.root), state);
-    }
-}
+/// Both are `ethlambda_storage`'s: a mainnet `BeaconState` is ~350 MB, so the
+/// store this module used to define could never have run against mainnet. Every
+/// method this file calls on a `Store` is defined there.
+pub use ethlambda_storage::{BeaconBlockIndex, Store};
 
 // ---------------------------------------------------------------------------
 // get_forkchoice_store
@@ -505,6 +370,7 @@ impl Store {
 /// client anchors at genesis, and a checkpoint-syncing client anchors at
 /// whatever finalized state and block it fetched instead.
 pub fn get_forkchoice_store(
+    backend: Arc<dyn StorageBackend>,
     anchor_state: BeaconState,
     anchor_block: SignedBeaconBlock,
     config: &Config,
@@ -544,45 +410,25 @@ pub fn get_forkchoice_store(
         .ok_or(Error::ArithmeticOverflow(
             "anchor_state.genesis_time + SECONDS_PER_SLOT * anchor_state.slot",
         ))?;
-    let genesis_time = anchor_state.genesis_time();
 
-    let mut blocks = HashMap::new();
-    blocks.insert(anchor_root, anchor_block);
+    let mut store = Store::init_beacon(backend, anchor_state.genesis_time());
+    store.set_beacon_time(time);
+    store.set_beacon_justified_checkpoint(justified_checkpoint);
+    store.set_beacon_finalized_checkpoint(finalized_checkpoint);
+    store.set_beacon_unrealized_justified_checkpoint(justified_checkpoint);
+    store.set_beacon_unrealized_finalized_checkpoint(finalized_checkpoint);
+    store.set_unrealized_justification(anchor_root, justified_checkpoint);
+    store.insert_beacon_block(anchor_root, &anchor_block);
 
-    let mut block_states = HashMap::new();
-    // The specification stores the anchor state under both `block_states` and
-    // `checkpoint_states` (`copy(anchor_state)` in each). This is the only
-    // place in this file that clones a whole `BeaconState` outright: genesis
-    // happens once, and the two maps each need their own entry to
-    // independently advance from here on.
-    block_states.insert(anchor_root, anchor_state.clone());
+    // The anchor is the base of every replay: it is the one state that is
+    // written to disk rather than reconstructed, and every later state is
+    // reachable from it by replaying blocks forward.
+    store.insert_beacon_state_snapshot(anchor_root, &anchor_state);
+    let anchor_state = Arc::new(anchor_state);
+    store.cache_beacon_state(anchor_root, Arc::clone(&anchor_state));
+    store.cache_checkpoint_state(justified_checkpoint, anchor_state);
 
-    let mut checkpoint_states = HashMap::new();
-    checkpoint_states.insert(
-        (justified_checkpoint.epoch, justified_checkpoint.root),
-        anchor_state,
-    );
-
-    let mut unrealized_justifications = HashMap::new();
-    unrealized_justifications.insert(anchor_root, justified_checkpoint);
-
-    Ok(Store {
-        time,
-        genesis_time,
-        justified_checkpoint,
-        finalized_checkpoint,
-        unrealized_justified_checkpoint: justified_checkpoint,
-        unrealized_finalized_checkpoint: finalized_checkpoint,
-        proposer_boost_root: Root::zero(),
-        equivocating_indices: HashSet::new(),
-        blocks,
-        block_states,
-        block_timeliness: HashMap::new(),
-        checkpoint_states,
-        latest_messages: HashMap::new(),
-        unrealized_justifications,
-        pow_blocks: HashMap::new(),
-    })
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +437,10 @@ pub fn get_forkchoice_store(
 
 /// How many whole slots have elapsed since genesis, as of `store.time`.
 pub fn get_slots_since_genesis(store: &Store, config: &Config) -> u64 {
-    store.time.saturating_sub(store.genesis_time) / config.seconds_per_slot
+    store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time())
+        / config.seconds_per_slot
 }
 
 /// The slot `store.time` currently falls in.
@@ -618,15 +467,15 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// specification calls out as invalid (`store.blocks[root]` would raise
 /// `KeyError` in the reference implementation), so it becomes a `SpecAssert`
 /// here rather than a panic.
-pub fn get_ancestor(store: &Store, root: Root, slot: Slot) -> Result<Root> {
+pub fn get_ancestor(index: &BeaconBlockIndex, root: Root, slot: Slot) -> Result<Root> {
     let mut root = root;
     loop {
-        let block = store
-            .blocks
+        let (block_slot, parent_root) = index
             .get(&root)
+            .copied()
             .ok_or(Error::SpecAssert("root in store.blocks"))?;
-        if block.slot() > slot {
-            root = block.parent_root();
+        if block_slot > slot {
+            root = parent_root;
         } else {
             return Ok(root);
         }
@@ -654,8 +503,8 @@ pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64)
 
 /// The checkpoint block for `epoch`, on `root`'s chain: the ancestor of `root`
 /// at that epoch's first slot.
-pub fn get_checkpoint_block(store: &Store, root: Root, epoch: Epoch) -> Result<Root> {
-    get_ancestor(store, root, compute_start_slot_at_epoch(epoch))
+pub fn get_checkpoint_block(index: &BeaconBlockIndex, root: Root, epoch: Epoch) -> Result<Root> {
+    get_ancestor(index, root, compute_start_slot_at_epoch(epoch))
 }
 
 /// The extra weight a timely, uncontested block gets over its competitors,
@@ -665,52 +514,51 @@ pub fn get_checkpoint_block(store: &Store, root: Root, epoch: Epoch) -> Result<R
 /// See [`calculate_committee_fraction`] for why this divides by a bare
 /// `100` rather than [`constants::BASIS_POINTS`].
 pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
-    let committee_weight = get_total_active_balance(justified_state)? / preset::SLOTS_PER_EPOCH;
+    let justified_state = checkpoint_state(store, store.beacon_justified_checkpoint(), config)?;
+    let committee_weight = get_total_active_balance(&justified_state)? / preset::SLOTS_PER_EPOCH;
     Ok(committee_weight.saturating_mul(config.proposer_score_boost) / 100)
 }
 
 /// The LMD GHOST weight of `root`: the effective balance of every
 /// non-equivocating, active, unslashed validator whose latest vote descends
 /// through `root`, plus the proposer boost if it applies.
-pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
-    let state = store
-        .checkpoint_state(&store.justified_checkpoint)
-        .ok_or(Error::SpecAssert(
-            "store.justified_checkpoint in store.checkpoint_states",
-        ))?;
+pub fn get_weight(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    root: Root,
+    config: &Config,
+) -> Result<Gwei> {
+    let state = checkpoint_state(store, store.beacon_justified_checkpoint(), config)?;
+    let state = &*state;
     let current_epoch = get_current_epoch(state);
-    let block_slot = store
-        .blocks
+    let (block_slot, _parent_root) = index
         .get(&root)
-        .ok_or(Error::SpecAssert("root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("root in store.blocks"))?;
 
+    // `validator_index` rather than the specification's own `i`: `index` is the
+    // block index this walk takes, and shadowing it here would silently make
+    // `get_ancestor` below take the validator instead.
     let mut attestation_score: Gwei = 0;
-    for index in get_active_validator_indices(state, current_epoch) {
-        let validator = state.validator(index)?;
-        if validator.slashed || store.equivocating_indices.contains(&index) {
+    for validator_index in get_active_validator_indices(state, current_epoch) {
+        let validator = state.validator(validator_index)?;
+        if validator.slashed || store.is_equivocating(validator_index) {
             continue;
         }
-        let Some(message) = store.latest_messages.get(&index) else {
+        let Some(message) = store.latest_message(validator_index) else {
             continue;
         };
-        if get_ancestor(store, message.root, block_slot)? == root {
+        if get_ancestor(index, message.root, block_slot)? == root {
             attestation_score = attestation_score.saturating_add(validator.effective_balance);
         }
     }
 
-    if store.proposer_boost_root.is_zero() {
+    if store.proposer_boost_root().is_zero() {
         return Ok(attestation_score);
     }
 
     let mut proposer_score: Gwei = 0;
-    if get_ancestor(store, store.proposer_boost_root, block_slot)? == root {
+    if get_ancestor(index, store.proposer_boost_root(), block_slot)? == root {
         proposer_score = get_proposer_score(store, config)?;
     }
     Ok(attestation_score.saturating_add(proposer_score))
@@ -725,28 +573,27 @@ pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
 /// `current_justified_checkpoint` happened to be at the time it was
 /// processed; a block from the current epoch has no unrealized value to pull
 /// up to yet, so its own post-state's checkpoint is used directly.
-pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Result<Checkpoint> {
-    let block_slot = store
-        .blocks
+pub fn get_voting_source(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    block_root: Root,
+    config: &Config,
+) -> Result<Checkpoint> {
+    let (block_slot, _parent_root) = index
         .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
     let current_epoch = get_current_store_epoch(store, config);
     let block_epoch = compute_epoch_at_slot(block_slot);
 
     if current_epoch > block_epoch {
         store
-            .unrealized_justifications
-            .get(&block_root)
-            .copied()
+            .unrealized_justification(block_root)
             .ok_or(Error::SpecAssert(
                 "block_root in store.unrealized_justifications",
             ))
     } else {
-        let head_state = store
-            .block_states
-            .get(&block_root)
-            .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
+        let head_state = block_state(store, block_root, config)?;
         Ok(head_state.current_justified_checkpoint())
     }
 }
@@ -768,21 +615,25 @@ pub fn get_voting_source(store: &Store, block_root: Root, config: &Config) -> Re
 /// Borrows `blocks` for the whole walk instead of the specification's owned
 /// output dict, so this never clones a [`SignedBeaconBlock`] just to hand a
 /// second reference to it to the caller.
-pub fn filter_block_tree<'store>(
-    store: &'store Store,
+pub fn filter_block_tree(
+    store: &Store,
+    index: &BeaconBlockIndex,
     block_root: Root,
-    blocks: &mut HashMap<Root, &'store SignedBeaconBlock>,
+    blocks: &mut HashSet<Root>,
     config: &Config,
 ) -> Result<bool> {
-    let block = store
-        .blocks
-        .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
+    // The specification indexes `store.blocks[block_root]` here, so an unknown
+    // root is its own "unhandled exception" case rather than a childless leaf.
+    // Kept explicit: without it a bad root would fall through to the leaf branch
+    // and surface as some unrelated-looking error two calls later.
+    verify(
+        index.contains_key(&block_root),
+        "block_root in store.blocks",
+    )?;
 
-    let children: Vec<Root> = store
-        .blocks
+    let children: Vec<Root> = index
         .iter()
-        .filter(|(_, candidate)| candidate.parent_root() == block_root)
+        .filter(|(_, (_, parent_root))| *parent_root == block_root)
         .map(|(root, _)| *root)
         .collect();
 
@@ -791,36 +642,37 @@ pub fn filter_block_tree<'store>(
     if !children.is_empty() {
         let mut any_viable = false;
         for child in children {
-            if filter_block_tree(store, child, blocks, config)? {
+            if filter_block_tree(store, index, child, blocks, config)? {
                 any_viable = true;
             }
         }
         if any_viable {
-            blocks.insert(block_root, block);
+            blocks.insert(block_root);
             return Ok(true);
         }
         return Ok(false);
     }
 
     let current_epoch = get_current_store_epoch(store, config);
-    let voting_source = get_voting_source(store, block_root, config)?;
+    let voting_source = get_voting_source(store, index, block_root, config)?;
 
     // The voting source should be either at the same height as the store's
     // justified checkpoint or not more than two epochs ago.
-    let correct_justified = store.justified_checkpoint.epoch == constants::GENESIS_EPOCH
-        || voting_source.epoch == store.justified_checkpoint.epoch
+    let justified = store.beacon_justified_checkpoint();
+    let correct_justified = justified.epoch == constants::GENESIS_EPOCH
+        || voting_source.epoch == justified.epoch
         || voting_source.epoch.saturating_add(2) >= current_epoch;
 
-    let finalized_checkpoint_block =
-        get_checkpoint_block(store, block_root, store.finalized_checkpoint.epoch)?;
+    let finalized = store.beacon_finalized_checkpoint();
+    let finalized_checkpoint_block = get_checkpoint_block(index, block_root, finalized.epoch)?;
 
-    let correct_finalized = store.finalized_checkpoint.epoch == constants::GENESIS_EPOCH
-        || store.finalized_checkpoint.root == finalized_checkpoint_block;
+    let correct_finalized =
+        finalized.epoch == constants::GENESIS_EPOCH || finalized.root == finalized_checkpoint_block;
 
     // If expected finalized/justified, add to viable block-tree and signal
     // viability to parent.
     if correct_justified && correct_finalized {
-        blocks.insert(block_root, block);
+        blocks.insert(block_root);
         return Ok(true);
     }
 
@@ -829,26 +681,28 @@ pub fn filter_block_tree<'store>(
 
 /// The filtered block tree: every block, from the justified checkpoint down,
 /// whose leaf state's justified/finalized info agrees with `store`'s own.
-pub fn get_filtered_block_tree<'store>(
-    store: &'store Store,
+pub fn get_filtered_block_tree(
+    store: &Store,
+    index: &BeaconBlockIndex,
     config: &Config,
-) -> Result<HashMap<Root, &'store SignedBeaconBlock>> {
-    let base = store.justified_checkpoint.root;
-    let mut blocks = HashMap::new();
-    filter_block_tree(store, base, &mut blocks, config)?;
+) -> Result<HashSet<Root>> {
+    let base = store.beacon_justified_checkpoint().root;
+    let mut blocks = HashSet::new();
+    filter_block_tree(store, index, base, &mut blocks, config)?;
     Ok(blocks)
 }
 
 /// The LMD GHOST head: starting from the justified checkpoint, repeatedly
 /// step to the child with the greatest weight until a leaf is reached.
 pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
-    let blocks = get_filtered_block_tree(store, config)?;
-    let mut head = store.justified_checkpoint.root;
+    let index = store.beacon_block_index();
+    let blocks = get_filtered_block_tree(store, &index, config)?;
+    let mut head = store.beacon_justified_checkpoint().root;
     loop {
         let children: Vec<Root> = blocks
             .iter()
-            .filter(|(_, block)| block.parent_root() == head)
-            .map(|(root, _)| *root)
+            .copied()
+            .filter(|root| index.get(root).is_some_and(|(_, parent)| *parent == head))
             .collect();
         if children.is_empty() {
             return Ok(head);
@@ -861,7 +715,7 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
         // `bytes` root.
         let mut ranked = Vec::with_capacity(children.len());
         for root in children {
-            ranked.push((get_weight(store, root, config)?, root));
+            ranked.push((get_weight(store, &index, root, config)?, root));
         }
         head = ranked
             .into_iter()
@@ -882,11 +736,11 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
 /// checkpoint arriving later (as can happen while replaying blocks out of
 /// order) must not roll a more advanced view back.
 pub fn update_checkpoints(store: &mut Store, justified: Checkpoint, finalized: Checkpoint) {
-    if justified.epoch > store.justified_checkpoint.epoch {
-        store.justified_checkpoint = justified;
+    if justified.epoch > store.beacon_justified_checkpoint().epoch {
+        store.set_beacon_justified_checkpoint(justified);
     }
-    if finalized.epoch > store.finalized_checkpoint.epoch {
-        store.finalized_checkpoint = finalized;
+    if finalized.epoch > store.beacon_finalized_checkpoint().epoch {
+        store.set_beacon_finalized_checkpoint(finalized);
     }
 }
 
@@ -896,11 +750,11 @@ pub fn update_unrealized_checkpoints(
     unrealized_justified: Checkpoint,
     unrealized_finalized: Checkpoint,
 ) {
-    if unrealized_justified.epoch > store.unrealized_justified_checkpoint.epoch {
-        store.unrealized_justified_checkpoint = unrealized_justified;
+    if unrealized_justified.epoch > store.beacon_unrealized_justified_checkpoint().epoch {
+        store.set_beacon_unrealized_justified_checkpoint(unrealized_justified);
     }
-    if unrealized_finalized.epoch > store.unrealized_finalized_checkpoint.epoch {
-        store.unrealized_finalized_checkpoint = unrealized_finalized;
+    if unrealized_finalized.epoch > store.beacon_unrealized_finalized_checkpoint().epoch {
+        store.set_beacon_unrealized_finalized_checkpoint(unrealized_finalized);
     }
 }
 
@@ -957,9 +811,7 @@ pub fn get_aggregate_due_ms(_epoch: Epoch, config: &Config) -> u64 {
 /// slot it was imported in.
 pub fn is_head_late(store: &Store, head_root: Root) -> Result<bool> {
     let timely = store
-        .block_timeliness
-        .get(&head_root)
-        .copied()
+        .block_timeliness(head_root)
         .ok_or(Error::SpecAssert("head_root in store.block_timeliness"))?;
     Ok(!timely)
 }
@@ -975,14 +827,12 @@ pub fn is_shuffling_stable(slot: Slot) -> bool {
 /// justification side.
 pub fn is_ffg_competitive(store: &Store, head_root: Root, parent_root: Root) -> Result<bool> {
     let head = store
-        .unrealized_justifications
-        .get(&head_root)
+        .unrealized_justification(head_root)
         .ok_or(Error::SpecAssert(
             "head_root in store.unrealized_justifications",
         ))?;
     let parent = store
-        .unrealized_justifications
-        .get(&parent_root)
+        .unrealized_justification(parent_root)
         .ok_or(Error::SpecAssert(
             "parent_root in store.unrealized_justifications",
         ))?;
@@ -994,14 +844,16 @@ pub fn is_ffg_competitive(store: &Store, head_root: Root, parent_root: Root) -> 
 /// much finality progress they may put at stake to pursue it.
 pub fn is_finalization_ok(store: &Store, slot: Slot, config: &Config) -> bool {
     let epochs_since_finalization =
-        compute_epoch_at_slot(slot).saturating_sub(store.finalized_checkpoint.epoch);
+        compute_epoch_at_slot(slot).saturating_sub(store.beacon_finalized_checkpoint().epoch);
     epochs_since_finalization <= config.reorg_max_epochs_since_finalization
 }
 
 /// Whether `store.time` is early enough in the current slot that a proposer
 /// building now still counts as on time.
 pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
-    let seconds_since_genesis = store.time.saturating_sub(store.genesis_time);
+    let seconds_since_genesis = store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time());
     let time_into_slot_ms =
         seconds_to_milliseconds(seconds_since_genesis) % config.slot_duration_ms;
     let epoch = get_current_store_epoch(store, config);
@@ -1011,30 +863,30 @@ pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
 /// Whether `head_root` has few enough votes to be overpowered by the
 /// proposer's own boost, i.e. reorging it out would not be fighting an
 /// already-decisive lead.
-pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<bool> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
+pub fn is_head_weak(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    head_root: Root,
+    config: &Config,
+) -> Result<bool> {
+    let justified_state = checkpoint_state(store, store.beacon_justified_checkpoint(), config)?;
     let reorg_threshold =
-        calculate_committee_fraction(justified_state, config.reorg_head_weight_threshold)?;
-    Ok(get_weight(store, head_root, config)? < reorg_threshold)
+        calculate_committee_fraction(&justified_state, config.reorg_head_weight_threshold)?;
+    Ok(get_weight(store, index, head_root, config)? < reorg_threshold)
 }
 
 /// Whether `parent_root` already has enough votes of its own that the missing
 /// votes are assigned to it rather than being hoarded elsewhere.
-pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Result<bool> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
+pub fn is_parent_strong(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    parent_root: Root,
+    config: &Config,
+) -> Result<bool> {
+    let justified_state = checkpoint_state(store, store.beacon_justified_checkpoint(), config)?;
     let parent_threshold =
-        calculate_committee_fraction(justified_state, config.reorg_parent_weight_threshold)?;
-    Ok(get_weight(store, parent_root, config)? > parent_threshold)
+        calculate_committee_fraction(&justified_state, config.reorg_parent_weight_threshold)?;
+    Ok(get_weight(store, index, parent_root, config)? > parent_threshold)
 }
 
 /// The block a proposer at `slot` should build on: `head_root`'s parent
@@ -1050,17 +902,15 @@ pub fn get_proposer_head(
     slot: Slot,
     config: &Config,
 ) -> Result<Root> {
-    let head_block = store
-        .blocks
+    let index = store.beacon_block_index();
+    let (head_slot, parent_root) = index
         .get(&head_root)
+        .copied()
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let parent_root = head_block.parent_root();
-    let head_slot = head_block.slot();
-    let parent_block = store
-        .blocks
+    let (parent_slot, _grandparent_root) = index
         .get(&parent_root)
+        .copied()
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_slot = parent_block.slot();
 
     // Only re-org the head block if it arrived later than the attestation
     // deadline.
@@ -1084,14 +934,14 @@ pub fn get_proposer_head(
     // Check that the head has few enough votes to be overpowered by our
     // proposer boost.
     verify(
-        store.proposer_boost_root != head_root,
+        store.proposer_boost_root() != head_root,
         "store.proposer_boost_root != head_root",
     )?;
-    let head_weak = is_head_weak(store, head_root, config)?;
+    let head_weak = is_head_weak(store, &index, head_root, config)?;
 
     // Check that the missing votes are assigned to the parent and not being
     // hoarded.
-    let parent_strong = is_parent_strong(store, parent_root, config)?;
+    let parent_strong = is_parent_strong(store, &index, parent_root, config)?;
 
     if head_late
         && shuffling_stable
@@ -1136,17 +986,15 @@ pub fn should_override_forkchoice_update(
     validator_is_connected: impl Fn(ValidatorIndex) -> bool,
     config: &Config,
 ) -> Result<bool> {
-    let head_block = store
-        .blocks
+    let index = store.beacon_block_index();
+    let (head_slot, parent_root) = index
         .get(&head_root)
+        .copied()
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let parent_root = head_block.parent_root();
-    let head_slot = head_block.slot();
-    let parent_block = store
-        .blocks
+    let (parent_slot, _grandparent_root) = index
         .get(&parent_root)
+        .copied()
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_slot = parent_block.slot();
     let current_slot = get_current_slot(store, config);
     let proposal_slot = head_slot.saturating_add(1);
 
@@ -1166,11 +1014,7 @@ pub fn should_override_forkchoice_update(
     // `.copy()`: advancing it to `proposal_slot` is only how this samples the
     // proposer that slot would draw, not a change
     // `store.block_states[parent_root]` should keep.
-    let mut parent_state_advanced = store
-        .block_states
-        .get(&parent_root)
-        .ok_or(Error::SpecAssert("parent_root in store.block_states"))?
-        .clone();
+    let mut parent_state_advanced = (*block_state(store, parent_root, config)?).clone();
     stf::process_slots(&mut parent_state_advanced, proposal_slot, config)?;
     let proposer_index = get_beacon_proposer_index(&parent_state_advanced)?;
     let proposing_reorg_slot = validator_is_connected(proposer_index);
@@ -1189,8 +1033,8 @@ pub fn should_override_forkchoice_update(
     // yet.
     let (head_weak, parent_strong) = if current_slot > head_slot {
         (
-            is_head_weak(store, head_root, config)?,
-            is_parent_strong(store, parent_root, config)?,
+            is_head_weak(store, &index, head_root, config)?,
+            is_parent_strong(store, &index, parent_root, config)?,
         )
     } else {
         (true, true)
@@ -1214,7 +1058,7 @@ pub fn should_override_forkchoice_update(
 /// `get_pow_block`. See [`PowBlock`]'s documentation for why this reads
 /// [`Store::pow_blocks`] rather than calling out to a real execution client.
 pub fn get_pow_block(store: &Store, hash: Root) -> Option<PowBlock> {
-    store.pow_blocks.get(&hash).copied()
+    store.beacon_pow_block(hash)
 }
 
 /// Records `pow_block` so later [`get_pow_block`] lookups by its own hash can
@@ -1222,7 +1066,7 @@ pub fn get_pow_block(store: &Store, hash: Root) -> Option<PowBlock> {
 /// no validity condition to check first, since this only ever adds data a
 /// fixture suite's `on_merge_block` step already trusts.
 pub fn insert_pow_block(store: &mut Store, pow_block: PowBlock) {
-    store.pow_blocks.insert(pow_block.block_hash, pow_block);
+    store.insert_beacon_pow_block(pow_block);
 }
 
 /// Whether `block` is the one PoW block where this chain's proof-of-work
@@ -1388,16 +1232,17 @@ pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -
 /// already having the checkpoint its own chain is clearly heading towards,
 /// rather than being stuck with whatever its post-state's
 /// `current_justified_checkpoint` was at the moment it was imported.
-pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Config) -> Result<()> {
+pub fn compute_pulled_up_tip(
+    store: &mut Store,
+    index: &BeaconBlockIndex,
+    block_root: Root,
+    config: &Config,
+) -> Result<()> {
     // A clone, matching the specification's own `.copy()`: this advances a
     // throwaway copy of the block's post-state to the next epoch boundary, and
     // `store.block_states[block_root]` must be left exactly as the block
     // itself produced it.
-    let mut state = store
-        .block_states
-        .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.block_states"))?
-        .clone();
+    let mut state = (*block_state(store, block_root, config)?).clone();
 
     // Through the fork-dispatching wrapper rather than phase0's version
     // directly. Altair rewrote this step to read participation flags instead of
@@ -1409,17 +1254,14 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
     let current_justified = state.current_justified_checkpoint();
     let finalized = state.finalized_checkpoint();
 
-    store
-        .unrealized_justifications
-        .insert(block_root, current_justified);
+    store.set_unrealized_justification(block_root, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
 
     // If the block is from a prior epoch, apply the realized values.
-    let block_slot = store
-        .blocks
+    let (block_slot, _parent_root) = index
         .get(&block_root)
-        .ok_or(Error::SpecAssert("block_root in store.blocks"))?
-        .slot();
+        .copied()
+        .ok_or(Error::SpecAssert("block_root in store.blocks"))?;
     let block_epoch = compute_epoch_at_slot(block_slot);
     let current_epoch = get_current_store_epoch(store, config);
     if block_epoch < current_epoch {
@@ -1441,23 +1283,21 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
 pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
     let previous_slot = get_current_slot(store, config);
 
-    store.time = time;
+    store.set_beacon_time(time);
 
     let current_slot = get_current_slot(store, config);
 
     // If this is a new slot, reset store.proposer_boost_root.
     if current_slot > previous_slot {
-        store.proposer_boost_root = Root::zero();
+        store.set_proposer_boost_root(Root::zero());
     }
 
     // If a new epoch, pull-up justification and finalization from previous
     // epoch.
     if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
-        update_checkpoints(
-            store,
-            store.unrealized_justified_checkpoint,
-            store.unrealized_finalized_checkpoint,
-        );
+        let justified = store.beacon_unrealized_justified_checkpoint();
+        let finalized = store.beacon_unrealized_finalized_checkpoint();
+        update_checkpoints(store, justified, finalized);
     }
 }
 
@@ -1522,19 +1362,20 @@ pub fn validate_on_attestation(
     // Attestation target must be for a known block. If target block is
     // unknown, delay consideration until block is found.
     verify(
-        store.blocks.contains_key(&target.root),
+        store.has_beacon_block(target.root),
         "target.root in store.blocks",
     )?;
 
     // Attestations must be for a known block. If block is unknown, delay
     // consideration until the block is found.
-    let head_block_slot = store
-        .blocks
-        .get(&data.beacon_block_root)
-        .ok_or(Error::SpecAssert(
-            "attestation.data.beacon_block_root in store.blocks",
-        ))?
-        .slot();
+    let index = store.beacon_block_index();
+    let (head_block_slot, _parent_root) =
+        index
+            .get(&data.beacon_block_root)
+            .copied()
+            .ok_or(Error::SpecAssert(
+                "attestation.data.beacon_block_root in store.blocks",
+            ))?;
     // Attestations must not be for blocks in the future. If not, the
     // attestation should not be considered.
     verify(
@@ -1543,7 +1384,7 @@ pub fn validate_on_attestation(
     )?;
 
     // LMD vote must be consistent with FFG vote target.
-    let checkpoint_block = get_checkpoint_block(store, data.beacon_block_root, target.epoch)?;
+    let checkpoint_block = get_checkpoint_block(&index, data.beacon_block_root, target.epoch)?;
     verify(
         target.root == checkpoint_block,
         "target.root == get_checkpoint_block(store, attestation.data.beacon_block_root, target.epoch)",
@@ -1559,34 +1400,15 @@ pub fn validate_on_attestation(
     Ok(())
 }
 
-/// Caches the state at `target`'s epoch boundary if [`Store::checkpoint_state`]
-/// does not already have one.
+/// The specification's `store_target_checkpoint_state`. Caching is
+/// [`checkpoint_state`]'s job now, so this exists only to keep `on_attestation`
+/// reading like the specification's own version.
 pub fn store_target_checkpoint_state(
     store: &mut Store,
     target: Checkpoint,
     config: &Config,
 ) -> Result<()> {
-    if store.has_checkpoint_state(&target) {
-        return Ok(());
-    }
-
-    // A clone, matching the specification's own `copy(store.block_states[...])`:
-    // `process_slots` below advances this copy toward the checkpoint's epoch
-    // boundary in place, and `store.block_states[target.root]` must be left as
-    // the block itself produced it, for whatever else still reads it at its
-    // own slot.
-    let mut base_state = store
-        .block_states
-        .get(&target.root)
-        .ok_or(Error::SpecAssert("target.root in store.block_states"))?
-        .clone();
-
-    let target_slot = compute_start_slot_at_epoch(target.epoch);
-    if base_state.slot() < target_slot {
-        stf::process_slots(&mut base_state, target_slot, config)?;
-    }
-
-    store.insert_checkpoint_state(target, base_state);
+    checkpoint_state(store, target, config)?;
     Ok(())
 }
 
@@ -1609,15 +1431,15 @@ pub fn update_latest_messages(
     let beacon_block_root = data.beacon_block_root;
 
     for &index in attesting_indices {
-        if store.equivocating_indices.contains(&index) {
+        if store.is_equivocating(index) {
             continue;
         }
-        let should_update = match store.latest_messages.get(&index) {
+        let should_update = match store.latest_message(index) {
             None => true,
             Some(existing) => target.epoch > existing.epoch,
         };
         if should_update {
-            store.latest_messages.insert(
+            store.set_latest_message(
                 index,
                 LatestMessage {
                     epoch: target.epoch,
@@ -1626,6 +1448,135 @@ pub fn update_latest_messages(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// State access
+// ---------------------------------------------------------------------------
+
+/// The post-state of the block at `root`.
+///
+/// The single place every state read goes through, which is what lets the whole
+/// reconstruction live in one function.
+///
+/// Three tiers, cheapest first:
+///
+/// 1. the cache, which holds the working set (see `ethlambda-storage`'s own
+///    `BeaconCaches`);
+/// 2. a `States` snapshot, which exists only for the finalized anchors;
+/// 3. replay: walk parent links back to the first root either tier answers for,
+///    then apply each block forward.
+///
+/// Termination is by construction, not by a bound. The bootstrap anchor always
+/// has a snapshot, [`on_block`] rejects any block that does not descend from the
+/// finalized checkpoint, and `Store::promote_beacon_anchor` never prunes below
+/// the older of the two anchors it keeps. So the walk always meets a snapshot
+/// before it runs out of blocks; running out is the same "unknown root" fault
+/// the specification calls invalid, and is reported as such.
+///
+/// Replay passes `validate_result = false`. The proposer signature and the
+/// committed state root were both checked when the block was first imported, and
+/// re-checking the state root means a `hash_tree_root` of a ~350 MB state per
+/// block replayed.
+pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<BeaconState>> {
+    if let Some(state) = store.cached_beacon_state(root) {
+        return Ok(state);
+    }
+    if let Some(state) = store.beacon_state_snapshot(root) {
+        let state = Arc::new(state);
+        store.cache_beacon_state(root, Arc::clone(&state));
+        return Ok(state);
+    }
+
+    // Walk back to the nearest state we have, collecting the blocks to replay.
+    let mut replay: Vec<SignedBeaconBlock> = Vec::new();
+    let mut cursor = root;
+    let mut state = loop {
+        let block = store
+            .beacon_block(cursor)
+            .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
+        let parent_root = block.parent_root();
+        replay.push(block);
+
+        if let Some(state) = store.cached_beacon_state(parent_root) {
+            break (*state).clone();
+        }
+        if let Some(state) = store.beacon_state_snapshot(parent_root) {
+            break state;
+        }
+        cursor = parent_root;
+    };
+
+    // `replay` runs target -> anchor child; reverse to anchor child -> target.
+    replay.reverse();
+    for block in &replay {
+        stf::state_transition(
+            &mut state,
+            block,
+            false,
+            config,
+            &stf::ExecutionEngine::valid(),
+        )?;
+    }
+
+    let state = Arc::new(state);
+    store.cache_beacon_state(root, Arc::clone(&state));
+    Ok(state)
+}
+
+/// The state at `checkpoint`'s epoch boundary.
+///
+/// Derives it when it is not cached, rather than erroring. The caches are sized
+/// for resident memory rather than for a hit rate (a mainnet state is ~350 MB),
+/// so an eviction has to be invisible: a `SpecAssert` here would turn a memory
+/// decision into a consensus one.
+pub fn checkpoint_state(
+    store: &Store,
+    checkpoint: Checkpoint,
+    config: &Config,
+) -> Result<Arc<BeaconState>> {
+    if let Some(state) = store.cached_checkpoint_state(&checkpoint) {
+        return Ok(state);
+    }
+
+    // A clone, matching the specification's own `copy(store.block_states[...])`:
+    // `process_slots` advances this copy toward the checkpoint's epoch boundary
+    // in place, and the block's own post-state must be left as the block
+    // produced it.
+    let mut base_state = (*block_state(store, checkpoint.root, config)?).clone();
+    let target_slot = compute_start_slot_at_epoch(checkpoint.epoch);
+    if base_state.slot() < target_slot {
+        stf::process_slots(&mut base_state, target_slot, config)?;
+    }
+
+    let state = Arc::new(base_state);
+    store.cache_checkpoint_state(checkpoint, Arc::clone(&state));
+    Ok(state)
+}
+
+/// Writes the state at the finalized checkpoint to disk, if finalization has
+/// moved since the last time this ran.
+///
+/// This is the only thing that ever writes a `States` row after bootstrap, and
+/// it is what keeps replay's walk short: without it, every reconstruction would
+/// run all the way back to the genesis anchor. `Store::promote_beacon_anchor`
+/// keeps the newest two and prunes the block index below the older one.
+///
+/// Called from the two handlers that can advance finalization, which are also
+/// the two that have a `config` to materialize the state with.
+fn promote_finalized_anchor(store: &mut Store, config: &Config) -> Result<()> {
+    let finalized = store.beacon_finalized_checkpoint();
+    if store.beacon_anchors().last() == Some(&finalized.root) {
+        return Ok(());
+    }
+    // A finalized checkpoint whose block has not been imported is the genesis
+    // checkpoint before any block: there is nothing to snapshot.
+    if !store.has_beacon_block(finalized.root) {
+        return Ok(());
+    }
+    let state = block_state(store, finalized.root, config)?;
+    store.promote_beacon_anchor(finalized.root, &state);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,15 +1592,22 @@ pub fn update_latest_messages(
 /// once per slot boundary crossed so that none of them are skipped even if
 /// `time` jumps forward by more than one slot since the last call.
 pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
-    let tick_slot = time.saturating_sub(store.genesis_time) / config.seconds_per_slot;
+    let tick_slot = time.saturating_sub(store.beacon_genesis_time()) / config.seconds_per_slot;
     while get_current_slot(store, config) < tick_slot {
         let next_slot = get_current_slot(store, config).saturating_add(1);
         let previous_time = store
-            .genesis_time
+            .beacon_genesis_time()
             .saturating_add(next_slot.saturating_mul(config.seconds_per_slot));
         on_tick_per_slot(store, previous_time, config);
     }
     on_tick_per_slot(store, time, config);
+
+    // `on_tick` has no `Result` in the specification and none here, so an
+    // anchor that cannot be materialized is logged rather than returned: the
+    // next block import calls this again, and a store that has genuinely lost
+    // its history fails loudly at the next `block_state` instead.
+    let _ = promote_finalized_anchor(store, config)
+        .inspect_err(|err| tracing::warn!(?err, "could not promote the finalized anchor"));
 }
 
 /// Validates and applies `signed_block`, adding it and its resulting
@@ -1678,19 +1636,21 @@ pub fn on_block(
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
 
-    // Parent block must be known.
+    // Parent block must be known. On this store that is a block-index lookup
+    // rather than a state lookup: the state cache holds only the working set,
+    // so a parent whose post-state has been evicted is still perfectly known
+    // and is one replay away. Asking the cache here would let an eviction
+    // reject a valid block, which is the same "a memory decision must never
+    // become a consensus one" rule `checkpoint_state` follows.
     verify(
-        store.block_states.contains_key(&parent_root),
+        store.has_beacon_block(parent_root),
         "block.parent_root in store.block_states",
     )?;
     // Make a copy of the state to avoid mutability issues: `state_transition`
     // below must not be able to corrupt the parent's own post-state if this
     // block turns out to be invalid partway through applying it.
-    let mut state = store
-        .block_states
-        .get(&parent_root)
-        .expect("just checked above")
-        .clone();
+    let parent_state = block_state(store, parent_root, config)?;
+    let mut state = (*parent_state).clone();
 
     // Blocks cannot be in the future. If they are, their consideration must
     // be delayed until they are in the past.
@@ -1701,17 +1661,24 @@ pub fn on_block(
 
     // Check that block is later than the finalized epoch slot (optimization
     // to reduce calls to get_ancestor).
-    let finalized_slot = compute_start_slot_at_epoch(store.finalized_checkpoint.epoch);
+    let finalized_slot = compute_start_slot_at_epoch(store.beacon_finalized_checkpoint().epoch);
     verify(
         signed_block.slot() > finalized_slot,
         "block.slot > finalized_slot",
     )?;
     // Check block is a descendant of the finalized block at the checkpoint
-    // finalized slot.
-    let finalized_checkpoint_block =
-        get_checkpoint_block(store, parent_root, store.finalized_checkpoint.epoch)?;
+    // finalized slot. One index build serves both this walk and
+    // `compute_pulled_up_tip`'s below, so a block import scans `LiveChain` once
+    // rather than twice. That scan is bounded by the unfinalized window, since
+    // anchor promotion prunes the index behind finalization.
+    let index = store.beacon_block_index();
+    let finalized_checkpoint_block = get_checkpoint_block(
+        &index,
+        parent_root,
+        store.beacon_finalized_checkpoint().epoch,
+    )?;
     verify(
-        store.finalized_checkpoint.root == finalized_checkpoint_block,
+        store.beacon_finalized_checkpoint().root == finalized_checkpoint_block,
         "store.finalized_checkpoint.root == finalized_checkpoint_block",
     )?;
 
@@ -1757,59 +1724,56 @@ pub fn on_block(
     // rather than `state`: that entry is still exactly the parent's own
     // post-state, since `state_transition` above mutated the *clone* this
     // function made of it, not the store's own copy.
-    if let SignedBeaconBlock::Bellatrix(block) = &signed_block {
-        let pre_state = store.block_states.get(&parent_root).expect("checked above");
-        if stf::bellatrix::is_merge_transition_block(
-            pre_state,
+    if let SignedBeaconBlock::Bellatrix(block) = &signed_block
+        && stf::bellatrix::is_merge_transition_block(
+            &parent_state,
             &block.message.body.execution_payload,
-        )? {
-            validate_merge_block(store, &block.message, config)?;
-        }
+        )?
+    {
+        validate_merge_block(store, &block.message, config)?;
     }
 
     // Add new block to the store, and the new state for this block to the
-    // store. `block_slot` is copied out first since `signed_block` moves into
-    // `store.blocks` next.
+    // store.
     let block_slot = signed_block.slot();
-    store.blocks.insert(block_root, signed_block);
-    store.block_states.insert(block_root, state);
+    let state = Arc::new(state);
+    store.insert_beacon_block(block_root, &signed_block);
+    store.cache_beacon_state(block_root, Arc::clone(&state));
 
     // Add block timeliness to the store.
-    let seconds_since_genesis = store.time.saturating_sub(store.genesis_time);
+    let seconds_since_genesis = store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time());
     let time_into_slot_ms =
         seconds_to_milliseconds(seconds_since_genesis) % config.slot_duration_ms;
     let epoch = get_current_store_epoch(store, config);
     let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
     let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
     let is_timely = get_current_slot(store, config) == block_slot && is_before_attesting_interval;
-    store.block_timeliness.insert(block_root, is_timely);
+    store.set_block_timeliness(block_root, is_timely);
 
     // Add proposer score boost if the block is timely and not conflicting
     // with an existing block.
-    let is_first_block = store.proposer_boost_root.is_zero();
+    let is_first_block = store.proposer_boost_root().is_zero();
     if is_timely && is_first_block {
-        store.proposer_boost_root = block_root;
+        store.set_proposer_boost_root(block_root);
     }
 
-    // Update checkpoints in store if necessary. Read out of the post-state
-    // before calling `update_checkpoints`, rather than while still borrowing
-    // it from `store.block_states`, since that call needs `store` mutably.
-    let (current_justified, finalized) = {
-        let post_state = store
-            .block_states
-            .get(&block_root)
-            .expect("just inserted above");
-        (
-            post_state.current_justified_checkpoint(),
-            post_state.finalized_checkpoint(),
-        )
-    };
+    // Update checkpoints in store if necessary.
+    let (current_justified, finalized) = (
+        state.current_justified_checkpoint(),
+        state.finalized_checkpoint(),
+    );
     update_checkpoints(store, current_justified, finalized);
 
-    // Eagerly compute unrealized justification and finality.
-    compute_pulled_up_tip(store, block_root, config)?;
+    // Eagerly compute unrealized justification and finality. The index built
+    // above predates this block, so the newly imported one is added to it
+    // rather than the whole scan being repeated.
+    let mut index = index;
+    index.insert(block_root, (block_slot, parent_root));
+    compute_pulled_up_tip(store, &index, block_root, config)?;
 
-    Ok(())
+    promote_finalized_anchor(store, config)
 }
 
 /// Validates `attestation` and, if valid, records it as each attester's
@@ -1832,15 +1796,11 @@ pub fn on_attestation(
 
     // Get state at the `target` to fully validate attestation. The attesting
     // indices are collected into an owned `Vec` before the block ends, so the
-    // borrow of `store.checkpoint_states` (via `target_state`) is released
-    // before `update_latest_messages` needs `store` mutably.
+    // target state is released before `update_latest_messages` needs `store`
+    // mutably.
     let attesting_indices = {
-        let target_state = store
-            .checkpoint_state(&data.target)
-            .ok_or(Error::SpecAssert(
-                "attestation.data.target in store.checkpoint_states",
-            ))?;
-        attestation.verified_attesting_indices(target_state)?
+        let target_state = checkpoint_state(store, data.target, config)?;
+        attestation.verified_attesting_indices(&target_state)?
     };
 
     // Update latest messages for attesting indices.
@@ -1858,7 +1818,11 @@ pub fn on_attestation(
 /// function does not enforce on its own; a caller replaying history is
 /// responsible for calling this for every attester slashing it encounters
 /// rather than only recent ones.
-pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlashing) -> Result<()> {
+pub fn on_attester_slashing(
+    store: &mut Store,
+    attester_slashing: &AttesterSlashing,
+    config: &Config,
+) -> Result<()> {
     let (data_1, data_2) = attester_slashing.data();
 
     verify(
@@ -1867,22 +1831,17 @@ pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlash
     )?;
 
     // The attesting indices are collected into owned `Vec`s before the block
-    // ends, so the borrow of `store.block_states` (via `state`) is released
-    // before `store.equivocating_indices` needs to be mutated below.
+    // ends, so the justified state is released before the equivocation set
+    // needs to be mutated below.
     let (indices_1, indices_2) = {
-        let state = store
-            .block_states
-            .get(&store.justified_checkpoint.root)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint.root in store.block_states",
-            ))?;
-        attester_slashing.verified_attesting_indices(state)?
+        let state = block_state(store, store.beacon_justified_checkpoint().root, config)?;
+        attester_slashing.verified_attesting_indices(&state)?
     };
 
     let indices_1: HashSet<ValidatorIndex> = indices_1.into_iter().collect();
     for index in indices_2 {
         if indices_1.contains(&index) {
-            store.equivocating_indices.insert(index);
+            store.insert_equivocating_index(index);
         }
     }
 
@@ -1893,27 +1852,14 @@ pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlash
 mod tests {
     use super::*;
 
-    /// A store with every collection empty and every checkpoint at its
-    /// default (genesis) value. Tests fill in only the fields the function
-    /// under test actually reads.
+    /// A store with no blocks and every checkpoint at its default (genesis)
+    /// value, on a throwaway in-memory backend. Tests fill in only what the
+    /// function under test actually reads.
     fn empty_store() -> Store {
-        Store {
-            time: 0,
-            genesis_time: 0,
-            justified_checkpoint: Checkpoint::default(),
-            finalized_checkpoint: Checkpoint::default(),
-            unrealized_justified_checkpoint: Checkpoint::default(),
-            unrealized_finalized_checkpoint: Checkpoint::default(),
-            proposer_boost_root: Root::zero(),
-            equivocating_indices: HashSet::new(),
-            blocks: HashMap::new(),
-            block_states: HashMap::new(),
-            block_timeliness: HashMap::new(),
-            checkpoint_states: HashMap::new(),
-            latest_messages: HashMap::new(),
-            unrealized_justifications: HashMap::new(),
-            pow_blocks: HashMap::new(),
-        }
+        Store::init_beacon(
+            Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
+            0,
+        )
     }
 
     /// A signed block with an empty body and a zero signature, for tests that
@@ -1941,35 +1887,92 @@ mod tests {
         })
     }
 
+    /// The block index `get_ancestor` and the tree walks take, built by hand.
+    fn index(entries: &[(Root, Slot, Root)]) -> BeaconBlockIndex {
+        entries
+            .iter()
+            .map(|&(root, slot, parent_root)| (root, (slot, parent_root)))
+            .collect()
+    }
+
     #[test]
     fn get_ancestor_walks_past_an_empty_slot_gap() {
-        let mut store = empty_store();
         let genesis_root = Root::repeat_byte(1);
         let a_root = Root::repeat_byte(2);
         let b_root = Root::repeat_byte(3);
-
-        store.blocks.insert(genesis_root, block(0, Root::zero()));
-        store.blocks.insert(a_root, block(1, genesis_root));
         // Slot 2 is empty: b's parent is a, two slots later.
-        store.blocks.insert(b_root, block(3, a_root));
+        let index = index(&[
+            (genesis_root, 0, Root::zero()),
+            (a_root, 1, genesis_root),
+            (b_root, 3, a_root),
+        ]);
 
         // At b's own slot, b is its own ancestor.
-        assert_eq!(get_ancestor(&store, b_root, 3).unwrap(), b_root);
-        // Querying the empty slot, or a's own slot, must land on a rather
-        // than on b, since b's slot is strictly after both.
-        assert_eq!(get_ancestor(&store, b_root, 2).unwrap(), a_root);
-        assert_eq!(get_ancestor(&store, b_root, 1).unwrap(), a_root);
+        assert_eq!(get_ancestor(&index, b_root, 3).unwrap(), b_root);
+        // Querying the empty slot, or a's own slot, must land on a rather than
+        // on b, since b's slot is strictly after both.
+        assert_eq!(get_ancestor(&index, b_root, 2).unwrap(), a_root);
+        assert_eq!(get_ancestor(&index, b_root, 1).unwrap(), a_root);
         // Querying before a's slot must walk one hop further, to genesis.
-        assert_eq!(get_ancestor(&store, b_root, 0).unwrap(), genesis_root);
+        assert_eq!(get_ancestor(&index, b_root, 0).unwrap(), genesis_root);
     }
 
     #[test]
     fn get_ancestor_rejects_an_unknown_root() {
-        let store = empty_store();
         // The specification's own KeyError-on-unknown-root is exactly the
         // "unhandled exception" case it calls invalid, so this must be an
         // error rather than a panic.
-        assert!(get_ancestor(&store, Root::repeat_byte(9), 0).is_err());
+        let index = index(&[]);
+        assert!(get_ancestor(&index, Root::repeat_byte(9), 0).is_err());
+    }
+
+    #[test]
+    fn a_checkpoint_state_is_derived_when_it_is_not_cached() {
+        // The caches are sized for resident memory, not for a hit rate, so an
+        // eviction must be invisible: every caller derives on a miss. A store
+        // with a block state and no checkpoint state at all is exactly the
+        // post-eviction shape.
+        let config = Config::active();
+        let mut store = empty_store();
+        let block_root = Root::repeat_byte(1);
+        let checkpoint = Checkpoint {
+            epoch: 0,
+            root: block_root,
+        };
+
+        store.insert_beacon_block(block_root, &block(0, Root::zero()));
+        let state = crate::helpers::test_state::with_validators(1);
+        store.cache_beacon_state(block_root, Arc::new(state));
+
+        assert!(!store.has_checkpoint_state(&checkpoint));
+        let derived = checkpoint_state(&store, checkpoint, &config)
+            .expect("a checkpoint state is derivable from its block's post-state");
+        // `test_state` sits at the first slot of epoch 1, and the checkpoint's
+        // own epoch starts below that, so `process_slots` is a no-op here and
+        // the derived state is the block's post-state itself. That is the point:
+        // what is under test is deriving rather than erroring on a miss.
+        assert_eq!(derived.slot(), preset::SLOTS_PER_EPOCH);
+        assert!(store.has_checkpoint_state(&checkpoint));
+    }
+
+    #[test]
+    fn a_state_falls_through_the_cache_to_its_snapshot() {
+        // Only the anchors are written, so an empty cache has to find one and
+        // repopulate itself rather than reporting the state missing.
+        let config = Config::active();
+        let mut store = empty_store();
+        let root = Root::repeat_byte(1);
+        let expected = crate::helpers::test_state::with_validators(1);
+
+        store.insert_beacon_state_snapshot(root, &expected);
+        assert!(store.cached_beacon_state(root).is_none());
+
+        let served = block_state(&store, root, &config).expect("the snapshot serves the read");
+        assert_eq!(served.hash_tree_root(), expected.hash_tree_root());
+        assert!(
+            store.cached_beacon_state(root).is_some(),
+            "a snapshot read must repopulate the cache, or every later read replays"
+        );
     }
 
     #[test]
@@ -1997,27 +2000,27 @@ mod tests {
         // "correct_justified"/"correct_finalized" checks have a
         // `== GENESIS_EPOCH` escape hatch): the point of this test is the
         // weight tie-break in `get_head`, not the filtering rules.
-        store.justified_checkpoint = Checkpoint {
+        store.set_beacon_justified_checkpoint(Checkpoint {
             epoch: constants::GENESIS_EPOCH,
             root: genesis_root,
-        };
-        store.finalized_checkpoint = store.justified_checkpoint;
+        });
+        store.set_beacon_finalized_checkpoint(store.beacon_justified_checkpoint());
 
-        store.blocks.insert(genesis_root, block(0, Root::zero()));
-        store.blocks.insert(low_root, block(1, genesis_root));
-        store.blocks.insert(high_root, block(1, genesis_root));
+        store.insert_beacon_block(genesis_root, &block(0, Root::zero()));
+        store.insert_beacon_block(low_root, &block(1, genesis_root));
+        store.insert_beacon_block(high_root, &block(1, genesis_root));
 
         // `get_weight` reads the justified checkpoint's cached state only to
         // enumerate active validators; with `latest_messages` left empty,
         // neither child gets any attesting balance, so both are weight zero
         // and the root comparison is all that can decide between them.
         let state = crate::helpers::test_state::with_validators(1);
-        store.insert_checkpoint_state(store.justified_checkpoint, state.clone());
+        store.cache_checkpoint_state(store.beacon_justified_checkpoint(), Arc::new(state.clone()));
         // `get_voting_source` needs a post-state for each leaf, since both
         // children are in the store's current epoch (its clock is left at
         // the default of slot zero) and so take the "not pulled up" branch.
-        store.block_states.insert(low_root, state.clone());
-        store.block_states.insert(high_root, state);
+        store.cache_beacon_state(low_root, Arc::new(state.clone()));
+        store.cache_beacon_state(high_root, Arc::new(state));
 
         let head = get_head(&store, &config).unwrap();
         assert_eq!(
@@ -2034,10 +2037,10 @@ mod tests {
         // `get_voting_source` takes the pulled-up branch
         // (`current_epoch > block_epoch`) rather than reading the block's own
         // post-state directly.
-        store.time = config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2;
+        store.set_beacon_time(config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2);
 
         let block_root = Root::repeat_byte(5);
-        store.blocks.insert(block_root, block(0, Root::zero()));
+        store.insert_beacon_block(block_root, &block(0, Root::zero()));
 
         let unrealized = Checkpoint {
             epoch: 1,
@@ -2052,15 +2055,14 @@ mod tests {
             "the test must exercise two different values"
         );
 
-        store
-            .unrealized_justifications
-            .insert(block_root, unrealized);
+        store.set_unrealized_justification(block_root, unrealized);
 
         let mut state = crate::helpers::test_state::with_validators(1);
         *state.current_justified_checkpoint_mut() = realized;
-        store.block_states.insert(block_root, state);
+        store.cache_beacon_state(block_root, Arc::new(state));
 
-        let voting_source = get_voting_source(&store, block_root, &config).unwrap();
+        let index = store.beacon_block_index();
+        let voting_source = get_voting_source(&store, &index, block_root, &config).unwrap();
         assert_eq!(
             voting_source, unrealized,
             "a block from a prior epoch must vote its pulled-up (unrealized) checkpoint"

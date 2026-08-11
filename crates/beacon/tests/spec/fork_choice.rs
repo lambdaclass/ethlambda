@@ -104,6 +104,7 @@ use ethlambda_beacon::containers::{
 use ethlambda_beacon::fork_choice::{self, DataAvailability, Store};
 use ethlambda_beacon::preset;
 use ethlambda_beacon::primitives::{KzgProof, Root};
+use ethlambda_storage::backend::InMemoryBackend;
 use libssz::SszDecode;
 use libssz_types::SszList;
 use libtest_mimic::Trial;
@@ -581,7 +582,7 @@ fn apply_block(
         })?;
     }
     for attester_slashing in &attester_slashings {
-        fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {
+        fork_choice::on_attester_slashing(store, attester_slashing, config).map_err(|err| {
             format!("on_attester_slashing for a slashing carried in {name}: {err:?}")
         })?;
     }
@@ -634,7 +635,7 @@ fn apply_execution_step(
     if let Some(name) = &step.attester_slashing {
         let attester_slashing = decode_attester_slashing(case, name)?;
         return match (
-            fork_choice::on_attester_slashing(store, &attester_slashing),
+            fork_choice::on_attester_slashing(store, &attester_slashing, config),
             step.valid,
         ) {
             (Ok(()), false) => Err(format!(
@@ -718,9 +719,8 @@ fn check_head(expected: &HeadCheck, store: &Store, config: &Config) -> Result<()
     let actual_root =
         fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
     let actual_slot = store
-        .blocks
-        .get(&actual_root)
-        .map(|block| block.slot())
+        .beacon_block_entry(actual_root)
+        .map(|(slot, _parent_root)| slot)
         .ok_or_else(|| {
             format!(
                 "get_head returned 0x{}, which is not in store.blocks",
@@ -788,19 +788,27 @@ fn check_should_override_forkchoice_update(
 /// Applies one `checks` step: every field the fixture sets must match.
 fn apply_checks(store: &Store, checks: &Checks, config: &Config) -> Result<(), String> {
     if let Some(expected) = checks.time {
-        check_u64("time", expected, store.time)?;
+        check_u64("time", expected, store.beacon_time())?;
     }
     if let Some(expected) = checks.genesis_time {
-        check_u64("genesis_time", expected, store.genesis_time)?;
+        check_u64("genesis_time", expected, store.beacon_genesis_time())?;
     }
     if let Some(expected) = &checks.justified_checkpoint {
-        check_checkpoint("justified_checkpoint", expected, store.justified_checkpoint)?;
+        check_checkpoint(
+            "justified_checkpoint",
+            expected,
+            store.beacon_justified_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.finalized_checkpoint {
-        check_checkpoint("finalized_checkpoint", expected, store.finalized_checkpoint)?;
+        check_checkpoint(
+            "finalized_checkpoint",
+            expected,
+            store.beacon_finalized_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.proposer_boost_root {
-        check_root("proposer_boost_root", expected, store.proposer_boost_root)?;
+        check_root("proposer_boost_root", expected, store.proposer_boost_root())?;
     }
     if let Some(expected) = &checks.head {
         check_head(expected, store, config)?;
@@ -830,7 +838,8 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
     let anchor_block = decode_anchor_block(case)?;
 
-    let mut store = fork_choice::get_forkchoice_store(anchor_state, anchor_block, config)
+    let backend = Arc::new(InMemoryBackend::new());
+    let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
     let steps: Vec<Step> = case.yaml("steps");
