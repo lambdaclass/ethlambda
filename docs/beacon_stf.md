@@ -5,8 +5,18 @@ consensus specification, [`ethereum/consensus-specs`][specs], phase0 through
 fulu.
 
 This is not the Lean consensus protocol the rest of this repository implements.
-The two share no types and no code beyond the SSZ crates: the crate depends on no
-other `ethlambda-*` crate, and nothing else in the workspace depends on it.
+The two share no *logic*, but they now share a crate: the containers, primitives,
+presets, constants, fork names, error type, and configuration live in
+`ethlambda-types` under its `beacon` module, so `BeaconState` can carry a `Lean`
+variant and one `BlockChainServer` can dispatch on it. This crate keeps the parts
+that are Beacon Chain behavior rather than Beacon Chain data: `helpers`, `stf`,
+`genesis`, `upgrade`, `fork_choice`, `bls`, `kzg`, and `hash`. It re-exports each
+moved module at its old path, so code inside the crate still says
+`crate::primitives`.
+
+`ForkName::Lean` sits outside `ForkName::ALL`, which is what keeps it out of the
+fixture harness, out of `parse`, and out of `upgrade`'s traversal. See
+`ForkName::ALL`'s own documentation.
 
 Correctness is defined by the released spec test fixtures, pinned in the
 `Makefile`.
@@ -23,16 +33,13 @@ without the fixture download.
 
 ## Layout
 
+`preset`, `config`, `constants`, `fork`, `primitives`, `containers`, and `error`
+moved to `ethlambda_types::beacon` and are re-exported here at their old paths.
+
 | Module | Holds |
 |--------|-------|
-| `preset` | Compile-time constants, mainnet or minimal |
-| `config` | Runtime configuration: fork schedule, churn limits, blob schedule |
-| `constants` | Values the spec fixes outright: domain types, flag weights, sentinels |
-| `fork` | `ForkName`, ordered oldest to newest |
-| `primitives` | Scalar aliases, `Root`, and the fixed-length byte strings |
 | `bls` | BLS12-381 via `blst` |
 | `kzg` | KZG via `c-kzg`, plus the two challenge functions c-kzg does not export |
-| `containers` | The `BeaconState` enum, fork-invariant containers, per-fork containers |
 | `helpers` | The spec's helper functions |
 | `stf` | The state transition: slots, blocks, operations, epoch processing |
 | `genesis` | Building a genesis state from Eth1 deposits |
