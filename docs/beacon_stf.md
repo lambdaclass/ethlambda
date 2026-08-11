@@ -44,7 +44,7 @@ moved to `ethlambda_types::beacon` and are re-exported here at their old paths.
 | `stf` | The state transition: slots, blocks, operations, epoch processing |
 | `genesis` | Building a genesis state from Eth1 deposits |
 | `upgrade` | Fork upgrades between per-fork state shapes |
-| `fork_choice` | The LMD GHOST store |
+| `fork_choice` | LMD GHOST, over `ethlambda_storage::Store` |
 
 ## Three kinds of parameter
 
@@ -336,6 +336,34 @@ forces a decision instead of quietly widening the gap.
 150 mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
 terminal-PoW validation, `should_override_forkchoice_update`, deneb's blob
 data availability, and fulu's column data availability.
+
+### Where the fork choice store lives
+
+The fork choice store is `ethlambda_storage::Store`, the same DB-backed store the
+lean side uses. It was an in-memory `HashMap` per field until
+`docs/superpowers/plans/2026-08-11-beacon-handlers-on-lean-store.md`; a mainnet
+`BeaconState` is ~350 MB and the store held one per block in the unfinalized
+window, so that shape could never have run against mainnet.
+
+Beacon states do not use lean's `StateDiff` path. A diff omits `validators` on
+the documented assumption that they never change, and a beacon registry changes
+every epoch, so routing one through would corrupt every reconstruction silently
+rather than failing. Instead:
+
+- `States` holds the latest finalized anchor and the one before it, each behind
+  a one-byte fork selector.
+- Everything above finalization is reconstructed by `fork_choice::block_state`,
+  which replays blocks forward from the nearest anchor with
+  `validate_result = false`.
+- Two small LRUs hold the working set: the head's post-state and the anchor, plus
+  the justified checkpoint's epoch-boundary state. A miss is a replay, never an
+  error, which is what lets them be that small.
+
+That last point is a rule, not an optimization: any check that asks whether a
+state is *cached* turns an eviction into a consensus decision. `on_block`'s
+"parent must be known" test therefore reads the block index
+(`Store::has_beacon_block`) rather than the state cache, and `checkpoint_state`
+derives on a miss rather than returning an error.
 
 The release still ships no phase0 `fork_choice` suite: the earliest is
 altair's, built from altair-shaped states even though altair changes nothing
