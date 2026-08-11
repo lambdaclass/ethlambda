@@ -32,16 +32,18 @@ tracing.workspace = true
 
 rand = "0.8"
 
-# Required for NodeEnr parsing
-# TEMPORARY: absolute path dependency on an unpushed local ethrex branch
-# (feat/lean-discovery-hooks). Builds only on this machine — CI and any other
-# checkout will fail to resolve it. Restore the git + rev form before opening a
-# PR; see the plan's "Reverting the path dependency" section.
-ethrex-p2p = { path = "/Users/mega/execution/ethrex/crates/networking/p2p" }
-ethrex-rlp = { path = "/Users/mega/execution/ethrex/crates/common/rlp" }
-ethrex-common = { path = "/Users/mega/execution/ethrex/crates/common" }
+# Discovery is built on ethrex's discv5 stack. The branch is not merged to
+# ethrex `main` yet, so this tracks the branch rather than a release; `Cargo.lock`
+# pins the exact commit, and `cargo update -p ethrex-p2p` is what moves it.
+#
+# The branch is rebased and force-pushed regularly. If a build starts failing
+# inside ethrex rather than here, check whether the pinned commit still exists
+# before assuming an API change.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
 # Only for the empty in-memory Store that DiscoveryServer::spawn requires.
-ethrex-storage = { path = "/Users/mega/execution/ethrex/crates/storage" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
 
 # Versions pinned to ethrex's workspace: these types cross the API boundary.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }

@@ -2153,6 +2153,7 @@ dependencies = [
 [[package]]
 name = "ethrex-blockchain"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -2177,6 +2178,7 @@ dependencies = [
 [[package]]
 name = "ethrex-common"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2210,6 +2212,7 @@ dependencies = [
 [[package]]
 name = "ethrex-crypto"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -2231,6 +2234,7 @@ dependencies = [
 [[package]]
 name = "ethrex-guest-program"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2249,6 +2253,7 @@ dependencies = [
 [[package]]
 name = "ethrex-l2-common"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2266,6 +2271,7 @@ dependencies = [
 [[package]]
 name = "ethrex-levm"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -2283,6 +2289,7 @@ dependencies = [
 [[package]]
 name = "ethrex-metrics"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -2294,10 +2301,10 @@ dependencies = [
 [[package]]
 name = "ethrex-p2p"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "aes",
  "aes-gcm",
- "async-trait",
  "bytes",
  "concat-kdf",
  "crossbeam",
@@ -2336,6 +2343,7 @@ dependencies = [
 [[package]]
 name = "ethrex-rlp"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2345,6 +2353,7 @@ dependencies = [
 [[package]]
 name = "ethrex-storage"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2366,6 +2375,7 @@ dependencies = [
 [[package]]
 name = "ethrex-trie"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2385,6 +2395,7 @@ dependencies = [
 [[package]]
 name = "ethrex-vm"
 version = "23.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",

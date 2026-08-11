@@ -18,7 +18,6 @@ use std::time::Duration;
 use ethlambda_types::enr::EnrForkId;
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
-use ethrex_p2p::requirements::NoRequirements;
 use ethrex_p2p::types::Node;
 use ethrex_storage::{EngineType, Store};
 use secp256k1::SecretKey;
@@ -106,7 +105,7 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         // would stamp every lean contact as rejected. Lean imposes nothing at
         // the ENR level here: the spec checks live in [`admission`] and run at
         // dial selection instead.
-        Arc::new(NoRequirements),
+        Arc::new(admission::AcceptEveryContact),
     );
 
     let seeds: Vec<Node> = config
