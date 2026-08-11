@@ -581,7 +581,7 @@ fn apply_block(
         })?;
     }
     for attester_slashing in &attester_slashings {
-        fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {
+        fork_choice::on_attester_slashing(store, attester_slashing, config).map_err(|err| {
             format!("on_attester_slashing for a slashing carried in {name}: {err:?}")
         })?;
     }
@@ -634,7 +634,7 @@ fn apply_execution_step(
     if let Some(name) = &step.attester_slashing {
         let attester_slashing = decode_attester_slashing(case, name)?;
         return match (
-            fork_choice::on_attester_slashing(store, &attester_slashing),
+            fork_choice::on_attester_slashing(store, &attester_slashing, config),
             step.valid,
         ) {
             (Ok(()), false) => Err(format!(
