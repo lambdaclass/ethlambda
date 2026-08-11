@@ -4,12 +4,14 @@
 //! the accessors in [`super::accessors`] they never take a state.
 
 use crate::constants;
-use crate::containers::shared::{ForkData, SigningData};
+use crate::containers::shared::SigningData;
 use crate::hash::hash;
 use crate::preset;
 use crate::primitives::{
     Bytes32, Domain, DomainType, Epoch, HashTreeRoot as _, Root, Slot, Version,
 };
+
+pub use ethlambda_types::beacon::fork_digest::compute_fork_data_root;
 
 /// The epoch containing `slot`.
 pub fn compute_epoch_at_slot(slot: Slot) -> Epoch {
@@ -29,18 +31,6 @@ pub fn compute_start_slot_at_epoch(epoch: Epoch) -> Slot {
 /// attacker from steering their own committee assignment.
 pub fn compute_activation_exit_epoch(epoch: Epoch) -> Epoch {
     epoch + 1 + preset::MAX_SEED_LOOKAHEAD
-}
-
-/// The root binding a fork version to a chain's genesis validator set.
-///
-/// Mixing both into every signing domain is what keeps a signature from one
-/// chain or fork from verifying on another.
-pub fn compute_fork_data_root(current_version: Version, genesis_validators_root: Root) -> Root {
-    ForkData {
-        current_version,
-        genesis_validators_root,
-    }
-    .hash_tree_root()
 }
 
 /// The signing domain for a message type on a particular fork and chain.

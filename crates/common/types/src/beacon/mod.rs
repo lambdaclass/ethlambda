@@ -10,6 +10,7 @@ pub mod constants;
 pub mod containers;
 pub mod error;
 pub mod fork;
+pub mod fork_digest;
 pub mod preset;
 pub mod primitives;
 
