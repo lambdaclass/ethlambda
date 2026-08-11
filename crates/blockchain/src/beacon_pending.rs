@@ -190,6 +190,82 @@ mod tests {
         built
     }
 
+    /// Drive the buffer the way the block handler does: import a block, release
+    /// its children, import each of those, and so on. Returns the slots in the
+    /// order they became importable.
+    fn drain_cascade(pending: &mut PendingBeaconBlocks, imported_root: Root) -> Vec<Slot> {
+        let mut order = Vec::new();
+        let mut queue = std::collections::VecDeque::from(pending.take_children(imported_root));
+        while let Some(block) = queue.pop_front() {
+            order.push(block.slot());
+            for child in pending.take_children(block.message_hash_tree_root()) {
+                queue.push_back(child);
+            }
+        }
+        order
+    }
+
+    /// The failure this whole plan exists to prevent.
+    ///
+    /// A follower that tracks the tip without backfilling accepts gossip blocks
+    /// whose parents it has never seen. Its head climbs while justification and
+    /// finalization stay frozen, because nothing it imported is actually on a
+    /// chain it can evaluate. Two properties separate that behaviour from a
+    /// correct one, and this test asserts both:
+    ///
+    ///   1. While the gap is unfilled, no block at the tip is importable. A
+    ///      tip-only follower has them all importable immediately.
+    ///   2. Once the gap is walked forward from the anchor, every held block
+    ///      comes out exactly once, contiguously, in ascending slot order. A
+    ///      tip-only follower has nothing left to release here, so the drained
+    ///      order is empty.
+    #[test]
+    fn tip_blocks_are_not_importable_until_the_gap_is_filled() {
+        let anchor = Root::repeat_byte(0xa0);
+        // The anchor is at slot 64; the live head is at 128. Slots 65..=119 are
+        // the gap the range fetch will bring; 120..=128 arrive on gossip first.
+        let full = chain(65, 128, anchor);
+        let mut pending = PendingBeaconBlocks::new();
+
+        // --- The tip arrives first, out of a chain the node cannot evaluate.
+        for (slot, _, signed) in &full {
+            if *slot >= 120 {
+                assert_eq!(
+                    pending.insert(signed.clone()),
+                    Pending::Buffered(full[(119 - 65) as usize].1),
+                    "every tip block must point at the same unknown ancestor, \
+                     the last block of the gap"
+                );
+            }
+        }
+        assert_eq!(pending.len(), 9, "slots 120 through 128 are held");
+
+        // Property 1: with the gap unfilled, nothing at the tip is importable.
+        // The anchor's children are not here, and neither is anything else the
+        // node currently has a state for.
+        assert!(
+            drain_cascade(&mut pending, anchor).is_empty(),
+            "a tip block must not become importable just because it arrived"
+        );
+        assert_eq!(pending.len(), 9, "and nothing may be silently dropped");
+
+        // --- The range fetch walks the gap forward from the anchor.
+        let mut applied = Vec::new();
+        for (slot, root, _) in full.iter().filter(|(slot, _, _)| *slot < 120) {
+            applied.push(*slot);
+            applied.extend(drain_cascade(&mut pending, *root));
+        }
+
+        // Property 2: the held tip blocks came out, once each, in slot order,
+        // and the whole chain is contiguous from the anchor to the head.
+        let expected: Vec<Slot> = (65..=128).collect();
+        assert_eq!(
+            applied, expected,
+            "the chain must be applied contiguously from the anchor to the head"
+        );
+        assert_eq!(pending.len(), 0, "the buffer must be empty afterwards");
+    }
+
     #[test]
     fn an_orphan_reports_its_own_parent_as_the_root_to_fetch() {
         let mut pending = PendingBeaconBlocks::new();
