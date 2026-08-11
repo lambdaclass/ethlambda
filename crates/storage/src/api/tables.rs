@@ -34,10 +34,18 @@ pub enum Table {
     /// Includes finalized blocks (anchor) and all non-finalized blocks.
     /// Pruned when slots become finalized (keeps finalized block itself).
     LiveChain,
+    /// Beacon fork-choice records: block root -> unrealized justification
+    /// (a beacon `Checkpoint`).
+    ///
+    /// The one fork-choice map that is worth persisting: `get_voting_source`
+    /// reads it for every block from a prior epoch, and recomputing an entry
+    /// means replaying epoch processing on a copy of that block's post-state.
+    /// Empty on a lean chain.
+    BeaconForkChoice,
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 8] = [
+pub const ALL_TABLES: [Table; 9] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockProof,
@@ -46,6 +54,7 @@ pub const ALL_TABLES: [Table; 8] = [
     Table::StateDiffs,
     Table::Metadata,
     Table::LiveChain,
+    Table::BeaconForkChoice,
 ];
 
 impl Table {
@@ -60,6 +69,7 @@ impl Table {
             Table::StateDiffs => "state_diffs",
             Table::Metadata => "metadata",
             Table::LiveChain => "live_chain",
+            Table::BeaconForkChoice => "beacon_fork_choice",
         }
     }
 }

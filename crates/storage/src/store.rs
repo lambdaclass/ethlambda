@@ -609,9 +609,6 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 /// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
 /// of attestations, and `pow_blocks` stands in for a call to an execution client
 /// that a restarted node would simply make again.
-// Written by `init_beacon` but not yet read: the accessors that read these
-// land with the beacon scratch surface. Removed there.
-#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: BeaconRoot,
@@ -700,8 +697,6 @@ pub struct Store {
     /// Avoids reconstructing recent states from diffs on every read.
     state_cache: Arc<Mutex<LruCache<H256, State>>>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
-    // Read by the beacon scratch accessors, which land next. Removed there.
-    #[allow(dead_code)]
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// Beacon state caches. Empty and untouched on a lean chain.
     pub(crate) beacon_cache: Arc<Mutex<BeaconCaches>>,

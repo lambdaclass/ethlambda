@@ -32,13 +32,16 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::containers::{BeaconState, Checkpoint, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
+use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
 use ethlambda_types::beacon::primitives::{Root, Slot};
 use libssz::{SszDecode, SszEncode};
 use libssz_derive::{SszDecode as SszDecodeDerive, SszEncode as SszEncodeDerive};
 
 use crate::api::Table;
 use crate::store::{
-    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, Store, decode_state_value, encode_state_value,
+    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, KEY_BEACON_FINALIZED, KEY_BEACON_JUSTIFIED,
+    KEY_BEACON_UNREALIZED_FINALIZED, KEY_BEACON_UNREALIZED_JUSTIFIED, KEY_TIME, Store,
+    decode_state_value, encode_state_value,
 };
 
 /// Every block in the beacon fork-choice window, as `root -> (slot, parent_root)`.
@@ -309,6 +312,194 @@ impl Store {
             .expect("delete superseded anchor snapshots");
         batch.commit().expect("commit");
     }
+
+    /// The beacon store's clock, as **Unix seconds**.
+    ///
+    /// Shares `Metadata["time"]` with the lean clock, which counts 800 ms
+    /// intervals since genesis instead. That is safe precisely because a
+    /// directory holds one chain: nothing ever reads the key through the other
+    /// chain's accessor. The unit difference is why there are two accessors and
+    /// not one.
+    pub fn beacon_time(&self) -> u64 {
+        self.beacon_metadata(KEY_TIME)
+    }
+
+    /// Sets [`Store::beacon_time`].
+    pub fn set_beacon_time(&mut self, time: u64) {
+        self.set_beacon_metadata(KEY_TIME, &time);
+    }
+
+    /// Genesis, as Unix seconds. Read off the anchor state at bootstrap.
+    pub fn beacon_genesis_time(&self) -> u64 {
+        self.config().genesis_time
+    }
+
+    /// The justified checkpoint fork choice is currently descending from.
+    pub fn beacon_justified_checkpoint(&self) -> Checkpoint {
+        self.beacon_metadata(KEY_BEACON_JUSTIFIED)
+    }
+
+    /// Sets [`Store::beacon_justified_checkpoint`]. No monotonicity check: the
+    /// specification's own `update_checkpoints` owns that rule.
+    pub fn set_beacon_justified_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.set_beacon_metadata(KEY_BEACON_JUSTIFIED, &checkpoint);
+    }
+
+    /// The finalized checkpoint. Fork choice never descends below it.
+    pub fn beacon_finalized_checkpoint(&self) -> Checkpoint {
+        self.beacon_metadata(KEY_BEACON_FINALIZED)
+    }
+
+    /// Sets [`Store::beacon_finalized_checkpoint`].
+    pub fn set_beacon_finalized_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.set_beacon_metadata(KEY_BEACON_FINALIZED, &checkpoint);
+    }
+
+    /// The highest justified checkpoint seen in any block's post-state, whether
+    /// or not its own chain has an epoch boundary that reflects it yet.
+    pub fn beacon_unrealized_justified_checkpoint(&self) -> Checkpoint {
+        self.beacon_metadata(KEY_BEACON_UNREALIZED_JUSTIFIED)
+    }
+
+    /// Sets [`Store::beacon_unrealized_justified_checkpoint`].
+    pub fn set_beacon_unrealized_justified_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.set_beacon_metadata(KEY_BEACON_UNREALIZED_JUSTIFIED, &checkpoint);
+    }
+
+    /// The finalized counterpart to
+    /// [`Store::beacon_unrealized_justified_checkpoint`].
+    pub fn beacon_unrealized_finalized_checkpoint(&self) -> Checkpoint {
+        self.beacon_metadata(KEY_BEACON_UNREALIZED_FINALIZED)
+    }
+
+    /// Sets [`Store::beacon_unrealized_finalized_checkpoint`].
+    pub fn set_beacon_unrealized_finalized_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.set_beacon_metadata(KEY_BEACON_UNREALIZED_FINALIZED, &checkpoint);
+    }
+
+    /// Reads an SSZ metadata value that `init_beacon` guarantees exists.
+    fn beacon_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view
+            .get(Table::Metadata, key)
+            .expect("get")
+            .expect("a beacon store writes every metadata key at bootstrap");
+        T::from_ssz_bytes(&bytes).expect("valid encoding")
+    }
+
+    /// Writes an SSZ metadata value.
+    fn set_beacon_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
+            .expect("put beacon metadata");
+        batch.commit().expect("commit");
+    }
+
+    /// The most recent timely, uncontested block seen this slot, or the zero
+    /// root if none has arrived yet or a new slot has reset it.
+    pub fn proposer_boost_root(&self) -> Root {
+        self.beacon.lock().unwrap().proposer_boost_root
+    }
+
+    /// Sets [`Store::proposer_boost_root`].
+    pub fn set_proposer_boost_root(&mut self, root: Root) {
+        self.beacon.lock().unwrap().proposer_boost_root = root;
+    }
+
+    /// Whether `root`'s block arrived before the attestation deadline of the
+    /// slot fork choice was in when it was imported.
+    pub fn block_timeliness(&self, root: Root) -> Option<bool> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_timeliness
+            .get(&root)
+            .copied()
+    }
+
+    /// Sets [`Store::block_timeliness`].
+    pub fn set_block_timeliness(&mut self, root: Root, timely: bool) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_timeliness
+            .insert(root, timely);
+    }
+
+    /// Whether `index` has been caught attesting to two conflicting things.
+    pub fn is_equivocating(&self, index: u64) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .equivocating_indices
+            .contains(&index)
+    }
+
+    /// Records `index` as an equivocator. Never reversed: an equivocation is a
+    /// fact about history, not a state that expires.
+    pub fn insert_equivocating_index(&mut self, index: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .equivocating_indices
+            .insert(index);
+    }
+
+    /// `index`'s most recent LMD GHOST vote.
+    pub fn latest_message(&self, index: u64) -> Option<LatestMessage> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .latest_messages
+            .get(&index)
+            .copied()
+    }
+
+    /// Sets [`Store::latest_message`]. No monotonicity check: the
+    /// specification's own `update_latest_messages` owns that rule.
+    pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .latest_messages
+            .insert(index, message);
+    }
+
+    /// The PoW block with this hash, if bellatrix's merge check has been told
+    /// about it.
+    pub fn beacon_pow_block(&self, hash: Root) -> Option<PowBlock> {
+        self.beacon.lock().unwrap().pow_blocks.get(&hash).copied()
+    }
+
+    /// Records a PoW block for later lookup by its own hash.
+    pub fn insert_beacon_pow_block(&mut self, block: PowBlock) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .pow_blocks
+            .insert(block.block_hash, block);
+    }
+
+    /// The unrealized justified checkpoint computed for `root`'s own post-state.
+    pub fn unrealized_justification(&self, root: Root) -> Option<Checkpoint> {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::BeaconForkChoice, &beacon_root_key(root))
+            .expect("get")
+            .map(|bytes| Checkpoint::from_ssz_bytes(&bytes).expect("valid checkpoint"))
+    }
+
+    /// Sets [`Store::unrealized_justification`].
+    pub fn set_unrealized_justification(&mut self, root: Root, checkpoint: Checkpoint) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::BeaconForkChoice,
+                vec![(beacon_root_key(root), checkpoint.to_ssz())],
+            )
+            .expect("put unrealized justification");
+        batch.commit().expect("commit");
+    }
 }
 
 #[cfg(test)]
@@ -317,8 +508,14 @@ mod tests {
 
     use ethlambda_types::beacon::containers::BeaconState;
     use ethlambda_types::beacon::containers::phase0;
+    use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
+    use ethlambda_types::beacon::primitives::Uint256;
 
     use super::*;
+    // In scope for the concrete `Arc<InMemoryBackend>` the reopen test reads
+    // through; the `impl` above reaches `dyn StorageBackend`, which resolves
+    // its methods without the trait being imported.
+    use crate::api::StorageBackend;
     use crate::backend::InMemoryBackend;
 
     /// A signed block with an empty body and a zero signature. Phase0-shaped
@@ -485,5 +682,107 @@ mod tests {
         assert!(!index.contains_key(&roots[1]));
         assert!(index.contains_key(&roots[2]));
         assert!(index.contains_key(&roots[4]));
+    }
+
+    #[test]
+    fn the_beacon_clock_and_checkpoints_round_trip() {
+        let mut store = Store::init_beacon(Arc::new(InMemoryBackend::new()), 1_700);
+        assert_eq!(store.beacon_genesis_time(), 1_700);
+        assert_eq!(store.beacon_time(), 0);
+        assert_eq!(store.beacon_justified_checkpoint(), Checkpoint::default());
+
+        store.set_beacon_time(12);
+        let justified = Checkpoint {
+            epoch: 3,
+            root: Root::repeat_byte(1),
+        };
+        let finalized = Checkpoint {
+            epoch: 2,
+            root: Root::repeat_byte(2),
+        };
+        store.set_beacon_justified_checkpoint(justified);
+        store.set_beacon_finalized_checkpoint(finalized);
+        store.set_beacon_unrealized_justified_checkpoint(justified);
+        store.set_beacon_unrealized_finalized_checkpoint(finalized);
+
+        assert_eq!(store.beacon_time(), 12);
+        assert_eq!(store.beacon_justified_checkpoint(), justified);
+        assert_eq!(store.beacon_finalized_checkpoint(), finalized);
+        assert_eq!(store.beacon_unrealized_justified_checkpoint(), justified);
+        assert_eq!(store.beacon_unrealized_finalized_checkpoint(), finalized);
+    }
+
+    #[test]
+    fn fork_choice_scratch_round_trips_and_is_shared_across_clones() {
+        let mut store = beacon_store();
+        let clone = store.clone();
+        let root = Root::repeat_byte(1);
+
+        assert_eq!(store.proposer_boost_root(), Root::zero());
+        assert_eq!(store.block_timeliness(root), None);
+        assert!(!store.is_equivocating(7));
+        assert_eq!(store.latest_message(7), None);
+
+        store.set_proposer_boost_root(root);
+        store.set_block_timeliness(root, true);
+        store.insert_equivocating_index(7);
+        store.set_latest_message(
+            7,
+            LatestMessage {
+                epoch: 4,
+                root: Root::repeat_byte(9),
+            },
+        );
+
+        assert_eq!(clone.proposer_boost_root(), root);
+        assert_eq!(clone.block_timeliness(root), Some(true));
+        assert!(clone.is_equivocating(7));
+        assert_eq!(
+            clone.latest_message(7),
+            Some(LatestMessage {
+                epoch: 4,
+                root: Root::repeat_byte(9)
+            })
+        );
+    }
+
+    #[test]
+    fn a_pow_block_is_looked_up_by_its_own_hash() {
+        let mut store = beacon_store();
+        let pow = PowBlock {
+            block_hash: Root::repeat_byte(1),
+            parent_hash: Root::repeat_byte(2),
+            total_difficulty: Uint256::from(9u64),
+        };
+
+        assert_eq!(store.beacon_pow_block(pow.block_hash), None);
+        store.insert_beacon_pow_block(pow);
+        assert_eq!(store.beacon_pow_block(pow.block_hash), Some(pow));
+    }
+
+    #[test]
+    fn an_unrealized_justification_survives_a_store_reopen() {
+        // Unlike the scratch above, this one is persisted: get_voting_source
+        // reads it for every block from a prior epoch, and recomputing it means
+        // replaying epoch processing per lookup.
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::init_beacon(backend.clone(), 0);
+        let root = Root::repeat_byte(1);
+        let checkpoint = Checkpoint {
+            epoch: 5,
+            root: Root::repeat_byte(2),
+        };
+
+        assert_eq!(store.unrealized_justification(root), None);
+        store.set_unrealized_justification(root, checkpoint);
+
+        let view = backend.begin_read().expect("read view");
+        assert!(
+            view.get(Table::BeaconForkChoice, &root.0)
+                .expect("get")
+                .is_some()
+        );
+        drop(view);
+        assert_eq!(store.unrealized_justification(root), Some(checkpoint));
     }
 }
