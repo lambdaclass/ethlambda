@@ -256,9 +256,6 @@ impl Wire {
         }
     }
 
-    /// Allowed dead for one commit: this task is a pure lean refactor, and the
-    /// beacon gossip handler that calls this arrives with the beacon swarm.
-    #[allow(dead_code)]
     pub(crate) fn beacon(&self) -> Option<&beacon::BeaconWire> {
         match self {
             Wire::Beacon(beacon) => Some(beacon),
@@ -753,7 +750,11 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },
         )) => {
-            gossipsub::handle_gossipsub_message(server, message).await;
+            if server.wire.beacon().is_some() {
+                beacon::handler::handle_beacon_gossip_message(server, message).await;
+            } else {
+                gossipsub::handle_gossipsub_message(server, message).await;
+            }
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -770,26 +771,47 @@ async fn handle_swarm_event(
                     direction,
                     "success",
                 );
-                // Send status request on first connection to this peer
-                let our_status = build_status(&server.store);
-                let our_finalized_slot = our_status.finalized.slot;
-                let our_head_slot = our_status.head.slot;
-                info!(
-                    %peer_id,
-                    %direction,
-                    peer_count,
-                    our_finalized_slot,
-                    our_head_slot,
-                    "Peer connected"
-                );
-                server
-                    .swarm_handle
-                    .send_request(
-                        peer_id,
-                        Request::Status(our_status),
-                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                // Compute the beacon status and its log fields first, so no
+                // borrow of `server.wire` is alive across the send.
+                let beacon_status = server.wire.beacon().map(|wire| {
+                    (
+                        beacon::handler::build_status(wire),
+                        hex::encode(wire.fork_digest),
                     )
-                    .await;
+                });
+                match beacon_status {
+                    Some((status, digest)) => {
+                        info!(
+                            %peer_id,
+                            %direction,
+                            peer_count,
+                            fork_digest = %digest,
+                            "Peer connected"
+                        );
+                        beacon::handler::send_status(server, peer_id, status).await;
+                    }
+                    None => {
+                        let our_status = build_status(&server.store);
+                        let our_finalized_slot = our_status.finalized.slot;
+                        let our_head_slot = our_status.head.slot;
+                        info!(
+                            %peer_id,
+                            %direction,
+                            peer_count,
+                            our_finalized_slot,
+                            our_head_slot,
+                            "Peer connected"
+                        );
+                        server
+                            .swarm_handle
+                            .send_request(
+                                peer_id,
+                                Request::Status(our_status),
+                                libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                            )
+                            .await;
+                    }
+                }
             } else {
                 info!(%peer_id, %direction, "Added peer connection");
             }

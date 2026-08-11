@@ -265,3 +265,47 @@ pub fn update_gossip_mesh_peers<'a>(
             .set(count);
     }
 }
+
+static LEAN_BEACON_GOSSIP_MESSAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_messages_total",
+        "Beacon gossip messages received, by topic and decode outcome",
+        &["topic", "result"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "lean_beacon_status_digest_mismatch_total",
+        "Beacon Status requests whose fork digest did not match ours"
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_FORK_DIGEST: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_beacon_fork_digest",
+        "The fork digest this node computed at startup, as a label",
+        &["digest"]
+    )
+    .unwrap()
+});
+
+/// Count one gossip message. `result` is `decoded`, `decode_failed`, or
+/// `decompress_failed`.
+pub fn inc_beacon_gossip(topic: &str, result: &str) {
+    LEAN_BEACON_GOSSIP_MESSAGES_TOTAL
+        .with_label_values(&[topic, result])
+        .inc();
+}
+
+pub fn inc_beacon_status_digest_mismatch() {
+    LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
+}
+
+/// Publish the computed fork digest as a label, so a dashboard can tell at a
+/// glance whether a node is stranded on a boundary it failed to cross.
+pub fn set_beacon_fork_digest(digest: &str) {
+    LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
+}

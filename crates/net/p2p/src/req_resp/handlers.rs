@@ -53,11 +53,12 @@ pub async fn handle_req_resp_message(
                         );
                         handle_blocks_by_range_request(server, request, channel, peer).await;
                     }
-                    // The beacon responder lands with the beacon handler; until
-                    // then an inbound beacon request is dropped rather than
-                    // answered wrongly.
-                    Request::Beacon(_) => {
-                        debug!(%peer, "Beacon request received before the responder landed");
+                    Request::Beacon(request) => {
+                        info!(kind = "beacon_request", peer_count, "P2P message received");
+                        crate::beacon::handler::handle_beacon_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
                     }
                 }
             }
@@ -72,8 +73,9 @@ pub async fn handle_req_resp_message(
                             info!(kind = "status_response", peer_count, "P2P message received");
                             handle_status_response(server, status, peer).await;
                         }
-                        ResponsePayload::Beacon(_) => {
-                            debug!(%peer, "Beacon response received before the handler landed");
+                        ResponsePayload::Beacon(response) => {
+                            info!(kind = "beacon_response", peer_count, "P2P message received");
+                            crate::beacon::handler::handle_beacon_response(server, peer, response);
                         }
                         ResponsePayload::Blocks(blocks) => {
                             info!(kind = "blocks_response", peer_count, "P2P message received");
