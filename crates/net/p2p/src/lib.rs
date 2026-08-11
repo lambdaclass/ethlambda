@@ -54,6 +54,7 @@ use crate::{
     swarm_adapter::SwarmHandle,
 };
 
+pub mod beacon;
 pub mod discovery;
 mod gossipsub;
 pub mod metrics;
