@@ -8,13 +8,16 @@ use crate::api::{
 type TableData = HashMap<Vec<u8>, Vec<u8>>;
 type StorageData = HashMap<Table, TableData>;
 
-/// Pending operation for a key - last operation wins.
+/// Pending operation in a batch, replayed in call order on commit so the last
+/// operation touching a key wins (matching how RocksDB applies a `WriteBatch`).
 enum PendingOp {
-    Put(Vec<u8>),
-    Delete,
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+    /// Delete every key in the half-open range `[from, to)`.
+    DeleteRange(Vec<u8>, Vec<u8>),
 }
 
-type PendingOps = HashMap<Table, HashMap<Vec<u8>, PendingOp>>;
+type PendingOps = Vec<(Table, PendingOp)>;
 
 /// In-memory storage backend using HashMaps.
 ///
@@ -52,7 +55,7 @@ impl StorageBackend for InMemoryBackend {
     fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, Error> {
         Ok(Box::new(InMemoryWriteBatch {
             data: Arc::clone(&self.data),
-            ops: HashMap::new(),
+            ops: PendingOps::new(),
         }))
     }
 }
@@ -105,34 +108,41 @@ struct InMemoryWriteBatch {
 
 impl StorageWriteBatch for InMemoryWriteBatch {
     fn put_batch(&mut self, table: Table, batch: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), Error> {
-        let table_ops = self.ops.entry(table).or_default();
         for (key, value) in batch {
-            table_ops.insert(key, PendingOp::Put(value));
+            self.ops.push((table, PendingOp::Put(key, value)));
         }
         Ok(())
     }
 
     fn delete_batch(&mut self, table: Table, keys: Vec<Vec<u8>>) -> Result<(), Error> {
-        let table_ops = self.ops.entry(table).or_default();
         for key in keys {
-            table_ops.insert(key, PendingOp::Delete);
+            self.ops.push((table, PendingOp::Delete(key)));
         }
+        Ok(())
+    }
+
+    fn delete_range(&mut self, table: Table, from: &[u8], to: &[u8]) -> Result<(), Error> {
+        let range = PendingOp::DeleteRange(from.to_vec(), to.to_vec());
+        self.ops.push((table, range));
         Ok(())
     }
 
     fn commit(self: Box<Self>) -> Result<(), Error> {
         let mut guard = self.data.write().map_err(|e| e.to_string())?;
 
-        for (table, ops) in self.ops {
+        for (table, op) in self.ops {
             let table_data = guard.get_mut(&table).expect("table exists");
-            for (key, op) in ops {
-                match op {
-                    PendingOp::Put(value) => {
-                        table_data.insert(key, value);
-                    }
-                    PendingOp::Delete => {
-                        table_data.remove(&key);
-                    }
+            match op {
+                PendingOp::Put(key, value) => {
+                    table_data.insert(key, value);
+                }
+                PendingOp::Delete(key) => {
+                    table_data.remove(&key);
+                }
+                // Keys are unordered here, so the range is applied by scanning
+                // the table rather than by seeking to `from`.
+                PendingOp::DeleteRange(from, to) => {
+                    table_data.retain(|key, _| key < &from || key >= &to);
                 }
             }
         }

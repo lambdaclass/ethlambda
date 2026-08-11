@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ethlambda_state_transition::state_transition;
+use ethlambda_state_transition::{process_block, state_transition};
+use ethlambda_test_fixtures::{RejectionReason, rejection::check_rejection_reason};
 use ethlambda_types::{
     block::Block,
     primitives::{H256, HashTreeRoot as _},
@@ -12,6 +13,39 @@ use crate::types::PostState;
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "state_transition_test";
 
+/// Fixtures to replay through `process_block` alone, matched as substrings of
+/// the test name.
+///
+/// Both entries are authored against leanSpec's `BlockSpec.skip_slot_processing`
+/// (`packages/testing/src/consensus_testing/test_types/block_spec.py`), which
+/// drives the filler to call `process_block` instead of `state_transition`, and
+/// to write the failing block with a placeholder zero `stateRoot`. That entry
+/// point never reaches the emitted fixture: `StateTransitionFixture` carries only
+/// `pre`, `blocks`, `post`, `postStateRoot` and `rejectionReason`. Replaying
+/// `state_transition()` as the format otherwise prescribes therefore runs
+/// `process_slots` first, which either makes the slots agree or rejects the block
+/// early, and the run dies before reaching the rule under test.
+///
+/// So the entry point is supplied here, which is the one piece of information the
+/// JSON omits, rather than skipping the vectors: `process_block` alone does
+/// enforce both rules and reports exactly the reason each fixture names. Scoped
+/// to these two names, not applied as a general "retry under another entry point"
+/// fallback, which would let any negative fixture pass on whichever path happens
+/// to produce the expected reason.
+///
+/// Upstream: the flag arrived in leanSpec PR #161 and grew a
+/// `check_state_transition` sibling in PR #1186, but nothing emits either into
+/// the fixture yet. Drop this list once something does; a vector that no longer
+/// needs the override then fails here loudly instead of passing quietly.
+const PROCESS_BLOCK_ONLY_TESTS: &[&str] = &[
+    // BLOCK_SLOT_MISMATCH from a state at slot 1 and a block claiming slot 2;
+    // `process_slots` would make the slots agree first.
+    "test_block_with_wrong_slot",
+    // BLOCK_OLDER_THAN_LATEST_HEADER from a second block at the tip's slot;
+    // `process_slots` would reject the first block before the header check runs.
+    "test_block_at_parent_slot_rejected_when_slot_processing_skipped",
+];
+
 mod types;
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
@@ -21,6 +55,19 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             return Err(format!(
                 "Unsupported fixture format: {} (expected {})",
                 test.info.fixture_format, SUPPORTED_FIXTURE_FORMAT
+            )
+            .into());
+        }
+        // Which entry point replays this fixture (see `PROCESS_BLOCK_ONLY_TESTS`).
+        let process_block_only = PROCESS_BLOCK_ONLY_TESTS
+            .iter()
+            .any(|entry| name.contains(entry));
+        // Skipping slot processing also skips the post-state root check, so the
+        // override is only sound for a fixture that asserts a rejection.
+        if process_block_only && test.post.is_some() {
+            return Err(format!(
+                "Test '{name}' is listed in PROCESS_BLOCK_ONLY_TESTS but carries a `post`, \
+                 which `process_block` alone cannot verify. Remove it from the list."
             )
             .into());
         }
@@ -44,7 +91,11 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
             let block: Block = block.into();
             let label = format!("block_{}", i + 1);
             block_registry.insert(label, block.hash_tree_root());
-            result = state_transition(&mut pre_state, &block);
+            result = if process_block_only {
+                process_block(&mut pre_state, &block)
+            } else {
+                state_transition(&mut pre_state, &block)
+            };
             if result.is_err() {
                 break;
             }
@@ -69,12 +120,24 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
                 }
             }
             (Ok(_), None) => {
-                return Err(
-                    format!("Test '{name}' failed: expected failure but got success").into(),
-                );
+                let expected = test
+                    .rejection_reason
+                    .as_ref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Test '{name}' failed: expected failure{expected} but got success"
+                )
+                .into());
             }
-            (Err(_), None) => {
-                // Expected failure
+            // Expected failure. When the fixture names why, the transition must
+            // have failed for that reason: a state-root mismatch standing in for
+            // the rule under test is a pass for the wrong reason.
+            (Err(err), None) => {
+                if let Some(expected) = test.rejection_reason.as_ref() {
+                    let actual = RejectionReason::from(&err);
+                    check_rejection_reason(&name, expected, Some(&actual), &err)?;
+                }
             }
             (Err(err), Some(_)) => {
                 return Err(format!(

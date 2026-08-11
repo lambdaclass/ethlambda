@@ -9,11 +9,16 @@ use crate::error::Error;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
-    attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
+    attestation::{
+        AggregatedAttestation, AggregationBits, AttestationData, HashedAttestationData,
+        bits_is_subset, validator_indices,
+    },
     block::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
+    constants::INTERVALS_PER_SLOT,
+    genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
     state::{ChainConfig, State, anchor_pair_is_consistent},
 };
@@ -21,7 +26,7 @@ use libssz::{SszDecode, SszEncode};
 
 use crate::state_diff::StateDiff;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -105,11 +110,11 @@ const SNAPSHOT_ANCHOR_INTERVAL: u64 = 1_024;
 /// snapshot read or a diff-chain reconstruction.
 const STATE_CACHE_CAPACITY: usize = 32;
 
-/// Keep block signatures for at least this many slots below the tip, even once
-/// finalized. Signatures older than this window are pruned only when the window
-/// lies entirely within finalized history; see [`Store::prune_old_block_signatures`].
+/// Keep block proofs for at least this many slots below the tip, even once
+/// finalized. Proofs older than this window are pruned only when the window
+/// lies entirely within finalized history; see [`Store::prune_old_block_proofs`].
 /// ~1 day at 4-second slots.
-const SIGNATURE_PRUNING_RANGE: u64 = 21_600;
+const BLOCK_PROOF_PRUNING_RANGE: u64 = 21_600;
 
 /// ~30 minutes of resume window at 4-second slots (1800 / 4 = 450).
 pub const MAX_RESUMABLE_DB_STATE_AGE: u64 = 450;
@@ -295,31 +300,6 @@ impl PayloadBuffer {
         }
         pruned
     }
-
-    /// Extract per-validator latest attestations from proofs' participation bits.
-    ///
-    /// An equivocator can cast two distinct votes at the same `slot`. To keep the
-    /// extracted head a pure function of pool contents (independent of arrival or
-    /// insertion order), votes are processed newest-first with an equal-slot tie
-    /// broken toward the larger canonical attestation-data root — the same rule the
-    /// block-level fork-choice tiebreak applies to block roots (leanSpec #1181). The
-    /// pool key is already `hash_tree_root(data)`, so the tie needs no extra hashing.
-    fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
-        let mut ordered: Vec<(&H256, &PayloadEntry)> = self.data.iter().collect();
-        // Descending by (slot, data_root): the larger tuple is the canonical winner.
-        ordered.sort_unstable_by(|a, b| (b.1.data.slot, b.0).cmp(&(a.1.data.slot, a.0)));
-
-        let mut result: HashMap<u64, AttestationData> = HashMap::new();
-        for (_data_root, entry) in ordered {
-            for proof in &entry.proofs {
-                for vid in proof.participant_indices() {
-                    // Descending order means the first vote seen for a validator wins.
-                    result.entry(vid).or_insert_with(|| entry.data.clone());
-                }
-            }
-        }
-        result
-    }
 }
 
 /// Gossip signatures grouped by attestation data.
@@ -339,6 +319,12 @@ pub type GossipSignatureSnapshot = Vec<(HashedAttestationData, Vec<(u64, Validat
 type StorageKey = Vec<u8>;
 type StorageEntry = (StorageKey, Vec<u8>);
 type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
+
+#[derive(Clone, Default)]
+struct ForkChoiceState {
+    known_votes: HashMap<u64, AttestationData>,
+    new_votes: HashMap<u64, AttestationData>,
+}
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
 ///
@@ -479,10 +465,9 @@ impl GossipSignatureBuffer {
 
     /// Extract per-validator latest attestations from the raw signature pool.
     ///
-    /// Mirrors `PayloadBuffer::extract_latest_attestations`: votes are processed
-    /// newest-first with an equal-slot tie broken toward the larger canonical
-    /// attestation-data root, so the extracted winner is independent of arrival or
-    /// insertion order (leanSpec #1181). This matches the leanSpec
+    /// Votes are processed newest-first with an equal-slot tie broken toward the
+    /// larger canonical attestation-data root, so the extracted winner is
+    /// independent of arrival or insertion order (leanSpec #1181). This matches the leanSpec
     /// `location == "signatures"` checker, which folds `attestation_signatures`
     /// keeping each validator's canonical-precedence winner.
     fn extract_latest_attestations(&self) -> HashMap<u64, AttestationData> {
@@ -521,7 +506,7 @@ fn encode_slot_root_key(slot: u64, root: &H256) -> Vec<u8> {
     result
 }
 
-/// Decode a slot||root key (LiveChain / BlockSignatures) from bytes.
+/// Decode a slot||root key (LiveChain / BlockProof) from bytes.
 fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
@@ -551,8 +536,19 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 #[derive(Clone)]
 pub struct Store {
     backend: Arc<dyn StorageBackend>,
+    /// Cached copy of the persisted [`ChainConfig`].
+    ///
+    /// The config is written once at bootstrap and has no setter, so a plain copy
+    /// per `Store` cannot go stale: sharing it behind an `Arc` would buy nothing.
+    /// It stays in `Table::Metadata` under `KEY_CONFIG` because `from_db_state`
+    /// reads it back to reject a DB whose `genesis_time` disagrees with the config
+    /// file; this field only spares every caller a backend round trip and a
+    /// `Result` it could never act on.
+    config: ChainConfig,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
+    /// Fork-choice votes, independent from bounded proof/signature buffers.
+    fork_choice: Arc<Mutex<ForkChoiceState>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
@@ -606,13 +602,24 @@ impl Store {
 
     /// Build a Store from the state already persisted in the storage backend.
     ///
-    /// Returns `None` if the backend is empty or its persisted `genesis_time`
-    /// doesn't match `expected_genesis_time`.
+    /// Returns `None` when the backend holds no chain state yet, leaving the
+    /// caller to initialize one from genesis or a checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::GenesisMismatch`] when the persisted chain was started
+    /// from a different genesis than `genesis`. This is fatal rather than a
+    /// fall back to "treat the DB as empty": writing a new anchor on top would
+    /// leave the foreign chain's rows in place, and slot-indexed reads such as
+    /// [`Self::get_signed_blocks_by_slot_range`] would then serve them to
+    /// peers.
     pub fn from_db_state(
         backend: Arc<dyn StorageBackend>,
-        expected_genesis_time: u64,
+        genesis: &GenesisConfig,
     ) -> Result<Option<Self>, Error> {
         let persisted_config = {
+            // Both keys are written by `init_store`, so a backend missing
+            // either has never held a chain.
             let view = backend.begin_read().expect("read view");
             let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
                 return Ok(None);
@@ -626,23 +633,38 @@ impl Store {
             }
             ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
         };
-        if persisted_config.genesis_time != expected_genesis_time {
-            warn!(
-                db_genesis_time = persisted_config.genesis_time,
-                expected_genesis_time,
-                "Persisted DB has a different genesis_time; treating as empty"
-            );
-            return Ok(None);
-        }
         let store = Self {
             backend,
+            config: persisted_config,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            fork_choice: Default::default(),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
         };
+
+        // Compare against the finalized state rather than the persisted
+        // `ChainConfig`: the config carries only `genesis_time`, so it cannot
+        // catch a chain that shares our genesis time but not our validator
+        // set. Finalized is chosen over head because it is the state the
+        // anchor is rebuilt from and it never gets pruned.
+        let finalized = store.latest_finalized()?.root;
+        let state = store
+            .get_state(&finalized)?
+            .ok_or(Error::UnexpectedMissingState(finalized))?;
+        genesis.verify_state(&state).inspect_err(|err| {
+            error!(
+                %err,
+                db_genesis_time = state.config.genesis_time,
+                db_validators = state.validators.len(),
+                expected_genesis_time = genesis.genesis_time,
+                expected_validators = genesis.genesis_validators.len(),
+                "Persisted DB belongs to a different network; refusing to reuse this data directory"
+            )
+        })?;
+
         info!("Loaded store from persisted DB state");
         Ok(Some(store))
     }
@@ -748,8 +770,10 @@ impl Store {
 
         Ok(Self {
             backend,
+            config: anchor_state.config,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+            fork_choice: Default::default(),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
@@ -781,9 +805,8 @@ impl Store {
 
     /// Returns the current store time in interval counts since genesis.
     ///
-    /// Each increment represents one 800ms interval. Derive slot/interval as:
-    ///   slot     = time() / INTERVALS_PER_SLOT
-    ///   interval = time() % INTERVALS_PER_SLOT
+    /// Each increment represents one 800ms interval. Use [`Self::current_slot`]
+    /// for the slot; the interval within it is `time() % INTERVALS_PER_SLOT`.
     pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
     }
@@ -793,11 +816,19 @@ impl Store {
         self.set_metadata(KEY_TIME, &time)
     }
 
+    /// The current slot, derived from the store clock.
+    pub fn current_slot(&self) -> u64 {
+        self.time().expect("store time exists") / INTERVALS_PER_SLOT
+    }
+
     // ============ Config ============
 
     /// Returns the chain configuration.
-    pub fn config(&self) -> Result<ChainConfig, Error> {
-        self.get_metadata(KEY_CONFIG)
+    ///
+    /// Infallible: the config is fixed at bootstrap and cached in the `Store`,
+    /// so this never reads the backend.
+    pub fn config(&self) -> &ChainConfig {
+        &self.config
     }
 
     // ============ Head ============
@@ -891,10 +922,10 @@ impl Store {
         Ok(())
     }
 
-    /// Prune finalized block signatures to keep signature storage bounded.
+    /// Prune finalized block proofs to keep proof storage bounded.
     ///
     /// State diffs, block headers, block bodies, and full-state snapshots are
-    /// all retained for the full history and are never pruned. Only signatures
+    /// all retained for the full history and are never pruned. Only proofs
     /// of finalized blocks older than the pruning window are removed.
     ///
     /// This is separated from `update_checkpoints` so callers can defer heavy
@@ -909,11 +940,11 @@ impl Store {
             .map_or(finalized_slot, |header| {
                 header.expect("Failed to get block header").slot
             });
-        let pruned_signatures = self
-            .prune_old_block_signatures(finalized_slot, tip_slot)
-            .expect("prune old block signatures");
-        if pruned_signatures > 0 {
-            info!(pruned_signatures, "Pruned old finalized block signatures");
+        let pruned_below_slot = self
+            .prune_old_block_proofs(finalized_slot, tip_slot)
+            .expect("prune old block proofs");
+        if pruned_below_slot > 0 {
+            info!(pruned_below_slot, "Pruned old finalized block proofs");
         }
         Ok(())
     }
@@ -1063,56 +1094,52 @@ impl Store {
         pruned_new + pruned_known
     }
 
-    /// Prune signatures of old finalized blocks, keeping a recent window.
+    /// Prune proofs of old finalized blocks, keeping a recent window.
     ///
-    /// Signatures within [`SIGNATURE_PRUNING_RANGE`] slots of `tip_slot` are
-    /// always kept, as are all signatures of non-finalized blocks. Concretely,
-    /// with `cutoff = tip_slot - SIGNATURE_PRUNING_RANGE`:
+    /// Proofs within [`BLOCK_PROOF_PRUNING_RANGE`] slots of `tip_slot` are
+    /// always kept, as are all proofs of non-finalized blocks. Concretely,
+    /// with `cutoff = tip_slot - BLOCK_PROOF_PRUNING_RANGE`:
     ///
-    /// - if `cutoff <= finalized_slot` (healthy finality): delete signatures for
+    /// - if `cutoff <= finalized_slot` (healthy finality): delete proofs for
     ///   `slot < cutoff` (entirely within finalized history);
     /// - otherwise (the non-finalized range exceeds the window): prune nothing,
     ///   since pruning up to `cutoff` would touch non-finalized blocks.
     ///
     /// Headers and bodies are always retained. Finalized blocks can never be
-    /// reverted, so their signatures are not needed for fork choice, re-org
+    /// reverted, so their proofs are not needed for fork choice, re-org
     /// safety, or re-aggregation once outside the window.
     ///
-    /// Returns the number of signatures pruned.
-    pub fn prune_old_block_signatures(
+    /// Returns the exclusive slot below which proofs were dropped, or 0 when
+    /// nothing was pruned. This is a range delete, so the count of removed keys
+    /// is not known without reading the table back.
+    pub fn prune_old_block_proofs(
         &mut self,
         finalized_slot: u64,
         tip_slot: u64,
-    ) -> Result<usize, Error> {
-        let cutoff = tip_slot.saturating_sub(SIGNATURE_PRUNING_RANGE);
+    ) -> Result<u64, Error> {
+        let cutoff = tip_slot.saturating_sub(BLOCK_PROOF_PRUNING_RANGE);
         // Only prune when the whole window is finalized; never touch
-        // non-finalized signatures.
-        if cutoff > finalized_slot {
+        // non-finalized proofs. A zero cutoff covers nothing.
+        if cutoff > finalized_slot || cutoff == 0 {
             return Ok(0);
         }
 
-        let view = self.backend.begin_read().expect("read view");
+        // Keys are slot||root in big-endian slot order, so the cutoff's bare
+        // slot prefix is an exact upper bound: keys below the cutoff sort
+        // before it, and keys at the cutoff sort after it (they extend it with
+        // a root). A single range delete drops them all without reading the
+        // table (and without walking the tombstones left by earlier prunes).
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_range(
+                Table::BlockProof,
+                &0u64.to_be_bytes(),
+                &cutoff.to_be_bytes(),
+            )
+            .expect("delete finalized block proofs");
+        batch.commit().expect("commit");
 
-        // Keys are slot||root in big-endian slot order, so iteration ascends by
-        // slot: take entries below the cutoff and stop at the first one past it.
-        let keys_to_delete: Vec<Vec<u8>> = view
-            .prefix_iterator(Table::BlockSignatures, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .map(|(key, _)| key.to_vec())
-            .take_while(|key| decode_slot_root_key(key).0 < cutoff)
-            .collect();
-        drop(view);
-
-        let count = keys_to_delete.len();
-        if count > 0 {
-            let mut batch = self.backend.begin_write().expect("write batch");
-            batch
-                .delete_batch(Table::BlockSignatures, keys_to_delete)
-                .expect("delete finalized block signatures");
-            batch.commit().expect("commit");
-        }
-        Ok(count)
+        Ok(cutoff)
     }
 
     /// Get the block header by root.
@@ -1128,8 +1155,8 @@ impl Store {
 
     /// Insert a block as pending (parent state not yet available).
     ///
-    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockSignatures`
-    /// **without** writing to `LiveChain`. This persists the heavy signature
+    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockProof`
+    /// **without** writing to `LiveChain`. This persists the heavy proof
     /// data (~3KB+ per block) to disk while keeping the block invisible to
     /// fork choice.
     ///
@@ -1170,6 +1197,7 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+        self.record_known_attestation_votes(&block.body.attestations);
         Ok(())
     }
 
@@ -1201,15 +1229,15 @@ impl Store {
     /// Get a signed block by combining header, body, and the merged proof.
     ///
     /// Returns None if the header or body (for non-empty bodies) is missing,
-    /// or if the signature row is missing for any block other than the
+    /// or if the proof row is missing for any block other than the
     /// slot-0 anchor.
     ///
-    /// Signatures are absent in two cases: genesis-style anchor blocks (no
-    /// proposer ever signed them), and finalized blocks whose signatures were
-    /// pruned by [`prune_old_block_signatures`](Self::prune_old_block_signatures).
+    /// Proofs are absent in two cases: genesis-style anchor blocks (no
+    /// proposer ever signed them), and finalized blocks whose proofs were
+    /// pruned by [`prune_old_block_proofs`](Self::prune_old_block_proofs).
     /// To keep BlocksByRoot symmetric with the fork-choice view for peers,
     /// synthesize an empty proof for the slot-0 anchor only; for any other slot
-    /// a missing signature surfaces as `None` (a pruned finalized block can no
+    /// a missing proof surfaces as `None` (a pruned finalized block can no
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
@@ -1231,7 +1259,7 @@ impl Store {
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockSignatures, &sig_key).expect("get") {
+        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
             Some(proof_bytes) => {
                 MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
@@ -1418,20 +1446,46 @@ impl Store {
 
     // ============ Attestation Extraction ============
 
-    /// Extract per-validator latest attestations from known (fork-choice-active) payloads.
+    fn should_replace_vote(existing: &AttestationData, candidate: &AttestationData) -> bool {
+        candidate.slot > existing.slot
+            || (candidate.slot == existing.slot
+                && candidate.hash_tree_root() > existing.hash_tree_root())
+    }
+
+    fn record_vote(
+        votes: &mut HashMap<u64, AttestationData>,
+        validator_id: u64,
+        data: &AttestationData,
+    ) {
+        let should_replace = votes
+            .get(&validator_id)
+            .is_none_or(|existing| Self::should_replace_vote(existing, data));
+        if should_replace {
+            votes.insert(validator_id, data.clone());
+        }
+    }
+
+    fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        for attestation in attestations {
+            for validator_id in validator_indices(&attestation.aggregation_bits) {
+                Self::record_vote(
+                    &mut fork_choice.known_votes,
+                    validator_id,
+                    &attestation.data,
+                );
+            }
+        }
+    }
+
+    /// Extract per-validator latest attestations from known fork-choice votes.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.known_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations()
+        self.fork_choice.lock().unwrap().known_votes.clone()
     }
 
     /// Extract per-validator latest attestations from new (pending) payloads.
     pub fn extract_latest_new_attestations(&self) -> HashMap<u64, AttestationData> {
-        self.new_payloads
-            .lock()
-            .unwrap()
-            .extract_latest_attestations()
+        self.fork_choice.lock().unwrap().new_votes.clone()
     }
 
     /// Extract per-validator latest attestations from the raw gossip signature
@@ -1508,20 +1562,17 @@ impl Store {
         self.new_payloads.lock().unwrap().attestation_data_keys()
     }
 
-    /// Insert a single proof into the known (fork-choice-active) buffer.
-    pub fn insert_known_aggregated_payload(
-        &mut self,
-        hashed: HashedAttestationData,
-        proof: SingleMessageAggregate,
-    ) {
-        self.known_payloads.lock().unwrap().push(hashed, proof);
-    }
-
     /// Batch-insert proofs into the known buffer.
     pub fn insert_known_aggregated_payloads_batch(
         &mut self,
         entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        for (hashed, proof) in &entries {
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.known_votes, validator_id, hashed.data());
+            }
+        }
         self.known_payloads.lock().unwrap().push_batch(entries);
     }
 
@@ -1536,6 +1587,12 @@ impl Store {
         hashed: HashedAttestationData,
         proof: SingleMessageAggregate,
     ) {
+        {
+            let mut fork_choice = self.fork_choice.lock().unwrap();
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.new_votes, validator_id, hashed.data());
+            }
+        }
         self.new_payloads.lock().unwrap().push(hashed, proof);
     }
 
@@ -1544,6 +1601,12 @@ impl Store {
         &mut self,
         entries: Vec<(HashedAttestationData, SingleMessageAggregate)>,
     ) {
+        let mut fork_choice = self.fork_choice.lock().unwrap();
+        for (hashed, proof) in &entries {
+            for validator_id in proof.participant_indices() {
+                Self::record_vote(&mut fork_choice.new_votes, validator_id, hashed.data());
+            }
+        }
         self.new_payloads.lock().unwrap().push_batch(entries);
     }
 
@@ -1554,6 +1617,15 @@ impl Store {
     /// Drains the new buffer and pushes all entries into the known buffer.
     pub fn promote_new_aggregated_payloads(&mut self) {
         let drained = self.new_payloads.lock().unwrap().drain();
+        {
+            let mut fork_choice = self.fork_choice.lock().unwrap();
+            let mut new_votes = std::mem::take(&mut fork_choice.new_votes);
+            for (validator_id, data) in new_votes.drain() {
+                Self::record_vote(&mut fork_choice.known_votes, validator_id, &data);
+            }
+            // Reuse the underlying buffer to keep memory constant
+            fork_choice.new_votes = new_votes;
+        }
         self.known_payloads.lock().unwrap().push_batch(drained);
     }
 
@@ -1695,12 +1767,11 @@ fn write_signed_block(
             .expect("put block body");
     }
 
-    // Store the merged multi-message aggregate proof blob, keyed by slot||root so signature
-    // pruning can scan in slot order and stop early. Table name kept for the
-    // column-family migration cost; renaming to `BlockProof` is a follow-up.
+    // Store the merged multi-message aggregate proof blob, keyed by slot||root
+    // so proof pruning can scan in slot order and stop early.
     let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
     batch
-        .put_batch(Table::BlockSignatures, proof_entries)
+        .put_batch(Table::BlockProof, proof_entries)
         .expect("put block proof");
 
     block
@@ -1710,8 +1781,34 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+    use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
 
-    /// Insert a block header (and dummy body + signature) for a given root, slot,
+    /// Validator at `index` whose two pubkeys are filled with `seed`, so
+    /// changing the seed changes the registry without changing its size.
+    fn validator(index: u64, seed: u8) -> Validator {
+        Validator {
+            attestation_pubkey: [seed; 52],
+            proposal_pubkey: [seed.wrapping_add(1); 52],
+            index,
+        }
+    }
+
+    /// Genesis config describing a chain started at `genesis_time` with
+    /// `validators`, for the `from_db_state` identity check.
+    fn genesis_config(genesis_time: u64, validators: &[Validator]) -> GenesisConfig {
+        GenesisConfig {
+            genesis_time,
+            genesis_validators: validators
+                .iter()
+                .map(|v| GenesisValidatorEntry {
+                    attestation_pubkey: v.attestation_pubkey,
+                    proposal_pubkey: v.proposal_pubkey,
+                })
+                .collect(),
+        }
+    }
+
+    /// Insert a block header (and dummy body + proof) for a given root, slot,
     /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
     /// state built from the same `(slot, parent_root)` reconstructs byte-identically.
     fn insert_header(backend: &dyn StorageBackend, root: H256, slot: u64, parent_root: H256) {
@@ -1726,10 +1823,10 @@ mod tests {
             .expect("put body");
         batch
             .put_batch(
-                Table::BlockSignatures,
+                Table::BlockProof,
                 vec![(encode_slot_root_key(slot, &root), vec![0u8; 4])],
             )
-            .expect("put sigs");
+            .expect("put proof");
         batch
             .put_batch(
                 Table::BlockRoots,
@@ -1763,10 +1860,10 @@ mod tests {
         view.get(table, &root.to_ssz()).expect("get").is_some()
     }
 
-    /// Check whether a block signature exists for a (slot, root) pair.
-    fn has_signature(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
+    /// Check whether a block proof exists for a (slot, root) pair.
+    fn has_block_proof(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(Table::BlockSignatures, &encode_slot_root_key(slot, root))
+        view.get(Table::BlockProof, &encode_slot_root_key(slot, root))
             .expect("get")
             .is_some()
     }
@@ -1799,14 +1896,35 @@ mod tests {
         }
     }
 
+    fn signed_block_with_attestations(
+        slot: u64,
+        parent_root: H256,
+        attestations: Vec<AggregatedAttestation>,
+    ) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: attestations.try_into().unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
     impl Store {
         /// Create a Store with an in-memory backend for tests.
         fn test_store() -> Self {
             let backend = Arc::new(InMemoryBackend::new());
             Self {
                 backend,
+                config: ChainConfig { genesis_time: 0 },
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+                fork_choice: Default::default(),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
@@ -1819,8 +1937,10 @@ mod tests {
         fn test_store_with_backend(backend: Arc<InMemoryBackend>) -> Self {
             Self {
                 backend,
+                config: ChainConfig { genesis_time: 0 },
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
+                fork_choice: Default::default(),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                     GOSSIP_SIGNATURE_CAP,
                 ))),
@@ -1906,7 +2026,7 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(block_root))
             .expect("update head");
 
-        let restored = Store::from_db_state(backend, 12345)
+        let restored = Store::from_db_state(backend, &genesis_config(12345, &[]))
             .expect("restore store")
             .expect("store exists");
         let blocks = restored
@@ -1917,33 +2037,56 @@ mod tests {
     }
 
     #[test]
-    fn prune_old_blocks_within_retention() {
+    fn insert_signed_block_records_block_attestation_votes() {
+        let mut store = Store::test_store();
+        let data = make_att_data_for_target(8, root(8));
+        let block = signed_block_with_attestations(
+            1,
+            H256::ZERO,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validators(&[1, 3]).participants,
+                data: data.clone(),
+            }],
+        );
+        let block_root = block.message.hash_tree_root();
+
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert signed block");
+
+        let votes = store.extract_latest_known_attestations();
+        assert_eq!(votes[&1], data);
+        assert_eq!(votes[&3], data);
+    }
+
+    #[test]
+    fn prune_old_block_proofs_within_retention() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
-        // Blocks at slots 0..12, each with header + body + signature.
+        // Blocks at slots 0..12, each with header + body + proof.
         for i in 0..13u64 {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Healthy finality: non-finalized gap (5) < SIGNATURE_PRUNING_RANGE.
+        // Healthy finality: non-finalized gap (5) < BLOCK_PROOF_PRUNING_RANGE.
         // tip = range + 10, finalized = range + 5, so cutoff = tip - range = 10.
-        let tip_slot = SIGNATURE_PRUNING_RANGE + 10;
-        let finalized_slot = SIGNATURE_PRUNING_RANGE + 5;
-        let pruned = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
+        let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 10;
+        let finalized_slot = BLOCK_PROOF_PRUNING_RANGE + 5;
+        let pruned_below_slot = store
+            .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
 
         // cutoff = 10: slots 0..9 pruned, slots 10..12 kept (within the window).
-        assert_eq!(pruned, 10);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 3);
+        assert_eq!(pruned_below_slot, 10);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 3);
 
-        // Oldest signatures are gone, but headers, bodies, and roots stay queryable.
+        // Oldest proofs are gone, but headers, bodies, and roots stay queryable.
         for i in 0..10u64 {
-            assert!(!has_signature(backend.as_ref(), i, &root(i)));
+            assert!(!has_block_proof(backend.as_ref(), i, &root(i)));
         }
         for i in 10..13u64 {
-            assert!(has_signature(backend.as_ref(), i, &root(i)));
+            assert!(has_block_proof(backend.as_ref(), i, &root(i)));
         }
 
         // Headers and bodies are always retained for the whole history.
@@ -1953,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_signatures_noop_when_non_finalized_range_exceeds_window() {
+    fn prune_block_proofs_noop_when_non_finalized_range_exceeds_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1961,19 +2104,19 @@ mod tests {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Deep non-finality: gap (tip - finalized) > SIGNATURE_PRUNING_RANGE, so
+        // Deep non-finality: gap (tip - finalized) > BLOCK_PROOF_PRUNING_RANGE, so
         // cutoff = tip - range > finalized → prune nothing.
-        let tip_slot = SIGNATURE_PRUNING_RANGE + 100;
+        let tip_slot = BLOCK_PROOF_PRUNING_RANGE + 100;
         let finalized_slot = 5;
-        let pruned = store
-            .prune_old_block_signatures(finalized_slot, tip_slot)
+        let pruned_below_slot = store
+            .prune_old_block_proofs(finalized_slot, tip_slot)
             .expect("prune");
-        assert_eq!(pruned, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
+        assert_eq!(pruned_below_slot, 0);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
     #[test]
-    fn prune_signatures_noop_when_tip_within_window() {
+    fn prune_block_proofs_noop_when_tip_within_window() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
 
@@ -1981,11 +2124,11 @@ mod tests {
             insert_header(backend.as_ref(), root(i), i, H256::ZERO);
         }
 
-        // Early chain: tip < SIGNATURE_PRUNING_RANGE → cutoff saturates to 0,
+        // Early chain: tip < BLOCK_PROOF_PRUNING_RANGE → cutoff saturates to 0,
         // so nothing is old enough to prune even though slots are finalized.
-        let pruned = store.prune_old_block_signatures(9, 9).expect("prune");
-        assert_eq!(pruned, 0);
-        assert_eq!(count_entries(backend.as_ref(), Table::BlockSignatures), 10);
+        let pruned_below_slot = store.prune_old_block_proofs(9, 9).expect("prune");
+        assert_eq!(pruned_below_slot, 0);
+        assert_eq!(count_entries(backend.as_ref(), Table::BlockProof), 10);
     }
 
     // ============ State Diff Reconstruction Tests ============
@@ -2235,17 +2378,23 @@ mod tests {
             make_proof_for_validator(0),
         );
         store.insert_new_aggregated_payload(
-            HashedAttestationData::new(data),
+            HashedAttestationData::new(data.clone()),
             make_proof_for_validator(1),
         );
 
         assert_eq!(store.new_payloads.lock().unwrap().len(), 1);
         assert_eq!(store.known_payloads.lock().unwrap().len(), 0);
+        assert_eq!(store.extract_latest_new_attestations()[&0], data);
+        assert_eq!(store.extract_latest_new_attestations()[&1], data);
+        assert!(store.extract_latest_known_attestations().is_empty());
 
         store.promote_new_aggregated_payloads();
 
         assert_eq!(store.new_payloads.lock().unwrap().len(), 0);
         assert_eq!(store.known_payloads.lock().unwrap().len(), 1);
+        assert!(store.extract_latest_new_attestations().is_empty());
+        assert_eq!(store.extract_latest_known_attestations()[&0], data);
+        assert_eq!(store.extract_latest_known_attestations()[&1], data);
         // The known buffer should have 2 proofs for this data
         assert_eq!(
             store.known_payloads.lock().unwrap().data[&data_root]
@@ -2574,18 +2723,18 @@ mod tests {
             HashedAttestationData::new(stale.clone()),
             make_proof_for_validators(&[0]),
         );
-        store.insert_known_aggregated_payload(
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(stale),
             make_proof_for_validators(&[1]),
-        );
+        )]);
         store.insert_new_aggregated_payload(
             HashedAttestationData::new(fresh.clone()),
             make_proof_for_validators(&[2]),
         );
-        store.insert_known_aggregated_payload(
+        store.insert_known_aggregated_payloads_batch(vec![(
             HashedAttestationData::new(fresh),
             make_proof_for_validators(&[3]),
-        );
+        )]);
 
         assert_eq!(store.new_aggregated_payloads_count(), 2);
         assert_eq!(store.known_aggregated_payloads_count(), 2);
@@ -2595,6 +2744,58 @@ mod tests {
         assert_eq!(pruned, 2);
         assert_eq!(store.new_aggregated_payloads_count(), 1);
         assert_eq!(store.known_aggregated_payloads_count(), 1);
+    }
+
+    #[test]
+    fn known_votes_survive_payload_fifo_eviction() {
+        let mut store = Store::test_store();
+        let vote = make_att_data_for_target(100, root(100));
+        let vote_root = vote.hash_tree_root();
+
+        store.insert_known_aggregated_payloads_batch(vec![(
+            HashedAttestationData::new(vote.clone()),
+            make_proof_for_validator(0),
+        )]);
+
+        for i in 0..=AGGREGATED_PAYLOAD_CAP {
+            let slot = i as u64 + 1;
+            let data = make_att_data_for_target(slot, root(1_000 + slot));
+            store.insert_known_aggregated_payloads_batch(vec![(
+                HashedAttestationData::new(data),
+                make_proof_for_validator(1),
+            )]);
+        }
+
+        assert!(
+            !store
+                .known_payloads
+                .lock()
+                .unwrap()
+                .data
+                .contains_key(&vote_root)
+        );
+        assert_eq!(store.extract_latest_known_attestations()[&0], vote);
+    }
+
+    #[test]
+    fn known_votes_survive_finalized_payload_pruning() {
+        let mut store = Store::test_store();
+        let stale = make_att_data_for_target(2, root(2));
+        let fresh = make_att_data_for_target(10, root(10));
+
+        store.insert_known_aggregated_payloads_batch(vec![(
+            HashedAttestationData::new(stale.clone()),
+            make_proof_for_validator(0),
+        )]);
+        store.insert_known_aggregated_payloads_batch(vec![(
+            HashedAttestationData::new(fresh.clone()),
+            make_proof_for_validator(1),
+        )]);
+
+        assert_eq!(store.prune_stale_aggregated_payloads(5), 1);
+        let votes = store.extract_latest_known_attestations();
+        assert_eq!(votes[&0], stale);
+        assert_eq!(votes[&1], fresh);
     }
 
     /// Build an attestation message at `slot` whose target points at `target_root`,
@@ -2608,61 +2809,6 @@ mod tests {
                 slot,
             },
             source: Checkpoint::default(),
-        }
-    }
-
-    /// When two aggregations share `slot` but disagree on the target
-    /// (same-slot equivocation), the vote with the larger canonical
-    /// attestation-data root must win for the validators present in both,
-    /// regardless of arrival/insertion order. This is the deterministic
-    /// fork-choice tiebreak (leanSpec #1181): it makes the extracted head a pure
-    /// function of pool contents, so two nodes that see the same votes in
-    /// different orders agree on the same head.
-    #[test]
-    fn extract_latest_attestations_canonical_root_wins_on_slot_tie() {
-        let target_a = H256([0xaa; 32]);
-        let target_b = H256([0xbb; 32]);
-        let data_a = make_att_data_for_target(3, target_a);
-        let data_b = make_att_data_for_target(3, target_b);
-        // The pool keys the tie on `hash_tree_root(data)`, not on the target root.
-        let root_a = data_a.hash_tree_root();
-        let root_b = data_b.hash_tree_root();
-        assert_ne!(root_a, root_b);
-
-        // The larger canonical root is the deterministic winner for shared voters.
-        let winner_target = if root_a > root_b { target_a } else { target_b };
-
-        // Deliver the same equivocating votes in both arrival orders; the winner
-        // for validators present in both aggregations (0, 1) must be identical.
-        for insert_b_first in [false, true] {
-            let mut buf = PayloadBuffer::new(10);
-            if insert_b_first {
-                buf.push(
-                    HashedAttestationData::new(data_b.clone()),
-                    make_proof_for_validators(&[0, 1, 3, 4]),
-                );
-                buf.push(
-                    HashedAttestationData::new(data_a.clone()),
-                    make_proof_for_validators(&[0, 1, 2]),
-                );
-            } else {
-                buf.push(
-                    HashedAttestationData::new(data_a.clone()),
-                    make_proof_for_validators(&[0, 1, 2]),
-                );
-                buf.push(
-                    HashedAttestationData::new(data_b.clone()),
-                    make_proof_for_validators(&[0, 1, 3, 4]),
-                );
-            }
-            let extracted = buf.extract_latest_attestations();
-            // Shared validators: deterministic canonical winner, independent of order.
-            assert_eq!(extracted[&0].target.root, winner_target);
-            assert_eq!(extracted[&1].target.root, winner_target);
-            // Exclusive validators keep their only vote.
-            assert_eq!(extracted[&2].target.root, target_a);
-            assert_eq!(extracted[&3].target.root, target_b);
-            assert_eq!(extracted[&4].target.root, target_b);
         }
     }
 
@@ -2873,7 +3019,7 @@ mod tests {
         assert_eq!(buf.len(), 2);
     }
 
-    /// `Store::from_anchor_state` writes the header but no `BlockSignatures`
+    /// `Store::from_anchor_state` writes the header but no `BlockProof`
     /// row for the slot-0 anchor. `get_signed_block` must synthesize an empty
     /// proof so the genesis block can still be served on BlocksByRoot /
     /// `/lean/v0/blocks/finalized`.
@@ -2893,14 +3039,14 @@ mod tests {
     }
 
     /// The synthesis branch must be confined to the slot-0 anchor: a
-    /// non-genesis block whose `BlockSignatures` row is missing is treated
+    /// non-genesis block whose `BlockProof` row is missing is treated
     /// as storage corruption and surfaces as `None`, not a fabricated block.
     #[test]
-    fn get_signed_block_returns_none_for_non_genesis_with_missing_signatures() {
+    fn get_signed_block_returns_none_for_non_genesis_with_missing_proof() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
         // Hand-insert a slot-1 header (and empty body, via `EMPTY_BODY_ROOT`)
-        // but skip the `BlockSignatures` row. This mimics the corruption case
+        // but skip the `BlockProof` row. This mimics the corruption case
         // the guard is meant to catch, without going through the normal
         // `insert_signed_block` write path which always writes all three rows.
         let header = BlockHeader {
@@ -2943,34 +3089,65 @@ mod tests {
     fn from_db_state_returns_none_on_empty_backend() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_none()
         );
     }
 
     #[test]
-    fn from_db_state_returns_some_on_matching_genesis_time() {
+    fn from_db_state_returns_some_on_matching_genesis() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_some()
         );
     }
 
+    /// Previously this returned `None` ("treat as empty"), which let the caller
+    /// write a fresh anchor over another network's rows. It is now fatal.
     #[test]
-    fn from_db_state_returns_none_on_genesis_time_mismatch() {
+    fn from_db_state_errors_on_genesis_time_mismatch() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
         let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
-        assert!(
-            Store::from_db_state(backend, 99999)
-                .expect("Failed to get store")
-                .is_none()
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = Store::from_db_state(backend, &genesis_config(99999, &[])) else {
+            panic!("genesis time mismatch must be fatal");
+        };
+        assert!(matches!(
+            err,
+            Error::GenesisMismatch(GenesisMismatch::GenesisTime {
+                expected: 99999,
+                got: 12345,
+            })
+        ));
+    }
+
+    /// The case a `genesis_time`-only check cannot see: same network start
+    /// time, different validator registry.
+    #[test]
+    fn from_db_state_errors_on_validator_set_mismatch() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let persisted = vec![validator(0, 1), validator(1, 2)];
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, persisted.clone()),
         );
+
+        let mut foreign = persisted;
+        foreign[1] = validator(1, 9);
+        let Err(err) = Store::from_db_state(backend, &genesis_config(12345, &foreign)) else {
+            panic!("validator set mismatch must be fatal");
+        };
+        assert!(matches!(
+            err,
+            Error::GenesisMismatch(GenesisMismatch::ValidatorPubkey { index: 1 })
+        ));
     }
 
     #[test]
@@ -2989,7 +3166,7 @@ mod tests {
             .expect("put config");
         batch.commit().expect("commit");
         assert!(
-            Store::from_db_state(backend, 12345)
+            Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
                 .is_none()
         );
