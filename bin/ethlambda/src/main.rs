@@ -1,4 +1,5 @@
 mod beacon;
+mod beacon_checkpoint;
 mod checkpoint_sync;
 mod cli;
 mod fd_limit;
