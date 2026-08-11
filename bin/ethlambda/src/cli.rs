@@ -5,9 +5,36 @@ use std::path::PathBuf;
 
 use crate::version;
 
+/// Flags every subcommand takes, with the same meaning and the same
+/// requiredness on each.
+///
+/// `--node-id`, `--bootnodes`, `--checkpoint-sync-url`, and `--discovery.*` are
+/// deliberately not here even though the design document groups them as common:
+/// each of them is required on one subcommand and optional or absent on the
+/// other, and a flattened struct has one requiredness.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CommonOptions {
+    #[arg(long, default_value = "9000")]
+    pub(crate) gossipsub_port: u16,
+    #[arg(long, default_value = "127.0.0.1")]
+    pub(crate) http_address: IpAddr,
+    #[arg(long, default_value = "5052")]
+    pub(crate) api_port: u16,
+    #[arg(long, default_value = "5054")]
+    pub(crate) metrics_port: u16,
+    #[arg(long)]
+    pub(crate) node_key: PathBuf,
+    /// Directory for RocksDB storage
+    #[arg(long, default_value = "./data")]
+    pub(crate) data_dir: PathBuf,
+}
+
+/// Flags for the lean consensus client.
 #[derive(Debug, clap::Parser)]
 #[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
-pub(crate) struct CliOptions {
+pub(crate) struct LeanOptions {
+    #[command(flatten)]
+    pub(crate) common: CommonOptions,
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     pub(crate) genesis: PathBuf,
@@ -23,16 +50,6 @@ pub(crate) struct CliOptions {
     /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
     #[arg(long)]
     pub(crate) hash_sig_keys_dir: PathBuf,
-    #[arg(long, default_value = "9000")]
-    pub(crate) gossipsub_port: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    pub(crate) http_address: IpAddr,
-    #[arg(long, default_value = "5052")]
-    pub(crate) api_port: u16,
-    #[arg(long, default_value = "5054")]
-    pub(crate) metrics_port: u16,
-    #[arg(long)]
-    pub(crate) node_key: PathBuf,
     /// The node ID to look up in annotated_validators.yaml (e.g., "ethlambda_0")
     #[arg(long)]
     pub(crate) node_id: String,
@@ -78,9 +95,6 @@ pub(crate) struct CliOptions {
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
-    /// Directory for RocksDB storage
-    #[arg(long, default_value = "./data")]
-    pub(crate) data_dir: PathBuf,
     /// Disable the sync-gate's suppression of validator duties.
     ///
     /// By default a node that judges itself to be syncing (local head lagging
@@ -148,17 +162,17 @@ pub(crate) struct DiscoveryConfig {
     pub(crate) advertise_ip: Option<std::net::IpAddr>,
 }
 
-impl CliOptions {
+impl LeanOptions {
     /// Reject a discovery port that collides with the QUIC port.
     ///
     /// Both are UDP. Without this the collision surfaces at bind time as an
     /// opaque `EADDRINUSE` on whichever socket loses the race.
     pub(crate) fn validate_discovery(&self) -> Result<(), String> {
-        if self.discovery.enable && self.discovery.port == self.gossipsub_port {
+        if self.discovery.enable && self.discovery.port == self.common.gossipsub_port {
             return Err(format!(
                 "--discovery.port ({}) must differ from --gossipsub-port ({}): \
                  both bind UDP and cannot share a port",
-                self.discovery.port, self.gossipsub_port
+                self.discovery.port, self.common.gossipsub_port
             ));
         }
         Ok(())
@@ -230,7 +244,7 @@ mod tests {
 
     #[test]
     fn discovery_is_disabled_by_default_on_port_9000() {
-        let opts = CliOptions::parse_from(base_args());
+        let opts = LeanOptions::parse_from(base_args());
         assert!(!opts.discovery.enable);
         assert_eq!(opts.discovery.port, 9000);
     }
@@ -239,7 +253,7 @@ mod tests {
     fn discovery_flags_use_a_dotted_prefix() {
         let mut args = base_args();
         args.extend(["--discovery.enable", "--discovery.port", "9010"]);
-        let opts = CliOptions::parse_from(args);
+        let opts = LeanOptions::parse_from(args);
         assert!(opts.discovery.enable);
         assert_eq!(opts.discovery.port, 9010);
     }
@@ -250,8 +264,8 @@ mod tests {
         // so the failure names the real problem instead of surfacing as EADDRINUSE.
         let mut args = base_args();
         args.push("--discovery.enable");
-        let opts = CliOptions::parse_from(args);
-        assert_eq!(opts.discovery.port, opts.gossipsub_port);
+        let opts = LeanOptions::parse_from(args);
+        assert_eq!(opts.discovery.port, opts.common.gossipsub_port);
         assert!(opts.validate_discovery().is_err());
     }
 
@@ -259,20 +273,20 @@ mod tests {
     fn distinct_ports_validate() {
         let mut args = base_args();
         args.extend(["--discovery.enable", "--discovery.port", "9010"]);
-        let opts = CliOptions::parse_from(args);
+        let opts = LeanOptions::parse_from(args);
         assert!(opts.validate_discovery().is_ok());
     }
 
     #[test]
     fn colliding_ports_are_fine_while_discovery_is_off() {
-        let opts = CliOptions::parse_from(base_args());
-        assert_eq!(opts.discovery.port, opts.gossipsub_port);
+        let opts = LeanOptions::parse_from(base_args());
+        assert_eq!(opts.discovery.port, opts.common.gossipsub_port);
         assert!(opts.validate_discovery().is_ok());
     }
 
     #[test]
     fn advertise_ip_defaults_to_none() {
-        let opts = CliOptions::parse_from(base_args());
+        let opts = LeanOptions::parse_from(base_args());
         assert_eq!(opts.discovery.advertise_ip, None);
     }
 
@@ -280,7 +294,7 @@ mod tests {
     fn advertise_ip_parses_an_explicit_address() {
         let mut args = base_args();
         args.extend(["--discovery.advertise-ip", "203.0.113.7"]);
-        let opts = CliOptions::parse_from(args);
+        let opts = LeanOptions::parse_from(args);
         assert_eq!(
             opts.discovery.advertise_ip,
             Some(std::net::IpAddr::from([203, 0, 113, 7]))

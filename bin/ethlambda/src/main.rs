@@ -32,7 +32,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
-use cli::CliOptions;
+use cli::LeanOptions;
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -80,7 +80,15 @@ async fn main() -> eyre::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")?;
 
-    let options = CliOptions::parse();
+    run_lean(LeanOptions::parse()).await
+}
+
+/// Boot the lean consensus client.
+///
+/// Everything `main` did after parsing, moved verbatim, so that the subcommand
+/// dispatch added next has a single function to call and the lean startup order
+/// is provably unchanged.
+async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
     options
         .validate_discovery()
         .map_err(|err| eyre::eyre!(err))?;
@@ -94,9 +102,9 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_start_time();
 
     let rpc_config = RpcConfig {
-        http_address: options.http_address,
-        api_port: options.api_port,
-        metrics_port: options.metrics_port,
+        http_address: options.common.http_address,
+        api_port: options.common.api_port,
+        metrics_port: options.common.metrics_port,
         version: version::CLIENT_VERSION,
     };
 
@@ -123,13 +131,13 @@ async fn main() -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key).wrap_err_with(|| {
+    let node_p2p_key = read_hex_file_bytes(&options.common.node_key).wrap_err_with(|| {
         format!(
             "failed to load node key from {}",
-            options.node_key.display()
+            options.common.node_key.display()
         )
     })?;
-    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.common.gossipsub_port);
     let discovery_enabled = options.discovery.enable;
     let discovery_port = options.discovery.port;
 
@@ -138,7 +146,7 @@ async fn main() -> eyre::Result<()> {
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
 
-    info!(node_key=?options.node_key, "got node key");
+    info!(node_key=?options.common.node_key, "got node key");
 
     let config_path = options.genesis;
     let bootnodes_path = options.bootnodes;
@@ -195,8 +203,8 @@ async fn main() -> eyre::Result<()> {
         read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
             .wrap_err("failed to load validator keys")?;
 
-    let data_dir =
-        std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
+    let data_dir = std::path::absolute(&options.common.data_dir)
+        .unwrap_or_else(|_| options.common.data_dir.clone());
     info!(data_dir = %data_dir.display(), "Initializing DB");
     std::fs::create_dir_all(&data_dir)
         .wrap_err_with(|| format!("failed to create data directory {}", data_dir.display()))?;
