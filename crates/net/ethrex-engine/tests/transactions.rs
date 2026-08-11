@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{engine, funded_address, genesis, signed_transfer};
+use common::{engine, funded_address, genesis, signed_transfer, signed_transfer_from};
 use ethlambda_types::primitives::H256 as LeanH256;
 use ethrex_common::Address;
 
@@ -198,4 +198,47 @@ async fn rejects_payload_whose_block_hash_does_not_match_its_contents() {
         err.to_string().contains("claims block hash"),
         "expected a block-hash mismatch, got: {err}"
     );
+}
+
+/// Regenerate the hex fixtures the RPC crate's submit-endpoint tests post.
+///
+/// Those tests need a validly signed transaction but should not pull in
+/// secp256k1 just to make one, so they read a checked-in hex file instead. This
+/// is the generator, ignored by default:
+///
+/// ```text
+/// cargo test -p ethlambda-ethrex-engine --profile release-fast \
+///   --test transactions -- --ignored regenerate_rpc_fixtures --nocapture
+/// ```
+///
+/// Rerun it if the genesis chain id or the funded account changes.
+#[test]
+#[ignore = "writes fixture files; run explicitly when the genesis changes"]
+fn regenerate_rpc_fixtures() {
+    let chain_id = genesis().config.chain_id;
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../rpc/tests/fixtures");
+    std::fs::create_dir_all(dir).expect("create fixtures dir");
+
+    let funded = signed_transfer(chain_id, 0, RECIPIENT, 1);
+    std::fs::write(
+        format!("{dir}/signed_transfer_nonce_0.hex"),
+        format!("0x{}\n", hex_encode(&funded)),
+    )
+    .expect("write funded fixture");
+
+    // An account the genesis does not fund, so the mempool rejects it for
+    // balance rather than for anything about its signature.
+    let unfunded = secp256k1::SecretKey::from_byte_array(&[0x11; 32]).expect("valid key");
+    let broke = signed_transfer_from(&unfunded, chain_id, 0, RECIPIENT, 1);
+    std::fs::write(
+        format!("{dir}/signed_transfer_unfunded.hex"),
+        format!("0x{}\n", hex_encode(&broke)),
+    )
+    .expect("write unfunded fixture");
+
+    println!("wrote 2 fixtures to {dir} (chain_id {chain_id})");
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

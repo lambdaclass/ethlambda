@@ -13,6 +13,7 @@
 #   ./run.sh --nodes 1 --slots 10   # single node
 #   ./run.sh --trace --keep         # EL trace logs, leave nodes running
 #   ./run.sh --build                # build the node image from this repo first
+#   ./run.sh --no-tx                # skip the transaction submission/inclusion check
 #
 set -euo pipefail
 
@@ -30,6 +31,7 @@ KEEP=false
 BUILD=false
 VERIFY=true
 NO_EL=false
+NO_TX=false
 
 KEYGEN_IMAGE="blockblaz/hash-sig-cli:latest"
 GENESIS_IMAGE="ethpandaops/eth-beacon-genesis:pk910-leanchain"
@@ -57,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --trace)       TRACE=true; shift ;;
     --keep)        KEEP=true; shift ;;
     --build)       BUILD=true; shift ;;
+    --no-tx)       NO_TX=true; shift ;;
     --no-verify)   VERIFY=false; shift ;;
     --no-el)       NO_EL=true; shift ;;
     -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -305,9 +308,69 @@ if [[ "$KEEP" == true ]]; then
 fi
 
 RUNTIME=$(( GENESIS_OFFSET + SLOTS * SECONDS_PER_SLOT ))
-step "Running for ~$SLOTS slots (${RUNTIME}s: ${GENESIS_OFFSET}s to genesis + ${SLOTS}×${SECONDS_PER_SLOT}s)"
 trap teardown EXIT
-sleep "$RUNTIME"
+
+# Transactions can only be submitted while the nodes are up, and inclusion can
+# only be read back from the API before teardown, so both happen mid-run.
+if [[ "$NO_EL" == true || "$NO_TX" == true ]]; then
+  step "Running for ~$SLOTS slots (${RUNTIME}s: ${GENESIS_OFFSET}s to genesis + ${SLOTS}×${SECONDS_PER_SLOT}s)"
+  sleep "$RUNTIME"
+else
+  # Let genesis pass and a few blocks accumulate before submitting, so the
+  # transaction lands in a normal steady-state block rather than block 1.
+  SETTLE=$(( GENESIS_OFFSET + 4 * SECONDS_PER_SLOT ))
+  step "Running to genesis + 4 slots (${SETTLE}s) before submitting a transaction"
+  sleep "$SETTLE"
+
+  # The same signed nonce-0 transfer the RPC tests post: 1 wei from the
+  # genesis-funded 0xf39f...2266. Each run generates a fresh chain, so nonce 0
+  # is always the right nonce.
+  TX_FILE="$REPO_ROOT/crates/net/rpc/tests/fixtures/signed_transfer_nonce_0.hex"
+  TX_RAW="$(tr -d '\n\r ' < "$TX_FILE")"
+  TX_BODY="$(printf '0x%s' "${TX_RAW#0x}")"
+
+  # Submitted to *every* node because there is no execution-layer gossip yet: a
+  # transaction sits in only the mempool that received it, so it would otherwise
+  # wait for that one node's turn to propose. Whichever node proposes next now
+  # includes it, and the rest evict it when they import the block.
+  step "Submitting a transaction to $NODES node(s)"
+  TX_ACCEPTED=0
+  for ((i = 0; i < NODES; i++)); do
+    RESP=$(curl -sS -m 5 -X POST \
+      -H 'content-type: application/json' \
+      -d "{\"raw\": \"$TX_BODY\"}" \
+      "http://127.0.0.1:$((15052 + i))/lean/v0/admin/el/tx" 2>&1 || echo "REQUEST_FAILED")
+    if [[ "$RESP" == *tx_hash* ]]; then
+      TX_ACCEPTED=$(( TX_ACCEPTED + 1 ))
+      TX_HASH="${RESP#*\"tx_hash\":\"}"; TX_HASH="${TX_HASH%%\"*}"
+      ok "$(node_name "$i") accepted it ($TX_HASH)"
+    else
+      warn "$(node_name "$i") rejected it: $RESP"
+    fi
+  done
+  echo "$TX_ACCEPTED" > "$LOG_DIR/tx-accepted.count"
+
+  REMAINING=$(( RUNTIME - SETTLE ))
+  step "Running the remaining ~$(( REMAINING / SECONDS_PER_SLOT )) slots (${REMAINING}s)"
+  sleep "$REMAINING"
+
+  # Find the block that carries it. The raw bytes are echoed verbatim in the
+  # payload's `transactions` list, so a substring match is exact — no jq needed.
+  step "Looking for the transaction on chain"
+  TX_NEEDLE="$(printf '%s' "${TX_RAW#0x}" | tr 'A-Z' 'a-z')"
+  : > "$LOG_DIR/tx-inclusion.json"
+  for ((slot = SLOTS; slot >= 1; slot--)); do
+    BLOCK=$(curl -sS -m 5 "http://127.0.0.1:15052/lean/v0/blocks/$slot" 2>/dev/null || true)
+    if [[ "$(printf '%s' "$BLOCK" | tr 'A-Z' 'a-z')" == *"$TX_NEEDLE"* ]]; then
+      printf '%s\n' "$BLOCK" > "$LOG_DIR/tx-inclusion.json"
+      echo "$slot" > "$LOG_DIR/tx-inclusion.slot"
+      ok "found in the block at slot $slot"
+      break
+    fi
+  done
+  [[ -s "$LOG_DIR/tx-inclusion.json" ]] || warn "not found in slots 1..$SLOTS"
+fi
+
 trap - EXIT
 teardown
 
@@ -361,7 +424,32 @@ else
   warn "payload build/execute counts need --trace (they log at trace level)"
 fi
 
-# 6. red flags
+# 6. the transaction went in and was executed. Reads the block captured mid-run,
+#    since the API is gone by now.
+if [[ "$NO_EL" == true || "$NO_TX" == true ]]; then
+  warn "transaction check skipped"
+else
+  ACCEPTED=$(cat "$LOG_DIR/tx-accepted.count" 2>/dev/null || echo 0)
+  if (( ACCEPTED == NODES )); then ok "transaction accepted by $ACCEPTED/$NODES node(s)"
+  else warn "transaction accepted by $ACCEPTED/$NODES node(s)"; FAIL=1; fi
+
+  if [[ -s "$LOG_DIR/tx-inclusion.json" ]]; then
+    INCL_SLOT=$(cat "$LOG_DIR/tx-inclusion.slot" 2>/dev/null || echo '?')
+    ok "transaction included in the block at slot $INCL_SLOT"
+    # Executing a transfer burns gas, so a zero here would mean the payload
+    # carried the transaction without running it. `gasUsed` is a hex *string*
+    # (`"0x5208"`) — every numeric payload field uses the hex_u64 serde helper —
+    # so extract the hex and let bash convert it.
+    GAS_HEX=$(tr ',' '\n' < "$LOG_DIR/tx-inclusion.json" |
+      grep -o '"gasUsed":"0x[0-9a-fA-F]*"' | head -1 | grep -o '0x[0-9a-fA-F]*' || true)
+    if [[ -n "$GAS_HEX" && "$GAS_HEX" != "0x0" ]]; then ok "gasUsed=$(( GAS_HEX )) in that block"
+    else warn "gasUsed missing or zero in that block (got '${GAS_HEX:-none}')"; FAIL=1; fi
+  else
+    warn "transaction never made it into a block"; FAIL=1
+  fi
+fi
+
+# 7. red flags
 BAD=$(( $(count "using synthetic payload") + $(count "EL rejected payload") ))
 if (( BAD == 0 )); then ok "no synthetic fallbacks / rejected payloads"
 else warn "EL failure lines: $BAD"; FAIL=1; fi

@@ -37,6 +37,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/node/syncing` | JSON | Sync status relative to the wall clock |
 | `GET` | `/lean/v0/admin/aggregator` | JSON | Current aggregator role |
 | `POST` | `/lean/v0/admin/aggregator` | JSON | Toggle aggregator role at runtime |
+| `POST` | `/lean/v0/admin/el/tx` | JSON | Submit a transaction to the embedded EL mempool |
 
 ### `GET /lean/v0/health`
 
@@ -207,6 +208,31 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 | `503` | Aggregator controller not wired (does not occur in normal `main.rs` boot) |
 
 > **Note:** Runtime toggles do **not** resubscribe gossip subnets, which are frozen at startup. A standby aggregator should boot with `--is-aggregator=true` (so subscriptions are in place), then use this endpoint to rotate duties. See the CLAUDE.md "Runtime Aggregator Toggle" notes for the operational model.
+
+### `POST /lean/v0/admin/el/tx`
+
+Submit an RLP-encoded transaction to the embedded execution layer's mempool. This is the **only** way transactions enter the system: ethrex is linked as a library and the node deliberately does not depend on `ethrex-rpc`, so there is no `eth_sendRawTransaction`.
+
+```bash
+curl -X POST http://127.0.0.1:5052/lean/v0/admin/el/tx \
+  -H 'content-type: application/json' \
+  -d '{"raw": "0x02f8720883...c0"}'
+# → {"tx_hash": "0x8a1c...f39b"}
+```
+
+The `0x` prefix on `raw` is optional. ethrex validates the transaction itself — encoded size, duplicate hash, signature recovery, nonce, balance, chain id, replacement rules — and its rejection message is passed through verbatim, since that is the useful part.
+
+| Status | Condition |
+|--------|-----------|
+| `200` | Accepted into the mempool; returns the transaction hash |
+| `400` | Missing/malformed body, missing `raw`, `raw` not a string, invalid hex, undecodable transaction, or a mempool rejection |
+| `501` | This node has no execution layer (started without `--el-genesis`) |
+
+> **Note:** `200` means *accepted as a candidate*, not included. The transaction is included when some proposer next fills a block. Until execution-layer gossip lands, a transaction stays in only the mempool that received it — so it waits for **that node's** turn to propose. Submit to every node if you want it in the next block regardless of who proposes; `scripts/inprocess-devnet/run.sh` does exactly that.
+>
+> The `501` is deliberately not the `503` the aggregator endpoints return for a missing controller: `503` implies "retry later", whereas the execution layer is configured at startup and will never appear on a node that started without it.
+>
+> Note the EL genesis `chainId` is `3503995874084926`, which exceeds 2⁵³ — JavaScript-based signing tools will silently corrupt it. Sign with `cast` or Python.
 
 ## Metrics & Debug Server (`:5054`)
 

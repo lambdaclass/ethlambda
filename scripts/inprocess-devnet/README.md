@@ -36,6 +36,7 @@ see `docs/ethrex-inprocess-integration.md`.)
 | `--image REF` | `ghcr.io/lambdaclass/ethlambda:local` | Node image to run. |
 | `--el-genesis PATH` | repo Cancun fixture | EL genesis JSON. Must be Cancun. |
 | `--workdir DIR` | `.devnet-inprocess/` | Where genesis, data and logs go (recreated each run). |
+| `--no-tx` | off | Skip submitting a transaction and checking it was included. |
 | `--no-verify` | off | Skip the post-run checks. |
 
 ## What it verifies
@@ -46,7 +47,28 @@ After the run it checks the log evidence and exits non-zero if something looks w
 - blocks were produced, and (with peers) imported over gossip,
 - finality advanced — needs roughly 30 slots,
 - with `--trace`: EL payloads were **built** and **submitted for execution**,
+- a submitted transaction was **accepted, included in a block, and executed**
+  (`gasUsed > 0`),
 - zero synthetic fallbacks, rejected payloads, or panics.
+
+### The transaction check
+
+Four slots after genesis the script posts a signed transfer to
+`/lean/v0/admin/el/tx` on **every** node, then scans the blocks afterwards for
+those exact raw bytes.
+
+It submits to every node deliberately. There is no execution-layer gossip yet, so
+a transaction sits only in the mempool that received it — submit to one node and
+you wait for that node's turn to propose. Fanning out means whichever node
+proposes next includes it, and the others drop it from their mempools when they
+import the block. Once EL devp2p lands, submitting to one node will be enough and
+this becomes the fallback.
+
+The transaction is a checked-in fixture (`crates/net/rpc/tests/fixtures/`) rather
+than signed at runtime, since bash cannot sign. Every run builds a fresh chain,
+so its nonce 0 is always correct. Regenerate it with
+`ethlambda-ethrex-engine`'s ignored `regenerate_rpc_fixtures` test if the EL
+genesis chain id or funded account changes.
 
 Reference healthy run — `./run.sh --nodes 3 --slots 32 --trace`:
 

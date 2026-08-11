@@ -267,6 +267,12 @@ async fn main() -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    // The API server needs the engine too, for transaction submission. Both
+    // hold the same `Arc`, and the blockchain actor stays the only caller of the
+    // slot-loop operations (build/execute/set_head) — submission only touches
+    // the mempool, which ethrex guards internally.
+    let rpc_execution_engine = execution_engine.clone();
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
@@ -329,6 +335,7 @@ async fn main() -> eyre::Result<()> {
             sync_status,
             local_peer_id,
             events,
+            rpc_execution_engine,
             rpc_shutdown,
         )
         .await

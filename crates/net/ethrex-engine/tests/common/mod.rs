@@ -80,9 +80,23 @@ pub fn funded_address() -> Address {
 /// Sign a minimal EIP-1559 value transfer from the funded account.
 ///
 /// Returns the canonical (`0x02 || rlp`) encoding, i.e. exactly what
-/// `submit_raw_transaction` takes. The signing payload mirrors ethrex's own
-/// `compute_sender`, which is what will verify it.
+/// `submit_raw_transaction` takes.
 pub fn signed_transfer(chain_id: u64, nonce: u64, to: Address, value: u64) -> Vec<u8> {
+    signed_transfer_from(&secret_key(), chain_id, nonce, to, value)
+}
+
+/// As [`signed_transfer`], but signed by an arbitrary key — used to produce a
+/// transaction from an account the genesis does not fund.
+///
+/// The signing payload mirrors ethrex's own `compute_sender`, which is what will
+/// verify it.
+pub fn signed_transfer_from(
+    key: &SecretKey,
+    chain_id: u64,
+    nonce: u64,
+    to: Address,
+    value: u64,
+) -> Vec<u8> {
     let mut tx = EIP1559Transaction {
         chain_id,
         nonce,
@@ -111,7 +125,7 @@ pub fn signed_transfer(chain_id: u64, nonce: u64, to: Address, value: u64) -> Ve
 
     let message = Message::from_digest(keccak(&payload).0);
     let (recovery_id, signature) = SECP256K1
-        .sign_ecdsa_recoverable(&message, &secret_key())
+        .sign_ecdsa_recoverable(&message, key)
         .serialize_compact();
 
     tx.signature_y_parity = i32::from(recovery_id) != 0;
