@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the eight tables holds, and which data is in-memory only.
+what each of the nine tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -114,7 +114,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 ## The Tables
 
-The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The nine variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 | Table             | Key         | Value                                     | Pruned?                          |
 | ----------------- | ----------- | ----------------------------------------- | -------------------------------- |
@@ -122,10 +122,11 @@ The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | `BlockBodies`     | root        | `BlockBody`                               | never                            |
 | `BlockProof`      | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
 | `BlockRoots`      | slot        | block root (`H256`)                       | never                            |
-| `States`          | root        | full `State` snapshot                     | never                            |
+| `States`          | root        | fork selector ‖ full state snapshot       | never (lean); two anchors (beacon) |
 | `StateDiffs`      | root        | `StateDiff`                               | never                            |
 | `Metadata`        | string      | SSZ scalars                               | never                            |
 | `LiveChain`       | slot ‖ root | `parent_root`                             | yes: below finalized             |
+| `BeaconForkChoice`| root        | beacon `Checkpoint` (unrealized justification) | never; empty on a lean chain |
 
 ### Key encoding
 
@@ -244,6 +245,41 @@ Presence in `LiveChain` is what makes a block _visible to fork choice_:
 while the block waits for its parent. When the block is later processed,
 `insert_signed_block` overwrites the same keys (idempotent) and adds the
 `LiveChain` entry.
+
+## Two chains, one storage layer
+
+A data directory holds one chain for its whole life. `Metadata["chain"]` says
+which, `Metadata["db_version"]` says which on-disk format it is in, and
+`from_db_state` refuses anything that does not match on either count: there is no
+migration, because the `States` value layout changed and a lean devnet resyncs in
+minutes.
+
+`States` values now begin with a one-byte `ForkName::selector`, so one table can
+hold a lean `State` and a beacon `BeaconState` without the reader having to
+already know which it is.
+
+On a beacon chain the tables carry different things:
+
+| Table | Beacon contents |
+|---|---|
+| `BlockHeaders` | block root -> `(slot, parent_root)`, the two fields the tree walks read |
+| `BlockBodies` | block root -> fork selector, then `SignedBeaconBlock` SSZ |
+| `LiveChain` | slot ‖ root -> parent root: the children index |
+| `States` | the latest two finalized anchors only |
+| `StateDiffs` | unused; beacon states replay rather than diff |
+| `BlockRoots`, `BlockProof` | unused |
+| `BeaconForkChoice` | block root -> unrealized justification |
+
+`BeaconForkChoice` is the ninth table and is empty on a lean chain, as are the
+beacon fields on `Store` itself.
+
+The section below is the **lean** state path. Beacon deliberately does not use
+it: a `StateDiff` omits `validators` on the documented assumption that they never
+change, and a beacon registry changes every epoch, so routing one through would
+corrupt every reconstruction silently rather than failing. Beacon states are
+reconstructed instead by `ethlambda_beacon::fork_choice::block_state`, which
+replays blocks forward from the nearest of the two retained anchors. See
+[beacon_stf.md](beacon_stf.md).
 
 ## State Storage: Snapshots + Diffs
 
@@ -389,8 +425,8 @@ and the (non-finalized) fork choice index are disposable.
 
 ## In-Memory Only (Lost on Restart)
 
-Four `Store` fields never touch the backend. All are bounded buffers shared
-across `Store` clones:
+Six `Store` fields never touch the backend. All are bounded buffers shared
+across `Store` clones; the last two are empty and untouched on a lean chain:
 
 | Buffer              | Capacity        | Contents                                                                                 |
 | ------------------- | --------------- | ---------------------------------------------------------------------------------------- |
@@ -398,6 +434,17 @@ across `Store` clones:
 | `known_payloads`    | 512 messages    | Fork-choice-active aggregated proofs                                                     |
 | `gossip_signatures` | 2048 signatures | Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case) |
 | `state_cache`       | 32 states       | LRU memoization of reconstructed/imported states                                         |
+| `beacon`            | unbounded¹      | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocators, latest messages, PoW blocks |
+| `beacon_cache`      | 2 + 1 states    | Beacon block post-states and checkpoint states; a miss is a replay, never an error       |
+
+¹ Bounded in practice by the validator set and the unfinalized window rather
+than by a cap. Nothing in `beacon` is worth persisting: proposer boost resets
+every slot, timeliness is only read by the same-slot reorg helpers, equivocators
+are rebuilt by replaying attester slashings on sync, latest messages are rebuilt
+by one epoch of attestations, and PoW blocks stand in for a call to an execution
+client that a restarted node would simply make again. The one beacon
+fork-choice map that *is* persisted, the unrealized justification, lives in
+`BeaconForkChoice`.
 
 The payload buffers evict FIFO when full, and redundant proofs (whose
 participants are a subset of an existing proof for the same attestation data)
@@ -411,7 +458,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eight tables survives.
+network. Everything persisted in the nine tables survives.
 
 ## Startup and Restore
 
@@ -424,19 +471,32 @@ A `Store` is created through one of three constructors in
 | `get_forkchoice_store` | [Checkpoint sync](checkpoint_sync.md)  | Initializes from a downloaded finalized state + anchor block, after validating they are consistent |
 | `from_db_state`        | Resume from an existing data directory | Re-opens the persisted store as-is                                                                 |
 
+A fourth, `init_beacon`, opens an empty beacon-chain directory; the anchor block
+and state are written by `ethlambda_beacon::fork_choice::get_forkchoice_store`,
+which needs beacon helpers the storage crate cannot call.
+
 The first two funnel into `init_store`, which writes the anchor in **one
-atomic batch**: all six `Metadata` keys (time = 0, config, head = safe_target
-= anchor root, justified = finalized = anchor checkpoint), the anchor header,
-its `BlockRoots` entry, the body if non-empty, a full snapshot into `States`
-(the base of every future diff chain), and the anchor's `LiveChain` entry.
+atomic batch**: all eight `Metadata` keys (db_version, chain, time = 0, config,
+head = safe_target = anchor root, justified = finalized = anchor checkpoint),
+the anchor header, its `BlockRoots` entry, the body if non-empty, a full snapshot
+into `States` (the base of every future diff chain), and the anchor's
+`LiveChain` entry.
 
 `from_db_state` is the restore path: it reads `config` and `latest_finalized`
-from `Metadata`, returning `None` for an empty DB. A populated DB from another
-network is fatal instead: the finalized state's genesis time and validator
-registry are compared against the genesis config, and a mismatch fails with
-`Error::GenesisMismatch` rather than being treated as empty, since writing a
-fresh anchor would leave the foreign chain's rows in place to be served to
-peers. At startup the node prefers this path but only
+from `Metadata`, returning `None` for an empty DB. Both of those reads answer
+"has this directory ever held a chain", so both come **before** the format
+checks: a directory that never did is `Ok(None)`, not a version mismatch. Having
+established that it did, `from_db_state` then rejects a `db_version` other than
+`DB_VERSION` (`Error::DbVersionMismatch`, with `0` standing for a directory
+written before versioning existed) and a `chain` tag other than `Chain::Lean`
+(`Error::WrongChain`). Neither is recoverable: the `States` value layout changed,
+so every state already written would decode as the wrong shape.
+
+A populated DB from another network is fatal in the same way: the finalized
+state's genesis time and validator registry are compared against the genesis
+config, and a mismatch fails with `Error::GenesisMismatch` rather than being
+treated as empty, since writing a fresh anchor would leave the foreign chain's
+rows in place to be served to peers. At startup the node prefers this path but only
 accepts the on-disk store if its head is at most `MAX_RESUMABLE_DB_STATE_AGE
 = 450` slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.
