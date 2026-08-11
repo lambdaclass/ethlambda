@@ -152,6 +152,15 @@ We have a proof-of-concept formalization of a part of the state transition funct
 - **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
 - **Ecosystem coordination**: the [PQ Interop calls](https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle) on `ethereum/pm` cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.
 
+## Security
+
+We take security seriously. If you discover a vulnerability in this project, please report it responsibly.
+
+- You can report vulnerabilities directly via the **[GitHub "Report a Vulnerability" feature](../../security/advisories/new)**.
+- Alternatively, send an email to **[security@lambdaclass.com](mailto:security@lambdaclass.com)**.
+
+For more details, please refer to our [Security Policy](./.github/SECURITY.md).
+
 ## Contributing
 
 We welcome contributions! Please read our [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get involved.
