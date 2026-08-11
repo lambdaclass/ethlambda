@@ -59,7 +59,13 @@ use crate::beacon::primitives::{
     WithdrawalIndex,
 };
 
-/// The beacon state, in whichever fork's shape it currently has.
+/// The beacon state, in whichever fork's shape it currently has, plus the lean
+/// state.
+///
+/// [`BeaconState::Lean`] is not a Beacon Chain shape. It is here so that one
+/// `BlockChainServer` can dispatch on a single state type; every accessor below
+/// treats it as unreachable, and the enforced boundary is the single `match` at
+/// the top of each handler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BeaconState {
     Phase0(phase0::BeaconState),
@@ -69,6 +75,7 @@ pub enum BeaconState {
     Deneb(deneb::BeaconState),
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
+    Lean(crate::state::State),
 }
 
 impl BeaconState {
@@ -82,6 +89,7 @@ impl BeaconState {
             BeaconState::Deneb(_) => ForkName::Deneb,
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
+            BeaconState::Lean(_) => ForkName::Lean,
         }
     }
 
@@ -113,12 +121,11 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
-            // Lean has a real shape and Task 10 gives this a genuine decode
-            // arm; until BeaconState::Lean exists there is nothing to build.
-            ForkName::Lean => Err(Error::UnsupportedForFork {
-                function: "BeaconState::from_ssz",
-                fork: ForkName::Lean,
-            }),
+            // Lean has a real shape, unlike SignedBeaconBlock::from_ssz's
+            // ForkName::Lean arm: there is something to build here.
+            ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
+                bytes,
+            )?)),
         }
     }
 
@@ -132,6 +139,10 @@ impl BeaconState {
             BeaconState::Deneb(state) => state.to_ssz(),
             BeaconState::Electra(state) => state.to_ssz(),
             BeaconState::Fulu(state) => state.to_ssz(),
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (to_ssz); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -145,6 +156,10 @@ impl BeaconState {
             BeaconState::Deneb(state) => state.hash_tree_root(),
             BeaconState::Electra(state) => state.hash_tree_root(),
             BeaconState::Fulu(state) => state.hash_tree_root(),
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (hash_tree_root); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 }
@@ -185,6 +200,13 @@ macro_rules! shared_state_accessors {
                         BeaconState::Deneb(state) => state.$field,
                         BeaconState::Electra(state) => state.$field,
                         BeaconState::Fulu(state) => state.$field,
+                        BeaconState::Lean(_) => unreachable!(
+                            concat!(
+                                "lean state reached a beacon accessor (",
+                                stringify!($field),
+                                "); BlockChainServer must dispatch on fork_name() before this point"
+                            )
+                        ),
                     }
                 }
 
@@ -197,6 +219,13 @@ macro_rules! shared_state_accessors {
                         BeaconState::Deneb(state) => &mut state.$field,
                         BeaconState::Electra(state) => &mut state.$field,
                         BeaconState::Fulu(state) => &mut state.$field,
+                        BeaconState::Lean(_) => unreachable!(
+                            concat!(
+                                "lean state reached a beacon accessor (",
+                                stringify!($field_mut),
+                                "); BlockChainServer must dispatch on fork_name() before this point"
+                            )
+                        ),
                     }
                 }
             )*
@@ -211,6 +240,13 @@ macro_rules! shared_state_accessors {
                         BeaconState::Deneb(state) => &state.$ref_field,
                         BeaconState::Electra(state) => &state.$ref_field,
                         BeaconState::Fulu(state) => &state.$ref_field,
+                        BeaconState::Lean(_) => unreachable!(
+                            concat!(
+                                "lean state reached a beacon accessor (",
+                                stringify!($ref_field),
+                                "); BlockChainServer must dispatch on fork_name() before this point"
+                            )
+                        ),
                     }
                 }
 
@@ -223,6 +259,13 @@ macro_rules! shared_state_accessors {
                         BeaconState::Deneb(state) => &mut state.$ref_field,
                         BeaconState::Electra(state) => &mut state.$ref_field,
                         BeaconState::Fulu(state) => &mut state.$ref_field,
+                        BeaconState::Lean(_) => unreachable!(
+                            concat!(
+                                "lean state reached a beacon accessor (",
+                                stringify!($ref_field_mut),
+                                "); BlockChainServer must dispatch on fork_name() before this point"
+                            )
+                        ),
                     }
                 }
             )*
@@ -354,6 +397,10 @@ impl BeaconState {
                     },
                 })
             }
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (withdrawal_cursor_mut); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -411,6 +458,10 @@ impl BeaconState {
                 &state.current_epoch_participation,
                 &state.inactivity_scores,
             )),
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (altair_validator_lists); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -473,6 +524,10 @@ impl BeaconState {
                 &mut state.current_epoch_participation,
                 &mut state.inactivity_scores,
             )),
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (altair_validator_lists_mut); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -511,6 +566,10 @@ impl BeaconState {
             BeaconState::Fulu(state) => {
                 Ok((&state.current_sync_committee, &state.next_sync_committee))
             }
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (sync_committees); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -554,6 +613,10 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             )),
+            BeaconState::Lean(_) => unreachable!(
+                "lean state reached a beacon accessor (sync_committees_mut); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 }
@@ -735,3 +798,24 @@ signed_beacon_block_accessors!(
         (signature, BlsSignature),
     ],
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lean_state_reports_the_lean_fork() {
+        let state = BeaconState::Lean(crate::state::State::from_genesis(0, Vec::new()));
+        assert_eq!(state.fork_name(), ForkName::Lean);
+    }
+
+    #[test]
+    #[should_panic(expected = "lean state reached a beacon accessor")]
+    fn a_lean_state_panics_in_a_beacon_accessor() {
+        // The guarantee is structural, not type-level: BeaconState::Lean is
+        // constructible anywhere, so this pins the failure mode to a named
+        // panic rather than a silent wrong answer.
+        let state = BeaconState::Lean(crate::state::State::from_genesis(0, Vec::new()));
+        let _ = state.slot();
+    }
+}
