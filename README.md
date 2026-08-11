@@ -53,17 +53,6 @@ Press `Ctrl+C` to stop all nodes.
 
 For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
 
-## Contributing
-
-We welcome contributions! Please read our [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get involved.
-
-## Community
-
-- **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
-- **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
-- **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
-- **Ecosystem coordination**: the [PQ Interop calls](https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle) on `ethereum/pm` cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.
-
 ## Philosophy
 
 Many long-established clients accumulate bloat over time. This often occurs due to the need to support legacy features for existing users or through attempts to implement overly ambitious software. The result is often complex, difficult-to-maintain, and error-prone systems.
@@ -92,6 +81,10 @@ The following links, repos, companies and projects have been important in the de
 - [Lantern](https://github.com/Pier-Two/lantern)
 
 If we forgot to include anyone, please file an issue so we can add you. We always strive to reference the inspirations and code we use, but as an organization with multiple people, mistakes can happen, and someone might forget to include a reference.
+
+## 📖 Documentation
+
+Full documentation is available in the [`docs/`](./docs) directory. Please refer to it for setup, usage, and development details. For better viewing, we have it hosted in [docs.ethlambda.xyz](https://docs.ethlambda.xyz).
 
 ## Current status
 
@@ -151,3 +144,14 @@ Some features we are looking to implement in the near future, in order of priori
 ### Experimental features
 
 We have a proof-of-concept formalization of a part of the state transition function in Lean4 in PR [#269](https://github.com/lambdaclass/ethlambda/pull/269).
+
+## Community
+
+- **Telegram**: [ethlambda group](https://t.me/ethlambda_client), where we post daily updates; drop by to ask questions or chat about anything Lean-related.
+- **X (Twitter)**: [@ethlambda_lean](https://twitter.com/ethlambda_lean) for occasional updates.
+- **Weekly community call**: every Friday, streamed live on [@class_lambda](https://x.com/class_lambda); the call link is posted on Telegram beforehand.
+- **Ecosystem coordination**: the [PQ Interop calls](https://github.com/ethereum/pm/issues?q=is%3Aissue+%22PQ+Interop%22+in%3Atitle) on `ethereum/pm` cover cross-client Lean Ethereum work and related updates; the meeting links are posted on each issue.
+
+## Contributing
+
+We welcome contributions! Please read our [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get involved.
