@@ -1117,13 +1117,12 @@ it defines are used by the lean side."
 ## Done when
 
 - [x] `make test-beacon` passes both presets with the fixture counts from Task 1 Step 4
-- [x] `make test` passes — **scoped**, see "What the plan got wrong" below
-- [x] `make lint` passes with no warnings — **scoped**, same reason
+- [x] `make test` passes
+- [x] `make lint` passes with no warnings
 - [x] `make fmt` produces no diff
 - [x] `ethlambda_types::beacon::containers::BeaconState::Lean` exists and reports `ForkName::Lean`
 - [x] `ForkName::parse("lean")` returns `None` and `ForkName::Fulu.next()` returns `None`
 - [ ] A lean devnet runs unchanged: `make run-devnet`, blocks produced and finalized
-      — **blocked**, the binary cannot link until the ethrex checkout is fixed
 
 Then start plan 2, CLI subcommands.
 
@@ -1151,17 +1150,18 @@ requirement, so Cargo would silently ignore the patch. Patch **all four**, since
 `libssz-types` depends on `libssz` and `libssz-merkle` by path inside that repo.
 Remove the whole block once `add-deref` is merged and released.
 
-**2. `make test` and `make lint` are broken by something outside this plan.**
-`crates/net/p2p` has an absolute path dependency on a local ethrex *directory*,
-and that checkout is on `feat/discovery-peer-requirements` rather than the
-`feat/lean-discovery-hooks` its comment names, so `NodeRecord::from_node_with_extra_pairs`
-and friends are missing. Pre-dates the beacon merge. The scoped substitutes used
-throughout, and the gates plans 2 to 5 should use until it is resolved:
+**2. `make test` and `make lint` were broken by something outside this plan, and
+are now fixed.** `crates/net/p2p` has an absolute path dependency on a local
+ethrex *directory*, and that checkout had moved to `feat/discovery-peer-requirements`
+rather than the `feat/lean-discovery-hooks` its comment named, so
+`NodeRecord::from_node_with_extra_pairs` and friends were missing. Pre-dated the
+beacon merge, so the tasks above ran against scoped substitutes.
 
-```bash
-cargo test --workspace --exclude ethlambda-beacon --exclude ethlambda-p2p --exclude ethlambda --profile release-fast
-cargo clippy --workspace --exclude ethlambda-p2p --exclude ethlambda --all-targets -- -D warnings
-```
+Resolved separately in commit `ba3b35b`, which migrated the discovery code to
+the newer ethrex API rather than pinning the checkout back. Plans 2 to 5 can use
+plain `make test` and `make lint`. If either starts failing inside
+`ethlambda-p2p` again, check the ethrex checkout's branch before suspecting
+ethlambda, and never build while that repo is mid-rebase.
 
 **3. Task 9 was far larger than one file.** The plan scoped it to `fork.rs`.
 Adding a `ForkName` variant makes every exhaustive match on it non-exhaustive:
