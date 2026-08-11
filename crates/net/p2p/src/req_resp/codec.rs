@@ -12,7 +12,13 @@ use super::{
     },
 };
 
+use crate::beacon::messages::{
+    BeaconMetaData, BeaconStatus, Goodbye, MetaDataV1, MetaDataV2, MetaDataV3, Ping, StatusV1,
+    StatusV2,
+};
+use crate::beacon::protocols;
 use crate::metrics;
+use crate::req_resp::messages::{BeaconRequest, BeaconResponse};
 use ethlambda_types::block::SignedBlock;
 
 /// Short label extracted from a libp2p protocol id, used as the `protocol`
@@ -22,7 +28,64 @@ fn protocol_label(protocol: &str) -> &'static str {
         STATUS_PROTOCOL_V1 => "status",
         BLOCKS_BY_ROOT_PROTOCOL_V1 => "blocks_by_root",
         BLOCKS_BY_RANGE_PROTOCOL_V1 => "blocks_by_range",
-        _ => "unknown",
+        other => crate::beacon::protocols::label(other).unwrap_or("unknown"),
+    }
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Encode a `Status` for the negotiated protocol version.
+///
+/// A version mismatch is an error rather than a conversion: a v1 value written
+/// on a v2 stream would be eight bytes short and the peer would read a
+/// truncated container, which is worse than a refused write.
+fn encode_beacon_status(protocol: &str, status: &BeaconStatus) -> io::Result<Vec<u8>> {
+    match (protocol, status) {
+        (protocols::STATUS_V1, BeaconStatus::V1(status)) => Ok(status.to_ssz()),
+        (protocols::STATUS_V2, BeaconStatus::V2(status)) => Ok(status.to_ssz()),
+        _ => Err(invalid(format!(
+            "status version does not match protocol {protocol}"
+        ))),
+    }
+}
+
+fn decode_beacon_status(protocol: &str, payload: &[u8]) -> io::Result<BeaconStatus> {
+    match protocol {
+        protocols::STATUS_V1 => StatusV1::from_ssz_bytes(payload)
+            .map(BeaconStatus::V1)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        protocols::STATUS_V2 => StatusV2::from_ssz_bytes(payload)
+            .map(BeaconStatus::V2)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        _ => Err(invalid(format!("not a status protocol: {protocol}"))),
+    }
+}
+
+fn encode_beacon_metadata(protocol: &str, metadata: &BeaconMetaData) -> io::Result<Vec<u8>> {
+    match (protocol, metadata) {
+        (protocols::METADATA_V1, BeaconMetaData::V1(value)) => Ok(value.to_ssz()),
+        (protocols::METADATA_V2, BeaconMetaData::V2(value)) => Ok(value.to_ssz()),
+        (protocols::METADATA_V3, BeaconMetaData::V3(value)) => Ok(value.to_ssz()),
+        _ => Err(invalid(format!(
+            "metadata version does not match protocol {protocol}"
+        ))),
+    }
+}
+
+fn decode_beacon_metadata(protocol: &str, payload: &[u8]) -> io::Result<BeaconMetaData> {
+    match protocol {
+        protocols::METADATA_V1 => MetaDataV1::from_ssz_bytes(payload)
+            .map(BeaconMetaData::V1)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        protocols::METADATA_V2 => MetaDataV2::from_ssz_bytes(payload)
+            .map(BeaconMetaData::V2)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        protocols::METADATA_V3 => MetaDataV3::from_ssz_bytes(payload)
+            .map(BeaconMetaData::V3)
+            .map_err(|err| invalid(format!("{err:?}"))),
+        _ => Err(invalid(format!("not a metadata protocol: {protocol}"))),
     }
 }
 
@@ -66,6 +129,25 @@ impl libp2p::request_response::Codec for Codec {
                 })?;
                 Ok(Request::BlocksByRange(request))
             }
+            protocols::STATUS_V1 | protocols::STATUS_V2 => Ok(Request::Beacon(
+                BeaconRequest::Status(decode_beacon_status(protocol.as_ref(), &payload)?),
+            )),
+            protocols::PING_V1 => Ok(Request::Beacon(BeaconRequest::Ping(
+                Ping::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
+            ))),
+            // Resolved to the `'static` constant so the variant can hold it.
+            protocols::METADATA_V1 => Ok(Request::Beacon(BeaconRequest::MetaData(
+                protocols::METADATA_V1,
+            ))),
+            protocols::METADATA_V2 => Ok(Request::Beacon(BeaconRequest::MetaData(
+                protocols::METADATA_V2,
+            ))),
+            protocols::METADATA_V3 => Ok(Request::Beacon(BeaconRequest::MetaData(
+                protocols::METADATA_V3,
+            ))),
+            protocols::GOODBYE_V1 => Ok(Request::Beacon(BeaconRequest::Goodbye(
+                Goodbye::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
+            ))),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -87,6 +169,26 @@ impl libp2p::request_response::Codec for Codec {
             BLOCKS_BY_ROOT_PROTOCOL_V1 | BLOCKS_BY_RANGE_PROTOCOL_V1 => {
                 decode_blocks_response(io, label).await
             }
+            protocols::STATUS_V1 | protocols::STATUS_V2 => {
+                decode_beacon_single_chunk(io, protocol.as_ref(), label, |protocol, payload| {
+                    decode_beacon_status(protocol, payload).map(BeaconResponse::Status)
+                })
+                .await
+            }
+            protocols::PING_V1 => {
+                decode_beacon_single_chunk(io, protocol.as_ref(), label, |_, payload| {
+                    Ping::from_ssz_bytes(payload)
+                        .map(BeaconResponse::Pong)
+                        .map_err(|err| invalid(format!("{err:?}")))
+                })
+                .await
+            }
+            protocols::METADATA_V1 | protocols::METADATA_V2 | protocols::METADATA_V3 => {
+                decode_beacon_single_chunk(io, protocol.as_ref(), label, |protocol, payload| {
+                    decode_beacon_metadata(protocol, payload).map(BeaconResponse::MetaData)
+                })
+                .await
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -105,10 +207,18 @@ impl libp2p::request_response::Codec for Codec {
     {
         trace!(?req, "Writing request");
 
-        let encoded = match req {
+        let encoded = match &req {
             Request::Status(status) => status.to_ssz(),
             Request::BlocksByRoot(request) => request.to_ssz(),
             Request::BlocksByRange(request) => request.to_ssz(),
+            Request::Beacon(BeaconRequest::Status(status)) => {
+                encode_beacon_status(protocol.as_ref(), status)?
+            }
+            Request::Beacon(BeaconRequest::Ping(ping)) => ping.to_ssz(),
+            // The spec's MetaData request is empty, and `write_payload` of an
+            // empty slice emits no bytes at all.
+            Request::Beacon(BeaconRequest::MetaData(_)) => Vec::new(),
+            Request::Beacon(BeaconRequest::Goodbye(goodbye)) => goodbye.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -168,6 +278,25 @@ impl libp2p::request_response::Codec for Codec {
                         // Empty response if no blocks found (stream just ends)
                         Ok(())
                     }
+                    ResponsePayload::Beacon(response) => {
+                        let encoded = match response {
+                            BeaconResponse::Status(status) => {
+                                encode_beacon_status(protocol.as_ref(), status)?
+                            }
+                            BeaconResponse::Pong(ping) => ping.to_ssz(),
+                            BeaconResponse::MetaData(metadata) => {
+                                encode_beacon_metadata(protocol.as_ref(), metadata)?
+                            }
+                        };
+                        io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
+                        let compressed_size = write_payload(io, &encoded).await?;
+                        metrics::observe_reqresp_response_chunk_size(
+                            label,
+                            encoded.len(),
+                            compressed_size,
+                        );
+                        Ok(())
+                    }
                 }
             }
             Response::Error { code, message } => {
@@ -183,6 +312,47 @@ impl libp2p::request_response::Codec for Codec {
             }
         }
     }
+}
+
+/// Read a single-chunk beacon response: one result-code byte, then one payload.
+///
+/// Every beacon protocol this node registers answers with exactly one chunk, so
+/// there is no EOF loop here; the multi-chunk shape arrives with the block
+/// protocols.
+async fn decode_beacon_single_chunk<T, F>(
+    io: &mut T,
+    protocol: &str,
+    protocol_label: &str,
+    decode: F,
+) -> io::Result<Response>
+where
+    T: AsyncRead + Unpin + Send,
+    F: FnOnce(&str, &[u8]) -> io::Result<BeaconResponse>,
+{
+    let mut result_byte = 0_u8;
+    io.read_exact(std::slice::from_mut(&mut result_byte))
+        .await?;
+    let code = ResponseCode::from(result_byte);
+
+    let decoded = decode_payload(io).await?;
+    let payload = decoded.uncompressed;
+    metrics::observe_reqresp_response_chunk_size(
+        protocol_label,
+        payload.len(),
+        decoded.compressed_size,
+    );
+
+    if code != ResponseCode::SUCCESS {
+        let message = ErrorMessage::from_ssz_bytes(&payload)
+            .map_err(|err| invalid(format!("Invalid error message: {err:?}")))?;
+        let error_str = String::from_utf8_lossy(&message).into_owned();
+        trace!(?code, %error_str, "Received error response");
+        return Ok(Response::error(code, message));
+    }
+
+    Ok(Response::success(ResponsePayload::Beacon(decode(
+        protocol, &payload,
+    )?)))
 }
 
 /// Decodes a Status protocol response from a single-chunk response stream.
@@ -302,4 +472,170 @@ where
     }
 
     Ok(Response::success(ResponsePayload::Blocks(blocks)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon::messages::{
+        AttnetsBits, BeaconMetaData, BeaconStatus, Goodbye, MetaDataV3, Ping, StatusV1,
+        SyncnetsBits,
+    };
+    use crate::beacon::protocols;
+    use crate::req_resp::messages::{BeaconRequest, BeaconResponse};
+    use ethlambda_types::beacon::primitives::Root;
+    use futures::io::Cursor;
+    use libp2p::StreamProtocol;
+    use libp2p::request_response::Codec as _;
+
+    fn status() -> BeaconStatus {
+        BeaconStatus::V1(StatusV1 {
+            fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+            finalized_root: Root::zero(),
+            finalized_epoch: 0,
+            head_root: Root::zero(),
+            head_slot: 0,
+        })
+    }
+
+    /// Write a request, then read it back off the same buffer.
+    async fn request_round_trip(protocol: &'static str, request: Request) -> Request {
+        let stream_protocol = StreamProtocol::new(protocol);
+        let mut buffer = Cursor::new(Vec::new());
+        Codec
+            .write_request(&stream_protocol, &mut buffer, request)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        Codec
+            .read_request(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads")
+    }
+
+    /// Write a response, then read it back off the same buffer.
+    async fn response_round_trip(protocol: &'static str, response: Response) -> Response {
+        let stream_protocol = StreamProtocol::new(protocol);
+        let mut buffer = Cursor::new(Vec::new());
+        Codec
+            .write_response(&stream_protocol, &mut buffer, response)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        Codec
+            .read_response(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads")
+    }
+
+    #[tokio::test]
+    async fn a_status_v1_request_round_trips_through_the_snappy_framing() {
+        let decoded = request_round_trip(
+            protocols::STATUS_V1,
+            Request::Beacon(BeaconRequest::Status(status())),
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            Request::Beacon(BeaconRequest::Status(BeaconStatus::V1(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_protocol_version_selects_the_status_shape() {
+        // A v1 payload on a v2 stream would be eight bytes short, so the
+        // version has to come from the negotiated protocol rather than from
+        // whichever variant the caller happened to build.
+        let stream_protocol = StreamProtocol::new(protocols::STATUS_V2);
+        let mut buffer = Cursor::new(Vec::new());
+        let result = Codec
+            .write_request(
+                &stream_protocol,
+                &mut buffer,
+                Request::Beacon(BeaconRequest::Status(status())),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "writing a v1 Status on a v2 stream must be refused, not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ping_round_trips() {
+        let decoded = request_round_trip(
+            protocols::PING_V1,
+            Request::Beacon(BeaconRequest::Ping(Ping { seq_number: 5 })),
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            Request::Beacon(BeaconRequest::Ping(Ping { seq_number: 5 }))
+        ));
+
+        let decoded = response_round_trip(
+            protocols::PING_V1,
+            Response::success(ResponsePayload::Beacon(BeaconResponse::Pong(Ping {
+                seq_number: 5,
+            }))),
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            Response::Success {
+                payload: ResponsePayload::Beacon(BeaconResponse::Pong(Ping { seq_number: 5 }))
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_metadata_request_carries_no_payload() {
+        // The spec's MetaData request is empty. `write_payload` of an empty
+        // slice emits nothing at all, and `decode_payload` reads a zero-length
+        // varint back, so the two agree on an empty stream.
+        let decoded = request_round_trip(
+            protocols::METADATA_V3,
+            Request::Beacon(BeaconRequest::MetaData(protocols::METADATA_V3)),
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            Request::Beacon(BeaconRequest::MetaData(protocols::METADATA_V3))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_metadata_v3_response_round_trips() {
+        let metadata = BeaconMetaData::V3(MetaDataV3 {
+            seq_number: 0,
+            attnets: AttnetsBits::default(),
+            syncnets: SyncnetsBits::default(),
+            custody_group_count: 4,
+        });
+        let decoded = response_round_trip(
+            protocols::METADATA_V3,
+            Response::success(ResponsePayload::Beacon(BeaconResponse::MetaData(metadata))),
+        )
+        .await;
+        let Response::Success {
+            payload: ResponsePayload::Beacon(BeaconResponse::MetaData(BeaconMetaData::V3(v3))),
+        } = decoded
+        else {
+            panic!("expected a v3 MetaData");
+        };
+        assert_eq!(v3.custody_group_count, 4);
+    }
+
+    #[tokio::test]
+    async fn a_goodbye_round_trips() {
+        let decoded = request_round_trip(
+            protocols::GOODBYE_V1,
+            Request::Beacon(BeaconRequest::Goodbye(Goodbye { reason: 128 })),
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            Request::Beacon(BeaconRequest::Goodbye(Goodbye { reason: 128 }))
+        ));
+    }
 }

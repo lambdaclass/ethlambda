@@ -277,11 +277,14 @@ pub struct BuiltSwarm {
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
 
-/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
-pub fn build_swarm(
-    config: SwarmConfig,
-) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
-    let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
+/// The gossipsub parameters both wires share.
+///
+/// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
+/// match the beacon spec, so `seen_ttl` is the only value that differs between
+/// the two networks: lean's slot is 4s with a 3-slot justification lookback,
+/// mainnet's epoch is 32 slots of 12s.
+pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config {
+    libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
         // d_low
@@ -294,8 +297,7 @@ pub fn build_swarm(
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
-        // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
-        .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
+        .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
         // Taken from ream
@@ -304,7 +306,29 @@ pub fn build_swarm(
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000)
         .build()
-        .expect("invalid gossipsub config");
+        .expect("invalid gossipsub config")
+}
+
+impl Behaviour {
+    pub(crate) fn new(
+        identify: libp2p::identify::Behaviour,
+        gossipsub: libp2p::gossipsub::Behaviour,
+        req_resp: request_response::Behaviour<Codec>,
+    ) -> Self {
+        Self {
+            identify,
+            gossipsub,
+            req_resp,
+        }
+    }
+}
+
+/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
+pub fn build_swarm(
+    config: SwarmConfig,
+) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
+    // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
+    let gossipsub_config = gossipsub_config(Duration::from_secs(4 * 3 * 2));
 
     let gossipsub =
         libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
@@ -338,11 +362,7 @@ pub fn build_swarm(
         identity.public(),
     ));
 
-    let behavior = Behaviour {
-        identify,
-        gossipsub,
-        req_resp,
-    };
+    let behavior = Behaviour::new(identify, gossipsub, req_resp);
 
     // TODO: set peer scoring params
 

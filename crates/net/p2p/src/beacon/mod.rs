@@ -10,6 +10,7 @@ pub mod bootnodes;
 pub mod decode;
 pub mod messages;
 pub mod protocols;
+pub mod swarm;
 pub mod topics;
 
 use ethlambda_types::beacon::config::Config;
