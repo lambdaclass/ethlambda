@@ -6,12 +6,21 @@
 //! the peer must advertise a port on a transport we actually speak.
 //!
 //! Lighthouse applies these inside the discovery query itself, via
-//! `discv5.find_node_predicate`. ethrex's `IterativeLookup` takes no ENR
-//! predicate, so ethlambda applies them one layer later, at dial selection. The
-//! visible behavior matches; the cost is that non-matching ENRs occupy peer
-//! table slots until `set_unwanted` sidelines them — and only permanent
-//! rejections (see [`RejectReason::is_permanent`]) get sidelined at all, since
-//! ethrex never clears that flag.
+//! `discv5.find_node_predicate`. ethlambda applies them one layer later, at dial
+//! selection. The visible behavior matches; the cost is that non-matching ENRs
+//! occupy peer table slots until `set_unwanted` sidelines them — and only
+//! permanent rejections (see [`RejectReason::is_permanent`]) get sidelined at
+//! all, since ethrex never clears that flag.
+//!
+//! ethrex now offers a closer fit for this than it did when the module was
+//! written: `PeerRequirements::evaluate` judges each contact as its ENR
+//! arrives, and its `Verdict` splits rejection the same way
+//! [`RejectReason::is_permanent`] does, except that `RejectedForNow` is
+//! *reconsidered* when the peer publishes a higher-`seq` record, which
+//! `set_unwanted` cannot do. Moving these checks into a `PeerRequirements` impl
+//! would drop the dial-selection pass and fix the one-way `unwanted` flag; the
+//! peer table is deliberately spawned with `NoRequirements` until then, so
+//! admission stays here and behavior is unchanged.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -216,7 +225,17 @@ mod tests {
                 .serialize_uncompressed()[1..],
         );
         let node = Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
-        NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap()
+        let mut record = NodeRecord::from_node(&node, 1, &signer).unwrap();
+        // `from_node` writes `tcp: 0`; the real builder leaves it unset. Drop it
+        // so these records match what `build_local_enr` publishes, and re-sign
+        // once with the extras applied.
+        record
+            .edit(&signer, |pairs| {
+                pairs.tcp_port = None;
+                pairs.extra_fields = extra;
+            })
+            .unwrap();
+        record
     }
 
     fn pair(key: &'static [u8], value: Vec<u8>) -> (Bytes, Bytes) {
@@ -248,7 +267,7 @@ mod tests {
     }
 
     /// Build a record whose pairs are fully controlled, bypassing
-    /// `from_node_with_extra_pairs`'s automatic `ip`/`secp256k1` population.
+    /// `from_pairs`'s automatic `secp256k1` population.
     /// `admit` never checks the signature, so an all-zero one is fine; this
     /// is the only way to reach a record with a missing/invalid public key or
     /// with neither `ip` nor `ip6`, both of which `record_with` always fills
@@ -322,7 +341,7 @@ mod tests {
             secp256k1: Some(ethrex_common::H264([0xff; 33])),
             ip: Some(Ipv4Addr::LOCALHOST),
             udp_port: Some(9010),
-            other: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
+            extra_fields: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
             ..Default::default()
         };
         assert_eq!(
@@ -339,7 +358,7 @@ mod tests {
         let pairs = ethrex_p2p::types::NodeRecordPairs {
             secp256k1: Some(ethrex_common::H264(public_key_bytes)),
             udp_port: Some(9010),
-            other: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
+            extra_fields: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
             ..Default::default()
         };
         assert_eq!(

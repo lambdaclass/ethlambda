@@ -2040,6 +2040,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
+ "ethrex-storage",
  "futures",
  "hex",
  "libp2p",

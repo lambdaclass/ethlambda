@@ -15,12 +15,9 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use bytes::Bytes;
 use ethlambda_types::enr::{EnrForkId, encode_attnets};
 use ethrex_common::H512;
-use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord};
-use ethrex_rlp::decode::RLPDecode;
-use ethrex_rlp::encode::RLPEncode;
+use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
 use libssz::SszEncode;
 use secp256k1::{PublicKey, SecretKey};
 
@@ -56,61 +53,50 @@ impl LocalEnrParams {
         )
     }
 
-    /// ENR entries outside the EIP-778 predefined dictionary. Values are
-    /// RLP-encoded, matching how `NodeRecordPairs::other` is decoded.
-    pub fn extra_pairs(&self) -> Vec<(Bytes, Bytes)> {
+    /// The full entry set this node advertises.
+    ///
+    /// `tcp_port` is left unset rather than zero: `from_pairs` takes the entry
+    /// set verbatim, so "no TCP listener" is spelled by the entry's absence.
+    ///
+    /// The three consensus entries go through `set_extra`/`set_extra_int`,
+    /// which pick the RLP codec once. Encoding them by hand is the trap that
+    /// helper exists for: a bare `Vec<u8>` hits the generic `Vec<T>` impl and
+    /// encodes as a *list* of per-byte scalars rather than a byte string, which
+    /// is well-formed but unreadable by every other client, and nothing local
+    /// ever complains.
+    pub fn local_pairs(&self) -> NodeRecordPairs {
+        let mut pairs = NodeRecordPairs {
+            udp_port: Some(self.discovery_port),
+            tcp_port: None,
+            ..Default::default()
+        };
+        match self.ip.to_canonical() {
+            IpAddr::V4(ip) => pairs.ip = Some(ip),
+            IpAddr::V6(ip) => pairs.ip6 = Some(ip),
+        }
+
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
-        vec![
-            (
-                Bytes::from_static(ATTNETS_ENR_KEY),
-                // `Vec<u8>` has a generic `RLPEncode` impl that encodes it as
-                // a *list* of individually-encoded byte scalars, not as a
-                // byte string. Route through `Bytes`, whose `RLPEncode` impl
-                // delegates to `[u8]` and produces the byte-string encoding
-                // `read_extra`'s `Bytes::decode` expects.
-                Bytes::from(Bytes::from(attnets).encode_to_vec()),
-            ),
-            (
-                Bytes::from_static(ETH2_ENR_KEY),
-                Bytes::from(Bytes::from(EnrForkId::local().to_ssz()).encode_to_vec()),
-            ),
-            (
-                Bytes::from_static(QUIC_ENR_KEY),
-                Bytes::from(self.quic_port.encode_to_vec()),
-            ),
-        ]
+        pairs.set_extra(ATTNETS_ENR_KEY, attnets);
+        pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
+        pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port);
+        pairs
     }
 }
 
 /// Build and sign this node's ENR.
 pub fn build_local_enr(params: &LocalEnrParams) -> Result<NodeRecord, String> {
-    NodeRecord::from_node_with_extra_pairs(
-        &params.local_node(),
-        INITIAL_ENR_SEQ,
-        &params.signer,
-        params.extra_pairs(),
-    )
-    .map_err(|err| format!("failed to build local ENR: {err}"))
+    NodeRecord::from_pairs(INITIAL_ENR_SEQ, &params.signer, params.local_pairs())
+        .map_err(|err| format!("failed to build local ENR: {err}"))
 }
 
 /// Read a non-dictionary entry's RLP-decoded byte payload.
 pub fn read_extra(record: &NodeRecord, key: &[u8]) -> Option<Vec<u8>> {
-    let (_, value) = record
-        .pairs()
-        .other
-        .iter()
-        .find(|(k, _)| k.as_ref() == key)?;
-    Bytes::decode(value.as_ref()).ok().map(|b| b.to_vec())
+    record.pairs().extra(key).map(|value| value.to_vec())
 }
 
 /// The advertised libp2p QUIC port, if any.
 pub fn read_quic_port(record: &NodeRecord) -> Option<u16> {
-    let (_, value) = record
-        .pairs()
-        .other
-        .iter()
-        .find(|(k, _)| k.as_ref() == QUIC_ENR_KEY)?;
-    u16::decode(value.as_ref()).ok()
+    record.pairs().extra_int::<u16>(QUIC_ENR_KEY)
 }
 
 #[cfg(test)]
@@ -118,6 +104,7 @@ mod tests {
     use super::*;
     use ethlambda_types::enr::{EnrForkId, decode_attnets};
     use ethrex_p2p::types::Node;
+    use ethrex_rlp::decode::RLPDecode as _;
     use libssz::SszDecode;
     use std::collections::HashSet;
     use std::net::Ipv4Addr;

@@ -583,10 +583,16 @@ impl P2PServer {
         };
 
         if needs_refill {
-            let contacts = peer_table
-                .get_contacts_to_initiate(DISCOVERY_CANDIDATE_BATCH)
-                .await
-                .unwrap_or_default();
+            // ethrex serves one contact per call and records each as tried
+            // before returning it, so successive calls never repeat and an
+            // early `None` means the pool is exhausted.
+            let mut contacts = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
+            for _ in 0..DISCOVERY_CANDIDATE_BATCH {
+                match peer_table.get_contact_to_initiate().await {
+                    Ok(Some(contact)) => contacts.push(*contact),
+                    _ => break,
+                }
+            }
 
             let (mut admitted, unwanted) =
                 select_candidates(contacts, &local_fork_id, self.attestation_committee_count);
@@ -934,17 +940,14 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // speaks no transport we have, which is exactly what every beacon-chain
     // bootnode looks like. Keep it as a discovery seed and let `build_swarm`
     // skip it when it picks static dial targets.
-    let quic_port = pairs
-        .other
-        .iter()
-        .find(|(key, _)| key.as_ref() == b"quic")
-        .map(|(_, value)| {
-            u16::decode(value.as_ref()).map_err(|err| format!("bad quic port: {err}"))
-        })
-        .transpose()?
-        // An absent entry RLP-decodes to 0 via left-padding, and 0 is
-        // undialable either way, so both collapse to "no quic port".
-        .filter(|port| *port != 0);
+    // `extra_int` answers `None` both for an absent entry and for one whose
+    // encoding it cannot read, which includes the non-minimal forms some
+    // clients emit. Either way there is no port we can dial.
+    //
+    // A zero is filtered out too: an absent entry RLP-decodes to 0 via
+    // left-padding, and 0 is undialable regardless, so both collapse to "no
+    // quic port".
+    let quic_port = pairs.extra_int::<u16>(b"quic").filter(|port| *port != 0);
 
     let public_key_bytes = pairs
         .secp256k1
@@ -996,7 +999,7 @@ fn select_candidates(
     let mut unwanted = Vec::new();
     for contact in contacts {
         let Some(record) = contact.record.as_ref() else {
-            // ethrex's `get_contacts_to_initiate` already added this node id
+            // ethrex's `get_contact_to_initiate` already added this node id
             // to `already_tried_peers` when it drew this contact, regardless
             // of what we do with it here. That set is only cleared once a
             // full pool scan finds nothing eligible, so skipping it now does
@@ -1192,28 +1195,23 @@ mod tests {
 
     #[test]
     fn parse_enrs_extracts_the_udp_port_when_present() {
-        use bytes::Bytes;
-        use ethrex_rlp::encode::RLPEncode;
         // `secp256k1` is already bound in this module to `libp2p::identity::secp256k1`
         // (see the top-of-file `use`), so reach the raw `secp256k1` crate that
-        // `ethrex_p2p::types::NodeRecord::from_node_with_extra_pairs` expects via an
-        // explicit crate-root path instead of the shadowed name.
+        // `ethrex_p2p::types::NodeRecord::from_pairs` expects via an explicit
+        // crate-root path instead of the shadowed name.
         use ::secp256k1 as raw_secp256k1;
 
-        // Build an ENR the way ethlambda will once discovery is enabled: udp for
+        // Build an ENR the way ethlambda does once discovery is enabled: udp for
         // discv5, quic for libp2p, no tcp.
         let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
-        let public_key = ethrex_common::H512::from_slice(
-            &raw_secp256k1::PublicKey::from_secret_key(raw_secp256k1::SECP256K1, &signer)
-                .serialize_uncompressed()[1..],
-        );
-        let node =
-            ethrex_p2p::types::Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
-        let extra = vec![(
-            Bytes::from_static(b"quic"),
-            Bytes::from(9001u16.encode_to_vec()),
-        )];
-        let record = NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap();
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(9010),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 9001u16);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
 
         let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
 
@@ -1275,36 +1273,24 @@ mod tests {
     /// hostile peer crafting the bytes by hand would.
     fn enr_for(fork_id: EnrForkId, quic_port: Option<u16>, attnets_bits: Vec<u8>) -> NodeRecord {
         use ::secp256k1 as raw_secp256k1;
-        use ethrex_rlp::encode::RLPEncode;
         use libssz::SszEncode;
 
         let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
-        let public_key = ethrex_common::H512::from_slice(
-            &raw_secp256k1::PublicKey::from_secret_key(raw_secp256k1::SECP256K1, &signer)
-                .serialize_uncompressed()[1..],
-        );
-        let node =
-            ethrex_p2p::types::Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
-        let mut extra = vec![
-            (
-                bytes::Bytes::from_static(crate::discovery::enr::ATTNETS_ENR_KEY),
-                bytes::Bytes::from(bytes::Bytes::from(attnets_bits).encode_to_vec()),
-            ),
-            (
-                bytes::Bytes::from_static(crate::discovery::enr::ETH2_ENR_KEY),
-                bytes::Bytes::from(bytes::Bytes::from(fork_id.to_ssz()).encode_to_vec()),
-            ),
-        ];
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(9010),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra(crate::discovery::enr::ATTNETS_ENR_KEY, attnets_bits);
+        pairs.set_extra(crate::discovery::enr::ETH2_ENR_KEY, fork_id.to_ssz());
         if let Some(port) = quic_port {
-            extra.push((
-                bytes::Bytes::from_static(crate::discovery::enr::QUIC_ENR_KEY),
-                bytes::Bytes::from(port.encode_to_vec()),
-            ));
+            pairs.set_extra_int(crate::discovery::enr::QUIC_ENR_KEY, port);
         }
-        NodeRecord::from_node_with_extra_pairs(&node, 1, &signer, extra).unwrap()
+        NodeRecord::from_pairs(1, &signer, pairs).unwrap()
     }
 
-    /// Wrap a record in a `Contact` the way `PeerTable::get_contacts_to_initiate`
+    /// Wrap a record in a `Contact` the way `PeerTable::get_contact_to_initiate`
     /// would once the ENR has arrived.
     fn contact_with_record(record: NodeRecord) -> Contact {
         let node =

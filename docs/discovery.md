@@ -158,6 +158,23 @@ another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
 
+### The record ethrex serves is not the record we report
+
+`GET /lean/v0/node/identity` reports the ENR built by `build_local_enr`, which
+carries every entry in the table above. ethrex's `DiscoveryServer` builds its
+own copy from the local `Node` and offers no way to seed the consensus entries,
+so the record it answers discv5 queries with carries `ip`, `udp` and
+`secp256k1` but **not** `eth2`, `attnets` or `quic`.
+
+Discovery is therefore one-sided: we find lean peers and admit them, but a lean
+peer applying [the same admission rules](#which-peers-get-dialed) to what ethrex
+serves rejects us for a missing `quic` entry. Copying our reported ENR into
+another node's bootnode list still works, since that is the complete record.
+
+Closing this needs a way to hand ethrex's `DiscoveryServer::spawn` a prepared
+record instead of having it build one. Until then, discovery finds peers but
+cannot be found by them.
+
 ### A beacon-chain client cannot discover us, and `tcp` is why
 
 Beyond the fork digest never matching a real beacon network, there is a second,

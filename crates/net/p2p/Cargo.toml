@@ -40,6 +40,8 @@ rand = "0.8"
 ethrex-p2p = { path = "/Users/mega/execution/ethrex/crates/networking/p2p" }
 ethrex-rlp = { path = "/Users/mega/execution/ethrex/crates/common/rlp" }
 ethrex-common = { path = "/Users/mega/execution/ethrex/crates/common" }
+# Only for the empty in-memory Store that DiscoveryServer::spawn requires.
+ethrex-storage = { path = "/Users/mega/execution/ethrex/crates/storage" }
 
 # Versions pinned to ethrex's workspace: these types cross the API boundary.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }
