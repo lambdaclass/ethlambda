@@ -45,9 +45,9 @@ After importing a block, all validators [recompute their head](./lmd_ghost.md), 
 the latest [finalized and justified checkpoints](./3sf_mini.md) according to the block's
 post-state.
 
-A block body carries at most
-`MAX_ATTESTATIONS_DATA` aggregated attestations: distinct `(slot, head, target, source)` tuples, each paired with a
-bitfield naming the validators bound to it.
+A block body carries at most `MAX_ATTESTATIONS_DATA` aggregated attestations: distinct
+`(slot, head, target, source)` tuples, each paired with a bitfield naming the validators
+bound to it.
 Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot to be
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.
@@ -77,10 +77,10 @@ Aggregators aggregate the votes they have received and gossip the resulting aggr
 attestations to the network. These aggregated attestations are imported by all validators,
 who verify and store them in a "new attestations buffer".
 
-Aggregation earns its own interval because it is the heaviest recurring computation in the
-client: collapsing a subnet's worth of them
-into one proof is heavy CPU work. It is also what makes a block affordable, since a block
-carrying raw votes would need one full XMSS signature per voter, quickly going over the network bandwidth limit.
+Aggregation earns its own interval because collapsing a subnet's worth of XMSS signatures
+into one proof is the heaviest recurring computation in the client. It is also what makes a
+block affordable, since a block carrying raw votes would need one full XMSS signature per
+voter, quickly going over the network bandwidth limit.
 
 > **In ethlambda:** the proofs run on an off-thread worker so the blockchain actor's
 > message loop stays responsive, and a session may start up to `EARLY_AGGREGATION_WINDOW`
@@ -94,7 +94,8 @@ Validators compute the [safe target](./lmd_ghost.md#safe-target-selection) they'
 deciding which finality vote to cast on the next slot. The safe target is computed based on
 the votes received in the current slot.
 
-It is LMD-GHOST run with a two-thirds weight threshold instead of a plain majority, so it
+It is LMD-GHOST again, but run over just the votes that arrived this slot and with a
+two-thirds weight threshold, where head selection applies none. The safe target therefore
 sits at or behind the head and advances only once a branch is backed by a supermajority.
 Deriving targets from it is what stops [3SF-mini](./3sf_mini.md) from justifying a branch
 the network has not visibly converged on.
@@ -105,6 +106,8 @@ Validators merge the aggregated attestations they have in their "new attestation
 into their fork-choice view, and recompute their head.
 
 This is the slot's second and last promotion point; the first is the proposer's, just
-before it builds. Between promotions a vote sits in the buffer without weight, which is
-what keeps a validator's fork-choice view from shifting under it mid-slot. See
-[why staged promotion](./lmd_ghost.md#why-staged-promotion) for the reasoning.
+before it builds. Until a vote is promoted it carries no weight in head selection, which is
+what keeps a validator's fork-choice view from shifting under it mid-slot. The safe target
+is the exception: it reads the unpromoted buffer directly, which is how it stays a view of
+this slot alone. See [why staged promotion](./lmd_ghost.md#why-staged-promotion) for the
+reasoning.
