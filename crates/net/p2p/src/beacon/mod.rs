@@ -7,6 +7,7 @@
 //! which are the beacon spec's to begin with.
 
 pub mod bootnodes;
+pub mod decode;
 pub mod messages;
 pub mod protocols;
 pub mod topics;
