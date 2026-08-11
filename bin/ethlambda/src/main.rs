@@ -420,10 +420,9 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
 
 /// Boot the Ethereum Beacon Chain follower.
 ///
-/// The subcommand exists before the chain does: the mainnet wire lands in plan
-/// 4 of the series and the anchor and fork choice in plan 5. Until then every
-/// parsed flag is logged, so an operator can see the configuration that was
-/// resolved, and startup stops rather than running a node that follows nothing.
+/// Checkpoint sync runs before the swarm exists, because the fork digest that
+/// names every gossip topic is derived from the anchor state's
+/// `genesis_validators_root`. See [`beacon::run`] and `docs/beacon_sync.md`.
 async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
     let discovery_port = options
         .resolve_discovery_port()
@@ -460,6 +459,7 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         discovery_port,
         advertise_ip: options.discovery.advertise_ip,
         bootnode_enrs,
+        data_dir: options.common.data_dir.clone(),
     })
     .await?;
     // Nothing to drive yet: the actor owns the swarm and the dial loop.

@@ -12,11 +12,6 @@
 //! holds by construction, with no retry loop for the case where the provider
 //! advances finalization mid-fetch.
 
-// The client is written before `run_beacon` calls it, so for exactly one commit
-// nothing outside the tests reaches this module. Removed as soon as startup
-// wires it in.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;

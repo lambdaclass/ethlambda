@@ -19,6 +19,7 @@ jemalloc = ["dep:tikv-jemallocator"]
 shadow-integration = ["ethlambda-crypto/shadow-integration"]
 
 [dependencies]
+ethlambda-beacon.workspace = true
 ethlambda-blockchain.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-network-api.workspace = true

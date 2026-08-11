@@ -1917,6 +1917,7 @@ name = "ethlambda"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ethlambda-beacon",
  "ethlambda-blockchain",
  "ethlambda-crypto",
  "ethlambda-network-api",
