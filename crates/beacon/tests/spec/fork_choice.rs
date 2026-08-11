@@ -788,19 +788,27 @@ fn check_should_override_forkchoice_update(
 /// Applies one `checks` step: every field the fixture sets must match.
 fn apply_checks(store: &Store, checks: &Checks, config: &Config) -> Result<(), String> {
     if let Some(expected) = checks.time {
-        check_u64("time", expected, store.time)?;
+        check_u64("time", expected, store.beacon_time())?;
     }
     if let Some(expected) = checks.genesis_time {
-        check_u64("genesis_time", expected, store.genesis_time)?;
+        check_u64("genesis_time", expected, store.beacon_genesis_time())?;
     }
     if let Some(expected) = &checks.justified_checkpoint {
-        check_checkpoint("justified_checkpoint", expected, store.justified_checkpoint)?;
+        check_checkpoint(
+            "justified_checkpoint",
+            expected,
+            store.beacon_justified_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.finalized_checkpoint {
-        check_checkpoint("finalized_checkpoint", expected, store.finalized_checkpoint)?;
+        check_checkpoint(
+            "finalized_checkpoint",
+            expected,
+            store.beacon_finalized_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.proposer_boost_root {
-        check_root("proposer_boost_root", expected, store.proposer_boost_root)?;
+        check_root("proposer_boost_root", expected, store.proposer_boost_root())?;
     }
     if let Some(expected) = &checks.head {
         check_head(expected, store, config)?;

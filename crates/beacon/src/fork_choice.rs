@@ -368,22 +368,22 @@ pub enum DataAvailability {
 pub struct Store {
     /// The current time, as Unix seconds. See the module documentation for how
     /// this relates to the millisecond deadlines the reorg helpers compute.
-    pub time: u64,
-    pub genesis_time: u64,
-    pub justified_checkpoint: Checkpoint,
-    pub finalized_checkpoint: Checkpoint,
+    time: u64,
+    genesis_time: u64,
+    justified_checkpoint: Checkpoint,
+    finalized_checkpoint: Checkpoint,
     /// The highest justified checkpoint observed in any block's post-state,
     /// whether or not that block's *own* chain has an on-chain epoch boundary
     /// that has caught up to reflect it yet.
-    pub unrealized_justified_checkpoint: Checkpoint,
+    unrealized_justified_checkpoint: Checkpoint,
     /// The finalized-checkpoint counterpart to
     /// [`Store::unrealized_justified_checkpoint`].
-    pub unrealized_finalized_checkpoint: Checkpoint,
+    unrealized_finalized_checkpoint: Checkpoint,
     /// The most recent timely, uncontested block seen this slot, or the zero
     /// root if none has arrived yet or a new slot has reset it. While set,
     /// [`get_weight`] adds [`get_proposer_score`]'s boost to this block and
     /// every ancestor of it.
-    pub proposer_boost_root: Root,
+    proposer_boost_root: Root,
     /// Validators caught attesting to two conflicting things, via
     /// [`on_attester_slashing`]. [`get_weight`] excludes their vote entirely,
     /// rather than letting an equivocator's [`LatestMessage`] count for either
@@ -424,6 +424,75 @@ pub struct Store {
 }
 
 impl Store {
+    /// The current time, as Unix seconds. See the module documentation for how
+    /// this relates to the millisecond deadlines the reorg helpers compute.
+    pub fn beacon_time(&self) -> u64 {
+        self.time
+    }
+
+    /// Sets [`Store::beacon_time`].
+    pub fn set_beacon_time(&mut self, time: u64) {
+        self.time = time;
+    }
+
+    /// Genesis, as Unix seconds.
+    pub fn beacon_genesis_time(&self) -> u64 {
+        self.genesis_time
+    }
+
+    /// The justified checkpoint fork choice is currently descending from.
+    pub fn beacon_justified_checkpoint(&self) -> Checkpoint {
+        self.justified_checkpoint
+    }
+
+    /// Sets [`Store::beacon_justified_checkpoint`]. No monotonicity check:
+    /// [`update_checkpoints`] owns that rule.
+    pub fn set_beacon_justified_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.justified_checkpoint = checkpoint;
+    }
+
+    /// The finalized checkpoint. Fork choice never descends below it.
+    pub fn beacon_finalized_checkpoint(&self) -> Checkpoint {
+        self.finalized_checkpoint
+    }
+
+    /// Sets [`Store::beacon_finalized_checkpoint`].
+    pub fn set_beacon_finalized_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.finalized_checkpoint = checkpoint;
+    }
+
+    /// The highest justified checkpoint observed in any block's post-state.
+    pub fn beacon_unrealized_justified_checkpoint(&self) -> Checkpoint {
+        self.unrealized_justified_checkpoint
+    }
+
+    /// Sets [`Store::beacon_unrealized_justified_checkpoint`].
+    pub fn set_beacon_unrealized_justified_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.unrealized_justified_checkpoint = checkpoint;
+    }
+
+    /// The finalized counterpart to
+    /// [`Store::beacon_unrealized_justified_checkpoint`].
+    pub fn beacon_unrealized_finalized_checkpoint(&self) -> Checkpoint {
+        self.unrealized_finalized_checkpoint
+    }
+
+    /// Sets [`Store::beacon_unrealized_finalized_checkpoint`].
+    pub fn set_beacon_unrealized_finalized_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.unrealized_finalized_checkpoint = checkpoint;
+    }
+
+    /// The most recent timely, uncontested block seen this slot, or the zero
+    /// root if none has arrived yet or a new slot has reset it.
+    pub fn proposer_boost_root(&self) -> Root {
+        self.proposer_boost_root
+    }
+
+    /// Sets [`Store::proposer_boost_root`].
+    pub fn set_proposer_boost_root(&mut self, root: Root) {
+        self.proposer_boost_root = root;
+    }
+
     /// The cached state at `checkpoint`, if [`store_target_checkpoint_state`]
     /// (or [`get_forkchoice_store`], for the anchor checkpoint) has already
     /// computed one.
@@ -542,7 +611,10 @@ pub fn get_forkchoice_store(
 
 /// How many whole slots have elapsed since genesis, as of `store.time`.
 pub fn get_slots_since_genesis(store: &Store, config: &Config) -> u64 {
-    store.time.saturating_sub(store.genesis_time) / config.seconds_per_slot
+    store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time())
+        / config.seconds_per_slot
 }
 
 /// The slot `store.time` currently falls in.
@@ -616,12 +688,11 @@ pub fn get_checkpoint_block(store: &Store, root: Root, epoch: Epoch) -> Result<R
 /// See [`calculate_committee_fraction`] for why this divides by a bare
 /// `100` rather than [`constants::BASIS_POINTS`].
 pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
+    let justified_state = store
+        .checkpoint_state(&store.beacon_justified_checkpoint())
+        .ok_or(Error::SpecAssert(
+            "store.justified_checkpoint in store.checkpoint_states",
+        ))?;
     let committee_weight = get_total_active_balance(justified_state)? / preset::SLOTS_PER_EPOCH;
     Ok(committee_weight.saturating_mul(config.proposer_score_boost) / 100)
 }
@@ -631,7 +702,7 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// through `root`, plus the proposer boost if it applies.
 pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
     let state = store
-        .checkpoint_state(&store.justified_checkpoint)
+        .checkpoint_state(&store.beacon_justified_checkpoint())
         .ok_or(Error::SpecAssert(
             "store.justified_checkpoint in store.checkpoint_states",
         ))?;
@@ -656,12 +727,12 @@ pub fn get_weight(store: &Store, root: Root, config: &Config) -> Result<Gwei> {
         }
     }
 
-    if store.proposer_boost_root.is_zero() {
+    if store.proposer_boost_root().is_zero() {
         return Ok(attestation_score);
     }
 
     let mut proposer_score: Gwei = 0;
-    if get_ancestor(store, store.proposer_boost_root, block_slot)? == root {
+    if get_ancestor(store, store.proposer_boost_root(), block_slot)? == root {
         proposer_score = get_proposer_score(store, config)?;
     }
     Ok(attestation_score.saturating_add(proposer_score))
@@ -758,15 +829,16 @@ pub fn filter_block_tree<'store>(
 
     // The voting source should be either at the same height as the store's
     // justified checkpoint or not more than two epochs ago.
-    let correct_justified = store.justified_checkpoint.epoch == constants::GENESIS_EPOCH
-        || voting_source.epoch == store.justified_checkpoint.epoch
+    let justified = store.beacon_justified_checkpoint();
+    let correct_justified = justified.epoch == constants::GENESIS_EPOCH
+        || voting_source.epoch == justified.epoch
         || voting_source.epoch.saturating_add(2) >= current_epoch;
 
-    let finalized_checkpoint_block =
-        get_checkpoint_block(store, block_root, store.finalized_checkpoint.epoch)?;
+    let finalized = store.beacon_finalized_checkpoint();
+    let finalized_checkpoint_block = get_checkpoint_block(store, block_root, finalized.epoch)?;
 
-    let correct_finalized = store.finalized_checkpoint.epoch == constants::GENESIS_EPOCH
-        || store.finalized_checkpoint.root == finalized_checkpoint_block;
+    let correct_finalized =
+        finalized.epoch == constants::GENESIS_EPOCH || finalized.root == finalized_checkpoint_block;
 
     // If expected finalized/justified, add to viable block-tree and signal
     // viability to parent.
@@ -784,7 +856,7 @@ pub fn get_filtered_block_tree<'store>(
     store: &'store Store,
     config: &Config,
 ) -> Result<HashMap<Root, &'store SignedBeaconBlock>> {
-    let base = store.justified_checkpoint.root;
+    let base = store.beacon_justified_checkpoint().root;
     let mut blocks = HashMap::new();
     filter_block_tree(store, base, &mut blocks, config)?;
     Ok(blocks)
@@ -794,7 +866,7 @@ pub fn get_filtered_block_tree<'store>(
 /// step to the child with the greatest weight until a leaf is reached.
 pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
     let blocks = get_filtered_block_tree(store, config)?;
-    let mut head = store.justified_checkpoint.root;
+    let mut head = store.beacon_justified_checkpoint().root;
     loop {
         let children: Vec<Root> = blocks
             .iter()
@@ -833,11 +905,11 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
 /// checkpoint arriving later (as can happen while replaying blocks out of
 /// order) must not roll a more advanced view back.
 pub fn update_checkpoints(store: &mut Store, justified: Checkpoint, finalized: Checkpoint) {
-    if justified.epoch > store.justified_checkpoint.epoch {
-        store.justified_checkpoint = justified;
+    if justified.epoch > store.beacon_justified_checkpoint().epoch {
+        store.set_beacon_justified_checkpoint(justified);
     }
-    if finalized.epoch > store.finalized_checkpoint.epoch {
-        store.finalized_checkpoint = finalized;
+    if finalized.epoch > store.beacon_finalized_checkpoint().epoch {
+        store.set_beacon_finalized_checkpoint(finalized);
     }
 }
 
@@ -847,11 +919,11 @@ pub fn update_unrealized_checkpoints(
     unrealized_justified: Checkpoint,
     unrealized_finalized: Checkpoint,
 ) {
-    if unrealized_justified.epoch > store.unrealized_justified_checkpoint.epoch {
-        store.unrealized_justified_checkpoint = unrealized_justified;
+    if unrealized_justified.epoch > store.beacon_unrealized_justified_checkpoint().epoch {
+        store.set_beacon_unrealized_justified_checkpoint(unrealized_justified);
     }
-    if unrealized_finalized.epoch > store.unrealized_finalized_checkpoint.epoch {
-        store.unrealized_finalized_checkpoint = unrealized_finalized;
+    if unrealized_finalized.epoch > store.beacon_unrealized_finalized_checkpoint().epoch {
+        store.set_beacon_unrealized_finalized_checkpoint(unrealized_finalized);
     }
 }
 
@@ -945,14 +1017,16 @@ pub fn is_ffg_competitive(store: &Store, head_root: Root, parent_root: Root) -> 
 /// much finality progress they may put at stake to pursue it.
 pub fn is_finalization_ok(store: &Store, slot: Slot, config: &Config) -> bool {
     let epochs_since_finalization =
-        compute_epoch_at_slot(slot).saturating_sub(store.finalized_checkpoint.epoch);
+        compute_epoch_at_slot(slot).saturating_sub(store.beacon_finalized_checkpoint().epoch);
     epochs_since_finalization <= config.reorg_max_epochs_since_finalization
 }
 
 /// Whether `store.time` is early enough in the current slot that a proposer
 /// building now still counts as on time.
 pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
-    let seconds_since_genesis = store.time.saturating_sub(store.genesis_time);
+    let seconds_since_genesis = store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time());
     let time_into_slot_ms =
         seconds_to_milliseconds(seconds_since_genesis) % config.slot_duration_ms;
     let epoch = get_current_store_epoch(store, config);
@@ -963,12 +1037,11 @@ pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
 /// proposer's own boost, i.e. reorging it out would not be fighting an
 /// already-decisive lead.
 pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<bool> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
+    let justified_state = store
+        .checkpoint_state(&store.beacon_justified_checkpoint())
+        .ok_or(Error::SpecAssert(
+            "store.justified_checkpoint in store.checkpoint_states",
+        ))?;
     let reorg_threshold =
         calculate_committee_fraction(justified_state, config.reorg_head_weight_threshold)?;
     Ok(get_weight(store, head_root, config)? < reorg_threshold)
@@ -977,12 +1050,11 @@ pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<b
 /// Whether `parent_root` already has enough votes of its own that the missing
 /// votes are assigned to it rather than being hoarded elsewhere.
 pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Result<bool> {
-    let justified_state =
-        store
-            .checkpoint_state(&store.justified_checkpoint)
-            .ok_or(Error::SpecAssert(
-                "store.justified_checkpoint in store.checkpoint_states",
-            ))?;
+    let justified_state = store
+        .checkpoint_state(&store.beacon_justified_checkpoint())
+        .ok_or(Error::SpecAssert(
+            "store.justified_checkpoint in store.checkpoint_states",
+        ))?;
     let parent_threshold =
         calculate_committee_fraction(justified_state, config.reorg_parent_weight_threshold)?;
     Ok(get_weight(store, parent_root, config)? > parent_threshold)
@@ -1035,7 +1107,7 @@ pub fn get_proposer_head(
     // Check that the head has few enough votes to be overpowered by our
     // proposer boost.
     verify(
-        store.proposer_boost_root != head_root,
+        store.proposer_boost_root() != head_root,
         "store.proposer_boost_root != head_root",
     )?;
     let head_weak = is_head_weak(store, head_root, config)?;
@@ -1392,23 +1464,21 @@ pub fn compute_pulled_up_tip(store: &mut Store, block_root: Root, config: &Confi
 pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
     let previous_slot = get_current_slot(store, config);
 
-    store.time = time;
+    store.set_beacon_time(time);
 
     let current_slot = get_current_slot(store, config);
 
     // If this is a new slot, reset store.proposer_boost_root.
     if current_slot > previous_slot {
-        store.proposer_boost_root = Root::zero();
+        store.set_proposer_boost_root(Root::zero());
     }
 
     // If a new epoch, pull-up justification and finalization from previous
     // epoch.
     if current_slot > previous_slot && compute_slots_since_epoch_start(current_slot) == 0 {
-        update_checkpoints(
-            store,
-            store.unrealized_justified_checkpoint,
-            store.unrealized_finalized_checkpoint,
-        );
+        let justified = store.beacon_unrealized_justified_checkpoint();
+        let finalized = store.beacon_unrealized_finalized_checkpoint();
+        update_checkpoints(store, justified, finalized);
     }
 }
 
@@ -1592,7 +1662,7 @@ pub fn update_latest_messages(
 /// once per slot boundary crossed so that none of them are skipped even if
 /// `time` jumps forward by more than one slot since the last call.
 pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
-    let tick_slot = time.saturating_sub(store.genesis_time) / config.seconds_per_slot;
+    let tick_slot = time.saturating_sub(store.beacon_genesis_time()) / config.seconds_per_slot;
     while get_current_slot(store, config) < tick_slot {
         let next_slot = get_current_slot(store, config).saturating_add(1);
         let previous_time = store
@@ -1652,17 +1722,20 @@ pub fn on_block(
 
     // Check that block is later than the finalized epoch slot (optimization
     // to reduce calls to get_ancestor).
-    let finalized_slot = compute_start_slot_at_epoch(store.finalized_checkpoint.epoch);
+    let finalized_slot = compute_start_slot_at_epoch(store.beacon_finalized_checkpoint().epoch);
     verify(
         signed_block.slot() > finalized_slot,
         "block.slot > finalized_slot",
     )?;
     // Check block is a descendant of the finalized block at the checkpoint
     // finalized slot.
-    let finalized_checkpoint_block =
-        get_checkpoint_block(store, parent_root, store.finalized_checkpoint.epoch)?;
+    let finalized_checkpoint_block = get_checkpoint_block(
+        store,
+        parent_root,
+        store.beacon_finalized_checkpoint().epoch,
+    )?;
     verify(
-        store.finalized_checkpoint.root == finalized_checkpoint_block,
+        store.beacon_finalized_checkpoint().root == finalized_checkpoint_block,
         "store.finalized_checkpoint.root == finalized_checkpoint_block",
     )?;
 
@@ -1726,7 +1799,9 @@ pub fn on_block(
     store.block_states.insert(block_root, state);
 
     // Add block timeliness to the store.
-    let seconds_since_genesis = store.time.saturating_sub(store.genesis_time);
+    let seconds_since_genesis = store
+        .beacon_time()
+        .saturating_sub(store.beacon_genesis_time());
     let time_into_slot_ms =
         seconds_to_milliseconds(seconds_since_genesis) % config.slot_duration_ms;
     let epoch = get_current_store_epoch(store, config);
@@ -1737,9 +1812,9 @@ pub fn on_block(
 
     // Add proposer score boost if the block is timely and not conflicting
     // with an existing block.
-    let is_first_block = store.proposer_boost_root.is_zero();
+    let is_first_block = store.proposer_boost_root().is_zero();
     if is_timely && is_first_block {
-        store.proposer_boost_root = block_root;
+        store.set_proposer_boost_root(block_root);
     }
 
     // Update checkpoints in store if necessary. Read out of the post-state
@@ -1823,7 +1898,7 @@ pub fn on_attester_slashing(store: &mut Store, attester_slashing: &AttesterSlash
     let (indices_1, indices_2) = {
         let state = store
             .block_states
-            .get(&store.justified_checkpoint.root)
+            .get(&store.beacon_justified_checkpoint().root)
             .ok_or(Error::SpecAssert(
                 "store.justified_checkpoint.root in store.block_states",
             ))?;
@@ -1948,11 +2023,11 @@ mod tests {
         // "correct_justified"/"correct_finalized" checks have a
         // `== GENESIS_EPOCH` escape hatch): the point of this test is the
         // weight tie-break in `get_head`, not the filtering rules.
-        store.justified_checkpoint = Checkpoint {
+        store.set_beacon_justified_checkpoint(Checkpoint {
             epoch: constants::GENESIS_EPOCH,
             root: genesis_root,
-        };
-        store.finalized_checkpoint = store.justified_checkpoint;
+        });
+        store.set_beacon_finalized_checkpoint(store.beacon_justified_checkpoint());
 
         store.blocks.insert(genesis_root, block(0, Root::zero()));
         store.blocks.insert(low_root, block(1, genesis_root));
@@ -1963,7 +2038,7 @@ mod tests {
         // neither child gets any attesting balance, so both are weight zero
         // and the root comparison is all that can decide between them.
         let state = crate::helpers::test_state::with_validators(1);
-        store.insert_checkpoint_state(store.justified_checkpoint, state.clone());
+        store.insert_checkpoint_state(store.beacon_justified_checkpoint(), state.clone());
         // `get_voting_source` needs a post-state for each leaf, since both
         // children are in the store's current epoch (its clock is left at
         // the default of slot zero) and so take the "not pulled up" branch.
@@ -1985,7 +2060,7 @@ mod tests {
         // `get_voting_source` takes the pulled-up branch
         // (`current_epoch > block_epoch`) rather than reading the block's own
         // post-state directly.
-        store.time = config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2;
+        store.set_beacon_time(config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2);
 
         let block_root = Root::repeat_byte(5);
         store.blocks.insert(block_root, block(0, Root::zero()));
