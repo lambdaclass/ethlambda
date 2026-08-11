@@ -119,3 +119,26 @@ jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 # in `shadow/quinn-udp-patch` (no GSO/GRO batch syscalls). A Cargo `[patch]`
 # cannot be feature-gated, so it is NOT committed here; `shadow/build.sh` injects
 # it into this manifest at build time. See `make shadow-build`.
+
+# The beacon state transition mutates SSZ collections in place: the validator
+# registry, the randao mixes, the historical roots. Published libssz-types 0.2.2
+# exposes only `Deref` and `Index`, so those 18 call sites need the `DerefMut`
+# and `IndexMut` impls that exist only on libssz's unmerged `add-deref` branch.
+# Without this patch `ethlambda-beacon` does not compile at all.
+#
+# Pinned to a rev rather than the branch: `add-deref`'s tip has since merged
+# libssz `main` and reports 0.3.0, which would not satisfy the `0.2.2`
+# requirements above, so Cargo would silently ignore the patch. This rev is
+# v0.2.2 plus three commits and is reachable from `origin/add-deref`.
+#
+# All four crates are patched together because libssz-types depends on libssz
+# and libssz-merkle by path inside that repository. Patching one alone would put
+# two incompatible copies of libssz in the graph, and the beacon containers now
+# live in `ethlambda-types` alongside lean's, so the two sides must share one.
+#
+# Remove once `add-deref` is merged and released.
+[patch.crates-io]
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "30320bd" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "30320bd" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "30320bd" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "30320bd" }
