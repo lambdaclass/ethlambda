@@ -32,7 +32,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
-use cli::LeanOptions;
+use cli::{BeaconOptions, Cli, Command, LeanOptions};
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -80,7 +80,12 @@ async fn main() -> eyre::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")?;
 
-    run_lean(LeanOptions::parse()).await
+    let cli = Cli::parse_from(cli::inject_default_subcommand(std::env::args_os()));
+
+    match cli.command {
+        Command::Lean(options) => run_lean(*options).await,
+        Command::Beacon(options) => run_beacon(*options).await,
+    }
 }
 
 /// Boot the lean consensus client.
@@ -404,6 +409,33 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Boot the Ethereum Beacon Chain follower.
+///
+/// The subcommand exists before the chain does: the mainnet wire lands in plan
+/// 4 of the series and the anchor and fork choice in plan 5. Until then every
+/// parsed flag is logged, so an operator can see the configuration that was
+/// resolved, and startup stops rather than running a node that follows nothing.
+async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
+    info!(
+        checkpoint_sync_url = ?options.checkpoint_sync_url,
+        bootnodes = ?options.bootnodes,
+        node_key = ?options.common.node_key,
+        data_dir = ?options.common.data_dir,
+        gossipsub_port = options.common.gossipsub_port,
+        http_address = %options.common.http_address,
+        api_port = options.common.api_port,
+        metrics_port = options.common.metrics_port,
+        discovery_port = ?options.discovery.port,
+        advertise_ip = ?options.discovery.advertise_ip,
+        "Resolved beacon configuration"
+    );
+    eyre::bail!(
+        "`ethlambda beacon` is not implemented yet: the mainnet wire and the \
+         anchor land in plans 4 and 5 of \
+         docs/superpowers/specs/2026-08-10-mainnet-network-design.md"
+    )
 }
 
 /// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
