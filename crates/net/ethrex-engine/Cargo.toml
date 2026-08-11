@@ -9,6 +9,15 @@ rust-version.workspace = true
 ethrex-common.workspace = true
 ethrex-storage.workspace = true
 ethrex-blockchain.workspace = true
+# Execution-layer transaction gossip (devp2p: discv4 + RLPx), independent of the
+# consensus layer's libp2p stack.
+ethrex-p2p.workspace = true
+secp256k1 = { version = "0.30.0", default-features = false, features = [
+  "global-context",
+  "recovery",
+  "std",
+] }
+tokio-util.workspace = true
 ethlambda-types.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
@@ -17,12 +26,6 @@ tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# Signing test transactions: the RLP encoder to build the EIP-1559 signing
-# payload, and secp256k1 to sign it. Version-matched to ethrex's own so no
-# second copy enters the graph.
+# Building the EIP-1559 signing payload for test transactions. secp256k1 itself
+# is a normal dependency, for the devp2p node key.
 ethrex-rlp.workspace = true
-secp256k1 = { version = "0.30.0", default-features = false, features = [
-  "global-context",
-  "recovery",
-  "std",
-] }

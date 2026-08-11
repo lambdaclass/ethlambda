@@ -14,8 +14,11 @@
 //! ethrex's own types stay behind it.
 
 mod conversion;
+mod p2p;
 
-use std::sync::Arc;
+pub use p2p::{DEFAULT_TARGET_PEERS, P2PConfig, derive_el_node_key};
+
+use std::sync::{Arc, OnceLock};
 
 use ethlambda_types::execution_payload::ExecutionPayloadV3;
 use ethlambda_types::primitives::H256 as LeanH256;
@@ -57,6 +60,12 @@ pub enum EngineError {
     BuildTask(String),
     #[error("transaction rejected by the mempool: {0}")]
     Mempool(#[from] MempoolError),
+    #[error("execution-layer p2p is already running")]
+    P2PAlreadyStarted,
+    #[error("execution-layer p2p configuration error: {0}")]
+    P2PConfig(String),
+    #[error("failed to start execution-layer p2p: {0}")]
+    P2PStart(String),
     #[error("payload claims block hash {claimed:#x} but its contents hash to {computed:#x}")]
     BlockHashMismatch { claimed: H256, computed: H256 },
     #[error("payload conversion error: {0}")]
@@ -71,6 +80,9 @@ pub struct EthrexEngine {
     store: Store,
     extra_data: Bytes,
     gas_ceil: u64,
+    /// Set by [`Self::start_p2p`] so it can only run once — the actors it spawns
+    /// have no shutdown handle.
+    p2p_started: OnceLock<()>,
 }
 
 impl EthrexEngine {
@@ -99,6 +111,7 @@ impl EthrexEngine {
             store,
             extra_data: Bytes::new(),
             gas_ceil: DEFAULT_BUILDER_GAS_CEIL,
+            p2p_started: OnceLock::new(),
         })
     }
 

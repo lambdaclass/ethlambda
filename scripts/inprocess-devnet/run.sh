@@ -32,6 +32,7 @@ BUILD=false
 VERIFY=true
 NO_EL=false
 NO_TX=false
+NO_EL_P2P=false
 
 KEYGEN_IMAGE="blockblaz/hash-sig-cli:latest"
 GENESIS_IMAGE="ethpandaops/eth-beacon-genesis:pk910-leanchain"
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --keep)        KEEP=true; shift ;;
     --build)       BUILD=true; shift ;;
     --no-tx)       NO_TX=true; shift ;;
+    --no-el-p2p)   NO_EL_P2P=true; shift ;;
     --no-verify)   VERIFY=false; shift ;;
     --no-el)       NO_EL=true; shift ;;
     -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -259,8 +261,27 @@ RUST_LOG_VALUE="info"
 [[ "$TRACE" == true ]] && RUST_LOG_VALUE="info,ethlambda_blockchain=trace"
 
 step "Starting $NODES node(s) with an embedded execution layer"
+# Execution-layer devp2p ports. Distinct from consensus gossip (9001+) and from
+# the API/metrics ports; one value per node serves both RLPx and discv4.
+el_p2p_port() { echo "$((30303 + $1))"; }
+# Node 0's enode, harvested from its log once it is up and used as the single
+# bootnode for the rest. Only node 0's is needed: discv4 finds the remainder of
+# the mesh from there. It cannot be computed here because the execution-layer key
+# is a keccak derivation of the consensus node key and bash cannot do secp256k1.
+EL_BOOTNODE=""
+
 for ((i = 0; i < NODES; i++)); do
   NAME="$(node_name "$i")"
+  EL_ARGS=()
+  if [[ "$NO_EL" == false ]]; then
+    EL_ARGS+=(--el-genesis /config/el-genesis.json)
+    if [[ "$NO_EL_P2P" == false ]]; then
+      EL_ARGS+=(--el-p2p-port "$(el_p2p_port "$i")")
+      [[ -n "$EL_BOOTNODE" ]] && EL_ARGS+=(--el-bootnodes "$EL_BOOTNODE")
+    fi
+  fi
+  [[ $i -eq 0 ]] && EL_ARGS+=(--is-aggregator)
+
   # --network host: containers reach each other on 127.0.0.1 as the ENRs say.
   # Ports must therefore differ per node, which they do by construction above.
   # Deliberately NOT --rm: a crashed node must keep its logs for diagnosis.
@@ -284,9 +305,20 @@ for ((i = 0; i < NODES; i++)); do
     --http-address 0.0.0.0 \
     --metrics-port "$((8081 + i))" \
     --api-port "$((15052 + i))" \
-    $([[ "$NO_EL" == false ]] && echo "--el-genesis /config/el-genesis.json") \
-    $([[ $i -eq 0 ]] && echo "--is-aggregator") >/dev/null || die "failed to start $NAME"
+    "${EL_ARGS[@]}" >/dev/null || die "failed to start $NAME"
   ok "$NAME (quic $((9001 + i)), api $((15052 + i)))$([[ $i -eq 0 ]] && echo ' [aggregator]')"
+
+  # Harvest node 0's enode before starting the rest, so they can find it.
+  if [[ $i -eq 0 && "$NO_EL" == false && "$NO_EL_P2P" == false ]]; then
+    for _ in $(seq 1 40); do
+      EL_BOOTNODE=$(docker logs "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' |
+        grep -o 'enode://[0-9a-fA-F]\{128\}@[0-9.]*:[0-9]*' | head -1 || true)
+      [[ -n "$EL_BOOTNODE" ]] && break
+      sleep 0.5
+    done
+    if [[ -n "$EL_BOOTNODE" ]]; then ok "EL bootnode: ${EL_BOOTNODE:0:26}...@${EL_BOOTNODE##*@}"
+    else warn "no EL enode from $NAME; remaining nodes start without a bootnode"; fi
+  fi
 done
 
 # Fail fast: a flag or config mistake kills nodes within a couple of seconds.
@@ -329,19 +361,38 @@ else
   TX_RAW="$(tr -d '\n\r ' < "$TX_FILE")"
   TX_BODY="$(printf '0x%s' "${TX_RAW#0x}")"
 
-  # Submitted to *every* node because there is no execution-layer gossip yet: a
-  # transaction sits in only the mempool that received it, so it would otherwise
-  # wait for that one node's turn to propose. Whichever node proposes next now
-  # includes it, and the rest evict it when they import the block.
-  step "Submitting a transaction to $NODES node(s)"
+  # Who to submit to. With execution-layer gossip the whole point is that it does
+  # NOT have to be the next proposer, so submit to exactly one node and pick one
+  # that is not about to propose — then a different proposer including it is proof
+  # the transaction travelled. Without gossip, fan out instead, since a lone
+  # mempool can only be drained by its own node's turn.
+  SUBMIT_TARGETS=()
+  if [[ "$NO_EL_P2P" == true ]]; then
+    for ((i = 0; i < NODES; i++)); do SUBMIT_TARGETS+=("$i"); done
+    step "Submitting a transaction to all $NODES node(s) (no EL gossip)"
+  else
+    # Proposers rotate round-robin by validator index, and this script gives node
+    # i exactly validator i, so the proposer of slot s is s % NODES. Submit to the
+    # node that *just* proposed: it is the furthest from proposing again (a full
+    # NODES slots away), which maximises the chance that some other node includes
+    # the transaction and the check is conclusive.
+    HEAD_SLOT=$(curl -sS -m 5 "http://127.0.0.1:15052/lean/v0/node/syncing" 2>/dev/null |
+      grep -o '"head_slot":"*[0-9]*' | grep -o '[0-9]*$' || true)
+    HEAD_SLOT="${HEAD_SLOT:-0}"
+    SUBMIT_TARGETS+=( "$(( HEAD_SLOT % NODES ))" )
+    step "Submitting a transaction to one node only (head slot $HEAD_SLOT)"
+  fi
+
   TX_ACCEPTED=0
-  for ((i = 0; i < NODES; i++)); do
+  : > "$LOG_DIR/tx-submitters"
+  for i in "${SUBMIT_TARGETS[@]}"; do
     RESP=$(curl -sS -m 5 -X POST \
       -H 'content-type: application/json' \
       -d "{\"raw\": \"$TX_BODY\"}" \
       "http://127.0.0.1:$((15052 + i))/lean/v0/admin/el/tx" 2>&1 || echo "REQUEST_FAILED")
     if [[ "$RESP" == *tx_hash* ]]; then
       TX_ACCEPTED=$(( TX_ACCEPTED + 1 ))
+      echo "$i" >> "$LOG_DIR/tx-submitters"
       TX_HASH="${RESP#*\"tx_hash\":\"}"; TX_HASH="${TX_HASH%%\"*}"
       ok "$(node_name "$i") accepted it ($TX_HASH)"
     else
@@ -349,6 +400,7 @@ else
     fi
   done
   echo "$TX_ACCEPTED" > "$LOG_DIR/tx-accepted.count"
+  echo "${#SUBMIT_TARGETS[@]}" > "$LOG_DIR/tx-targets.count"
 
   REMAINING=$(( RUNTIME - SETTLE ))
   step "Running the remaining ~$(( REMAINING / SECONDS_PER_SLOT )) slots (${REMAINING}s)"
@@ -430,8 +482,9 @@ if [[ "$NO_EL" == true || "$NO_TX" == true ]]; then
   warn "transaction check skipped"
 else
   ACCEPTED=$(cat "$LOG_DIR/tx-accepted.count" 2>/dev/null || echo 0)
-  if (( ACCEPTED == NODES )); then ok "transaction accepted by $ACCEPTED/$NODES node(s)"
-  else warn "transaction accepted by $ACCEPTED/$NODES node(s)"; FAIL=1; fi
+  TARGETS=$(cat "$LOG_DIR/tx-targets.count" 2>/dev/null || echo "$NODES")
+  if (( ACCEPTED == TARGETS && TARGETS > 0 )); then ok "transaction accepted by $ACCEPTED/$TARGETS node(s) submitted to"
+  else warn "transaction accepted by $ACCEPTED/$TARGETS node(s) submitted to"; FAIL=1; fi
 
   if [[ -s "$LOG_DIR/tx-inclusion.json" ]]; then
     INCL_SLOT=$(cat "$LOG_DIR/tx-inclusion.slot" 2>/dev/null || echo '?')
@@ -444,9 +497,38 @@ else
       grep -o '"gasUsed":"0x[0-9a-fA-F]*"' | head -1 | grep -o '0x[0-9a-fA-F]*' || true)
     if [[ -n "$GAS_HEX" && "$GAS_HEX" != "0x0" ]]; then ok "gasUsed=$(( GAS_HEX )) in that block"
     else warn "gasUsed missing or zero in that block (got '${GAS_HEX:-none}')"; FAIL=1; fi
+
+    # The point of execution-layer gossip: a node that never saw the submission
+    # included it. `proposer_index` is a validator index and this script gives
+    # node i validator i, so it names the node that built the block.
+    if [[ "$NO_EL_P2P" == false ]]; then
+      PROPOSER=$(tr ',' '\n' < "$LOG_DIR/tx-inclusion.json" |
+        grep -o '"proposer_index":[0-9]*' | head -1 | grep -o '[0-9]*$' || true)
+      SUBMITTERS=$(tr '\n' ' ' < "$LOG_DIR/tx-submitters" 2>/dev/null || true)
+      if [[ -z "$PROPOSER" ]]; then
+        warn "could not read proposer_index from the including block"; FAIL=1
+      elif [[ " $SUBMITTERS " == *" $PROPOSER "* ]]; then
+        # Inclusion is proven, propagation is not: the node that received the
+        # transaction is the one that proposed. Not a failure — just no evidence
+        # either way. The submit target is chosen to avoid this.
+        warn "included by node $PROPOSER, which is also where it was submitted — gossip unproven"
+      else
+        ok "gossip proven: submitted to node(s) $SUBMITTERS, included by node $PROPOSER"
+      fi
+    fi
   else
     warn "transaction never made it into a block"; FAIL=1
   fi
+fi
+
+# 6b. the execution layers actually peered with each other
+if [[ "$NO_EL" == false && "$NO_EL_P2P" == false ]]; then
+  EL_P2P_UP=$(count "EL devp2p enabled")
+  if (( EL_P2P_UP == NODES )); then ok "EL devp2p started on $EL_P2P_UP/$NODES node(s)"
+  else warn "EL devp2p started on $EL_P2P_UP/$NODES node(s)"; FAIL=1; fi
+
+  EL_P2P_FAIL=$(count "EL transaction gossip unavailable")
+  if (( EL_P2P_FAIL > 0 )); then warn "EL devp2p failed to start on $EL_P2P_FAIL node(s)"; FAIL=1; fi
 fi
 
 # 7. red flags

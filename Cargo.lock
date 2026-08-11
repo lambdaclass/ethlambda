@@ -1948,12 +1948,14 @@ dependencies = [
  "ethlambda-types",
  "ethrex-blockchain",
  "ethrex-common",
+ "ethrex-p2p",
  "ethrex-rlp",
  "ethrex-storage",
  "secp256k1 0.30.0",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

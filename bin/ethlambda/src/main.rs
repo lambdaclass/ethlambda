@@ -37,7 +37,7 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
-use ethlambda_ethrex_engine::EthrexEngine;
+use ethlambda_ethrex_engine::{EthrexEngine, P2PConfig, derive_el_node_key};
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
@@ -218,6 +218,23 @@ async fn main() -> eyre::Result<()> {
             (Some(Arc::new(engine)), Some(hash))
         }
     };
+
+    // Join the execution layers into their own transaction-gossip mesh. Without
+    // it each mempool is isolated, so a submitted transaction waits for the turn
+    // of the node that received it; with it, whichever node proposes next can
+    // include it. Independent of consensus gossip in every respect — own key,
+    // own port, own peer set.
+    if let (Some(engine), Some(port)) = (execution_engine.as_ref(), options.el_p2p_port) {
+        let mut el_p2p = P2PConfig::loopback(derive_el_node_key(&node_p2p_key), port);
+        el_p2p.bootnodes = options.el_bootnodes.clone();
+        // A node that cannot join the mesh still executes every block consensus
+        // hands it, so this is not fatal: it degrades to an isolated mempool.
+        // Loud, though — silence here would look like working gossip.
+        match engine.start_p2p(el_p2p).await {
+            Ok(enode) => info!(%enode, "EL transaction gossip joined"),
+            Err(err) => error!(%err, "EL transaction gossip unavailable; mempool stays local"),
+        }
+    }
 
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
