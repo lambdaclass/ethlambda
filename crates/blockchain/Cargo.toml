@@ -13,6 +13,9 @@ autotests = false
 [dependencies]
 ethlambda-network-api.workspace = true
 ethlambda-storage.workspace = true
+# The beacon arm of each handler's dispatch. Pulls the Beacon Chain state
+# transition, BLS, and KZG into this crate's build.
+ethlambda-beacon.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-crypto.workspace = true

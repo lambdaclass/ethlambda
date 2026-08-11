@@ -1971,6 +1971,7 @@ name = "ethlambda-blockchain"
 version = "0.1.0"
 dependencies = [
  "datatest-stable",
+ "ethlambda-beacon",
  "ethlambda-crypto",
  "ethlambda-fork-choice",
  "ethlambda-metrics",

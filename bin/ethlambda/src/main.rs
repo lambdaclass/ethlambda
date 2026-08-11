@@ -259,6 +259,9 @@ async fn main() -> eyre::Result<()> {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
         },
+        // Unread on a lean chain: the dispatch never reaches the beacon arm.
+        // `ethlambda beacon` (plan 5) is what supplies a config that matters.
+        beacon_config: ethlambda_types::beacon::config::Config::mainnet(),
     };
 
     let blockchain = BlockChain::spawn(

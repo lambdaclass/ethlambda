@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
-use ethlambda_storage::{ALL_TABLES, Store};
+use ethlambda_storage::{ALL_TABLES, Chain, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
@@ -34,6 +34,7 @@ use crate::store::StoreError;
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
+pub mod beacon_chain;
 pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
@@ -66,6 +67,10 @@ pub struct BlockChainConfig {
     pub subscribed_subnets: HashSet<u64>,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
+    /// The Beacon Chain fork schedule and timing, read only when
+    /// [`ethlambda_storage::Store::chain`] is [`Chain::Beacon`]. The lean wiring
+    /// passes `Config::mainnet()` and never reads it.
+    pub beacon_config: ethlambda_types::beacon::config::Config,
 }
 
 /// Milliseconds per interval (800ms ticks).
@@ -160,6 +165,7 @@ impl BlockChain {
             gate_duties,
             subscribed_subnets,
             proposer_config,
+            beacon_config,
         } = config;
 
         metrics::set_is_aggregator(aggregator.is_enabled());
@@ -191,6 +197,7 @@ impl BlockChain {
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+            beacon_config,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -281,10 +288,28 @@ pub struct BlockChainServer {
     /// Chain-event publication bus. The actor is the sole publisher; consumers
     /// only subscribe, preserving the one-directional write flow.
     events: EventBus,
+
+    /// The Beacon Chain fork schedule and timing. Read only by the
+    /// [`Chain::Beacon`] arm of each handler's dispatch.
+    beacon_config: ethlambda_types::beacon::config::Config,
 }
 
 impl BlockChainServer {
+    /// The one dispatch point for the tick handler.
+    ///
+    /// Nothing beacon-typed may be read above this `match`, and nothing lean-
+    /// typed below its `Lean` arm: this is the boundary that makes
+    /// `BeaconState::Lean`'s `unreachable!()` arms sound.
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
+        match self.store.chain() {
+            Chain::Lean => self.lean_on_tick(timestamp_ms, ctx).await,
+            Chain::Beacon => {
+                beacon_chain::on_tick(&mut self.store, timestamp_ms, &self.beacon_config)
+            }
+        }
+    }
+
+    async fn lean_on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let genesis_time_ms = self.store.config().genesis_time * 1000;
 
         // Calculate current slot and interval from milliseconds
@@ -971,8 +996,20 @@ impl BlockChainServer {
         Ok(())
     }
 
-    /// Process a newly received block.
+    /// The one dispatch point for block import. See [`Self::on_tick`].
     fn on_block(&mut self, signed_block: SignedBlock) {
+        match self.store.chain() {
+            Chain::Lean => self.lean_on_block(signed_block),
+            // A lean gossip block cannot reach a beacon chain: plan 4 is what
+            // gives the P2P layer beacon message variants, and until then this
+            // arm exists to keep the lean import from running on a beacon store
+            // rather than to handle traffic.
+            Chain::Beacon => warn!("dropping a lean block on a beacon chain"),
+        }
+    }
+
+    /// Process a newly received block.
+    fn lean_on_block(&mut self, signed_block: SignedBlock) {
         let mut queue = VecDeque::new();
         queue.push_back(signed_block);
 
@@ -1229,7 +1266,17 @@ impl BlockChainServer {
         }
     }
 
+    /// The one dispatch point for a gossiped attestation. See [`Self::on_tick`].
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
+        match self.store.chain() {
+            Chain::Lean => self.lean_on_attestation(attestation),
+            // See `on_block`'s beacon arm: no lean attestation can reach a
+            // beacon chain until plan 4 gives P2P beacon message variants.
+            Chain::Beacon => warn!("dropping a lean attestation on a beacon chain"),
+        }
+    }
+
+    fn lean_on_attestation(&mut self, attestation: &SignedAttestation) {
         // Read fresh here too: a gossip event can arrive between ticks, and
         // if the admin API just toggled, the first gossip after the toggle
         // should already use the new value.
@@ -1250,7 +1297,16 @@ impl BlockChainServer {
         }
     }
 
+    /// The one dispatch point for a gossiped aggregate. See [`Self::on_tick`].
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
+        match self.store.chain() {
+            Chain::Lean => self.lean_on_aggregated_attestation(attestation),
+            // See `on_block`'s beacon arm.
+            Chain::Beacon => warn!("dropping a lean aggregate on a beacon chain"),
+        }
+    }
+
+    fn lean_on_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
         // The store consumes the aggregate, so snapshot the event inputs first.
         // Aggregates are low-rate (~one per subnet per slot), so building these
         // unconditionally is cheap; `emit`'s own guard drops them on an
