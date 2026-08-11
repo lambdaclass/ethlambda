@@ -1,3 +1,4 @@
+mod beacon;
 mod checkpoint_sync;
 mod cli;
 mod fd_limit;
@@ -313,6 +314,8 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
                 attestation_committee_count,
                 bootnodes: discovery_bootnodes,
                 advertise_ip,
+                fork_id: ethlambda_types::enr::EnrForkId::local(),
+                custody_group_count: None,
             },
         )
         .await
@@ -437,11 +440,43 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         advertise_ip = ?options.discovery.advertise_ip,
         "Resolved beacon configuration"
     );
-    eyre::bail!(
-        "`ethlambda beacon` is not implemented yet: the mainnet wire and the \
-         anchor land in plans 4 and 5 of \
-         docs/superpowers/specs/2026-08-10-mainnet-network-design.md"
-    )
+    let node_key = read_hex_file_bytes(&options.common.node_key).wrap_err_with(|| {
+        format!(
+            "failed to load node key from {}",
+            options.common.node_key.display()
+        )
+    })?;
+    let bootnode_enrs = match options.bootnodes.as_ref() {
+        Some(path) => Some(read_bootnode_strings(path)?),
+        None => None,
+    };
+    let _p2p = beacon::run(beacon::BeaconRunConfig {
+        checkpoint_sync_urls: options.checkpoint_sync_url.clone(),
+        node_key,
+        gossipsub_port: options.common.gossipsub_port,
+        // `resolve_discovery_port` already defaults this to gossipsub_port + 1
+        // and rejects a collision, so there is nothing to resolve here.
+        discovery_port,
+        advertise_ip: options.discovery.advertise_ip,
+        bootnode_enrs,
+    })
+    .await?;
+    // Nothing to drive yet: the actor owns the swarm and the dial loop.
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Read an ENR-per-line bootnode file, tolerating `- ` prefixes and `#`
+/// comments so the same file works as YAML or as a plain list.
+fn read_bootnode_strings(path: &std::path::Path) -> eyre::Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read bootnodes from {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(|line| line.trim().trim_start_matches("- ").trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.to_string())
+        .collect())
 }
 
 /// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.

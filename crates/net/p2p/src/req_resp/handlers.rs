@@ -53,6 +53,13 @@ pub async fn handle_req_resp_message(
                         );
                         handle_blocks_by_range_request(server, request, channel, peer).await;
                     }
+                    Request::Beacon(request) => {
+                        info!(kind = "beacon_request", peer_count, "P2P message received");
+                        crate::beacon::handler::handle_beacon_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -65,6 +72,10 @@ pub async fn handle_req_resp_message(
                         ResponsePayload::Status(status) => {
                             info!(kind = "status_response", peer_count, "P2P message received");
                             handle_status_response(server, status, peer).await;
+                        }
+                        ResponsePayload::Beacon(response) => {
+                            info!(kind = "beacon_response", peer_count, "P2P message received");
+                            crate::beacon::handler::handle_beacon_response(server, peer, response);
                         }
                         ResponsePayload::Blocks(blocks) => {
                             info!(kind = "blocks_response", peer_count, "P2P message received");

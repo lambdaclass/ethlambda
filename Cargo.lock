@@ -1932,6 +1932,7 @@ dependencies = [
  "reqwest",
  "secp256k1 0.30.0",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.18",
  "tikv-jemallocator",

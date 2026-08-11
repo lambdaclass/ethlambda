@@ -24,6 +24,7 @@ use secp256k1::{PublicKey, SecretKey};
 pub const QUIC_ENR_KEY: &[u8] = b"quic";
 pub const ETH2_ENR_KEY: &[u8] = b"eth2";
 pub const ATTNETS_ENR_KEY: &[u8] = b"attnets";
+pub const CGC_ENR_KEY: &[u8] = b"cgc";
 
 /// Everything needed to build this node's ENR.
 pub struct LocalEnrParams {
@@ -36,6 +37,18 @@ pub struct LocalEnrParams {
     pub quic_port: u16,
     pub subscription_subnets: HashSet<u64>,
     pub attestation_committee_count: u64,
+    /// The `eth2` entry to publish.
+    ///
+    /// Lean's is a compile-time constant, but the beacon wire computes its
+    /// digest from the fork schedule and the anchor's genesis validators root
+    /// at startup, so this cannot be reached for internally.
+    pub fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    ///
+    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire, even though nothing is
+    /// custodied yet: peers may reject a lower value outright, which would
+    /// defeat the mode. `None` on lean, which has no data-availability domain.
+    pub custody_group_count: Option<u64>,
 }
 
 impl LocalEnrParams {
@@ -77,8 +90,11 @@ impl LocalEnrParams {
 
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
-        pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
+        pairs.set_extra(ETH2_ENR_KEY, self.fork_id.to_ssz());
         pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port);
+        if let Some(count) = self.custody_group_count {
+            pairs.set_extra_int(CGC_ENR_KEY, count);
+        }
         pairs
     }
 }
@@ -121,8 +137,77 @@ mod tests {
             quic_port: 9001,
             subscription_subnets: HashSet::from([1u64, 4]),
             attestation_committee_count: 8,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .expect("ENR builds")
+    }
+
+    #[test]
+    fn the_published_fork_id_is_the_one_supplied() {
+        // Lean's is a compile-time constant, but the beacon wire computes its
+        // digest from the fork schedule at startup, so the ENR builder must not
+        // reach for EnrForkId::local() behind the caller's back.
+        let supplied = EnrForkId {
+            fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+            next_fork_version: [0x06, 0x00, 0x00, 0x00],
+            next_fork_epoch: u64::MAX,
+        };
+        let record = build_local_enr(&LocalEnrParams {
+            signer: test_signer(),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            quic_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: supplied,
+            custody_group_count: None,
+        })
+        .expect("ENR builds");
+
+        let raw = read_extra(&record, ETH2_ENR_KEY).expect("eth2 entry present");
+        assert_eq!(EnrForkId::from_ssz_bytes(&raw).unwrap(), supplied);
+    }
+
+    #[test]
+    fn the_custody_group_count_is_published_only_when_asked_for() {
+        // Lean has no data-availability domain, so publishing a cgc there would
+        // advertise a claim with no meaning behind it.
+        let record = build();
+        assert_eq!(read_extra(&record, CGC_ENR_KEY), None);
+
+        let with_cgc = build_local_enr(&LocalEnrParams {
+            signer: test_signer(),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            quic_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(with_cgc.pairs().extra_int::<u64>(CGC_ENR_KEY), Some(4));
+    }
+
+    #[test]
+    fn a_sixty_four_wide_attnets_is_eight_bytes_of_zeroes() {
+        // What a node subscribing to no attestation subnet actually serves.
+        // Publishing a shorter bitfield would be a different claim: readers
+        // treat bits past the end as unset, but the beacon spec's attnets is a
+        // fixed-width Bitvector and a short one is malformed to a strict reader.
+        let record = build_local_enr(&LocalEnrParams {
+            signer: test_signer(),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            quic_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(read_extra(&record, ATTNETS_ENR_KEY), Some(vec![0u8; 8]));
     }
 
     #[test]

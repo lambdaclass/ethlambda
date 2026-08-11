@@ -54,6 +54,7 @@ use crate::{
     swarm_adapter::SwarmHandle,
 };
 
+pub mod beacon;
 pub mod discovery;
 mod gossipsub;
 pub mod metrics;
@@ -146,6 +147,8 @@ impl RangeSyncState {
 pub(crate) struct DiscoveryState {
     pub(crate) peer_table: PeerTable,
     pub(crate) local_fork_id: EnrForkId,
+    /// Subnet ids at or beyond this are dropped from a peer's `attnets`.
+    pub(crate) subnet_count: u64,
     /// Admitted candidates, best first, drained one per tick. Refilled from the
     /// peer table when empty.
     pub(crate) candidates: VecDeque<DiscoveredPeer>,
@@ -221,24 +224,64 @@ pub fn attestation_subscription_subnets(
     subnets
 }
 
+/// Which network's wire this node speaks.
+///
+/// One `P2PServer` serves both, dispatching on this once at the top of each
+/// handler, exactly as `BlockChainServer` dispatches on the state variant.
+/// Nothing is shared below the match: the topic names, the req/resp protocol
+/// ids, the handshake and the decode are all different, and the parts that
+/// genuinely coincide (the discv5 stack, the `ssz_snappy` framing,
+/// `compute_message_id`) sit one layer down and are the beacon spec's anyway.
+pub enum Wire {
+    Lean(LeanWire),
+    /// Boxed because a `BeaconWire` carries a whole `Config` and so is four
+    /// times the size of a `LeanWire`; unboxed, every lean node would pay for
+    /// it in each `Wire` it moves.
+    Beacon(Box<beacon::BeaconWire>),
+}
+
+/// The lean network's gossip topics.
+pub struct LeanWire {
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+}
+
+impl Wire {
+    pub(crate) fn lean(&self) -> Option<&LeanWire> {
+        match self {
+            Wire::Lean(lean) => Some(lean),
+            Wire::Beacon(_) => None,
+        }
+    }
+
+    pub(crate) fn beacon(&self) -> Option<&beacon::BeaconWire> {
+        match self {
+            Wire::Beacon(beacon) => Some(beacon),
+            Wire::Lean(_) => None,
+        }
+    }
+}
+
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
     /// This node's libp2p peer ID, derived from the node key. Exposed so the
     /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
     pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
     pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
 }
 
-/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
-pub fn build_swarm(
-    config: SwarmConfig,
-) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
-    let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
+/// The gossipsub parameters both wires share.
+///
+/// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
+/// match the beacon spec, so `seen_ttl` is the only value that differs between
+/// the two networks: lean's slot is 4s with a 3-slot justification lookback,
+/// mainnet's epoch is 32 slots of 12s.
+pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config {
+    libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
         // d_low
@@ -251,8 +294,7 @@ pub fn build_swarm(
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
-        // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
-        .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
+        .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
         // Taken from ream
@@ -261,7 +303,29 @@ pub fn build_swarm(
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000)
         .build()
-        .expect("invalid gossipsub config");
+        .expect("invalid gossipsub config")
+}
+
+impl Behaviour {
+    pub(crate) fn new(
+        identify: libp2p::identify::Behaviour,
+        gossipsub: libp2p::gossipsub::Behaviour,
+        req_resp: request_response::Behaviour<Codec>,
+    ) -> Self {
+        Self {
+            identify,
+            gossipsub,
+            req_resp,
+        }
+    }
+}
+
+/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
+pub fn build_swarm(
+    config: SwarmConfig,
+) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
+    // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
+    let gossipsub_config = gossipsub_config(Duration::from_secs(4 * 3 * 2));
 
     let gossipsub =
         libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
@@ -295,11 +359,7 @@ pub fn build_swarm(
         identity.public(),
     ));
 
-    let behavior = Behaviour {
-        identify,
-        gossipsub,
-        req_resp,
-    };
+    let behavior = Behaviour::new(identify, gossipsub, req_resp);
 
     // TODO: set peer scoring params
 
@@ -382,10 +442,12 @@ pub fn build_swarm(
     Ok(BuiltSwarm {
         local_peer_id,
         swarm,
-        attestation_topics,
-        attestation_committee_count: config.attestation_committee_count,
-        block_topic,
-        aggregation_topic,
+        wire: Wire::Lean(LeanWire {
+            attestation_topics,
+            attestation_committee_count: config.attestation_committee_count,
+            block_topic,
+            aggregation_topic,
+        }),
         bootnode_addrs,
     })
 }
@@ -417,10 +479,7 @@ impl P2P {
             swarm_handle,
             store,
             blockchain: None,
-            attestation_topics: built.attestation_topics,
-            attestation_committee_count: built.attestation_committee_count,
-            block_topic: built.block_topic,
-            aggregation_topic: built.aggregation_topic,
+            wire: built.wire,
             connected_peers: HashSet::new(),
             pending_root_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
@@ -431,6 +490,7 @@ impl P2P {
             discovery: discovery.map(|handle| DiscoveryState {
                 peer_table: handle.peer_table,
                 local_fork_id: handle.local_fork_id,
+                subnet_count: handle.subnet_count,
                 candidates: VecDeque::new(),
                 peer_attnets: HashMap::new(),
             }),
@@ -469,10 +529,7 @@ pub struct P2PServer {
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
@@ -570,11 +627,12 @@ impl P2PServer {
 
         // Snapshot what the refill needs before any `.await`, so no borrow of
         // `self.discovery` has to live across the async boundary.
-        let Some((peer_table, local_fork_id, needs_refill)) =
+        let Some((peer_table, local_fork_id, subnet_count, needs_refill)) =
             self.discovery.as_ref().map(|discovery| {
                 (
                     discovery.peer_table.clone(),
                     discovery.local_fork_id,
+                    discovery.subnet_count,
                     discovery.candidates.is_empty(),
                 )
             })
@@ -595,7 +653,7 @@ impl P2PServer {
             }
 
             let (mut admitted, unwanted) =
-                select_candidates(contacts, &local_fork_id, self.attestation_committee_count);
+                select_candidates(contacts, &local_fork_id, subnet_count);
             for node_id in unwanted {
                 let _ = peer_table.set_unwanted(node_id);
             }
@@ -692,7 +750,11 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
             message @ libp2p::gossipsub::Event::Message { .. },
         )) => {
-            gossipsub::handle_gossipsub_message(server, message).await;
+            if server.wire.beacon().is_some() {
+                beacon::handler::handle_beacon_gossip_message(server, message).await;
+            } else {
+                gossipsub::handle_gossipsub_message(server, message).await;
+            }
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -709,26 +771,47 @@ async fn handle_swarm_event(
                     direction,
                     "success",
                 );
-                // Send status request on first connection to this peer
-                let our_status = build_status(&server.store);
-                let our_finalized_slot = our_status.finalized.slot;
-                let our_head_slot = our_status.head.slot;
-                info!(
-                    %peer_id,
-                    %direction,
-                    peer_count,
-                    our_finalized_slot,
-                    our_head_slot,
-                    "Peer connected"
-                );
-                server
-                    .swarm_handle
-                    .send_request(
-                        peer_id,
-                        Request::Status(our_status),
-                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                // Compute the beacon status and its log fields first, so no
+                // borrow of `server.wire` is alive across the send.
+                let beacon_status = server.wire.beacon().map(|wire| {
+                    (
+                        beacon::handler::build_status(wire),
+                        hex::encode(wire.fork_digest),
                     )
-                    .await;
+                });
+                match beacon_status {
+                    Some((status, digest)) => {
+                        info!(
+                            %peer_id,
+                            %direction,
+                            peer_count,
+                            fork_digest = %digest,
+                            "Peer connected"
+                        );
+                        beacon::handler::send_status(server, peer_id, status).await;
+                    }
+                    None => {
+                        let our_status = build_status(&server.store);
+                        let our_finalized_slot = our_status.finalized.slot;
+                        let our_head_slot = our_status.head.slot;
+                        info!(
+                            %peer_id,
+                            %direction,
+                            peer_count,
+                            our_finalized_slot,
+                            our_head_slot,
+                            "Peer connected"
+                        );
+                        server
+                            .swarm_handle
+                            .send_request(
+                                peer_id,
+                                Request::Status(our_status),
+                                libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                            )
+                            .await;
+                    }
+                }
             } else {
                 info!(%peer_id, %direction, "Added peer connection");
             }
@@ -1075,6 +1158,24 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    #[test]
+    fn a_lean_wire_reports_its_topics_and_no_beacon_wire() {
+        // The enum is what makes "subscribed to lean topics and beacon topics
+        // at once" unrepresentable. `P2PServer` dispatches on it once per
+        // handler, the same way `BlockChainServer` dispatches on the state
+        // variant.
+        let wire = Wire::Lean(LeanWire {
+            attestation_topics: HashMap::new(),
+            attestation_committee_count: 4,
+            block_topic: block_topic(),
+            aggregation_topic: aggregation_topic(),
+        });
+        assert!(wire.beacon().is_none());
+        let lean = wire.lean().expect("a lean wire");
+        assert_eq!(lean.attestation_committee_count, 4);
+        assert!(lean.block_topic.to_string().starts_with("/leanconsensus/"));
     }
 
     #[test]

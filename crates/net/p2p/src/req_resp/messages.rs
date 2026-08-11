@@ -2,16 +2,41 @@ use ethlambda_types::{block::SignedBlock, checkpoint::Checkpoint, primitives::H2
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 
+use crate::beacon::messages::{BeaconMetaData, BeaconStatus, Goodbye, Ping};
+
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
 pub const BLOCKS_BY_RANGE_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
 pub const MAX_REQUEST_BLOCKS: u64 = 1024; // Maximum number of blocks in a single request (1024).
+
+/// A request on one of the beacon protocols.
+#[derive(Debug, Clone)]
+pub enum BeaconRequest {
+    Status(BeaconStatus),
+    Ping(Ping),
+    /// The negotiated `metadata/N` protocol id.
+    ///
+    /// The request is empty on the wire, but the responder has to answer in the
+    /// version the peer asked for, and `request_response::Event::Message` does
+    /// not carry the protocol id. The codec does, so it records it here.
+    MetaData(&'static str),
+    Goodbye(Goodbye),
+}
+
+/// A response on one of the beacon protocols.
+#[derive(Debug, Clone)]
+pub enum BeaconResponse {
+    Status(BeaconStatus),
+    Pong(Ping),
+    MetaData(BeaconMetaData),
+}
 
 #[derive(Debug, Clone)]
 pub enum Request {
     Status(Status),
     BlocksByRoot(BlocksByRootRequest),
     BlocksByRange(BlocksByRangeRequest),
+    Beacon(BeaconRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +117,7 @@ impl std::fmt::Debug for ResponseCode {
 pub enum ResponsePayload {
     Status(Status),
     Blocks(Vec<SignedBlock>),
+    Beacon(BeaconResponse),
 }
 
 #[derive(Debug, Clone, SszEncode, SszDecode)]

@@ -130,21 +130,24 @@ it finds, completes the beacon `Status` handshake, subscribes to
 block that arrives. Typical run: a block within ~30 seconds of startup, one
 second after its own slot, from two connected peers and one mesh slot.
 
-That binary is a probe, not a second client mode. Its `/eth2/…` topic names,
-beacon req/resp protocol ids and `Status` handshake are mainnet's, not lean's,
-and none of it belongs in `P2PServer`. What it *does* share with the node is
-the part worth testing against a hostile-by-default real network: discv5,
-ENR parsing and verification, and the `ssz_snappy` framing. It never publishes
-and never claims a chain of its own.
+That binary was a probe, and what it proved is now shipped:
+[the mainnet wire](./beacon_wire.md) puts the same topic names, protocol ids and
+`Status` handshake behind the `ethlambda beacon` subcommand. What the probe
+shares with both is the layer underneath: discv5, ENR parsing and verification,
+and the `ssz_snappy` framing.
 
-Two details are worth copying if lean ever meets a real network:
+Two details from it are worth keeping in mind:
 
-- The fork digest is learned by plurality vote over discovered ENRs rather than
-  hardcoded, so a fork does not strand the probe. Bootnode records are poor
-  witnesses here: mainnet's still advertise the phase0 digest.
+- The probe learned the fork digest by plurality vote over discovered ENRs.
+  `ethlambda beacon` computes it from the fork schedule instead, which is
+  correct across a boundary rather than merely current. Bootnode records remain
+  poor witnesses either way: mainnet's still advertise the phase0 digest, and
+  three of them a pre-genesis one.
 - Gossip message ids follow Altair's function, which inserts the topic length
   and topic bytes between the domain and the payload. Phase0's shorter form
   produces ids no peer agrees with, which breaks IWANT/IHAVE silently.
+  `compute_message_id` in `crates/net/p2p/src/lib.rs` is already the Altair form
+  and is shared by both wires.
 
 ## Known limitations
 
