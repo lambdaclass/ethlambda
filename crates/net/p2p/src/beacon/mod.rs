@@ -11,6 +11,7 @@ pub mod decode;
 pub mod handler;
 pub mod messages;
 pub mod protocols;
+pub(crate) mod range_sync;
 pub mod swarm;
 pub mod topics;
 

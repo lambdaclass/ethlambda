@@ -2,7 +2,10 @@ use ethlambda_types::{block::SignedBlock, checkpoint::Checkpoint, primitives::H2
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 
-use crate::beacon::messages::{BeaconMetaData, BeaconStatus, Goodbye, Ping};
+use crate::beacon::messages::{
+    BeaconBlocksByRangeRequest, BeaconBlocksByRootRequest, BeaconMetaData, BeaconStatus, Goodbye,
+    Ping,
+};
 
 pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
 pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
@@ -21,14 +24,23 @@ pub enum BeaconRequest {
     /// not carry the protocol id. The codec does, so it records it here.
     MetaData(&'static str),
     Goodbye(Goodbye),
+    /// `beacon_blocks_by_range/2`: the anchor-to-head batch fetch.
+    BlocksByRange(BeaconBlocksByRangeRequest),
+    /// `beacon_blocks_by_root/2`: one block still orphaned after the range
+    /// fetch passed its slot.
+    BlocksByRoot(BeaconBlocksByRootRequest),
 }
 
 /// A response on one of the beacon protocols.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum BeaconResponse {
     Status(BeaconStatus),
     Pong(Ping),
     MetaData(BeaconMetaData),
+    /// The blocks a range or by-root request returned, already decoded under
+    /// the fork each chunk's `context-bytes` named.
+    Blocks(Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>),
 }
 
 #[derive(Debug, Clone)]

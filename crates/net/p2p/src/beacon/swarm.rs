@@ -53,7 +53,14 @@ pub fn build_beacon_swarm(
     )
     .expect("failed to initiate behaviour");
 
-    let req_resp = request_response::Behaviour::new(protocols::registrations(), Default::default());
+    // The codec carries the fork schedule: a `beacon_blocks_by_*/2` chunk is
+    // fork-typed, so decoding one needs the same schedule the digest was
+    // computed from.
+    let req_resp = request_response::Behaviour::with_codec(
+        crate::req_resp::Codec::beacon(config.config.clone()),
+        protocols::registrations(),
+        Default::default(),
+    );
 
     let secret_key =
         secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");

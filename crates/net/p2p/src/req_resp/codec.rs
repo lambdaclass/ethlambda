@@ -89,8 +89,34 @@ fn decode_beacon_metadata(protocol: &str, payload: &[u8]) -> io::Result<BeaconMe
     }
 }
 
+/// Bytes of `<context-bytes>` on an altair-and-later response chunk.
+///
+/// A fixed-width `ForkDigest`. Present on every `beacon_blocks_by_*/2` chunk and
+/// on no v1 protocol, so it has to be consumed here or every following chunk
+/// reads four bytes out of phase.
+///
+/// Source: `consensus-specs` `specs/altair/p2p-interface.md`, "`ForkDigest`-context".
+const CONTEXT_BYTES_LEN: usize = 4;
+
 #[derive(Debug, Clone, Default)]
-pub struct Codec;
+pub struct Codec {
+    /// The fork schedule, on a beacon swarm only.
+    ///
+    /// `beacon_blocks_by_*/2` chunks are fork-typed, so decoding one needs the
+    /// schedule. Lean's swarm builds this codec with `Default::default()` and
+    /// never reaches a protocol that reads it.
+    beacon_config: Option<std::sync::Arc<ethlambda_types::beacon::config::Config>>,
+}
+
+impl Codec {
+    /// The codec for a beacon swarm, carrying the schedule its block responses
+    /// are decoded against.
+    pub fn beacon(config: ethlambda_types::beacon::config::Config) -> Self {
+        Self {
+            beacon_config: Some(std::sync::Arc::new(config)),
+        }
+    }
+}
 
 impl libp2p::request_response::Codec for Codec {
     type Protocol = libp2p::StreamProtocol;
@@ -189,6 +215,12 @@ impl libp2p::request_response::Codec for Codec {
                 })
                 .await
             }
+            protocols::BEACON_BLOCKS_BY_RANGE_V2 | protocols::BEACON_BLOCKS_BY_ROOT_V2 => {
+                let config = self.beacon_config.as_ref().ok_or_else(|| {
+                    invalid("a beacon block response reached a codec with no fork schedule")
+                })?;
+                decode_beacon_blocks_response(io, label, config).await
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -219,6 +251,8 @@ impl libp2p::request_response::Codec for Codec {
             // empty slice emits no bytes at all.
             Request::Beacon(BeaconRequest::MetaData(_)) => Vec::new(),
             Request::Beacon(BeaconRequest::Goodbye(goodbye)) => goodbye.to_ssz(),
+            Request::Beacon(BeaconRequest::BlocksByRange(request)) => request.to_ssz(),
+            Request::Beacon(BeaconRequest::BlocksByRoot(request)) => request.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -286,6 +320,17 @@ impl libp2p::request_response::Codec for Codec {
                             BeaconResponse::Pong(ping) => ping.to_ssz(),
                             BeaconResponse::MetaData(metadata) => {
                                 encode_beacon_metadata(protocol.as_ref(), metadata)?
+                            }
+                            // `beacon_blocks_by_*/2` are registered
+                            // `ProtocolSupport::Outbound`, so libp2p never opens
+                            // an inbound stream for one and this arm is
+                            // unreachable. Refusing beats emitting a chunk with
+                            // no `context-bytes`, which would desynchronize a
+                            // peer's reader.
+                            BeaconResponse::Blocks(_) => {
+                                return Err(invalid(
+                                    "this node does not serve beacon block responses",
+                                ));
                             }
                         };
                         io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
@@ -410,6 +455,86 @@ where
     Ok(Response::success(ResponsePayload::Status(status)))
 }
 
+/// Decodes a `beacon_blocks_by_{range,root}/2` response.
+///
+/// The chunk shape altair introduced and every later fork keeps:
+///
+/// ```text
+/// response_chunk ::= <result> | <context-bytes> | <encoding-dependent-header> | <encoded-payload>
+/// ```
+///
+/// `<context-bytes>` is the 4-byte `ForkDigest` naming the chunk's type. It is
+/// read and discarded rather than mapped back to a fork: recovering a fork from
+/// a digest needs `genesis_validators_root` as well as the schedule, and the
+/// block's own slot answers the same question against the same schedule the
+/// gossip path already uses (`beacon::decode::fork_at_slot`). A peer that sends
+/// a digest from a fork this client does not know still decodes correctly, and
+/// one that lies about the digest cannot make this decode the wrong shape.
+///
+/// Skipping the four bytes is not optional: without it every following chunk in
+/// the stream reads out of phase.
+async fn decode_beacon_blocks_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+    config: &ethlambda_types::beacon::config::Config,
+) -> io::Result<Response>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    use ethlambda_types::beacon::containers::SignedBeaconBlock;
+
+    let mut blocks = Vec::new();
+
+    loop {
+        let mut result_byte = 0_u8;
+        if let Err(err) = io.read_exact(std::slice::from_mut(&mut result_byte)).await {
+            if err.kind() == io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(err);
+        }
+        let code = ResponseCode::from(result_byte);
+
+        // Only a success chunk carries context bytes; the spec is explicit that
+        // an error chunk's are empty.
+        if code == ResponseCode::SUCCESS {
+            let mut context = [0_u8; CONTEXT_BYTES_LEN];
+            io.read_exact(&mut context).await?;
+        }
+
+        let decoded = decode_payload(io).await?;
+        let payload = decoded.uncompressed;
+        metrics::observe_reqresp_response_chunk_size(
+            protocol_label,
+            payload.len(),
+            decoded.compressed_size,
+        );
+
+        if code != ResponseCode::SUCCESS {
+            let error_message = ErrorMessage::from_ssz_bytes(&payload)
+                .map(|msg| String::from_utf8_lossy(&msg).into_owned())
+                .unwrap_or_else(|_| "<invalid error message>".to_string());
+            debug!(?code, %error_message, "Skipping beacon block chunk with non-success code");
+            continue;
+        }
+
+        let slot = crate::beacon::decode::block_slot(&payload)
+            .map_err(|err| invalid(format!("beacon block chunk has no readable slot: {err:?}")))?;
+        let fork = crate::beacon::decode::fork_at_slot(config, slot);
+        let block = SignedBeaconBlock::from_ssz(fork, &payload).map_err(|err| {
+            invalid(format!(
+                "beacon block chunk at slot {slot} is not a valid {} block: {err:?}",
+                fork.as_str()
+            ))
+        })?;
+        blocks.push(block);
+    }
+
+    Ok(Response::success(ResponsePayload::Beacon(
+        BeaconResponse::Blocks(blocks),
+    )))
+}
+
 /// Decodes a block protocol response from a multi-chunk response stream.
 ///
 /// Reads chunks until EOF, collecting successfully decoded blocks. Each chunk has
@@ -502,12 +627,12 @@ mod tests {
     async fn request_round_trip(protocol: &'static str, request: Request) -> Request {
         let stream_protocol = StreamProtocol::new(protocol);
         let mut buffer = Cursor::new(Vec::new());
-        Codec
+        Codec::default()
             .write_request(&stream_protocol, &mut buffer, request)
             .await
             .expect("writes");
         let mut buffer = Cursor::new(buffer.into_inner());
-        Codec
+        Codec::default()
             .read_request(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
@@ -517,12 +642,12 @@ mod tests {
     async fn response_round_trip(protocol: &'static str, response: Response) -> Response {
         let stream_protocol = StreamProtocol::new(protocol);
         let mut buffer = Cursor::new(Vec::new());
-        Codec
+        Codec::default()
             .write_response(&stream_protocol, &mut buffer, response)
             .await
             .expect("writes");
         let mut buffer = Cursor::new(buffer.into_inner());
-        Codec
+        Codec::default()
             .read_response(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
@@ -548,7 +673,7 @@ mod tests {
         // whichever variant the caller happened to build.
         let stream_protocol = StreamProtocol::new(protocols::STATUS_V2);
         let mut buffer = Cursor::new(Vec::new());
-        let result = Codec
+        let result = Codec::default()
             .write_request(
                 &stream_protocol,
                 &mut buffer,

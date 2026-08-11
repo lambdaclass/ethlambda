@@ -143,6 +143,19 @@ pub async fn handle_beacon_request(
             info!(%peer, reason, "Peer said goodbye");
             return;
         }
+        // Registered `ProtocolSupport::Outbound`, so libp2p refuses the inbound
+        // stream at negotiation and these never arrive. A checkpoint-synced
+        // node holds nothing below its anchor, so declining the stream is a
+        // more useful answer than a short response the peer has to diagnose.
+        BeaconRequest::BlocksByRange(_) | BeaconRequest::BlocksByRoot(_) => {
+            debug!(%peer, "Refusing an inbound beacon block request: this node serves none");
+            let response = Response::error(
+                ResponseCode::RESOURCE_UNAVAILABLE,
+                error_message("this node does not serve beacon blocks"),
+            );
+            server.swarm_handle.send_response(channel, response);
+            return;
+        }
     };
 
     let Some(response) = response else {
@@ -184,6 +197,17 @@ pub fn handle_beacon_response(server: &mut P2PServer, peer: PeerId, response: Be
         }
         BeaconResponse::MetaData(_) => {
             debug!(%peer, "Peer metadata received");
+        }
+        // Routed by `req_resp::handlers`, which knows which request this
+        // answers and therefore which slots it was meant to cover. Reaching
+        // here means a block response arrived with no matching outbound
+        // request recorded.
+        BeaconResponse::Blocks(blocks) => {
+            debug!(
+                %peer,
+                count = blocks.len(),
+                "Beacon block response with no matching outbound request"
+            );
         }
     }
 }
