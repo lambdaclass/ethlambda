@@ -35,6 +35,7 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 pub mod beacon_chain;
+pub(crate) mod beacon_pending;
 pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
