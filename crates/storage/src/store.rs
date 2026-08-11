@@ -8,6 +8,8 @@ use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::error::Error;
 
 use ethlambda_crypto::signature::ValidatorSignature;
+use ethlambda_types::beacon::containers::BeaconState;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
@@ -89,6 +91,51 @@ const KEY_SAFE_TARGET: &[u8] = b"safe_target";
 const KEY_LATEST_JUSTIFIED: &[u8] = b"latest_justified";
 /// Key for "latest_finalized" field of the Store. Its value has type [`Checkpoint`] and it's SSZ-encoded.
 const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
+/// Key for the on-disk format version. Its value has type [`u64`] and it's SSZ-encoded.
+const KEY_DB_VERSION: &[u8] = b"db_version";
+/// Key for which chain this directory holds. Its value is a single
+/// [`Chain::selector`] byte, not SSZ: it predates being able to decode
+/// anything else in the directory.
+const KEY_CHAIN: &[u8] = b"chain";
+
+/// The on-disk format this build reads and writes.
+///
+/// Bumped whenever a table's key or value layout changes. `from_db_state`
+/// refuses any other value rather than migrating: a lean devnet resyncs in
+/// minutes, and a wrong guess about an old layout corrupts silently.
+pub const DB_VERSION: u64 = 1;
+
+/// The consensus protocol a data directory holds.
+///
+/// Written once at bootstrap and never rewritten, like `Metadata["config"]`. A
+/// directory is one chain or the other for its whole life: the two use
+/// different state shapes, different checkpoint types, and different clock
+/// units, and nothing migrates between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    Lean,
+    Beacon,
+}
+
+impl Chain {
+    /// The byte this chain is stored under. Spelled out for the same reason
+    /// [`ForkName::selector`] is: it is a storage format, not a discriminant.
+    pub const fn selector(self) -> u8 {
+        match self {
+            Chain::Lean => 0,
+            Chain::Beacon => 1,
+        }
+    }
+
+    /// The inverse of [`Chain::selector`].
+    pub const fn from_selector(byte: u8) -> Option<Chain> {
+        match byte {
+            0 => Some(Chain::Lean),
+            1 => Some(Chain::Beacon),
+            _ => None,
+        }
+    }
+}
 
 /// Persist a full-state snapshot whenever a block's slot crosses a multiple of
 /// this value (relative to its parent's slot).
@@ -561,6 +608,10 @@ pub struct Store {
     /// file; this field only spares every caller a backend round trip and a
     /// `Result` it could never act on.
     config: ChainConfig,
+    /// Which chain this directory holds. Cached for the same reason [`Store::config`]
+    /// is: written once at bootstrap, so a per-`Store` copy cannot go stale, and
+    /// `BlockChainServer`'s dispatch reads it on every handler entry.
+    pub(crate) chain: Chain,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
@@ -574,6 +625,47 @@ pub struct Store {
 fn new_state_cache() -> Arc<Mutex<LruCache<H256, State>>> {
     let capacity = NonZeroUsize::new(STATE_CACHE_CAPACITY).expect("cache capacity is non-zero");
     Arc::new(Mutex::new(LruCache::new(capacity)))
+}
+
+/// Encodes a `States` value: the state's fork selector, then the variant's own
+/// SSZ.
+///
+/// The tag is what lets one table hold both a lean `State` and a beacon
+/// `BeaconState` without the reader having to already know which it is.
+/// [`BeaconState::to_ssz`] panics on the `Lean` variant by design, so the lean
+/// arm reaches through to the inner state rather than going via the enum.
+pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(state.fork_name().selector());
+    match state {
+        BeaconState::Lean(lean) => bytes.extend_from_slice(&lean.to_ssz()),
+        beacon => bytes.extend_from_slice(&beacon.to_ssz()),
+    }
+    bytes
+}
+
+/// The inverse of [`encode_state_value`].
+///
+/// Panics on a value this build cannot tag-decode, matching every other read in
+/// this file: `from_db_state` has already rejected a directory of the wrong
+/// format version, so anything reaching here is corruption rather than an old
+/// database.
+pub(crate) fn decode_state_value(bytes: &[u8]) -> BeaconState {
+    let (tag, ssz) = bytes.split_first().expect("state value is never empty");
+    let fork = ForkName::from_selector(*tag).expect("state value carries a known fork selector");
+    BeaconState::from_ssz(fork, ssz).expect("valid state")
+}
+
+/// [`decode_state_value`] for the lean reader, which has no beacon shape to do
+/// anything with.
+fn decode_lean_state_value(bytes: &[u8]) -> State {
+    match decode_state_value(bytes) {
+        BeaconState::Lean(state) => state,
+        beacon => panic!(
+            "lean read a {} state out of the States table; a data directory holds one chain",
+            beacon.fork_name()
+        ),
+    }
 }
 
 impl Store {
@@ -645,11 +737,38 @@ impl Store {
             {
                 return Ok(None);
             }
+
+            // Both checks above answer "has this directory ever held a chain",
+            // and both have to come first: a directory that never did is
+            // `Ok(None)`, not a version mismatch, and a half-written one is
+            // missing the version key for the same reason it is missing the
+            // finalized checkpoint.
+            let found = view
+                .get(Table::Metadata, KEY_DB_VERSION)
+                .expect("get db version")
+                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid db version"))
+                .unwrap_or(0);
+            if found != DB_VERSION {
+                return Err(Error::DbVersionMismatch {
+                    found,
+                    expected: DB_VERSION,
+                });
+            }
+            let chain = view
+                .get(Table::Metadata, KEY_CHAIN)
+                .expect("get chain")
+                .and_then(|bytes| bytes.first().copied())
+                .and_then(Chain::from_selector)
+                .expect("a versioned directory always carries a chain tag");
+            if chain != Chain::Lean {
+                return Err(Error::WrongChain);
+            }
             ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
         };
         let store = Self {
             backend,
             config: persisted_config,
+            chain: Chain::Lean,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -721,6 +840,8 @@ impl Store {
 
             // Metadata
             let metadata_entries = vec![
+                (KEY_DB_VERSION.to_vec(), DB_VERSION.to_ssz()),
+                (KEY_CHAIN.to_vec(), vec![Chain::Lean.selector()]),
                 (KEY_TIME.to_vec(), 0u64.to_ssz()),
                 (KEY_CONFIG.to_vec(), anchor_state.config.to_ssz()),
                 (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
@@ -762,7 +883,10 @@ impl Store {
             // State snapshot. The anchor has no parent in the store, so it is
             // the base of every diff chain: store it as a full snapshot in
             // `States` (never pruned) so reconstruction always terminates here.
-            let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
+            let state_entries = vec![(
+                anchor_block_root.to_ssz(),
+                encode_state_value(&BeaconState::Lean(anchor_state.clone())),
+            )];
             batch
                 .put_batch(Table::States, state_entries)
                 .expect("put state");
@@ -784,6 +908,7 @@ impl Store {
         Ok(Self {
             backend,
             config: anchor_state.config,
+            chain: Chain::Lean,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -837,6 +962,14 @@ impl Store {
     /// so this never reads the backend.
     pub fn config(&self) -> &ChainConfig {
         &self.config
+    }
+
+    /// Which consensus protocol this data directory holds.
+    ///
+    /// Infallible for the same reason [`Store::config`] is: fixed at bootstrap
+    /// and cached, so this never reads the backend.
+    pub fn chain(&self) -> Chain {
+        self.chain
     }
 
     // ============ Head ============
@@ -1330,7 +1463,7 @@ impl Store {
             let view = self.backend.begin_read().expect("read view");
             view.get(Table::States, &root.to_ssz())
                 .expect("get")
-                .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
+                .map(|bytes| decode_lean_state_value(&bytes))
         };
         let state = if let Some(s) = snapshot {
             s
@@ -1358,7 +1491,7 @@ impl Store {
         let mut cursor = *root;
         let snapshot = loop {
             if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
-                break State::from_ssz_bytes(&bytes).expect("valid state");
+                break decode_lean_state_value(&bytes);
             }
             let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
             else {
@@ -1428,8 +1561,9 @@ impl Store {
         let is_anchor =
             state.slot / SNAPSHOT_ANCHOR_INTERVAL > parent_state.slot / SNAPSHOT_ANCHOR_INTERVAL;
 
-        // Snapshot only at anchors; serialize before `state` is consumed.
-        let snapshot_bytes = is_anchor.then(|| state.to_ssz());
+        // Snapshot only at anchors; encode before `state` is consumed.
+        let snapshot_bytes =
+            is_anchor.then(|| encode_state_value(&BeaconState::Lean(state.clone())));
         // Memoize the post-state for fast reads, then move it into the diff so
         // its multi-MB justification fields are not cloned again.
         self.state_cache.lock().unwrap().put(root, state.clone());
@@ -1802,8 +1936,12 @@ mod tests {
     /// Insert a real full-state snapshot for a given root (seeds a diff-chain base).
     fn insert_snapshot(backend: &dyn StorageBackend, root: H256, state: &State) {
         let mut batch = backend.begin_write().expect("write batch");
+        let entries = vec![(
+            root.to_ssz(),
+            encode_state_value(&BeaconState::Lean(state.clone())),
+        )];
         batch
-            .put_batch(Table::States, vec![(root.to_ssz(), state.to_ssz())])
+            .put_batch(Table::States, entries)
             .expect("put snapshot");
         batch.commit().expect("commit");
     }
@@ -1866,6 +2004,7 @@ mod tests {
             Self {
                 backend,
                 config: ChainConfig { genesis_time: 0 },
+                chain: Chain::Lean,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -1881,6 +2020,7 @@ mod tests {
             Self {
                 backend,
                 config: ChainConfig { genesis_time: 0 },
+                chain: Chain::Lean,
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
@@ -1889,6 +2029,91 @@ mod tests {
                 state_cache: new_state_cache(),
             }
         }
+    }
+
+    // ============ Chain tag and database version ============
+
+    #[test]
+    fn a_fresh_lean_store_records_its_chain_and_db_version() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend.clone(), State::from_genesis(7, vec![]));
+        assert_eq!(store.chain(), Chain::Lean);
+
+        let view = backend.begin_read().expect("read view");
+        let version = view
+            .get(Table::Metadata, KEY_DB_VERSION)
+            .expect("get")
+            .expect("db version written at bootstrap");
+        assert_eq!(
+            u64::from_ssz_bytes(&version).expect("valid version"),
+            DB_VERSION
+        );
+    }
+
+    #[test]
+    fn states_values_carry_a_fork_selector() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(backend.clone(), State::from_genesis(7, vec![]));
+        let anchor = store.head().expect("head root");
+
+        let view = backend.begin_read().expect("read view");
+        let value = view
+            .get(Table::States, &anchor.to_ssz())
+            .expect("get")
+            .expect("anchor snapshot written at bootstrap");
+        assert_eq!(value[0], ForkName::Lean.selector());
+    }
+
+    #[test]
+    fn from_db_state_rejects_a_database_written_before_the_fork_selector() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(7, vec![]));
+
+        // A pre-versioned database is exactly one with no version key, so
+        // deleting it reproduces the format this build must refuse.
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::Metadata, vec![KEY_DB_VERSION.to_vec()])
+            .expect("delete db version");
+        batch.commit().expect("commit");
+
+        // Matched rather than `expect_err`: that would need `Store: Debug`, and
+        // the store holds a `dyn StorageBackend` and two buffers that have no
+        // `Debug` to derive from.
+        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
+            panic!("a pre-versioned database must not be reused");
+        };
+        assert!(matches!(
+            err,
+            Error::DbVersionMismatch {
+                found: 0,
+                expected: DB_VERSION
+            }
+        ));
+    }
+
+    #[test]
+    fn from_db_state_refuses_a_beacon_data_directory() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(7, vec![]));
+
+        // Rewrite only the chain byte: everything else is a valid lean chain,
+        // so this pins the check to the chain tag rather than to some
+        // side effect of a half-written directory.
+        let mut batch = backend.begin_write().expect("write batch");
+        batch
+            .put_batch(
+                Table::Metadata,
+                vec![(KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()])],
+            )
+            .expect("put chain");
+        batch.commit().expect("commit");
+
+        // See the version test above for why this is not `expect_err`.
+        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
+            panic!("a beacon data directory must not be opened as lean");
+        };
+        assert!(matches!(err, Error::WrongChain));
     }
 
     // ============ Block Signature Pruning Tests ============

@@ -17,7 +17,9 @@ tracing.workspace = true
 rocksdb.workspace = true
 thiserror.workspace = true
 
-libssz.workspace = true
+# `ethereum_types` because a beacon `Root` is an `ethereum_types::H256`, which
+# `States` and the beacon block tables both key and encode.
+libssz = { workspace = true, features = ["ethereum_types"] }
 libssz-derive.workspace = true
 libssz-types.workspace = true
 
