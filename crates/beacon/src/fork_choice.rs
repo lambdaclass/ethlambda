@@ -163,21 +163,7 @@ use crate::kzg;
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex};
 use crate::stf;
-
-// ---------------------------------------------------------------------------
-// LatestMessage
-// ---------------------------------------------------------------------------
-
-/// One validator's most recent attestation: the epoch it targeted, and the
-/// block it attested to (the LMD GHOST vote).
-///
-/// `Copy`, matching the specification's `@dataclass(eq=True, frozen=True)`:
-/// there is nothing here worth borrowing rather than copying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LatestMessage {
-    pub epoch: Epoch,
-    pub root: Root,
-}
+pub use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
 
 // ---------------------------------------------------------------------------
 // Attestation, AttesterSlashing
@@ -328,41 +314,6 @@ impl AttesterSlashing {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// PowBlock
-// ---------------------------------------------------------------------------
-
-/// The execution chain's own block header, as far as bellatrix's merge
-/// transition check needs it: `specs/bellatrix/fork-choice.md`'s `PowBlock`.
-///
-/// The specification's own `get_pow_block(hash) -> Optional[PowBlock]` is
-/// "implementation and context dependent": a real client would ask its
-/// execution engine. [`Store::pow_blocks`] and [`insert_pow_block`] are what
-/// stand in for that here, populated directly by the fixture suites' own
-/// `on_merge_block` step rather than a real PoW chain.
-///
-/// Defined in its own module, rather than inline here like [`LatestMessage`],
-/// purely to keep its `SszDecode` derive out of the scope of this file's own
-/// `use crate::error::Result;`: that alias and the derive macro's
-/// generated code (which expects the standard library's own two-parameter
-/// `Result`) would otherwise collide.
-mod pow_block {
-    use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-
-    use crate::primitives::{Root, Uint256};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
-    pub struct PowBlock {
-        pub block_hash: Root,
-        pub parent_hash: Root,
-        /// The total work behind `block_hash`, compared against
-        /// [`crate::config::Config::terminal_total_difficulty`] to decide
-        /// whether this is the one PoW block the merge transitioned at.
-        pub total_difficulty: Uint256,
-    }
-}
-pub use pow_block::PowBlock;
 
 // ---------------------------------------------------------------------------
 // DataAvailability
