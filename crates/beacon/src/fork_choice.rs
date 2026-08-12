@@ -1895,6 +1895,62 @@ mod tests {
             .collect()
     }
 
+    /// The refusal the whole anchor-to-head fetch exists to work around.
+    ///
+    /// A checkpoint-synced node's store holds exactly one block, the anchor.
+    /// A gossiped block from the live head names a parent two epochs newer, so
+    /// it is refused, and stays refused until the slots between are fetched.
+    /// Nothing here reaches a state transition or a signature check: the parent
+    /// test is the first thing `on_block` does, deliberately, so a block on an
+    /// unknown chain costs nothing to reject.
+    ///
+    /// The refusal is enforced twice over, which is worth knowing before
+    /// touching either half: commenting out the `has_beacon_block` check above
+    /// does *not* make this test pass, because `block_state` immediately after
+    /// it fails with `block_root in store.block_states` on the same missing
+    /// parent. The explicit check is the cheap one, and keeps a block on an
+    /// unknown chain from costing a state lookup.
+    #[test]
+    fn on_block_refuses_a_block_whose_parent_is_unknown() {
+        let config = Config::active();
+        let anchor_state = crate::helpers::test_state::with_validators(1);
+        let anchor_slot = anchor_state.slot();
+        let anchor_block = {
+            let mut signed = block(anchor_slot, Root::zero());
+            let SignedBeaconBlock::Phase0(inner) = &mut signed else {
+                panic!("`block` builds a phase0 block");
+            };
+            inner.message.state_root = anchor_state.hash_tree_root();
+            signed
+        };
+        let mut store = get_forkchoice_store(
+            Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
+            anchor_state,
+            anchor_block,
+            &config,
+        )
+        .expect("the pair matches");
+
+        // A block from the live head: two epochs on, naming a parent that only
+        // a node which fetched the gap could possibly have.
+        let orphan = block(
+            anchor_slot + 2 * preset::SLOTS_PER_EPOCH,
+            Root::repeat_byte(0xbe),
+        );
+        let orphan_root = orphan.message_hash_tree_root();
+
+        let result = on_block(&mut store, orphan, &config, &DataAvailability::NotRequired);
+
+        assert!(
+            result.is_err(),
+            "a block whose parent is not in the store must not import"
+        );
+        assert!(
+            !store.has_beacon_block(orphan_root),
+            "a refused block must leave the store untouched"
+        );
+    }
+
     #[test]
     fn get_ancestor_walks_past_an_empty_slot_gap() {
         let genesis_root = Root::repeat_byte(1);
