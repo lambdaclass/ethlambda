@@ -91,8 +91,8 @@ Lighthouse's relevance check exempts a zero `finalized_root`, so this reads as
 | `attnets` | 64 bits, all unset |
 | `cgc` | `CUSTODY_REQUIREMENT` |
 | `quic` | `--gossipsub-port` |
+| `tcp` | `--gossipsub-port`, the same number: TCP and UDP are separate namespaces |
 | `udp` | `--discovery.port` |
-| no `tcp` | ethlambda speaks QUIC only |
 
 Two of these advertise less, or more, than they look like:
 
@@ -177,15 +177,21 @@ What each failure looks like:
 | connected peers above zero, no gossip at all | the topic hash: almost always the digest's hex formatting or `compute_message_id` |
 | every candidate rejected as `missing or undecodable eth2 entry` | see below |
 
-### QUIC is the practical gate on peering
+### QUIC was the practical gate on peering
 
-ethlambda dials QUIC only, and it dials the `quic` port a peer's ENR advertises.
-Most mainnet beacon nodes are reachable over TCP and advertise a `quic` entry
-that does not answer, either because the node is behind a NAT that forwards only
-TCP or because QUIC is disabled behind an advertised port. The result is a long
-run of `Handshake with the remote timed out` against otherwise valid, correctly
-admitted peers, and a peer count that climbs far more slowly than a TCP-speaking
-client's would.
+ethlambda used to dial QUIC only, against the `quic` port a peer's ENR
+advertises. Most mainnet beacon nodes are reachable over TCP and advertise a
+`quic` entry that does not answer, either because the node is behind a NAT that
+forwards only TCP or because QUIC is disabled behind an advertised port. The
+result was a long run of `Handshake with the remote timed out` against otherwise
+valid, correctly admitted peers, and a peer count that climbed far more slowly
+than a TCP-speaking client's would.
+
+The node now listens on and dials both transports, and admission accepts a peer
+advertising either, so a dead `quic` entry falls back to TCP within the same dial
+rather than ending it. **This is unverified on mainnet**: no live run has
+happened against it, so the paragraph above is the recorded symptom, not a
+resolved one. `docs/beacon_sync.md`'s manual procedure is what settles it.
 
 This is a property of the network, not a defect in admission: candidates that
 reach the dial stage have already had their `eth2` digest matched and their
