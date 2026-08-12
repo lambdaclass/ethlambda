@@ -76,10 +76,11 @@ where
 /// Flags every subcommand takes, with the same meaning and the same
 /// requiredness on each.
 ///
-/// `--node-id`, `--bootnodes`, `--checkpoint-sync-url`, and `--discovery.*` are
-/// deliberately not here even though the design document groups them as common:
-/// each of them is required on one subcommand and optional or absent on the
-/// other, and a flattened struct has one requiredness.
+/// `--node-id`, `--bootnodes`, `--checkpoint-sync-url`, `--discovery.*`, and
+/// `--node-key` are deliberately not here even though the design document
+/// groups them as common: each of them is required on one subcommand and
+/// optional or absent on the other, and a flattened struct has one
+/// requiredness.
 #[derive(Debug, clap::Args)]
 pub(crate) struct CommonOptions {
     #[arg(long, default_value = "9000")]
@@ -90,8 +91,6 @@ pub(crate) struct CommonOptions {
     pub(crate) api_port: u16,
     #[arg(long, default_value = "5054")]
     pub(crate) metrics_port: u16,
-    #[arg(long)]
-    pub(crate) node_key: PathBuf,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
@@ -102,6 +101,10 @@ pub(crate) struct CommonOptions {
 pub(crate) struct LeanOptions {
     #[command(flatten)]
     pub(crate) common: CommonOptions,
+    /// Hex file holding the secp256k1 key that is this node's libp2p and
+    /// discv5 identity.
+    #[arg(long)]
+    pub(crate) node_key: PathBuf,
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     pub(crate) genesis: PathBuf,
@@ -226,7 +229,7 @@ pub(crate) struct DiscoveryConfig {
     /// node on: `127.0.0.1` for a local devnet, or the host's public address.
     /// discv5's PONG-based IP voting may still replace it at runtime.
     #[arg(long = "discovery.advertise-ip")]
-    pub(crate) advertise_ip: Option<std::net::IpAddr>,
+    pub(crate) advertise_ip: Option<IpAddr>,
 }
 
 impl LeanOptions {
@@ -251,6 +254,17 @@ impl LeanOptions {
 pub(crate) struct BeaconOptions {
     #[command(flatten)]
     pub(crate) common: CommonOptions,
+    /// Hex file holding the secp256k1 key that is this node's libp2p and
+    /// discv5 identity.
+    ///
+    /// Optional, unlike lean's flag of the same name: `beacon` is a
+    /// read-only follower with no validator identity to protect, so a
+    /// stable node identity is a convenience rather than a requirement. When
+    /// omitted, a fresh key is generated in memory at startup (logged as a
+    /// warning) and used for that run only; the PeerId and ENR differ on the
+    /// next start.
+    #[arg(long)]
+    pub(crate) node_key: Option<PathBuf>,
     /// Base URL(s) of Beacon API servers to take the anchor from, e.g.
     /// `https://checkpointz.example`.
     ///
@@ -591,7 +605,7 @@ mod tests {
             panic!("`beacon` must resolve to the beacon subcommand");
         };
         assert_eq!(options.checkpoint_sync_url, ["https://checkpointz.example"]);
-        assert_eq!(options.common.node_key, PathBuf::from("node.key"));
+        assert_eq!(options.node_key, Some(PathBuf::from("node.key")));
         // No flag given, so the built-in mainnet ENR list applies.
         assert_eq!(options.bootnodes, None);
     }
@@ -608,17 +622,30 @@ mod tests {
     }
 
     #[test]
-    fn beacon_requires_a_node_key() {
-        let result = Cli::try_parse_from([
+    fn beacon_accepts_no_node_key() {
+        // Inverts what this test used to assert. `beacon` has no validator
+        // identity to protect, so a stable node identity is a convenience,
+        // not a requirement: omitting `--node-key` must parse, and `main`'s
+        // `run_beacon` generates an ephemeral key instead of erroring.
+        let options = parse_beacon(vec![
             "ethlambda",
             "beacon",
             "--checkpoint-sync-url",
             "https://checkpointz.example",
         ]);
-        assert!(
-            result.is_err(),
-            "--node-key is common and required on both subcommands"
-        );
+        assert_eq!(options.node_key, None);
+    }
+
+    #[test]
+    fn lean_still_requires_a_node_key() {
+        // The beacon subcommand's `--node-key` became optional; lean's own
+        // copy of the flag must not have moved with it.
+        let mut args = base_args();
+        let key_index = args.iter().position(|&a| a == "node.key").unwrap();
+        args.remove(key_index);
+        args.remove(key_index - 1); // the preceding "--node-key"
+        let result = Cli::try_parse_from(inject_default_subcommand(args));
+        assert!(result.is_err(), "lean must still require --node-key");
     }
 
     #[test]

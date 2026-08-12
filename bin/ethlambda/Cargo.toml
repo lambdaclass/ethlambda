@@ -51,8 +51,10 @@ thiserror.workspace = true
 eyre.workspace = true
 
 # Pinned to ethlambda-p2p's discovery module, which takes a raw secp256k1
-# `SecretKey` in `DiscoverySpawnConfig`.
-secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context"] }
+# `SecretKey` in `DiscoverySpawnConfig`. `rand` is for `run_beacon`'s
+# ephemeral-key generation when `--node-key` is omitted; it also re-exports
+# the `rand` crate (`secp256k1::rand`), so nothing else needs a direct dep on it.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }
 
 tikv-jemallocator = { workspace = true, optional = true }
 

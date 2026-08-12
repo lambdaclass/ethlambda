@@ -33,10 +33,12 @@ listing rather than a missing-flag error for `lean`.
 ## Common flags
 
 Taken by both subcommands, with the same meaning and the same defaults.
+`--node-key` is deliberately not here even though it fits the description:
+it is required on `lean` and optional on `beacon`, and a flattened struct has
+one requiredness — see each subcommand's own table below.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--node-key` | required | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity |
 | `--data-dir` | `./data` | RocksDB directory |
 | `--gossipsub-port` | `9000` | Port for libp2p gossip: UDP for QUIC and TCP for the TCP transport, same number on both, since they are separate namespaces |
 | `--http-address` | `127.0.0.1` | Bind address for both HTTP servers |
@@ -47,6 +49,7 @@ Taken by both subcommands, with the same meaning and the same defaults.
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--node-key` | required | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity |
 | `--genesis` | required | Chain genesis config, e.g. `config.yaml` |
 | `--validators` | required | Validator registry, e.g. `annotated_validators.yaml` |
 | `--bootnodes` | required | YAML list of bootnode ENRs |
@@ -71,6 +74,7 @@ from a normal build.
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--node-key` | generates an ephemeral key | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, a fresh key is generated in memory each start (logged as a warning): the PeerId and ENR differ on every restart |
 | `--checkpoint-sync-url` | required | Beacon API base URLs supplying the anchor state |
 | `--bootnodes` | built-in mainnet ENRs | Override the built-in list |
 | `--discovery.port` | `--gossipsub-port` + 1 | discv5 UDP port |

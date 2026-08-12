@@ -134,6 +134,9 @@ reachable mainnet peers and a finalizing chain. This procedure is the check.
 ```bash
 make lint && make test && make test-beacon
 cargo build --profile release-fast --bin ethlambda
+# Optional: --node-key is not required on `beacon`. Omitting it generates an
+# ephemeral key in memory each start, logged as a warning, with a different
+# PeerId and ENR every restart. Supply a file for a stable identity:
 openssl rand -hex 32 > /tmp/beacon-node.key
 rm -rf /tmp/beacon-data && mkdir -p /tmp/beacon-data
 ```
@@ -150,6 +153,9 @@ rm -rf /tmp/beacon-data && mkdir -p /tmp/beacon-data
   --metrics-port 5054 \
   2>&1 | tee /tmp/beacon-run.log
 ```
+
+Drop `--node-key /tmp/beacon-node.key` to run without one; the startup log
+then shows the generated-key warning instead of nothing.
 
 `https://mainnet-checkpoint-sync.attestant.io` is a second provider if the first
 is down. Discovery is forced on for `beacon` and its port defaults to

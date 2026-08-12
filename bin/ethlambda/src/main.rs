@@ -138,10 +138,10 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = read_hex_file_bytes(&options.common.node_key).wrap_err_with(|| {
+    let node_p2p_key = read_hex_file_bytes(&options.node_key).wrap_err_with(|| {
         format!(
             "failed to load node key from {}",
-            options.common.node_key.display()
+            options.node_key.display()
         )
     })?;
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.common.gossipsub_port);
@@ -153,7 +153,7 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
 
-    info!(node_key=?options.common.node_key, "got node key");
+    info!(node_key=?options.node_key, "got node key");
 
     let config_path = options.genesis;
     let bootnodes_path = options.bootnodes;
@@ -433,7 +433,7 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
     info!(
         checkpoint_sync_url = ?options.checkpoint_sync_url,
         bootnodes = ?options.bootnodes,
-        node_key = ?options.common.node_key,
+        node_key = ?options.node_key,
         data_dir = ?options.common.data_dir,
         gossipsub_port = options.common.gossipsub_port,
         http_address = %options.common.http_address,
@@ -443,12 +443,7 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         advertise_ip = ?options.discovery.advertise_ip,
         "Resolved beacon configuration"
     );
-    let node_key = read_hex_file_bytes(&options.common.node_key).wrap_err_with(|| {
-        format!(
-            "failed to load node key from {}",
-            options.common.node_key.display()
-        )
-    })?;
+    let node_key = resolve_beacon_node_key(options.node_key.as_deref())?;
     let bootnode_enrs = match options.bootnodes.as_ref() {
         Some(path) => Some(read_bootnode_strings(path)?),
         None => None,
@@ -777,6 +772,32 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
     let hex_string = file_content.trim().trim_start_matches("0x");
     hex::decode(hex_string)
         .wrap_err_with(|| format!("failed to decode hex file from {}", path.display()))
+}
+
+/// Resolve `ethlambda beacon`'s node key: read `--node-key` if given,
+/// otherwise generate a fresh secp256k1 key in memory.
+///
+/// `beacon` is a read-only follower with no validator identity to protect,
+/// so a missing key generates one rather than erroring the way `lean`'s
+/// (required) flag of the same name does. There is no precedent elsewhere in
+/// this binary for writing generated key material to `--data-dir`, and doing
+/// so would need file permissions this repo does not otherwise establish;
+/// keeping it in memory only is the conservative choice, so this identity
+/// does not survive a restart.
+fn resolve_beacon_node_key(node_key_path: Option<&Path>) -> eyre::Result<Vec<u8>> {
+    match node_key_path {
+        Some(path) => read_hex_file_bytes(path)
+            .wrap_err_with(|| format!("failed to load node key from {}", path.display())),
+        None => {
+            let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng);
+            warn!(
+                "No --node-key supplied: generated an ephemeral secp256k1 key in memory for \
+                 this run only. This node's PeerId and ENR will be different on the next \
+                 start; pass --node-key with a persisted key file for a stable identity."
+            );
+            Ok(generated.secret_bytes().to_vec())
+        }
+    }
 }
 
 /// Fetch the initial state for the node.
@@ -1163,5 +1184,52 @@ validators:
             matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
             "unexpected error: {err}"
         );
+    }
+
+    /// A unique path under the OS temp dir, so parallel test runs cannot
+    /// collide on the same file.
+    fn temp_key_path(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ethlambda-test-node-key-{label}-{nanos}.key"))
+    }
+
+    #[test]
+    fn a_supplied_node_key_is_read_verbatim_and_stable_across_calls() {
+        // A `PeerId` is a pure function of the key bytes (see
+        // `ethlambda_p2p::derive_peer_ids`), so two calls returning the same
+        // bytes for the same file is exactly what "the same PeerId across two
+        // runs" comes down to, without pulling libp2p's key derivation into
+        // this crate's tests.
+        let path = temp_key_path("supplied");
+        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
+
+        let first = resolve_beacon_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let second = resolve_beacon_node_key(Some(path.as_path())).expect("reads the supplied key");
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_missing_node_key_generates_a_valid_key_that_differs_from_a_supplied_one() {
+        let path = temp_key_path("baseline");
+        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
+        let supplied =
+            resolve_beacon_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let _ = std::fs::remove_file(&path);
+
+        let generated_a = resolve_beacon_node_key(None).expect("generates a key");
+        let generated_b = resolve_beacon_node_key(None).expect("generates a key");
+
+        // "Accepted": the bytes are a valid secp256k1 secret key, the same
+        // check `beacon::run` performs before deriving the swarm identity.
+        secp256k1::SecretKey::from_slice(&generated_a)
+            .expect("generated key is a valid secp256k1 secret key");
+
+        assert_ne!(generated_a, supplied);
+        assert_ne!(generated_a, generated_b, "two generations must not collide");
     }
 }

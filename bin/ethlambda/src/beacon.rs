@@ -202,6 +202,8 @@ async fn fetch_genesis_from_any(urls: &[String]) -> eyre::Result<Genesis> {
 /// Everything `run` needs, gathered from the `beacon` subcommand's flags.
 pub struct BeaconRunConfig {
     pub checkpoint_sync_urls: Vec<String>,
+    /// Raw secp256k1 secret key bytes, either read from `--node-key` or
+    /// generated in memory by `run_beacon` when the flag is omitted.
     pub node_key: Vec<u8>,
     pub gossipsub_port: u16,
     pub discovery_port: u16,
