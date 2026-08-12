@@ -98,6 +98,39 @@ static LEAN_SAFE_TARGET_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLoc
     register_int_gauge!("lean_safe_target_slot", "Safe target slot").unwrap()
 });
 
+static LEAN_SYNC_ANCHOR_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_sync_anchor_slot",
+        "Slot of the checkpoint-sync anchor this process started from"
+    )
+    .unwrap()
+});
+
+static LEAN_SYNC_PENDING_BLOCKS: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_sync_pending_blocks",
+        "Blocks held waiting on a parent the store does not have yet"
+    )
+    .unwrap()
+});
+
+static LEAN_SYNC_PENDING_DROPPED: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_sync_pending_dropped_total",
+            "Blocks dropped because the pending buffer was full"
+        )
+        .unwrap()
+    });
+
+static LEAN_SYNC_RANGE_BLOCKS: std::sync::LazyLock<IntCounter> = std::sync::LazyLock::new(|| {
+    register_int_counter!(
+        "lean_sync_range_blocks_total",
+        "Beacon blocks imported while closing the anchor-to-head gap"
+    )
+    .unwrap()
+});
+
 static LEAN_NODE_INFO: std::sync::LazyLock<IntGaugeVec> = std::sync::LazyLock::new(|| {
     register_int_gauge_vec!(
         "lean_node_info",
@@ -905,6 +938,27 @@ pub fn update_current_slot(slot: u64) {
     LEAN_CURRENT_SLOT.set(slot.try_into().unwrap());
 }
 
+/// Record the checkpoint-sync anchor slot, once, at startup.
+///
+/// The floor every other slot series is read against: `lean_head_slot` sitting
+/// at this value while `lean_sync_pending_blocks` climbs is the anchor-to-head
+/// fetch having never started or never finished.
+pub fn set_sync_anchor_slot(slot: u64) {
+    LEAN_SYNC_ANCHOR_SLOT.set(slot.try_into().unwrap());
+}
+
+pub fn set_sync_pending_blocks(count: u64) {
+    LEAN_SYNC_PENDING_BLOCKS.set(count.try_into().unwrap());
+}
+
+pub fn inc_sync_pending_dropped() {
+    LEAN_SYNC_PENDING_DROPPED.inc();
+}
+
+pub fn inc_sync_range_blocks() {
+    LEAN_SYNC_RANGE_BLOCKS.inc();
+}
+
 pub fn update_validators_count(count: u64) {
     LEAN_VALIDATORS_COUNT.set(count.try_into().unwrap());
 }
@@ -1166,5 +1220,38 @@ pub fn set_node_sync_status(status: SyncStatus) {
         LEAN_NODE_SYNC_STATUS
             .with_label_values(&[label])
             .set(i64::from(*label == active));
+    }
+}
+
+#[cfg(test)]
+mod sync_metric_tests {
+    use super::*;
+
+    /// The four anchor-to-head series exist and move. Prometheus registration
+    /// panics on a duplicate name, so simply calling each setter once proves
+    /// the names do not collide with anything already registered.
+    #[test]
+    fn the_anchor_to_head_series_register_and_move() {
+        set_sync_anchor_slot(12_345);
+        set_sync_pending_blocks(7);
+        inc_sync_pending_dropped();
+        inc_sync_range_blocks();
+
+        let gathered =
+            ethlambda_metrics::gather_default_metrics().expect("metrics gather succeeds");
+
+        for name in [
+            "lean_sync_anchor_slot",
+            "lean_sync_pending_blocks",
+            "lean_sync_pending_dropped_total",
+            "lean_sync_range_blocks_total",
+        ] {
+            assert!(
+                gathered.contains(name),
+                "{name} must be exported: the manual verification procedure reads it"
+            );
+        }
+        assert!(gathered.contains("lean_sync_anchor_slot 12345"));
+        assert!(gathered.contains("lean_sync_pending_blocks 7"));
     }
 }

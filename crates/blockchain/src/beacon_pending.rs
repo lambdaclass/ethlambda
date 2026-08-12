@@ -137,10 +137,9 @@ impl PendingBeaconBlocks {
     }
 
     /// Held blocks, across every parent.
-    // Read by the tests and, from the next commit, by
-    // `lean_sync_pending_blocks`, which is the series the operator procedure
-    // reads to tell a stalled fetch from a healthy one.
-    #[allow(dead_code)]
+    ///
+    /// Exported as `lean_sync_pending_blocks`, the series the operator
+    /// procedure reads to tell a stalled fetch from a healthy one.
     pub(crate) fn len(&self) -> usize {
         self.len
     }

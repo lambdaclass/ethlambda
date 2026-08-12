@@ -314,15 +314,17 @@ impl BlockChainServer {
         }
     }
 
-    /// Advance the beacon clock, then keep the pending buffer bounded by
-    /// finalization.
+    /// Advance the beacon clock, keep the pending buffer bounded by
+    /// finalization, and report where the head sits against wall clock.
     fn beacon_on_tick(&mut self, timestamp_ms: u64) {
+        use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+
         beacon_chain::on_tick(&mut self.store, timestamp_ms, &self.beacon_config);
 
         // A block at or below the finalized slot can never import, so holding
         // it only spends buffer the live fork needs.
         let finalized_epoch = self.store.beacon_finalized_checkpoint().epoch;
-        let finalized_slot = finalized_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let finalized_slot = finalized_epoch * SLOTS_PER_EPOCH;
         let dropped = self.beacon_pending.prune_below(finalized_slot);
         if dropped > 0 {
             debug!(
@@ -330,6 +332,28 @@ impl BlockChainServer {
                 dropped, "Pruned held beacon blocks below finalization"
             );
         }
+        metrics::set_sync_pending_blocks(self.beacon_pending.len() as u64);
+
+        let genesis_time = self.store.config().genesis_time;
+        let wall_clock_slot = (timestamp_ms / 1000).saturating_sub(genesis_time)
+            / self.beacon_config.seconds_per_slot;
+        let head_slot = self.store.head_slot();
+        let justified_slot = self.store.beacon_justified_checkpoint().epoch * SLOTS_PER_EPOCH;
+
+        metrics::update_current_slot(wall_clock_slot);
+        metrics::update_head_slot(head_slot);
+        metrics::update_latest_justified_slot(justified_slot);
+        metrics::update_latest_finalized_slot(finalized_slot);
+
+        // Observe-only on the beacon path: this node publishes nothing, so
+        // there are no duties for the gate to suppress. The status is still
+        // what `lean_node_sync_status` and `/lean/v0/node/syncing` report, and
+        // it is how "head tracks wall clock" is read off a running node.
+        let status = self
+            .sync_status
+            .update(wall_clock_slot, head_slot, wall_clock_slot);
+        metrics::set_node_sync_status(status);
+        self.sync_status_controller.set(status);
     }
 
     async fn lean_on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
@@ -1053,6 +1077,7 @@ impl BlockChainServer {
         while let Some(block) = queue.pop_front() {
             self.process_or_hold_beacon_block(block, source, &mut queue);
         }
+        metrics::set_sync_pending_blocks(self.beacon_pending.len() as u64);
     }
 
     /// Import one beacon block, or hold it if the store has no state for its
@@ -1076,6 +1101,7 @@ impl BlockChainServer {
             match self.beacon_pending.insert(signed_block) {
                 beacon_pending::Pending::Full => {
                     warn!(%slot, "Pending beacon block buffer is full; dropping block");
+                    metrics::inc_sync_pending_dropped();
                 }
                 beacon_pending::Pending::Buffered(missing) => {
                     debug!(
@@ -1100,7 +1126,9 @@ impl BlockChainServer {
         match self.import_beacon_block(signed_block) {
             Ok(()) => {
                 info!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block imported");
-                let _ = source;
+                if source == BlockSource::Sync {
+                    metrics::inc_sync_range_blocks();
+                }
                 for child in self.beacon_pending.take_children(block_root) {
                     queue.push_back(child);
                 }

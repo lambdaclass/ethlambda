@@ -404,6 +404,8 @@ pub async fn run(config: BeaconRunConfig) -> eyre::Result<ethlambda_p2p::P2P> {
     .map_err(|err| eyre::eyre!("{err:?}"))
     .wrap_err("failed to initialize the store from the checkpoint anchor")?;
 
+    ethlambda_blockchain::metrics::set_sync_anchor_slot(anchor_slot);
+
     Ok(ethlambda_p2p::P2P::spawn(
         built,
         store,
