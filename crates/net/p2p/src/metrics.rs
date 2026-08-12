@@ -223,6 +223,20 @@ pub fn notify_peer_disconnected(node_name: &str, direction: &str, reason: &str) 
     LEAN_CONNECTED_PEERS.with_label_values(&[node_name]).dec();
 }
 
+/// Counts dials initiated from discv5 discovery, as opposed to static bootnode
+/// dials. Connection outcomes are already covered by the peer connect and
+/// disconnect metrics.
+pub fn inc_discovered_peers_dialed() {
+    static LEAN_DISCOVERED_PEERS_DIALED: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "lean_discovered_peers_dialed_total",
+            "Peers dialed as a result of discv5 discovery"
+        )
+        .unwrap()
+    });
+    LEAN_DISCOVERED_PEERS_DIALED.inc();
+}
+
 /// Refresh the gossipsub mesh peers gauge from the current mesh peer set.
 pub fn update_gossip_mesh_peers<'a>(
     peers: impl Iterator<Item = &'a PeerId>,

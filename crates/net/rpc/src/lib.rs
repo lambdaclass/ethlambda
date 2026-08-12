@@ -22,6 +22,7 @@ mod spec;
 pub mod test_driver;
 
 pub(crate) use base::json_response;
+pub use node::NodeIdentity;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -64,11 +65,11 @@ pub async fn start_rpc_server(
     store: Store,
     aggregator: AggregatorController,
     sync_status: SyncStatusController,
-    peer_id: String,
+    identity: NodeIdentity,
     events: EventBus,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store, config.version, peer_id)
+    let api_router = build_api_router(store, config.version, identity)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
         .layer(Extension(events));
@@ -107,21 +108,22 @@ pub async fn start_rpc_server(
     Ok(())
 }
 
-/// Build the API router with the given store, client version, and peer ID.
+/// Build the API router with the given store, client version, and node identity.
 ///
-/// `version` (`RpcConfig::version`) and `peer_id` (the node's libp2p peer ID)
-/// are captured by the `/lean/v0/node/identity` route so it can report them.
+/// `version` (`RpcConfig::version`) and `identity` (the node's libp2p peer ID
+/// plus its discv5 ENR, the latter `None` when discovery is disabled) are
+/// captured by the `/lean/v0/node/identity` route so it can report them.
 /// The aggregator controller is threaded in separately via `Extension` by the
 /// caller (see `start_rpc_server`) so existing store-backed handlers don't need
 /// to know about it and admin handlers extract it independently.
-fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Router {
+fn build_api_router(store: Store, version: &'static str, identity: NodeIdentity) -> Router {
     Router::new()
         .merge(base::routes())
         .merge(blocks::routes())
         .merge(events::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
-        .merge(node::routes(version, peer_id))
+        .merge(node::routes(version, identity))
         .merge(genesis::routes())
         .merge(spec::routes())
         .with_state(store)
@@ -154,7 +156,14 @@ pub(crate) mod test_utils {
     /// and peer ID. Tests that assert on those identity values (e.g. the
     /// `/lean/v0/node/identity` test) call `crate::build_api_router` directly.
     pub(crate) fn test_api_router(store: Store) -> Router {
-        crate::build_api_router(store, "ethlambda/test", "test-peer".to_string())
+        crate::build_api_router(
+            store,
+            "ethlambda/test",
+            crate::node::NodeIdentity {
+                peer_id: "test-peer".to_string(),
+                enr: None,
+            },
+        )
     }
 
     /// Create a minimal test state for testing.

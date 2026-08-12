@@ -32,10 +32,23 @@ tracing.workspace = true
 
 rand = "0.8"
 
-# Required for NodeEnr parsing
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+# Required for NodeEnr parsing.
+#
+# Points at an unmerged ethrex branch: feat/discovery-peer-requirements carries
+# the unified discovery module, the peer table, and the `PeerFilter` seam this
+# crate needs, none of which are on ethrex's main yet. `branch` rather than
+# `rev` so the two move together while that branch is still being reviewed;
+# Cargo.lock pins the exact commit, so builds stay reproducible until someone
+# runs `cargo update`. Repoint at a main revision once the branch merges.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/discovery-peer-requirements" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/discovery-peer-requirements" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/discovery-peer-requirements" }
+# Only for the empty in-memory Store that DiscoveryServer::spawn requires.
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/discovery-peer-requirements" }
+
+# Versions pinned to ethrex's workspace: these types cross the API boundary.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }
+bytes = "1.6.0"
 
 # SSZ
 libssz.workspace = true
