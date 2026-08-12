@@ -100,24 +100,54 @@ impl EthrexEngine {
     /// The genesis must be **Cancun**: a Prague genesis makes ethrex require a
     /// `requests_hash` in the block header that the Cancun-shaped
     /// [`ExecutionPayloadV3`] cannot carry, and every payload is then rejected.
-    pub async fn from_genesis_path(path: impl AsRef<std::path::Path>) -> Result<Self, EngineError> {
+    ///
+    /// `store_dir` selects where execution state lives. `Some(dir)` persists it
+    /// in RocksDB, so a restarted node keeps the blocks it has already executed;
+    /// `None` keeps it in memory, which is what tests want. A persistent store
+    /// re-reads its own genesis on reopen and rejects a *different* one, so the
+    /// directory doubles as a genesis fingerprint.
+    pub async fn from_genesis_path(
+        path: impl AsRef<std::path::Path>,
+        store_dir: Option<&std::path::Path>,
+    ) -> Result<Self, EngineError> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)
             .map_err(|err| EngineError::GenesisLoad(format!("open {}: {err}", path.display())))?;
         let genesis: Genesis = serde_json::from_reader(std::io::BufReader::new(file))
             .map_err(|err| EngineError::GenesisLoad(format!("parse {}: {err}", path.display())))?;
-        Self::from_genesis(genesis).await
+        Self::build(genesis, store_dir).await
     }
 
-    /// Bootstrap an engine with an in-memory store initialised from `genesis`.
+    /// Bootstrap an engine with an **in-memory** store initialised from
+    /// `genesis`. Execution state does not survive the process.
     pub async fn from_genesis(genesis: Genesis) -> Result<Self, EngineError> {
+        Self::build(genesis, None).await
+    }
+
+    async fn build(
+        genesis: Genesis,
+        store_dir: Option<&std::path::Path>,
+    ) -> Result<Self, EngineError> {
         // Load the KZG trusted setup on a background thread. It is compiled in,
         // so there is no file to find, but the first blob verification would
         // otherwise pay a multi-second initialisation — and the call that
         // triggers it could be a payload build at interval 4.
         ethrex_crypto::kzg::warm_up_trusted_setup();
 
-        let mut store = Store::new("", EngineType::InMemory)?;
+        let mut store = match store_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|err| {
+                    EngineError::Store(StoreError::Custom(format!(
+                        "create EL store dir {}: {err}",
+                        dir.display()
+                    )))
+                })?;
+                Store::new(dir.to_string_lossy().as_ref(), EngineType::RocksDB)?
+            }
+            None => Store::new("", EngineType::InMemory)?,
+        };
+        // Idempotent: on an existing datadir this recognises its own genesis and
+        // returns, and rejects a mismatched one rather than corrupting the chain.
         store.add_initial_state(genesis).await?;
         let blockchain = Arc::new(Blockchain::default_with_store(store.clone()));
         Ok(Self {
@@ -127,6 +157,41 @@ impl EthrexEngine {
             gas_ceil: DEFAULT_BUILDER_GAS_CEIL,
             p2p_started: OnceLock::new(),
         })
+    }
+
+    /// Whether the execution layer can extend the block with this hash — it has
+    /// the block *and* the block's post-state is reachable in the database.
+    ///
+    /// Both halves matter, and testing only the first is a trap. An unclean
+    /// shutdown can leave a block's header durable while its state trie is not,
+    /// and such a block looks present while every attempt to build on it fails
+    /// with `StateNotReachable`. This is the same condition ethrex checks before
+    /// accepting a fork-choice update, so it answers exactly the question
+    /// [`Self::build_payload`] will later ask.
+    ///
+    /// Used to find where a restarted node's execution state effectively stopped,
+    /// so only the unusable payloads are replayed.
+    pub async fn can_build_on(&self, hash: LeanH256) -> Result<bool, EngineError> {
+        let Some(header) = self.store.get_block_header_by_hash(H256(hash.0))? else {
+            return Ok(false);
+        };
+        Ok(self.store.has_state_root(header.state_root)?)
+    }
+
+    /// Hash of the execution layer's **genesis** block.
+    ///
+    /// Distinct from [`Self::head_hash`], which is only the same thing on a fresh
+    /// store. This is what seeds the consensus genesis anchor, so a node with a
+    /// persistent execution store must not use the head: after a restart that is
+    /// whatever block it last executed, and anchoring a genesis state to it would
+    /// silently produce a chain no peer agrees with.
+    pub async fn genesis_hash(&self) -> Result<LeanH256, EngineError> {
+        let hash = self
+            .store
+            .get_block_header(0)?
+            .ok_or(EngineError::NoCanonicalHead)?
+            .hash();
+        Ok(LeanH256(hash.0))
     }
 
     /// Hash of the current canonical head block.

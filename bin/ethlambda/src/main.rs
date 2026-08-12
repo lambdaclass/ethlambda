@@ -207,34 +207,37 @@ async fn main() -> eyre::Result<()> {
     let (execution_engine, el_genesis_hash) = match options.el_genesis.as_deref() {
         None => (None, None),
         Some(path) => {
-            let engine = EthrexEngine::from_genesis_path(path)
+            // Execution state lives beside the consensus store, so a restarted
+            // node keeps the blocks it has already executed. Without this it
+            // rewinds to genesis while consensus resumes at its old slot, and
+            // since block import is gated on execution, the node then drops
+            // every block it receives — permanently.
+            let el_store_dir = options.data_dir.join("el");
+            let engine = EthrexEngine::from_genesis_path(path, Some(el_store_dir.as_path()))
                 .await
                 .map_err(|err| eyre::eyre!("failed to bootstrap embedded ethrex: {err}"))?;
-            let hash = engine
-                .head_hash()
+            // The *genesis* hash, not the head. They coincide only on a fresh
+            // store; with execution state persisted, the head after a restart is
+            // whatever block was last executed, and anchoring a newly created
+            // consensus genesis to that would silently build a chain no peer
+            // agrees with.
+            let genesis_hash = engine
+                .genesis_hash()
                 .await
                 .map_err(|err| eyre::eyre!("failed to read EL genesis block hash: {err}"))?;
-            info!(genesis = %path.display(), el_genesis_hash = %hash, "Embedded ethrex enabled");
-            (Some(Arc::new(engine)), Some(hash))
+            let head = engine
+                .head_number()
+                .await
+                .map_err(|err| eyre::eyre!("failed to read EL head: {err}"))?;
+            info!(
+                genesis = %path.display(),
+                el_genesis_hash = %genesis_hash,
+                el_head_block = head,
+                "Embedded ethrex enabled"
+            );
+            (Some(Arc::new(engine)), Some(genesis_hash))
         }
     };
-
-    // Join the execution layers into their own transaction-gossip mesh. Without
-    // it each mempool is isolated, so a submitted transaction waits for the turn
-    // of the node that received it; with it, whichever node proposes next can
-    // include it. Independent of consensus gossip in every respect — own key,
-    // own port, own peer set.
-    if let (Some(engine), Some(port)) = (execution_engine.as_ref(), options.el_p2p_port) {
-        let mut el_p2p = P2PConfig::loopback(derive_el_node_key(&node_p2p_key), port);
-        el_p2p.bootnodes = options.el_bootnodes.clone();
-        // A node that cannot join the mesh still executes every block consensus
-        // hands it, so this is not fatal: it degrades to an isolated mempool.
-        // Loud, though — silence here would look like working gossip.
-        match engine.start_p2p(el_p2p).await {
-            Ok(enode) => info!(%enode, "EL transaction gossip joined"),
-            Err(err) => error!(%err, "EL transaction gossip unavailable; mempool stays local"),
-        }
-    }
 
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
@@ -251,6 +254,36 @@ async fn main() -> eyre::Result<()> {
     )
     .await
     .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+
+    // Catch the execution layer up to the consensus chain before anything else
+    // runs. On a fresh genesis this is a no-op; on a restart it replays whatever
+    // the persistent execution store is missing. It has to happen before the
+    // blockchain actor starts, because the actor's first tick may propose a block
+    // and would build on the wrong parent.
+    if let Some(engine) = execution_engine.as_ref() {
+        ethlambda_blockchain::el_sync::resync_execution_layer(&store, engine).await;
+    }
+
+    // Join the execution layers into their own transaction-gossip mesh. Without
+    // it each mempool is isolated, so a submitted transaction waits for the turn
+    // of the node that received it; with it, whichever node proposes next can
+    // include it. Independent of consensus gossip in every respect — own key,
+    // own port, own peer set.
+    //
+    // After the resync, deliberately: joining marks the execution layer as
+    // synced, which is what unlocks inbound transaction gossip, and that should
+    // not happen while it is still behind the chain.
+    if let (Some(engine), Some(port)) = (execution_engine.as_ref(), options.el_p2p_port) {
+        let mut el_p2p = P2PConfig::loopback(derive_el_node_key(&node_p2p_key), port);
+        el_p2p.bootnodes = options.el_bootnodes.clone();
+        // A node that cannot join the mesh still executes every block consensus
+        // hands it, so this is not fatal: it degrades to an isolated mempool.
+        // Loud, though — silence here would look like working gossip.
+        match engine.start_p2p(el_p2p).await {
+            Ok(enode) => info!(%enode, "EL transaction gossip joined"),
+            Err(err) => error!(%err, "EL transaction gossip unavailable; mempool stays local"),
+        }
+    }
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 

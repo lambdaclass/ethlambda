@@ -123,7 +123,8 @@ mod tests {
 
     async fn engine() -> Arc<EthrexEngine> {
         Arc::new(
-            EthrexEngine::from_genesis_path(GENESIS_PATH)
+            // `None`: in-memory execution state, so the test needs no temp dir.
+            EthrexEngine::from_genesis_path(GENESIS_PATH, None)
                 .await
                 .expect("bootstrap engine"),
         )

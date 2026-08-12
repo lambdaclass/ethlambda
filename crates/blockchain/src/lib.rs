@@ -40,6 +40,7 @@ pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
 mod el_integration;
+pub mod el_sync;
 pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;

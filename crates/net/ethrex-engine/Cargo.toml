@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 ethrex-common.workspace = true
-ethrex-storage.workspace = true
+ethrex-storage = { workspace = true, features = ["rocksdb"] }
 # `c-kzg` gates the blob-transaction mempool API. It already arrives through
 # ethrex-p2p's default features, but naming it here keeps `cargo check -p
 # ethlambda-ethrex-engine` and any --no-default-features build honest.

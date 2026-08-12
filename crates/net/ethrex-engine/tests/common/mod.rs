@@ -3,6 +3,10 @@
 //! Signing lives here because the mempool recovers the sender from the
 //! signature, so no transaction test can use an unsigned placeholder.
 
+// Each test binary compiles this module separately and uses only part of it, so
+// the unused rest is expected rather than dead.
+#![allow(dead_code)]
+
 use ethlambda_ethrex_engine::EthrexEngine;
 use ethrex_common::{
     Address, Bytes, U256,

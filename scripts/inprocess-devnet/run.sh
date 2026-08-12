@@ -33,6 +33,7 @@ VERIFY=true
 NO_EL=false
 NO_TX=false
 NO_EL_P2P=false
+RESTART_NODE=""           # index of a node to restart mid-run, to prove it recovers
 
 KEYGEN_IMAGE="blockblaz/hash-sig-cli:latest"
 GENESIS_IMAGE="ethpandaops/eth-beacon-genesis:pk910-leanchain"
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --build)       BUILD=true; shift ;;
     --no-tx)       NO_TX=true; shift ;;
     --no-el-p2p)   NO_EL_P2P=true; shift ;;
+    --restart-node) RESTART_NODE="$2"; shift 2 ;;
     --no-verify)   VERIFY=false; shift ;;
     --no-el)       NO_EL=true; shift ;;
     -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -406,6 +408,45 @@ else
   step "Running the remaining ~$(( REMAINING / SECONDS_PER_SLOT )) slots (${REMAINING}s)"
   sleep "$REMAINING"
 
+  # Restart a node and confirm it comes back following the chain. Execution state
+  # is persisted and any gap is replayed at startup; before that, a restarted node
+  # rewound its EL to genesis while consensus resumed at its old slot, and since
+  # block import is gated on execution it then dropped every block it received —
+  # silently and permanently. Head-slot advancing after the restart is the proof.
+  if [[ -n "$RESTART_NODE" ]]; then
+    RNAME="$(node_name "$RESTART_NODE")"
+    RAPI="$(( 15052 + RESTART_NODE ))"
+    head_slot_of() {
+      curl -sS -m 5 "http://127.0.0.1:$1/lean/v0/node/syncing" 2>/dev/null |
+        grep -o '"head_slot":"*[0-9]*' | grep -o '[0-9]*$' || true
+    }
+    step "Restarting $RNAME to prove it recovers"
+    BEFORE=$(head_slot_of "$RAPI"); BEFORE="${BEFORE:-0}"
+
+    # Mark the log so the post-restart window can be isolated exactly. Counting
+    # lines across the whole file cannot distinguish "recovered" from "was
+    # already working before the restart".
+    RESTART_MARK=$(date -u +%Y-%m-%dT%H:%M:%S)
+    echo "$RESTART_MARK" > "$LOG_DIR/restart.mark"
+
+    # Stop, wait out the gossipsub backoff, then start. A fast stop/start leaves
+    # the node outside the attestation meshes: it stays up and looks healthy while
+    # receiving nothing, which would confound the recovery check with a
+    # networking artifact.
+    docker stop "$RNAME" >/dev/null || warn "could not stop $RNAME"
+    ok "stopped at head slot $BEFORE; waiting out the gossipsub backoff (60s)"
+    sleep 60
+    docker start "$RNAME" >/dev/null || warn "could not start $RNAME"
+    ok "restarted"
+
+    # Boot, replay whatever is missing, re-peer, and import for a few slots.
+    sleep $(( 12 * SECONDS_PER_SLOT ))
+    AFTER=$(head_slot_of "$RAPI"); AFTER="${AFTER:-0}"
+    PEER=$(head_slot_of "$(( 15052 + (RESTART_NODE + 1) % NODES ))"); PEER="${PEER:-0}"
+    printf '%s %s %s\n' "$BEFORE" "$AFTER" "$PEER" > "$LOG_DIR/restart.slots"
+    ok "after restart: head slot $AFTER (a peer is at $PEER)"
+  fi
+
   # Find the block that carries it. The raw bytes are echoed verbatim in the
   # payload's `transactions` list, so a substring match is exact — no jq needed.
   step "Looking for the transaction on chain"
@@ -436,11 +477,21 @@ strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 # `|| echo 0` fallback would emit a second line and break the arithmetic below.
 # Concatenating first also avoids grep's per-file counts.
 count() { local n; n=$(cat "$LOG_DIR"/*.log 2>/dev/null | grep -c "$1" || true); echo "${n:-0}"; }
+# How many *nodes* logged something, rather than how many lines matched. A
+# restarted node logs its startup lines twice, which made per-node checks report
+# impossible totals like "4/3 nodes".
+count_nodes() {
+  local n=0 i
+  for ((i = 0; i < NODES; i++)); do
+    grep -q "$1" "$LOG_DIR/$(node_name "$i").log" 2>/dev/null && n=$((n + 1))
+  done
+  echo "$n"
+}
 count1() { local n; n=$(grep -c "$1" "$2" 2>/dev/null || true); echo "${n:-0}"; }
 FAIL=0
 
 # 1. the embedded EL came up on every node
-EL_UP=$(count "Embedded ethrex enabled")
+EL_UP=$(count_nodes "Embedded ethrex enabled")
 if [[ "$NO_EL" == true ]]; then ok "consensus-only control run (no EL expected)"
 elif [[ "$EL_UP" == "$NODES" ]]; then ok "in-process EL enabled on $EL_UP/$NODES node(s)"
 else warn "in-process EL enabled on $EL_UP/$NODES node(s)"; FAIL=1; fi
@@ -521,9 +572,60 @@ else
   fi
 fi
 
+# 6c. a restarted node came back following the chain
+if [[ -n "$RESTART_NODE" ]]; then
+  RLOG="$LOG_DIR/$(node_name "$RESTART_NODE").log"
+  MARK=$(cat "$LOG_DIR/restart.mark" 2>/dev/null || echo "")
+  # Everything the restarted node logged after the restart. Strip colour FIRST:
+  # the timestamp is only field 1 once the escape codes are gone.
+  post_restart() {
+    [[ -n "$MARK" ]] || return 0
+    sed 's/\x1b\[[0-9;]*m//g' "$RLOG" 2>/dev/null | awk -v m="$MARK" '$1 > m'
+  }
+  post_count() { post_restart | grep -c "$1" || true; }
+
+  # The load-bearing assertions: a node that came back but is NOT following the
+  # chain still advances its own head — it just builds a private fork, at the
+  # same rate as the real chain. So head slot and "level with peers" prove
+  # nothing on their own. Importing peers' blocks, and executing their payloads,
+  # cannot happen on a fork.
+  R_IMPORTED=$(post_count "Block imported")
+  if (( R_IMPORTED > 0 )); then ok "restarted node imported $R_IMPORTED block(s) from peers"
+  else warn "restarted node imported NOTHING after the restart — it is not following the chain"; FAIL=1; fi
+
+  R_ELFAIL=$(post_count "EL payload build failed")
+  if (( R_ELFAIL == 0 )); then ok "restarted node's EL builds payloads normally"
+  else warn "restarted node fell back to synthetic payloads $R_ELFAIL time(s) — its EL did not recover"; FAIL=1; fi
+
+  # A resync line must be present either way: silence is indistinguishable from
+  # a resync that never ran.
+  #
+  # Deliberately not `| grep -q` or `| head -1`: both exit on the first match,
+  # which SIGPIPEs the upstream awk, and `set -o pipefail` then reports the whole
+  # pipeline as failed. That turns a passing check into a spurious failure — it
+  # did exactly that here. `grep -o` reads to EOF, so trim in bash instead.
+  R_RESYNC=$(post_restart | grep -o "Execution layer .*" || true)
+  R_RESYNC="${R_RESYNC%%$'\n'*}"
+  if [[ -n "$R_RESYNC" ]]; then
+    ok "restarted node's EL: ${R_RESYNC:0:80}"
+  else
+    warn "restarted node logged no EL resync outcome at all"; FAIL=1
+  fi
+
+  if [[ -s "$LOG_DIR/restart.slots" ]]; then
+    read -r R_BEFORE R_AFTER R_PEER < "$LOG_DIR/restart.slots"
+    # Reported, not asserted: see above for why this is weak evidence.
+    ok "head slot $R_BEFORE → $R_AFTER (a peer at $R_PEER)"
+  fi
+
+  STUCK=$(count "Could not fully resync")
+  if (( STUCK == 0 )); then ok "no unresynced execution layers"
+  else warn "EL resync incomplete on $STUCK node(s)"; FAIL=1; fi
+fi
+
 # 6b. the execution layers actually peered with each other
 if [[ "$NO_EL" == false && "$NO_EL_P2P" == false ]]; then
-  EL_P2P_UP=$(count "EL devp2p enabled")
+  EL_P2P_UP=$(count_nodes "EL devp2p enabled")
   if (( EL_P2P_UP == NODES )); then ok "EL devp2p started on $EL_P2P_UP/$NODES node(s)"
   else warn "EL devp2p started on $EL_P2P_UP/$NODES node(s)"; FAIL=1; fi
 
