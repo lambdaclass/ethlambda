@@ -106,6 +106,25 @@ static LEAN_SYNC_ANCHOR_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLoc
     .unwrap()
 });
 
+/// The beacon path's forward-sync watermark: the highest slot the store holds
+/// a block for, regardless of which branch fork choice actually settled on.
+/// See `Store::beacon_highest_imported_slot`.
+///
+/// Deliberately not `lean_head_slot`, which reports the fork-choice head on
+/// both chains: the two answer different questions and can disagree while
+/// syncing (a range-fetch batch can land blocks well past the branch fork
+/// choice is currently building on), and folding this into `lean_head_slot`
+/// would make "gap closing" indistinguishable from "head moving" in
+/// docs/beacon_sync.md's diagnosis table.
+static LEAN_SYNC_LOCAL_HEAD_SLOT: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_sync_local_head_slot",
+        "Highest slot the beacon store holds a block for (forward-sync watermark, not the \
+         fork-choice head)"
+    )
+    .unwrap()
+});
+
 static LEAN_SYNC_PENDING_BLOCKS: std::sync::LazyLock<IntGauge> = std::sync::LazyLock::new(|| {
     register_int_gauge!(
         "lean_sync_pending_blocks",
@@ -951,6 +970,13 @@ pub fn set_sync_pending_blocks(count: u64) {
     LEAN_SYNC_PENDING_BLOCKS.set(count.try_into().unwrap());
 }
 
+/// Update the beacon path's forward-sync watermark. See
+/// [`LEAN_SYNC_LOCAL_HEAD_SLOT`] for why this is a distinct series from
+/// [`update_head_slot`].
+pub fn set_sync_local_head_slot(slot: u64) {
+    LEAN_SYNC_LOCAL_HEAD_SLOT.set(slot.try_into().unwrap());
+}
+
 pub fn inc_sync_pending_dropped() {
     LEAN_SYNC_PENDING_DROPPED.inc();
 }
@@ -1227,7 +1253,7 @@ pub fn set_node_sync_status(status: SyncStatus) {
 mod sync_metric_tests {
     use super::*;
 
-    /// The four anchor-to-head series exist and move. Prometheus registration
+    /// The five anchor-to-head series exist and move. Prometheus registration
     /// panics on a duplicate name, so simply calling each setter once proves
     /// the names do not collide with anything already registered.
     #[test]
@@ -1236,6 +1262,7 @@ mod sync_metric_tests {
         set_sync_pending_blocks(7);
         inc_sync_pending_dropped();
         inc_sync_range_blocks();
+        set_sync_local_head_slot(12_400);
 
         let gathered =
             ethlambda_metrics::gather_default_metrics().expect("metrics gather succeeds");
@@ -1245,6 +1272,7 @@ mod sync_metric_tests {
             "lean_sync_pending_blocks",
             "lean_sync_pending_dropped_total",
             "lean_sync_range_blocks_total",
+            "lean_sync_local_head_slot",
         ] {
             assert!(
                 gathered.contains(name),
@@ -1253,5 +1281,6 @@ mod sync_metric_tests {
         }
         assert!(gathered.contains("lean_sync_anchor_slot 12345"));
         assert!(gathered.contains("lean_sync_pending_blocks 7"));
+        assert!(gathered.contains("lean_sync_local_head_slot 12400"));
     }
 }

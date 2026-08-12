@@ -314,12 +314,24 @@ impl BlockChainServer {
         }
     }
 
-    /// Advance the beacon clock, keep the pending buffer bounded by
-    /// finalization, and report where the head sits against wall clock.
+    /// Advance the beacon clock, recompute the fork-choice head if the slot
+    /// moved, keep the pending buffer bounded by finalization, and report
+    /// where the head sits against wall clock.
     fn beacon_on_tick(&mut self, timestamp_ms: u64) {
         use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
 
+        let previous_slot = beacon_chain::current_slot(&self.store, &self.beacon_config);
         beacon_chain::on_tick(&mut self.store, timestamp_ms, &self.beacon_config);
+        let current_slot = beacon_chain::current_slot(&self.store, &self.beacon_config);
+
+        // Proposer boost expiry and attestation arrival can each move LMD
+        // GHOST's weights with no new block involved, so the head can change
+        // on a tick alone; recomputing only when the slot itself has advanced
+        // keeps this from re-walking the filtered tree on every 800ms
+        // sub-slot tick.
+        if current_slot > previous_slot {
+            self.update_beacon_head();
+        }
 
         // A block at or below the finalized slot can never import, so holding
         // it only spends buffer the live fork needs.
@@ -337,25 +349,94 @@ impl BlockChainServer {
         let genesis_time = self.store.config().genesis_time;
         let wall_clock_slot = (timestamp_ms / 1000).saturating_sub(genesis_time)
             / self.beacon_config.seconds_per_slot;
-        // Not `store.head_slot()`: that reads a lean-only metadata key, absent
-        // on a beacon store. See `Store::beacon_highest_imported_slot`.
-        let head_slot = self.store.beacon_highest_imported_slot();
+        // The forward-sync watermark: how far range sync has fetched, not
+        // which branch fork choice settled on. Not `store.head_slot()`: that
+        // reads a lean-only metadata key, absent on a beacon store. See
+        // `Store::beacon_highest_imported_slot`. Kept as its own metric
+        // series (`lean_sync_local_head_slot`) rather than folded into
+        // `lean_head_slot` below, so docs/beacon_sync.md's diagnosis table can
+        // still tell "gap closing" apart from "head moving".
+        let highest_imported_slot = self.store.beacon_highest_imported_slot();
         let justified_slot = self.store.beacon_justified_checkpoint().epoch * SLOTS_PER_EPOCH;
 
         metrics::update_current_slot(wall_clock_slot);
-        metrics::update_head_slot(head_slot);
+        metrics::set_sync_local_head_slot(highest_imported_slot);
         metrics::update_latest_justified_slot(justified_slot);
         metrics::update_latest_finalized_slot(finalized_slot);
+
+        // The fork-choice head, falling back to the import watermark only
+        // until the first `update_beacon_head` call this process has made
+        // (import or tick, whichever comes first after startup) has actually
+        // run.
+        let head_slot = self
+            .store
+            .beacon_head()
+            .map_or(highest_imported_slot, |(slot, _)| slot);
 
         // Observe-only on the beacon path: this node publishes nothing, so
         // there are no duties for the gate to suppress. The status is still
         // what `lean_node_sync_status` and `/lean/v0/node/syncing` report, and
         // it is how "head tracks wall clock" is read off a running node.
+        //
+        // `head_slot` is now the real fork-choice head rather than the raw
+        // import watermark, matching what the lean path's own
+        // `update_sync_status` passes via `store.head_slot()`: this is the
+        // block a validator would actually build on if this node had duties,
+        // so it is the honest answer to "does this node's own view track
+        // wall clock". `highest_imported_slot` moves into the `max_seen_slot`
+        // role instead, mirroring lean's `max_live_chain_slot`: the freshest
+        // slot *any* block is known for, canonical or not, which is what
+        // should flag a stalled network rather than a merely-losing local
+        // branch.
         let status = self
             .sync_status
-            .update(wall_clock_slot, head_slot, wall_clock_slot);
+            .update(wall_clock_slot, head_slot, highest_imported_slot);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
+    }
+
+    /// Recomputes the fork-choice head and reports any change: called once
+    /// per beacon-block cascade (`on_beacon_block`) and once per tick when
+    /// the slot advances (`beacon_on_tick`), never per block inside a
+    /// cascade. See `beacon_chain::update_head` for why those are the right
+    /// moments.
+    fn update_beacon_head(&mut self) {
+        let update = match beacon_chain::update_head(&mut self.store, &self.beacon_config) {
+            Ok(update) => update,
+            Err(err) => {
+                warn!(?err, "Failed to compute the beacon fork choice head");
+                return;
+            }
+        };
+        metrics::update_head_slot(update.slot);
+
+        let moved = update.previous.map(|(_, root)| root) != Some(update.root);
+        if !moved {
+            return;
+        }
+        info!(
+            slot = update.slot,
+            block_root = %ShortRoot(&update.root.0),
+            parent_root = %ShortRoot(&update.parent_root.0),
+            "Beacon fork choice head updated"
+        );
+
+        let Some(depth) = update.reorg_depth else {
+            return;
+        };
+        let (previous_slot, previous_root) = update
+            .previous
+            .expect("reorg_depth is Some only when previous is Some");
+        metrics::inc_fork_choice_reorgs();
+        metrics::observe_fork_choice_reorg_depth(depth);
+        info!(
+            %previous_slot,
+            previous_root = %ShortRoot(&previous_root.0),
+            slot = update.slot,
+            block_root = %ShortRoot(&update.root.0),
+            depth,
+            "Beacon fork choice reorg detected"
+        );
     }
 
     async fn lean_on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
@@ -1080,6 +1161,12 @@ impl BlockChainServer {
             self.process_or_hold_beacon_block(block, source, &mut queue);
         }
         metrics::set_sync_pending_blocks(self.beacon_pending.len() as u64);
+
+        // Once per cascade, not once per block: `update_head` walks the whole
+        // filtered tree, and only the head after the cascade's last import is
+        // ever acted on. Mirrors `lean_on_block`'s own post-cascade-only work
+        // (`store.prune_old_data()`) below it.
+        self.update_beacon_head();
     }
 
     /// Import one beacon block, or hold it if the store has no state for its
