@@ -78,7 +78,18 @@ pub(crate) struct PendingRequest {
 
 pub(crate) enum PendingRequestKind {
     Root(H256),
-    Range { start_slot: u64, end_slot: u64 },
+    Range {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// A beacon anchor-to-head batch, and the slots it covers.
+    BeaconRange {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// One beacon block, fetched because it stayed orphaned after the range
+    /// fetch passed its slot.
+    BeaconRoot(ethlambda_types::beacon::primitives::Root),
 }
 
 pub(crate) struct RangeSyncState {
@@ -503,6 +514,9 @@ impl P2P {
             pending_root_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
+            beacon_range_sync: None,
+            beacon_peer_heads: HashMap::new(),
+            beacon_pending_root_requests: HashMap::new(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             local_peer_id: built.local_peer_id,
@@ -516,12 +530,23 @@ impl P2P {
         };
         // Read the flag before `server` is moved into `start()`.
         let discovery_enabled = server.discovery.is_some();
+        let is_beacon = server.wire.beacon().is_some();
         let handle = server.start();
         if discovery_enabled {
             send_after(
                 DISCOVERY_DIAL_INTERVAL,
                 handle.context(),
                 p2p_protocol::DiscoverPeers,
+            );
+        }
+        // Beacon only: lean opens a session from a peer's first `Status` and
+        // never needs to reopen one, so arming this on a lean node would be a
+        // timer with nothing to do.
+        if is_beacon {
+            send_after(
+                crate::beacon::range_sync::BEACON_RESYNC_INTERVAL,
+                handle.context(),
+                p2p_protocol::BeaconResyncCheck,
             );
         }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
@@ -554,6 +579,17 @@ pub struct P2PServer {
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
     pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
+    /// The open beacon anchor-to-head session, if any.
+    pub(crate) beacon_range_sync: Option<RangeSyncState>,
+    /// Every connected beacon peer's last advertised head slot.
+    ///
+    /// Outlives the session on purpose: `on_beacon_resync_check` needs to know
+    /// who to reopen a session with after every peer in the previous one
+    /// failed, and a `Status` is only exchanged on connect.
+    pub(crate) beacon_peer_heads: HashMap<PeerId, u64>,
+    /// In-flight `beacon_blocks_by_root/2` fetches, keyed by the requested root.
+    pub(crate) beacon_pending_root_requests:
+        HashMap<ethlambda_types::beacon::primitives::Root, PendingRequest>,
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
     node_names: HashMap<PeerId, String>,
 
@@ -582,6 +618,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn beacon_resync_check(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -708,6 +746,21 @@ impl P2PServer {
             break;
         }
     }
+
+    #[send_handler]
+    async fn handle_beacon_resync_check(
+        &mut self,
+        _msg: p2p_protocol::BeaconResyncCheck,
+        ctx: &Context<Self>,
+    ) {
+        // Reschedule first, so an early return can never stop the loop.
+        send_after(
+            crate::beacon::range_sync::BEACON_RESYNC_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::BeaconResyncCheck,
+        );
+        beacon::sync::on_beacon_resync_check(self).await;
+    }
 }
 
 // --- Manual Handler impls for network-api messages ---
@@ -751,9 +804,12 @@ impl Handler<FetchBlock> for P2PServer {
 
 impl Handler<FetchBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: FetchBeaconBlock, _ctx: &Context<Self>) {
-        // The by-root fetch itself lands with `beacon::sync`, which owns the
-        // in-flight table this needs to deduplicate against.
-        trace!(root = %msg.root, "Beacon block fetch requested");
+        let root = msg.root;
+        if self.beacon_pending_root_requests.contains_key(&root) {
+            trace!(%root, "Beacon block fetch already in progress, ignoring duplicate");
+            return;
+        }
+        beacon::sync::fetch_beacon_block_from_peer(self, root).await;
     }
 }
 

@@ -15,7 +15,7 @@ use ethlambda_types::{block::SignedBlock, primitives::H256};
 use super::{
     BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
     BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
-    messages::{ResponseCode, error_message},
+    messages::{BeaconResponse, ResponseCode, error_message},
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
@@ -73,6 +73,41 @@ pub async fn handle_req_resp_message(
                             info!(kind = "status_response", peer_count, "P2P message received");
                             handle_status_response(server, status, peer).await;
                         }
+                        ResponsePayload::Beacon(BeaconResponse::Status(status)) => {
+                            info!(kind = "beacon_status", peer_count, "P2P message received");
+                            crate::beacon::handler::handle_beacon_response(
+                                server,
+                                peer,
+                                BeaconResponse::Status(status.clone()),
+                            );
+                            crate::beacon::sync::on_beacon_status(server, peer, &status).await;
+                        }
+                        ResponsePayload::Beacon(BeaconResponse::Blocks(blocks)) => {
+                            info!(kind = "beacon_blocks", peer_count, "P2P message received");
+                            match server.outbound_requests.remove(&request_id) {
+                                Some(PendingRequestKind::BeaconRange {
+                                    start_slot,
+                                    end_slot,
+                                }) => {
+                                    crate::beacon::sync::on_beacon_blocks_by_range_response(
+                                        server, blocks, peer, start_slot, end_slot,
+                                    )
+                                    .await;
+                                }
+                                Some(PendingRequestKind::BeaconRoot(root)) => {
+                                    crate::beacon::sync::on_beacon_blocks_by_root_response(
+                                        server, blocks, peer, root,
+                                    )
+                                    .await;
+                                }
+                                other => {
+                                    warn!(%peer, ?request_id, "Beacon blocks response for an unexpected request");
+                                    if let Some(kind) = other {
+                                        server.outbound_requests.insert(request_id, kind);
+                                    }
+                                }
+                            }
+                        }
                         ResponsePayload::Beacon(response) => {
                             info!(kind = "beacon_response", peer_count, "P2P message received");
                             crate::beacon::handler::handle_beacon_response(server, peer, response);
@@ -96,8 +131,16 @@ pub async fn handle_req_resp_message(
                                     )
                                     .await;
                                 }
-                                None => {
-                                    warn!(%peer, ?request_id, "Received blocks response for unknown request_id");
+                                // A lean `Blocks` payload cannot answer a beacon
+                                // request: the two travel on different protocol
+                                // ids and decode to different types. Reaching
+                                // here means the request table and the codec
+                                // have drifted apart.
+                                other => {
+                                    warn!(%peer, ?request_id, "Received lean blocks response for an unexpected request");
+                                    if let Some(kind) = other {
+                                        server.outbound_requests.insert(request_id, kind);
+                                    }
                                 }
                             }
                         }
@@ -112,6 +155,23 @@ pub async fn handle_req_resp_message(
                             }
                             Some(request @ PendingRequestKind::Root(_)) => {
                                 server.outbound_requests.insert(request_id, request);
+                            }
+                            // A peer declining to serve, not a transport fault,
+                            // so it is handled exactly like an outbound failure:
+                            // rotate the peer out and leave the session's range
+                            // where it is. Nothing is retried in place, because
+                            // a peer that answered RESOURCE_UNAVAILABLE once
+                            // will answer it again.
+                            Some(PendingRequestKind::BeaconRange { .. }) => {
+                                crate::beacon::sync::fail_beacon_range_request(server, &peer);
+                                crate::beacon::sync::request_next_beacon_batch(server).await;
+                            }
+                            Some(PendingRequestKind::BeaconRoot(root)) => {
+                                if let Some(pending) =
+                                    server.beacon_pending_root_requests.get_mut(&root)
+                                {
+                                    pending.failed_peers.insert(peer);
+                                }
                             }
                             None => {}
                         }
@@ -143,6 +203,20 @@ pub async fn handle_req_resp_message(
                         end_slot,
                         "BlocksByRange request failed; retry is disabled"
                     );
+                }
+                Some(PendingRequestKind::BeaconRange {
+                    start_slot,
+                    end_slot,
+                }) => {
+                    warn!(%peer, start_slot, end_slot, "BeaconBlocksByRange request failed; rotating peer");
+                    crate::beacon::sync::fail_beacon_range_request(server, &peer);
+                    crate::beacon::sync::request_next_beacon_batch(server).await;
+                }
+                Some(PendingRequestKind::BeaconRoot(root)) => {
+                    warn!(%peer, %root, "BeaconBlocksByRoot request failed");
+                    if let Some(pending) = server.beacon_pending_root_requests.get_mut(&root) {
+                        pending.failed_peers.insert(peer);
+                    }
                 }
                 None => {}
             }

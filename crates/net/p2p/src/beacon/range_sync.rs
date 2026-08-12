@@ -16,11 +16,6 @@
 //! `Status`. A session that ends with all its peers failed must be reopenable,
 //! or one bad minute ends syncing for the life of the process.
 
-// The decisions are written and tested before the actor that drives them, so
-// for exactly one commit nothing outside the tests calls into this module.
-// Removed as soon as `beacon::sync` wires it up.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;

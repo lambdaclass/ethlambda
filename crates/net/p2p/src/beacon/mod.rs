@@ -13,6 +13,7 @@ pub mod messages;
 pub mod protocols;
 pub(crate) mod range_sync;
 pub mod swarm;
+pub(crate) mod sync;
 pub mod topics;
 
 use ethlambda_types::beacon::config::Config;
