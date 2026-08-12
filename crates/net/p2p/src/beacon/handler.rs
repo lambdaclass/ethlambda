@@ -6,11 +6,12 @@
 //! produce today would be signature-valid and nothing it holds is worth
 //! serving.
 
+use ethlambda_network_api::BlockSource;
 use ethlambda_types::beacon::primitives::Root;
 use libp2p::PeerId;
 use libp2p::gossipsub::Event;
 use libp2p::request_response::ResponseChannel;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::messages::{
     AttnetsBits, BeaconMetaData, BeaconStatus, Goodbye, MetaDataV1, MetaDataV2, MetaDataV3, Ping,
@@ -247,7 +248,7 @@ pub async fn handle_beacon_gossip_message(server: &mut P2PServer, event: Event) 
     match decode::decode_gossip(&wire.config, label, &payload) {
         Ok(decode::BeaconGossip::Block(block)) => {
             metrics::inc_beacon_gossip(label, "decoded");
-            info!(
+            debug!(
                 slot = block.slot(),
                 proposer = block.proposer_index(),
                 fork = block.fork_name().as_str(),
@@ -255,6 +256,18 @@ pub async fn handle_beacon_gossip_message(server: &mut P2PServer, event: Event) 
                 bytes = payload.len(),
                 "Beacon block decoded"
             );
+            // Hand it to the chain actor, which holds it if its parent is not
+            // in the store yet. Before the anchor-to-head fetch existed there
+            // was nothing useful to do with a decoded block, so this only
+            // logged; now dropping one here would be the tip-tracking failure
+            // by omission.
+            let Some(blockchain) = server.blockchain.as_ref() else {
+                debug!("No blockchain handler available for a gossiped beacon block");
+                return;
+            };
+            let _ = blockchain
+                .new_beacon_block(*block, BlockSource::Gossip)
+                .inspect_err(|err| error!(%err, "Failed to forward a gossiped beacon block"));
         }
         Ok(other) => {
             metrics::inc_beacon_gossip(label, "decoded");

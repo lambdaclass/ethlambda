@@ -1009,6 +1009,39 @@ impl BlockChainServer {
         }
     }
 
+    /// Process a beacon block that reached this node.
+    ///
+    /// Imports directly for now. Holding a block whose parent the store lacks,
+    /// and cascading held blocks on import, is what turns this from a
+    /// tip-tracker into a follower that backfills; that lands next, over
+    /// [`beacon_pending::PendingBeaconBlocks`].
+    fn on_beacon_block(
+        &mut self,
+        signed_block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+        _source: BlockSource,
+    ) {
+        let slot = signed_block.slot();
+        let block_root = signed_block.message_hash_tree_root();
+        match self.import_beacon_block(signed_block) {
+            Ok(()) => info!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block imported"),
+            Err(err) => {
+                warn!(%slot, block_root = %ShortRoot(&block_root.0), ?err, "Failed to import beacon block")
+            }
+        }
+    }
+
+    /// Import one beacon block: fork choice, then the operations its body
+    /// carries.
+    ///
+    /// The per-block work only. `on_beacon_block` is the cascade around it,
+    /// which decides whether this block is importable at all.
+    fn import_beacon_block(
+        &mut self,
+        signed_block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+    ) -> Result<(), ethlambda_beacon::error::Error> {
+        beacon_chain::on_block(&mut self.store, signed_block, &self.beacon_config)
+    }
+
     /// Process a newly received block.
     fn lean_on_block(&mut self, signed_block: SignedBlock) {
         let mut queue = VecDeque::new();
@@ -1423,13 +1456,19 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    NewAggregatedAttestation, NewAttestation, NewBlock,
+    NewAggregatedAttestation, NewAttestation, NewBeaconBlock, NewBlock,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
     async fn handle(&mut self, msg: InitP2P, _ctx: &Context<Self>) {
         self.p2p = Some(msg.p2p);
         info!("P2P protocol ref initialized");
+    }
+}
+
+impl Handler<NewBeaconBlock> for BlockChainServer {
+    async fn handle(&mut self, msg: NewBeaconBlock, _ctx: &Context<Self>) {
+        self.on_beacon_block(msg.block, msg.source);
     }
 }
 

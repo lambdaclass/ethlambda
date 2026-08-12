@@ -8,7 +8,8 @@ use std::{
 use ethlambda_network_api::{
     InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
-        FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+        FetchBeaconBlock, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
+        PublishBlock,
     },
 };
 use ethlambda_storage::Store;
@@ -745,6 +746,14 @@ impl Handler<FetchBlock> for P2PServer {
             return;
         }
         fetch_block_from_peer(self, root).await;
+    }
+}
+
+impl Handler<FetchBeaconBlock> for P2PServer {
+    async fn handle(&mut self, msg: FetchBeaconBlock, _ctx: &Context<Self>) {
+        // The by-root fetch itself lands with `beacon::sync`, which owns the
+        // in-flight table this needs to deduplicate against.
+        trace!(root = %msg.root, "Beacon block fetch requested");
     }
 }
 
