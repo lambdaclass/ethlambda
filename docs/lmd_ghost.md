@@ -455,9 +455,9 @@ designated moments. This ensures all validators operate on a consistent view.
                           fixed points
 ```
 
-> **In ethlambda:** The two stages are called "new" and "known" attestations, stored
-> in `LatestNewAttestations` and `LatestKnownAttestations` tables respectively.
-> Promotion happens at tick intervals 0 (if proposing) and 3 (end of slot).
+> **In ethlambda:** The two stages are called "new" and "known" attestations, held in
+> the in-memory `new_payloads` and `known_payloads` buffers of the `Store` respectively.
+> Promotion happens at tick intervals 0 (if proposing) and 4 (end of slot).
 
 ### Why Staged Promotion?
 
@@ -618,27 +618,28 @@ source code locations, and performance.
 
 ### Tick-Based Scheduling
 
-ethlambda divides time into **4-second slots**, each split into **4 intervals** (1 second
-each). Fork choice operations are scheduled at specific intervals:
+ethlambda divides time into **4-second slots**, each split into **5 intervals** (800 ms
+each), as described in [Slots and Intervals](./slots_and_intervals.md). Fork choice
+operations are scheduled at specific intervals:
 
 ```text
-                          ONE SLOT (4 seconds)
-    ┌──────────────┬──────────────┬──────────────┬──────────────┐
-    │  Interval 0  │  Interval 1  │  Interval 2  │  Interval 3  │
-    │   (t+0s)     │   (t+1s)     │   (t+2s)     │   (t+3s)     │
-    ├──────────────┼──────────────┼──────────────┼──────────────┤
-    │              │              │              │              │
-    │ IF PROPOSER: │ NON-PROPOSER:│ update_safe  │ accept_new   │
-    │  accept new  │  produce     │ _target()    │ _attestations│
-    │  attestations│  attestation │              │ ()           │
-    │  + propose   │              │ (2/3 vote    │              │
-    │  block       │              │  threshold)  │ update_head()│
-    │              │              │              │              │
-    │ update_head()│              │              │              │
-    │              │              │              │              │
-    └──────────────┴──────────────┴──────────────┴──────────────┘
+                             ONE SLOT (4000 ms)
+    ┌────────────┬────────────┬────────────┬────────────┬────────────┐
+    │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
+    │  t+0 ms    │  t+800 ms  │ t+1600 ms  │ t+2400 ms  │ t+3200 ms  │
+    ├────────────┼────────────┼────────────┼────────────┼────────────┤
+    │            │            │            │            │            │
+    │IF PROPOSER:│ ALL        │ aggregators│update_safe │accept_new_ │
+    │ accept new │ VALIDATORS:│ publish    │_target()   │attestations│
+    │ attestation│  produce   │ aggregated │            │()          │
+    │ + propose  │ attestation│ attestation│ (2/3 vote  │            │
+    │ block      │            │            │ threshold) │update_head │
+    │            │            │            │            │()          │
+    │update_head │            │            │            │            │
+    │()          │            │            │            │            │
+    └────────────┴────────────┴────────────┴────────────┴────────────┘
 
-    ◄─────────────── Slot N ──────────────────────────────────────►
+    ◄─────────────── Slot N ──────────────────────────────────────────►
 ```
 
 **Detailed sequence:**
@@ -655,20 +656,25 @@ each). Fork choice operations are scheduled at specific intervals:
     │
     Interval 1 ─ Attestation production
     │
-    ├── Non-proposers:
+    ├── All validators, proposer included:
     │   └── Create attestation with:
     │       • head   = current fork choice head (newest head)
     │       • target = derived from safe_target (for 3SF-mini)
     │       • source = latest_justified checkpoint
     │       Publish attestation to gossipsub
     │
-    Interval 2 ─ Safe target update
+    Interval 2 ─ Aggregation
+    │
+    ├── Aggregators: aggregate their subnet's gossip signatures
+    │   └── Publish the aggregated attestation to gossipsub
+    │
+    Interval 3 ─ Safe target update
     │
     ├── Recalculate safe_target using 2/3 supermajority threshold
     │   └── Only blocks with ≥ ⌈2V/3⌉ attestation weight qualify
     │       (V = total validators)
     │
-    Interval 3 ─ End of slot
+    Interval 4 ─ End of slot
     │
     ├── Promote new → known attestations
     └── Run fork choice → update_head()

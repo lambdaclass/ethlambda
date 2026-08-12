@@ -95,10 +95,10 @@ ssz = { package = "ethereum_ssz", version = "0.10" }
 postcard = { version = "1.1.3", features = ["alloc"] }
 
 # SSZ implementation
-libssz = "0.2.2"
-libssz-derive = "0.2.2"
-libssz-merkle = "0.2.2"
-libssz-types = "0.2.2"
+libssz = "0.3.0"
+libssz-derive = "0.3.0"
+libssz-merkle = "0.3.0"
+libssz-types = "0.3.0"
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }
