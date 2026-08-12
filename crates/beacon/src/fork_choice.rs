@@ -2124,4 +2124,201 @@ mod tests {
             "a block from a prior epoch must vote its pulled-up (unrealized) checkpoint"
         );
     }
+
+    /// Measures `on_attestation`'s warm-path cost: this is the number
+    /// `ethlambda-blockchain`'s gossip-ingress wiring needs before it can
+    /// decide whether the chain actor's single mailbox can absorb a slot's
+    /// worth of aggregate volume without starving block import. "Warm" means
+    /// the checkpoint state is already cached (`store_target_checkpoint_state`
+    /// is a no-op), so every iteration pays only what a call after the first
+    /// one in an epoch actually costs: committee derivation plus a real BLS
+    /// aggregate-signature verification.
+    ///
+    /// Run at two validator-registry sizes on purpose. `get_beacon_committee`
+    /// calls `get_active_validator_indices` (twice: once directly, once inside
+    /// `get_committee_count_per_slot`), which is an unconditional `O(registry
+    /// size)` scan with no cache of its own — unlike the checkpoint *state*,
+    /// nothing memoizes the *active set* or the *committee* derived from it.
+    /// `small` isolates the fixed per-call cost (BLS pairing, bookkeeping);
+    /// `mainnet_scale` adds the registry scan at roughly today's real mainnet
+    /// active validator count, so the gap between the two numbers is that
+    /// scan's cost.
+    ///
+    /// Not part of `make test-beacon`'s pass/fail contract: it always
+    /// succeeds if the constructed attestation verifies, and exists to print a
+    /// number (`--nocapture`), not to gate CI on a wall-clock threshold no
+    /// shared runner can promise.
+    #[test]
+    fn measures_the_warm_path_cost_of_on_attestation() {
+        use std::time::Instant;
+
+        use blst::min_pk::SecretKey;
+
+        use crate::helpers::accessors::{get_beacon_committee, get_domain};
+        use crate::helpers::misc::compute_signing_root;
+        use crate::primitives::{BlsSignature, HashTreeRoot as _};
+
+        // Mirrors `bls::DST`, private to that module: the IETF ciphersuite
+        // domain separation tag every signature in this crate is checked
+        // against. Duplicated here rather than exported, since nothing else
+        // needs to sign a message outside of this benchmark.
+        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+        const ITERATIONS: u32 = 50;
+
+        /// Regenerates the secret key behind `test_state::with_validators`'s
+        /// deterministic public key for `index`, from the identical KDF
+        /// input. That helper only ever returns public keys, and this
+        /// benchmark needs a real signature that verifies against one.
+        fn secret_key_for(index: u64) -> SecretKey {
+            let mut ikm = [0u8; 32];
+            ikm[..8].copy_from_slice(&(index + 1).to_le_bytes());
+            SecretKey::key_gen(&ikm, &[]).expect("32 bytes of ikm is enough for key generation")
+        }
+
+        /// Builds a store and a genuinely-verifying gossip aggregate over
+        /// `validator_count` validators, then times `on_attestation` against
+        /// it.
+        fn measure(validator_count: usize, label: &str) {
+            let config = Config::active();
+            let genesis_root = Root::repeat_byte(1);
+
+            let mut store = empty_store();
+            let genesis_checkpoint = Checkpoint {
+                epoch: constants::GENESIS_EPOCH,
+                root: genesis_root,
+            };
+            store.set_beacon_justified_checkpoint(genesis_checkpoint);
+            store.set_beacon_finalized_checkpoint(genesis_checkpoint);
+            store.insert_beacon_block(genesis_root, &block(0, Root::zero()));
+            // `validate_on_attestation` requires `get_current_slot(store) >=
+            // data.slot + 1`; one slot past genesis is the least that holds.
+            store.set_beacon_time(config.seconds_per_slot);
+
+            let state = crate::helpers::test_state::with_validators(validator_count);
+            let committee =
+                get_beacon_committee(&state, 0, 0).expect("a committee exists at slot 0");
+
+            let target = genesis_checkpoint;
+            let data = AttestationData {
+                slot: 0,
+                index: 0,
+                beacon_block_root: genesis_root,
+                source: target,
+                target,
+            };
+            let domain = get_domain(&state, constants::DOMAIN_BEACON_ATTESTER, Some(0));
+            let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+
+            let mut bits = phase0::AggregationBits::with_length(committee.len())
+                .expect("committee is non-empty and within the bitlist bound");
+            let mut signatures = Vec::with_capacity(committee.len());
+            for (position, &validator_index) in committee.iter().enumerate() {
+                bits.set(position, true)
+                    .expect("position is within the bitlist's own length");
+                let signature =
+                    secret_key_for(validator_index).sign(signing_root.as_bytes(), DST, &[]);
+                signatures.push(BlsSignature(signature.to_bytes()));
+            }
+            let aggregate_signature =
+                crate::bls::aggregate(&signatures).expect("at least one signer");
+
+            let attestation = Attestation::Phase0(phase0::Attestation {
+                aggregation_bits: bits,
+                data,
+                signature: aggregate_signature,
+            });
+
+            // Pre-populates the cache `on_attestation` reads, so every timed
+            // call takes the "already warm" branch: see this test's own doc
+            // comment for why that is the representative steady-state cost.
+            store.cache_checkpoint_state(target, Arc::new(state));
+
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                on_attestation(&mut store, &attestation, false, &config)
+                    .expect("the constructed attestation verifies");
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "{label}: {validator_count} validators, {} in committee 0 -> {:?}/call \
+                 ({ITERATIONS} calls, {elapsed:?} total)",
+                committee.len(),
+                elapsed / ITERATIONS,
+            );
+        }
+
+        // `small` isolates the fixed per-call cost from the registry-size-
+        // dependent scan (see this test's own doc comment).
+        measure(4_096, "small");
+        // Roughly today's real mainnet active validator count, to size the
+        // scan `get_beacon_committee` repeats on every call at production
+        // scale.
+        measure(1_048_576, "mainnet_scale");
+    }
+
+    /// Measures `get_weight`'s own cost, the thing `get_head`'s descent loop
+    /// calls once per level, with and without a populated `latest_messages`
+    /// map.
+    ///
+    /// `get_weight` shares the same unconditional `get_active_validator_indices`
+    /// scan as `get_beacon_committee` above, plus a `get_ancestor` walk for
+    /// every validator that actually has a latest message. With gossip
+    /// attestation ingestion deferred (see this module's own doc comment for
+    /// why), `latest_messages` in production today is populated only by
+    /// `on_block`'s block-embedded attestations, so the "no votes" number is
+    /// the realistic one for deciding whether `update_head`'s "once per
+    /// cascade, once per tick" call rate is safe to ship on its own; the
+    /// "fully voted" number is what a future, unthrottled Part 2 would turn
+    /// every one of those calls into.
+    #[test]
+    fn measures_get_weight_cost_with_and_without_votes() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 20;
+        const VALIDATOR_COUNT: usize = 1_048_576;
+
+        let config = Config::active();
+        let mut store = empty_store();
+        let genesis_root = Root::repeat_byte(1);
+        let genesis_checkpoint = Checkpoint {
+            epoch: constants::GENESIS_EPOCH,
+            root: genesis_root,
+        };
+        store.set_beacon_justified_checkpoint(genesis_checkpoint);
+        store.insert_beacon_block(genesis_root, &block(0, Root::zero()));
+        let child_root = Root::repeat_byte(2);
+        store.insert_beacon_block(child_root, &block(1, genesis_root));
+
+        let state = crate::helpers::test_state::with_validators(VALIDATOR_COUNT);
+        store.cache_checkpoint_state(genesis_checkpoint, Arc::new(state));
+        let index = store.beacon_block_index();
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            get_weight(&store, &index, child_root, &config).expect("weight computes");
+        }
+        let no_votes = start.elapsed() / ITERATIONS;
+        println!(
+            "get_weight, {VALIDATOR_COUNT} validators, 0 latest_messages -> {no_votes:?}/call"
+        );
+
+        for validator_index in 0..VALIDATOR_COUNT as u64 {
+            store.set_latest_message(
+                validator_index,
+                LatestMessage {
+                    epoch: 0,
+                    root: child_root,
+                },
+            );
+        }
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            get_weight(&store, &index, child_root, &config).expect("weight computes");
+        }
+        let fully_voted = start.elapsed() / ITERATIONS;
+        println!(
+            "get_weight, {VALIDATOR_COUNT} validators, {VALIDATOR_COUNT} latest_messages -> \
+             {fully_voted:?}/call"
+        );
+    }
 }
