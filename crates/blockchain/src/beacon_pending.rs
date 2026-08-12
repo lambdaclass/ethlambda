@@ -12,11 +12,6 @@
 //! thing that separates a follower that backfills from one that only tracks the
 //! tip, and it deserves tests that need neither an actor nor a store.
 
-// The buffer and its ordering guarantee are written and tested before the block
-// handler that drives them, so for two commits nothing outside the tests
-// reaches this module. Removed as soon as `on_beacon_block` cascades through it.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
@@ -141,6 +136,11 @@ impl PendingBeaconBlocks {
         removed
     }
 
+    /// Held blocks, across every parent.
+    // Read by the tests and, from the next commit, by
+    // `lean_sync_pending_blocks`, which is the series the operator procedure
+    // reads to tell a stalled fetch from a healthy one.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }

@@ -199,6 +199,7 @@ impl BlockChain {
             sync_status_controller,
             events,
             beacon_config,
+            beacon_pending: beacon_pending::PendingBeaconBlocks::new(),
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -293,6 +294,11 @@ pub struct BlockChainServer {
     /// The Beacon Chain fork schedule and timing. Read only by the
     /// [`Chain::Beacon`] arm of each handler's dispatch.
     beacon_config: ethlambda_types::beacon::config::Config,
+
+    /// Beacon blocks held on a parent the store does not have yet.
+    ///
+    /// Empty on the lean path: nothing outside `on_beacon_block` touches it.
+    beacon_pending: beacon_pending::PendingBeaconBlocks,
 }
 
 impl BlockChainServer {
@@ -304,9 +310,25 @@ impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         match self.store.chain() {
             Chain::Lean => self.lean_on_tick(timestamp_ms, ctx).await,
-            Chain::Beacon => {
-                beacon_chain::on_tick(&mut self.store, timestamp_ms, &self.beacon_config)
-            }
+            Chain::Beacon => self.beacon_on_tick(timestamp_ms),
+        }
+    }
+
+    /// Advance the beacon clock, then keep the pending buffer bounded by
+    /// finalization.
+    fn beacon_on_tick(&mut self, timestamp_ms: u64) {
+        beacon_chain::on_tick(&mut self.store, timestamp_ms, &self.beacon_config);
+
+        // A block at or below the finalized slot can never import, so holding
+        // it only spends buffer the live fork needs.
+        let finalized_epoch = self.store.beacon_finalized_checkpoint().epoch;
+        let finalized_slot = finalized_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let dropped = self.beacon_pending.prune_below(finalized_slot);
+        if dropped > 0 {
+            debug!(
+                finalized_slot,
+                dropped, "Pruned held beacon blocks below finalization"
+            );
         }
     }
 
@@ -1009,25 +1031,94 @@ impl BlockChainServer {
         }
     }
 
-    /// Process a beacon block that reached this node.
+    /// Process a beacon block, and any held blocks it unblocks.
     ///
-    /// Imports directly for now. Holding a block whose parent the store lacks,
-    /// and cascading held blocks on import, is what turns this from a
-    /// tip-tracker into a follower that backfills; that lands next, over
-    /// [`beacon_pending::PendingBeaconBlocks`].
+    /// Iterative rather than recursive, like the lean cascade above it: an
+    /// anchor-to-head gap is dozens of blocks deep and a recursive drain would
+    /// put that on the stack.
+    ///
+    /// `source` reaches this from `P2PToBlockChain::new_beacon_block` and is
+    /// only used to count: `lean_sync_range_blocks_total` must count blocks the
+    /// node *fetched*, since a counter that also moved on gossip could not tell
+    /// a closed gap from a node happily tracking a tip it cannot evaluate.
+    /// Blocks released from the buffer inherit their releaser's source, which
+    /// is the honest answer: they became importable because of a fetch.
     fn on_beacon_block(
         &mut self,
         signed_block: ethlambda_types::beacon::containers::SignedBeaconBlock,
-        _source: BlockSource,
+        source: BlockSource,
+    ) {
+        let mut queue = VecDeque::new();
+        queue.push_back(signed_block);
+        while let Some(block) = queue.pop_front() {
+            self.process_or_hold_beacon_block(block, source, &mut queue);
+        }
+    }
+
+    /// Import one beacon block, or hold it if the store has no state for its
+    /// parent. On success, queue whatever the import unblocked.
+    fn process_or_hold_beacon_block(
+        &mut self,
+        signed_block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+        source: BlockSource,
+        queue: &mut VecDeque<ethlambda_types::beacon::containers::SignedBeaconBlock>,
     ) {
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
+        let parent_root = signed_block.parent_root();
+
+        // A block-index lookup rather than a state lookup, matching what
+        // `fork_choice::on_block` itself checks: the state cache holds only the
+        // working set, so a parent whose post-state was evicted is still known
+        // and one replay away. Holding such a block would stall the cascade on
+        // a memory decision.
+        if !self.store.has_beacon_block(parent_root) {
+            match self.beacon_pending.insert(signed_block) {
+                beacon_pending::Pending::Full => {
+                    warn!(%slot, "Pending beacon block buffer is full; dropping block");
+                }
+                beacon_pending::Pending::Buffered(missing) => {
+                    debug!(
+                        %slot,
+                        block_root = %ShortRoot(&block_root.0),
+                        parent_root = %ShortRoot(&parent_root.0),
+                        missing_ancestor = %ShortRoot(&missing.0),
+                        "Beacon block parent missing; held"
+                    );
+                    // Only worth asking for once the range fetch has already
+                    // passed this slot. Below that, the batch on the wire will
+                    // bring the parent anyway and a by-root request would only
+                    // duplicate it.
+                    if self.store.head_slot() >= slot {
+                        self.request_missing_beacon_block(missing);
+                    }
+                }
+            }
+            return;
+        }
+
         match self.import_beacon_block(signed_block) {
-            Ok(()) => info!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block imported"),
+            Ok(()) => {
+                info!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block imported");
+                let _ = source;
+                for child in self.beacon_pending.take_children(block_root) {
+                    queue.push_back(child);
+                }
+            }
             Err(err) => {
-                warn!(%slot, block_root = %ShortRoot(&block_root.0), ?err, "Failed to import beacon block")
+                warn!(%slot, block_root = %ShortRoot(&block_root.0), ?err, "Failed to import beacon block");
             }
         }
+    }
+
+    /// Ask the P2P actor for a block by root.
+    fn request_missing_beacon_block(&self, root: ethlambda_types::beacon::primitives::Root) {
+        let Some(p2p) = self.p2p.as_ref() else {
+            return;
+        };
+        let _ = p2p
+            .fetch_beacon_block(root)
+            .inspect_err(|err| warn!(%err, %root, "Failed to request a missing beacon block"));
     }
 
     /// Import one beacon block: fork choice, then the operations its body
