@@ -110,6 +110,11 @@ pub(crate) const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_fi
 /// rather than SSZ: it is read on every anchor promotion and the layout is one
 /// line either way.
 pub(crate) const KEY_BEACON_ANCHORS: &[u8] = b"beacon_anchors";
+/// Key for the highest slot the beacon store holds a block for. Its value has
+/// type [`u64`] and it's SSZ-encoded. See
+/// [`Store::beacon_highest_imported_slot`] for why the beacon path tracks a
+/// watermark instead of reading [`KEY_HEAD`], which only the lean path writes.
+pub(crate) const KEY_BEACON_HIGHEST_IMPORTED_SLOT: &[u8] = b"beacon_highest_imported_slot";
 
 /// Key for the on-disk format version. Its value has type [`u64`] and it's SSZ-encoded.
 const KEY_DB_VERSION: &[u8] = b"db_version";
@@ -796,6 +801,7 @@ impl Store {
                 (KEY_BEACON_UNREALIZED_JUSTIFIED.to_vec(), zero.to_ssz()),
                 (KEY_BEACON_UNREALIZED_FINALIZED.to_vec(), zero.to_ssz()),
                 (KEY_BEACON_ANCHORS.to_vec(), Vec::new()),
+                (KEY_BEACON_HIGHEST_IMPORTED_SLOT.to_vec(), 0u64.to_ssz()),
             ];
             batch
                 .put_batch(Table::Metadata, metadata_entries)
@@ -1066,12 +1072,23 @@ impl Store {
 
     // ============ Metadata Helpers ============
 
+    /// Reads an SSZ metadata value that lean bootstrap guarantees exists.
+    ///
+    /// Names the key on the way out: the lean and beacon paths seed different
+    /// key sets, so an absent key means a lean accessor was reached on a beacon
+    /// store, and the key is what says which one.
     fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
         let view = self.backend.begin_read().expect("read view");
         let bytes = view
             .get(Table::Metadata, key)
             .expect("get")
-            .expect("metadata key exists");
+            .unwrap_or_else(|| {
+                panic!(
+                    "metadata key {:?} is absent on a {:?} store",
+                    String::from_utf8_lossy(key),
+                    self.chain
+                )
+            });
         Ok(T::from_ssz_bytes(&bytes).expect("valid encoding"))
     }
 

@@ -39,9 +39,9 @@ use libssz_derive::{SszDecode as SszDecodeDerive, SszEncode as SszEncodeDerive};
 
 use crate::api::Table;
 use crate::store::{
-    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, KEY_BEACON_FINALIZED, KEY_BEACON_JUSTIFIED,
-    KEY_BEACON_UNREALIZED_FINALIZED, KEY_BEACON_UNREALIZED_JUSTIFIED, KEY_TIME, Store,
-    decode_state_value, encode_state_value,
+    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, KEY_BEACON_FINALIZED,
+    KEY_BEACON_HIGHEST_IMPORTED_SLOT, KEY_BEACON_JUSTIFIED, KEY_BEACON_UNREALIZED_FINALIZED,
+    KEY_BEACON_UNREALIZED_JUSTIFIED, KEY_TIME, Store, decode_state_value, encode_state_value,
 };
 
 /// Every block in the beacon fork-choice window, as `root -> (slot, parent_root)`.
@@ -101,8 +101,9 @@ impl Store {
     /// Records `block` under `root`, which must be the root of its unsigned
     /// message (`SignedBeaconBlock::message_hash_tree_root`).
     ///
-    /// Writes all three rows in one batch: a half-written block would be visible
-    /// to the children scan without being decodable.
+    /// Writes all four rows in one batch: a half-written block would be visible
+    /// to the children scan without being decodable, and a watermark ahead of
+    /// the block it counts would make forward sync skip that block's slot.
     pub fn insert_beacon_block(&mut self, root: Root, block: &SignedBeaconBlock) {
         let entry = BeaconBlockEntry {
             slot: block.slot(),
@@ -111,6 +112,15 @@ impl Store {
         let key = beacon_root_key(root);
 
         let mut batch = self.backend.begin_write().expect("write batch");
+        if entry.slot > self.beacon_highest_imported_slot() {
+            let watermark = vec![(
+                KEY_BEACON_HIGHEST_IMPORTED_SLOT.to_vec(),
+                entry.slot.to_ssz(),
+            )];
+            batch
+                .put_batch(Table::Metadata, watermark)
+                .expect("put beacon highest imported slot");
+        }
         batch
             .put_batch(Table::BlockHeaders, vec![(key.clone(), entry.to_ssz())])
             .expect("put beacon block entry");
@@ -342,6 +352,25 @@ impl Store {
         self.config().genesis_time
     }
 
+    /// The highest slot the store holds a block for.
+    ///
+    /// The beacon counterpart to what [`Store::head_slot`] answers for lean, and
+    /// deliberately not the same question: that one reads `Metadata["head"]`,
+    /// which only the lean bootstrap and `update_checkpoints` ever write, so
+    /// reaching it on a beacon store panics. The LMD GHOST head is
+    /// `ethlambda_beacon::fork_choice::get_head`, which weighs every active
+    /// validator over the whole filtered tree and is far too expensive for the
+    /// per-`Status` and per-tick reads this answers.
+    ///
+    /// Monotone, and a watermark rather than a chain tip: a block only imports
+    /// once its parent is in the store, so this is the slot forward sync has
+    /// reached, which is exactly what a peer's advertised head is compared
+    /// against. A reorg lowers the head without lowering this, which is the
+    /// right way round: the slots below it have already been fetched.
+    pub fn beacon_highest_imported_slot(&self) -> Slot {
+        self.beacon_metadata(KEY_BEACON_HIGHEST_IMPORTED_SLOT)
+    }
+
     /// The justified checkpoint fork choice is currently descending from.
     pub fn beacon_justified_checkpoint(&self) -> Checkpoint {
         self.beacon_metadata(KEY_BEACON_JUSTIFIED)
@@ -570,6 +599,43 @@ mod tests {
             store.beacon_block_entry(root),
             Some((3, Root::repeat_byte(1)))
         );
+    }
+
+    #[test]
+    fn a_fresh_beacon_store_has_a_readable_local_head() {
+        // The regression this pins: the beacon path used to answer its local
+        // head with `Store::head_slot`, which reads a metadata key only lean
+        // bootstrap writes, so the first peer `Status` panicked the P2P actor.
+        let store = beacon_store();
+        assert_eq!(store.beacon_highest_imported_slot(), 0);
+    }
+
+    #[test]
+    fn the_local_head_follows_the_highest_imported_block() {
+        let mut store = beacon_store();
+        let anchor = block(64, Root::zero());
+        let anchor_root = anchor.message_hash_tree_root();
+        store.insert_beacon_block(anchor_root, &anchor);
+        assert_eq!(store.beacon_highest_imported_slot(), 64);
+
+        let next = block(65, anchor_root);
+        store.insert_beacon_block(next.message_hash_tree_root(), &next);
+        assert_eq!(store.beacon_highest_imported_slot(), 65);
+    }
+
+    #[test]
+    fn a_lower_slot_import_does_not_lower_the_local_head() {
+        // Forward sync fetches ranges in batches and a fork can land a block
+        // below the watermark; either lowering it would refetch slots already
+        // on disk, forever.
+        let mut store = beacon_store();
+        let tip = block(65, Root::zero());
+        store.insert_beacon_block(tip.message_hash_tree_root(), &tip);
+
+        let fork = block(64, Root::repeat_byte(3));
+        store.insert_beacon_block(fork.message_hash_tree_root(), &fork);
+
+        assert_eq!(store.beacon_highest_imported_slot(), 65);
     }
 
     #[test]

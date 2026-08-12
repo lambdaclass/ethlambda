@@ -337,7 +337,9 @@ impl BlockChainServer {
         let genesis_time = self.store.config().genesis_time;
         let wall_clock_slot = (timestamp_ms / 1000).saturating_sub(genesis_time)
             / self.beacon_config.seconds_per_slot;
-        let head_slot = self.store.head_slot();
+        // Not `store.head_slot()`: that reads a lean-only metadata key, absent
+        // on a beacon store. See `Store::beacon_highest_imported_slot`.
+        let head_slot = self.store.beacon_highest_imported_slot();
         let justified_slot = self.store.beacon_justified_checkpoint().epoch * SLOTS_PER_EPOCH;
 
         metrics::update_current_slot(wall_clock_slot);

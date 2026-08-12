@@ -29,7 +29,7 @@ pub(crate) async fn on_beacon_status(server: &mut P2PServer, peer: PeerId, statu
     let peer_head_slot = status.head_slot();
     server.beacon_peer_heads.insert(peer, peer_head_slot);
 
-    let local_head_slot = server.store.head_slot();
+    let local_head_slot = server.store.beacon_highest_imported_slot();
     let opened = start_or_merge(
         &mut server.beacon_range_sync,
         peer,
@@ -69,7 +69,7 @@ pub(crate) async fn on_beacon_resync_check(server: &mut P2PServer) {
     let Some((peer, peer_head_slot)) = best_peer_head(&server.beacon_peer_heads) else {
         return;
     };
-    let local_head_slot = server.store.head_slot();
+    let local_head_slot = server.store.beacon_highest_imported_slot();
     if peer_head_slot.saturating_sub(local_head_slot) <= BEACON_SYNC_LAG_THRESHOLD {
         return;
     }
