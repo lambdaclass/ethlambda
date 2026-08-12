@@ -314,6 +314,35 @@ consensus one, or replay payloads at startup. The second is appealing because th
 Lean chain already *contains* every `ExecutionPayloadV3`, so executing them in
 canonical order from EL genesis is a complete EL sync with no new wire protocol.
 
+### Gotcha 6: blob transactions execute, but blob data is not available
+
+Blob (EIP-4844) transactions can be submitted and are included and executed
+normally. What does **not** happen is data availability, and the distinction
+matters before anyone builds on it.
+
+A peer executes a blob-bearing block without ever seeing the sidecar, by design:
+block validation derives blob gas and blob count from `blob_versioned_hashes`
+alone, and every KZG check lives on the mempool-insertion path, not the import
+path. That is what makes blob transactions safe to include at all — if peers
+needed the sidecar to validate, one blob transaction would fork the network.
+`peer_executes_a_blob_block_without_ever_seeing_the_sidecar` pins this down.
+
+The flip side is that nothing retains the blobs. `ExecutionPayloadV3` has no
+sidecar field, so the sidecar never crosses the Lean network; it exists only in
+the mempools that happened to receive the transaction, and mempool eviction on
+import (gotcha: that eviction is required, see §7) discards those. `BLOBHASH` and
+the point-evaluation precompile still work, because they need only the versioned
+hashes and caller-supplied data, so nothing inside the EVM notices.
+
+In short: **blob transactions execute; blob data is not retained or gossiped by
+the Lean layer.** Treat blob support as exercising the fee market and the
+execution path, not as a data-availability layer.
+
+One encoding constraint: the EL genesis is Cancun, so the wrapper version must be
+**0** (one KZG proof per blob). Version 1 — cell proofs, EIP-7594, an Osaka
+encoding — is rejected. Current tooling often emits version 1 by default, so a
+transaction built by an up-to-date library may need to be told otherwise.
+
 ## 7. Design decisions
 
 | Decision | Rationale |

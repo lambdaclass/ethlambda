@@ -3,9 +3,12 @@
 
 mod common;
 
-use common::{engine, funded_address, genesis, signed_transfer, signed_transfer_from};
+use common::{
+    engine, funded_address, genesis, signed_blob_transfer, signed_transfer, signed_transfer_from,
+};
 use ethlambda_types::primitives::H256 as LeanH256;
 use ethrex_common::Address;
+use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode};
 
 /// Empty-trie root: `receipts_root` of a block that executed nothing. A block
 /// that actually ran a transaction must differ from this.
@@ -197,6 +200,115 @@ async fn rejects_payload_whose_block_hash_does_not_match_its_contents() {
     assert!(
         err.to_string().contains("claims block hash"),
         "expected a block-hash mismatch, got: {err}"
+    );
+}
+
+/// A blob transaction submitted in the wrapped form is accepted, included, and
+/// charged blob gas.
+#[tokio::test]
+async fn blob_transaction_is_accepted_and_included() {
+    let (engine, genesis_timestamp, chain_id) = engine().await;
+    let genesis_hash = engine.head_hash().await.unwrap();
+
+    let raw = signed_blob_transfer(chain_id, 0, RECIPIENT);
+    engine
+        .submit_raw_transaction(&raw)
+        .await
+        .expect("mempool accepts a wrapped blob transaction with valid KZG proofs");
+
+    let payload = engine
+        .build_payload(
+            genesis_hash,
+            genesis_timestamp + 12,
+            LeanH256::ZERO,
+            genesis_hash,
+            [0u8; 20],
+        )
+        .await
+        .expect("build payload");
+
+    assert_eq!(
+        payload.transactions.len(),
+        1,
+        "the blob transaction is packed"
+    );
+    assert_eq!(
+        payload.blob_gas_used, 131_072,
+        "one blob costs exactly GAS_PER_BLOB"
+    );
+    assert!(payload.gas_used > 0, "the transaction also ran");
+
+    engine
+        .execute_payload(&payload, genesis_hash)
+        .expect("EL accepts its own blob-bearing payload");
+}
+
+/// The sidecar never crosses the Lean network, and a peer executes the block
+/// anyway.
+///
+/// This is the load-bearing test for blob support here. `ExecutionPayloadV3` has
+/// no sidecar field, so a peer receives only the transaction body; block
+/// validation derives blob gas and count from `blob_versioned_hashes` alone and
+/// KZG verification happens exclusively on mempool insertion. A second engine
+/// that never saw the blobs must therefore import the block successfully — if it
+/// could not, including a blob transaction would fork the network.
+///
+/// It also demonstrates the limitation: that second node now has the block but
+/// no way to obtain the blob data. Blob transactions execute; blob data is not
+/// available.
+#[tokio::test]
+async fn peer_executes_a_blob_block_without_ever_seeing_the_sidecar() {
+    let (proposer, genesis_timestamp, chain_id) = engine().await;
+    let genesis_hash = proposer.head_hash().await.unwrap();
+
+    let raw = signed_blob_transfer(chain_id, 0, RECIPIENT);
+    proposer.submit_raw_transaction(&raw).await.expect("submit");
+
+    let payload = proposer
+        .build_payload(
+            genesis_hash,
+            genesis_timestamp + 12,
+            LeanH256::ZERO,
+            genesis_hash,
+            [0u8; 20],
+        )
+        .await
+        .expect("build payload");
+    assert_eq!(payload.transactions.len(), 1);
+
+    // The payload is everything a peer gets — no sidecar accompanies it.
+    let (peer, _, _) = engine().await;
+    peer.execute_payload(&payload, genesis_hash)
+        .expect("a peer must execute a blob-bearing block without the sidecar");
+
+    assert_eq!(
+        peer.head_number().await.unwrap(),
+        0,
+        "execute_payload imports without moving the head; set_head does that"
+    );
+}
+
+/// A bare (unwrapped) blob transaction is refused with an actionable message
+/// rather than an opaque bundle error, since sending the block form instead of
+/// the wire form is the obvious mistake to make.
+#[tokio::test]
+async fn rejects_a_blob_transaction_submitted_without_its_sidecar() {
+    let (engine, _, chain_id) = engine().await;
+
+    // Strip the wrapper: keep the type byte and re-encode only the inner tx.
+    let wrapped = signed_blob_transfer(chain_id, 0, RECIPIENT);
+    let bare = ethrex_common::types::WrappedEIP4844Transaction::decode(&wrapped[1..])
+        .expect("decode wrapped");
+    let mut raw = vec![0x03];
+    bare.tx.encode(&mut raw);
+
+    let err = engine
+        .submit_raw_transaction(&raw)
+        .await
+        .expect_err("a blob transaction without its sidecar must be refused");
+    assert!(
+        err.to_string().contains("no sidecar"),
+        "expected an actionable message, got: {err}"
     );
 }
 

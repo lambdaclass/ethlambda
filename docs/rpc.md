@@ -222,6 +222,10 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/el/tx \
 
 The `0x` prefix on `raw` is optional. ethrex validates the transaction itself — encoded size, duplicate hash, signature recovery, nonce, balance, chain id, replacement rules — and its rejection message is passed through verbatim, since that is the useful part.
 
+**Blob transactions (type `0x03`)** must be submitted in the *wrapped* form, `0x03 || rlp([tx, wrapper_version, blobs, commitments, proofs])` — the same shape `eth_sendRawTransaction` takes — because the mempool needs the sidecar to verify the KZG proofs and to build with later. Submitting the bare form that appears inside blocks is refused with an explicit "no sidecar" message. `wrapper_version` must be **0** (one proof per blob): version 1 is the EIP-7594 cell-proof encoding for Osaka and later, and this EL genesis is Cancun, so a transaction built by up-to-date tooling may need to be told to use version 0.
+
+> **Blob data is not available.** Blob transactions execute normally, but `ExecutionPayloadV3` carries no sidecar, so the blobs never cross the Lean network and are dropped from the mempool once the transaction is included. Nothing can retrieve them afterwards. `BLOBHASH` and the point-evaluation precompile are unaffected, since they need only the versioned hashes. See gotcha 6 in [`ethrex-inprocess-integration.md`](./ethrex-inprocess-integration.md).
+
 | Status | Condition |
 |--------|-----------|
 | `200` | Accepted into the mempool; returns the transaction hash |

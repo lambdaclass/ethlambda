@@ -6,9 +6,13 @@
 use ethlambda_ethrex_engine::EthrexEngine;
 use ethrex_common::{
     Address, Bytes, U256,
-    types::{EIP1559Transaction, Genesis, Transaction, TxKind},
+    types::{
+        BYTES_PER_BLOB, Blob, BlobsBundle, EIP1559Transaction, EIP4844Transaction, Genesis,
+        Transaction, TxKind, WrappedEIP4844Transaction,
+    },
     utils::keccak,
 };
+use ethrex_rlp::encode::RLPEncode;
 use ethrex_rlp::structs::Encoder;
 use secp256k1::{Message, SECP256K1, SecretKey};
 
@@ -133,4 +137,76 @@ pub fn signed_transfer_from(
     tx.signature_s = U256::from_big_endian(&signature[32..]);
 
     Transaction::EIP1559Transaction(tx).encode_canonical_to_vec()
+}
+
+/// Build a signed, wrapped EIP-4844 transaction carrying one blob.
+///
+/// Returns `0x03 || rlp([tx, wrapper_version, blobs, commitments, proofs])` —
+/// the wire form `submit_raw_transaction` expects, and the same shape
+/// `eth_sendRawTransaction` takes.
+///
+/// `wrapper_version` is 0 because the test genesis is Cancun. Version 1 (cell
+/// proofs, EIP-7594) is an Osaka-and-later encoding and is rejected here, which
+/// is worth knowing since current tooling tends to emit it.
+///
+/// The blob's bytes are field elements, so each 32-byte chunk must be below the
+/// BLS modulus. Writing only the last byte of each chunk keeps every element
+/// trivially in range while still making the blob non-empty.
+pub fn signed_blob_transfer(chain_id: u64, nonce: u64, to: Address) -> Vec<u8> {
+    let mut blob: Blob = [0u8; BYTES_PER_BLOB];
+    for (i, chunk) in blob.chunks_mut(32).enumerate() {
+        chunk[31] = (i % 251) as u8;
+    }
+
+    let blobs_bundle = BlobsBundle::create_from_blobs(&vec![blob], Some(0))
+        .expect("KZG commitments and proofs for one blob");
+    let blob_versioned_hashes = blobs_bundle.generate_versioned_hashes();
+
+    let mut tx = EIP4844Transaction {
+        chain_id,
+        nonce,
+        max_priority_fee_per_gas: 1_000_000_000,
+        max_fee_per_gas: 100_000_000_000,
+        gas: 100_000,
+        to,
+        value: U256::zero(),
+        data: Bytes::new(),
+        access_list: Vec::new(),
+        max_fee_per_blob_gas: U256::from(1_000_000_000u64),
+        blob_versioned_hashes,
+        ..Default::default()
+    };
+
+    let mut payload = vec![0x03];
+    Encoder::new(&mut payload)
+        .encode_field(&tx.chain_id)
+        .encode_field(&tx.nonce)
+        .encode_field(&tx.max_priority_fee_per_gas)
+        .encode_field(&tx.max_fee_per_gas)
+        .encode_field(&tx.gas)
+        .encode_field(&tx.to)
+        .encode_field(&tx.value)
+        .encode_field(&tx.data)
+        .encode_field(&tx.access_list)
+        .encode_field(&tx.max_fee_per_blob_gas)
+        .encode_field(&tx.blob_versioned_hashes)
+        .finish();
+
+    let message = Message::from_digest(keccak(&payload).0);
+    let (recovery_id, signature) = SECP256K1
+        .sign_ecdsa_recoverable(&message, &secret_key())
+        .serialize_compact();
+
+    tx.signature_y_parity = i32::from(recovery_id) != 0;
+    tx.signature_r = U256::from_big_endian(&signature[..32]);
+    tx.signature_s = U256::from_big_endian(&signature[32..]);
+
+    let wrapped = WrappedEIP4844Transaction {
+        tx,
+        wrapper_version: Some(0),
+        blobs_bundle,
+    };
+    let mut raw = vec![0x03];
+    wrapped.encode(&mut raw);
+    raw
 }

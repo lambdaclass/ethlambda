@@ -30,8 +30,12 @@ use ethrex_blockchain::{
 };
 use ethrex_common::{
     Address, Bytes, H256,
-    types::{DEFAULT_BUILDER_GAS_CEIL, ELASTICITY_MULTIPLIER, Genesis, Transaction, Withdrawal},
+    types::{
+        DEFAULT_BUILDER_GAS_CEIL, ELASTICITY_MULTIPLIER, Genesis, Transaction, Withdrawal,
+        WrappedEIP4844Transaction,
+    },
 };
+use ethrex_rlp::decode::RLPDecode;
 use ethrex_storage::{EngineType, Store, error::StoreError};
 use tracing::warn;
 
@@ -41,6 +45,10 @@ use crate::conversion::{block_to_payload, payload_to_block};
 /// Cancun/Prague V3 attributes shape ethlambda produces. It only feeds ethrex's
 /// internal id derivation — block validity comes from the store's chain config.
 const PAYLOAD_VERSION: u8 = 3;
+
+/// EIP-4844 transaction type byte. Submissions carrying it need the wrapped
+/// encoding, which is a different shape from every other type.
+const EIP4844_TX_TYPE: u8 = 0x03;
 
 /// Errors surfaced by [`EthrexEngine`], one variant per underlying ethrex
 /// failure domain plus the local guards.
@@ -103,6 +111,12 @@ impl EthrexEngine {
 
     /// Bootstrap an engine with an in-memory store initialised from `genesis`.
     pub async fn from_genesis(genesis: Genesis) -> Result<Self, EngineError> {
+        // Load the KZG trusted setup on a background thread. It is compiled in,
+        // so there is no file to find, but the first blob verification would
+        // otherwise pay a multi-second initialisation — and the call that
+        // triggers it could be a payload build at interval 4.
+        ethrex_crypto::kzg::warm_up_trusted_setup();
+
         let mut store = Store::new("", EngineType::InMemory)?;
         store.add_initial_state(genesis).await?;
         let blockchain = Arc::new(Blockchain::default_with_store(store.clone()));
@@ -203,6 +217,14 @@ impl EthrexEngine {
     /// `Ok(())` means the execution layer accepted it. An `Err` means the
     /// payload is unexecutable on this chain — the caller decides what that
     /// implies for consensus (today: drop the block, but never stall).
+    ///
+    /// Blob transactions execute here **without their sidecar**: validation
+    /// derives blob gas and count from `blob_versioned_hashes` alone, and KZG
+    /// verification happens only on mempool insertion, never on import. That is
+    /// why a peer can execute a block containing one. It also means the blob
+    /// data is not available: `ExecutionPayloadV3` has no sidecar field, so it
+    /// never crosses the Lean network, and the mempool eviction below discards
+    /// the only copies that existed. See `docs/ethrex-inprocess-integration.md`.
     pub fn execute_payload(
         &self,
         payload: &ExecutionPayloadV3,
@@ -259,12 +281,48 @@ impl EthrexEngine {
     /// comes back as [`EngineError::Mempool`].
     ///
     /// An accepted transaction is a *candidate*: it is included when some
-    /// proposer's [`Self::build_payload`] next fills a block, which for a
-    /// transaction submitted to this node means the next slot this node proposes.
+    /// proposer's [`Self::build_payload`] next fills a block. With
+    /// execution-layer gossip running that can be any node; without it, only
+    /// this one.
+    ///
+    /// Blob transactions (type `0x03`) must be submitted in the **wrapped**
+    /// form — `0x03 || rlp([tx, wrapper_version, blobs, commitments, proofs])`,
+    /// the same shape `eth_sendRawTransaction` takes — because the mempool needs
+    /// the sidecar to verify the KZG proofs and to build with later. The bare
+    /// form carried inside blocks has no sidecar and is rejected.
+    ///
+    /// Note what happens to that sidecar afterwards: see [`Self::execute_payload`].
     pub async fn submit_raw_transaction(&self, raw: &[u8]) -> Result<LeanH256, EngineError> {
+        if raw.first() == Some(&EIP4844_TX_TYPE) {
+            return self.submit_blob_transaction(&raw[1..]).await;
+        }
         let transaction = Transaction::decode_canonical(raw)
             .map_err(|err| EngineError::Conversion(format!("decode transaction: {err}")))?;
         let hash = self.blockchain.add_transaction_to_pool(transaction).await?;
+        Ok(LeanH256(hash.0))
+    }
+
+    /// Decode a wrapped blob transaction and hand it, with its sidecar, to the
+    /// mempool. `rlp` is the payload after the `0x03` type byte.
+    async fn submit_blob_transaction(&self, rlp: &[u8]) -> Result<LeanH256, EngineError> {
+        let wrapped = WrappedEIP4844Transaction::decode(rlp)
+            .map_err(|err| EngineError::Conversion(format!("decode blob transaction: {err}")))?;
+
+        // A bare `0x03` transaction still decodes here — the decoder falls back
+        // to the blobless form and hands back an empty bundle. Say so plainly
+        // rather than letting it surface as an opaque bundle-validation error.
+        if wrapped.blobs_bundle.blobs.is_empty() {
+            return Err(EngineError::Conversion(
+                "blob transaction carries no sidecar: submit the wrapped form \
+                 (0x03 || rlp([tx, wrapper_version, blobs, commitments, proofs]))"
+                    .into(),
+            ));
+        }
+
+        let hash = self
+            .blockchain
+            .add_blob_transaction_to_pool(wrapped.tx, wrapped.blobs_bundle)
+            .await?;
         Ok(LeanH256(hash.0))
     }
 

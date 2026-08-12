@@ -1948,6 +1948,7 @@ dependencies = [
  "ethlambda-types",
  "ethrex-blockchain",
  "ethrex-common",
+ "ethrex-crypto",
  "ethrex-p2p",
  "ethrex-rlp",
  "ethrex-storage",

@@ -77,6 +77,12 @@ ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249
 ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+# default-features = false is load-bearing: ethrex-crypto's defaults include
+# `kzg-rs`, a second, pure-Rust KZG implementation that nothing here uses. Cargo
+# unifies features across the graph, so enabling it once pulls kzg-rs and its
+# Plonky3 tree into every build — including a duplicate `p3-util`, which has
+# broken this workspace's MSRV before. ethrex declares it the same way.
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4", default-features = false }
 
 tracing = "0.1"
 thiserror = "2.0.9"
