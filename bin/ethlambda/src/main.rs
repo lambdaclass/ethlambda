@@ -37,6 +37,7 @@ use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
+use ethlambda_ethrex_engine::{EthrexEngine, P2PConfig, derive_el_node_key};
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
@@ -198,6 +199,46 @@ async fn main() -> eyre::Result<()> {
             .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
     );
 
+    // Bring the embedded execution layer up before state init: it bootstraps
+    // from `--el-genesis`, so its startup head IS the EL genesis block, and that
+    // hash has to be seeded into the consensus genesis anchor below. Without the
+    // seed the first head update names a parent the EL has never seen and it
+    // never starts building.
+    let (execution_engine, el_genesis_hash) = match options.el_genesis.as_deref() {
+        None => (None, None),
+        Some(path) => {
+            // Execution state lives beside the consensus store, so a restarted
+            // node keeps the blocks it has already executed. Without this it
+            // rewinds to genesis while consensus resumes at its old slot, and
+            // since block import is gated on execution, the node then drops
+            // every block it receives — permanently.
+            let el_store_dir = options.data_dir.join("el");
+            let engine = EthrexEngine::from_genesis_path(path, Some(el_store_dir.as_path()))
+                .await
+                .map_err(|err| eyre::eyre!("failed to bootstrap embedded ethrex: {err}"))?;
+            // The *genesis* hash, not the head. They coincide only on a fresh
+            // store; with execution state persisted, the head after a restart is
+            // whatever block was last executed, and anchoring a newly created
+            // consensus genesis to that would silently build a chain no peer
+            // agrees with.
+            let genesis_hash = engine
+                .genesis_hash()
+                .await
+                .map_err(|err| eyre::eyre!("failed to read EL genesis block hash: {err}"))?;
+            let head = engine
+                .head_number()
+                .await
+                .map_err(|err| eyre::eyre!("failed to read EL head: {err}"))?;
+            info!(
+                genesis = %path.display(),
+                el_genesis_hash = %genesis_hash,
+                el_head_block = head,
+                "Embedded ethrex enabled"
+            );
+            (Some(Arc::new(engine)), Some(genesis_hash))
+        }
+    };
+
     let clean_checkpoint_urls: Vec<String> = options
         .checkpoint_sync_url
         .into_iter()
@@ -205,9 +246,44 @@ async fn main() -> eyre::Result<()> {
         .filter(|url| !url.is_empty())
         .collect();
 
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
-        .await
-        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+    let store = fetch_initial_state(
+        &clean_checkpoint_urls,
+        &genesis_config,
+        backend.clone(),
+        el_genesis_hash,
+    )
+    .await
+    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+
+    // Catch the execution layer up to the consensus chain before anything else
+    // runs. On a fresh genesis this is a no-op; on a restart it replays whatever
+    // the persistent execution store is missing. It has to happen before the
+    // blockchain actor starts, because the actor's first tick may propose a block
+    // and would build on the wrong parent.
+    if let Some(engine) = execution_engine.as_ref() {
+        ethlambda_blockchain::el_sync::resync_execution_layer(&store, engine).await;
+    }
+
+    // Join the execution layers into their own transaction-gossip mesh. Without
+    // it each mempool is isolated, so a submitted transaction waits for the turn
+    // of the node that received it; with it, whichever node proposes next can
+    // include it. Independent of consensus gossip in every respect — own key,
+    // own port, own peer set.
+    //
+    // After the resync, deliberately: joining marks the execution layer as
+    // synced, which is what unlocks inbound transaction gossip, and that should
+    // not happen while it is still behind the chain.
+    if let (Some(engine), Some(port)) = (execution_engine.as_ref(), options.el_p2p_port) {
+        let mut el_p2p = P2PConfig::loopback(derive_el_node_key(&node_p2p_key), port);
+        el_p2p.bootnodes = options.el_bootnodes.clone();
+        // A node that cannot join the mesh still executes every block consensus
+        // hands it, so this is not fatal: it degrades to an isolated mempool.
+        // Loud, though — silence here would look like working gossip.
+        match engine.start_p2p(el_p2p).await {
+            Ok(enode) => info!(%enode, "EL transaction gossip joined"),
+            Err(err) => error!(%err, "EL transaction gossip unavailable; mempool stays local"),
+        }
+    }
 
     let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
 
@@ -241,6 +317,12 @@ async fn main() -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    // The API server needs the engine too, for transaction submission. Both
+    // hold the same `Arc`, and the blockchain actor stays the only caller of the
+    // slot-loop operations (build/execute/set_head) — submission only touches
+    // the mempool, which ethrex guards internally.
+    let rpc_execution_engine = execution_engine.clone();
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
@@ -251,6 +333,7 @@ async fn main() -> eyre::Result<()> {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
         },
+        execution_engine,
     };
 
     let blockchain = BlockChain::spawn(
@@ -302,6 +385,7 @@ async fn main() -> eyre::Result<()> {
             sync_status,
             local_peer_id,
             events,
+            rpc_execution_engine,
             rpc_shutdown,
         )
         .await
@@ -681,6 +765,7 @@ async fn fetch_initial_state(
     checkpoint_urls: &[String],
     genesis: &GenesisConfig,
     backend: Arc<dyn StorageBackend>,
+    el_genesis_hash: Option<H256>,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
@@ -717,8 +802,25 @@ async fn fetch_initial_state(
 
     if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
-        let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+        // With an execution layer, the genesis anchor pair must carry the EL's
+        // genesis block hash in both the cached header and the genesis block
+        // body; `from_genesis_with_el_hash` owns that protocol.
+        return Ok(match el_genesis_hash {
+            Some(el_hash) => {
+                let (genesis_state, genesis_block) =
+                    State::from_genesis_with_el_hash(genesis.genesis_time, validators, el_hash);
+                Store::get_forkchoice_store(backend, genesis_state, genesis_block).map_err(
+                    |err| {
+                        error!(%err, "Failed to initialize store with EL-seeded genesis");
+                        checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch
+                    },
+                )?
+            }
+            None => Store::from_anchor_state(
+                backend,
+                State::from_genesis(genesis.genesis_time, validators),
+            ),
+        });
     }
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.
@@ -904,7 +1006,9 @@ validators:
         let genesis = test_genesis(now_secs());
         let backend = Arc::new(InMemoryBackend::default());
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), 0);
     }
@@ -915,7 +1019,9 @@ validators:
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &genesis);
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -929,7 +1035,9 @@ validators:
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &genesis);
 
-        let store = fetch_initial_state(&[], &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&[], &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -949,7 +1057,9 @@ validators:
         seed_db(backend.clone(), &genesis);
 
         let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
-        let store = fetch_initial_state(&urls, &genesis, backend).await.unwrap();
+        let store = fetch_initial_state(&urls, &genesis, backend, None)
+            .await
+            .unwrap();
 
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -968,7 +1078,7 @@ validators:
         let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `expect_err`.
-        let Err(err) = fetch_initial_state(&urls, &genesis, backend).await else {
+        let Err(err) = fetch_initial_state(&urls, &genesis, backend, None).await else {
             panic!("unreachable checkpoint URL must abort startup");
         };
 
@@ -989,7 +1099,7 @@ validators:
 
         let other_genesis = test_genesis(seeded_genesis.genesis_time + 1);
         // `Store` is not `Debug`, so unwrap the error by pattern.
-        let Err(err) = fetch_initial_state(&[], &other_genesis, backend.clone()).await else {
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend.clone(), None).await else {
             panic!("a foreign DB must not be silently re-anchored");
         };
 
@@ -1015,7 +1125,7 @@ validators:
 
         let mut other_genesis = test_genesis(genesis_time);
         other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
-        let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
+        let Err(err) = fetch_initial_state(&[], &other_genesis, backend, None).await else {
             panic!("a foreign validator set must not be silently re-anchored");
         };
 

@@ -1,0 +1,35 @@
+[package]
+name = "ethlambda-ethrex-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ethrex-common.workspace = true
+ethrex-storage = { workspace = true, features = ["rocksdb"] }
+# `c-kzg` gates the blob-transaction mempool API. It already arrives through
+# ethrex-p2p's default features, but naming it here keeps `cargo check -p
+# ethlambda-ethrex-engine` and any --no-default-features build honest.
+ethrex-blockchain = { workspace = true, features = ["c-kzg"] }
+# KZG trusted-setup warm-up. The setup itself is compiled in — no runtime file.
+ethrex-crypto = { workspace = true, features = ["c-kzg"] }
+# RLP decoding for the wrapped (tx + sidecar) blob-transaction form.
+ethrex-rlp.workspace = true
+# Execution-layer transaction gossip (devp2p: discv4 + RLPx), independent of the
+# consensus layer's libp2p stack.
+ethrex-p2p.workspace = true
+secp256k1 = { version = "0.30.0", default-features = false, features = [
+  "global-context",
+  "recovery",
+  "std",
+] }
+tokio-util.workspace = true
+ethlambda-types.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

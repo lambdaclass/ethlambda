@@ -16,6 +16,7 @@
 use ethlambda_types::{
     block::BlockHeader,
     checkpoint::Checkpoint,
+    execution_payload::ExecutionPayloadHeader,
     primitives::{H256, HashTreeRoot},
     state::{JustificationRoots, JustificationValidators, JustifiedSlots, State},
 };
@@ -41,6 +42,10 @@ pub struct StateDiff {
     pub justifications_roots: JustificationRoots,
     /// Target state's `justifications_validators` (stored in full).
     pub justifications_validators: JustificationValidators,
+    /// Target state's latest execution payload header. Changes per block
+    /// (carries the EL `block_hash` chain), so it is stored verbatim rather
+    /// than taken from the snapshot.
+    pub latest_execution_payload_header: ExecutionPayloadHeader,
 }
 
 /// Why a post-state could not be reduced to a [`StateDiff`].
@@ -127,6 +132,7 @@ impl StateDiff {
             justified_slots,
             justifications_roots,
             justifications_validators,
+            latest_execution_payload_header,
             ..
         } = post_state;
 
@@ -146,6 +152,7 @@ impl StateDiff {
             justified_slots,
             justifications_roots,
             justifications_validators,
+            latest_execution_payload_header,
         })
     }
 }
@@ -230,6 +237,7 @@ pub(crate) fn reconstruct(
         validators: snapshot.validators,
         justifications_roots: target.justifications_roots.clone(),
         justifications_validators: target.justifications_validators.clone(),
+        latest_execution_payload_header: target.latest_execution_payload_header.clone(),
     }
 }
 

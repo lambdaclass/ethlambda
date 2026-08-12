@@ -11,6 +11,7 @@ members = [
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
+    "crates/net/ethrex-engine",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
@@ -61,9 +62,27 @@ ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
+ethlambda-ethrex-engine = { path = "crates/net/ethrex-engine" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+
+# ethrex — pinned git rev. Every ethrex crate in the workspace MUST share this
+# rev: ethrex-crypto bundles a C SHA3 whose symbols are not namespaced, so two
+# ethrex versions in the graph collide at link time under GNU ld (Linux). The
+# in-process EL (ethrex-{common,storage,blockchain}) and the p2p ENR helpers
+# (ethrex-{p2p,rlp,common}) are unified on this single rev.
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-blockchain = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4" }
+# default-features = false is load-bearing: ethrex-crypto's defaults include
+# `kzg-rs`, a second, pure-Rust KZG implementation that nothing here uses. Cargo
+# unifies features across the graph, so enabling it once pulls kzg-rs and its
+# Plonky3 tree into every build — including a duplicate `p3-util`, which has
+# broken this workspace's MSRV before. ethrex declares it the same way.
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex", rev = "de9b249baa8451290b06021c17756ccdd4031da4", default-features = false }
 
 tracing = "0.1"
 thiserror = "2.0.9"
@@ -76,6 +95,7 @@ spawned-concurrency = "0.5.0"
 spawned-rt = "0.5.0"
 tokio = "1.0"
 tokio-util = "0.7"
+async-trait = "0.1.83"
 
 prometheus = "0.14"
 

@@ -39,3 +39,6 @@ devnet.log
 
 # mdbook build output
 book/
+
+# Standalone in-process devnet working directory (scripts/inprocess-devnet)
+.devnet-inprocess/

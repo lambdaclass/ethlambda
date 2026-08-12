@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
+use ethlambda_ethrex_engine::EthrexEngine;
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -10,6 +12,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    execution_payload::ExecutionPayloadV3,
     primitives::{H256, HashTreeRoot as _},
 };
 
@@ -36,6 +39,8 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 pub mod aggregation;
 pub mod block_builder;
 pub(crate) mod coverage;
+mod el_integration;
+pub mod el_sync;
 pub mod events;
 pub(crate) mod fork_choice_tree;
 pub mod key_manager;
@@ -66,6 +71,8 @@ pub struct BlockChainConfig {
     pub subscribed_subnets: HashSet<u64>,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
+    /// Embedded ethrex execution layer, when `--el-genesis` was supplied.
+    pub execution_engine: Option<Arc<EthrexEngine>>,
 }
 
 // The interval grid lives in `ethlambda-types` because `ethlambda-storage` also
@@ -160,6 +167,7 @@ impl BlockChain {
             gate_duties,
             subscribed_subnets,
             proposer_config,
+            execution_engine,
         } = config;
 
         metrics::set_is_aggregator(aggregator.is_enabled());
@@ -191,6 +199,7 @@ impl BlockChain {
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+            execution_engine,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -267,6 +276,12 @@ pub struct BlockChainServer {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
+    /// Embedded ethrex execution layer, present when `--el-genesis` was given.
+    /// When set, the actor drives the payload pipeline against it: a per-slot
+    /// head update, an inline payload build at interval 4 when proposing, and
+    /// execution of every payload that arrives in a block.
+    execution_engine: Option<Arc<EthrexEngine>>,
 
     /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
     /// validator duties while syncing, unless that gating was disabled at
@@ -377,7 +392,12 @@ impl BlockChainServer {
             // advances the store to this slot's interval 0 before building (see
             // `propose_block`). The real interval-0 tick is then skipped by the
             // idempotency guard above, since the store clock is already here.
-            SlotInterval::BlockPublication => {}
+            SlotInterval::BlockPublication => {
+                // Keep the EL's head/safe/finalized in step once per slot.
+                // Awaited so the actor stays the execution layer's only caller
+                // (see `notify_execution_layer`).
+                self.notify_execution_layer().await;
+            }
 
             // ==== interval 1 ====
             //
@@ -455,7 +475,13 @@ impl BlockChainServer {
                     .filter(|_| self.sync_status.duties_allowed());
 
                 if let Some(validator_id) = next_proposer {
-                    self.propose_block(next_slot, validator_id).await;
+                    // Build the next slot's execution payload here, inline: the
+                    // embedded EL builds synchronously, so there is nothing to
+                    // pre-request or stash. `None` (no EL, or a failed build)
+                    // falls back to `synthetic_payload` in `build_block`.
+                    let execution_payload = self.build_execution_payload(next_slot).await;
+                    self.propose_block(next_slot, validator_id, execution_payload)
+                        .await;
                 }
             }
         }
@@ -715,7 +741,12 @@ impl BlockChainServer {
     /// common case under load) we publish at once. The whole proposal is
     /// self-contained here, so it never depends on the interval-0 tick — which
     /// `handle_tick` skips whenever this build overruns its interval.
-    async fn propose_block(&mut self, slot: u64, validator_id: u64) {
+    async fn propose_block(
+        &mut self,
+        slot: u64,
+        validator_id: u64,
+        execution_payload: Option<ExecutionPayloadV3>,
+    ) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let genesis_time_ms = self.store.config().genesis_time * 1000;
@@ -743,6 +774,7 @@ impl BlockChainServer {
             slot,
             validator_id,
             self.proposer_config,
+            execution_payload,
         )
         .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"));
 
@@ -912,6 +944,19 @@ impl BlockChainServer {
         }
 
         metrics::inc_block_building_success();
+
+        // Execute our own block's payload on the EL. `build_payload` produced it
+        // as a candidate; without this the EL never imports it, its head stays
+        // put, and the next build has no parent to extend. Gossiped blocks get
+        // this via `import_gossiped_block`, but nobody gossips our block back to
+        // us. A failure is logged, not reversed: the block is already in the
+        // store and on its way to the network.
+        if !self.validate_payload_with_el(
+            &signed_block.message.body.execution_payload,
+            signed_block.message.parent_root,
+        ) {
+            warn!(%slot, %validator_id, "EL rejected our own block's payload");
+        }
 
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
@@ -1385,8 +1430,8 @@ impl Handler<NewBlock> for BlockChainServer {
         // fired for req/resp sync blocks; and sync backfill delivers blocks many
         // slots after they were due, which would swamp the arrival histogram
         // with stale deltas that reflect catch-up speed, not gossip timeliness.
-        // `self.on_block(msg.block)` still runs for every source below: it is
-        // the import path and must not be gated.
+        // The import below still runs for every source: it is the import path
+        // and must not be gated.
         if msg.source == BlockSource::Gossip {
             let slot = msg.block.message.slot;
             self.events.emit(ChainEvent::BlockGossip {
@@ -1396,7 +1441,9 @@ impl Handler<NewBlock> for BlockChainServer {
             let genesis_ms = self.store.config().genesis_time * 1000;
             metrics::observe_gossip_block_arrival(arrival_ms, genesis_ms, slot);
         }
-        self.on_block(msg.block);
+        // Executes the payload on the embedded EL before the store sees the
+        // block; a no-op passthrough to `on_block` when no EL is configured.
+        self.import_gossiped_block(msg.block);
     }
 }
 

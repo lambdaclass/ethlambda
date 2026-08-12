@@ -81,6 +81,35 @@ pub(crate) struct CliOptions {
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
+    /// Path to the execution-layer genesis JSON (ethrex/geth format).
+    ///
+    /// Setting this enables the embedded ethrex execution layer; omitting it
+    /// runs ethlambda as a consensus-only node. The genesis must be Cancun: a
+    /// Prague genesis requires a `requests_hash` that the Cancun-shaped
+    /// `ExecutionPayloadV3` cannot carry, and every payload would be rejected.
+    #[arg(long)]
+    pub(crate) el_genesis: Option<PathBuf>,
+    /// TCP/UDP port for execution-layer transaction gossip (devp2p).
+    ///
+    /// Setting this joins the execution layers into their own mesh so a
+    /// transaction submitted to one node reaches every mempool, and whichever
+    /// node proposes next can include it. Omitting it leaves each mempool
+    /// isolated: a transaction then waits for the turn of the node that received
+    /// it. Requires `--el-genesis`.
+    ///
+    /// This is a second, independent network stack (discv4 + RLPx over TCP)
+    /// alongside consensus gossip (libp2p over QUIC). One value serves both the
+    /// RLPx listener and discovery, which keeps the advertised enode free of a
+    /// `?discport=` suffix.
+    #[arg(long, requires = "el_genesis")]
+    pub(crate) el_p2p_port: Option<u16>,
+    /// `enode://…` URLs to seed execution-layer discovery with.
+    ///
+    /// One is enough: discv4 finds the rest of the mesh from there. Each node
+    /// logs its own enode at startup ("EL devp2p enabled"). Requires
+    /// `--el-p2p-port`.
+    #[arg(long, value_delimiter = ',', requires = "el_p2p_port")]
+    pub(crate) el_bootnodes: Vec<String>,
     /// Disable the sync-gate's suppression of validator duties.
     ///
     /// By default a node that judges itself to be syncing (local head lagging

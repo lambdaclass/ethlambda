@@ -14,6 +14,9 @@ axum = "0.8.1"
 tokio.workspace = true
 tokio-util.workspace = true
 ethlambda-blockchain.workspace = true
+# Already in this crate's graph via ethlambda-blockchain; named explicitly
+# because the transaction-submission route takes the engine directly.
+ethlambda-ethrex-engine.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-state-transition.workspace = true

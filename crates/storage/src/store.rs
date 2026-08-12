@@ -1909,6 +1909,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody {
                     attestations: attestations.try_into().unwrap(),
+                    execution_payload: Default::default(),
                 },
             },
             proof: MultiMessageAggregate::default(),

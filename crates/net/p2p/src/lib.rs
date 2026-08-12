@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     ops::Range,
     time::Duration,
 };
@@ -13,7 +13,6 @@ use ethlambda_network_api::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
-use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
@@ -728,42 +727,31 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
     for enr_str in enrs {
         let base64_decoded = ethrex_common::base64::decode(&enr_str.as_bytes()[4..]);
         let record = NodeRecord::decode(&base64_decoded).unwrap();
-        let (_, quic_port_bytes) = record
-            .pairs
+        // v15 decodes the ENR into a typed `NodeRecordPairs`: standard keys
+        // become fields; custom keys (like lean's `quic`) land in `other`.
+        let pairs = record.pairs();
+
+        let (_, quic_port_bytes) = pairs
+            .other
             .iter()
             .find(|(key, _)| key.as_ref() == b"quic")
             .expect("node doesn't support QUIC");
+        let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
 
-        let (_, public_key_rlp) = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"secp256k1")
+        let public_key_bytes = pairs
+            .secp256k1
+            .as_ref()
             .expect("node record missing public key");
-
-        let public_key_bytes = H264::decode(public_key_rlp).unwrap();
         let public_key =
             libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
                 .unwrap();
 
-        let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
-
-        let ipv4 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv4Addr::decode(bytes.as_ref()).expect("invalid IPv4 address"))
-            });
-        let ipv6 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip6")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv6Addr::decode(bytes.as_ref()).expect("invalid IPv6 address"))
-            });
-
-        // Prefer IPv4 if both are present
-        let ip = ipv4.or(ipv6).expect("node record missing IP address");
+        // Prefer IPv4 if both are present.
+        let ip = pairs
+            .ip
+            .map(IpAddr::V4)
+            .or(pairs.ip6.map(IpAddr::V6))
+            .expect("node record missing IP address");
 
         bootnodes.push(Bootnode {
             ip,
@@ -807,6 +795,8 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     fn random_peer() -> PeerId {

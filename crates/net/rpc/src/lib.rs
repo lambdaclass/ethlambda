@@ -1,7 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
+use ethlambda_ethrex_engine::EthrexEngine;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +14,7 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 mod admin;
 mod base;
 mod blocks;
+mod el;
 mod events;
 mod fork_choice;
 mod genesis;
@@ -59,6 +62,10 @@ pub async fn start_test_driver_rpc_server(
     Ok(())
 }
 
+/// `execution_engine` is `None` on a node started without `--el-genesis`; the
+/// transaction-submission route then answers 501 rather than being absent, so the
+/// difference is visible to a client instead of looking like a routing mistake.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     config: RpcConfig,
     store: Store,
@@ -66,12 +73,16 @@ pub async fn start_rpc_server(
     sync_status: SyncStatusController,
     peer_id: String,
     events: EventBus,
+    execution_engine: Option<Arc<EthrexEngine>>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router = build_api_router(store, config.version, peer_id)
+    let mut api_router = build_api_router(store, config.version, peer_id)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
         .layer(Extension(events));
+    if let Some(engine) = execution_engine {
+        api_router = api_router.layer(Extension(engine));
+    }
     let metrics_router = metrics::start_prometheus_metrics_api();
     let debug_router = build_debug_router();
 
@@ -121,6 +132,7 @@ fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Rou
         .merge(events::routes())
         .merge(fork_choice::routes())
         .merge(admin::routes())
+        .merge(el::routes())
         .merge(node::routes(version, peer_id))
         .merge(genesis::routes())
         .merge(spec::routes())
@@ -183,6 +195,7 @@ pub(crate) mod test_utils {
             validators: Default::default(),
             justifications_roots: Default::default(),
             justifications_validators: JustificationValidators::new(),
+            latest_execution_payload_header: Default::default(),
         }
     }
 
