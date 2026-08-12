@@ -354,3 +354,35 @@ fn regenerate_rpc_fixtures() {
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Generate a run of signed transfers (nonces 0..N) for live demos, where the
+/// same transaction cannot be submitted twice.
+///
+/// ```text
+/// DEMO_TX_DIR=/tmp/demo-txs DEMO_TX_COUNT=25 cargo test -p ethlambda-ethrex-engine \
+///   --profile release-fast --test transactions -- --ignored generate_demo_transactions --nocapture
+/// ```
+#[test]
+#[ignore = "writes files; run explicitly when you need demo transactions"]
+fn generate_demo_transactions() {
+    let dir = std::env::var("DEMO_TX_DIR").unwrap_or_else(|_| "/tmp/demo-txs".into());
+    let count: u64 = std::env::var("DEMO_TX_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
+    let chain_id = genesis().config.chain_id;
+    std::fs::create_dir_all(&dir).expect("create demo dir");
+
+    for nonce in 0..count {
+        let raw = signed_transfer(chain_id, nonce, RECIPIENT, 1);
+        std::fs::write(
+            format!("{dir}/tx-{nonce:03}.hex"),
+            format!("0x{}\n", hex_encode(&raw)),
+        )
+        .expect("write demo tx");
+    }
+    println!(
+        "wrote {count} signed transfers (nonces 0..{}) to {dir}",
+        count - 1
+    );
+}

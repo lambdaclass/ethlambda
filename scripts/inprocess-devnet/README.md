@@ -120,3 +120,46 @@ Reference healthy run — `./run.sh --nodes 3 --slots 32 --trace`:
   own block back, so that check is informational in single-node mode.
 - `--network host` is used so containers reach each other on `127.0.0.1` as the
   ENRs advertise; ports are therefore distinct per node by construction.
+
+## Deploying to a multi-node server
+
+`run.sh` above is self-contained and local. Two companion scripts cover a
+persistent server deployment (paths assume `/opt/lean-quickstart`, as on the
+LambdaClass devnet hosts):
+
+| Script | Purpose |
+|---|---|
+| `server-launch.sh NODES SUBNETS IMAGE` | Launch N nodes with the embedded EL **and** execution-layer transaction gossip |
+| `server-demo-tx.sh` | Submit one transaction to one node and show a *different* node included it |
+
+### Why the launch is two-phase
+
+`--el-bootnodes` needs an `enode://…` URL that **cannot be computed in advance**:
+each node's execution-layer key is a keccak derivation of its consensus node key,
+so the only way to learn the enode is to ask the node. `server-launch.sh`
+therefore starts node 0 alone, reads its enode out of its own log, and passes it
+to nodes 1..N-1. One bootnode is enough — discv4 finds the rest of the mesh.
+
+It refuses to launch if the EL genesis has no funded account (transactions would
+be unspendable) or if the subnet count disagrees with the genesis on disk, since
+both produce a devnet that looks healthy but cannot demonstrate anything.
+
+### Demo transactions
+
+`server-demo-tx.sh` reads pre-signed transfers from `/tmp/demo-txs` and walks
+them in nonce order, skipping any already spent, so it is repeatable. Mint them
+with the ignored generator in the engine's test suite:
+
+```bash
+DEMO_TX_DIR=/tmp/demo-txs DEMO_TX_COUNT=100 \
+  cargo test -p ethlambda-ethrex-engine --profile release-fast \
+  --test transactions -- --ignored generate_demo_transactions --nocapture
+```
+
+It submits to the node that *just proposed* — the one furthest from proposing
+again — so inclusion by a different node is deterministic rather than luck, which
+is what makes it evidence that gossip works rather than evidence that a mempool
+drains.
+
+> The pre-signed transactions spend from the genesis-funded dev account
+> (`0xf39f…2266`, the standard Hardhat/Anvil key). Devnet funds only.
