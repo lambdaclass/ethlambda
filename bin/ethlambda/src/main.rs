@@ -311,6 +311,9 @@ async fn run_lean(options: LeanOptions) -> eyre::Result<()> {
                 bind_ip,
                 discovery_port,
                 quic_port: p2p_socket.port(),
+                // Same port number as `quic_port`: TCP and UDP are separate
+                // namespaces, so `build_swarm` binds both without a collision.
+                tcp_port: p2p_socket.port(),
                 subscription_subnets: subscribed_subnets,
                 attestation_committee_count,
                 bootnodes: discovery_bootnodes,

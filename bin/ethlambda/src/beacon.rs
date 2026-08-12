@@ -373,6 +373,10 @@ pub async fn run(config: BeaconRunConfig) -> eyre::Result<ethlambda_p2p::P2P> {
             bind_ip: IpAddr::from([0, 0, 0, 0]),
             discovery_port: config.discovery_port,
             quic_port: config.gossipsub_port,
+            // Same port number as `quic_port`: TCP and UDP are separate
+            // namespaces, so `build_beacon_swarm` binds both without a
+            // collision.
+            tcp_port: config.gossipsub_port,
             // No attestation subnet is subscribed, so the bitfield is 64 bits
             // all unset: exactly what this node serves.
             subscription_subnets: Default::default(),
