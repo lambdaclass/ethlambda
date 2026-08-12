@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a0050628.js";
+            window.path_to_searchindex_js = "searchindex-d3e5491e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-54238a3b.js"></script>
+        <script src="toc-4653f9cc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -2644,6 +2644,33 @@ to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 </tbody>
 </table>
 </div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="spec-deviations"><a class="header" href="#spec-deviations">Spec Deviations</a></h1>
+<p>ethlambda diverges from the <a href="https://github.com/leanEthereum/leanSpec">leanSpec</a>
+reference in a few places, mainly for performance reasons. This page lists those
+deviations; each will be fleshed out with rationale, implementation notes, and
+trade-offs over time.</p>
+<h2 id="asynchronous-signature-aggregation-with-an-early-start-and-an-early-stop"><a class="header" href="#asynchronous-signature-aggregation-with-an-early-start-and-an-early-stop">Asynchronous signature aggregation with an early start and an early stop</a></h2>
+<p>Aggregation runs off the main BlockChainServer actor loop, may start before its
+interval, and stops early once it runs out of time.</p>
+<ul>
+<li><strong>ethlambda:</strong> the actor snapshots everything aggregation needs (<code>snapshot_aggregation_inputs</code>, <code>crates/blockchain/src/aggregation.rs</code>) and spawns a <code>tokio::task::spawn_blocking</code> worker (<code>run_aggregation_worker</code>, <code>aggregation.rs</code>). Candidates are the store’s gossip-signature groups plus payload-only groups (<code>new_payload_keys</code>, which need at least two existing proofs to merge). A tiered greedy selector orders them by consensus value (current-slot before stale, then <code>Finalize &gt; Justify &gt; Build</code>, mirroring the block builder) and emits at most <code>MAX_AGGREGATION_JOBS</code> jobs, dropping to a single job in the slot before one of our validators proposes. The worker streams each finished group back as an <code>AggregateProduced</code> message; the actor loop is never blocked on XMSS work.</li>
+<li><strong>Early start:</strong> a session normally fires at interval 2, but may start up to <code>EARLY_AGGREGATION_WINDOW</code> earlier once the 2/3 signature threshold is already met (<code>maybe_start_early_aggregation</code>, <code>crates/blockchain/src/lib.rs</code>), so the proof lands earlier in the slot.</li>
+<li><strong>Early stop:</strong> a <code>send_after(AGGREGATION_DEADLINE, ...)</code> timer cancels the session that long after <strong>session start</strong>, so a session that started early also ends early (<code>AGGREGATION_DEADLINE</code>, <code>aggregation.rs</code>). The worker checks <code>cancel.is_cancelled()</code> before each job (<code>aggregation.rs</code>); in-flight jobs finish, remaining jobs are dropped.</li>
+<li><strong>leanSpec:</strong> <code>aggregate()</code> is called inline and synchronously from <code>tick_interval</code>, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.</li>
+<li><strong>Equivalence:</strong> on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.</li>
+</ul>
+<h2 id="attestation-scoring-on-block-building"><a class="header" href="#attestation-scoring-on-block-building">Attestation scoring on block building</a></h2>
+<p>Attestations are scored and selected when packing a block, rather than taken in
+target-slot order as they are scanned.</p>
+<ul>
+<li><strong>ethlambda:</strong> <code>select_attestations</code> (<code>crates/blockchain/src/block_builder.rs</code>) ranks candidate <code>AttestationData</code> entries by tier <code>Finalize &gt; Justify &gt; Build</code> (<code>enum Tier</code>, <code>block_builder.rs</code>). The within-tier order is tier-dependent (<code>EntryScore::ordering_key</code>, <code>block_builder.rs</code>): <code>Finalize</code>/<code>Justify</code> entries already cross 2/3, so newer chain progress leads (target slot, attestation slot, then new-voter count); <code>Build</code> entries only add marginal voters, so coverage leads (new-voter count, target slot, then attestation slot). <code>data_root</code> is the final deterministic tiebreak in both tiers. Each round picks the best candidate against a projected post-state.</li>
+<li><strong>Proposer budget:</strong> rounds stop at <code>max_attestations_per_block</code> distinct <code>AttestationData</code> entries (<code>--max-attestations-per-block</code>, default 3), clamped to <code>MAX_ATTESTATIONS_DATA</code>. The <em>consensus</em> cap is <code>MAX_ATTESTATIONS_DATA</code>, the same value leanSpec enforces in its state transition; only the proposer-side budget differs, and it is configurable.</li>
+<li><strong>Collapsing duplicate data:</strong> a winning entry may carry several proofs, which must collapse to one proof per <code>AttestationData</code> before the block is valid. By default ethlambda keeps only the best-coverage proof and <strong>drops</strong> the rest (<code>keep_best_proof_per_data</code>, <code>block_builder.rs</code>), skipping the leanVM merge at the cost of the voters those proofs carried. With <code>--enable-proposer-aggregation</code>, <code>compact_attestations</code> (<code>block_builder.rs</code>) instead merges them through recursive proof aggregation, which is what leanSpec always does.</li>
+<li><strong>leanSpec:</strong> <code>build_block</code> scans candidates sorted by <code>(target.slot, data_root)</code>, oldest target first, and includes the first ones that pass its filters (greedy, no scoring), re-running the scan as a fixed point when justification/finalization advances. Its proposer budget is <code>MAX_ATTESTATIONS_DATA</code> itself.</li>
+<li><strong>Equivalence:</strong> both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the <em>newest</em> target where leanSpec takes the <em>oldest</em>; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.</li>
+<li><strong>Upstream status:</strong> the tiered strategy is proposed upstream as leanSpec <a href="https://github.com/leanEthereum/leanSpec/pull/1149">PR #1149</a> (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.</li>
+</ul>
 
                     </main>
 
