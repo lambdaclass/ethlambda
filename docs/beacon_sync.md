@@ -106,22 +106,34 @@ performance, which no test in this repository measures.
 | Series | Meaning |
 |---|---|
 | `lean_sync_anchor_slot` | The checkpoint anchor this process started from. Constant for the life of the process |
-| `lean_head_slot` | Current fork-choice head |
+| `lean_head_slot` | Current fork-choice head (`ethlambda_beacon::fork_choice::get_head`), recomputed once per beacon-block cascade and once per tick when the slot advances |
+| `lean_sync_local_head_slot` | Forward-sync watermark: the highest slot the store holds a block for, on any branch. Not the head — see below |
 | `lean_current_slot` | Wall-clock slot |
 | `lean_latest_justified_slot`, `lean_latest_finalized_slot` | The FFG checkpoints |
 | `lean_sync_pending_blocks` | Blocks held on a parent the store does not have |
 | `lean_sync_pending_dropped_total` | Blocks dropped because that buffer was full |
 | `lean_sync_range_blocks_total` | Blocks imported while closing the gap |
+| `lean_fork_choice_reorgs_total` | Count of times the head moved to a block that does not descend from the previous head |
+| `lean_fork_choice_reorg_depth` | Histogram of how many slots back each reorg had to walk to find the shared ancestor |
 | `lean_node_sync_status` | 0 idle, 1 syncing, 2 synced |
+
+`lean_head_slot` and `lean_sync_local_head_slot` answer different questions and
+are expected to disagree while syncing: the watermark is how far the range
+fetch has reached on *any* branch, the head is which block fork choice has
+actually settled on. A range-fetch batch can land blocks past the point fork
+choice is currently building on; a competing branch can also import deeper
+than the one fork choice weighs heavier. Neither is a bug in the other.
 
 Reading them together:
 
 | Symptom | Diagnosis |
 |---|---|
-| `head_slot == sync_anchor_slot`, `sync_pending_blocks` climbing | The range fetch never started. No peer's `Status` arrived, or every peer is at or behind the anchor |
+| `sync_local_head_slot == sync_anchor_slot`, `sync_pending_blocks` climbing | The range fetch never started. No peer's `Status` arrived, or every peer is at or behind the anchor |
 | `sync_range_blocks_total` flat, `sync_pending_blocks` climbing | The range fetch stalled. Check for `rotating peer` warnings |
-| `head_slot` climbing, `latest_finalized_slot` frozen | Tip tracking without backfill, the failure this page is about |
+| `sync_local_head_slot` climbing, `head_slot` frozen well behind it | Blocks are importing but fork choice is not following: check for `Failed to compute the beacon fork choice head` warnings, and whether the justified checkpoint has stalled far enough behind the tip that `filter_block_tree` no longer accepts it |
+| `head_slot` climbing, `latest_finalized_slot` frozen | Fork choice is following a chain that never finalizes, the failure this page is about — now visible on the real head rather than the import watermark |
 | `sync_pending_dropped_total` rising | A peer is feeding blocks on fabricated parents, or the gap is wider than the buffer |
+| `fork_choice_reorgs_total` rising with no corresponding drop in `latest_finalized_slot` | Ordinary proposer/fork competition being resolved, not by itself a problem; `fork_choice_reorg_depth` says how far each one reached back |
 | `current_slot - head_slot <= 1`, finalized advancing every 32 slots | Healthy |
 
 ## Manual verification
@@ -191,7 +203,7 @@ curl -s -o /dev/null -w '%{speed_download} B/s\n' --max-time 30 \
 while true; do
   date +%H:%M:%S | tr -d '\n'
   curl -s localhost:5054/metrics \
-    | grep -E '^lean_(sync_anchor_slot|head_slot|current_slot|latest_finalized_slot|sync_pending_blocks|sync_range_blocks_total) ' \
+    | grep -E '^lean_(sync_anchor_slot|head_slot|sync_local_head_slot|current_slot|latest_finalized_slot|sync_pending_blocks|sync_range_blocks_total) ' \
     | sed 's/^lean_//' | tr '\n' ' '
   echo
   sleep 12
@@ -202,7 +214,10 @@ done
 
 Fifteen minutes, not five: two epochs of finalization lag is 12.8 minutes, so a
 shorter window cannot distinguish a node that finalizes from one that only
-appears to. All five must hold:
+appears to. `head_slot` is now `get_head`'s actual output rather than the raw
+import watermark, so the first condition below is a real answer to "does this
+node's own view track wall clock", not a coincidence of the two having stayed
+close together. All five must hold:
 
 ```
 current_slot - head_slot          <= 1
