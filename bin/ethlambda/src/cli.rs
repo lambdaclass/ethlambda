@@ -113,11 +113,57 @@ pub(crate) struct CliOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
+    #[command(flatten)]
+    pub(crate) discovery: DiscoveryConfig,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]
     #[command(flatten)]
     pub(crate) shadow: ShadowOptions,
+}
+
+/// discv5 peer discovery. Off by default: nothing else on the lean network
+/// speaks discv5 yet, so enabling it only finds other ethlambda nodes.
+#[derive(Debug, clap::Args)]
+pub(crate) struct DiscoveryConfig {
+    /// Enable discv5 peer discovery.
+    ///
+    /// Requires `--discovery.port` to differ from `--gossipsub-port`: both are
+    /// UDP sockets and they cannot share one port.
+    #[arg(long = "discovery.enable", default_value = "false")]
+    pub(crate) enable: bool,
+    /// UDP port for the discv5 socket.
+    ///
+    /// Independent of `--gossipsub-port`, which carries libp2p QUIC. Both
+    /// default to 9000, so enabling discovery means changing one of them.
+    #[arg(long = "discovery.port", default_value = "9000")]
+    pub(crate) port: u16,
+    /// IP address to advertise in the ENR.
+    ///
+    /// Defaults to the bind address, which is the wildcard `0.0.0.0` and is not
+    /// dialable as published. Set this to the address peers should reach this
+    /// node on: `127.0.0.1` for a local devnet, or the host's public address.
+    /// discv5's PONG-based IP voting may still replace it at runtime.
+    #[arg(long = "discovery.advertise-ip")]
+    pub(crate) advertise_ip: Option<std::net::IpAddr>,
+}
+
+impl CliOptions {
+    /// Reject a discovery port that collides with the QUIC port.
+    ///
+    /// Both are UDP. Without this the collision surfaces at bind time as an
+    /// opaque `EADDRINUSE` on whichever socket loses the race.
+    pub(crate) fn validate_discovery(&self) -> eyre::Result<()> {
+        if self.discovery.enable && self.discovery.port == self.gossipsub_port {
+            eyre::bail!(
+                "--discovery.port ({}) must differ from --gossipsub-port ({}): \
+                 both bind UDP and cannot share a port",
+                self.discovery.port,
+                self.gossipsub_port
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Shadow-simulator sim-cost + fake-XMSS flags. Compiled only under the
