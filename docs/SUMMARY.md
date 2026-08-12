@@ -10,6 +10,7 @@
 # Beacon Chain
 
 - [Beacon Chain State Transition](./beacon_stf.md)
+- [Beacon Chain Sync](./beacon_sync.md)
 
 # Operations
 

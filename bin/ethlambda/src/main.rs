@@ -460,6 +460,8 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         advertise_ip: options.discovery.advertise_ip,
         bootnode_enrs,
         data_dir: options.common.data_dir.clone(),
+        http_address: options.common.http_address,
+        metrics_port: options.common.metrics_port,
     })
     .await?;
     // Nothing to drive yet: the actor owns the swarm and the dial loop.

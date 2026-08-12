@@ -33,6 +33,9 @@ libssz-types.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
+# `ethlambda beacon` serves the sync metrics itself: the lean API needs a lean
+# Store and controllers it has none of, so it mounts only the metrics router.
+axum = "0.8.1"
 
 tracing.workspace = true
 tracing-subscriber = "0.3"

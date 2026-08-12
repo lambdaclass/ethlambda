@@ -209,6 +209,11 @@ pub struct BeaconRunConfig {
     /// `None` uses the built-in mainnet list.
     pub bootnode_enrs: Option<Vec<String>>,
     pub data_dir: std::path::PathBuf,
+    /// Address the metrics server binds.
+    pub http_address: IpAddr,
+    /// Port the metrics server binds. Only `/metrics` and `/health` are served;
+    /// the lean API needs a lean `Store` and controllers this mode has none of.
+    pub metrics_port: u16,
 }
 
 /// Cross-check the anchor against the provider's own genesis endpoint.
@@ -406,12 +411,42 @@ pub async fn run(config: BeaconRunConfig) -> eyre::Result<ethlambda_p2p::P2P> {
 
     ethlambda_blockchain::metrics::set_sync_anchor_slot(anchor_slot);
 
+    spawn_metrics_server(config.http_address, config.metrics_port).await?;
+
     Ok(ethlambda_p2p::P2P::spawn(
         built,
         store,
         Default::default(),
         Some(discovery),
     ))
+}
+
+/// Serve `/metrics` and `/health`, and nothing else.
+///
+/// The sync metrics are the only way to tell a follower that is closing the gap
+/// from one that is tip-tracking with a frozen finalized checkpoint, and the two
+/// look identical in the logs. Recording them without serving them would leave
+/// `docs/beacon_sync.md`'s verification procedure unrunnable.
+///
+/// Not `start_rpc_server`: that mounts the lean API, which needs a lean `Store`,
+/// an `AggregatorController`, a `SyncStatusController` and an `EventBus`. None
+/// of those exist on this path, and inventing empty ones would serve lean
+/// answers for a beacon chain.
+async fn spawn_metrics_server(address: IpAddr, port: u16) -> eyre::Result<()> {
+    let addr = std::net::SocketAddr::new(address, port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .wrap_err_with(|| format!("failed to bind the metrics server on {addr}"))?;
+    let router = ethlambda_rpc::metrics::start_prometheus_metrics_api();
+
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, router).await {
+            tracing::error!(%err, "Metrics server stopped");
+        }
+    });
+
+    info!(metrics_addr = %addr, "Metrics server listening");
+    Ok(())
 }
 
 #[cfg(test)]

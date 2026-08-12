@@ -1916,6 +1916,7 @@ dependencies = [
 name = "ethlambda"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "ethlambda-beacon",
  "ethlambda-blockchain",

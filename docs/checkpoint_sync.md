@@ -4,6 +4,13 @@
 
 Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.
 
+This page is the **lean** client's checkpoint sync. `ethlambda beacon` has its
+own, described in [Beacon Chain Sync](./beacon_sync.md), and the two differ in
+ways that matter: the beacon one is mandatory rather than optional, runs before
+the swarm exists because the fork digest depends on its result, fetches the
+block first and then the state by that block's own `state_root` so the pair
+cannot disagree, and re-runs on every boot rather than resuming from disk.
+
 ## Usage
 
 Checkpoint sync still requires the network config files (genesis, validators, bootnodes, etc.). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.
