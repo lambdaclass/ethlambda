@@ -13,11 +13,12 @@ use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::identity::secp256k1;
 use libp2p::multiaddr::Protocol;
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, request_response};
 use tracing::{debug, info};
 
 use super::{BeaconWire, protocols, topics::BeaconTopics};
-use crate::{Behaviour, Bootnode, BuiltSwarm, PeerId, Wire, gossipsub_config};
+use crate::{Behaviour, Bootnode, BuiltSwarm, PeerId, Wire, bootnode_dial_addrs, gossipsub_config};
 
 /// How long gossipsub remembers a message id, so a duplicate arriving late is
 /// dropped rather than re-forwarded.
@@ -36,9 +37,9 @@ pub struct BeaconSwarmConfig {
     pub fork_digest: ForkDigest,
     pub config: Config,
     pub genesis_time: u64,
-    /// Parsed from the built-in list or from `--bootnodes`. Kept only so a
-    /// record that does advertise `quic` can still be dialed statically; none
-    /// of the published mainnet records does.
+    /// Parsed from the built-in list or from `--bootnodes`. Every published
+    /// mainnet record advertises `tcp` (none advertises `quic`), which is
+    /// what makes them statically dialable now that the swarm speaks TCP.
     pub bootnodes: Vec<Bootnode>,
 }
 
@@ -76,6 +77,12 @@ pub fn build_beacon_swarm(
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default().nodelay(true),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .expect("failed to add TCP transport to swarm")
         .with_quic()
         .with_behaviour(|_| Behaviour::new(identify, gossipsub, req_resp))
         .expect("failed to add behaviour to swarm")
@@ -89,27 +96,34 @@ pub fn build_beacon_swarm(
         if peer_id == local_peer_id {
             continue;
         }
-        let Some(quic_port) = bootnode.quic_port else {
-            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no quic port, discv5 seed only");
+        let addrs = bootnode_dial_addrs(&bootnode, peer_id);
+        if addrs.is_empty() {
+            // Discovery-only seed: reachable over discv5, but with no QUIC or
+            // TCP port there is nothing for the swarm to dial.
+            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no dialable transport, discv5 seed only");
             continue;
-        };
-        let addr = Multiaddr::empty()
-            .with(bootnode.ip.into())
-            .with(Protocol::Udp(quic_port))
-            .with(Protocol::QuicV1)
-            .with_p2p(peer_id)
-            .expect("failed to add peer ID to multiaddr");
-        bootnode_addrs.insert(peer_id, addr.clone());
-        swarm.dial(addr).expect("failed to dial bootnode");
+        }
+        bootnode_addrs.insert(peer_id, addrs.clone());
+        swarm
+            .dial(DialOpts::peer_id(peer_id).addresses(addrs).build())
+            .expect("failed to dial bootnode");
     }
 
-    let listen_addr = Multiaddr::empty()
+    let quic_listen_addr = Multiaddr::empty()
         .with(config.listening_socket.ip().into())
         .with(Protocol::Udp(config.listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
-        .listen_on(listen_addr)
-        .expect("failed to bind gossipsub listening address");
+        .listen_on(quic_listen_addr)
+        .expect("failed to bind gossipsub QUIC listening address");
+    // Same port number as the QUIC listener above: TCP and UDP are separate
+    // namespaces, so this cannot collide with it.
+    let tcp_listen_addr = Multiaddr::empty()
+        .with(config.listening_socket.ip().into())
+        .with(Protocol::Tcp(config.listening_socket.port()));
+    swarm
+        .listen_on(tcp_listen_addr)
+        .expect("failed to bind gossipsub TCP listening address");
 
     let beacon_topics = BeaconTopics::new(config.fork_digest);
     for topic in &beacon_topics.topics {
@@ -152,30 +166,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_beacon_swarm_subscribes_to_seven_topics_and_dials_nothing() {
+    async fn a_beacon_swarm_subscribes_to_seven_topics_and_dials_bootnodes_over_tcp() {
         // Port 0 asks the OS for a free port, so this cannot collide with a
         // running node or a sibling test.
+        let mainnet_bootnodes = crate::parse_enrs(
+            super::super::bootnodes::MAINNET_BOOTNODES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
+        // Checked directly against the list (see `beacon::bootnodes`'s own
+        // test): Teku's two and Nimbus's two advertise `tcp`; the other
+        // thirteen advertise neither transport and stay seed-only.
+        let tcp_dialable_count = mainnet_bootnodes
+            .iter()
+            .filter(|b| b.tcp_port.is_some())
+            .count();
         let built = build_beacon_swarm(BeaconSwarmConfig {
             node_key: vec![1u8; 32],
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
             config: Config::mainnet(),
             genesis_time: 1_606_824_023,
-            bootnodes: crate::parse_enrs(
-                super::super::bootnodes::MAINNET_BOOTNODES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
-            ),
+            bootnodes: mainnet_bootnodes,
         })
         .expect("swarm builds");
 
         let wire = built.wire.beacon().expect("a beacon wire");
         assert_eq!(wire.topics.topics.len(), 7);
         assert_eq!(wire.fork_digest, [0x8c, 0x9f, 0x62, 0xfe]);
-        assert!(
-            built.bootnode_addrs.is_empty(),
-            "no published mainnet bootnode advertises quic, so none is dialed"
-        );
+        // No published mainnet bootnode advertises `quic`, but the ones that
+        // advertise `tcp` are now dialable, which is the point of adding the
+        // transport; the rest are still seed-only, exactly as before.
+        assert_eq!(built.bootnode_addrs.len(), tcp_dialable_count);
+        for addrs in built.bootnode_addrs.values() {
+            assert_eq!(
+                addrs.len(),
+                1,
+                "a quic-less bootnode dial list must carry exactly its tcp address"
+            );
+            assert!(addrs[0].to_string().contains("/tcp/"));
+        }
     }
 }

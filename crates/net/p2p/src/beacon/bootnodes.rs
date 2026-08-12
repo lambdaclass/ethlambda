@@ -4,9 +4,13 @@
 //! maintainer comments kept so a stale entry can be traced back to whoever runs
 //! it. `--bootnodes` overrides the whole list.
 //!
-//! Not one of these advertises a `quic` entry, so `build_beacon_swarm` dials
-//! none of them: they are discv5 seeds only. That is why discovery is forced on
-//! for the beacon subcommand rather than being a flag.
+//! Not one of these advertises a `quic` entry. Only Teku's two and Nimbus's
+//! two advertise `tcp`; the other thirteen (Prylab, Lighthouse, the EF's, and
+//! Lodestar's) advertise neither and remain discv5-seed-only, exactly as
+//! before TCP support. `build_beacon_swarm` now dials the four that do.
+//! Discovery is still forced on for the beacon subcommand rather than being a
+//! flag: the static list alone reaches a minority of it, and a discv5 crawl
+//! is what finds the rest of the network.
 
 /// The ENRs `ethlambda beacon` seeds discv5 from when `--bootnodes` is unset.
 pub const MAINNET_BOOTNODES: [&str; 17] = [
@@ -82,14 +86,25 @@ mod tests {
     }
 
     #[test]
-    fn no_bootnode_is_statically_dialable() {
-        // This is why discovery is forced on for the beacon subcommand: with no
-        // `quic` entry there is nothing for build_beacon_swarm to dial, so a
-        // node relying on the static list alone would peer with nobody.
+    fn four_bootnodes_are_now_dialable_over_tcp() {
+        // Partially inverts what this test used to assert. Before TCP
+        // support, no bootnode was statically dialable because none
+        // advertises `quic`. Checked directly against the list: Teku's two
+        // and Nimbus's two advertise `tcp` and are now real dial targets: the
+        // other thirteen (Prylab, Lighthouse, the EF's, Lodestar's) advertise
+        // neither transport and remain discv5-seed-only, same as before.
         let parsed = parse_enrs(MAINNET_BOOTNODES.iter().map(|s| s.to_string()).collect());
         assert!(
             parsed.iter().all(|bootnode| bootnode.quic_port.is_none()),
-            "a mainnet bootnode now advertises quic; static dialing could be re-enabled"
+            "a mainnet bootnode now advertises quic; this test's premise changed"
+        );
+        let tcp_dialable = parsed
+            .iter()
+            .filter(|bootnode| bootnode.tcp_port.is_some())
+            .count();
+        assert_eq!(
+            tcp_dialable, 4,
+            "the count of mainnet bootnodes advertising tcp changed; re-check which ones"
         );
     }
 }

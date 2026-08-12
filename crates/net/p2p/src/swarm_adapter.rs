@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol,
+    PeerId, StreamProtocol,
     futures::StreamExt,
     request_response::{self, OutboundRequestId},
-    swarm::SwarmEvent,
+    swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{error, warn};
@@ -20,7 +20,12 @@ pub enum SwarmCommand {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
     },
-    Dial(Multiaddr),
+    /// Carries the full set of addresses worth trying for one dial attempt
+    /// (e.g. a peer's QUIC and TCP ports both): libp2p races every address in
+    /// a single `DialOpts` rather than treating each as a separate attempt,
+    /// which is what lets a live TCP address rescue a dial whose advertised
+    /// QUIC port does not answer.
+    Dial(DialOpts),
     SendRequest {
         peer: PeerId,
         request: Request,
@@ -47,10 +52,10 @@ impl SwarmHandle {
             .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
     }
 
-    pub fn dial(&self, addr: Multiaddr) {
+    pub fn dial(&self, opts: DialOpts) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Dial(addr))
+            .send(SwarmCommand::Dial(opts))
             .inspect_err(|_| warn!("Swarm adapter closed, cannot dial"));
     }
 
@@ -147,9 +152,9 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"))
                 .ok();
         }
-        SwarmCommand::Dial(addr) => {
+        SwarmCommand::Dial(opts) => {
             let _ = swarm
-                .dial(addr)
+                .dial(opts)
                 .inspect_err(|err| warn!(%err, "Swarm adapter: dial failed"));
         }
         SwarmCommand::SendRequest {

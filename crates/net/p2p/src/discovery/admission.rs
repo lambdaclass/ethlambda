@@ -62,7 +62,10 @@ impl PeerRequirements for AcceptEveryContact {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveredPeer {
     pub peer_id: PeerId,
-    pub addr: Multiaddr,
+    /// Dial targets, QUIC first then TCP, built from whichever of the two
+    /// ports the record actually advertises. Never empty: [`admit`] rejects a
+    /// record with neither.
+    pub addrs: Vec<Multiaddr>,
     /// Attestation subnets the peer advertises in `attnets`.
     pub subnets: Vec<u64>,
     /// Human-readable tag used in tests and logs.
@@ -78,10 +81,11 @@ pub enum RejectReason {
     MissingForkId,
     /// On a different network.
     ForkDigestMismatch,
-    /// Discoverable over discv5, but advertises no libp2p QUIC port (or one
-    /// that is `0`, which is undialable and RLP-decodes the same way an
-    /// absent entry does).
-    NoQuicPort,
+    /// Discoverable over discv5, but advertises no dialable transport: no
+    /// libp2p QUIC port and no libp2p TCP port (a port that is `0` is treated
+    /// the same as absent, since it RLP-decodes the same way an absent entry
+    /// does and is undialable either way).
+    NoDialableTransport,
     /// No `secp256k1` entry, or one that is not a valid key.
     BadPublicKey,
     /// Neither `ip` nor `ip6`.
@@ -93,7 +97,7 @@ impl RejectReason {
         match self {
             Self::MissingForkId => "missing or undecodable eth2 entry",
             Self::ForkDigestMismatch => "fork digest mismatch",
-            Self::NoQuicPort => "no quic port advertised",
+            Self::NoDialableTransport => "no quic or tcp port advertised",
             Self::BadPublicKey => "missing or invalid secp256k1 key",
             Self::MissingAddress => "no ip or ip6 entry",
         }
@@ -111,9 +115,10 @@ impl RejectReason {
             Self::MissingForkId | Self::ForkDigestMismatch => true,
             // A record we cannot derive a peer id from is unusable whoever sent it.
             Self::BadPublicKey => true,
-            // Both can be fixed by a later ENR: a node can add a quic entry, and
-            // discv5's own IP voting can fill in an address that was missing.
-            Self::NoQuicPort | Self::MissingAddress => false,
+            // Both can be fixed by a later ENR: a node can add a quic or tcp
+            // entry, and discv5's own IP voting can fill in an address that
+            // was missing.
+            Self::NoDialableTransport | Self::MissingAddress => false,
         }
     }
 }
@@ -151,15 +156,17 @@ pub fn admit(
         );
     }
 
-    // `None` and `Some(0)` are the same failure: no dialable quic port. They
-    // also coincide by construction, since an absent entry RLP-decodes to
-    // `0u16` via left-padding.
-    let quic_port = match read_quic_port(record) {
-        None | Some(0) => return Err(RejectReason::NoQuicPort),
-        Some(port) => port,
-    };
-
     let pairs = record.pairs();
+
+    // `None` and `Some(0)` are the same failure for either transport: no
+    // dialable port. Both coincide by construction with an absent entry,
+    // since that RLP-decodes to `0u16` via left-padding either way.
+    let quic_port = read_quic_port(record).filter(|port| *port != 0);
+    let tcp_port = pairs.tcp_port.filter(|port| *port != 0);
+    if quic_port.is_none() && tcp_port.is_none() {
+        return Err(RejectReason::NoDialableTransport);
+    }
+
     let public_key_bytes = pairs.secp256k1.ok_or(RejectReason::BadPublicKey)?;
     let public_key =
         libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
@@ -172,12 +179,29 @@ pub fn admit(
         .or_else(|| pairs.ip6.map(IpAddr::from))
         .ok_or(RejectReason::MissingAddress)?;
 
-    let addr = Multiaddr::empty()
-        .with(ip.into())
-        .with(Protocol::Udp(quic_port))
-        .with(Protocol::QuicV1)
-        .with_p2p(peer_id)
-        .map_err(|_| RejectReason::BadPublicKey)?;
+    // QUIC first: it is what most peers advertise today, and ordering it
+    // ahead of TCP here is what makes discovery's own dial list agree with
+    // `bootnode_dial_addrs`'s ordering.
+    let mut addrs = Vec::with_capacity(2);
+    if let Some(port) = quic_port {
+        addrs.push(
+            Multiaddr::empty()
+                .with(ip.into())
+                .with(Protocol::Udp(port))
+                .with(Protocol::QuicV1)
+                .with_p2p(peer_id)
+                .map_err(|_| RejectReason::BadPublicKey)?,
+        );
+    }
+    if let Some(port) = tcp_port {
+        addrs.push(
+            Multiaddr::empty()
+                .with(ip.into())
+                .with(Protocol::Tcp(port))
+                .with_p2p(peer_id)
+                .map_err(|_| RejectReason::BadPublicKey)?,
+        );
+    }
 
     let subnets = read_extra(record, ATTNETS_ENR_KEY)
         .map(|bits| decode_attnets(&bits))
@@ -188,7 +212,7 @@ pub fn admit(
 
     Ok(DiscoveredPeer {
         peer_id,
-        addr,
+        addrs,
         subnets,
         label: peer_id.to_string(),
     })
@@ -217,7 +241,7 @@ impl DiscoveredPeer {
     fn for_test(label: &str, subnets: Vec<u64>) -> Self {
         Self {
             peer_id: PeerId::random(),
-            addr: Multiaddr::empty(),
+            addrs: Vec::new(),
             subnets,
             label: label.to_string(),
         }
@@ -272,6 +296,30 @@ mod tests {
         pair(QUIC_ENR_KEY, port.encode_to_vec())
     }
 
+    /// Like `record_with`, but with a real `tcp` port too — the shape a
+    /// beacon-chain mainnet bootnode ENR actually has (`record_with` always
+    /// clears `tcp_port`, so it can only ever produce a quic-only record).
+    fn record_with_tcp(extra: Vec<(Bytes, Bytes)>, tcp_port: u16) -> NodeRecord {
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let public_key = ethrex_common::H512::from_slice(
+            &secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &signer)
+                .serialize_uncompressed()[1..],
+        );
+        let node = Node::new(
+            IpAddr::from(Ipv4Addr::LOCALHOST),
+            9010,
+            tcp_port,
+            public_key,
+        );
+        let mut record = NodeRecord::from_node(&node, 1, &signer).unwrap();
+        record
+            .edit(&signer, |pairs| {
+                pairs.extra_fields = extra;
+            })
+            .unwrap();
+        record
+    }
+
     fn attnets_pair(subnets: &[u64]) -> (Bytes, Bytes) {
         let bits = encode_attnets(&subnets.iter().copied().collect::<HashSet<_>>(), 8);
         pair(ATTNETS_ENR_KEY, Bytes::from(bits).encode_to_vec())
@@ -297,6 +345,8 @@ mod tests {
 
     #[test]
     fn accepts_a_well_formed_peer() {
+        // This is also the quic-only case: `record_with` always clears
+        // `tcp_port`, so `peer.addrs` here has exactly the one quic address.
         let record = record_with(vec![
             attnets_pair(&[2, 5]),
             eth2_pair(EnrForkId::local()),
@@ -305,8 +355,45 @@ mod tests {
         let peer = admit_record(&record).expect("accepted");
         assert_eq!(peer.subnets, vec![2, 5]);
         assert_eq!(
-            peer.addr.to_string(),
-            format!("/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{}", peer.peer_id)
+            peer.addrs,
+            vec![
+                format!("/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{}", peer.peer_id)
+                    .parse()
+                    .unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_a_tcp_only_peer() {
+        // Every published mainnet beacon-chain bootnode looks like this: `tcp`
+        // and `udp`, no `quic`. Before TCP support this was `NoQuicPort`.
+        let record = record_with_tcp(vec![eth2_pair(EnrForkId::local())], 9001);
+        let peer = admit_record(&record).expect("accepted");
+        assert_eq!(
+            peer.addrs,
+            vec![
+                format!("/ip4/127.0.0.1/tcp/9001/p2p/{}", peer.peer_id)
+                    .parse()
+                    .unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_a_peer_with_both_transports_and_orders_quic_first() {
+        let record = record_with_tcp(vec![eth2_pair(EnrForkId::local()), quic_pair(9001)], 9002);
+        let peer = admit_record(&record).expect("accepted");
+        assert_eq!(
+            peer.addrs,
+            vec![
+                format!("/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{}", peer.peer_id)
+                    .parse()
+                    .unwrap(),
+                format!("/ip4/127.0.0.1/tcp/9002/p2p/{}", peer.peer_id)
+                    .parse()
+                    .unwrap(),
+            ]
         );
     }
 
@@ -337,20 +424,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_peer_with_no_quic_port() {
-        // Reachable by discv5 but not over our only transport.
+    fn rejects_a_peer_with_neither_quic_nor_tcp() {
+        // Reachable by discv5 but not over either transport we speak.
+        // `record_with` always clears `tcp_port`, so this is a plain
+        // eth2-only record.
         let record = record_with(vec![eth2_pair(EnrForkId::local())]);
-        assert_eq!(admit_record(&record), Err(RejectReason::NoQuicPort));
+        assert_eq!(
+            admit_record(&record),
+            Err(RejectReason::NoDialableTransport)
+        );
+        assert!(!RejectReason::NoDialableTransport.is_permanent());
     }
 
     #[test]
-    fn rejects_a_peer_with_a_quic_port_of_zero() {
+    fn rejects_a_peer_with_a_quic_port_of_zero_and_no_tcp() {
         // A port of 0 is undialable, and this is also how an absent entry
         // decodes (left-padded to 0u16), so it must hit the same reason as
-        // `rejects_a_peer_with_no_quic_port` rather than sail through as
-        // "accepted" with an unusable `/udp/0/quic-v1` multiaddr.
+        // `rejects_a_peer_with_neither_quic_nor_tcp` rather than sail through
+        // as "accepted" with an unusable `/udp/0/quic-v1` multiaddr.
         let record = record_with(vec![eth2_pair(EnrForkId::local()), quic_pair(0)]);
-        assert_eq!(admit_record(&record), Err(RejectReason::NoQuicPort));
+        assert_eq!(
+            admit_record(&record),
+            Err(RejectReason::NoDialableTransport)
+        );
     }
 
     #[test]
