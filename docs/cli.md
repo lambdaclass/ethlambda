@@ -38,7 +38,7 @@ Taken by both subcommands, with the same meaning and the same defaults.
 |---|---|---|
 | `--node-key` | required | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity |
 | `--data-dir` | `./data` | RocksDB directory |
-| `--gossipsub-port` | `9000` | UDP port for libp2p QUIC |
+| `--gossipsub-port` | `9000` | Port for libp2p gossip: UDP for QUIC and TCP for the TCP transport, same number on both, since they are separate namespaces |
 | `--http-address` | `127.0.0.1` | Bind address for both HTTP servers |
 | `--api-port` | `5052` | API server port |
 | `--metrics-port` | `5054` | Metrics and debug server port. Equal to `--api-port` merges the routers onto one listener |

@@ -48,12 +48,15 @@ The layout follows the discovery domain of the beacon-chain
 | `ip` | `--discovery.advertise-ip`, or the bind address (`0.0.0.0`) if unset |
 | `udp` | `--discovery.port` |
 | `quic` | `--gossipsub-port`, the libp2p QUIC listener |
+| `tcp` | `--gossipsub-port`, the libp2p TCP listener |
 | `secp256k1` | compressed public key from `--node-key` |
 | `eth2` | SSZ `ENRForkID`, 16 bytes |
 | `attnets` | subscribed attestation subnet bitfield |
 
-There is no `tcp` entry: the spec defines it as the libp2p TCP listening port
-and ethlambda speaks QUIC only.
+`tcp` and `quic` share the same port number: TCP and UDP are separate
+namespaces, so `build_swarm` binds both without a collision. Advertising both
+is what lets a peer whose `quic` port does not answer still reach this node
+over TCP.
 
 Read the local ENR from `GET /lean/v0/node/identity`, which reports it as `enr`
 (`null` when discovery is disabled). It is also logged once at startup.
@@ -64,12 +67,16 @@ A discovered peer is admitted only if:
 
 - its ENR carries a decodable `eth2` entry, **and**
 - that entry's `fork_digest` equals ours, **and**
-- it advertises a `quic` port.
+- it advertises a `quic` port, a `tcp` port, or both.
 
 A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
 upcoming fork but compatible now. Rejected peers are marked unwanted in the peer
 table and are not reconsidered.
+
+A peer's dial list carries every address it advertises, QUIC first then TCP.
+libp2p races every address in one dial attempt, so a peer whose `quic` does not
+answer can still connect over `tcp` without a separate retry.
 
 Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
@@ -79,20 +86,24 @@ Dialing stops once 16 peers are connected, and resumes if that drops.
 
 ## Bootnodes
 
-The two entries a bootnode ENR can carry are read independently, because they
-answer different questions:
+The three entries a bootnode ENR can carry are read independently, because
+they answer different questions:
 
 | Entry | Absent means |
 | --- | --- |
-| `quic` | Not dialed statically by `build_swarm`; discv5 seed only |
-| `udp` | Not seeded into the discv5 routing table; static dial target only |
+| `quic` | Not part of the static dial list over QUIC |
+| `tcp` | Not part of the static dial list over TCP |
+| `udp` | Not seeded into the discv5 routing table |
 
-Neither absence is an error, and a record carrying just one of them is still
-kept. The ENRs `lean-quickstart` generates today carry `ip`/`quic`/`secp256k1`
-and no `udp`, so they stay reachable but contribute nothing to discovery. Every
-beacon-chain bootnode published today is the mirror image: `ip`/`udp`/`tcp` and
-no `quic`, usable as a discv5 seed but never dialed. A record with neither is
-dropped with a warning, as is one missing an `ip` or a `secp256k1` key.
+A bootnode is dropped only when it has none of the three: neither transport to
+dial nor a `udp` port to seed discv5 from. Any other combination is kept,
+including one with only `quic`, only `tcp`, only `udp`, or any pair. The ENRs
+`lean-quickstart` generates today carry `ip`/`quic`/`secp256k1` and no `udp`,
+so they stay reachable but contribute nothing to discovery. Not every
+published beacon-chain bootnode advertises `quic`, but some advertise `tcp`,
+which is what makes them statically dialable now that the swarm speaks both
+transports; the rest carry only `udp` and remain discv5-seed-only. A record
+missing an `ip` or a `secp256k1` key is dropped regardless of its transports.
 
 The ENR reported by `GET /lean/v0/node/identity` is only useful to a peer if
 the node that published it was started with a real `--discovery.advertise-ip`.
@@ -178,17 +189,20 @@ Closing this needs a way to hand ethrex's `DiscoveryServer::spawn` a prepared
 record instead of having it build one. Until then, discovery finds peers but
 cannot be found by them.
 
-### A beacon-chain client cannot discover us, and `tcp` is why
+### A beacon-chain client still cannot discover a *lean* node, but `tcp` is no longer why
 
-Beyond the fork digest never matching a real beacon network, there is a second,
-independent blocker. Lighthouse's discovery predicate is stricter than the spec
-text: alongside the `fork_digest` comparison it requires
-`enr.tcp4().is_some() || enr.tcp6().is_some()`, and it applies that as a
-discv5 query filter, so a `tcp`-less record is dropped before lighthouse's dial
-logic ever sees it. Our records deliberately carry no `tcp`, so they would be
-filtered out even if the digests did match. That is the right trade for a
-QUIC-only client, but it means the omission is a real interop cost and not a
-free simplification.
+There used to be two independent blockers here. Lighthouse's discovery
+predicate is stricter than the spec text: alongside the `fork_digest`
+comparison it requires `enr.tcp4().is_some() || enr.tcp6().is_some()`, and it
+applies that as a discv5 query filter, so a `tcp`-less record was dropped
+before lighthouse's dial logic ever saw it. Now that the local ENR advertises
+`tcp` (see the entry table above), that filter no longer excludes us.
+
+The other blocker remains and is unrelated to transport: the lean network's
+`fork_digest` is the hardcoded cross-client dummy `0x12345678`, which never
+matches a real beacon network's digest. A lighthouse node still would not
+admit a lean node, but for the same reason it would not admit any other
+foreign network — not because of a missing transport entry.
 
 ### `attnets` is not a fixed-width SSZ `Bitvector`
 

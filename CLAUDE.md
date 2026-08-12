@@ -273,7 +273,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ## Networking (libp2p)
 
 ### Protocols
-- **Transport**: QUIC over UDP (TLS 1.3)
+- **Transport**: QUIC over UDP (TLS 1.3), and TCP (noise + yamux) on the same port number as a fallback — added so a peer whose advertised `quic` doesn't answer (common on mainnet) can still be reached over TCP; libp2p races both addresses within one dial
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients

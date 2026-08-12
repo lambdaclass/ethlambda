@@ -174,7 +174,7 @@ curl -s -o /dev/null -w '%{speed_download} B/s\n' --max-time 30 \
 | ~1-6 min | `Beacon checkpoint sync complete` with `anchor_slot`, `genesis_validators_root`, `fork_digest`, `digest_epoch` | The anchor downloaded and verified. Dominated by the provider's rate, not by this node |
 | immediately after | the same line's `fork_digest` | Must match the digest recorded for the current epoch in [`discovery.md`](./discovery.md). A wrong digest means zero peers, silently |
 | immediately after | `Restart this node before the epoch above` with `boundary_epoch` and `boundary_unix_time` | The next boundary is named. If `boundary_unix_time` is in the past, the digest is already stale and no peer will match |
-| ~2 min | `Peer connected` at least 8 times | QUIC-only peering found enough of the network. Fewer than 4 after five minutes means the QUIC-only trade-off is biting |
+| ~2 min | `Peer connected` at least 8 times, `transport` field showing a mix of `quic` and `tcp` | Peering found enough of the network over both transports. Fewer than 4 after five minutes, or a `transport` value that is always `quic`, means the TCP fallback is not doing what it was added for; see "Known limitation" below |
 | ~2 min | `Anchor-to-head range sync started` with `gap` near 64 | A peer's `Status` opened a session |
 | ~3 min | `Anchor-to-head range sync complete` | The gap closed. A ~64-slot gap is one 128-block batch |
 | continuously | `Beacon block imported` roughly every 12s | Gossip is now importable, which it was not before the line above |
@@ -237,26 +237,38 @@ Confirmed working on live data:
 | Fork digest | `8c9f62fe`, matching [`discovery.md`](./discovery.md)'s record for this epoch |
 | Boundary warning | "No fork or blob-schedule boundary is scheduled" |
 | Topics | 7, no subnet families |
-| Local ENR | `attnets`, `cgc`, `eth2=8c9f62fe`, `quic`, and no `tcp` |
+| Local ENR | `attnets`, `cgc`, `eth2=8c9f62fe`, `quic`, and no `tcp` (predates TCP support, see below) |
 | Admission | live rejects for "no quic port", "missing or undecodable eth2 entry", "fork digest mismatch" |
 | `lean_sync_anchor_slot` | served, and equal to the anchor slot in the log |
 
 Not shown: sustained gossip, a closed gap, or finality advancing. Peers
 connect and drop.
 
-### Known limitation: QUIC-only peering on mainnet
+### Known limitation (as of the 2026-08-12 runs above): QUIC-only peering on mainnet
 
-ethlambda speaks QUIC and no TCP, and mainnet nodes widely advertise a `quic`
+ethlambda spoke QUIC and no TCP, and mainnet nodes widely advertise a `quic`
 ENR entry that does not answer. Across both runs, dials failed with
 `Handshake with the remote timed out` far more often than they succeeded; an
 earlier run reached ten admitted peers with correctly decoded `attnets`,
 connected to one, exchanged a `Status`, and correctly decoded that peer's
 `Goodbye` before losing it. Discovery, admission, the fork digest and the codec
-are all proven on live data; the transport is what does not hold.
+were all proven on live data; the transport was what did not hold.
 
-So a run that reaches §3's `Peer connected` line fewer than four times is more
-likely reporting the network's QUIC posture than a defect here, and §5's five
-conditions cannot be evaluated at all without a peer that stays. Re-run this
-from a host with real inbound UDP before concluding anything about the sync
-path. See [`discovery.md`](./discovery.md) for why the missing `tcp` entry is a
-deliberate trade and what it costs.
+### What changed since, and what is still unverified
+
+TCP (noise + yamux) now runs alongside QUIC on both swarms, on the same port
+number as the QUIC listener. The local ENR advertises `tcp` in addition to
+`quic` (see [`discovery.md`](./discovery.md)'s entry table), admission accepts
+a peer that offers either transport, and a dial carries every address a peer
+advertises so libp2p races QUIC and TCP within one attempt — the mechanism
+meant to let a live TCP address rescue a dial whose advertised `quic` does
+not answer.
+
+None of this has been checked against live mainnet traffic yet. The change is
+unit- and integration-tested (including two local swarms actually completing
+a TCP connection), but whether it measurably improves the `Peer connected`
+count against real mainnet peers is an open question this page cannot answer
+without a fresh run of the procedure above. Re-run it, and compare the `Peer
+connected` count and the `transport` field it now logs against the 2026-08-12
+baseline before concluding anything about whether the QUIC-only trade-off is
+actually resolved.
