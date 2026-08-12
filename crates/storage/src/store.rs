@@ -13,6 +13,7 @@ use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
 use ethlambda_types::beacon::primitives::Root as BeaconRoot;
+use ethlambda_types::beacon::primitives::Slot as BeaconSlot;
 use ethlambda_types::{
     attestation::{AggregationBits, AttestationData, HashedAttestationData, bits_is_subset},
     block::{
@@ -614,6 +615,12 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
 /// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
 /// of attestations, and `pow_blocks` stands in for a call to an execution client
 /// that a restarted node would simply make again.
+///
+/// `head` belongs here for the same reason: it is a pure function of the block
+/// tree and checkpoints already persisted elsewhere in this `Store`, so a
+/// restarted node recomputes it (`ethlambda_beacon::fork_choice::get_head`) on
+/// its first tick rather than trusting a stale value read back off disk. `None`
+/// until that first computation runs.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: BeaconRoot,
@@ -621,6 +628,7 @@ pub(crate) struct BeaconScratch {
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<BeaconRoot, PowBlock>,
+    pub(crate) head: Option<(BeaconSlot, BeaconRoot)>,
 }
 
 /// The beacon state caches.

@@ -537,6 +537,26 @@ impl Store {
             .expect("put unrealized justification");
         batch.commit().expect("commit");
     }
+
+    /// The most recently computed LMD GHOST head, or `None` before the first
+    /// `ethlambda_beacon::fork_choice::get_head` call this process has made.
+    ///
+    /// See [`BeaconScratch`](crate::store::BeaconScratch)'s module comment for
+    /// why this is in-memory rather than a `Metadata` row: it is cheap to
+    /// recompute from the block tree and checkpoints already on disk, so
+    /// persisting it would only be a second value a bug could let drift from
+    /// what a fresh computation produces. Distinct from
+    /// [`Store::beacon_highest_imported_slot`], which tracks how far forward
+    /// sync has fetched rather than which branch fork choice has settled on;
+    /// the two can and do disagree while syncing.
+    pub fn beacon_head(&self) -> Option<(Slot, Root)> {
+        self.beacon.lock().unwrap().head
+    }
+
+    /// Sets [`Store::beacon_head`].
+    pub fn set_beacon_head(&mut self, slot: Slot, root: Root) {
+        self.beacon.lock().unwrap().head = Some((slot, root));
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +816,7 @@ mod tests {
         assert_eq!(store.block_timeliness(root), None);
         assert!(!store.is_equivocating(7));
         assert_eq!(store.latest_message(7), None);
+        assert_eq!(store.beacon_head(), None);
 
         store.set_proposer_boost_root(root);
         store.set_block_timeliness(root, true);
@@ -807,10 +828,12 @@ mod tests {
                 root: Root::repeat_byte(9),
             },
         );
+        store.set_beacon_head(3, root);
 
         assert_eq!(clone.proposer_boost_root(), root);
         assert_eq!(clone.block_timeliness(root), Some(true));
         assert!(clone.is_equivocating(7));
+        assert_eq!(clone.beacon_head(), Some((3, root)));
         assert_eq!(
             clone.latest_message(7),
             Some(LatestMessage {
