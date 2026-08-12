@@ -222,16 +222,41 @@ Expected: a second `Beacon checkpoint sync complete`, with an `anchor_slot`
 Re-downloading the anchor is the intended behaviour, not a regression: see
 "Every boot checkpoint-syncs" above.
 
-## Known limitation: QUIC-only peering on mainnet
+## What a live run has actually shown
+
+Two runs against mainnet from a developer machine, 2026-08-12. Recorded here
+because the gap between "starts up correctly" and "follows the chain" is the
+whole subject of this page, and only the first half is currently proven.
+
+Confirmed working on live data:
+
+| | |
+|---|---|
+| Checkpoint sync | anchor slot 14977216, fork `fulu`, ~3.5 min at ~1 MB/s |
+| `genesis_validators_root` | `0x4b363db9…bfe95`, matching the value the digest tests pin |
+| Fork digest | `8c9f62fe`, matching [`discovery.md`](./discovery.md)'s record for this epoch |
+| Boundary warning | "No fork or blob-schedule boundary is scheduled" |
+| Topics | 7, no subnet families |
+| Local ENR | `attnets`, `cgc`, `eth2=8c9f62fe`, `quic`, and no `tcp` |
+| Admission | live rejects for "no quic port", "missing or undecodable eth2 entry", "fork digest mismatch" |
+| `lean_sync_anchor_slot` | served, and equal to the anchor slot in the log |
+
+Not shown: sustained gossip, a closed gap, or finality advancing. Peers
+connect and drop.
+
+### Known limitation: QUIC-only peering on mainnet
 
 ethlambda speaks QUIC and no TCP, and mainnet nodes widely advertise a `quic`
-ENR entry that does not answer. A run from a developer machine has reached ten
-admitted peers with correctly decoded `attnets`, connected to one, exchanged a
-`Status`, and correctly decoded that peer's `Goodbye` — while nine of ten dials
-died with `Handshake with the remote timed out`. Discovery, admission, the fork
-digest and the codec were all proven on live data; sustained gossip was not.
+ENR entry that does not answer. Across both runs, dials failed with
+`Handshake with the remote timed out` far more often than they succeeded; an
+earlier run reached ten admitted peers with correctly decoded `attnets`,
+connected to one, exchanged a `Status`, and correctly decoded that peer's
+`Goodbye` before losing it. Discovery, admission, the fork digest and the codec
+are all proven on live data; the transport is what does not hold.
 
 So a run that reaches §3's `Peer connected` line fewer than four times is more
-likely to be reporting the network's QUIC posture than a defect here. See
-[`discovery.md`](./discovery.md) for why the missing `tcp` entry is a deliberate
-trade and what it costs.
+likely reporting the network's QUIC posture than a defect here, and §5's five
+conditions cannot be evaluated at all without a peer that stays. Re-run this
+from a host with real inbound UDP before concluding anything about the sync
+path. See [`discovery.md`](./discovery.md) for why the missing `tcp` entry is a
+deliberate trade and what it costs.
