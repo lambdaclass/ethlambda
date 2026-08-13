@@ -30,7 +30,7 @@
 //! # Reading the state without matching on the fork
 //!
 //! About twenty of the state's fields exist unchanged in every fork. The
-//! [`shared_state_accessors`] macro generates their accessors from one list, and
+//! `shared_state_accessors` macro generates their accessors from one list, and
 //! that list is this crate's statement of which fields are fork-invariant: if a
 //! future fork changes one, it leaves the list and gains an explicit match at
 //! each use site.
@@ -336,7 +336,7 @@ impl BeaconState {
     /// made, and which validator the next sweep resumes from.
     ///
     /// Both exist from capella on, so they cannot join
-    /// [`shared_state_accessors`]' fork-invariant lists, and they are read
+    /// `shared_state_accessors`' fork-invariant lists, and they are read
     /// through here rather than through a per-fork projection to a concrete
     /// state struct because the sweep that reads them is genuinely shared: deneb
     /// reuses capella's `get_expected_withdrawals` unchanged, and a projection
@@ -407,7 +407,7 @@ impl BeaconState {
     /// The three per-validator lists that exist from altair on, by reference and
     /// all at once.
     ///
-    /// These cannot join [`shared_state_accessors`]' lists, since phase0 has
+    /// These cannot join `shared_state_accessors`' lists, since phase0 has
     /// none of them, and a per-fork projection to a concrete state struct (the
     /// way `ethlambda_beacon::helpers::altair::altair_state_ref` reaches them) cannot
     /// serve every fork that carries them: bellatrix, capella, deneb, electra,
@@ -535,7 +535,7 @@ impl BeaconState {
     ///
     /// Both exist from altair on, byte-for-byte the same field in every later
     /// fork (see, for instance, bellatrix's own state doc), so they cannot
-    /// join [`shared_state_accessors`]' lists, since phase0 predates sync
+    /// join `shared_state_accessors`' lists, since phase0 predates sync
     /// committees entirely. A per-fork projection cannot serve here either:
     /// `ethlambda_beacon::stf::altair::process_sync_aggregate` is called for every
     /// fork from altair through fulu (see that function's own documentation),
@@ -743,11 +743,11 @@ impl SignedBeaconBlock {
 /// A signed block has far fewer share points than [`BeaconState`], and none of
 /// them need a `_mut` accessor, since nothing in this crate mutates a decoded
 /// block in place. The list is still split in two, the same way
-/// [`shared_state_accessors`]'s is: every field here happens to be `Copy`, so
+/// `shared_state_accessors`'s is: every field here happens to be `Copy`, so
 /// the split is not `copy` versus `reference` but `message` versus `outer`,
 /// separating the fields nested under `message` from `signature`, the one
 /// field [`SignedBeaconBlock`] carries directly. As with
-/// [`shared_state_accessors`], the variant list itself cannot be a macro
+/// `shared_state_accessors`, the variant list itself cannot be a macro
 /// parameter, since `macro_rules!` zips repetitions at the same nesting depth
 /// rather than nesting them, so each list's arms are spelled out in full.
 macro_rules! signed_beacon_block_accessors {

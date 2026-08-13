@@ -67,7 +67,7 @@ pub type SyncCommitteePubkeys = SszVector<BlsPubkey, { preset::SYNC_COMMITTEE_SI
 const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
 
 /// One bit per member of a single sync subcommittee (one
-/// [`SYNC_COMMITTEE_SUBNET_COUNT`]th of a full sync committee), recording who
+/// `SYNC_COMMITTEE_SUBNET_COUNT`th of a full sync committee), recording who
 /// contributed to one [`SyncCommitteeContribution`].
 pub type SyncSubcommitteeBits =
     SszBitvector<{ preset::SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT }>;

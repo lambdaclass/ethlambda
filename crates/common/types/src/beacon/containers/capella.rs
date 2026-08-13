@@ -26,8 +26,7 @@
 //! verifier that only knows one of the two forms still check a historical
 //! proof against either.
 //!
-//! [`ExtraData`](super::bellatrix::ExtraData), [`LogsBloom`](super::bellatrix::LogsBloom),
-//! and [`Transactions`](super::bellatrix::Transactions) are unchanged from
+//! [`ExtraData`], [`LogsBloom`], and [`Transactions`] are unchanged from
 //! bellatrix, so this module imports them rather than redefining them.
 //! [`ExecutionPayload`] and [`ExecutionPayloadHeader`] themselves are not
 //! imported, since every field of both is repeated here with `withdrawals`
