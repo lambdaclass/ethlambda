@@ -218,7 +218,18 @@ pub async fn handle_req_resp_message(
                         pending.failed_peers.insert(peer);
                     }
                 }
-                None => {}
+                // Only the handshake is untracked, and only one failure of it
+                // is worth acting on: a peer that has dropped `status/1`
+                // refuses the stream outright, and without a handshake it never
+                // enters the sync peer set at all.
+                None => {
+                    if matches!(
+                        error,
+                        request_response::OutboundFailure::UnsupportedProtocols
+                    ) {
+                        crate::beacon::handler::retry_status_on_other_version(server, peer).await;
+                    }
+                }
             }
         }
         request_response::Event::InboundFailure {

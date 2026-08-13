@@ -933,7 +933,11 @@ async fn handle_swarm_event(
                 // borrow of `server.wire` is alive across the send.
                 let beacon_status = server.wire.beacon().map(|wire| {
                     (
-                        beacon::handler::build_status(wire),
+                        beacon::handler::build_status(
+                            wire,
+                            &server.store,
+                            beacon::handler::StatusVersion::V1,
+                        ),
                         hex::encode(wire.fork_digest),
                     )
                 });

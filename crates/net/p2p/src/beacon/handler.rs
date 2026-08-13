@@ -7,7 +7,6 @@
 //! serving.
 
 use ethlambda_network_api::BlockSource;
-use ethlambda_types::beacon::primitives::Root;
 use libp2p::PeerId;
 use libp2p::gossipsub::Event;
 use libp2p::request_response::ResponseChannel;
@@ -15,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use super::messages::{
     AttnetsBits, BeaconMetaData, BeaconStatus, Goodbye, MetaDataV1, MetaDataV2, MetaDataV3, Ping,
-    StatusV1, SyncnetsBits,
+    StatusV1, StatusV2, SyncnetsBits,
 };
 use super::{BeaconWire, constants, decode, protocols, topics};
 use crate::gossipsub::decompress_message;
@@ -23,24 +22,67 @@ use crate::req_resp::{
     BeaconRequest, BeaconResponse, Request, Response, ResponseCode, ResponsePayload, error_message,
 };
 use crate::{P2PServer, metrics};
+use ethlambda_storage::Store;
 
-/// The `Status` this node advertises.
+/// The `Status` this node advertises, in the version the stream asked for.
 ///
-/// Every field but the fork digest is zero, which is the honest answer for a
-/// node that holds no beacon chain. Lighthouse's relevance check explicitly
-/// exempts a zero `finalized_root` from its finalized-root comparison, reading
-/// it as "this peer is syncing" rather than as a conflicting chain, so a zero
-/// Status keeps the connection instead of earning an `IrrelevantPeer`
-/// disconnect. The anchor-and-follow work replaces this with the store-derived
-/// Status.
-pub fn build_status(wire: &BeaconWire) -> BeaconStatus {
-    BeaconStatus::V1(StatusV1 {
+/// Derived from the store: the fork-choice head if there is one, falling back
+/// to the forward-sync watermark before the first head computation, and the
+/// finalized checkpoint the anchor established. A zero Status is what this sent
+/// while the node held no chain; it survives peer relevance checks (Lighthouse
+/// reads a zero `finalized_root` as "still syncing" rather than as a conflicting
+/// chain) but it also tells every peer that we are worth nothing to them, and a
+/// well-connected node answers `Goodbye(129)`, "too many peers", to exactly
+/// those first.
+///
+/// `version` is the stream's, not ours to choose: a v1 body written on a v2
+/// stream is eight bytes short and the codec refuses it, which killed the
+/// connection outright. Answering a request means answering in its own version.
+pub fn build_status(wire: &BeaconWire, store: &Store, version: StatusVersion) -> BeaconStatus {
+    let finalized = store.beacon_finalized_checkpoint();
+    let (head_slot, head_root) = store
+        .beacon_head()
+        .unwrap_or_else(|| (store.beacon_highest_imported_slot(), finalized.root));
+
+    let v1 = StatusV1 {
         fork_digest: wire.fork_digest,
-        finalized_root: Root::zero(),
-        finalized_epoch: 0,
-        head_root: Root::zero(),
-        head_slot: 0,
-    })
+        finalized_root: finalized.root,
+        finalized_epoch: finalized.epoch,
+        head_root,
+        head_slot,
+    };
+    match version {
+        StatusVersion::V1 => BeaconStatus::V1(v1),
+        // The oldest slot this node can serve. Everything below the anchor was
+        // never fetched, so the honest answer is the anchor's own slot rather
+        // than zero: a peer that backfills from us would otherwise ask for
+        // blocks we have never had.
+        StatusVersion::V2 => BeaconStatus::V2(StatusV2 {
+            fork_digest: v1.fork_digest,
+            finalized_root: v1.finalized_root,
+            finalized_epoch: v1.finalized_epoch,
+            head_root: v1.head_root,
+            head_slot: v1.head_slot,
+            earliest_available_slot: store.beacon_anchor_slot(),
+        }),
+    }
+}
+
+/// Which `Status` version a stream negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusVersion {
+    V1,
+    V2,
+}
+
+impl StatusVersion {
+    /// The version to answer a request in: the one it arrived in.
+    pub fn of(status: &BeaconStatus) -> Self {
+        match status {
+            BeaconStatus::V1(_) => Self::V1,
+            BeaconStatus::V2(_) => Self::V2,
+        }
+    }
 }
 
 /// The `MetaData` this node advertises, in the version the protocol asked for.
@@ -75,17 +117,37 @@ pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaDat
 /// Open the handshake on a newly established connection.
 ///
 /// `status/1` rather than `status/2`: every mainnet client still answers v1, and
-/// the probe that proved this path completed its handshake on it. If a client
-/// ever drops v1, this is the single line that moves.
+/// the probe that proved this path completed its handshake on it. A peer that
+/// has dropped v1 refuses the stream with "the remote supports none of the
+/// requested protocols", which is what [`retry_status_on_other_version`]
+/// answers.
 pub async fn send_status(server: &P2PServer, peer_id: PeerId, wire_status: BeaconStatus) {
+    let protocol = match StatusVersion::of(&wire_status) {
+        StatusVersion::V1 => protocols::STATUS_V1,
+        StatusVersion::V2 => protocols::STATUS_V2,
+    };
     server
         .swarm_handle
         .send_request(
             peer_id,
             Request::Beacon(BeaconRequest::Status(wire_status)),
-            libp2p::StreamProtocol::new(protocols::STATUS_V1),
+            libp2p::StreamProtocol::new(protocol),
         )
         .await;
+}
+
+/// Re-open a refused handshake on the other `Status` version.
+///
+/// A peer that supports neither version was never going to talk to us, and one
+/// retry cannot loop: the retry is sent in the version the first attempt was
+/// not.
+pub async fn retry_status_on_other_version(server: &P2PServer, peer_id: PeerId) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let status = build_status(wire, &server.store, StatusVersion::V2);
+    debug!(%peer_id, "Retrying the beacon handshake on status/2");
+    send_status(server, peer_id, status).await;
 }
 
 /// Answer a beacon request, or drop the channel when the protocol expects no
@@ -127,7 +189,11 @@ pub async fn handle_beacon_request(
                     "Beacon status received"
                 );
             }
-            Some(BeaconResponse::Status(build_status(wire)))
+            Some(BeaconResponse::Status(build_status(
+                wire,
+                &server.store,
+                StatusVersion::of(&peer_status),
+            )))
         }
         BeaconRequest::Ping(ping) => {
             debug!(%peer, peer_seq_number = ping.seq_number, "Ping received");
@@ -299,19 +365,60 @@ mod tests {
         }
     }
 
+    fn empty_beacon_store() -> Store {
+        Store::init_beacon(
+            std::sync::Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
+            1_606_824_023,
+        )
+    }
+
     #[test]
-    fn the_advertised_status_carries_the_digest_and_nothing_else() {
-        // Zero roots are the honest answer for a node with no chain, and
-        // lighthouse exempts a zero finalized_root from its relevance check, so
-        // this keeps the connection rather than earning a disconnect.
-        let BeaconStatus::V1(status) = build_status(&wire()) else {
-            panic!("v1 is what we send");
+    fn the_advertised_status_reports_the_chain_the_store_holds() {
+        let mut store = empty_beacon_store();
+        let head_root = ethlambda_types::beacon::primitives::Root::repeat_byte(0xaa);
+        let finalized_root = ethlambda_types::beacon::primitives::Root::repeat_byte(0xbb);
+        store.set_beacon_head(4_242, head_root);
+        store.set_beacon_finalized_checkpoint(ethlambda_types::beacon::containers::Checkpoint {
+            epoch: 130,
+            root: finalized_root,
+        });
+
+        let BeaconStatus::V1(status) = build_status(&wire(), &store, StatusVersion::V1) else {
+            panic!("v1 was asked for");
         };
         assert_eq!(status.fork_digest, [0x8c, 0x9f, 0x62, 0xfe]);
-        assert_eq!(status.finalized_root, Root::zero());
-        assert_eq!(status.head_root, Root::zero());
-        assert_eq!(status.finalized_epoch, 0);
-        assert_eq!(status.head_slot, 0);
+        assert_eq!(status.head_slot, 4_242);
+        assert_eq!(status.head_root, head_root);
+        assert_eq!(status.finalized_epoch, 130);
+        assert_eq!(status.finalized_root, finalized_root);
+    }
+
+    /// A v1 body on a v2 stream is eight bytes short, and the codec refuses to
+    /// write it: answering every `Status` in v1 dropped the connection of every
+    /// peer that opened the handshake on `status/2`.
+    #[test]
+    fn the_status_version_answered_is_the_one_that_was_asked_for() {
+        let store = empty_beacon_store();
+        let wire = wire();
+
+        assert!(matches!(
+            build_status(&wire, &store, StatusVersion::V1),
+            BeaconStatus::V1(_)
+        ));
+        assert!(matches!(
+            build_status(&wire, &store, StatusVersion::V2),
+            BeaconStatus::V2(_)
+        ));
+
+        let peer_asked_in = BeaconStatus::V2(StatusV2 {
+            fork_digest: wire.fork_digest,
+            finalized_root: Default::default(),
+            finalized_epoch: 0,
+            head_root: Default::default(),
+            head_slot: 0,
+            earliest_available_slot: 0,
+        });
+        assert_eq!(StatusVersion::of(&peer_asked_in), StatusVersion::V2);
     }
 
     #[test]
