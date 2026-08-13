@@ -3,6 +3,7 @@ use ethlambda_blockchain::metrics::SyncStatus;
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, SyncStatusController};
 use ethlambda_storage::Store;
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::json_response;
 
@@ -29,10 +30,10 @@ pub struct NodeIdentity {
 }
 
 #[derive(Serialize)]
-struct IdentityResponse {
+struct IdentityResponse<'a> {
     version: &'static str,
     #[serde(flatten)]
-    identity: NodeIdentity,
+    identity: &'a NodeIdentity,
 }
 
 /// Sync status for `/lean/v0/node/syncing`.
@@ -77,11 +78,17 @@ async fn get_syncing(
 /// rustc version), the node's libp2p peer ID, and its discv5 ENR (`null` when
 /// discovery is disabled). All three are fixed at startup and captured by the
 /// route in `routes`.
-async fn get_identity(version: &'static str, identity: NodeIdentity) -> impl IntoResponse {
-    json_response(IdentityResponse { version, identity })
+async fn get_identity(version: &'static str, identity: Arc<NodeIdentity>) -> impl IntoResponse {
+    json_response(IdentityResponse {
+        version,
+        identity: &identity,
+    })
 }
 
 pub(crate) fn routes(version: &'static str, identity: NodeIdentity) -> Router<Store> {
+    // `Arc` so the route closure hands each request a refcount bump rather than
+    // re-cloning two startup-fixed strings.
+    let identity = Arc::new(identity);
     Router::new()
         .route("/lean/v0/node/syncing", get(get_syncing))
         .route(

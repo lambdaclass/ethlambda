@@ -45,10 +45,6 @@ reqwest.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
 
-# Pinned to ethlambda-p2p's discovery module, which takes a raw secp256k1
-# `SecretKey` in `DiscoverySpawnConfig`.
-secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context"] }
-
 tikv-jemallocator = { workspace = true, optional = true }
 
 libc.workspace = true

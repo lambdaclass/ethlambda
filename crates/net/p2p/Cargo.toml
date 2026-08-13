@@ -29,6 +29,7 @@ snap = "1.1"
 
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 
 rand = "0.8"
 
@@ -46,9 +47,8 @@ ethrex-common = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/
 # Only for the empty in-memory Store that DiscoveryServer::spawn requires.
 ethrex-storage = { git = "https://github.com/lambdaclass/ethrex", branch = "feat/discovery-peer-requirements" }
 
-# Versions pinned to ethrex's workspace: these types cross the API boundary.
-secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }
-bytes = "1.6.0"
+# Version pinned to ethrex's workspace: `SecretKey` crosses the API boundary.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context"] }
 
 # SSZ
 libssz.workspace = true
@@ -60,3 +60,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 hex.workspace = true
+# `Bytes` builds the raw ENR entries the admission tests feed to `NodeRecord`,
+# and `rand` seeds their throwaway signing keys. Neither is used outside tests.
+bytes = "1.6.0"
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }

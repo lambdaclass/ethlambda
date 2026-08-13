@@ -3,7 +3,6 @@ pub mod attestation;
 pub mod block;
 pub mod checkpoint;
 pub mod constants;
-pub mod enr;
 pub mod genesis;
 pub mod primitives;
 pub mod state;

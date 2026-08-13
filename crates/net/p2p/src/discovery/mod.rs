@@ -8,6 +8,7 @@
 //! See `docs/discovery.md` for the operator-facing description.
 
 pub mod admission;
+pub(crate) mod dial;
 pub mod enr;
 
 use std::collections::HashSet;
@@ -15,18 +16,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ethlambda_types::enr::EnrForkId;
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
 use ethrex_p2p::types::Node;
 use ethrex_storage::{EngineType, Store};
-use secp256k1::SecretKey;
 use tokio::net::UdpSocket;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::Bootnode;
 use admission::LeanFilter;
-use enr::{LocalEnrParams, build_local_enr};
+use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 
 /// How often the dial loop looks for a new peer.
 pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
@@ -38,8 +37,32 @@ pub const DISCOVERY_TARGET_PEERS: usize = 16;
 /// Candidates drawn from the peer table per refill.
 pub const DISCOVERY_CANDIDATE_BATCH: usize = 8;
 
+/// Why discovery could not be started. Every variant is fatal at startup.
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    #[error("failed to bind discovery socket on {addr}: {source}")]
+    BindSocket {
+        addr: SocketAddr,
+        source: std::io::Error,
+    },
+    #[error("failed to read discovery socket address: {0}")]
+    SocketAddr(std::io::Error),
+    #[error("failed to build local ENR: {0}")]
+    BuildEnr(ethrex_p2p::types::NodeError),
+    #[error("failed to encode local ENR: {0}")]
+    EncodeEnr(ethrex_p2p::types::NodeError),
+    #[error("failed to create the discovery store: {0}")]
+    Store(String),
+    #[error("failed to start discovery server: {0}")]
+    Server(String),
+    #[error("node key is not a valid secp256k1 secret key: {0}")]
+    NodeKey(secp256k1::Error),
+}
+
 pub struct DiscoverySpawnConfig {
-    pub node_key: SecretKey,
+    /// Raw 32-byte secp256k1 secret key, the same bytes `SwarmConfig::node_key`
+    /// takes, so the binary never needs to name a crypto type.
+    pub node_key: Vec<u8>,
     pub bind_ip: IpAddr,
     pub discovery_port: u16,
     pub quic_port: u16,
@@ -62,11 +85,6 @@ pub struct DiscoveryHandle {
     /// loop can apply the same rules when it turns a contact into a dial target.
     /// See [`LeanFilter`].
     pub filter: LeanFilter,
-    /// The discv5 socket's actual bound address. Equal to the requested
-    /// `discovery_port` unless that was 0, in which case this carries the
-    /// port the OS assigned — the same one baked into `local_enr`'s `udp`
-    /// entry.
-    pub bound_addr: SocketAddr,
 }
 
 /// Bind the discv5 socket, build the local ENR, and start ethrex's discovery
@@ -78,18 +96,25 @@ pub struct DiscoveryHandle {
 ///
 /// Only bootnodes whose ENR advertises a `udp` port can seed discv5; the rest
 /// are still dialed statically by `build_swarm`.
-pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHandle, String> {
+pub async fn spawn_discovery(
+    config: DiscoverySpawnConfig,
+) -> Result<DiscoveryHandle, DiscoveryError> {
+    let signer =
+        secp256k1::SecretKey::from_slice(&config.node_key).map_err(DiscoveryError::NodeKey)?;
+
     let bind_addr = SocketAddr::new(config.bind_ip, config.discovery_port);
     let socket = UdpSocket::bind(bind_addr)
         .await
-        .map_err(|err| format!("failed to bind discovery socket on {bind_addr}: {err}"))?;
-    let bound = socket
-        .local_addr()
-        .map_err(|err| format!("failed to read discovery socket address: {err}"))?;
+        .map_err(|source| DiscoveryError::BindSocket {
+            addr: bind_addr,
+            source,
+        })?;
+    let bound = socket.local_addr().map_err(DiscoveryError::SocketAddr)?;
 
+    let advertise_ip = config.advertise_ip.unwrap_or(config.bind_ip);
     let params = LocalEnrParams {
-        signer: config.node_key,
-        ip: config.advertise_ip.unwrap_or(config.bind_ip),
+        signer,
+        ip: advertise_ip,
         discovery_port: bound.port(),
         quic_port: config.quic_port,
         subscription_subnets: config.subscription_subnets,
@@ -97,9 +122,7 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
-    let local_enr = local_record
-        .enr_url()
-        .map_err(|err| format!("failed to encode local ENR: {err}"))?;
+    let local_enr = local_record.enr_url().map_err(DiscoveryError::EncodeEnr)?;
 
     // `spawn` rather than `spawn_with_filter` would install ethrex's own filter,
     // which wants an EIP-2124 `eth` entry compatible with an execution chain lean
@@ -128,23 +151,14 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         "Starting discv5 discovery"
     );
 
-    // An empty in-memory store, because `spawn` requires one and lean has no
-    // execution chain. The discv5 path reads it for exactly one thing,
-    // `get_fork_id`, to stamp an `eth` entry into the record ethrex serves; on a
-    // store with no genesis block that call errors and `spawn` skips the entry,
-    // which is what we want. (The other reader is discv4's ENR handler, and
-    // discv4 is disabled below.)
-    //
-    // KNOWN GAP: `spawn` builds its own local record from `local_node` alone and
-    // offers no way to seed the consensus entries, so the record ethrex serves
-    // over the wire carries `ip`/`udp`/`secp256k1` but not `eth2`, `attnets` or
-    // `quic`. The ENR this node reports (and logs below) is `local_record`,
-    // built by `build_local_enr`, and is complete. The consequence is one-sided
-    // discovery: we can find and admit lean peers, but a lean peer applying the
-    // same admission rules to what ethrex serves would reject us for a missing
-    // `quic` entry. Closing this needs a way to hand `spawn` a prepared record.
+    // `spawn` requires a store but the discv5 path reads it only for
+    // `get_fork_id`, which errors on a store with no genesis block and makes
+    // ethrex skip the `eth` entry — what lean wants, having no execution chain.
+    // That the record ethrex then serves is *not* the complete one we report is
+    // a known gap; see docs/discovery.md, "The record ethrex serves is not the
+    // record we report".
     let store = Store::new("", EngineType::InMemory)
-        .map_err(|err| format!("failed to create the discovery store: {err}"))?;
+        .map_err(|err| DiscoveryError::Store(err.to_string()))?;
 
     DiscoveryServer::spawn(
         store,
@@ -160,15 +174,22 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         },
     )
     .await
-    .map_err(|err| format!("failed to start discovery server: {err}"))?;
+    .map_err(|err| DiscoveryError::Server(err.to_string()))?;
 
     info!(enr = %local_enr, "Local ENR");
+    if advertise_ip.is_unspecified() {
+        warn!(
+            "Local ENR advertises an unspecified IP; peers can still reach us once \
+             discv5 IP voting resolves our external address, but this ENR is not \
+             directly dialable as published. Set --discovery.advertise-ip to the \
+             address peers should reach this node on"
+        );
+    }
 
     Ok(DiscoveryHandle {
         peer_table,
         local_enr,
         filter,
-        bound_addr: bound,
     })
 }
 
@@ -178,43 +199,49 @@ mod tests {
     use ethrex_p2p::peer_filter::PeerFilter;
     use ethrex_p2p::types::NodeRecord;
     use ethrex_rlp::decode::RLPDecode;
-    use std::collections::HashSet;
     use std::net::Ipv4Addr;
+
+    fn config(discovery_port: u16, advertise_ip: Option<IpAddr>) -> DiscoverySpawnConfig {
+        DiscoverySpawnConfig {
+            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
+                .secret_bytes()
+                .to_vec(),
+            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port,
+            quic_port: 9001,
+            subscription_subnets: HashSet::from([0u64]),
+            attestation_committee_count: 4,
+            bootnodes: Vec::new(),
+            advertise_ip,
+        }
+    }
+
+    fn decode_enr(local_enr: &str) -> NodeRecord {
+        NodeRecord::decode(&ethrex_common::base64::decode(
+            local_enr
+                .strip_prefix("enr:")
+                .expect("enr: prefix")
+                .as_bytes(),
+        ))
+        .expect("local ENR decodes")
+    }
 
     #[tokio::test]
     async fn spawn_binds_the_socket_and_returns_the_local_enr() {
         // Port 0 asks the OS for a free port, so the test cannot collide with a
         // running node or a sibling test.
-        let handle = spawn_discovery(DiscoverySpawnConfig {
-            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
-            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
-            discovery_port: 0,
-            quic_port: 9001,
-            subscription_subnets: HashSet::from([0u64]),
-            attestation_committee_count: 4,
-            bootnodes: Vec::new(),
-            advertise_ip: None,
-        })
-        .await
-        .expect("discovery spawns");
+        let handle = spawn_discovery(config(0, None))
+            .await
+            .expect("discovery spawns");
 
         assert!(handle.local_enr.starts_with("enr:"));
+        let record = decode_enr(&handle.local_enr);
 
-        // With discovery_port: 0 the OS picks the real port. The bound
-        // address must reflect that real port, and the published ENR's `udp`
-        // entry must match it: were the two out of sync (e.g. the ENR built
-        // from the requested port 0 instead of the bound one), the record
-        // would advertise an undialable node.
-        assert_ne!(handle.bound_addr.port(), 0);
-        let record = NodeRecord::decode(&ethrex_common::base64::decode(
-            handle
-                .local_enr
-                .strip_prefix("enr:")
-                .expect("enr: prefix")
-                .as_bytes(),
-        ))
-        .expect("local ENR decodes");
-        assert_eq!(record.pairs().udp_port, Some(handle.bound_addr.port()));
+        // With discovery_port: 0 the OS picks the real port, and the published
+        // ENR must advertise that one: were it built from the requested 0
+        // instead of the bound port, the record would name an undialable node.
+        let advertised_port = record.pairs().udp_port.expect("udp entry");
+        assert_ne!(advertised_port, 0);
 
         // The policy handed to the peer table must admit our own record. A peer
         // running this code applies exactly these rules to what we publish, so a
@@ -230,30 +257,11 @@ mod tests {
         // locally. The ENR must reflect the advertised address, not the bind
         // address.
         let advertised = Ipv4Addr::new(203, 0, 113, 7);
-        let handle = spawn_discovery(DiscoverySpawnConfig {
-            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
-            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
-            discovery_port: 0,
-            quic_port: 9001,
-            subscription_subnets: HashSet::from([0u64]),
-            attestation_committee_count: 4,
-            bootnodes: Vec::new(),
-            advertise_ip: Some(IpAddr::from(advertised)),
-        })
-        .await
-        .expect("discovery spawns");
+        let handle = spawn_discovery(config(0, Some(IpAddr::from(advertised))))
+            .await
+            .expect("discovery spawns");
 
-        assert_eq!(handle.bound_addr.ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
-
-        let record = NodeRecord::decode(&ethrex_common::base64::decode(
-            handle
-                .local_enr
-                .strip_prefix("enr:")
-                .expect("enr: prefix")
-                .as_bytes(),
-        ))
-        .expect("local ENR decodes");
-        assert_eq!(record.pairs().ip, Some(advertised));
+        assert_eq!(decode_enr(&handle.local_enr).pairs().ip, Some(advertised));
     }
 
     #[tokio::test]
@@ -261,17 +269,7 @@ mod tests {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let busy = socket.local_addr().unwrap().port();
 
-        let result = spawn_discovery(DiscoverySpawnConfig {
-            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
-            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
-            discovery_port: busy,
-            quic_port: 9001,
-            subscription_subnets: HashSet::new(),
-            attestation_committee_count: 4,
-            bootnodes: Vec::new(),
-            advertise_ip: None,
-        })
-        .await;
+        let result = spawn_discovery(config(busy, None)).await;
 
         assert!(result.is_err(), "a busy discovery port must not be silent");
     }
