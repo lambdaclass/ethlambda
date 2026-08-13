@@ -37,7 +37,7 @@ use crate::helpers::accessors::{
     get_beacon_committee, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
     get_committee_count_per_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
 };
-use crate::helpers::altair::{add_flag, get_base_reward, has_flag};
+use crate::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
 use crate::helpers::attestation::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
@@ -341,6 +341,9 @@ pub fn process_attestation(
         previous_participation
     };
 
+    // Hoisted: see the comment on the same line in `electra::process_attestation`.
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
     for index in attesting_indices {
@@ -360,9 +363,18 @@ pub fn process_attestation(
             }
             new_flags = add_flag(new_flags, flag_index);
             let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-            let reward = get_base_reward(state, index)?.checked_mul(weight).ok_or(
-                Error::ArithmeticOverflow("get_base_reward(state, index) * weight"),
-            )?;
+            // `get_base_reward(state, index)` inlined against the hoisted
+            // per-increment value, in the helper's own order of operations so
+            // the result is bit-identical. See `electra::process_attestation`
+            // for why the hoist is not an optimisation but the difference
+            // between importing a block at mainnet scale and not.
+            let increments =
+                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let reward = (increments * base_reward_per_increment)
+                .checked_mul(weight)
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_base_reward(state, index) * weight",
+                ))?;
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;

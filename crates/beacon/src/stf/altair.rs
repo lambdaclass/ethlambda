@@ -26,6 +26,8 @@
 //! two are the same number applied with opposite sign, not two independently
 //! derived quantities that happen to match.
 
+use std::collections::HashMap;
+
 use crate::bls;
 use crate::constants;
 use crate::containers::{BeaconState, altair, phase0};
@@ -36,8 +38,7 @@ use crate::helpers::accessors::{
     get_total_active_balance,
 };
 use crate::helpers::altair::{
-    add_flag, get_attestation_participation_flag_indices, get_base_reward,
-    get_base_reward_per_increment, has_flag,
+    add_flag, get_attestation_participation_flag_indices, get_base_reward_per_increment, has_flag,
 };
 use crate::helpers::attestation::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
@@ -45,7 +46,7 @@ use crate::helpers::attestation::{
 use crate::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::helpers::mutators::{decrease_balance, increase_balance};
 use crate::preset;
-use crate::primitives::{Gwei, ParticipationFlags, ValidatorIndex};
+use crate::primitives::{BlsPubkey, Gwei, ParticipationFlags, ValidatorIndex};
 
 // ---------------------------------------------------------------------------
 // Attestations
@@ -153,6 +154,9 @@ pub fn process_attestation(
         previous_epoch_participation
     };
 
+    // Hoisted: see the comment on the same line in `electra::process_attestation`.
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
     for index in attesting_indices {
@@ -172,9 +176,18 @@ pub fn process_attestation(
             }
             new_flags = add_flag(new_flags, flag_index);
             let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-            let reward = get_base_reward(state, index)?.checked_mul(weight).ok_or(
-                Error::ArithmeticOverflow("get_base_reward(state, index) * weight"),
-            )?;
+            // `get_base_reward(state, index)` inlined against the hoisted
+            // per-increment value, in the helper's own order of operations so
+            // the result is bit-identical. See `electra::process_attestation`
+            // for why the hoist is not an optimisation but the difference
+            // between importing a block at mainnet scale and not.
+            let increments =
+                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let reward = (increments * base_reward_per_increment)
+                .checked_mul(weight)
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_base_reward(state, index) * weight",
+                ))?;
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
@@ -307,17 +320,36 @@ pub fn process_sync_aggregate(
     // function's documentation for why the mutation loop below cannot do its
     // own scan of `state.validators` the way the specification's single loop
     // does.
-    let committee_indices: Vec<ValidatorIndex> = committee_pubkeys
-        .iter()
-        .map(|pubkey| {
-            state
-                .validators()
-                .iter()
-                .position(|validator| validator.pubkey == *pubkey)
-                .map(|index| index as ValidatorIndex)
-                .ok_or(Error::SpecAssert(
-                    "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
-                ))
+    //
+    // One pass over the registry, not one per seat. The specification writes
+    // this as a search per committee member, which is `SYNC_COMMITTEE_SIZE`
+    // scans of the whole validator set: at mainnet's ~1M validators that is
+    // hundreds of millions of 48-byte pubkey comparisons per block, and it was
+    // measured as the single largest cost in a live import, dwarfing the
+    // signature verification above it. Inverting the loop makes it one scan
+    // against a committee-sized map.
+    //
+    // A pubkey may hold more than one seat, since sync-committee selection
+    // samples with replacement, so each key maps to every seat it occupies
+    // rather than to one.
+    let mut seats_by_pubkey: HashMap<&BlsPubkey, Vec<usize>> = HashMap::new();
+    for (seat, pubkey) in committee_pubkeys.iter().enumerate() {
+        seats_by_pubkey.entry(pubkey).or_default().push(seat);
+    }
+    let mut resolved: Vec<Option<ValidatorIndex>> = vec![None; committee_pubkeys.len()];
+    for (index, validator) in state.validators().iter().enumerate() {
+        if let Some(seats) = seats_by_pubkey.get(&validator.pubkey) {
+            for &seat in seats {
+                resolved[seat] = Some(index as ValidatorIndex);
+            }
+        }
+    }
+    let committee_indices: Vec<ValidatorIndex> = resolved
+        .into_iter()
+        .map(|index| {
+            index.ok_or(Error::SpecAssert(
+                "state.current_sync_committee.pubkeys[i] in [v.pubkey for v in state.validators]",
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
 

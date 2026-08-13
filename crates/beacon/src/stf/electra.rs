@@ -57,7 +57,7 @@ use crate::helpers::accessors::{
     get_beacon_committee, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
     get_committee_count_per_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
 };
-use crate::helpers::altair::{add_flag, get_base_reward, has_flag};
+use crate::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
 use crate::helpers::electra::{
     compute_exit_epoch_and_update_churn, electra_state, get_attesting_indices,
     get_committee_indices, get_consolidation_churn_limit, get_indexed_attestation,
@@ -726,6 +726,24 @@ pub fn process_attestation(
     let current_epoch_target = data.target.epoch == current_epoch;
     let participation = epoch_participation(state, current_epoch_target, "process_attestation")?;
 
+    // Hoisted out of the loop below, where the specification writes
+    // `get_base_reward(state, index)` per attester per flag. That helper is
+    // `increments * get_base_reward_per_increment(state)`, and the second
+    // factor is `get_total_active_balance`, which scans the whole validator
+    // registry and allocates a `Vec` of the active set on every call, with no
+    // cache anywhere beneath it.
+    //
+    // The read phase does not mutate `state`, so the value is constant across
+    // the whole loop and this is the same arithmetic in a different order. At
+    // mainnet's ~1M validators it is also the difference between importing a
+    // block and not: an Electra block carries up to `MAX_ATTESTATIONS_ELECTRA`
+    // aggregates covering thousands of attesters each, so the unhoisted form
+    // ran tens of thousands of million-element scans per block and never
+    // finished one. That was measured on a live mainnet run: the chain actor
+    // sat at 98% CPU inside `get_active_validator_indices`, reached through
+    // exactly this line, and the node's clock stopped advancing.
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
     for index in attesting_indices {
@@ -745,9 +763,16 @@ pub fn process_attestation(
             }
             new_flags = add_flag(new_flags, flag_index);
             let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-            let reward = get_base_reward(state, index)?.checked_mul(weight).ok_or(
-                Error::ArithmeticOverflow("get_base_reward(state, index) * weight"),
-            )?;
+            // `get_base_reward(state, index)` inlined against the hoisted
+            // per-increment value above, keeping the helper's own order of
+            // operations so the result is bit-identical.
+            let increments =
+                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let reward = (increments * base_reward_per_increment)
+                .checked_mul(weight)
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_base_reward(state, index) * weight",
+                ))?;
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;
