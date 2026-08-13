@@ -676,6 +676,22 @@ pub fn filter_block_tree(
         return Ok(true);
     }
 
+    // A leaf that fails here is dropped silently by the specification, and a
+    // whole branch of them leaves the head pinned to the justified root with no
+    // explanation anywhere. Name the condition that rejected it.
+    tracing::debug!(
+        block_root = %hex::encode(&block_root.0[..4]),
+        correct_justified,
+        correct_finalized,
+        voting_source_epoch = voting_source.epoch,
+        justified_epoch = justified.epoch,
+        finalized_epoch = finalized.epoch,
+        current_epoch,
+        finalized_root = %hex::encode(&finalized.root.0[..4]),
+        checkpoint_block = %hex::encode(&finalized_checkpoint_block.0[..4]),
+        "Beacon fork choice rejected a leaf as unviable"
+    );
+
     Ok(false)
 }
 
@@ -698,6 +714,16 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
     let index = store.beacon_block_index();
     let blocks = get_filtered_block_tree(store, &index, config)?;
     let mut head = store.beacon_justified_checkpoint().root;
+    // "The head will not move" is the operational question this answers, and
+    // the two counts separate its causes: an index that never grew (nothing is
+    // importing) from a filtered tree that dropped what the index holds (blocks
+    // import, and fork choice finds the branch unviable).
+    tracing::debug!(
+        indexed = index.len(),
+        viable = blocks.len(),
+        justified_epoch = store.beacon_justified_checkpoint().epoch,
+        "Beacon head descent starting"
+    );
     loop {
         let children: Vec<Root> = blocks
             .iter()
@@ -2253,6 +2279,14 @@ mod tests {
         // Roughly today's real mainnet active validator count, to size the
         // scan `get_beacon_committee` repeats on every call at production
         // scale.
+        //
+        // Mainnet preset only. A registry this size divides into committees far
+        // wider than the minimal preset's `MAX_VALIDATORS_PER_COMMITTEE`, so
+        // the aggregation bitlist this builds does not fit its own bound and
+        // the call panics on `OverCapacity` before measuring anything. The
+        // number is a statement about mainnet in any case; under the minimal
+        // preset it would describe a network that does not exist.
+        #[cfg(not(feature = "preset-minimal"))]
         measure(1_048_576, "mainnet_scale");
     }
 
@@ -2319,6 +2353,117 @@ mod tests {
         println!(
             "get_weight, {VALIDATOR_COUNT} validators, {VALIDATOR_COUNT} latest_messages -> \
              {fully_voted:?}/call"
+        );
+    }
+
+    /// Measures the cost of deriving every committee in one slot at mainnet
+    /// scale, calling `get_beacon_committee` once per committee -- the shape
+    /// `helpers::electra::get_attesting_indices` drives once per Electra
+    /// attestation (once per committee bit its `committee_bits` names), and
+    /// `stf::electra::process_attestation` drives again while validating
+    /// those same bits, for every attestation in every block.
+    ///
+    /// Measured twice, deliberately. The first pass is against a slot no
+    /// call has touched yet, so it pays whatever deriving that epoch's
+    /// committees costs from a cold start. The second is against a
+    /// *different* slot of the *same* epoch -- same seed, same active set,
+    /// same shuffle -- which is the call pattern every later block or
+    /// attestation in that epoch actually repeats. A fix that only makes the
+    /// first pass faster without also making the second one nearly free
+    /// would not explain why importing block 2 of an epoch should be any
+    /// faster than importing block 1; this is why both numbers are reported
+    /// rather than just the first.
+    ///
+    /// This is the number `helpers::accessors::EpochCommittees` exists to
+    /// collapse: see that type's own documentation for what it caches and
+    /// why calling `get_beacon_committee` in a loop, while still correct, is
+    /// no longer how those two callers actually derive their committees.
+    ///
+    /// Not part of `make test-beacon`'s pass/fail contract, for the same
+    /// reason as `measures_the_warm_path_cost_of_on_attestation` above: it
+    /// always succeeds as long as every committee derives, and exists to
+    /// print a number (`--nocapture`), not to gate CI on a wall-clock
+    /// threshold no shared runner can promise.
+    ///
+    /// Mainnet preset only, matching `measures_the_warm_path_cost_of_on_attestation`:
+    /// 1,048,576 validators is a statement about the real network, and the
+    /// minimal preset's much smaller `MAX_COMMITTEES_PER_SLOT` and
+    /// `TARGET_COMMITTEE_SIZE` would turn the same validator count into
+    /// committees far larger than any network that preset actually models
+    /// produces.
+    #[cfg(not(feature = "preset-minimal"))]
+    #[test]
+    fn measures_the_cost_of_deriving_every_committee_in_a_slot() {
+        use std::time::Instant;
+
+        use crate::helpers::accessors::{get_beacon_committee, get_committee_count_per_slot};
+        use crate::helpers::misc::compute_epoch_at_slot;
+
+        const VALIDATOR_COUNT: usize = 1_048_576;
+
+        let state = crate::helpers::test_state::with_validators(VALIDATOR_COUNT);
+        // Not `get_current_epoch(&state)`: `test_state::with_validators` sets
+        // `state.slot()` to `SLOTS_PER_EPOCH`, i.e. epoch 1, which is not the
+        // epoch slots 0 and 1 below fall in. Every measurement in this test
+        // derives its epoch from the same slot 0 this does, so all three
+        // share one seed and one cached shuffling instead of the third
+        // silently paying for a different epoch's cold one.
+        let epoch = compute_epoch_at_slot(0);
+        let committees_per_slot = get_committee_count_per_slot(&state, epoch);
+
+        let mut total_members = 0usize;
+        let start = Instant::now();
+        for index in 0..committees_per_slot {
+            total_members += get_beacon_committee(&state, 0, index)
+                .expect("a committee exists at every index below committees_per_slot")
+                .len();
+        }
+        let cold = start.elapsed();
+        println!(
+            "get_beacon_committee, {VALIDATOR_COUNT} validators, {committees_per_slot} \
+             committees ({total_members} members), first pass over slot 0 -> {cold:?} total, \
+             {:?}/call",
+            cold / committees_per_slot as u32
+        );
+
+        // Slot 1 is still epoch 0 (`SLOTS_PER_EPOCH` is 32 at mainnet), so
+        // this shares the previous pass's seed and active set exactly.
+        let start = Instant::now();
+        for index in 0..committees_per_slot {
+            get_beacon_committee(&state, 1, index)
+                .expect("a committee exists at every index below committees_per_slot");
+        }
+        let warm = start.elapsed();
+        println!(
+            "get_beacon_committee, {VALIDATOR_COUNT} validators, {committees_per_slot} \
+             committees, second pass over slot 1 (same epoch) -> {warm:?} total, {:?}/call",
+            warm / committees_per_slot as u32
+        );
+
+        // `get_beacon_committee` above rebuilds `EpochCommittees` -- and so
+        // rescans the active set -- on every single call, by design: it is
+        // the entry point for a caller that wants exactly one committee, not
+        // for the loops that want many. `helpers::electra::get_attesting_indices`
+        // and `stf::electra::process_attestation` are exactly those loops, and
+        // both build one `EpochCommittees` up front instead of calling
+        // `get_beacon_committee` per committee. This measures that path
+        // directly, to show the cost a caller which does adopt it actually
+        // pays: everything left over once neither the shuffle nor the active
+        // set is recomputed per committee.
+        use crate::helpers::accessors::EpochCommittees;
+        let start = Instant::now();
+        let committees = EpochCommittees::new(&state, epoch);
+        for index in 0..committees_per_slot {
+            committees
+                .committee(1, index)
+                .expect("a committee exists at every index below committees_per_slot");
+        }
+        let shared = start.elapsed();
+        println!(
+            "EpochCommittees::committee, {VALIDATOR_COUNT} validators, {committees_per_slot} \
+             committees, one EpochCommittees shared across the slot -> {shared:?} total, \
+             {:?}/call",
+            shared / committees_per_slot as u32
         );
     }
 }

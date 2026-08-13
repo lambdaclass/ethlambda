@@ -3,14 +3,19 @@
 //! Each case gives a seed, a set size, and the full permutation the
 //! specification's shuffle produces. `mapping[i]` is where index `i` ends up, so
 //! checking every entry pins down `compute_shuffled_index` exactly, for every
-//! index rather than for a sampled few.
+//! index rather than for a sampled few. The same fixture also pins down
+//! `compute_shuffled_indices`, the whole-list form
+//! `helpers::accessors::EpochCommittees` derives its cached shuffling from: it
+//! is a from-scratch reimplementation sharing hashing across positions rather
+//! than a wrapper around `compute_shuffled_index`, so it gets its own pass
+//! over every case rather than riding along on the per-index one.
 //!
 //! This is the only fixture suite that tests the shuffle directly. Everything
 //! else depends on it only through committee assignment, where a subtle error
 //! would show up as a confusing signature failure much later, so it is worth
 //! getting green on its own before any of that is built.
 
-use ethlambda_beacon::helpers::shuffling::compute_shuffled_index;
+use ethlambda_beacon::helpers::shuffling::{compute_shuffled_index, compute_shuffled_indices};
 use ethlambda_beacon::primitives::Root;
 use libtest_mimic::Trial;
 
@@ -60,6 +65,14 @@ pub fn trials() -> Vec<Trial> {
             // which the fixtures do not cover but the specification asserts.
             if compute_shuffled_index(mapping.count, mapping.count, seed).is_ok() {
                 return Err("an out-of-range index was accepted".to_string());
+            }
+
+            let whole_list = compute_shuffled_indices(mapping.count, seed);
+            if whole_list != mapping.mapping {
+                return Err(format!(
+                    "compute_shuffled_indices produced {whole_list:?}, expected {:?}",
+                    mapping.mapping
+                ));
             }
 
             Ok(())

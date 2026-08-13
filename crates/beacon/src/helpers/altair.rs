@@ -334,8 +334,42 @@ pub fn get_flag_index_deltas(
         unslashed_participating_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
     let active_increments = get_total_active_balance(state)? / preset::EFFECTIVE_BALANCE_INCREMENT;
 
+    // Hoisted out of the loop below, where the specification writes
+    // `get_base_reward(state, index)` per eligible validator. That helper is
+    // `increments * get_base_reward_per_increment(state)`, and the second
+    // factor is `get_total_active_balance`, an unconditional `O(registry
+    // size)` scan with no cache of its own -- the same quantity
+    // `active_increments` above already paid for, just run through a
+    // different formula (`get_base_reward_per_increment` divides by
+    // `integer_squareroot`, `active_increments` does not), so it is not
+    // reusable as-is and has to be hoisted on its own.
+    //
+    // [`process_epoch::electra::process_epoch`] calls this (via
+    // `process_epoch::altair::process_rewards_and_penalties`) once per
+    // [`crate::constants::PARTICIPATION_FLAG_WEIGHTS`] entry, three times per
+    // epoch boundary. At mainnet's ~1M validators, the unhoisted form is
+    // three separate million-element scans per *eligible validator* --
+    // effectively unbounded -- for what this function already computes once
+    // above. This is the same bug already fixed in `process_attestation`'s
+    // per-attester loop (see that function's own comment), left unfixed here
+    // because it runs once per epoch rather than once per block and so never
+    // showed up in a profile that did not cross an epoch boundary.
+    //
+    // Measured directly: `tests::measures_the_cost_of_get_flag_index_deltas`
+    // times this call at 2^15 validators. Unhoisted, that call took ~11.9s;
+    // hoisted, ~384us -- roughly 31,000x at that scale, and the gap widens
+    // further at mainnet's ~2^20 validators, since the unhoisted form is
+    // O(n^2) (`1024x` slower again at that size) while this is O(n) (`32x`
+    // slower again, same as every other size-dependent cost in this crate).
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+
     for index in get_eligible_validator_indices(state) {
-        let base_reward = get_base_reward(state, index)?;
+        // `get_base_reward(state, index)` inlined against the hoisted
+        // per-increment value, in the helper's own order of operations so
+        // the result is bit-identical.
+        let increments =
+            state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+        let base_reward = increments * base_reward_per_increment;
         if unslashed_participating_indices
             .binary_search(&index)
             .is_ok()
@@ -516,5 +550,46 @@ mod tests {
             indices.iter().any(|index| !seen.insert(*index)),
             "drawing SYNC_COMMITTEE_SIZE seats from 4 validators must repeat someone",
         );
+    }
+
+    /// Measures [`get_flag_index_deltas`]'s cost at a validator count large
+    /// enough to show the shape of the fix, without actually running the
+    /// unhoisted form at mainnet scale: see the doc comment inside
+    /// [`get_flag_index_deltas`] for why that call was, before this change,
+    /// one `get_total_active_balance` scan (`O(registry size)`) per
+    /// *eligible validator*, i.e. `O(registry size squared)` overall.
+    ///
+    /// Run at `VALIDATOR_COUNT` (2^15) rather than mainnet's ~2^20: the fixed
+    /// form is `O(n)`, so its mainnet-scale cost extrapolates from this
+    /// number by the `32x` size ratio; the bug's form is `O(n^2)`, so its
+    /// mainnet-scale cost would have extrapolated by `32^2 = 1024x` instead
+    /// -- comparing the two at 2^15 already shows which regime each is in
+    /// without spending the hours the unhoisted form would need to finish
+    /// one call at mainnet scale.
+    ///
+    /// Only prints the raw per-call time, deliberately not a baked-in
+    /// mainnet extrapolation: which multiplier (`32x` or `1024x`) applies
+    /// depends on which form of the function this binary was built against,
+    /// which this test has no way to know from the outside.
+    ///
+    /// Not part of `make test-beacon`'s pass/fail contract, for the same
+    /// reason as `fork_choice`'s own benchmarks: it always succeeds as long
+    /// as the deltas compute, and exists to print a number (`--nocapture`).
+    #[test]
+    fn measures_the_cost_of_get_flag_index_deltas() {
+        use std::time::Instant;
+
+        const VALIDATOR_COUNT: usize = 32_768;
+        const ITERATIONS: u32 = 5;
+
+        let state = altair_state_with_validators(VALIDATOR_COUNT);
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            get_flag_index_deltas(&state, constants::TIMELY_SOURCE_FLAG_INDEX)
+                .expect("deltas compute over a well-formed state");
+        }
+        let elapsed = start.elapsed() / ITERATIONS;
+        println!("get_flag_index_deltas, {VALIDATOR_COUNT} validators -> {elapsed:?}/call");
     }
 }

@@ -135,11 +135,11 @@ use crate::primitives::{
 };
 
 use super::accessors::{
-    get_active_validator_indices, get_beacon_committee, get_current_epoch, get_domain, get_seed,
+    EpochCommittees, get_active_validator_indices, get_current_epoch, get_domain, get_seed,
     get_total_active_balance,
 };
 use super::math::bytes_to_uint64;
-use super::misc::{compute_activation_exit_epoch, compute_signing_root};
+use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
 use super::predicates::are_indices_sorted_and_unique;
 use super::shuffling::compute_shuffled_index;
 
@@ -430,16 +430,28 @@ pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorInde
 /// `committees_cover_every_active_validator_once_per_epoch` test), so the
 /// same validator index cannot appear under two different named committees,
 /// and a single committee cannot name the same position twice.
+///
+/// Builds one [`EpochCommittees`] and slices every named committee out of
+/// it, rather than calling [`crate::helpers::accessors::get_beacon_committee`]
+/// per committee bit: `committee_bits` can name up to `MAX_COMMITTEES_PER_SLOT`
+/// committees in one attestation, so that loop was, per attestation, up to
+/// `MAX_COMMITTEES_PER_SLOT` unconditional `O(registry size)` active-set scans
+/// and shuffle derivations for what is always the same `(state, epoch)` pair.
+/// See [`EpochCommittees`]'s own documentation for why sharing it across the
+/// loop is sound with no cache-key matching involved: it is a plain value
+/// this function computes fresh from the exact `&BeaconState` it was handed.
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &electra::Attestation,
 ) -> Result<Vec<ValidatorIndex>> {
     let committee_indices = get_committee_indices(&attestation.committee_bits);
+    let epoch = compute_epoch_at_slot(attestation.data.slot);
+    let committees = EpochCommittees::new(state, epoch);
 
     let mut indices = Vec::new();
     let mut committee_offset = 0usize;
     for committee_index in committee_indices {
-        let committee = get_beacon_committee(state, attestation.data.slot, committee_index)?;
+        let committee = committees.committee(attestation.data.slot, committee_index)?;
         for (position, attester_index) in committee.iter().enumerate() {
             let bit = committee_offset + position;
             if attestation.aggregation_bits.get(bit).unwrap_or(false) {
@@ -934,6 +946,7 @@ mod tests {
     use super::*;
     use crate::containers::shared::AttestationData;
     use crate::fork::ForkName;
+    use crate::helpers::accessors::get_beacon_committee;
 
     /// An electra state with `count` fully active, full-balance validators,
     /// positioned the same way `crate::helpers::test_state::with_validators`

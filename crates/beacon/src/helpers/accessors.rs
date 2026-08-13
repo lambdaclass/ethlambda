@@ -16,11 +16,13 @@ use crate::primitives::{
     Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
 };
 
+use std::sync::Arc;
+
 use super::misc::{
     compute_domain, compute_epoch_at_slot, compute_start_slot_at_epoch, fork_version_at_epoch,
 };
 use super::predicates::is_active_validator;
-use super::shuffling::compute_committee;
+use super::shuffling::{cached_shuffled_indices, compute_committee_from_shuffling};
 
 /// The epoch the state is currently in.
 pub fn get_current_epoch(state: &BeaconState) -> Epoch {
@@ -106,14 +108,114 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
     hash(&input)
 }
 
+/// How many committees a slot with `active_count` active validators splits
+/// into: at least one, so a small chain still produces committees, and at
+/// most `MAX_COMMITTEES_PER_SLOT`.
+///
+/// The half of [`get_committee_count_per_slot`] that does not need a state,
+/// split out so [`EpochCommittees::new`] can share one
+/// [`get_active_validator_indices`] scan between this and the shuffle itself,
+/// rather than [`get_committee_count_per_slot`] repeating the scan the caller
+/// already did to get `active_count` in the first place.
+fn committee_count_per_slot(active_count: u64) -> u64 {
+    let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
+    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+}
+
 /// How many committees each slot of `epoch` has.
 ///
 /// At least one, so a small chain still produces committees, and at most
 /// `MAX_COMMITTEES_PER_SLOT`.
 pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
     let active = get_active_validator_indices(state, epoch).len() as u64;
-    let ideal = active / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
-    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+    committee_count_per_slot(active)
+}
+
+/// Everything [`get_beacon_committee`] needs for one `(state, epoch)` pair,
+/// computed once so that deriving every committee of that epoch does not
+/// repeat the active-set scan or the whole-list shuffle per committee.
+///
+/// Electra's `get_attesting_indices` ([`crate::helpers::electra`]) calls
+/// [`get_beacon_committee`] once per committee bit set in one attestation —
+/// up to `MAX_COMMITTEES_PER_SLOT` times for each of up to
+/// `MAX_ATTESTATIONS_ELECTRA` attestations in a block — and
+/// [`crate::stf::electra::process_attestation`] does the same again while
+/// validating the attestation's committee bits. Building one `EpochCommittees`
+/// and slicing every committee a caller needs out of it, instead of calling
+/// [`get_beacon_committee`] in that loop, turns those hundreds of calls back
+/// into the one active-set scan and one shuffle their shared `(state, epoch)`
+/// pair actually costs.
+///
+/// # Why the active set is not memoized across calls the way the shuffle is
+///
+/// [`super::shuffling::cached_shuffled_indices`] safely memoizes the shuffle
+/// permutation on `(seed, index_count)` alone, because that pair is the
+/// *entire* input to the pure function that computes it. The active
+/// validator set has no equivalent: [`get_active_validator_indices`] reads
+/// `validator.activation_epoch` and `.exit_epoch` off every validator in
+/// `state.validators()`, so it is a function of the state's registry, not of
+/// `epoch` or `seed` alone. Two different states can share an epoch number,
+/// or even a seed (the seed is derived from a RANDAO mix fixed before either
+/// state's fork point, so two sibling branches that diverge afterward can
+/// share it exactly), while disagreeing on which validators are active —
+/// which is precisely the scenario fork choice holds multiple concurrent
+/// states for, and precisely the kind of adversarial case the spec fixtures
+/// construct on purpose. Keying a cross-call cache on either value would risk
+/// serving one state's active set to a lookup for another. There is no
+/// cheaper-than-`O(registry size)` value derivable from `&BeaconState` alone
+/// that identifies "this exact registry" without the risk of two different
+/// registries producing the same key, so this recomputes the active set
+/// fresh every time an `EpochCommittees` is built — sound by construction,
+/// since it is a plain function of the exact `&BeaconState` the caller holds
+/// for as long as they hold it, no key-matching involved — and only avoids
+/// recomputing it *within* the lifetime of one `EpochCommittees`.
+pub struct EpochCommittees {
+    active_indices: Vec<ValidatorIndex>,
+    committees_per_slot: u64,
+    shuffling: Arc<Vec<u64>>,
+}
+
+impl EpochCommittees {
+    /// Scans `state`'s active set for `epoch` once, and looks up (or
+    /// computes) the whole-epoch shuffle over it.
+    ///
+    /// The shuffle is over the active set itself (`active_indices.len()`
+    /// positions), not over `committees_per_slot * SLOTS_PER_EPOCH`: that
+    /// product only says how many pieces [`compute_committee_from_shuffling`]
+    /// slices the active population into, exactly as
+    /// [`super::shuffling::compute_committee`]'s own `count` parameter does
+    /// for [`compute_shuffled_index`] -- the shuffle's `index_count` there is
+    /// `total = indices.len()`, never `count`.
+    pub fn new(state: &BeaconState, epoch: Epoch) -> Self {
+        let active_indices = get_active_validator_indices(state, epoch);
+        let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
+        let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
+        let shuffling = cached_shuffled_indices(active_indices.len() as u64, seed);
+        Self {
+            active_indices,
+            committees_per_slot,
+            shuffling,
+        }
+    }
+
+    /// How many committees each slot of this epoch has. Same value
+    /// [`get_committee_count_per_slot`] would return for this epoch, read
+    /// off the cache instead of rescanning the registry for it.
+    pub fn committees_per_slot(&self) -> u64 {
+        self.committees_per_slot
+    }
+
+    /// The committee at `slot` (which must fall in this epoch) with `index`.
+    /// Same value [`get_beacon_committee`] would return, sliced from the
+    /// already-computed shuffle instead of deriving it again.
+    pub fn committee(&self, slot: Slot, index: CommitteeIndex) -> Result<Vec<ValidatorIndex>> {
+        compute_committee_from_shuffling(
+            &self.active_indices,
+            &self.shuffling,
+            (slot % preset::SLOTS_PER_EPOCH) * self.committees_per_slot + index,
+            self.committees_per_slot * preset::SLOTS_PER_EPOCH,
+        )
+    }
 }
 
 /// The committee at `slot` with index `index`.
@@ -121,22 +223,21 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// One epoch's active set is shuffled once and then split across every slot and
 /// committee of that epoch, so the committee index is a position within that
 /// single split rather than an independent draw.
+///
+/// Building a fresh [`EpochCommittees`] per call, so a single lookup pays
+/// exactly what it always did (one active-set scan, one shuffle-or-cache-hit).
+/// A caller deriving many committees for the same `(state, epoch)` — more
+/// than one committee, or the same committee across more than one call —
+/// should build its own `EpochCommittees` once and call
+/// [`EpochCommittees::committee`] instead of calling this in a loop; see that
+/// type's own documentation for why.
 pub fn get_beacon_committee(
     state: &BeaconState,
     slot: Slot,
     index: CommitteeIndex,
 ) -> Result<Vec<ValidatorIndex>> {
     let epoch = compute_epoch_at_slot(slot);
-    let committees_per_slot = get_committee_count_per_slot(state, epoch);
-    let indices = get_active_validator_indices(state, epoch);
-    let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
-
-    compute_committee(
-        &indices,
-        seed,
-        (slot % preset::SLOTS_PER_EPOCH) * committees_per_slot + index,
-        committees_per_slot * preset::SLOTS_PER_EPOCH,
-    )
+    EpochCommittees::new(state, epoch).committee(slot, index)
 }
 
 /// The proposer for the state's current slot, dispatching on fork for the
