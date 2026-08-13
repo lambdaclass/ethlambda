@@ -68,13 +68,13 @@ pub struct BlockChainConfig {
     pub proposer_config: ProposerConfig,
 }
 
-/// Milliseconds per interval (800ms ticks).
-pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
-/// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
-pub const INTERVALS_PER_SLOT: u64 = 5;
-/// Milliseconds in a slot (derived from interval duration and count).
-pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
+// The interval grid lives in `ethlambda-types` because `ethlambda-storage` also
+// derives slots from `store.time()` and must not carry a second copy of a
+// consensus-critical constant.
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
+pub use ethlambda_types::constants::{
+    INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
+};
 pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
@@ -106,7 +106,7 @@ impl SlotInterval {
             2 => Self::Aggregation,
             3 => Self::SafeTargetUpdate,
             4 => Self::EndOfSlot,
-            _ => unreachable!("slots only have 5 intervals"),
+            _ => unreachable!("slots only have {INTERVALS_PER_SLOT} intervals"),
         }
     }
 
@@ -1413,7 +1413,7 @@ impl Handler<NewAttestation> for BlockChainServer {
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
         // the check unless this attestation is for the store's current slot.
-        let current_slot = self.store.time().expect("store time exists") / INTERVALS_PER_SLOT;
+        let current_slot = self.store.current_slot();
         if msg.attestation.data.slot == current_slot {
             self.maybe_start_early_aggregation(ctx).await;
         }

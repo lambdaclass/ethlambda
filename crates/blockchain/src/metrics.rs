@@ -460,12 +460,15 @@ static LEAN_BLOCK_BUILDING_PAYLOAD_AGGREGATION_TIME_SECONDS: std::sync::LazyLock
         .unwrap()
     });
 
+// Widened past the leanMetrics bucket set: block builds regularly exceed its top bound,
+// which collapsed every sample into `+Inf` and pinned the reported quantiles to that
+// bound. The range mirrors the phase timings this metric encloses.
 static LEAN_BLOCK_BUILDING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
             "lean_block_building_time_seconds",
             "Time taken to build a block",
-            vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+            vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0]
         )
         .unwrap()
     });
