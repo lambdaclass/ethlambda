@@ -202,19 +202,25 @@ impl DiscoveredPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use ethrex_p2p::types::Node;
+    use ethrex_p2p::types::{Node, NodeRecordPairs};
     use ethrex_p2p::utils::public_key_from_signing_key;
-    use ethrex_rlp::encode::RLPEncode;
     use libssz::SszEncode;
     use std::collections::HashSet;
     use std::net::Ipv4Addr;
 
     use super::super::enr::{FAR_FUTURE_EPOCH, QUIC_ENR_KEY, encode_attnets};
 
-    /// Build an ENR with an arbitrary set of extra pairs, so each test can omit
-    /// or corrupt exactly one entry.
-    fn record_with(extra: Vec<(Bytes, Bytes)>) -> NodeRecord {
+    /// The committee count these tests admit against. `set_attnets` encodes to
+    /// the same width, so the subnets below are all meant to be in range.
+    const TEST_COMMITTEE_COUNT: u64 = 8;
+
+    /// Build an ENR, applying `set_entries` to its extras so each test can omit
+    /// or corrupt exactly one of them.
+    ///
+    /// Entries go through the same `set_extra*` accessors `build_local_enr` uses,
+    /// rather than assigning `extra_fields` directly: a record these tests accept
+    /// is then one built the way production builds it, encoding included.
+    fn record_with(set_entries: impl FnOnce(&mut NodeRecordPairs)) -> NodeRecord {
         let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
         let public_key = public_key_from_signing_key(&signer);
         let node = Node::new(IpAddr::from(Ipv4Addr::LOCALHOST), 9010, 0, public_key);
@@ -225,35 +231,37 @@ mod tests {
         record
             .edit(&signer, |pairs| {
                 pairs.tcp_port = None;
-                pairs.extra_fields = extra;
+                set_entries(pairs);
             })
             .unwrap();
         record
     }
 
-    fn pair(key: &'static [u8], value: Vec<u8>) -> (Bytes, Bytes) {
-        (Bytes::from_static(key), Bytes::from(value))
+    fn set_eth2(pairs: &mut NodeRecordPairs, fork_id: EnrForkId) {
+        pairs.set_extra(ETH2_ENR_KEY, fork_id.to_ssz());
     }
 
-    // Byte payloads go through `Bytes` so RLP encodes them as a byte string; see
-    // `LocalEnrParams::local_pairs` for why a bare `Vec<u8>` would not. `u16` is
-    // a scalar and needs no wrapping.
-    fn eth2_pair(fork_id: EnrForkId) -> (Bytes, Bytes) {
-        pair(ETH2_ENR_KEY, Bytes::from(fork_id.to_ssz()).encode_to_vec())
+    fn set_quic(pairs: &mut NodeRecordPairs, port: u16) {
+        pairs.set_extra_int(QUIC_ENR_KEY, port.into());
     }
 
-    fn quic_pair(port: u16) -> (Bytes, Bytes) {
-        pair(QUIC_ENR_KEY, port.encode_to_vec())
+    fn set_attnets(pairs: &mut NodeRecordPairs, subnets: &[u64]) {
+        let subnets = subnets.iter().copied().collect::<HashSet<_>>();
+        set_attnets_bits(pairs, encode_attnets(&subnets, TEST_COMMITTEE_COUNT));
     }
 
-    fn attnets_pair(subnets: &[u64]) -> (Bytes, Bytes) {
-        let bits = encode_attnets(&subnets.iter().copied().collect::<HashSet<_>>(), 8);
-        pair(ATTNETS_ENR_KEY, Bytes::from(bits).encode_to_vec())
+    /// `attnets` from raw bytes, for the widths `encode_attnets` would not
+    /// produce for us: a foreign committee count, or a hostile pad.
+    fn set_attnets_bits(pairs: &mut NodeRecordPairs, bits: Vec<u8>) {
+        pairs.set_extra(ATTNETS_ENR_KEY, bits);
     }
 
-    /// `attnets_pair` above encodes against a committee count of 8, so this
-    /// matches it: subnets in the tests below are all meant to be in-range.
-    const TEST_COMMITTEE_COUNT: u64 = 8;
+    /// The `eth2` and `quic` entries that get a record past every check except
+    /// the one under test.
+    fn set_admissible_entries(pairs: &mut NodeRecordPairs) {
+        set_eth2(pairs, EnrForkId::local());
+        set_quic(pairs, 9001);
+    }
 
     fn admit_record(record: &NodeRecord) -> Result<DiscoveredPeer, RejectReason> {
         admit(record, &EnrForkId::local(), TEST_COMMITTEE_COUNT)
@@ -265,17 +273,17 @@ mod tests {
     /// is the only way to reach a record with a missing/invalid public key or
     /// with neither `ip` nor `ip6`, both of which `record_with` always fills
     /// in from the `Node` it wraps.
-    fn raw_record(pairs: ethrex_p2p::types::NodeRecordPairs) -> NodeRecord {
+    fn raw_record(mut pairs: NodeRecordPairs) -> NodeRecord {
+        set_admissible_entries(&mut pairs);
         NodeRecord::new(ethrex_common::H512::zero(), 1, pairs)
     }
 
     #[test]
     fn accepts_a_well_formed_peer() {
-        let record = record_with(vec![
-            attnets_pair(&[2, 5]),
-            eth2_pair(EnrForkId::local()),
-            quic_pair(9001),
-        ]);
+        let record = record_with(|pairs| {
+            set_attnets(pairs, &[2, 5]);
+            set_admissible_entries(pairs);
+        });
         let peer = admit_record(&record).expect("accepted");
         assert_eq!(peer.subnets, vec![2, 5]);
         assert_eq!(
@@ -286,7 +294,7 @@ mod tests {
 
     #[test]
     fn rejects_a_peer_with_no_eth2_entry() {
-        let record = record_with(vec![quic_pair(9001)]);
+        let record = record_with(|pairs| set_quic(pairs, 9001));
         assert_eq!(admit_record(&record), Err(RejectReason::MissingForkId));
     }
 
@@ -294,7 +302,10 @@ mod tests {
     fn rejects_a_peer_on_another_network() {
         let mut foreign = EnrForkId::local();
         foreign.fork_digest = [0xde, 0xad, 0xbe, 0xef];
-        let record = record_with(vec![eth2_pair(foreign), quic_pair(9001)]);
+        let record = record_with(|pairs| {
+            set_eth2(pairs, foreign);
+            set_quic(pairs, 9001);
+        });
         assert_eq!(admit_record(&record), Err(RejectReason::ForkDigestMismatch));
     }
 
@@ -306,14 +317,17 @@ mod tests {
         let mut upcoming = EnrForkId::local();
         upcoming.next_fork_version = [9, 9, 9, 9];
         upcoming.next_fork_epoch = FAR_FUTURE_EPOCH - 1;
-        let record = record_with(vec![eth2_pair(upcoming), quic_pair(9001)]);
+        let record = record_with(|pairs| {
+            set_eth2(pairs, upcoming);
+            set_quic(pairs, 9001);
+        });
         assert!(admit_record(&record).is_ok());
     }
 
     #[test]
     fn rejects_a_peer_with_no_quic_port() {
         // Reachable by discv5 but not over our only transport.
-        let record = record_with(vec![eth2_pair(EnrForkId::local())]);
+        let record = record_with(|pairs| set_eth2(pairs, EnrForkId::local()));
         assert_eq!(admit_record(&record), Err(RejectReason::NoQuicPort));
     }
 
@@ -323,18 +337,20 @@ mod tests {
         // decodes (left-padded to 0u16), so it must hit the same reason as
         // `rejects_a_peer_with_no_quic_port` rather than sail through as
         // "accepted" with an unusable `/udp/0/quic-v1` multiaddr.
-        let record = record_with(vec![eth2_pair(EnrForkId::local()), quic_pair(0)]);
+        let record = record_with(|pairs| {
+            set_eth2(pairs, EnrForkId::local());
+            set_quic(pairs, 0);
+        });
         assert_eq!(admit_record(&record), Err(RejectReason::NoQuicPort));
     }
 
     #[test]
     fn rejects_a_peer_with_an_invalid_public_key() {
-        let pairs = ethrex_p2p::types::NodeRecordPairs {
+        let pairs = NodeRecordPairs {
             // `0xff` is not a valid compressed secp256k1 point tag (`02`/`03`).
             secp256k1: Some(ethrex_common::H264([0xff; 33])),
             ip: Some(Ipv4Addr::LOCALHOST),
             udp_port: Some(9010),
-            extra_fields: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
             ..Default::default()
         };
         assert_eq!(
@@ -347,10 +363,9 @@ mod tests {
     fn rejects_a_peer_with_neither_ip_nor_ip6() {
         let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
         let compressed = signer.public_key(secp256k1::SECP256K1).serialize();
-        let pairs = ethrex_p2p::types::NodeRecordPairs {
+        let pairs = NodeRecordPairs {
             secp256k1: Some(ethrex_common::H264(compressed)),
             udp_port: Some(9010),
-            extra_fields: vec![eth2_pair(EnrForkId::local()), quic_pair(9001)],
             ..Default::default()
         };
         assert_eq!(
@@ -363,7 +378,7 @@ mod tests {
     fn accepts_a_peer_with_no_attnets() {
         // subnet_predicate treats a missing bitfield as covering no subnets, but
         // that never excludes a peer from general discovery.
-        let record = record_with(vec![eth2_pair(EnrForkId::local()), quic_pair(9001)]);
+        let record = record_with(set_admissible_entries);
         let peer = admit_record(&record).expect("accepted");
         assert!(peer.subnets.is_empty());
     }
@@ -374,12 +389,10 @@ mod tests {
         // ids our own committee count has no room for; `admit` must not surface
         // them. `subnets_from_attnets` is what enforces that (and is tested
         // directly in `enr`); this checks `admit` actually routes through it.
-        let bits = encode_attnets(&HashSet::from([2u64, 8, 40]), 64);
-        let record = record_with(vec![
-            pair(ATTNETS_ENR_KEY, Bytes::from(bits).encode_to_vec()),
-            eth2_pair(EnrForkId::local()),
-            quic_pair(9001),
-        ]);
+        let record = record_with(|pairs| {
+            set_attnets_bits(pairs, encode_attnets(&HashSet::from([2u64, 8, 40]), 64));
+            set_admissible_entries(pairs);
+        });
         let peer = admit_record(&record).expect("accepted");
         assert_eq!(peer.subnets, vec![2]);
     }
@@ -392,11 +405,10 @@ mod tests {
 
     #[test]
     fn a_well_formed_record_is_accepted_and_dialable() {
-        let record = record_with(vec![
-            attnets_pair(&[2, 5]),
-            eth2_pair(EnrForkId::local()),
-            quic_pair(9001),
-        ]);
+        let record = record_with(|pairs| {
+            set_attnets(pairs, &[2, 5]);
+            set_admissible_entries(pairs);
+        });
 
         assert!(filter().accepts(&record));
         let peer = filter().dial_target(&record).expect("dialable");
@@ -407,7 +419,10 @@ mod tests {
     fn another_network_is_rejected() {
         let mut foreign = EnrForkId::local();
         foreign.fork_digest = [0xde, 0xad, 0xbe, 0xef];
-        let record = record_with(vec![eth2_pair(foreign), quic_pair(9001)]);
+        let record = record_with(|pairs| {
+            set_eth2(pairs, foreign);
+            set_quic(pairs, 9001);
+        });
 
         assert!(!filter().accepts(&record));
         assert!(filter().dial_target(&record).is_none());
@@ -420,7 +435,7 @@ mod tests {
         // again on a higher-`seq` record. This is what the dial-time
         // `set_unwanted` this replaced could not express, since ethrex never
         // clears that flag.
-        let record = record_with(vec![eth2_pair(EnrForkId::local())]);
+        let record = record_with(|pairs| set_eth2(pairs, EnrForkId::local()));
 
         assert!(!filter().accepts(&record));
         assert!(filter().dial_target(&record).is_none());
@@ -435,16 +450,15 @@ mod tests {
         let mut hostile_bits = vec![0u8; TEST_COMMITTEE_COUNT.div_ceil(8) as usize];
         hostile_bits.extend(vec![0xffu8; 290]);
 
-        let honest = record_with(vec![
-            attnets_pair(&[3]),
-            eth2_pair(EnrForkId::local()),
-            quic_pair(9001),
-        ]);
-        let hostile = record_with(vec![
-            pair(ATTNETS_ENR_KEY, Bytes::from(hostile_bits).encode_to_vec()),
-            eth2_pair(EnrForkId::local()),
-            quic_pair(9002),
-        ]);
+        let honest = record_with(|pairs| {
+            set_attnets(pairs, &[3]);
+            set_admissible_entries(pairs);
+        });
+        let hostile = record_with(|pairs| {
+            set_attnets_bits(pairs, hostile_bits);
+            set_eth2(pairs, EnrForkId::local());
+            set_quic(pairs, 9002);
+        });
 
         let policy = filter();
         let mut admitted: Vec<_> = [honest, hostile]

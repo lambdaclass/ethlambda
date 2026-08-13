@@ -2008,7 +2008,6 @@ dependencies = [
 name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "ethlambda-metrics",
  "ethlambda-network-api",
  "ethlambda-storage",

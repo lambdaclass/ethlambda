@@ -60,7 +60,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 hex.workspace = true
-# `Bytes` builds the raw ENR entries the admission tests feed to `NodeRecord`,
-# and `rand` seeds their throwaway signing keys. Neither is used outside tests.
-bytes = "1.6.0"
+# `rand` seeds the throwaway signing keys the ENR tests build records with.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }
