@@ -39,3 +39,10 @@ devnet.log
 
 # mdbook build output
 book/
+
+# Slack webhook consumed by the devnet finality alert deploy script (a secret)
+webhook.txt
+finality-alerts.yaml
+
+# Filled-in copy of the multi-server-devnet deployment env (names hosts/paths)
+devnet.env
