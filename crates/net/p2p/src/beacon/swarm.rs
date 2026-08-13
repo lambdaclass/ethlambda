@@ -80,7 +80,13 @@ pub fn build_beacon_swarm(
         .with_tcp(
             libp2p::tcp::Config::default().nodelay(true),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            // mplex is not decoration here: mainnet beacon peers answer `na` to
+            // a yamux-only proposal. See `crate::muxers` for the measurement.
+            #[allow(deprecated)]
+            (
+                libp2p::yamux::Config::default,
+                libp2p_mplex::MplexConfig::default,
+            ),
         )
         .expect("failed to add TCP transport to swarm")
         .with_quic()

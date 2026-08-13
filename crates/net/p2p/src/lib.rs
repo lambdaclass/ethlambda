@@ -1,3 +1,31 @@
+pub mod muxers {
+    //! Why the TCP transport offers mplex as well as yamux.
+    //!
+    //! Measured against live mainnet peers on 2026-08-13, dialing with
+    //! `examples/tcp_probe.rs`, which carries nothing but `identify` so that
+    //! none of this crate's own protocols can be the cause:
+    //!
+    //! ```text
+    //! yamux only      Proposed /yamux/1.0.0  ->  NotAvailable
+    //!                 connection dies ~250ms in, no Goodbye, yamux frame
+    //!                 decode error: multistream-select negotiates the muxer
+    //!                 optimistically, so we are already writing yamux frames
+    //!                 when the refusal arrives and we parse their reply as one
+    //!
+    //! yamux + mplex   Proposed /yamux/1.0.0, then /mplex/6.7.0
+    //!                 Negotiated /mplex/6.7.0, identify completes both ways
+    //! ```
+    //!
+    //! The same probe against a non-Ethereum libp2p node (an IPFS bootstrapper)
+    //! completes identify with yamux alone, which is what rules out this crate's
+    //! transport setup and points at the beacon network's own convention.
+    //!
+    //! mplex is deprecated in libp2p and the facade crate has already dropped
+    //! its re-export, so `libp2p-mplex` is depended on directly. When mainnet
+    //! peers accept yamux, this goes away; until then a yamux-only beacon node
+    //! peers with nothing over TCP.
+}
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -400,7 +428,14 @@ pub fn build_swarm(
         .with_tcp(
             libp2p::tcp::Config::default().nodelay(true),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            // Same muxer pair the beacon swarm offers, for the reason recorded
+            // in [`muxers`]. Lean peers all speak yamux, so this costs the lean
+            // wire nothing and keeps one transport stack rather than two.
+            #[allow(deprecated)]
+            (
+                libp2p::yamux::Config::default,
+                libp2p_mplex::MplexConfig::default,
+            ),
         )
         .expect("failed to add TCP transport to swarm")
         .with_quic()
@@ -738,10 +773,22 @@ impl P2PServer {
         }
 
         let local_peer_id = self.local_peer_id;
+        // Dial the whole shortfall rather than one candidate per interval.
+        // Measured on mainnet: a well-connected beacon node is at its inbound
+        // cap, so it completes the handshake and answers `Goodbye(129)`, "too
+        // many peers", within the same millisecond. Finding one with room is a
+        // numbers game, and one dial per interval loses it: the node spent
+        // minutes at zero peers while candidates queued up behind a `break`.
+        let budget = DISCOVERY_TARGET_PEERS
+            .saturating_sub(self.connected_peers.len())
+            .min(DISCOVERY_CANDIDATE_BATCH);
+        let mut dialed = 0;
         let Some(discovery) = self.discovery.as_mut() else {
             return;
         };
-        while let Some(candidate) = discovery.candidates.pop_front() {
+        while dialed < budget
+            && let Some(candidate) = discovery.candidates.pop_front()
+        {
             if candidate.peer_id == local_peer_id
                 || self.connected_peers.contains(&candidate.peer_id)
             {
@@ -762,7 +809,7 @@ impl P2PServer {
                     .addresses(candidate.addrs)
                     .build(),
             );
-            break;
+            dialed += 1;
         }
     }
 

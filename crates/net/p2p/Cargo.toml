@@ -25,6 +25,12 @@ libp2p = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0
     "full",
 ] }
 
+# Mainnet beacon peers refuse a yamux-only muxer proposal, so the TCP transport
+# has to offer mplex too. The libp2p facade dropped its `mplex` re-export when
+# the muxer was deprecated, so it is taken directly from the same pinned tree.
+# See the `muxers` module for the measurement.
+libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "2f14d0ec9665a01cfb6a02326c90628c4bba521c" }
+
 snap = "1.1"
 
 tokio.workspace = true
@@ -57,3 +63,7 @@ libssz-types.workspace = true
 
 sha2 = "0.10"
 hex.workspace = true
+
+[dev-dependencies]
+# For `examples/tcp_probe.rs`, the interop probe described in that file.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
