@@ -439,6 +439,10 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version,
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
+            ForkName::Lean => unreachable!(
+                "lean state reached a beacon accessor (fork_version); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -455,6 +459,10 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch,
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
+            ForkName::Lean => unreachable!(
+                "lean state reached a beacon accessor (fork_epoch); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
@@ -478,6 +486,10 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch = epoch,
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
+            ForkName::Lean => unreachable!(
+                "lean state reached a beacon accessor (with_fork_epoch); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
         self
     }

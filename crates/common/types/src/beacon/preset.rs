@@ -982,8 +982,8 @@ pub use minimal::*;
 /// that function correct. `ethlambda_beacon::stf::epoch::electra::process_slashings` is
 /// a separate function for exactly that reason; see its own doc for the
 /// arithmetic. `slash_validator` never breaks the pattern this module
-/// describes, so it keeps reading [`retuned::min_slashing_penalty_quotient`] and
-/// [`retuned::whistleblower_reward_quotient`] from here through every fork this crate
+/// describes, so it keeps reading [`min_slashing_penalty_quotient`] and
+/// [`whistleblower_reward_quotient`] from here through every fork this crate
 /// implements.
 ///
 /// This is the one place in the crate where a preset value is chosen at runtime.
@@ -1039,6 +1039,10 @@ pub mod retuned {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
             ForkName::Electra | ForkName::Fulu => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
+            ForkName::Lean => unreachable!(
+                "lean state reached a beacon accessor (min_slashing_penalty_quotient); \
+                 BlockChainServer must dispatch on fork_name() before this point"
+            ),
         }
     }
 
