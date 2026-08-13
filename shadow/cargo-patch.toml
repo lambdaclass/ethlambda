@@ -1,7 +1,13 @@
-
 # Shadow simulator compatibility: replace quinn-udp with a fallback that uses
 # plain send_to/recv_from instead of GSO/GRO batch syscalls, which Shadow's UDP
 # emulation does not support. Appended to the workspace Cargo.toml at build time
 # by shadow/build.sh (and the Dockerfile's SHADOW path); never committed.
-[patch.crates-io]
-quinn-udp = { path = "shadow/quinn-udp-patch" }
+#
+# Declared as a sub-table rather than as `[patch.crates-io]` with a `quinn-udp`
+# key. The workspace manifest already defines `[patch.crates-io]` for libssz, and
+# appending a second definition of the same table is a TOML error. Naming the
+# sub-table directly is valid whether or not the parent table exists, so this
+# fragment does not depend on what the manifest it is appended to happens to end
+# with.
+[patch.crates-io.quinn-udp]
+path = "shadow/quinn-udp-patch"

@@ -107,7 +107,31 @@ eyre = "0.6"
 tikv-jemallocator = { version = "0.6", features = ["stats", "unprefixed_malloc_on_supported_platforms", "profiling"] }
 jemalloc_pprof = { version = "0.8", features = ["flamegraph"] }
 
-# NOTE: Shadow-simulator builds also replace quinn-udp with the fallback crate
-# in `shadow/quinn-udp-patch` (no GSO/GRO batch syscalls). A Cargo `[patch]`
-# cannot be feature-gated, so it is NOT committed here; `shadow/build.sh` injects
-# it into this manifest at build time. See `make shadow-build`.
+# The Beacon Chain state transition mutates SSZ collections in place: the
+# validator registry, the randao mixes, the historical roots. Published
+# libssz-types 0.3.0 exposes only `Deref` and `Index`, so the 18 places in
+# `crates/beacon` that assign through one need `DerefMut` and `IndexMut`. Those
+# landed in libssz after the release (lambdaclass/libssz#33, merged 2026-08-12).
+# Without this patch `ethlambda-beacon` does not compile at all.
+#
+# Pinned to that merge commit rather than tracking `main`, so the dependency does
+# not move underneath us. It reports 0.3.0, which is what makes the patch apply:
+# Cargo silently ignores a `[patch]` whose version does not satisfy the
+# requirement it replaces, and the result is the original 18 errors with nothing
+# saying why.
+#
+# All four crates are patched together because libssz-types depends on libssz and
+# libssz-merkle by path inside that repository. Patching one alone would put two
+# incompatible copies of libssz in the dependency graph.
+#
+# Remove once libssz publishes a release containing #33.
+#
+# NOTE: Shadow-simulator builds also replace quinn-udp with the fallback crate in
+# `shadow/quinn-udp-patch` (no GSO/GRO batch syscalls). A Cargo `[patch]` cannot
+# be feature-gated, so that entry is NOT committed here; `shadow/build.sh` and
+# the Dockerfile append it to this table at build time. See `make shadow-build`.
+[patch.crates-io]
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd" }

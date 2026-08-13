@@ -316,10 +316,13 @@ nothing depends on it.
 - Per-fork containers are plain structs behind an enum, so SSZ stays derived. See
   [`docs/beacon_stf.md`](docs/beacon_stf.md) for why, including the fork-by-fork
   field counts and the merkle depth change at electra.
-- **Needs mutable element access on `SszList`/`SszVector`**, which published
-  libssz 0.2.2 lacks. Currently built against a local `[patch.crates-io]`
-  override that is intentionally not committed, so the crate builds only where
-  that override exists.
+- **Needs mutable element access on `SszList`/`SszVector`**, which no published
+  libssz release has yet. The root `Cargo.toml` carries a `[patch.crates-io]`
+  pinning all four libssz crates to `36802dd`, which is the `0.3.0` release plus
+  the single commit adding `DerefMut`/`IndexMut` (lambdaclass/libssz#33). Drop
+  the patch once that ships in a release. Note this makes `[patch.crates-io]` a
+  committed table, which `shadow/cargo-patch.toml` appends to rather than
+  redeclares.
 - **Status:** all seven forks (phase0 through fulu) have containers, fork
   upgrades, state transitions, and epoch processing. Every fixture case passes
   on both presets: mainnet is 5705 cases plus 244 lib tests, minimal is 40009
