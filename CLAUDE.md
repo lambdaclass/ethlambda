@@ -398,7 +398,7 @@ behavior.
 
 ## Resources
 
-**Specs:** `leanSpec/src/lean_spec/` (Python reference implementation)
+**Specs:** `leanSpec/src/lean_spec/spec/` (Python reference implementation; fork logic under `forks/<fork>/`, e.g. `forks/lstar/`)
 **Devnet:** `lean-quickstart` (github.com/blockblaz/lean-quickstart)
 **Docs:** `docs/` — `rpc.md`, `metrics.md`, `checkpoint_sync.md`, `3sf_mini.md`, `lmd_ghost.md` (mdbook via `make docs`)
 **Releases:** See `RELEASE.md` for release process documentation

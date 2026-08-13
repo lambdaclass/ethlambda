@@ -81,6 +81,7 @@ async fn main() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")?;
 
     let options = CliOptions::parse();
+    options.validate_discovery()?;
 
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
