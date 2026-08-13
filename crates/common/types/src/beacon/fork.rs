@@ -85,6 +85,46 @@ impl ForkName {
         let index = ForkName::ALL.iter().position(|f| *f == self)?;
         ForkName::ALL.get(index + 1).copied()
     }
+
+    /// The one-byte tag this fork is stored under in a `States` value.
+    ///
+    /// Spelled out rather than `self as u8`. The variant order is already
+    /// load-bearing for the derived [`Ord`] (see this enum's own doc), so
+    /// deriving the on-disk tag from it too would mean a reorder made for the
+    /// ordering's sake silently reinterpreted every state already written.
+    ///
+    /// [`ForkName::Lean`] takes 255 rather than 7 so that the beacon forks after
+    /// fulu can keep taking the next free value as they land.
+    pub const fn selector(self) -> u8 {
+        match self {
+            ForkName::Phase0 => 0,
+            ForkName::Altair => 1,
+            ForkName::Bellatrix => 2,
+            ForkName::Capella => 3,
+            ForkName::Deneb => 4,
+            ForkName::Electra => 5,
+            ForkName::Fulu => 6,
+            ForkName::Lean => 255,
+        }
+    }
+
+    /// The inverse of [`ForkName::selector`].
+    ///
+    /// `None` for a byte this build does not know, which means a corrupt or
+    /// future-format database rather than anything a caller can recover from.
+    pub const fn from_selector(byte: u8) -> Option<ForkName> {
+        match byte {
+            0 => Some(ForkName::Phase0),
+            1 => Some(ForkName::Altair),
+            2 => Some(ForkName::Bellatrix),
+            3 => Some(ForkName::Capella),
+            4 => Some(ForkName::Deneb),
+            5 => Some(ForkName::Electra),
+            6 => Some(ForkName::Fulu),
+            255 => Some(ForkName::Lean),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ForkName {
@@ -149,5 +189,31 @@ mod tests {
     #[test]
     fn lean_has_a_name() {
         assert_eq!(ForkName::Lean.as_str(), "lean");
+    }
+
+    #[test]
+    fn every_fork_round_trips_through_its_selector() {
+        for fork in ForkName::ALL {
+            assert_eq!(ForkName::from_selector(fork.selector()), Some(fork));
+        }
+        // Lean is outside ALL but is exactly the value the tag exists to
+        // distinguish, so it is checked separately rather than left out.
+        assert_eq!(
+            ForkName::from_selector(ForkName::Lean.selector()),
+            Some(ForkName::Lean)
+        );
+    }
+
+    #[test]
+    fn selectors_are_pinned_to_their_on_disk_values() {
+        // These bytes are a storage format: changing one makes every existing
+        // database decode as the wrong fork. Asserted literally rather than
+        // derived from the variant order, which the derived Ord already owns.
+        assert_eq!(ForkName::Phase0.selector(), 0);
+        assert_eq!(ForkName::Fulu.selector(), 6);
+        // Lean sits at the top of the byte range so gloas and heze can keep
+        // taking the next free value after fulu.
+        assert_eq!(ForkName::Lean.selector(), 255);
+        assert_eq!(ForkName::from_selector(7), None);
     }
 }
