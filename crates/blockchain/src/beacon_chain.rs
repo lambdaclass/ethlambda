@@ -54,6 +54,7 @@ use ethlambda_beacon::fork_choice::{
 };
 use ethlambda_beacon::primitives::{Root, Slot};
 use ethlambda_storage::Store;
+use tracing::trace;
 
 /// Bound on how far [`reorg_depth`] walks back before giving up.
 ///
@@ -81,13 +82,34 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, config: &Config) {
 /// at startup rather than silently implied.
 pub fn on_block(store: &mut Store, block: SignedBeaconBlock, config: &Config) -> Result<()> {
     let (attestations, slashings) = block_operations(&block);
+    let slot = block.slot();
     fork_choice::on_block(store, block, config, &DataAvailability::NotRequired)?;
 
+    // The block is imported by the line above; what follows is fork choice
+    // learning from its body, and a body item this store cannot evaluate is not
+    // grounds for calling the import a failure.
+    //
+    // The reference test generator can propagate here because every fixture
+    // adds a block's antecedents before the block itself. A checkpoint-synced
+    // follower cannot: an attestation may name a target up to
+    // `SLOTS_PER_EPOCH` slots back, and for the first epochs after the anchor
+    // that target is below it and was never fetched, so
+    // `validate_on_attestation`'s "target.root in store.blocks" rejects it. The
+    // spec-test harness keeps its own strict replay
+    // (`tests/spec/fork_choice.rs::apply_block`), so the fixtures still fail on
+    // anything they can legitimately reach.
+    //
+    // Returning `Err` here also cost more than a log line: the caller reads it
+    // as "this block did not import" and stops the cascade, leaving every held
+    // descendant held behind a block that is in fact in the store.
     for attestation in &attestations {
-        fork_choice::on_attestation(store, attestation, true, config)?;
+        let _ = fork_choice::on_attestation(store, attestation, true, config).inspect_err(
+            |err| trace!(%slot, ?err, "Ignoring an unusable attestation from a block"),
+        );
     }
     for slashing in &slashings {
-        fork_choice::on_attester_slashing(store, slashing, config)?;
+        let _ = fork_choice::on_attester_slashing(store, slashing, config)
+            .inspect_err(|err| trace!(%slot, ?err, "Ignoring an unusable slashing from a block"));
     }
     Ok(())
 }
