@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: ["**"]
+  # Required for Lint and Test to run against the merge queue's temporary
+  # branch. A merge queue only reports a check as passing if the workflow
+  # subscribes to merge_group; without it the queue waits forever on checks
+  # that never start.
+  merge_group:
   workflow_dispatch:
 
-# Cancel in-progress runs when a new commit is pushed to the same PR or branch
+# Cancel in-progress runs when a new commit is pushed to the same PR or branch.
+# merge_group runs have no head_ref, so they fall back to the unique run_id and
+# are never cancelled by a sibling run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
