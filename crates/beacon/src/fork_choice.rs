@@ -144,7 +144,7 @@
 //!   [`stf::ExecutionEngine`] already collapses to whatever the fixture
 //!   suites supply directly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ethlambda_storage::StorageBackend;
@@ -161,7 +161,7 @@ use crate::helpers::accessors::{
 use crate::helpers::attestation as phase0_attestation;
 use crate::helpers::electra as electra_helpers;
 use crate::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
-use crate::helpers::predicates::is_slashable_attestation_data;
+use crate::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::kzg;
 use crate::preset;
 use crate::primitives::{Epoch, Gwei, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex};
@@ -522,6 +522,10 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// The LMD GHOST weight of `root`: the effective balance of every
 /// non-equivocating, active, unslashed validator whose latest vote descends
 /// through `root`, plus the proposer boost if it applies.
+///
+/// The specification's own per-root definition, kept as written. [`get_head`]
+/// calls [`compute_weights`] instead, which produces the same numbers for the
+/// whole tree at once; this is what that is tested against.
 pub fn get_weight(
     store: &Store,
     index: &BeaconBlockIndex,
@@ -562,6 +566,102 @@ pub fn get_weight(
         proposer_score = get_proposer_score(store, config)?;
     }
     Ok(attestation_score.saturating_add(proposer_score))
+}
+
+/// Every indexed block's LMD GHOST weight, in one pass over the votes.
+///
+/// [`get_weight`] is the specification's definition and is per-root, so a head
+/// descent that calls it once per candidate re-walks every validator's vote at
+/// every step: on mainnet that is a two-million-entry registry scan and a
+/// parent walk per voter, repeated for each of the tens of blocks between the
+/// justified checkpoint and the head. Measured on a live mainnet follower it
+/// took the chain actor to a full core and starved block import entirely.
+///
+/// The same numbers fall out of one bottom-up accumulation, because a vote
+/// counts for a root exactly when the voted block descends from it: sum each
+/// vote at its own block, then fold every block's total into its parent,
+/// walking blocks from the highest slot down so a child is complete before its
+/// parent reads it. A parent link always points at a strictly earlier slot, so
+/// that order is a valid topological one.
+///
+/// A vote for a block no longer in `index` is dropped rather than raising.
+/// `Store::promote_beacon_anchor` prunes the block index below the oldest kept
+/// finalized anchor, and a validator whose freshest recorded vote is for a
+/// block down there keeps that vote until it attests again. Such a vote cannot
+/// distinguish between candidates above the justified checkpoint (all of them
+/// descend from the finalized block it voted below), so it weighs nothing, and
+/// the alternative is what a live node actually hit: one stale voter aborting
+/// the whole head computation with `SpecAssert("root in store.blocks")` and
+/// pinning the head for as long as it stayed stale.
+pub fn compute_weights(
+    store: &Store,
+    index: &BeaconBlockIndex,
+    config: &Config,
+) -> Result<HashMap<Root, Gwei>> {
+    let state = checkpoint_state(store, store.beacon_justified_checkpoint(), config)?;
+    let current_epoch = get_current_epoch(&state);
+
+    // Keyed on the voted block itself; the fold below turns these into subtree
+    // totals in place.
+    let mut weights: HashMap<Root, Gwei> = HashMap::new();
+    // Equivocators are filtered by the store itself: see
+    // `for_each_non_equivocating_latest_message` for why asking it per voter
+    // from in here would deadlock.
+    store.for_each_non_equivocating_latest_message(|validator_index, message| {
+        // Not `get_active_validator_indices`: that allocates the whole active
+        // set (~2 million entries on mainnet) to answer a membership question,
+        // and an index past this state's registry is a validator that did not
+        // exist yet at the justified checkpoint, which is a skip rather than an
+        // error.
+        let Ok(validator) = state.validator(validator_index) else {
+            return;
+        };
+        if validator.slashed || !is_active_validator(validator, current_epoch) {
+            return;
+        }
+        *weights.entry(message.root).or_default() += validator.effective_balance;
+    });
+
+    // Highest slot first: see above for why that is a topological order.
+    let mut blocks: Vec<(Root, Slot, Root)> = index
+        .iter()
+        .map(|(root, (slot, parent_root))| (*root, *slot, *parent_root))
+        .collect();
+    blocks.sort_unstable_by(|left, right| right.1.cmp(&left.1).then(right.0.cmp(&left.0)));
+
+    for (root, _slot, parent_root) in &blocks {
+        let subtree_weight = weights.get(root).copied().unwrap_or_default();
+        if subtree_weight == 0 {
+            continue;
+        }
+        // Only into a parent that is still indexed: the anchor's own parent is
+        // below the retained window, and there is nothing there to weigh.
+        if index.contains_key(parent_root) {
+            *weights.entry(*parent_root).or_default() += subtree_weight;
+        }
+    }
+
+    let boost_root = store.proposer_boost_root();
+    if !boost_root.is_zero() && index.contains_key(&boost_root) {
+        // The specification gives the boost to every root the boosted block
+        // descends from, which is every block on its ancestor walk. Ends at the
+        // justified checkpoint: `get_head` never descends below it, and below
+        // it the walk would leave the retained window.
+        let justified_slot = index
+            .get(&store.beacon_justified_checkpoint().root)
+            .map_or(0, |(slot, _)| *slot);
+        let proposer_score = get_proposer_score(store, config)?;
+        let mut cursor = boost_root;
+        while let Some((slot, parent_root)) = index.get(&cursor).copied() {
+            *weights.entry(cursor).or_default() += proposer_score;
+            if slot <= justified_slot {
+                break;
+            }
+            cursor = parent_root;
+        }
+    }
+
+    Ok(weights)
 }
 
 /// The checkpoint a block would cast as its FFG source if it were canonical
@@ -713,6 +813,9 @@ pub fn get_filtered_block_tree(
 pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
     let index = store.beacon_block_index();
     let blocks = get_filtered_block_tree(store, &index, config)?;
+    // Every candidate's weight at once: see `compute_weights` for why the
+    // specification's per-root `get_weight` is not what the descent calls.
+    let weights = compute_weights(store, &index, config)?;
     let mut head = store.beacon_justified_checkpoint().root;
     // "The head will not move" is the operational question this answers, and
     // the two counts separate its causes: an index that never grew (nothing is
@@ -741,7 +844,7 @@ pub fn get_head(store: &Store, config: &Config) -> Result<Root> {
         // `bytes` root.
         let mut ranked = Vec::with_capacity(children.len());
         for root in children {
-            ranked.push((get_weight(store, &index, root, config)?, root));
+            ranked.push((weights.get(&root).copied().unwrap_or_default(), root));
         }
         head = ranked
             .into_iter()
@@ -1974,6 +2077,138 @@ mod tests {
         assert!(
             !store.has_beacon_block(orphan_root),
             "a refused block must leave the store untouched"
+        );
+    }
+
+    /// A store anchored on `count` validators, plus the anchor's own root.
+    ///
+    /// The anchor is what `checkpoint_state` resolves the justified checkpoint
+    /// to, which is the one thing both weight functions need from a real store.
+    fn anchored_store(count: usize) -> (Store, Root, Slot) {
+        let anchor_state = crate::helpers::test_state::with_validators(count);
+        let anchor_slot = anchor_state.slot();
+        let anchor_block = {
+            let mut signed = block(anchor_slot, Root::zero());
+            let SignedBeaconBlock::Phase0(inner) = &mut signed else {
+                panic!("`block` builds a phase0 block");
+            };
+            inner.message.state_root = anchor_state.hash_tree_root();
+            signed
+        };
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let store = get_forkchoice_store(
+            Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
+            anchor_state,
+            anchor_block,
+            &Config::active(),
+        )
+        .expect("the pair matches");
+        (store, anchor_root, anchor_slot)
+    }
+
+    /// `compute_weights` is the specification's `get_weight` for every root at
+    /// once, so the two have to agree root by root: over a fork, over voters
+    /// spread across both branches, and with the proposer boost applied.
+    #[test]
+    fn the_single_pass_weights_match_the_specifications_per_root_weight() {
+        let config = Config::active();
+        let (mut store, anchor_root, anchor_slot) = anchored_store(8);
+
+        // anchor -> a -> {b, c}: a fork whose two leaves split the vote, so a
+        // wrong fold shows up as a leaf carrying its sibling's balance.
+        let a_root = Root::repeat_byte(0xa1);
+        let b_root = Root::repeat_byte(0xb2);
+        let c_root = Root::repeat_byte(0xc3);
+        let index = index(&[
+            (anchor_root, anchor_slot, Root::zero()),
+            (a_root, anchor_slot + 1, anchor_root),
+            (b_root, anchor_slot + 2, a_root),
+            (c_root, anchor_slot + 2, a_root),
+        ]);
+
+        // Three voters on `b`, one on `c`, one on the anchor itself (a vote
+        // that counts for no candidate above it), and one equivocator whose
+        // vote must not count at all.
+        for (validator_index, root) in [(0, b_root), (1, b_root), (2, b_root), (3, c_root)] {
+            store.set_latest_message(validator_index, LatestMessage { epoch: 0, root });
+        }
+        store.set_latest_message(
+            4,
+            LatestMessage {
+                epoch: 0,
+                root: anchor_root,
+            },
+        );
+        store.set_latest_message(
+            5,
+            LatestMessage {
+                epoch: 0,
+                root: b_root,
+            },
+        );
+        store.insert_equivocating_index(5);
+        store.set_proposer_boost_root(b_root);
+
+        let weights = compute_weights(&store, &index, &config).expect("the anchor state is there");
+
+        for root in [anchor_root, a_root, b_root, c_root] {
+            assert_eq!(
+                weights.get(&root).copied().unwrap_or_default(),
+                get_weight(&store, &index, root, &config).expect("every root is indexed"),
+                "the two weights disagree at {root}"
+            );
+        }
+        assert!(
+            weights[&b_root] > weights[&c_root],
+            "three voters and the boost must outweigh one voter"
+        );
+    }
+
+    /// The failure a live mainnet follower hit: `promote_beacon_anchor` prunes
+    /// the block index below the oldest kept anchor, and any validator whose
+    /// freshest vote was for a block down there kept pointing at it. The
+    /// specification's `get_weight` raises on that vote and takes the whole
+    /// head computation with it; the head froze for as long as one stale voter
+    /// stayed stale.
+    #[test]
+    fn a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing() {
+        let config = Config::active();
+        let (mut store, anchor_root, anchor_slot) = anchored_store(8);
+        let a_root = Root::repeat_byte(0xa1);
+        let index = index(&[
+            (anchor_root, anchor_slot, Root::zero()),
+            (a_root, anchor_slot + 1, anchor_root),
+        ]);
+
+        store.set_latest_message(
+            0,
+            LatestMessage {
+                epoch: 0,
+                root: a_root,
+            },
+        );
+        store.set_latest_message(
+            1,
+            LatestMessage {
+                epoch: 0,
+                // Below the anchor, so no longer indexed.
+                root: Root::repeat_byte(0xde),
+            },
+        );
+
+        assert!(
+            get_weight(&store, &index, a_root, &config).is_err(),
+            "the specification's own version is what raises here; this test \
+             exists because that took the whole head computation with it"
+        );
+
+        let weights = compute_weights(&store, &index, &config).expect("a pruned vote is not fatal");
+
+        let one_validator_balance = weights[&a_root];
+        assert!(one_validator_balance > 0, "the live vote still counts");
+        assert_eq!(
+            weights[&anchor_root], one_validator_balance,
+            "and it counts exactly once, for a_root and everything it descends from"
         );
     }
 

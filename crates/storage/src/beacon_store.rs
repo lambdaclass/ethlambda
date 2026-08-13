@@ -268,6 +268,18 @@ impl Store {
         bytes.chunks_exact(32).map(Root::from_slice).collect()
     }
 
+    /// The slot of the oldest anchor still kept, which is the oldest slot this
+    /// node can serve a block for: `promote_beacon_anchor` prunes the block
+    /// index below it, and nothing below the bootstrap anchor was ever fetched.
+    ///
+    /// This is what fulu's `Status` v2 calls `earliest_available_slot`.
+    pub fn beacon_anchor_slot(&self) -> Slot {
+        self.beacon_anchors()
+            .first()
+            .and_then(|root| self.beacon_block_entry(*root))
+            .map_or(0, |(slot, _parent_root)| slot)
+    }
+
     /// Records `root` as the newest finalized anchor, writing `state` as its
     /// snapshot and dropping everything the two-anchor rule no longer keeps.
     ///
@@ -491,6 +503,29 @@ impl Store {
             .latest_messages
             .get(&index)
             .copied()
+    }
+
+    /// Calls `f` once per recorded LMD GHOST vote whose voter is not a known
+    /// equivocator.
+    ///
+    /// A closure rather than a returned collection: on mainnet this holds one
+    /// entry per validator that has ever attested, and copying two million of
+    /// them out for every fork-choice head would cost more than the walk the
+    /// caller is there to do. The lock is held for the whole pass, which the
+    /// single-threaded chain actor never contends.
+    ///
+    /// The equivocation filter is applied here rather than left to the caller
+    /// for the same reason: [`Store::is_equivocating`] takes the same lock this
+    /// pass holds, and a `std::sync::Mutex` is not reentrant, so a caller doing
+    /// the obvious thing inside `f` would deadlock rather than fail.
+    pub fn for_each_non_equivocating_latest_message(&self, mut f: impl FnMut(u64, LatestMessage)) {
+        let beacon = self.beacon.lock().unwrap();
+        for (index, message) in &beacon.latest_messages {
+            if beacon.equivocating_indices.contains(index) {
+                continue;
+            }
+            f(*index, *message);
+        }
     }
 
     /// Sets [`Store::latest_message`]. No monotonicity check: the

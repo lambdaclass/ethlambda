@@ -406,6 +406,7 @@ impl BlockChainServer {
     /// cascade. See `beacon_chain::update_head` for why those are the right
     /// moments.
     fn update_beacon_head(&mut self) {
+        let _timing = metrics::time_beacon_head_compute();
         let update = match beacon_chain::update_head(&mut self.store, &self.beacon_config) {
             Ok(update) => update,
             Err(err) => {

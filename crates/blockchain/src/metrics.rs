@@ -379,6 +379,22 @@ static LEAN_ATTESTATION_VALIDATION_TIME_SECONDS: std::sync::LazyLock<Histogram> 
         .unwrap()
     });
 
+/// Buckets run to a whole mainnet slot because that is the question this
+/// answers: a head computation that costs seconds is one the chain actor
+/// cannot afford between blocks, and it took a live node pinned at 100% CPU
+/// with a frozen head to notice, because nothing measured it.
+static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_head_compute_time_seconds",
+            "Duration of one beacon fork-choice head computation",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -880,6 +896,7 @@ pub fn init() {
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATIONS_PRODUCTION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS);
@@ -1032,6 +1049,13 @@ pub fn time_fork_choice_block_processing() -> TimingGuard {
 /// Start timing attestation validation. Records duration when the guard is dropped.
 pub fn time_attestation_validation() -> TimingGuard {
     TimingGuard::new(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS)
+}
+
+/// Start timing a beacon fork-choice head computation. Records duration when
+/// the guard is dropped, including on the error path: a head computation that
+/// fails still spent the time, and the failing one was the expensive one.
+pub fn time_beacon_head_compute() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
 }
 
 /// Increment the PQ aggregated signatures counter.
