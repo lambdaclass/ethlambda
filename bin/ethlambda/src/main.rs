@@ -448,7 +448,7 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         Some(path) => Some(read_bootnode_strings(path)?),
         None => None,
     };
-    let _p2p = beacon::run(beacon::BeaconRunConfig {
+    let _node = beacon::run(beacon::BeaconRunConfig {
         checkpoint_sync_urls: options.checkpoint_sync_url.clone(),
         node_key,
         gossipsub_port: options.common.gossipsub_port,
@@ -462,7 +462,9 @@ async fn run_beacon(options: BeaconOptions) -> eyre::Result<()> {
         metrics_port: options.common.metrics_port,
     })
     .await?;
-    // Nothing to drive yet: the actor owns the swarm and the dial loop.
+    // Nothing to drive here: the P2P actor owns the swarm and the dial loop,
+    // and the chain actor drives itself off its own tick. `_node` holds both
+    // for the life of the process; dropping it would silently stop imports.
     std::future::pending::<()>().await;
     Ok(())
 }

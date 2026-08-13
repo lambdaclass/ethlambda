@@ -24,6 +24,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ethlambda_blockchain::block_builder::ProposerConfig;
+use ethlambda_blockchain::metrics::SyncStatus;
+use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
+use ethlambda_network_api::{
+    InitBlockChain, InitP2P, ToBlockChainToP2PRef as _, ToP2PToBlockChainRef as _,
+};
+use ethlambda_types::aggregator::AggregatorController;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::fork_digest::{compute_fork_digest, next_fork_boundary};
 use ethlambda_types::beacon::preset;
@@ -31,7 +38,7 @@ use ethlambda_types::beacon::primitives::{Epoch, Root};
 use ethlambda_types::enr::EnrForkId;
 use eyre::WrapErr as _;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// The sentinel every unscheduled fork epoch carries.
 const FAR_FUTURE_EPOCH: Epoch = u64::MAX;
@@ -259,8 +266,9 @@ async fn cross_check_anchor_against_genesis(
     Ok(())
 }
 
-/// Start the mainnet follower and return once the P2P actor is running.
-pub async fn run(config: BeaconRunConfig) -> eyre::Result<ethlambda_p2p::P2P> {
+/// Start the mainnet follower and return once both actors are running and
+/// wired to each other.
+pub async fn run(config: BeaconRunConfig) -> eyre::Result<BeaconNode> {
     let chain = Config::mainnet();
 
     let checkpoint_urls: Vec<String> = config
@@ -419,12 +427,77 @@ pub async fn run(config: BeaconRunConfig) -> eyre::Result<ethlambda_p2p::P2P> {
 
     spawn_metrics_server(config.http_address, config.metrics_port).await?;
 
-    Ok(ethlambda_p2p::P2P::spawn(
-        built,
-        store,
+    // The chain actor. Without it the P2P actor holds `blockchain: None`, and
+    // every decoded gossip block is dropped at the handler's "no blockchain
+    // handler available" branch while no tick ever fires, so nothing imports a
+    // block and no head is ever computed. That is what this node did before
+    // this call existed: it peered, decoded, and discarded.
+    //
+    // Four of `BlockChainConfig`'s fields describe validator duties this node
+    // does not perform. They are set to the values that mean "does none of
+    // that" rather than to placeholders, because the tick dispatch reaches the
+    // beacon arm on a beacon store and never reads them; the two that do
+    // matter are `beacon_config` and `gate_duties`.
+    let blockchain = BlockChain::spawn(
+        store.clone(),
+        // No validator keys: this node follows and publishes nothing.
         Default::default(),
-        Some(discovery),
-    ))
+        BlockChainConfig {
+            // Publishes nothing, so it aggregates nothing.
+            aggregator: AggregatorController::new(false),
+            // Beacon's gate is observe-only (see `beacon_on_tick`): with no
+            // duties to suppress, the status is a report rather than a brake.
+            sync_status_controller: SyncStatusController::new(SyncStatus::Idle),
+            gate_duties: false,
+            attestation_committee_count: ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
+            subscribed_subnets: Default::default(),
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: ethlambda_blockchain::MAX_ATTESTATIONS_DATA,
+            },
+            // The one field this path exists to supply: the fork schedule and
+            // slot timing every beacon tick and every import reads.
+            beacon_config: chain.clone(),
+        },
+        EventBus::default(),
+    );
+
+    let p2p = ethlambda_p2p::P2P::spawn(built, store, Default::default(), Some(discovery));
+
+    // Cross-wire, exactly as the lean path does. Each actor learns the other
+    // only after both exist, which is why this is a message rather than a
+    // constructor argument.
+    blockchain
+        .actor_ref()
+        .recipient::<InitP2P>()
+        .send(InitP2P {
+            p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
+    p2p.actor_ref()
+        .recipient::<InitBlockChain>()
+        .send(InitBlockChain {
+            blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
+
+    Ok(BeaconNode { p2p, blockchain })
+}
+
+/// The two actors `run` leaves running.
+///
+/// Both are returned because both must outlive the call: dropping either end
+/// of the pair leaves the other talking to a closed mailbox, and the symptom
+/// (blocks arriving, nothing importing) is the one this whole path is built to
+/// make impossible.
+// Held for their `Drop`, never read: that is the entire contract of this type,
+// and it is what `dead_code` cannot see. Naming them is still worth it, because
+// a future reader deciding to "clean up an unused field" needs to find this
+// sentence rather than the lint.
+#[allow(dead_code)]
+pub struct BeaconNode {
+    pub p2p: ethlambda_p2p::P2P,
+    pub blockchain: BlockChain,
 }
 
 /// Serve `/metrics` and `/health`, and nothing else.
