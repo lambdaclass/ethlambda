@@ -130,7 +130,7 @@ Reading them together:
 |---|---|
 | `sync_local_head_slot == sync_anchor_slot`, `sync_pending_blocks` climbing | The range fetch never started. No peer's `Status` arrived, or every peer is at or behind the anchor |
 | `sync_range_blocks_total` flat, `sync_pending_blocks` climbing | The range fetch stalled. Check for `rotating peer` warnings |
-| `sync_local_head_slot` climbing, `head_slot` frozen well behind it | Blocks are importing but fork choice is not following: check for `Failed to compute the beacon fork choice head` warnings, and whether the justified checkpoint has stalled far enough behind the tip that `filter_block_tree` no longer accepts it |
+| `sync_local_head_slot` climbing, `head_slot` frozen well behind it | Blocks are importing but fork choice is not following. Almost always staleness rather than a defect: once the node is more than two epochs behind wall clock, `filter_block_tree` rejects every leaf and the descent returns the justified root. Run with `RUST_LOG=ethlambda_beacon::fork_choice=debug` and read `Beacon fork choice rejected a leaf as unviable`, which names the failing condition. See "Why the head stays at the anchor" below |
 | `head_slot` climbing, `latest_finalized_slot` frozen | Fork choice is following a chain that never finalizes, the failure this page is about — now visible on the real head rather than the import watermark |
 | `sync_pending_dropped_total` rising | A peer is feeding blocks on fabricated parents, or the gap is wider than the buffer |
 | `fork_choice_reorgs_total` rising with no corresponding drop in `latest_finalized_slot` | Ordinary proposer/fork competition being resolved, not by itself a problem; `fork_choice_reorg_depth` says how far each one reached back |
@@ -285,11 +285,80 @@ advertises so libp2p races QUIC and TCP within one attempt — the mechanism
 meant to let a live TCP address rescue a dial whose advertised `quic` does
 not answer.
 
-None of this has been checked against live mainnet traffic yet. The change is
-unit- and integration-tested (including two local swarms actually completing
-a TCP connection), but whether it measurably improves the `Peer connected`
-count against real mainnet peers is an open question this page cannot answer
-without a fresh run of the procedure above. Re-run it, and compare the `Peer
-connected` count and the `transport` field it now logs against the 2026-08-12
-baseline before concluding anything about whether the QUIC-only trade-off is
-actually resolved.
+## The 2026-08-13 runs: what the transport change bought, and what it exposed
+
+Re-run against mainnet after the TCP work, then again after each fix below.
+Recorded in the order the failures surfaced, because each one hid the next.
+
+| | |
+|---|---|
+| Peering | `Peer connected` with `transport=tcp` and `transport=quic`. TCP carries the sessions that survive; QUIC-only never got one past the handshake |
+| Muxer | mainnet peers answer `NotAvailable` to a yamux-only proposal and negotiate `/mplex/6.7.0`. A yamux-only node peers with nothing over TCP |
+| Gossip | live and decoding: ~500 `beacon_aggregate_and_proof`, 20 `sync_committee_contribution_and_proof` and several `beacon_block` in a six-minute window |
+| Range sync | `Status` exchanged, `BeaconBlocksByRange` issued and answered |
+| Block import | **blocks import, in consecutive slots**, which had never happened before |
+| Head | still pinned at the anchor, and that part is fork choice behaving correctly. See below |
+
+Three defects had to be fixed before one block could import, none visible from
+outside the process:
+
+1. **No chain actor.** `beacon::run` spawned discovery, the metrics server and
+   the P2P actor and no `BlockChain`, so `P2PServer::blockchain` stayed `None`
+   and every decoded block hit its "no blockchain handler available" branch at
+   debug level. The tell was in the metrics: eight `lean_` series exposed and
+   not one tick-driven one, because they register lazily on first update.
+2. **A lean accessor on the beacon path.** The held-block logic asked
+   `store.head_slot()`, which reads a metadata key a beacon store never
+   writes. The actor panicked on the first gossiped block with an unknown
+   parent, and a panicked handler leaves the process running, so the node went
+   on peering and decoding with nothing behind it.
+3. **Registry rescans inside the state transition.** Import went from never
+   completing to ~13-16s per block.
+
+### Why the head stays at the anchor
+
+Not a defect. `filter_block_tree` rejects a leaf whose voting source is stale:
+
+```text
+correct_justified = justified.epoch == GENESIS_EPOCH
+                 || voting_source.epoch == justified.epoch
+                 || voting_source.epoch + 2 >= current_epoch
+```
+
+Observed live, at debug level on `ethlambda_beacon::fork_choice`:
+
+```text
+Beacon fork choice rejected a leaf as unviable
+  correct_justified=false correct_finalized=true
+  voting_source_epoch=468251 justified_epoch=468252 current_epoch=468255
+```
+
+468251 + 2 is below 468255, so every imported block is unviable, the filtered
+tree is empty, and the descent returns the justified root: the anchor. That is
+the specification protecting fork choice from following a branch whose
+justification has fallen more than two epochs behind wall clock.
+
+The node is in that state because **import is slower than block production**.
+At ~13-16s per block against a 12s slot it loses ground every slot and can
+never re-enter the two-epoch window. Nothing about peering or fork choice
+fixes that; import throughput is the whole remaining gap. Profiling a live
+import puts roughly 60% of samples in committee derivation
+(`compute_shuffled_index`, `get_active_validator_indices`,
+`get_beacon_committee`, `compute_committee`) — the shuffling cache this
+codebase does not yet have — with `hash_tree_root` and `aggregate_verify`
+next behind it.
+
+So the honest reading of `head_slot` frozen at `sync_anchor_slot` while
+`sync_local_head_slot` climbs is: blocks are importing, too slowly, and fork
+choice is right to refuse them.
+
+### Peer retention is still unresolved
+
+Peers accept the connection, complete the beacon handshake, and answer
+`Goodbye(129)` — too many peers — within a millisecond. Fifteen connections
+over six minutes, ten of them ending that way. Two contributing factors are
+outside this code (the test host is behind NAT with no inbound, and the node
+serves no blocks, so a peer at its cap sheds it first) and one is inside it:
+the dial loop now retries every second while at zero peers rather than every
+five, which roughly tripled attempts. Whether that is enough on a
+reachable host is unmeasured.
