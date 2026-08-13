@@ -67,7 +67,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DISCOVERY_CANDIDATE_BATCH, DISCOVERY_DIAL_INTERVAL, DISCOVERY_TARGET_PEERS,
+        DISCOVERY_CANDIDATE_BATCH, DISCOVERY_DIAL_INTERVAL, DISCOVERY_STARVED_DIAL_INTERVAL,
+        DISCOVERY_TARGET_PEERS,
         DiscoveryHandle,
         admission::{DiscoveredPeer, admit, rank_by_uncovered_subnets},
     },
@@ -720,12 +721,16 @@ impl P2PServer {
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        // Reschedule first, so an early return never stops the loop.
-        send_after(
-            DISCOVERY_DIAL_INTERVAL,
-            ctx.clone(),
-            p2p_protocol::DiscoverPeers,
-        );
+        // Reschedule first, so an early return never stops the loop. A node
+        // with no peers retries on the shorter interval: see
+        // `DISCOVERY_STARVED_DIAL_INTERVAL` for why zero peers is a failure to
+        // work through rather than a state to wait out.
+        let interval = if self.connected_peers.is_empty() {
+            DISCOVERY_STARVED_DIAL_INTERVAL
+        } else {
+            DISCOVERY_DIAL_INTERVAL
+        };
+        send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
 
         if self.connected_peers.len() >= DISCOVERY_TARGET_PEERS {
             return;

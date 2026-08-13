@@ -27,8 +27,17 @@ use tracing::info;
 use crate::Bootnode;
 use enr::{LocalEnrParams, build_local_enr};
 
-/// How often the dial loop looks for a new peer.
+/// How often the dial loop looks for a new peer once the node has some.
 pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often it looks while it has none.
+///
+/// A node with zero peers is not idling, it is failing. Mainnet beacon nodes
+/// sit at their inbound cap and answer `Goodbye(129)`, "too many peers", within
+/// a millisecond of the handshake, so landing one with room takes many
+/// attempts. Five seconds between rounds is a reasonable heartbeat for a
+/// connected node and far too slow for a starving one.
+pub const DISCOVERY_STARVED_DIAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Connected-peer count above which discovery stops dialing. Also the peer
 /// table's own target.
