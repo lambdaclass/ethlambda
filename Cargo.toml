@@ -81,14 +81,34 @@ prometheus = "0.14"
 
 clap = { version = "4.3", features = ["derive", "env"] }
 
+# Beacon Chain containers. Matches the version ethrex uses, and the version
+# libssz's `ethereum_types` feature is built against.
+ethereum-types = "0.15.1"
+
+# `asm` selects the CPU's SHA-256 instructions where it has them. Merkleizing a
+# beacon state is almost entirely SHA-256 compressions, so this is not a
+# micro-optimization. Selection is at run time through `cpufeatures`, so the
+# build stays portable to hardware lacking the extensions.
+sha2 = { version = "0.10.9", features = ["asm"] }
+
 # XMSS signatures
 leansig = { git = "https://github.com/leanEthereum/leanSig", branch = "devnet4" }
 
-# SSZ implementation
-libssz = "0.3.0"
-libssz-derive = "0.3.0"
-libssz-merkle = "0.3.0"
-libssz-types = "0.3.0"
+# SSZ implementation.
+#
+# Tracked from git rather than crates.io because the Beacon Chain containers
+# hand out `&mut` into an `SszList` (the validator registry, through
+# `altair_validator_lists_mut`), which published libssz-types 0.3.0 cannot do:
+# it exposes only `Deref` and `Index`. `DerefMut` and `IndexMut` landed after
+# that release, in lambdaclass/libssz#33.
+#
+# `Cargo.lock` pins the exact commit, so this does not drift on its own; it
+# moves when someone runs `cargo update`. Return these to a crates.io version
+# once a release carrying #33 exists.
+libssz = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }

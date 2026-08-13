@@ -9,15 +9,25 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Compile the beacon containers against the minimal preset instead of mainnet.
+#
+# Container shapes are compile-time constants (SSZ list and vector bounds), so
+# the preset cannot be selected at runtime. Mainnet is the implicit default.
+# `ethlambda-beacon`'s feature of the same name forwards to this one.
+preset-minimal = []
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 hex.workspace = true
 
-libssz.workspace = true
+libssz = { workspace = true, features = ["ethereum_types"] }
 libssz-derive.workspace = true
-libssz-merkle.workspace = true
+libssz-merkle = { workspace = true, features = ["ethereum_types"] }
 libssz-types.workspace = true
+ethereum-types.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
