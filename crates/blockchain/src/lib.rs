@@ -1204,7 +1204,15 @@ impl BlockChainServer {
                     // passed this slot. Below that, the batch on the wire will
                     // bring the parent anyway and a by-root request would only
                     // duplicate it.
-                    if self.store.head_slot() >= slot {
+                    //
+                    // The import watermark, not `store.head_slot()`: that reads
+                    // lean's `head` metadata key, which a beacon store never
+                    // writes, so it panicked the actor on the first gossiped
+                    // block with an unknown parent. It is also the wrong
+                    // question, since what this needs to know is how far the
+                    // range fetch has reached, not which branch fork choice
+                    // settled on.
+                    if self.store.beacon_highest_imported_slot() >= slot {
                         self.request_missing_beacon_block(missing);
                     }
                 }
