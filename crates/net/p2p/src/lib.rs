@@ -1051,7 +1051,7 @@ mod tests {
             tcp_port: None,
             ..Default::default()
         };
-        pairs.set_extra_int(b"quic", 9001u16);
+        pairs.set_extra_int(b"quic", 9001);
         let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
 
         let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);

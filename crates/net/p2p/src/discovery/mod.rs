@@ -136,7 +136,7 @@ pub async fn spawn_discovery(
     let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
         DISCOVERY_TARGET_PEERS,
-        Box::new(filter.clone()),
+        filter.clone(),
     );
 
     let seeds: Vec<Node> = config

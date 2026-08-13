@@ -153,10 +153,14 @@ impl LocalEnrParams {
             IpAddr::V6(ip) => pairs.ip6 = Some(ip),
         }
 
+        // Each setter answers whether the entry was stored, which is `false`
+        // only for a key the record already has a typed field for. All three
+        // below are outside that dictionary, and the tests assert each one lands
+        // in the built record, so the answers are not checked here.
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
         pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
-        pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port);
+        pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port.into());
         pairs
     }
 }
