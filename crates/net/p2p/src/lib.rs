@@ -68,8 +68,7 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     discovery::{
         DISCOVERY_CANDIDATE_BATCH, DISCOVERY_DIAL_INTERVAL, DISCOVERY_STARVED_DIAL_INTERVAL,
-        DISCOVERY_TARGET_PEERS,
-        DiscoveryHandle,
+        DISCOVERY_TARGET_PEERS, DiscoveryHandle,
         admission::{DiscoveredPeer, admit, rank_by_uncovered_subnets},
     },
     gossipsub::{
