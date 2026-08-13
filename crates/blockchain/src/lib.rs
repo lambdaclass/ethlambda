@@ -1165,6 +1165,7 @@ impl BlockChainServer {
         queue.push_back(signed_block);
         while let Some(block) = queue.pop_front() {
             self.process_or_hold_beacon_block(block, source, &mut queue);
+            self.advance_beacon_clock_mid_cascade();
         }
         metrics::set_sync_pending_blocks(self.beacon_pending.len() as u64);
 
@@ -1187,6 +1188,31 @@ impl BlockChainServer {
         if self.beacon_head_updated_for_slot != Some(current_slot) {
             self.beacon_head_updated_for_slot = Some(current_slot);
             self.update_beacon_head();
+        }
+    }
+
+    /// Run the tick's work if wall clock has left the slot the store thinks it
+    /// is in, without waiting for the scheduled tick to be dequeued.
+    ///
+    /// The actor has one FIFO mailbox, and a range-sync batch arrives as one
+    /// message per block. A backlog import runs at seconds per block, so the
+    /// `Tick` message sits behind the whole batch: measured on a mainnet
+    /// follower, a 104-block batch froze the store clock for ten minutes.
+    ///
+    /// That is not only a reporting gap. `filter_block_tree` compares a
+    /// block's voting source against `get_current_store_epoch`, so a store
+    /// clock stuck in the past has fork choice judging branches against an
+    /// epoch that has already gone by. Advancing it here costs one comparison
+    /// per imported block in the common case, and the slot-guarded head
+    /// recompute inside it still runs at most once per slot.
+    fn advance_beacon_clock_mid_cascade(&mut self) {
+        let now_ms = unix_now_ms();
+        let store_slot = beacon_chain::current_slot(&self.store, &self.beacon_config);
+        let genesis_time = self.store.config().genesis_time;
+        let wall_clock_slot =
+            (now_ms / 1000).saturating_sub(genesis_time) / self.beacon_config.seconds_per_slot;
+        if wall_clock_slot > store_slot {
+            self.beacon_on_tick(now_ms);
         }
     }
 
