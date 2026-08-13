@@ -2,6 +2,10 @@
 
 [Introduction](./introduction.md)
 
+# Design
+
+- [Architecture](./architecture.md)
+
 # Consensus
 
 - [Slots and Intervals](./slots_and_intervals.md)

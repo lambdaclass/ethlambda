@@ -4,8 +4,11 @@
 consensus client, written in Rust.
 
 This book collects the design notes and operator-facing references for ethlambda.
-It is split into two parts:
+It is split into three parts:
 
+- **Design** describes the shape of a running node: the
+  [architecture](./architecture.md) of its actors, workers and shared storage,
+  and how they are wired together at startup.
 - **Consensus** explains how the chain advances: the
   [slot and interval structure](./slots_and_intervals.md) that schedules every
   validator duty, the [3SF-mini](./3sf_mini.md) justification and finalization
