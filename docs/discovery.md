@@ -58,6 +58,12 @@ and ethlambda speaks QUIC only.
 Read the local ENR from `GET /lean/v0/node/identity`, which reports it as `enr`
 (`null` when discovery is disabled). It is also logged once at startup.
 
+This same record is handed to ethrex's `DiscoveryServer`, so it is what answers
+discv5 queries: what we report and what peers see are the same bytes. If IP
+voting later changes our external address, ethrex edits and re-signs that record
+rather than rebuilding one, so the consensus entries survive the bump; only the
+sequence number and `ip` move, which the reported ENR then lags.
+
 ## Which peers get dialed
 
 A discovered peer is admitted only if:
@@ -130,23 +136,6 @@ check therefore separates lean from non-lean but **not one lean devnet from
 another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
-
-### The record ethrex serves is not the record we report
-
-`GET /lean/v0/node/identity` reports the ENR built by `build_local_enr`, which
-carries every entry in the table above. ethrex's `DiscoveryServer` builds its
-own copy from the local `Node` and offers no way to seed the consensus entries,
-so the record it answers discv5 queries with carries `ip`, `udp` and
-`secp256k1` but **not** `eth2`, `attnets` or `quic`.
-
-Discovery is therefore one-sided: we find lean peers and admit them, but a lean
-peer applying [the same admission rules](#which-peers-get-dialed) to what ethrex
-serves rejects us for a missing `quic` entry. Copying our reported ENR into
-another node's bootnode list still works, since that is the complete record.
-
-Closing this needs a way to hand ethrex's `DiscoveryServer::spawn` a prepared
-record instead of having it build one. Until then, discovery finds peers but
-cannot be found by them.
 
 ### A beacon-chain client cannot discover us, and `tcp` is why
 

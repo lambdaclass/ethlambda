@@ -19,7 +19,6 @@ use std::time::Duration;
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
 use ethrex_p2p::types::Node;
-use ethrex_storage::{EngineType, Store};
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
@@ -51,8 +50,6 @@ pub enum DiscoveryError {
     BuildEnr(ethrex_p2p::types::NodeError),
     #[error("failed to encode local ENR: {0}")]
     EncodeEnr(ethrex_p2p::types::NodeError),
-    #[error("failed to create the discovery store: {0}")]
-    Store(String),
     #[error("failed to start discovery server: {0}")]
     Server(String),
     #[error("node key is not a valid secp256k1 secret key: {0}")]
@@ -151,18 +148,14 @@ pub async fn spawn_discovery(
         "Starting discv5 discovery"
     );
 
-    // `spawn` requires a store but the discv5 path reads it only for
-    // `get_fork_id`, which errors on a store with no genesis block and makes
-    // ethrex skip the `eth` entry — what lean wants, having no execution chain.
-    // That the record ethrex then serves is *not* the complete one we report is
-    // a known gap; see docs/discovery.md, "The record ethrex serves is not the
-    // record we report".
-    let store = Store::new("", EngineType::InMemory)
-        .map_err(|err| DiscoveryError::Store(err.to_string()))?;
-
+    // The record we hand over is the same one `enr_url` above reported, so what
+    // ethrex answers discv5 queries with carries the consensus entries (`eth2`,
+    // `attnets`, `quic`) and a lean peer applying our own admission rules to it
+    // admits us. ethrex re-signs it under `params.signer` whenever IP voting
+    // bumps the sequence number, keeping the extra entries.
     DiscoveryServer::spawn(
-        store,
         local_node,
+        local_record,
         params.signer,
         Arc::new(socket),
         peer_table.clone(),

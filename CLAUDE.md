@@ -282,7 +282,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Peer Discovery (discv5, opt-in)
 - Off by default; `--discovery.enable` plus `--discovery.port` (own UDP socket, must differ from `--gossipsub-port`)
-- Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled and an empty in-memory ethrex `Store` (`spawn` requires one; lean has no execution chain)
+- Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`secp256k1`/`eth2`/`attnets`, deliberately **no** `tcp`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, `quic` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
 - Candidates ranked by uncovered attestation subnets. See [`docs/discovery.md`](docs/discovery.md)
