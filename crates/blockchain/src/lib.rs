@@ -200,6 +200,7 @@ impl BlockChain {
             events,
             beacon_config,
             beacon_pending: beacon_pending::PendingBeaconBlocks::new(),
+            beacon_head_updated_for_slot: None,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -299,6 +300,10 @@ pub struct BlockChainServer {
     ///
     /// Empty on the lean path: nothing outside `on_beacon_block` touches it.
     beacon_pending: beacon_pending::PendingBeaconBlocks,
+    /// The slot the beacon fork-choice head was last recomputed for, so a
+    /// backlog of imports in one slot pays for one descent rather than one
+    /// each. `None` until the first recomputation.
+    beacon_head_updated_for_slot: Option<ethlambda_types::beacon::primitives::Slot>,
 }
 
 impl BlockChainServer {
@@ -1166,7 +1171,22 @@ impl BlockChainServer {
         // filtered tree, and only the head after the cascade's last import is
         // ever acted on. Mirrors `lean_on_block`'s own post-cascade-only work
         // (`store.prune_old_data()`) below it.
-        self.update_beacon_head();
+        //
+        // And at most once per slot. Range sync delivers backlog blocks one
+        // per message, so each is its own cascade, and a descent costs
+        // `get_weight` per level: measured at 205ms per call once every
+        // validator has a latest message, which made fork choice the single
+        // largest consumer of a catching-up node's CPU. Nothing reads the head
+        // between two backlog imports in the same slot. `beacon_on_tick`
+        // recomputes it when the slot turns regardless, so the head an
+        // observer sees is never more than one slot stale, and a node at the
+        // tip (one block per slot) is unaffected: its cascades already fall in
+        // separate slots.
+        let current_slot = beacon_chain::current_slot(&self.store, &self.beacon_config);
+        if self.beacon_head_updated_for_slot != Some(current_slot) {
+            self.beacon_head_updated_for_slot = Some(current_slot);
+            self.update_beacon_head();
+        }
     }
 
     /// Import one beacon block, or hold it if the store has no state for its
@@ -1180,6 +1200,20 @@ impl BlockChainServer {
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
         let parent_root = signed_block.parent_root();
+
+        // Already imported: nothing to do, and doing it anyway is expensive.
+        // `fork_choice::on_block` has no idempotence check of its own, so a
+        // duplicate replays the whole state transition, signature verification
+        // included, to reach a state the store already holds. Duplicates are
+        // routine rather than exceptional: a range fetch that reopens against
+        // a new peer re-requests from the sync watermark, and gossip delivers
+        // blocks a range batch is already carrying. On a live catch-up run
+        // this had the node re-importing a range it had already finished, at
+        // 99% CPU, while the tip moved further away.
+        if self.store.has_beacon_block(block_root) {
+            trace!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block already imported");
+            return;
+        }
 
         // A block-index lookup rather than a state lookup, matching what
         // `fork_choice::on_block` itself checks: the state cache holds only the
