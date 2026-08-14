@@ -248,15 +248,54 @@ jobs:
           fi
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
 
-      - name: Run Hive Simulation
-        uses: ethpandaops/hive-github-action@09050fc75bae8a10b1876a0826ca4114ea9ed6e8 # v0.6.3
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
-          hive_repository: ethereum/hive
-          hive_version: dde4f59d04ff0ff8b6585670b08cea1b6c8ab65c
-          simulator: lean
-          client: ethlambda_devnet4
-          client_config: ${{ steps.client-config.outputs.config }}
-          extra_flags: ${{ steps.hive-flags.outputs.flags }}
+          go-version: "1.24"
+          cache: false
+
+      - name: Checkout hive
+        uses: actions/checkout@v6
+        with:
+          repository: ethereum/hive
+          ref: dde4f59d04ff0ff8b6585670b08cea1b6c8ab65c
+          path: src
+
+      - name: Patch Hive Lean Dockerfile
+        run: python3 .github/scripts/patch-hive-lean-dockerfile.py src/simulators/lean/Dockerfile
+
+      - name: Build Hive
+        working-directory: src
+        run: go build -o hive .
+
+      - name: Create Hive results directory
+        working-directory: src
+        run: mkdir -p results
+
+      - name: Write Hive client config
+        working-directory: src
+        run: |
+          cat > client-config.yaml <<'EOF'
+          ${{ steps.client-config.outputs.config }}
+          EOF
+
+      - name: Run Hive Simulation
+        working-directory: src
+        run: |
+          set -x
+          (./hive \
+            --sim lean \
+            --client ethlambda_devnet5 \
+            --results-root results \
+            --client-file=client-config.yaml \
+            ${{ steps.hive-flags.outputs.flags }} \
+            2>&1 || true) | tee hive.log
+
+          if tail -n 10 hive.log | grep -q "simulation .* finished"; then
+            exit 0
+          fi
+
+          exit 1
 
       - name: Check Hive Results For Failures
         id: verify-hive-results
