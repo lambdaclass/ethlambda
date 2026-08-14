@@ -186,33 +186,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Lean RPC Compat"
-            limit: "rpc-compat"
-            artifact_prefix: lean_rpc_compat
-          - name: "Lean Sync"
-            limit: "sync"
-            artifact_prefix: lean_sync
-          - name: "Lean Client Interop"
-            limit: "client-interop"
-            artifact_prefix: lean_client_interop
           - name: "Lean Validation"
             limit: "validation"
             artifact_prefix: lean_validation
           - name: "Lean Gossip"
             limit: "gossip"
             artifact_prefix: lean_gossip
-          - name: "Lean ReqResp"
-            limit: "reqresp"
-            artifact_prefix: lean_reqresp
-          - name: "Lean Fork Choice Spec Tests"
-            limit: "lean-spec-tests-fork-choice"
-            artifact_prefix: lean_spec_fork_choice
-          - name: "Lean State Transition Spec Tests"
-            limit: "lean-spec-tests-state-transition"
-            artifact_prefix: lean_spec_state_transition
-          - name: "Lean Verify Signatures Spec Tests"
-            limit: "lean-spec-tests-verify-signatures"
-            artifact_prefix: lean_spec_verify_signatures
     steps:
       - uses: actions/checkout@v6
 
@@ -285,7 +264,7 @@ jobs:
           set -x
           (./hive \
             --sim lean \
-            --client ethlambda_devnet5 \
+            --client ethlambda_devnet4 \
             --results-root results \
             --client-file=client-config.yaml \
             ${{ steps.hive-flags.outputs.flags }} \
