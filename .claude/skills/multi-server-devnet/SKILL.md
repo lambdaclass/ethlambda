@@ -50,12 +50,31 @@ Nothing about the servers is hardcoded. Establish these from the operator:
 Put those values in `scripts/devnet.env` (copy `scripts/devnet.env.example`;
 gitignored) instead of retyping them: the operator-side scripts source it via
 `scripts/devnet-env.sh`, and an env var exported in the shell still wins over the
-file. It is the one place a deployment's hosts, urls, and Grafana ids live.
-Per-devnet `NODES`/`SUBNETS` are recorded there too, but as the operator's
-inventory — the scripts take them as positional args, and the authority on a
-running devnet is always its own `genesis/config.yaml`
-(`ATTESTATION_COMMITTEE_COUNT`), which `start-devnet.sh` and `convert.sh` check
-against.
+file. It is the one place a deployment's urls and Grafana ids live.
+
+**The servers themselves live in `scripts/devnet.inventory`** (copy
+`scripts/devnet.inventory.example`; gitignored) — name, ip, tags, and per-devnet
+`NODES`/`SUBNETS`, one row per host. Query it with `scripts/inventory.sh` rather
+than reading it by hand:
+
+```bash
+inventory.sh --tag devnet-ab --field ip        # ips, one per line, for a loop
+inventory.sh --tag devnet-ab --tag aggregator  # AND across tags
+inventory.sh --tag validator                   # derived, see below
+SERVERS=$(inventory.sh --field name | tr '\n' ' ')
+```
+
+Tag conventions: a `devnet-*` tag names the chain a host's nodes belong to (two
+hosts sharing one means the split-chain model, *not* two like-named devnets), and
+`aggregator` is a whole-server role. `validator` is **derived** — "has a `devnet-*`
+tag and is not tagged `aggregator`" — so it can never disagree with the aggregator
+tag. An unknown tag exits 2 with the known-tag list rather than returning nothing,
+because a typo that yields an empty loop reports success while doing nothing.
+
+`NODES`/`SUBNETS` there are still the operator's inventory: the scripts take them
+as positional args, and the authority on a running devnet is always its own
+`genesis/config.yaml` (`ATTESTATION_COMMITTEE_COUNT`), which `start-devnet.sh` and
+`convert.sh` check against.
 
 Per devnet, node `n` (0 ≤ n < NODES) on its host:
 
@@ -473,7 +492,8 @@ Swap (persistent): `fallocate -l 16G /swapfile && chmod 600 && mkswap && swapon`
 | `promtail-config.sh` | operator | `NETWORK HOST_IP LOKI_PUSH_URL [N:client ...]` | Emit a per-host promtail.yml (docker_sd → central Loki, labels mirror prometheus, backlog guard) |
 | `sweep.sh` | operator | `CENTRAL_PROM_URL` | Cross-devnet audit: head/justified/finalized + client mix from the central Prometheus |
 | `deploy-finality-alert.sh` | operator | `[WEBHOOK_FILE]`; `METRICS_HOST`, `GRAFANA_*`, `PROM_DS_UID`; `DRY_RUN` | Render + ship the "lost finality" Slack alert to the central Grafana |
-| `devnet-env.sh` / `devnet.env.example` | operator | `$DEVNET_ENV`, `./devnet.env`, script dir | Load this deployment's hosts/urls/Grafana ids as defaults; exported vars win. Copy the example to `devnet.env` (gitignored) once |
+| `devnet-env.sh` / `devnet.env.example` | operator | `$DEVNET_ENV`, `./devnet.env`, script dir | Load this deployment's urls/Grafana ids as defaults; exported vars win. Copy the example to `devnet.env` (gitignored) once |
+| `inventory.sh` / `devnet.inventory.example` | operator | `[--tag T]... [--not-tag T]... [--field F] [--file P] [--count]`; `$DEVNET_INVENTORY`, `./devnet.inventory`, script dir | Select servers by tag from the fleet inventory (name, ip, tags, NODES, SUBNETS). `devnet-*` tags name the chain, `aggregator` is a server role, `validator` is derived (`devnet-*` and not `aggregator`). Unknown tag → exit 2 + known-tag list, so a typo can't masquerade as an empty fleet. Copy the example to `devnet.inventory` (gitignored) once |
 
 **Grafana dashboards** (copy into the central Grafana's dashboards dir —
 `GRAFANA_DASHBOARDS_DIR`, *not* the provisioning tree; they auto-load in ~30s and
