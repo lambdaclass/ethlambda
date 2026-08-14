@@ -564,6 +564,7 @@ impl P2P {
             range_sync_state: None,
             beacon_range_sync: None,
             beacon_peer_heads: HashMap::new(),
+            beacon_fetched_through: 0,
             beacon_pending_root_requests: HashMap::new(),
             bootnode_addrs: built.bootnode_addrs,
             node_names,
@@ -633,8 +634,23 @@ pub struct P2PServer {
     ///
     /// Outlives the session on purpose: `on_beacon_resync_check` needs to know
     /// who to reopen a session with after every peer in the previous one
-    /// failed, and a `Status` is only exchanged on connect.
+    /// failed, and it is refreshed once per slot by `refresh_beacon_peer_heads`.
     pub(crate) beacon_peer_heads: HashMap<PeerId, u64>,
+    /// Highest slot a range batch has been *delivered* for, which is what
+    /// deciding the next range must start from.
+    ///
+    /// The store's import watermark is the obvious candidate and is the wrong
+    /// one: blocks reach the chain actor as messages and import at seconds
+    /// each, so it lags a delivered batch by the whole backlog. Opening the
+    /// next session from it re-requests everything still draining, once per
+    /// resync tick. Measured on a mainnet follower: 11,213 blocks pulled off
+    /// the wire against 100 imported, each duplicate paying a
+    /// `hash_tree_root` before the store could recognise it as one.
+    ///
+    /// Advanced on delivery rather than on request, so a batch whose peer died
+    /// mid-flight is never skipped: it was never delivered, and the session's
+    /// own cursor reissues it.
+    pub(crate) beacon_fetched_through: u64,
     /// In-flight `beacon_blocks_by_root/2` fetches, keyed by the requested root.
     pub(crate) beacon_pending_root_requests:
         HashMap<ethlambda_types::beacon::primitives::Root, PendingRequest>,

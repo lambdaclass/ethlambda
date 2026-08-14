@@ -24,12 +24,29 @@ use crate::beacon::range_sync::{
 use crate::req_resp::{BeaconRequest, Request};
 use crate::{P2PServer, PendingRequest, PendingRequestKind};
 
+/// The slot the next range must start after: the further along of what the
+/// store has imported and what a batch has already delivered.
+///
+/// See `P2PServer::beacon_fetched_through` for why the import watermark alone
+/// is not it.
+fn beacon_sync_origin(server: &P2PServer) -> u64 {
+    sync_origin(
+        server.store.beacon_highest_imported_slot(),
+        server.beacon_fetched_through,
+    )
+}
+
+/// [`beacon_sync_origin`] without a server, so the rule it encodes is testable.
+fn sync_origin(imported_through: u64, fetched_through: u64) -> u64 {
+    imported_through.max(fetched_through)
+}
+
 /// Record a peer's advertised head and open or extend the sync session.
 pub(crate) async fn on_beacon_status(server: &mut P2PServer, peer: PeerId, status: &BeaconStatus) {
     let peer_head_slot = status.head_slot();
     server.beacon_peer_heads.insert(peer, peer_head_slot);
 
-    let local_head_slot = server.store.beacon_highest_imported_slot();
+    let local_head_slot = beacon_sync_origin(server);
     let opened = start_or_merge(
         &mut server.beacon_range_sync,
         peer,
@@ -80,7 +97,7 @@ pub(crate) async fn on_beacon_resync_check(server: &mut P2PServer) {
     let Some((peer, peer_head_slot)) = best_peer_head(&server.beacon_peer_heads) else {
         return;
     };
-    let local_head_slot = server.store.beacon_highest_imported_slot();
+    let local_head_slot = beacon_sync_origin(server);
     if peer_head_slot.saturating_sub(local_head_slot) <= BEACON_SYNC_LAG_THRESHOLD {
         return;
     }
@@ -191,6 +208,9 @@ pub(crate) async fn on_beacon_blocks_by_range_response(
         }
     }
     debug!(%peer, start_slot, end_slot, forwarded, "BeaconBlocksByRange batch applied");
+    // Delivered, so the next range starts after it even though the chain actor
+    // has not imported it yet. See `P2PServer::beacon_fetched_through`.
+    server.beacon_fetched_through = server.beacon_fetched_through.max(end_slot);
 
     if let Some(state) = &mut server.beacon_range_sync {
         state.complete_batch(end_slot);
@@ -321,6 +341,7 @@ mod tests {
     use super::*;
     use crate::RangeSyncState;
     use crate::beacon::messages::MAX_REQUEST_BLOCKS_DENEB;
+    use crate::beacon::range_sync::forward_sync_range;
     use libp2p::identity::Keypair;
 
     fn peer_n(n: u8) -> PeerId {
@@ -381,6 +402,37 @@ mod tests {
             "an empty peer set ends the session; on_beacon_resync_check reopens \
              it once a peer with a higher head is known again"
         );
+    }
+
+    /// The next range starts after what a batch has *delivered*, not after
+    /// what the chain actor has managed to import out of it.
+    ///
+    /// A 64-block batch takes minutes to import at mainnet block sizes while
+    /// the resync timer fires every slot. Starting from the import watermark
+    /// re-requests the whole undrained remainder every tick: the follower this
+    /// was measured on pulled 11,213 blocks off the wire to import 100, and
+    /// every duplicate cost a `hash_tree_root` before the store could reject
+    /// it.
+    #[test]
+    fn the_next_range_follows_what_was_fetched_not_what_was_imported() {
+        let imported_through = 100;
+        let fetched_through = 164;
+
+        let origin = sync_origin(imported_through, fetched_through);
+
+        assert_eq!(origin, fetched_through);
+        assert_eq!(
+            forward_sync_range(origin, 200),
+            Some(165..201),
+            "the 64 blocks already in the actor's mailbox must not be re-requested"
+        );
+    }
+
+    /// Nothing fetched yet, which is every restart: the store is the only
+    /// thing that knows how far this node got.
+    #[test]
+    fn a_fresh_process_falls_back_to_the_import_watermark() {
+        assert_eq!(sync_origin(100, 0), 100);
     }
 
     #[test]
