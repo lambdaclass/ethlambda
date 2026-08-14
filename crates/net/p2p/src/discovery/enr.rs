@@ -94,7 +94,7 @@ impl LocalEnrParams {
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
         pairs.set_extra(ETH2_ENR_KEY, self.fork_id.to_ssz());
-        pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port);
+        pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port.into());
         if let Some(count) = self.custody_group_count {
             pairs.set_extra_int(CGC_ENR_KEY, count);
         }

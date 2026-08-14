@@ -172,7 +172,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -183,7 +183,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -730,7 +730,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -1848,7 +1848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2045,7 +2045,6 @@ dependencies = [
  "ethrex-common",
  "ethrex-p2p",
  "ethrex-rlp",
- "ethrex-storage",
  "futures",
  "hex",
  "libp2p",
@@ -2159,8 +2158,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-blockchain"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -2184,8 +2183,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2218,8 +2217,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -2240,8 +2239,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2259,8 +2258,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2277,8 +2276,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -2295,8 +2294,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-metrics"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -2307,8 +2306,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-p2p"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2349,8 +2348,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2359,8 +2358,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-storage"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2381,8 +2380,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2401,8 +2400,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-vm"
-version = "23.0.0"
-source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#83d7295ba4533f6a840837671415434a64ec3a6b"
+version = "24.0.0"
+source = "git+https://github.com/lambdaclass/ethrex.git?branch=feat%2Fdiscovery-peer-requirements#bf40128061531317366bd0f5718250de0cb83ad7"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
@@ -3144,7 +3143,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3162,7 +3161,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5101,7 +5100,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5875,7 +5874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5971,7 +5970,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6008,7 +6007,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6563,7 +6562,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7057,7 +7056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7328,7 +7327,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8158,7 +8157,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

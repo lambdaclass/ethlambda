@@ -1633,7 +1633,7 @@ mod tests {
             tcp_port: None,
             ..Default::default()
         };
-        pairs.set_extra_int(b"quic", 9001u16);
+        pairs.set_extra_int(b"quic", 9001u64);
         let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
 
         let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
@@ -1708,7 +1708,7 @@ mod tests {
         pairs.set_extra(crate::discovery::enr::ATTNETS_ENR_KEY, attnets_bits);
         pairs.set_extra(crate::discovery::enr::ETH2_ENR_KEY, fork_id.to_ssz());
         if let Some(port) = quic_port {
-            pairs.set_extra_int(crate::discovery::enr::QUIC_ENR_KEY, port);
+            pairs.set_extra_int(crate::discovery::enr::QUIC_ENR_KEY, port.into());
         }
         NodeRecord::from_pairs(1, &signer, pairs).unwrap()
     }

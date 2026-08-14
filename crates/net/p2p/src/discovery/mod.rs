@@ -19,7 +19,7 @@ use ethlambda_types::enr::EnrForkId;
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
 use ethrex_p2p::types::Node;
-use ethrex_storage::{EngineType, Store};
+
 use secp256k1::SecretKey;
 use tokio::net::UdpSocket;
 use tracing::info;
@@ -120,7 +120,7 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         .enr_url()
         .map_err(|err| format!("failed to encode local ENR: {err}"))?;
 
-    let peer_table = PeerTableServer::spawn_with_requirements(
+    let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
         DISCOVERY_TARGET_PEERS,
         // `PeerTableServer::spawn` would impose ethrex's own requirement, an
@@ -128,7 +128,7 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         // would stamp every lean contact as rejected. Lean imposes nothing at
         // the ENR level here: the spec checks live in [`admission`] and run at
         // dial selection instead.
-        Arc::new(admission::AcceptEveryContact),
+        admission::AcceptEveryContact,
     );
 
     let seeds: Vec<Node> = config
@@ -143,25 +143,21 @@ pub async fn spawn_discovery(config: DiscoverySpawnConfig) -> Result<DiscoveryHa
         "Starting discv5 discovery"
     );
 
-    // An empty in-memory store, because `spawn` requires one and lean has no
-    // execution chain. It is read for exactly one thing, `get_fork_id`, whose
-    // result is written into the record ethrex serves; an empty store yields a
-    // genesis-less default rather than anything meaningful.
+    // The record handed over is the same one `enr_url` reported above, so what
+    // ethrex answers discv5 queries with carries every entry a peer judges us
+    // on: `eth2`, `attnets`, `quic` and, on the beacon wire, `tcp` and `cgc`.
+    // ethrex edits and re-signs this record when PONG voting moves our external
+    // IP, rather than rebuilding it, so those entries survive the sequence bump.
     //
-    // KNOWN GAP: `spawn` builds its own local record from `local_node` alone and
-    // offers no way to seed the consensus entries, so the record ethrex serves
-    // over the wire carries `ip`/`udp`/`secp256k1` but not `eth2`, `attnets` or
-    // `quic`. The ENR this node reports (and logs below) is `local_record`,
-    // built by `build_local_enr`, and is complete. The consequence is one-sided
-    // discovery: we can find and admit lean peers, but a lean peer applying the
-    // same admission rules to what ethrex serves would reject us for a missing
-    // `quic` entry. Closing this needs a way to hand `spawn` a prepared record.
-    let store = Store::new("", EngineType::InMemory)
-        .map_err(|err| format!("failed to create the discovery store: {err}"))?;
-
+    // Until `spawn` took a prepared record it built its own from `local_node`
+    // alone, carrying `ip`/`udp`/`secp256k1` and nothing else. Discovery was
+    // one-sided as a result: we found peers and admitted them, while every peer
+    // applying the same fork-digest rule to what we served rejected us, so
+    // nothing ever dialed in. A mainnet follower measured 13 of 18 peers
+    // answering `Goodbye(129)` with no inbound connections to replace them.
     DiscoveryServer::spawn(
-        store,
         local_node,
+        local_record,
         params.signer,
         Arc::new(socket),
         peer_table.clone(),

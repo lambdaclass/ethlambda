@@ -13,11 +13,9 @@
 //! all, since ethrex never clears that flag.
 //!
 //! ethrex now offers a closer fit for this than it did when the module was
-//! written: `PeerRequirements::evaluate` judges each contact as its ENR
-//! arrives, and its `Verdict` splits rejection the same way
-//! [`RejectReason::is_permanent`] does, except that `RejectedForNow` is
-//! *reconsidered* when the peer publishes a higher-`seq` record, which
-//! `set_unwanted` cannot do. Moving these checks there would drop the
+//! written: `PeerFilter::accepts` judges each contact as its ENR arrives, and
+//! the peer table re-runs it when the peer publishes a higher-`seq` record,
+//! which `set_unwanted` cannot do. Moving these checks there would drop the
 //! dial-selection pass and fix the one-way `unwanted` flag. The peer table is
 //! deliberately spawned with [`AcceptEveryContact`] until then, so admission
 //! stays here and behavior is unchanged.
@@ -26,7 +24,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ethlambda_types::enr::{EnrForkId, decode_attnets};
-use ethrex_p2p::requirements::{PeerRequirements, Verdict};
+use ethrex_p2p::peer_filter::PeerFilter;
 use ethrex_p2p::types::NodeRecord;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
@@ -40,21 +38,21 @@ use super::enr::{ATTNETS_ENR_KEY, ETH2_ENR_KEY, read_extra, read_quic_port};
 #[cfg(test)]
 use super::enr::QUIC_ENR_KEY;
 
-/// A [`PeerRequirements`] that imposes nothing at the ENR level.
+/// A [`PeerFilter`] that imposes nothing at the ENR level.
 ///
-/// ethrex's own `PeerTableServer::spawn` would install `EthForkIdRequirements`,
-/// which demands an EIP-2124 `eth` entry compatible with a chain lean does not
-/// have, and so would reject every lean contact permanently. Lean's real checks
-/// are [`admit`], applied at dial selection; see this module's own docs for why
-/// they have not moved here yet.
+/// ethrex's own `PeerTableServer::spawn` would install `EthForkIdFilter`, which
+/// demands an EIP-2124 `eth` entry compatible with a chain lean does not have,
+/// and so would reject every lean contact. Lean's real checks are [`admit`],
+/// applied at dial selection; see this module's own docs for why they have not
+/// moved here yet.
 ///
-/// Answering [`Verdict::Wanted`] unconditionally is what keeps the peer table's
-/// behaviour identical to before ethrex grew this hook.
+/// Accepting unconditionally is what keeps the peer table's behaviour identical
+/// to before ethrex grew this hook.
 pub struct AcceptEveryContact;
 
-impl PeerRequirements for AcceptEveryContact {
-    fn evaluate(&self, _record: &NodeRecord) -> Verdict {
-        Verdict::Wanted
+impl PeerFilter for AcceptEveryContact {
+    fn accepts(&self, _record: &NodeRecord) -> bool {
+        true
     }
 }
 

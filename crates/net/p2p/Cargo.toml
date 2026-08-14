@@ -48,8 +48,6 @@ rand = "0.8"
 ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
 ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
 ethrex-common = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
-# Only for the empty in-memory Store that DiscoveryServer::spawn requires.
-ethrex-storage = { git = "https://github.com/lambdaclass/ethrex.git", branch = "feat/discovery-peer-requirements" }
 
 # Versions pinned to ethrex's workspace: these types cross the API boundary.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "recovery", "rand"] }
