@@ -55,9 +55,6 @@ pub(crate) async fn on_beacon_status(server: &mut P2PServer, peer: PeerId, statu
 /// at the head, so a session whose peers all failed must be reopenable without
 /// a reconnect.
 pub(crate) async fn on_beacon_resync_check(server: &mut P2PServer) {
-    if server.beacon_range_sync.is_some() {
-        return;
-    }
     // Cloned rather than borrowed through `server`: two disjoint fields of the
     // same struct, one mutably, is a rule the reader should not have to check.
     // A `HashSet<PeerId>` of at most a few dozen entries, every 12 seconds.
@@ -65,6 +62,20 @@ pub(crate) async fn on_beacon_resync_check(server: &mut P2PServer) {
     server
         .beacon_peer_heads
         .retain(|peer, _| connected.contains(peer));
+
+    // Ask again what every peer's head is, before deciding there is nothing to
+    // fetch. A `Status` arrives once, at the handshake, so without this the
+    // recorded head is frozen at whatever the peer had when it connected: the
+    // session closes on reaching it and `best_peer_head` then reports nobody
+    // ahead of us, no matter how far the chain has moved. Measured on a mainnet
+    // follower, that left 100-second gaps between import bursts, each ended
+    // only by a *new* peer connecting with a fresher head, and the node lost
+    // ground to wall clock while importing at twice realtime.
+    refresh_beacon_peer_heads(server, &connected).await;
+
+    if server.beacon_range_sync.is_some() {
+        return;
+    }
 
     let Some((peer, peer_head_slot)) = best_peer_head(&server.beacon_peer_heads) else {
         return;
@@ -87,6 +98,27 @@ pub(crate) async fn on_beacon_resync_check(server: &mut P2PServer) {
         );
     }
     request_next_beacon_batch(server).await;
+}
+
+/// Re-open the `Status` handshake with every connected peer.
+///
+/// The answer comes back through the ordinary response path, which is what
+/// records the peer's new head and opens or extends a session; nothing here
+/// waits for it. One small request per peer per mainnet slot.
+async fn refresh_beacon_peer_heads(server: &mut P2PServer, connected: &HashSet<PeerId>) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    // Built once for all peers, and before the loop, so no borrow of
+    // `server.wire` is alive across the sends.
+    let status = crate::beacon::handler::build_status(
+        wire,
+        &server.store,
+        crate::beacon::handler::StatusVersion::V1,
+    );
+    for peer in connected {
+        crate::beacon::handler::send_status(server, *peer, status.clone()).await;
+    }
 }
 
 /// Put the next batch on the wire, if there is one and nothing is in flight.
