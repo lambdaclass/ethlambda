@@ -36,9 +36,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DISCOVERY_DIAL_INTERVAL, DiscoveryHandle,
+        DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
         dial::{DiscoveryState, dial_tick},
         enr::read_quic_port,
+        spawn_discovery,
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
@@ -380,18 +381,30 @@ pub struct P2P {
 }
 
 impl P2P {
-    /// Build swarm, start I/O adapter, spawn actor, and wire the swarm event stream.
+    /// Start discovery, start the I/O adapter, spawn the actor, and wire the
+    /// swarm event stream.
     ///
-    /// `discovery` is `Some` when discv5 discovery is enabled; it seeds the
-    /// dial loop's state and schedules its first tick. `None` leaves the dial
-    /// loop permanently dormant, so peering relies solely on the static
-    /// bootnode list dialed by `build_swarm`.
-    pub fn spawn(
+    /// `discovery` is `Some` when discv5 discovery is enabled: the discv5
+    /// server is started here, and its handle seeds the dial loop's state and
+    /// schedules its first tick. `None` leaves the dial loop permanently
+    /// dormant, so peering relies solely on the static bootnode list dialed by
+    /// `build_swarm`.
+    ///
+    /// Discovery is started before the swarm adapter so a fatal discovery
+    /// failure (a busy UDP port, say) surfaces before any actor is running.
+    pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: Option<DiscoveryHandle>,
-    ) -> P2P {
+        discovery: Option<DiscoverySpawnConfig>,
+    ) -> Result<P2P, DiscoveryError> {
+        let discovery = match discovery {
+            Some(config) => Some(spawn_discovery(config).await?),
+            None => {
+                info!("discv5 discovery disabled; peering from the static bootnode list only");
+                None
+            }
+        };
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
@@ -421,7 +434,7 @@ impl P2P {
             );
         }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
-        P2P { handle }
+        Ok(P2P { handle })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<P2PServer> {
