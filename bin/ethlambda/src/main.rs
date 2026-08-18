@@ -295,8 +295,6 @@ async fn main() -> eyre::Result<()> {
         info!("discv5 discovery disabled; peering from the static bootnode list only");
         None
     };
-    let local_enr = discovery.as_ref().map(|handle| handle.local_enr.clone());
-
     let p2p = P2P::spawn(built, store.clone(), node_names, discovery);
 
     // Wire actors together via protocol refs
@@ -323,10 +321,7 @@ async fn main() -> eyre::Result<()> {
             store,
             aggregator,
             sync_status,
-            ethlambda_rpc::NodeIdentity {
-                peer_id: local_peer_id,
-                enr: local_enr,
-            },
+            local_peer_id,
             events,
             rpc_shutdown,
         )

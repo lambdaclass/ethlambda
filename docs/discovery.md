@@ -55,8 +55,7 @@ The layout follows the discovery domain of the beacon-chain
 There is no `tcp` entry: the spec defines it as the libp2p TCP listening port
 and ethlambda speaks QUIC only.
 
-Read the local ENR from `GET /lean/v0/node/identity`, which reports it as `enr`
-(`null` when discovery is disabled). It is also logged once at startup.
+The local ENR is logged once at startup.
 
 This same record is handed to ethrex's `DiscoveryServer`, so it is what answers
 discv5 queries: what we report and what peers see are the same bytes. If IP
@@ -105,8 +104,8 @@ beacon-chain bootnode published today is the mirror image: `ip`/`udp`/`tcp` and
 no `quic`, usable as a discv5 seed but never dialed. A record with neither is
 dropped with a warning, as is one missing an `ip` or a `secp256k1` key.
 
-The ENR reported by `GET /lean/v0/node/identity` is only useful to a peer if
-the node that published it was started with a real `--discovery.advertise-ip`.
+The ENR a node logs at startup is only useful to a peer if that node was
+started with a real `--discovery.advertise-ip`.
 Copying an ENR built from the default `0.0.0.0` into another node's bootnode
 list produces a `udp`/`quic` target that cannot be dialed, since `0.0.0.0`
 names no reachable host. Set `--discovery.advertise-ip` before pointing other

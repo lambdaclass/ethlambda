@@ -3,7 +3,6 @@ use ethlambda_blockchain::metrics::SyncStatus;
 use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, SyncStatusController};
 use ethlambda_storage::Store;
 use serde::Serialize;
-use std::sync::Arc;
 
 use crate::json_response;
 
@@ -15,25 +14,11 @@ struct SyncingResponse {
     finalized_slot: u64,
 }
 
-/// How this node identifies itself on the network. Fixed at startup and
-/// reported verbatim by `/lean/v0/node/identity`.
-#[derive(Debug, Clone, Serialize)]
-pub struct NodeIdentity {
-    /// This node's libp2p peer ID (base58), as it appears to peers on the wire.
-    pub peer_id: String,
-    /// This node's discv5 ENR, or `null` when discovery is disabled.
-    ///
-    /// Captured at startup. discv5 may bump the record's sequence number later
-    /// if PONG-based IP voting changes our external address, which this field
-    /// does not track.
-    pub enr: Option<String>,
-}
-
 #[derive(Serialize)]
-struct IdentityResponse<'a> {
+struct IdentityResponse {
     version: &'static str,
-    #[serde(flatten)]
-    identity: &'a NodeIdentity,
+    /// This node's libp2p peer ID (base58), as it appears to peers on the wire.
+    peer_id: String,
 }
 
 /// Sync status for `/lean/v0/node/syncing`.
@@ -75,25 +60,18 @@ async fn get_syncing(
 
 /// Reports node identity: the full client version string (identical to
 /// `ethlambda --version`: semver, git branch and short SHA, target triple, and
-/// rustc version), the node's libp2p peer ID, and its discv5 ENR (`null` when
-/// discovery is disabled). All three are fixed at startup and captured by the
-/// route in `routes`.
-async fn get_identity(version: &'static str, identity: Arc<NodeIdentity>) -> impl IntoResponse {
-    json_response(IdentityResponse {
-        version,
-        identity: &identity,
-    })
+/// rustc version) and the node's libp2p peer ID. Both are fixed at startup and
+/// captured by the route in `routes`.
+async fn get_identity(version: &'static str, peer_id: String) -> impl IntoResponse {
+    json_response(IdentityResponse { version, peer_id })
 }
 
-pub(crate) fn routes(version: &'static str, identity: NodeIdentity) -> Router<Store> {
-    // `Arc` so the route closure hands each request a refcount bump rather than
-    // re-cloning two startup-fixed strings.
-    let identity = Arc::new(identity);
+pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .route("/lean/v0/node/syncing", get(get_syncing))
         .route(
             "/lean/v0/node/identity",
-            get(move || get_identity(version, identity.clone())),
+            get(move || get_identity(version, peer_id.clone())),
         )
 }
 
@@ -112,7 +90,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    use super::NodeIdentity;
     use crate::test_utils::create_test_state;
 
     /// Helper: GET /lean/v0/node/syncing (with the given sync controller) and
@@ -191,41 +168,7 @@ mod tests {
             "ethlambda/v9.9.9-test-deadbeef/x86_64-unknown-linux-gnu/rustc-v1.92.0";
         const PEER_ID: &str = "16Uiu2HAmTestPeerIdSentinel";
         let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(
-            store,
-            VERSION,
-            NodeIdentity {
-                peer_id: PEER_ID.to_string(),
-                enr: None,
-            },
-        );
-        let json = identity_json(app).await;
-        assert_eq!(json["version"], VERSION);
-        assert_eq!(json["peer_id"], PEER_ID);
-        assert!(
-            json["enr"].is_null(),
-            "enr must be null when discovery is disabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn node_identity_reports_the_enr_when_discovery_is_enabled() {
-        const ENR: &str = "enr:-TestSentinelRecord";
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
-        let app = crate::build_api_router(
-            store,
-            "ethlambda/test",
-            NodeIdentity {
-                peer_id: "test-peer".to_string(),
-                enr: Some(ENR.to_string()),
-            },
-        );
-        let json = identity_json(app).await;
-        assert_eq!(json["enr"], ENR);
-    }
-
-    /// Helper: GET /lean/v0/node/identity and parse the JSON body.
-    async fn identity_json(app: axum::Router) -> serde_json::Value {
+        let app = crate::build_api_router(store, VERSION, PEER_ID.to_string());
         let resp = app
             .oneshot(
                 Request::builder()
@@ -237,6 +180,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&body).unwrap()
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], VERSION);
+        assert_eq!(json["peer_id"], PEER_ID);
     }
 }
