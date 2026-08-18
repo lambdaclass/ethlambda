@@ -13,8 +13,8 @@ use super::{
 };
 
 use crate::beacon::messages::{
-    BeaconMetaData, BeaconStatus, Goodbye, MetaDataV1, MetaDataV2, MetaDataV3, Ping, StatusV1,
-    StatusV2,
+    BeaconBlocksByRangeRequest, BeaconBlocksByRootRequest, BeaconMetaData, BeaconStatus, Goodbye,
+    MetaDataV1, MetaDataV2, MetaDataV3, Ping, StatusV1, StatusV2,
 };
 use crate::beacon::protocols;
 use crate::metrics;
@@ -207,6 +207,18 @@ impl libp2p::request_response::Codec for Codec {
             protocols::GOODBYE_V1 => Ok(Request::Beacon(BeaconRequest::Goodbye(
                 Goodbye::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
             ))),
+            protocols::BEACON_BLOCKS_BY_RANGE_V2 => {
+                Ok(Request::Beacon(BeaconRequest::BlocksByRange(
+                    BeaconBlocksByRangeRequest::from_ssz_bytes(&payload)
+                        .map_err(|err| invalid(format!("{err:?}")))?,
+                )))
+            }
+            protocols::BEACON_BLOCKS_BY_ROOT_V2 => {
+                Ok(Request::Beacon(BeaconRequest::BlocksByRoot(
+                    BeaconBlocksByRootRequest::from_ssz_bytes(&payload)
+                        .map_err(|err| invalid(format!("{err:?}")))?,
+                )))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown protocol: {}", protocol.as_ref()),
@@ -733,6 +745,48 @@ mod tests {
             .read_response(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
+    }
+
+    /// Registering a protocol inbound is only half of serving it: the codec has
+    /// to be able to *read* the request too. Without these arms `read_request`
+    /// fell through to "unknown protocol", libp2p aborted the inbound stream,
+    /// and the asking peer saw the response end at EOF with nothing in it.
+    #[tokio::test]
+    async fn a_beacon_range_request_round_trips() {
+        let decoded = request_round_trip(
+            protocols::BEACON_BLOCKS_BY_RANGE_V2,
+            Request::Beacon(BeaconRequest::BlocksByRange(
+                BeaconBlocksByRangeRequest::new(15_021_857, 5),
+            )),
+        )
+        .await;
+
+        let Request::Beacon(BeaconRequest::BlocksByRange(request)) = decoded else {
+            panic!("a range request reads back as one");
+        };
+        assert_eq!(request.start_slot, 15_021_857);
+        assert_eq!(request.count, 5);
+        assert_eq!(request.step, 1);
+    }
+
+    #[tokio::test]
+    async fn a_beacon_by_root_request_round_trips() {
+        let mut roots = crate::beacon::messages::BeaconRequestedBlockRoots::new();
+        roots.push(Root::repeat_byte(7)).expect("within the bound");
+        roots.push(Root::repeat_byte(8)).expect("within the bound");
+
+        let decoded = request_round_trip(
+            protocols::BEACON_BLOCKS_BY_ROOT_V2,
+            Request::Beacon(BeaconRequest::BlocksByRoot(BeaconBlocksByRootRequest {
+                roots: roots.clone(),
+            })),
+        )
+        .await;
+
+        let Request::Beacon(BeaconRequest::BlocksByRoot(request)) = decoded else {
+            panic!("a by-root request reads back as one");
+        };
+        assert_eq!(request.roots.to_vec(), roots.to_vec());
     }
 
     /// A block chunk is `<result><context-bytes><payload>`, and the reader
