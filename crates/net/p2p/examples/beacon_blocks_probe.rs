@@ -22,7 +22,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::primitives::Root;
 use libp2p::futures::StreamExt as _;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, identity, noise, request_response, tcp, yamux};
+use libp2p::{Multiaddr, StreamProtocol, identity, noise, request_response, tcp, yamux};
 
 /// Mainnet's `genesis_validators_root`. Only used to build the codec, which
 /// needs it to label the chunks it *writes*; this probe only reads.
@@ -98,11 +98,16 @@ async fn main() {
                 // address alone is enough to dial.
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     println!("CONNECTED {peer_id}, asking for {count} blocks from slot {start_slot}");
-                    swarm.behaviour_mut().send_request(
+                    // `send_request_with_protocol`, not `send_request`: with
+                    // several protocols registered the latter picks the first
+                    // one the remote supports, which is `status/1`, and the
+                    // range request would go out on the handshake stream.
+                    swarm.behaviour_mut().send_request_with_protocol(
                         &peer_id,
                         Request::Beacon(BeaconRequest::BlocksByRange(
                             BeaconBlocksByRangeRequest::new(start_slot, count),
                         )),
+                        StreamProtocol::new(protocols::BEACON_BLOCKS_BY_RANGE_V2),
                     );
                 }
                 SwarmEvent::Behaviour(request_response::Event::Message {
