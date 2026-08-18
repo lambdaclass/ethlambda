@@ -13,9 +13,13 @@
 //! | a finalized anchor state | `States` | root | fork selector, then `BeaconState` SSZ |
 //! | the unrealized justification of a block | `BeaconForkChoice` | root | beacon `Checkpoint` SSZ |
 //!
-//! `BlockRoots` is not written on this path. Nothing serves canonical-by-slot
-//! beacon queries until sub-project E, and an index nothing reads is an
-//! invariant nothing checks.
+//! `BlockRoots` is still not written on this path.
+//! [`Store::beacon_canonical_blocks_by_range`], which is what serves
+//! `beacon_blocks_by_range`, walks parent links back from the fork-choice head
+//! instead. The walk is bounded by the retained window and answers with the
+//! chain the head actually descends from, which a slot-keyed index could not do
+//! on its own: a slot holds several blocks as soon as there is a fork, and
+//! picking between them is exactly what the parent links decide.
 //!
 //! # These accessors do not return `Result`
 //!
@@ -592,6 +596,66 @@ impl Store {
     pub fn set_beacon_head(&mut self, slot: Slot, root: Root) {
         self.beacon.lock().unwrap().head = Some((slot, root));
     }
+
+    /// The canonical blocks in `start_slot ..= end_slot`, oldest first.
+    ///
+    /// "Canonical" means on the chain the fork-choice head descends from, which
+    /// is what `beacon_blocks_by_range` is defined to return: the index alone
+    /// cannot answer it, because a slot can hold several blocks once a fork
+    /// exists and only one of them is on the head's chain.
+    ///
+    /// Found by walking parent links back from the head, so the walk visits
+    /// exactly the canonical chain and nothing else. Slots with no block are
+    /// simply absent from the result, which is what a peer expects: the
+    /// specification's response is a list, not a slot-indexed array.
+    ///
+    /// Empty when there is no head yet, which is every moment before this
+    /// process has computed one. A node that cannot say which chain is
+    /// canonical has nothing honest to serve.
+    pub fn beacon_canonical_blocks_by_range(
+        &self,
+        start_slot: Slot,
+        end_slot: Slot,
+    ) -> Vec<SignedBeaconBlock> {
+        let Some((head_slot, head_root)) = self.beacon_head() else {
+            return Vec::new();
+        };
+        if start_slot > end_slot || start_slot > head_slot {
+            return Vec::new();
+        }
+
+        // Walk down from the head to `start_slot`, collecting the roots that
+        // fall inside the window. The walk starts at the head rather than at
+        // `end_slot` because only the parent links say which block at a given
+        // slot is the canonical one.
+        let mut roots = Vec::new();
+        let mut cursor = head_root;
+        // Ends when the walk leaves the retained window: `promote_beacon_anchor`
+        // prunes below the oldest kept anchor, and a missing entry there is the
+        // floor rather than a fault.
+        while let Some((slot, parent_root)) = self.beacon_block_entry(cursor) {
+            if slot < start_slot {
+                break;
+            }
+            if slot <= end_slot {
+                roots.push(cursor);
+            }
+            // Genesis is its own parent's root of zero; without this the walk
+            // would look zero up and stop one iteration later anyway, but only
+            // by accident.
+            if slot == 0 {
+                break;
+            }
+            cursor = parent_root;
+        }
+
+        // The walk produced newest-first; the response is oldest-first.
+        roots.reverse();
+        roots
+            .into_iter()
+            .filter_map(|root| self.beacon_block(root))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +702,115 @@ mod tests {
     /// An empty beacon store on an in-memory backend.
     fn beacon_store() -> Store {
         Store::init_beacon(Arc::new(InMemoryBackend::new()), 0)
+    }
+
+    /// Builds `anchor -> 1 -> 2 -> ... -> length` and returns each block's
+    /// root by slot, with the head set to the last one.
+    fn chain(store: &mut Store, length: u64) -> Vec<Root> {
+        let mut roots = Vec::new();
+        let mut parent = Root::zero();
+        for slot in 1..=length {
+            let signed = block(slot, parent);
+            let root = signed.message_hash_tree_root();
+            store.insert_beacon_block(root, &signed);
+            roots.push(root);
+            parent = root;
+        }
+        store.set_beacon_head(length, *roots.last().expect("length is nonzero"));
+        roots
+    }
+
+    #[test]
+    fn a_canonical_range_comes_back_oldest_first_and_inclusive_of_both_ends() {
+        let mut store = beacon_store();
+        chain(&mut store, 10);
+
+        let blocks = store.beacon_canonical_blocks_by_range(3, 6);
+
+        assert_eq!(
+            blocks.iter().map(|block| block.slot()).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+    }
+
+    /// A slot holds more than one block as soon as there is a fork, and only
+    /// the parent links say which of them the head descends from. Serving the
+    /// other one would hand a peer a block off its own canonical chain.
+    #[test]
+    fn a_fork_sibling_at_the_same_slot_is_not_served() {
+        let mut store = beacon_store();
+        let roots = chain(&mut store, 5);
+
+        // A competing block at slot 5, off slot 3, which the head does not
+        // descend from.
+        let sibling = block(5, roots[2]);
+        let sibling_root = sibling.message_hash_tree_root();
+        store.insert_beacon_block(sibling_root, &sibling);
+
+        let served: Vec<_> = store
+            .beacon_canonical_blocks_by_range(5, 5)
+            .iter()
+            .map(|block| block.message_hash_tree_root())
+            .collect();
+
+        assert_eq!(served, vec![roots[4]], "the head's own slot-5 block");
+        assert!(!served.contains(&sibling_root));
+    }
+
+    /// The walk starts at the head, so anything above it is not canonical yet
+    /// and must not be served, even though the store holds it.
+    #[test]
+    fn nothing_above_the_head_is_served() {
+        let mut store = beacon_store();
+        let roots = chain(&mut store, 5);
+        let ahead = block(6, roots[4]);
+        store.insert_beacon_block(ahead.message_hash_tree_root(), &ahead);
+
+        let blocks = store.beacon_canonical_blocks_by_range(1, 10);
+
+        assert_eq!(
+            blocks.iter().map(|block| block.slot()).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "the head bounds the answer, not the highest block stored"
+        );
+    }
+
+    /// Before the first `get_head` call there is no canonical chain to name,
+    /// and a node that cannot say which chain is canonical has nothing honest
+    /// to serve.
+    #[test]
+    fn a_store_with_no_head_serves_nothing() {
+        let mut store = beacon_store();
+        let signed = block(1, Root::zero());
+        store.insert_beacon_block(signed.message_hash_tree_root(), &signed);
+
+        assert!(store.beacon_canonical_blocks_by_range(0, 10).is_empty());
+    }
+
+    /// The walk ends where pruning did, rather than failing on the first root
+    /// `promote_beacon_anchor` removed from the index.
+    #[test]
+    fn a_range_reaching_below_the_retained_window_stops_there() {
+        let mut store = beacon_store();
+        let roots = chain(&mut store, 6);
+        // Re-root the chain at slot 4 by making its parent unknown, which is
+        // what a prune below the oldest anchor leaves behind.
+        let orphaned = block(4, Root::repeat_byte(0xfe));
+        let orphaned_root = orphaned.message_hash_tree_root();
+        store.insert_beacon_block(orphaned_root, &orphaned);
+        let five = block(5, orphaned_root);
+        let five_root = five.message_hash_tree_root();
+        store.insert_beacon_block(five_root, &five);
+        store.set_beacon_head(5, five_root);
+        let _ = roots;
+
+        let blocks = store.beacon_canonical_blocks_by_range(1, 5);
+
+        assert_eq!(
+            blocks.iter().map(|block| block.slot()).collect::<Vec<_>>(),
+            vec![4, 5],
+            "the walk stops at the missing parent instead of panicking"
+        );
     }
 
     #[test]

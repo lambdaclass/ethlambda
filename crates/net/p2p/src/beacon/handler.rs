@@ -13,8 +13,9 @@ use libp2p::request_response::ResponseChannel;
 use tracing::{debug, error, info, warn};
 
 use super::messages::{
-    AttnetsBits, BeaconMetaData, BeaconStatus, Goodbye, MetaDataV1, MetaDataV2, MetaDataV3, Ping,
-    StatusV1, StatusV2, SyncnetsBits,
+    AttnetsBits, BeaconBlocksByRangeRequest, BeaconMetaData, BeaconStatus, Goodbye,
+    MAX_REQUEST_BLOCKS_DENEB, MetaDataV1, MetaDataV2, MetaDataV3, Ping, StatusV1, StatusV2,
+    SyncnetsBits,
 };
 use super::{BeaconWire, constants, decode, protocols, topics};
 use crate::gossipsub::decompress_message;
@@ -23,6 +24,7 @@ use crate::req_resp::{
 };
 use crate::{P2PServer, metrics};
 use ethlambda_storage::Store;
+use ethlambda_types::beacon::containers::SignedBeaconBlock;
 
 /// The `Status` this node advertises, in the version the stream asked for.
 ///
@@ -150,6 +152,36 @@ pub async fn retry_status_on_other_version(server: &P2PServer, peer_id: PeerId) 
     send_status(server, peer_id, status).await;
 }
 
+/// The canonical blocks answering `request`, oldest first.
+///
+/// Three bounds, all of them the specification's:
+///
+/// * `count` is clamped to `MAX_REQUEST_BLOCKS_DENEB` rather than refused. A
+///   peer asking for more than the cap gets the cap's worth, which is what it
+///   would have got by asking twice.
+/// * The window starts no earlier than this node's own anchor. Everything below
+///   it was never fetched, and `Status` v2 already told the peer so through
+///   `earliest_available_slot`.
+/// * Nothing above the fork-choice head, which
+///   [`Store::beacon_canonical_blocks_by_range`] enforces by construction: it
+///   walks down from the head, so a slot the head does not descend from cannot
+///   appear.
+///
+/// A short or empty answer is legal and expected here. The asking peer reads
+/// the slots it actually received, not the ones it asked for.
+fn blocks_by_range(store: &Store, request: &BeaconBlocksByRangeRequest) -> Vec<SignedBeaconBlock> {
+    let count = request.count.min(MAX_REQUEST_BLOCKS_DENEB);
+    if count == 0 {
+        return Vec::new();
+    }
+    let start_slot = request.start_slot.max(store.beacon_anchor_slot());
+    // `count - 1` because the range is inclusive of its start.
+    let Some(end_slot) = request.start_slot.checked_add(count - 1) else {
+        return Vec::new();
+    };
+    store.beacon_canonical_blocks_by_range(start_slot, end_slot)
+}
+
 /// Answer a beacon request, or drop the channel when the protocol expects no
 /// answer.
 pub async fn handle_beacon_request(
@@ -210,18 +242,30 @@ pub async fn handle_beacon_request(
             info!(%peer, reason, "Peer said goodbye");
             return;
         }
-        // Registered `ProtocolSupport::Outbound`, so libp2p refuses the inbound
-        // stream at negotiation and these never arrive. A checkpoint-synced
-        // node holds nothing below its anchor, so declining the stream is a
-        // more useful answer than a short response the peer has to diagnose.
-        BeaconRequest::BlocksByRange(_) | BeaconRequest::BlocksByRoot(_) => {
-            debug!(%peer, "Refusing an inbound beacon block request: this node serves none");
-            let response = Response::error(
-                ResponseCode::RESOURCE_UNAVAILABLE,
-                error_message("this node does not serve beacon blocks"),
+        BeaconRequest::BlocksByRange(request) => {
+            let blocks = blocks_by_range(&server.store, &request);
+            info!(
+                %peer,
+                start_slot = request.start_slot,
+                count = request.count,
+                served = blocks.len(),
+                "Serving a beacon range request"
             );
-            server.swarm_handle.send_response(channel, response);
-            return;
+            Some(BeaconResponse::Blocks(blocks))
+        }
+        BeaconRequest::BlocksByRoot(request) => {
+            let blocks: Vec<_> = request
+                .roots
+                .iter()
+                .filter_map(|root| server.store.beacon_block(*root))
+                .collect();
+            debug!(
+                %peer,
+                asked = request.roots.len(),
+                served = blocks.len(),
+                "Serving a beacon by-root request"
+            );
+            Some(BeaconResponse::Blocks(blocks))
         }
     };
 
@@ -365,6 +409,43 @@ mod tests {
         }
     }
 
+    /// A phase0 block at `slot`, for building a canonical chain in the store.
+    fn beacon_block(
+        slot: u64,
+        parent_root: ethlambda_types::beacon::primitives::Root,
+    ) -> ethlambda_types::beacon::containers::SignedBeaconBlock {
+        use ethlambda_types::beacon::containers::phase0;
+        ethlambda_types::beacon::containers::SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: Default::default(),
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Default::default(),
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// Any state at all: `promote_beacon_anchor` writes one, and nothing under
+    /// test here reads it back. The lean variant is the one with a constructor
+    /// that takes no fixture, which is why an otherwise all-beacon test uses
+    /// it; the storage crate's own tests do the same.
+    fn beacon_state() -> ethlambda_types::beacon::containers::BeaconState {
+        ethlambda_types::beacon::containers::BeaconState::Lean(
+            ethlambda_types::state::State::from_genesis(0, Vec::new()),
+        )
+    }
+
     fn empty_beacon_store() -> Store {
         Store::init_beacon(
             std::sync::Arc::new(ethlambda_storage::backend::InMemoryBackend::new()),
@@ -419,6 +500,87 @@ mod tests {
             earliest_available_slot: 0,
         });
         assert_eq!(StatusVersion::of(&peer_asked_in), StatusVersion::V2);
+    }
+
+    /// A store holding slots 1..=`length` on the canonical chain, anchored at
+    /// `anchor_slot`.
+    fn store_with_chain(anchor_slot: u64, length: u64) -> Store {
+        let mut store = empty_beacon_store();
+        let mut parent = ethlambda_types::beacon::primitives::Root::zero();
+        let mut last = (0, parent);
+        for slot in 1..=length {
+            let signed = beacon_block(slot, parent);
+            let root = signed.message_hash_tree_root();
+            store.insert_beacon_block(root, &signed);
+            parent = root;
+            last = (slot, root);
+        }
+        store.set_beacon_head(last.0, last.1);
+        if anchor_slot > 0 {
+            // `beacon_anchor_slot` reads the oldest anchor's own block, so the
+            // anchor list has to name a block the store holds.
+            let anchor_root = store
+                .beacon_canonical_blocks_by_range(anchor_slot, anchor_slot)
+                .first()
+                .expect("the anchor slot is on the chain")
+                .message_hash_tree_root();
+            store.promote_beacon_anchor(anchor_root, &beacon_state());
+        }
+        store
+    }
+
+    /// A peer asking for more than `MAX_REQUEST_BLOCKS_DENEB` gets the cap's
+    /// worth rather than an error: that is what it would have got by asking
+    /// twice, and refusing teaches it nothing.
+    #[test]
+    fn an_oversized_range_request_is_clamped_rather_than_refused() {
+        let store = store_with_chain(0, 200);
+
+        let served = blocks_by_range(
+            &store,
+            &BeaconBlocksByRangeRequest::new(1, MAX_REQUEST_BLOCKS_DENEB + 50),
+        );
+
+        assert_eq!(served.len() as u64, MAX_REQUEST_BLOCKS_DENEB);
+        assert_eq!(served.first().expect("nonempty").slot(), 1);
+    }
+
+    #[test]
+    fn a_zero_count_request_is_answered_with_nothing() {
+        let store = store_with_chain(0, 10);
+
+        assert!(blocks_by_range(&store, &BeaconBlocksByRangeRequest::new(1, 0)).is_empty());
+    }
+
+    /// Everything below the anchor was never fetched. The window is raised to
+    /// the anchor rather than the whole request being refused, so a peer that
+    /// asked across the boundary still gets the half this node has.
+    #[test]
+    fn a_range_starting_below_the_anchor_is_served_from_the_anchor() {
+        let store = store_with_chain(5, 10);
+
+        let served = blocks_by_range(&store, &BeaconBlocksByRangeRequest::new(1, 8));
+
+        assert_eq!(
+            served.iter().map(|block| block.slot()).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8],
+            "from the anchor up to the end the request named"
+        );
+    }
+
+    /// The count is counted from the slot the peer asked for, not from the
+    /// anchor the answer starts at: raising the floor must not extend the top.
+    #[test]
+    fn raising_the_start_to_the_anchor_does_not_extend_the_end() {
+        let store = store_with_chain(5, 20);
+
+        let served = blocks_by_range(&store, &BeaconBlocksByRangeRequest::new(1, 8));
+
+        assert_eq!(
+            served.last().expect("nonempty").slot(),
+            8,
+            "slot 1 + 8 - 1, the end of the range the peer named"
+        );
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! The request/response protocols `ethlambda beacon` registers.
 //!
 //! Registered by direction, following the same subscribe-only-what-you-consume
-//! rule the topics follow. `beacon_blocks_by_{range,root}/2` are registered
-//! outbound now that the anchor-to-head fetch calls them. The sidecar protocols
-//! stay absent: nothing consumes them, and an unregistered protocol is refused
-//! at stream negotiation rather than answered with a lie.
+//! rule the topics follow. `beacon_blocks_by_{range,root}/2` are registered in
+//! both directions: the anchor-to-head fetch calls them, and the store can
+//! answer them for the window it retains. The sidecar protocols stay absent:
+//! nothing consumes them, and an unregistered protocol is refused at stream
+//! negotiation rather than answered with a lie.
 
 use libp2p::StreamProtocol;
 use libp2p::request_response::ProtocolSupport;
@@ -26,11 +27,14 @@ pub const BEACON_BLOCKS_BY_ROOT_V2: &str =
 /// `goodbye/1` is inbound only: this node logs the reason code a peer sends and
 /// never sends one itself, because it has no opinion worth disconnecting over.
 ///
-/// The two block protocols are **outbound only**: this node asks for blocks to
-/// close the anchor-to-head gap, and serves none. It cannot honestly serve
-/// them, because checkpoint sync leaves it with nothing below its anchor, and
-/// answering a range request with a short response is worse for the asking peer
-/// than declining the stream outright.
+/// The two block protocols are bidirectional. This node asks for blocks to
+/// close the anchor-to-head gap, and serves what it holds above its own anchor:
+/// a short response is exactly what the specification expects from a
+/// checkpoint-synced peer, which is why `Status` v2 carries
+/// `earliest_available_slot` for the asker to read first. Declining the stream
+/// instead made this node useless to every peer it connected to, and a
+/// well-connected one answers `Goodbye(129)`, "too many peers", to the useless
+/// ones first.
 ///
 /// Everything else is bidirectional, since the handshake runs in both
 /// directions on every connection.
@@ -45,11 +49,11 @@ pub fn registrations() -> Vec<(StreamProtocol, ProtocolSupport)> {
         (StreamProtocol::new(GOODBYE_V1), ProtocolSupport::Inbound),
         (
             StreamProtocol::new(BEACON_BLOCKS_BY_RANGE_V2),
-            ProtocolSupport::Outbound,
+            ProtocolSupport::Full,
         ),
         (
             StreamProtocol::new(BEACON_BLOCKS_BY_ROOT_V2),
-            ProtocolSupport::Outbound,
+            ProtocolSupport::Full,
         ),
     ]
 }
@@ -131,8 +135,13 @@ mod tests {
         }
     }
 
+    /// Both directions, since this node both asks for blocks and answers for
+    /// them. Registering them outbound-only refused the inbound stream at
+    /// negotiation, which is what made this node worth nothing to its peers:
+    /// a well-connected one prunes the peers it cannot get anything from
+    /// first, and this one was answered `Goodbye(129)` by most of them.
     #[test]
-    fn the_block_protocols_are_registered_outbound() {
+    fn the_block_protocols_are_registered_in_both_directions() {
         // Verified against consensus-specs specs/deneb/p2p-interface.md, which
         // gives both protocol ids; the `ssz_snappy` suffix is the encoding
         // strategy every mainnet client negotiates.
@@ -151,9 +160,10 @@ mod tests {
                 .find(|(protocol, _)| protocol.as_ref() == id)
                 .unwrap_or_else(|| panic!("{id} is registered"));
             assert!(
-                matches!(support, ProtocolSupport::Outbound),
-                "{id} is requested, never served: a checkpoint-synced node has \
-                 nothing below its anchor to answer with"
+                matches!(support, ProtocolSupport::Full),
+                "{id} is both requested and served; a short answer bounded by \
+                 this node's anchor is what a peer expects, which is why \
+                 Status v2 carries earliest_available_slot"
             );
         }
     }

@@ -369,6 +369,7 @@ pub async fn run(config: BeaconRunConfig) -> eyre::Result<BeaconNode> {
             fork_digest: fork_id.fork_digest,
             config: chain.clone(),
             genesis_time: params.genesis_time,
+            genesis_validators_root: params.genesis_validators_root,
             bootnodes,
         },
     )

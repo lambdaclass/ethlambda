@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::ForkDigest;
+use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 use libp2p::identity::secp256k1;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::dial_opts::DialOpts;
@@ -37,6 +37,9 @@ pub struct BeaconSwarmConfig {
     pub fork_digest: ForkDigest,
     pub config: Config,
     pub genesis_time: u64,
+    /// Needed by the req/resp codec, which labels each block chunk it writes
+    /// with the fork digest of that block's own fork.
+    pub genesis_validators_root: Root,
     /// Parsed from the built-in list or from `--bootnodes`. Every published
     /// mainnet record advertises `tcp` (none advertises `quic`), which is
     /// what makes them statically dialable now that the swarm speaks TCP.
@@ -54,11 +57,12 @@ pub fn build_beacon_swarm(
     )
     .expect("failed to initiate behaviour");
 
-    // The codec carries the fork schedule: a `beacon_blocks_by_*/2` chunk is
-    // fork-typed, so decoding one needs the same schedule the digest was
-    // computed from.
+    // The codec carries the fork schedule and the genesis validators root: a
+    // `beacon_blocks_by_*/2` chunk is fork-typed, so decoding one needs the
+    // same schedule the digest was computed from, and writing one needs to
+    // recompute the digest of the fork each block belongs to.
     let req_resp = request_response::Behaviour::with_codec(
-        crate::req_resp::Codec::beacon(config.config.clone()),
+        crate::req_resp::Codec::beacon(config.config.clone(), config.genesis_validators_root),
         protocols::registrations(),
         Default::default(),
     );
@@ -194,6 +198,7 @@ mod tests {
             fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
             config: Config::mainnet(),
             genesis_time: 1_606_824_023,
+            genesis_validators_root: Root::zero(),
             bootnodes: mainnet_bootnodes,
         })
         .expect("swarm builds");

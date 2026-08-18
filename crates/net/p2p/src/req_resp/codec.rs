@@ -106,15 +106,48 @@ pub struct Codec {
     /// schedule. Lean's swarm builds this codec with `Default::default()` and
     /// never reaches a protocol that reads it.
     beacon_config: Option<std::sync::Arc<ethlambda_types::beacon::config::Config>>,
+    /// The chain's `genesis_validators_root`, on a beacon swarm only.
+    ///
+    /// Writing a block chunk needs it: the `context-bytes` prefix is the fork
+    /// digest of the fork *the block belongs to*, and a fork digest is computed
+    /// from the schedule and this root together. Reading does not, which is why
+    /// it arrives with the write path rather than with the schedule.
+    beacon_genesis_validators_root: ethlambda_types::beacon::primitives::Root,
 }
 
 impl Codec {
-    /// The codec for a beacon swarm, carrying the schedule its block responses
-    /// are decoded against.
-    pub fn beacon(config: ethlambda_types::beacon::config::Config) -> Self {
+    /// The codec for a beacon swarm, carrying what its block chunks are decoded
+    /// against and written with.
+    pub fn beacon(
+        config: ethlambda_types::beacon::config::Config,
+        genesis_validators_root: ethlambda_types::beacon::primitives::Root,
+    ) -> Self {
         Self {
             beacon_config: Some(std::sync::Arc::new(config)),
+            beacon_genesis_validators_root: genesis_validators_root,
         }
+    }
+
+    /// The `context-bytes` for a block at `slot`: the fork digest of the fork
+    /// whose rules that block was made under.
+    ///
+    /// Not this node's current digest. A range request spanning a fork boundary
+    /// must label each chunk with its own fork, or the asking peer decodes the
+    /// older blocks with the newer fork's container and gets nonsense.
+    fn beacon_context_bytes(
+        &self,
+        slot: ethlambda_types::beacon::primitives::Slot,
+    ) -> io::Result<ethlambda_types::beacon::primitives::ForkDigest> {
+        let config = self
+            .beacon_config
+            .as_ref()
+            .ok_or_else(|| invalid("a beacon block response needs the fork schedule"))?;
+        let epoch = slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        Ok(ethlambda_types::beacon::fork_digest::compute_fork_digest(
+            config,
+            self.beacon_genesis_validators_root,
+            epoch,
+        ))
     }
 }
 
@@ -321,16 +354,39 @@ impl libp2p::request_response::Codec for Codec {
                             BeaconResponse::MetaData(metadata) => {
                                 encode_beacon_metadata(protocol.as_ref(), metadata)?
                             }
-                            // `beacon_blocks_by_*/2` are registered
-                            // `ProtocolSupport::Outbound`, so libp2p never opens
-                            // an inbound stream for one and this arm is
-                            // unreachable. Refusing beats emitting a chunk with
-                            // no `context-bytes`, which would desynchronize a
-                            // peer's reader.
-                            BeaconResponse::Blocks(_) => {
-                                return Err(invalid(
-                                    "this node does not serve beacon block responses",
-                                ));
+                            // The only multi-chunk beacon response, and the
+                            // only one carrying `context-bytes`, so it writes
+                            // itself here and returns rather than falling
+                            // through to the single-chunk write below.
+                            BeaconResponse::Blocks(blocks) => {
+                                for block in blocks {
+                                    let encoded = block.to_ssz();
+                                    // Encoded before the result byte goes out,
+                                    // so an oversized block is skipped rather
+                                    // than leaving a chunk header on the wire
+                                    // with no payload behind it.
+                                    if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+                                        warn!(
+                                            slot = block.slot(),
+                                            size = encoded.len(),
+                                            "Skipping oversized block in a beacon block response"
+                                        );
+                                        continue;
+                                    }
+                                    let context = self.beacon_context_bytes(block.slot())?;
+                                    io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
+                                    io.write_all(&context).await?;
+                                    let compressed_size = write_payload(io, &encoded).await?;
+                                    metrics::observe_reqresp_response_chunk_size(
+                                        label,
+                                        encoded.len(),
+                                        compressed_size,
+                                    );
+                                }
+                                // No blocks is a valid answer: the stream just
+                                // ends, which is how the specification says "I
+                                // have none of what you asked for".
+                                return Ok(());
                             }
                         };
                         io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
@@ -608,10 +664,36 @@ mod tests {
     };
     use crate::beacon::protocols;
     use crate::req_resp::messages::{BeaconRequest, BeaconResponse};
-    use ethlambda_types::beacon::primitives::Root;
+    use ethlambda_types::beacon::containers::phase0;
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32, Root, Slot};
     use futures::io::Cursor;
     use libp2p::StreamProtocol;
     use libp2p::request_response::Codec as _;
+
+    /// A phase0 block at `slot` with an empty body: the chunk framing is what
+    /// is under test, not the contents.
+    fn block_at(slot: Slot) -> phase0::SignedBeaconBlock {
+        phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 7,
+                parent_root: Root::repeat_byte(1),
+                state_root: Root::repeat_byte(2),
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: BlsSignature::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Bytes32::zero(),
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: BlsSignature::default(),
+        }
+    }
 
     fn status() -> BeaconStatus {
         BeaconStatus::V1(StatusV1 {
@@ -651,6 +733,131 @@ mod tests {
             .read_response(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
+    }
+
+    /// A block chunk is `<result><context-bytes><payload>`, and the reader
+    /// consumes exactly those four context bytes before the payload. Writing
+    /// the payload without them, or writing the wrong number of them, leaves
+    /// every following chunk four bytes out of phase, so this asserts the
+    /// blocks survive a full multi-chunk round trip rather than just the first.
+    #[tokio::test]
+    async fn beacon_block_chunks_round_trip_through_the_context_bytes() {
+        let stream_protocol = StreamProtocol::new(protocols::BEACON_BLOCKS_BY_RANGE_V2);
+        let blocks: Vec<_> = [64_u64, 65, 66]
+            .into_iter()
+            .map(|slot| {
+                ethlambda_types::beacon::containers::SignedBeaconBlock::Phase0(block_at(slot))
+            })
+            .collect();
+        let mut codec = Codec::beacon(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            Root::repeat_byte(9),
+        );
+
+        let mut buffer = Cursor::new(Vec::new());
+        codec
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::Beacon(BeaconResponse::Blocks(
+                    blocks.clone(),
+                ))),
+            )
+            .await
+            .expect("writes");
+
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let decoded = codec
+            .read_response(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads");
+
+        let Response::Success {
+            payload: ResponsePayload::Beacon(BeaconResponse::Blocks(read_back)),
+        } = decoded
+        else {
+            panic!("a block response reads back as one");
+        };
+        assert_eq!(
+            read_back
+                .iter()
+                .map(|block| block.slot())
+                .collect::<Vec<_>>(),
+            vec![64, 65, 66],
+            "every chunk must survive, in order"
+        );
+        assert_eq!(read_back, blocks);
+    }
+
+    /// The context bytes name the fork *the block* belongs to, not the one the
+    /// serving node is on. A range spanning a fork boundary labelled with one
+    /// digest throughout would have the asking peer decode the older half with
+    /// the newer fork's container.
+    #[tokio::test]
+    async fn each_chunk_is_labelled_with_its_own_forks_digest() {
+        let config = ethlambda_types::beacon::config::Config::mainnet();
+        let genesis_validators_root = Root::repeat_byte(9);
+        let codec = Codec::beacon(config.clone(), genesis_validators_root);
+
+        let phase0_slot = 0;
+        let later_slot = config.altair_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        let early = codec.beacon_context_bytes(phase0_slot).expect("computes");
+        let late = codec.beacon_context_bytes(later_slot).expect("computes");
+
+        assert_ne!(
+            early, late,
+            "two forks must not share a digest, or the label carries no information"
+        );
+        assert_eq!(
+            late,
+            ethlambda_types::beacon::fork_digest::compute_fork_digest(
+                &config,
+                genesis_validators_root,
+                config.altair_fork_epoch,
+            ),
+            "and the digest is the one that fork's own epoch produces"
+        );
+    }
+
+    /// No blocks is a legal answer, and it is what a checkpoint-synced node
+    /// gives for a range below its anchor. The reader must see an empty list
+    /// rather than an error or a hang.
+    #[tokio::test]
+    async fn an_empty_beacon_block_response_reads_back_as_no_blocks() {
+        let stream_protocol = StreamProtocol::new(protocols::BEACON_BLOCKS_BY_RANGE_V2);
+        let mut codec = Codec::beacon(
+            ethlambda_types::beacon::config::Config::mainnet(),
+            Root::zero(),
+        );
+
+        let mut buffer = Cursor::new(Vec::new());
+        codec
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::Beacon(BeaconResponse::Blocks(Vec::new()))),
+            )
+            .await
+            .expect("writes");
+        assert!(
+            buffer.get_ref().is_empty(),
+            "an empty response puts nothing on the wire; the stream just ends"
+        );
+
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let decoded = codec
+            .read_response(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads");
+
+        let Response::Success {
+            payload: ResponsePayload::Beacon(BeaconResponse::Blocks(read_back)),
+        } = decoded
+        else {
+            panic!("a block response reads back as one");
+        };
+        assert!(read_back.is_empty());
     }
 
     #[tokio::test]
