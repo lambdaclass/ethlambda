@@ -287,6 +287,7 @@ async fn main() -> eyre::Result<()> {
         attestation_committee_count,
         bootnodes,
         advertise_ip: options.discovery.advertise_ip,
+        target_peers: options.discovery.target_peers,
     });
 
     let p2p = P2P::spawn(built, store.clone(), node_names, discovery)

@@ -24,6 +24,7 @@ ethlambda \
 | `--discovery.enable` | `false` | Run the discv5 server and the dial loop |
 | `--discovery.port` | `9000` | UDP port for the discv5 socket |
 | `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
+| `--discovery.target-peers` | `200` | Connected-peer count above which dialing stops |
 
 Both `--discovery.port` and `--gossipsub-port` default to 9000 and both bind
 UDP, so they cannot share a port. Enabling discovery without changing one of
@@ -85,7 +86,8 @@ Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
-Dialing stops once 16 peers are connected, and resumes if that drops.
+Dialing stops once `--discovery.target-peers` peers are connected, and resumes
+if that count drops. The same number sizes the discv5 peer table.
 
 ## Bootnodes
 

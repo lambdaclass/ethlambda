@@ -1,5 +1,6 @@
 //! Command-line interface for the ethlambda binary.
 
+use ethlambda_p2p::discovery::DEFAULT_DISCOVERY_TARGET_PEERS;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -146,6 +147,13 @@ pub(crate) struct DiscoveryConfig {
     /// discv5's PONG-based IP voting may still replace it at runtime.
     #[arg(long = "discovery.advertise-ip")]
     pub(crate) advertise_ip: Option<std::net::IpAddr>,
+    /// Connected-peer count above which discovery stops dialing.
+    ///
+    /// Also the size the discv5 peer table targets. The dial loop keeps
+    /// ticking either way and resumes dialing as soon as the connected count
+    /// drops back below this, so 0 means "discover and serve, never dial".
+    #[arg(long = "discovery.target-peers", default_value_t = DEFAULT_DISCOVERY_TARGET_PEERS)]
+    pub(crate) target_peers: usize,
 }
 
 impl CliOptions {

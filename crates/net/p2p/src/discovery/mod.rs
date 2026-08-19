@@ -29,9 +29,10 @@ use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 /// How often the dial loop looks for a new peer.
 pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Connected-peer count above which discovery stops dialing. Also the peer
-/// table's own target.
-pub const DISCOVERY_TARGET_PEERS: usize = 16;
+/// Default connected-peer count above which discovery stops dialing, and the
+/// peer table's own target. Overridable per node via
+/// [`DiscoverySpawnConfig::target_peers`].
+pub const DEFAULT_DISCOVERY_TARGET_PEERS: usize = 200;
 
 /// Candidates drawn from the peer table per refill.
 pub const DISCOVERY_CANDIDATE_BATCH: usize = 8;
@@ -69,6 +70,11 @@ pub struct DiscoverySpawnConfig {
     /// IP address to advertise in the ENR. Defaults to `bind_ip` when unset,
     /// which is undialable if `bind_ip` is the wildcard `0.0.0.0`.
     pub advertise_ip: Option<IpAddr>,
+    /// Connected-peer count above which the dial loop stops dialing, and the
+    /// target the peer table sizes itself to. Defaults to
+    /// [`DEFAULT_DISCOVERY_TARGET_PEERS`]; a target of 0 leaves the dial loop
+    /// ticking without ever dialing.
+    pub target_peers: usize,
 }
 
 /// What the P2P actor needs from a running discovery server.
@@ -82,6 +88,9 @@ pub struct DiscoveryHandle {
     /// loop can apply the same rules when it turns a contact into a dial target.
     /// See [`LeanFilter`].
     pub filter: LeanFilter,
+    /// The configured [`DiscoverySpawnConfig::target_peers`], carried through so
+    /// the dial loop stops at the same count the peer table was sized to.
+    pub target_peers: usize,
 }
 
 /// Bind the discv5 socket, build the local ENR, and start ethrex's discovery
@@ -132,7 +141,7 @@ pub async fn spawn_discovery(
     let filter = LeanFilter::new(EnrForkId::local(), config.attestation_committee_count);
     let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
-        DISCOVERY_TARGET_PEERS,
+        config.target_peers,
         filter.clone(),
     );
 
@@ -183,6 +192,7 @@ pub async fn spawn_discovery(
         peer_table,
         local_enr,
         filter,
+        target_peers: config.target_peers,
     })
 }
 
@@ -206,6 +216,7 @@ mod tests {
             attestation_committee_count: 4,
             bootnodes: Vec::new(),
             advertise_ip,
+            target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
         }
     }
 

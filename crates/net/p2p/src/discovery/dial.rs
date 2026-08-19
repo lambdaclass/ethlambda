@@ -2,7 +2,7 @@
 //!
 //! Runs as a `P2PServer` tick every [`DISCOVERY_DIAL_INTERVAL`], drawing
 //! candidates from the ethrex peer table, ranking them by subnet coverage, and
-//! dialing one per tick until [`DISCOVERY_TARGET_PEERS`] are connected.
+//! dialing one per tick until [`DiscoveryState::target_peers`] are connected.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -11,7 +11,7 @@ use libp2p::PeerId;
 use tracing::info;
 
 use super::admission::{DiscoveredPeer, LeanFilter, rank_by_uncovered_subnets};
-use super::{DISCOVERY_CANDIDATE_BATCH, DISCOVERY_TARGET_PEERS, DiscoveryHandle};
+use super::{DISCOVERY_CANDIDATE_BATCH, DiscoveryHandle};
 use crate::{P2PServer, metrics};
 
 /// Everything the dial loop needs from a running discovery server.
@@ -27,6 +27,8 @@ pub(crate) struct DiscoveryState {
     peer_attnets: HashMap<PeerId, Vec<u64>>,
     /// Our own peer ID, so the loop never dials itself.
     local_peer_id: PeerId,
+    /// Connected-peer count above which the loop stops dialing.
+    target_peers: usize,
 }
 
 impl DiscoveryState {
@@ -37,6 +39,7 @@ impl DiscoveryState {
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
             local_peer_id,
+            target_peers: handle.target_peers,
         }
     }
 }
@@ -57,16 +60,15 @@ impl P2PServer {
 
 /// One tick of the dial loop. A no-op when discovery is disabled.
 pub(crate) async fn dial_tick(server: &mut P2PServer) {
-    if server.connected_peers.len() >= DISCOVERY_TARGET_PEERS {
-        return;
-    }
-
     // Snapshot what the refill needs before any `.await`, so no borrow of
     // `server.discovery` has to live across the async boundary. Both are handle
     // clones: an actor ref and two `Copy` fields.
     let Some(discovery) = server.discovery.as_ref() else {
         return;
     };
+    if server.connected_peers.len() >= discovery.target_peers {
+        return;
+    }
     let peer_table = discovery.peer_table.clone();
     let filter = discovery.filter.clone();
     let mut admitted = if discovery.candidates.is_empty() {
