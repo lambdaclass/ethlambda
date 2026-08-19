@@ -320,7 +320,6 @@ pub struct BeaconState {
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
-    use libssz_types::SszVector;
 
     use super::*;
 
@@ -330,7 +329,7 @@ mod tests {
             fee_recipient: ExecutionAddress::zero(),
             state_root: Bytes32::zero(),
             receipts_root: Bytes32::zero(),
-            logs_bloom: SszVector::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
+            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
             prev_randao: Bytes32::zero(),
             block_number: 0,
             gas_limit: 0,

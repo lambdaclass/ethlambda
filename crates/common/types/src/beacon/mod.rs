@@ -15,6 +15,38 @@ pub mod fork_digest;
 pub mod preset;
 pub mod primitives;
 
+/// Panics, naming the Beacon Chain-only path a lean value reached.
+///
+/// The boundary is structural rather than type-level: [`containers::BeaconState`]
+/// carries a `Lean` variant and [`fork::ForkName`] a `Lean` name, so every
+/// beacon-only path needs an arm for them. Written once here so the wording, and
+/// the diagnosis it points at, cannot drift from one such arm to the next.
+///
+/// Two forms, because the two boundaries are crossed by different mistakes.
+/// `state:` is a beacon accessor handed lean's own state, which means a handler
+/// dispatched on the wrong thing. `fork:` is a beacon-only function handed
+/// [`fork::ForkName::Lean`], which is not a point on the beacon fork schedule at
+/// all, so no state is involved and the fault is the argument.
+macro_rules! lean_unreachable {
+    (state: $function:expr) => {
+        unreachable!(
+            "lean state reached a beacon accessor ({}); \
+             BlockChainServer must dispatch on fork_name() before this point",
+            $function
+        )
+    };
+    (fork: $function:expr) => {
+        unreachable!(
+            "ForkName::Lean reached a Beacon Chain function ({}); \
+             lean is not a point on the beacon fork schedule, so the caller \
+             passed a fork it should have dispatched on first",
+            $function
+        )
+    };
+}
+
+pub(crate) use lean_unreachable;
+
 #[cfg(test)]
 mod tests {
     #[test]

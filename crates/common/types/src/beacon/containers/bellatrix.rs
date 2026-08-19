@@ -310,7 +310,7 @@ mod tests {
             gas_used: 0,
             timestamp: 0,
             extra_data: Default::default(),
-            base_fee_per_gas: Uint256::default(),
+            base_fee_per_gas: Uint256::zero(),
             block_hash: ExecutionBlockHash::zero(),
             transactions: Default::default(),
         }

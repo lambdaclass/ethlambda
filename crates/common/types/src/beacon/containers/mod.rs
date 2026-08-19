@@ -54,10 +54,75 @@ use libssz::{SszDecode as _, SszEncode as _};
 
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
+use crate::beacon::lean_unreachable;
 use crate::beacon::primitives::{
     BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
     WithdrawalIndex,
 };
+
+/// Runs `$body` against whichever fork's state this is.
+///
+/// For the reads every beacon fork answers the same way: the arm list lives here
+/// once instead of once per accessor, so a new fork is one line in this macro and
+/// one in [`BeaconState::fork_name`] rather than one line in each of twenty match
+/// ladders. `$function` names the accessor for the lean arm's panic only.
+macro_rules! dispatch_state {
+    ($self:expr, $function:expr, |$state:ident| $body:expr) => {
+        match $self {
+            BeaconState::Phase0($state) => $body,
+            BeaconState::Altair($state) => $body,
+            BeaconState::Bellatrix($state) => $body,
+            BeaconState::Capella($state) => $body,
+            BeaconState::Deneb($state) => $body,
+            BeaconState::Electra($state) => $body,
+            BeaconState::Fulu($state) => $body,
+            BeaconState::Lean(_) => lean_unreachable!(state: $function),
+        }
+    };
+}
+
+/// Runs `$body` against the forks that carry a field, and names the ones that
+/// predate it.
+///
+/// Same purpose as `dispatch_state!`, for a field the specification introduces
+/// partway along the fork schedule: `carried_by` is the forks whose state has it,
+/// `absent_from` the forks that answer [`Error::UnsupportedForFork`]. Both lists
+/// are spelled out rather than one being derived from the other, so that a new
+/// fork does not silently join either side.
+macro_rules! dispatch_state_from {
+    (
+        $self:expr, $function:expr, |$state:ident| $body:expr,
+        carried_by: [$($fork:ident),+ $(,)?],
+        absent_from: [$($absent:ident),+ $(,)?],
+    ) => {
+        match $self {
+            $(BeaconState::$fork($state) => Ok($body),)+
+            $(BeaconState::$absent(_) => Err(Error::UnsupportedForFork {
+                function: $function,
+                fork: ForkName::$absent,
+            }),)+
+            BeaconState::Lean(_) => lean_unreachable!(state: $function),
+        }
+    };
+}
+
+/// Runs `$body` against whichever fork's block this is.
+///
+/// [`SignedBeaconBlock`] has no lean variant, so unlike `dispatch_state!` there
+/// is no boundary arm and nothing to name in a panic.
+macro_rules! dispatch_block {
+    ($self:expr, |$block:ident| $body:expr) => {
+        match $self {
+            SignedBeaconBlock::Phase0($block) => $body,
+            SignedBeaconBlock::Altair($block) => $body,
+            SignedBeaconBlock::Bellatrix($block) => $body,
+            SignedBeaconBlock::Capella($block) => $body,
+            SignedBeaconBlock::Deneb($block) => $body,
+            SignedBeaconBlock::Electra($block) => $body,
+            SignedBeaconBlock::Fulu($block) => $body,
+        }
+    };
+}
 
 /// The beacon state, in whichever fork's shape it currently has, plus the lean
 /// state.
@@ -131,36 +196,12 @@ impl BeaconState {
 
     /// Encodes the state.
     pub fn to_ssz(&self) -> Vec<u8> {
-        match self {
-            BeaconState::Phase0(state) => state.to_ssz(),
-            BeaconState::Altair(state) => state.to_ssz(),
-            BeaconState::Bellatrix(state) => state.to_ssz(),
-            BeaconState::Capella(state) => state.to_ssz(),
-            BeaconState::Deneb(state) => state.to_ssz(),
-            BeaconState::Electra(state) => state.to_ssz(),
-            BeaconState::Fulu(state) => state.to_ssz(),
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (to_ssz); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
-        }
+        dispatch_state!(self, "to_ssz", |state| state.to_ssz())
     }
 
     /// The state's merkle root, which a block's `state_root` must equal.
     pub fn hash_tree_root(&self) -> Root {
-        match self {
-            BeaconState::Phase0(state) => state.hash_tree_root(),
-            BeaconState::Altair(state) => state.hash_tree_root(),
-            BeaconState::Bellatrix(state) => state.hash_tree_root(),
-            BeaconState::Capella(state) => state.hash_tree_root(),
-            BeaconState::Deneb(state) => state.hash_tree_root(),
-            BeaconState::Electra(state) => state.hash_tree_root(),
-            BeaconState::Fulu(state) => state.hash_tree_root(),
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (hash_tree_root); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
-        }
+        dispatch_state!(self, "hash_tree_root", |state| state.hash_tree_root())
     }
 }
 
@@ -176,14 +217,11 @@ impl BeaconState {
 /// accessor, and both names are given explicitly, since `macro_rules!` cannot
 /// concatenate identifiers on stable Rust.
 ///
-/// # Adding a fork
-///
-/// Add one match arm to each of the four accessor bodies below. The variant list
-/// cannot be a macro parameter: `macro_rules!` zips two repetitions at the same
+/// The arms come from `dispatch_state!`, which is also why the variant list is
+/// not a parameter of this macro: `macro_rules!` zips two repetitions at the same
 /// nesting depth rather than nesting them, so a `variants: [...]` list would be
-/// iterated in lockstep with the field list instead of once per field. Spelling
-/// the arms out is the simpler of the two ways around that, and it keeps the
-/// expansion something you can read.
+/// iterated in lockstep with the field list instead of once per field. Calling
+/// one macro from the other sidesteps that and keeps the fork list in one place.
 macro_rules! shared_state_accessors {
     (
         copy: [$(($field:ident, $field_mut:ident, $ty:ty)),* $(,)?],
@@ -192,81 +230,25 @@ macro_rules! shared_state_accessors {
         impl BeaconState {
             $(
                 pub fn $field(&self) -> $ty {
-                    match self {
-                        BeaconState::Phase0(state) => state.$field,
-                        BeaconState::Altair(state) => state.$field,
-                        BeaconState::Bellatrix(state) => state.$field,
-                        BeaconState::Capella(state) => state.$field,
-                        BeaconState::Deneb(state) => state.$field,
-                        BeaconState::Electra(state) => state.$field,
-                        BeaconState::Fulu(state) => state.$field,
-                        BeaconState::Lean(_) => unreachable!(
-                            concat!(
-                                "lean state reached a beacon accessor (",
-                                stringify!($field),
-                                "); BlockChainServer must dispatch on fork_name() before this point"
-                            )
-                        ),
-                    }
+                    dispatch_state!(self, stringify!($field), |state| state.$field)
                 }
 
                 pub fn $field_mut(&mut self) -> &mut $ty {
-                    match self {
-                        BeaconState::Phase0(state) => &mut state.$field,
-                        BeaconState::Altair(state) => &mut state.$field,
-                        BeaconState::Bellatrix(state) => &mut state.$field,
-                        BeaconState::Capella(state) => &mut state.$field,
-                        BeaconState::Deneb(state) => &mut state.$field,
-                        BeaconState::Electra(state) => &mut state.$field,
-                        BeaconState::Fulu(state) => &mut state.$field,
-                        BeaconState::Lean(_) => unreachable!(
-                            concat!(
-                                "lean state reached a beacon accessor (",
-                                stringify!($field_mut),
-                                "); BlockChainServer must dispatch on fork_name() before this point"
-                            )
-                        ),
-                    }
+                    dispatch_state!(self, stringify!($field_mut), |state| &mut state.$field)
                 }
             )*
 
             $(
                 pub fn $ref_field(&self) -> &$ref_ty {
-                    match self {
-                        BeaconState::Phase0(state) => &state.$ref_field,
-                        BeaconState::Altair(state) => &state.$ref_field,
-                        BeaconState::Bellatrix(state) => &state.$ref_field,
-                        BeaconState::Capella(state) => &state.$ref_field,
-                        BeaconState::Deneb(state) => &state.$ref_field,
-                        BeaconState::Electra(state) => &state.$ref_field,
-                        BeaconState::Fulu(state) => &state.$ref_field,
-                        BeaconState::Lean(_) => unreachable!(
-                            concat!(
-                                "lean state reached a beacon accessor (",
-                                stringify!($ref_field),
-                                "); BlockChainServer must dispatch on fork_name() before this point"
-                            )
-                        ),
-                    }
+                    dispatch_state!(self, stringify!($ref_field), |state| &state.$ref_field)
                 }
 
                 pub fn $ref_field_mut(&mut self) -> &mut $ref_ty {
-                    match self {
-                        BeaconState::Phase0(state) => &mut state.$ref_field,
-                        BeaconState::Altair(state) => &mut state.$ref_field,
-                        BeaconState::Bellatrix(state) => &mut state.$ref_field,
-                        BeaconState::Capella(state) => &mut state.$ref_field,
-                        BeaconState::Deneb(state) => &mut state.$ref_field,
-                        BeaconState::Electra(state) => &mut state.$ref_field,
-                        BeaconState::Fulu(state) => &mut state.$ref_field,
-                        BeaconState::Lean(_) => unreachable!(
-                            concat!(
-                                "lean state reached a beacon accessor (",
-                                stringify!($ref_field_mut),
-                                "); BlockChainServer must dispatch on fork_name() before this point"
-                            )
-                        ),
-                    }
+                    dispatch_state!(
+                        self,
+                        stringify!($ref_field_mut),
+                        |state| &mut state.$ref_field
+                    )
                 }
             )*
         }
@@ -344,64 +326,30 @@ impl BeaconState {
     /// mistake was made once here and cost a runtime `UnsupportedForFork` on
     /// every deneb block carrying a withdrawal.
     pub fn withdrawal_cursor(&self) -> Result<(WithdrawalIndex, ValidatorIndex)> {
-        match self {
-            BeaconState::Capella(state) => Ok((
+        dispatch_state_from!(
+            self,
+            "BeaconState::withdrawal_cursor",
+            |state| (
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Deneb(state) => Ok((
-                state.next_withdrawal_index,
-                state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Electra(state) => Ok((
-                state.next_withdrawal_index,
-                state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Fulu(state) => Ok((
-                state.next_withdrawal_index,
-                state.next_withdrawal_validator_index,
-            )),
-            other => Err(Error::UnsupportedForFork {
-                function: "BeaconState::withdrawal_cursor",
-                fork: other.fork_name(),
-            }),
-        }
+            ),
+            carried_by: [Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0, Altair, Bellatrix],
+        )
     }
 
     /// The withdrawal sweep's cursor, mutably. See [`Self::withdrawal_cursor`].
     pub fn withdrawal_cursor_mut(&mut self) -> Result<(&mut WithdrawalIndex, &mut ValidatorIndex)> {
-        match self {
-            BeaconState::Capella(state) => Ok((
+        dispatch_state_from!(
+            self,
+            "BeaconState::withdrawal_cursor_mut",
+            |state| (
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Deneb(state) => Ok((
-                &mut state.next_withdrawal_index,
-                &mut state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Electra(state) => Ok((
-                &mut state.next_withdrawal_index,
-                &mut state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Fulu(state) => Ok((
-                &mut state.next_withdrawal_index,
-                &mut state.next_withdrawal_validator_index,
-            )),
-            BeaconState::Phase0(_) | BeaconState::Altair(_) | BeaconState::Bellatrix(_) => {
-                Err(Error::UnsupportedForFork {
-                    function: "BeaconState::withdrawal_cursor_mut",
-                    fork: match self {
-                        BeaconState::Phase0(_) => ForkName::Phase0,
-                        BeaconState::Altair(_) => ForkName::Altair,
-                        _ => ForkName::Bellatrix,
-                    },
-                })
-            }
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (withdrawal_cursor_mut); \
-                 BlockChainServer must dispatch on fork_name() before this point"
             ),
-        }
+            carried_by: [Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0, Altair, Bellatrix],
+        )
     }
 
     /// The three per-validator lists that exist from altair on, by reference and
@@ -423,46 +371,17 @@ impl BeaconState {
     pub fn altair_validator_lists(
         &self,
     ) -> Result<(&EpochParticipation, &EpochParticipation, &InactivityScores)> {
-        match self {
-            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
-                function: "BeaconState::altair_validator_lists",
-                fork: ForkName::Phase0,
-            }),
-            BeaconState::Altair(state) => Ok((
+        dispatch_state_from!(
+            self,
+            "BeaconState::altair_validator_lists",
+            |state| (
                 &state.previous_epoch_participation,
                 &state.current_epoch_participation,
                 &state.inactivity_scores,
-            )),
-            BeaconState::Bellatrix(state) => Ok((
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
-            )),
-            BeaconState::Capella(state) => Ok((
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
-            )),
-            BeaconState::Deneb(state) => Ok((
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
-            )),
-            BeaconState::Electra(state) => Ok((
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
-            )),
-            BeaconState::Fulu(state) => Ok((
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
-            )),
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (altair_validator_lists); \
-                 BlockChainServer must dispatch on fork_name() before this point"
             ),
-        }
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0],
+        )
     }
 
     /// The three per-validator lists that exist from altair on, mutably and all
@@ -489,46 +408,17 @@ impl BeaconState {
         &mut EpochParticipation,
         &mut InactivityScores,
     )> {
-        match self {
-            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
-                function: "BeaconState::altair_validator_lists_mut",
-                fork: ForkName::Phase0,
-            }),
-            BeaconState::Altair(state) => Ok((
+        dispatch_state_from!(
+            self,
+            "BeaconState::altair_validator_lists_mut",
+            |state| (
                 &mut state.previous_epoch_participation,
                 &mut state.current_epoch_participation,
                 &mut state.inactivity_scores,
-            )),
-            BeaconState::Bellatrix(state) => Ok((
-                &mut state.previous_epoch_participation,
-                &mut state.current_epoch_participation,
-                &mut state.inactivity_scores,
-            )),
-            BeaconState::Capella(state) => Ok((
-                &mut state.previous_epoch_participation,
-                &mut state.current_epoch_participation,
-                &mut state.inactivity_scores,
-            )),
-            BeaconState::Deneb(state) => Ok((
-                &mut state.previous_epoch_participation,
-                &mut state.current_epoch_participation,
-                &mut state.inactivity_scores,
-            )),
-            BeaconState::Electra(state) => Ok((
-                &mut state.previous_epoch_participation,
-                &mut state.current_epoch_participation,
-                &mut state.inactivity_scores,
-            )),
-            BeaconState::Fulu(state) => Ok((
-                &mut state.previous_epoch_participation,
-                &mut state.current_epoch_participation,
-                &mut state.inactivity_scores,
-            )),
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (altair_validator_lists_mut); \
-                 BlockChainServer must dispatch on fork_name() before this point"
             ),
-        }
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0],
+        )
     }
 
     /// The current and next sync committee, by reference.
@@ -543,34 +433,13 @@ impl BeaconState {
     /// for an altair state, not for the bellatrix, capella, deneb, electra, or
     /// fulu ones the same call site also has to serve.
     pub fn sync_committees(&self) -> Result<(&altair::SyncCommittee, &altair::SyncCommittee)> {
-        match self {
-            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
-                function: "BeaconState::sync_committees",
-                fork: ForkName::Phase0,
-            }),
-            BeaconState::Altair(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Bellatrix(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Capella(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Deneb(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Electra(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Fulu(state) => {
-                Ok((&state.current_sync_committee, &state.next_sync_committee))
-            }
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (sync_committees); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
-        }
+        dispatch_state_from!(
+            self,
+            "BeaconState::sync_committees",
+            |state| (&state.current_sync_committee, &state.next_sync_committee),
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0],
+        )
     }
 
     /// The current and next sync committee, mutably. See
@@ -584,40 +453,16 @@ impl BeaconState {
     pub fn sync_committees_mut(
         &mut self,
     ) -> Result<(&mut altair::SyncCommittee, &mut altair::SyncCommittee)> {
-        match self {
-            BeaconState::Phase0(_) => Err(Error::UnsupportedForFork {
-                function: "BeaconState::sync_committees_mut",
-                fork: ForkName::Phase0,
-            }),
-            BeaconState::Altair(state) => Ok((
+        dispatch_state_from!(
+            self,
+            "BeaconState::sync_committees_mut",
+            |state| (
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
-            )),
-            BeaconState::Bellatrix(state) => Ok((
-                &mut state.current_sync_committee,
-                &mut state.next_sync_committee,
-            )),
-            BeaconState::Capella(state) => Ok((
-                &mut state.current_sync_committee,
-                &mut state.next_sync_committee,
-            )),
-            BeaconState::Deneb(state) => Ok((
-                &mut state.current_sync_committee,
-                &mut state.next_sync_committee,
-            )),
-            BeaconState::Electra(state) => Ok((
-                &mut state.current_sync_committee,
-                &mut state.next_sync_committee,
-            )),
-            BeaconState::Fulu(state) => Ok((
-                &mut state.current_sync_committee,
-                &mut state.next_sync_committee,
-            )),
-            BeaconState::Lean(_) => unreachable!(
-                "lean state reached a beacon accessor (sync_committees_mut); \
-                 BlockChainServer must dispatch on fork_name() before this point"
             ),
-        }
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            absent_from: [Phase0],
+        )
     }
 }
 
@@ -707,15 +552,7 @@ impl SignedBeaconBlock {
 
     /// Encodes the signed block.
     pub fn to_ssz(&self) -> Vec<u8> {
-        match self {
-            SignedBeaconBlock::Phase0(block) => block.to_ssz(),
-            SignedBeaconBlock::Altair(block) => block.to_ssz(),
-            SignedBeaconBlock::Bellatrix(block) => block.to_ssz(),
-            SignedBeaconBlock::Capella(block) => block.to_ssz(),
-            SignedBeaconBlock::Deneb(block) => block.to_ssz(),
-            SignedBeaconBlock::Electra(block) => block.to_ssz(),
-            SignedBeaconBlock::Fulu(block) => block.to_ssz(),
-        }
+        dispatch_block!(self, |block| block.to_ssz())
     }
 
     /// The merkle root of the unsigned `message`, which is what the proposer's
@@ -726,15 +563,7 @@ impl SignedBeaconBlock {
     /// which no code in this crate needs yet but which would mean something
     /// different from this method if added later.
     pub fn message_hash_tree_root(&self) -> Root {
-        match self {
-            SignedBeaconBlock::Phase0(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Altair(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Bellatrix(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Capella(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Deneb(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Electra(block) => block.message.hash_tree_root(),
-            SignedBeaconBlock::Fulu(block) => block.message.hash_tree_root(),
-        }
+        dispatch_block!(self, |block| block.message.hash_tree_root())
     }
 }
 
@@ -747,9 +576,8 @@ impl SignedBeaconBlock {
 /// the split is not `copy` versus `reference` but `message` versus `outer`,
 /// separating the fields nested under `message` from `signature`, the one
 /// field [`SignedBeaconBlock`] carries directly. As with
-/// `shared_state_accessors`, the variant list itself cannot be a macro
-/// parameter, since `macro_rules!` zips repetitions at the same nesting depth
-/// rather than nesting them, so each list's arms are spelled out in full.
+/// `shared_state_accessors`, the arms come from `dispatch_block!` rather than
+/// from a variant list of this macro's own.
 macro_rules! signed_beacon_block_accessors {
     (
         message: [$(($field:ident, $ty:ty)),* $(,)?],
@@ -758,29 +586,13 @@ macro_rules! signed_beacon_block_accessors {
         impl SignedBeaconBlock {
             $(
                 pub fn $field(&self) -> $ty {
-                    match self {
-                        SignedBeaconBlock::Phase0(block) => block.message.$field,
-                        SignedBeaconBlock::Altair(block) => block.message.$field,
-                        SignedBeaconBlock::Bellatrix(block) => block.message.$field,
-                        SignedBeaconBlock::Capella(block) => block.message.$field,
-                        SignedBeaconBlock::Deneb(block) => block.message.$field,
-                        SignedBeaconBlock::Electra(block) => block.message.$field,
-                        SignedBeaconBlock::Fulu(block) => block.message.$field,
-                    }
+                    dispatch_block!(self, |block| block.message.$field)
                 }
             )*
 
             $(
                 pub fn $outer_field(&self) -> $outer_ty {
-                    match self {
-                        SignedBeaconBlock::Phase0(block) => block.$outer_field,
-                        SignedBeaconBlock::Altair(block) => block.$outer_field,
-                        SignedBeaconBlock::Bellatrix(block) => block.$outer_field,
-                        SignedBeaconBlock::Capella(block) => block.$outer_field,
-                        SignedBeaconBlock::Deneb(block) => block.$outer_field,
-                        SignedBeaconBlock::Electra(block) => block.$outer_field,
-                        SignedBeaconBlock::Fulu(block) => block.$outer_field,
-                    }
+                    dispatch_block!(self, |block| block.$outer_field)
                 }
             )*
         }

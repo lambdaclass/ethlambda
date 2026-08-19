@@ -1006,6 +1006,7 @@ pub use minimal::*;
 /// any numeric relationship, which does not.
 pub mod retuned {
     use crate::beacon::fork::ForkName;
+    use crate::beacon::lean_unreachable;
 
     /// How much the summed slashings are scaled by before being capped at the
     /// total active balance.
@@ -1017,7 +1018,12 @@ pub mod retuned {
         match fork {
             ForkName::Phase0 => super::PROPORTIONAL_SLASHING_MULTIPLIER,
             ForkName::Altair => super::PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
-            _ => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => super::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+            ForkName::Lean => lean_unreachable!(fork: "proportional_slashing_multiplier"),
         }
     }
 
@@ -1039,10 +1045,7 @@ pub mod retuned {
                 super::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
             }
             ForkName::Electra | ForkName::Fulu => super::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA,
-            ForkName::Lean => unreachable!(
-                "lean state reached a beacon accessor (min_slashing_penalty_quotient); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
+            ForkName::Lean => lean_unreachable!(fork: "min_slashing_penalty_quotient"),
         }
     }
 
@@ -1056,7 +1059,12 @@ pub mod retuned {
     pub fn whistleblower_reward_quotient(fork: ForkName) -> u64 {
         match fork {
             ForkName::Electra | ForkName::Fulu => super::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
-            _ => super::WHISTLEBLOWER_REWARD_QUOTIENT,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => super::WHISTLEBLOWER_REWARD_QUOTIENT,
+            ForkName::Lean => lean_unreachable!(fork: "whistleblower_reward_quotient"),
         }
     }
 
@@ -1071,7 +1079,12 @@ pub mod retuned {
         match fork {
             ForkName::Phase0 => super::INACTIVITY_PENALTY_QUOTIENT,
             ForkName::Altair => super::INACTIVITY_PENALTY_QUOTIENT_ALTAIR,
-            _ => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => super::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX,
+            ForkName::Lean => lean_unreachable!(fork: "inactivity_penalty_quotient"),
         }
     }
 
@@ -1295,170 +1308,92 @@ mod tests {
     /// whichever fork first needs the missing side.
     #[test]
     fn same_names_in_both_presets() {
-        let _: usize = mainnet::MAX_COMMITTEES_PER_SLOT;
-        let _: usize = minimal::MAX_COMMITTEES_PER_SLOT;
-        let _: u64 = mainnet::TARGET_COMMITTEE_SIZE;
-        let _: u64 = minimal::TARGET_COMMITTEE_SIZE;
-        let _: usize = mainnet::MAX_VALIDATORS_PER_COMMITTEE;
-        let _: usize = minimal::MAX_VALIDATORS_PER_COMMITTEE;
-        let _: u64 = mainnet::SHUFFLE_ROUND_COUNT;
-        let _: u64 = minimal::SHUFFLE_ROUND_COUNT;
-        let _: u64 = mainnet::HYSTERESIS_QUOTIENT;
-        let _: u64 = minimal::HYSTERESIS_QUOTIENT;
-        let _: u64 = mainnet::HYSTERESIS_DOWNWARD_MULTIPLIER;
-        let _: u64 = minimal::HYSTERESIS_DOWNWARD_MULTIPLIER;
-        let _: u64 = mainnet::HYSTERESIS_UPWARD_MULTIPLIER;
-        let _: u64 = minimal::HYSTERESIS_UPWARD_MULTIPLIER;
+        /// Names one constant at its type through both presets. The pairing is
+        /// the point, so the macro takes the name once and writes both paths.
+        macro_rules! in_both {
+            ($ty:ty: $($name:ident),+ $(,)?) => {
+                $(
+                    let _: $ty = mainnet::$name;
+                    let _: $ty = minimal::$name;
+                )+
+            };
+        }
 
-        let _: u64 = mainnet::MIN_DEPOSIT_AMOUNT;
-        let _: u64 = minimal::MIN_DEPOSIT_AMOUNT;
-        let _: u64 = mainnet::MAX_EFFECTIVE_BALANCE;
-        let _: u64 = minimal::MAX_EFFECTIVE_BALANCE;
-        let _: u64 = mainnet::EFFECTIVE_BALANCE_INCREMENT;
-        let _: u64 = minimal::EFFECTIVE_BALANCE_INCREMENT;
+        in_both!(usize: MAX_COMMITTEES_PER_SLOT);
+        in_both!(u64: TARGET_COMMITTEE_SIZE);
+        in_both!(usize: MAX_VALIDATORS_PER_COMMITTEE);
+        in_both!(u64:
+            SHUFFLE_ROUND_COUNT, HYSTERESIS_QUOTIENT, HYSTERESIS_DOWNWARD_MULTIPLIER,
+            HYSTERESIS_UPWARD_MULTIPLIER,
+        );
 
-        let _: u64 = mainnet::MIN_ATTESTATION_INCLUSION_DELAY;
-        let _: u64 = minimal::MIN_ATTESTATION_INCLUSION_DELAY;
-        let _: u64 = mainnet::SLOTS_PER_EPOCH;
-        let _: u64 = minimal::SLOTS_PER_EPOCH;
-        let _: u64 = mainnet::MIN_SEED_LOOKAHEAD;
-        let _: u64 = minimal::MIN_SEED_LOOKAHEAD;
-        let _: u64 = mainnet::MAX_SEED_LOOKAHEAD;
-        let _: u64 = minimal::MAX_SEED_LOOKAHEAD;
-        let _: u64 = mainnet::EPOCHS_PER_ETH1_VOTING_PERIOD;
-        let _: u64 = minimal::EPOCHS_PER_ETH1_VOTING_PERIOD;
-        let _: usize = mainnet::SLOTS_PER_ETH1_VOTING_PERIOD;
-        let _: usize = minimal::SLOTS_PER_ETH1_VOTING_PERIOD;
-        let _: usize = mainnet::SLOTS_PER_HISTORICAL_ROOT;
-        let _: usize = minimal::SLOTS_PER_HISTORICAL_ROOT;
-        let _: u64 = mainnet::MIN_EPOCHS_TO_INACTIVITY_PENALTY;
-        let _: u64 = minimal::MIN_EPOCHS_TO_INACTIVITY_PENALTY;
+        in_both!(u64: MIN_DEPOSIT_AMOUNT, MAX_EFFECTIVE_BALANCE, EFFECTIVE_BALANCE_INCREMENT);
 
-        let _: usize = mainnet::EPOCHS_PER_HISTORICAL_VECTOR;
-        let _: usize = minimal::EPOCHS_PER_HISTORICAL_VECTOR;
-        let _: usize = mainnet::EPOCHS_PER_SLASHINGS_VECTOR;
-        let _: usize = minimal::EPOCHS_PER_SLASHINGS_VECTOR;
-        let _: usize = mainnet::HISTORICAL_ROOTS_LIMIT;
-        let _: usize = minimal::HISTORICAL_ROOTS_LIMIT;
-        let _: usize = mainnet::VALIDATOR_REGISTRY_LIMIT;
-        let _: usize = minimal::VALIDATOR_REGISTRY_LIMIT;
+        in_both!(u64:
+            MIN_ATTESTATION_INCLUSION_DELAY, SLOTS_PER_EPOCH, MIN_SEED_LOOKAHEAD,
+            MAX_SEED_LOOKAHEAD, EPOCHS_PER_ETH1_VOTING_PERIOD,
+        );
+        in_both!(usize: SLOTS_PER_ETH1_VOTING_PERIOD, SLOTS_PER_HISTORICAL_ROOT);
+        in_both!(u64: MIN_EPOCHS_TO_INACTIVITY_PENALTY);
 
-        let _: u64 = mainnet::BASE_REWARD_FACTOR;
-        let _: u64 = minimal::BASE_REWARD_FACTOR;
-        let _: u64 = mainnet::WHISTLEBLOWER_REWARD_QUOTIENT;
-        let _: u64 = minimal::WHISTLEBLOWER_REWARD_QUOTIENT;
-        let _: u64 = mainnet::PROPOSER_REWARD_QUOTIENT;
-        let _: u64 = minimal::PROPOSER_REWARD_QUOTIENT;
-        let _: u64 = mainnet::INACTIVITY_PENALTY_QUOTIENT;
-        let _: u64 = minimal::INACTIVITY_PENALTY_QUOTIENT;
-        let _: u64 = mainnet::MIN_SLASHING_PENALTY_QUOTIENT;
-        let _: u64 = minimal::MIN_SLASHING_PENALTY_QUOTIENT;
-        let _: u64 = mainnet::PROPORTIONAL_SLASHING_MULTIPLIER;
-        let _: u64 = minimal::PROPORTIONAL_SLASHING_MULTIPLIER;
+        in_both!(usize:
+            EPOCHS_PER_HISTORICAL_VECTOR, EPOCHS_PER_SLASHINGS_VECTOR, HISTORICAL_ROOTS_LIMIT,
+            VALIDATOR_REGISTRY_LIMIT,
+        );
 
-        let _: usize = mainnet::MAX_PROPOSER_SLASHINGS;
-        let _: usize = minimal::MAX_PROPOSER_SLASHINGS;
-        let _: usize = mainnet::MAX_ATTESTER_SLASHINGS;
-        let _: usize = minimal::MAX_ATTESTER_SLASHINGS;
-        let _: usize = mainnet::MAX_ATTESTATIONS;
-        let _: usize = minimal::MAX_ATTESTATIONS;
-        let _: usize = mainnet::MAX_PENDING_ATTESTATIONS;
-        let _: usize = minimal::MAX_PENDING_ATTESTATIONS;
-        let _: usize = mainnet::MAX_DEPOSITS;
-        let _: usize = minimal::MAX_DEPOSITS;
-        let _: usize = mainnet::MAX_VOLUNTARY_EXITS;
-        let _: usize = minimal::MAX_VOLUNTARY_EXITS;
+        in_both!(u64:
+            BASE_REWARD_FACTOR, WHISTLEBLOWER_REWARD_QUOTIENT, PROPOSER_REWARD_QUOTIENT,
+            INACTIVITY_PENALTY_QUOTIENT, MIN_SLASHING_PENALTY_QUOTIENT,
+            PROPORTIONAL_SLASHING_MULTIPLIER,
+        );
 
-        let _: u64 = mainnet::INACTIVITY_PENALTY_QUOTIENT_ALTAIR;
-        let _: u64 = minimal::INACTIVITY_PENALTY_QUOTIENT_ALTAIR;
-        let _: u64 = mainnet::MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR;
-        let _: u64 = minimal::MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR;
-        let _: u64 = mainnet::PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR;
-        let _: u64 = minimal::PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR;
-        let _: usize = mainnet::SYNC_COMMITTEE_SIZE;
-        let _: usize = minimal::SYNC_COMMITTEE_SIZE;
-        let _: u64 = mainnet::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let _: u64 = minimal::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let _: u64 = mainnet::MIN_SYNC_COMMITTEE_PARTICIPANTS;
-        let _: u64 = minimal::MIN_SYNC_COMMITTEE_PARTICIPANTS;
-        let _: u64 = mainnet::UPDATE_TIMEOUT;
-        let _: u64 = minimal::UPDATE_TIMEOUT;
+        in_both!(usize:
+            MAX_PROPOSER_SLASHINGS, MAX_ATTESTER_SLASHINGS, MAX_ATTESTATIONS,
+            MAX_PENDING_ATTESTATIONS, MAX_DEPOSITS, MAX_VOLUNTARY_EXITS,
+        );
 
-        let _: u64 = mainnet::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
-        let _: u64 = minimal::INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
-        let _: u64 = mainnet::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX;
-        let _: u64 = minimal::MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX;
-        let _: u64 = mainnet::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX;
-        let _: u64 = minimal::PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX;
-        let _: usize = mainnet::MAX_BYTES_PER_TRANSACTION;
-        let _: usize = minimal::MAX_BYTES_PER_TRANSACTION;
-        let _: usize = mainnet::MAX_TRANSACTIONS_PER_PAYLOAD;
-        let _: usize = minimal::MAX_TRANSACTIONS_PER_PAYLOAD;
-        let _: usize = mainnet::BYTES_PER_LOGS_BLOOM;
-        let _: usize = minimal::BYTES_PER_LOGS_BLOOM;
-        let _: usize = mainnet::MAX_EXTRA_DATA_BYTES;
-        let _: usize = minimal::MAX_EXTRA_DATA_BYTES;
+        in_both!(u64:
+            INACTIVITY_PENALTY_QUOTIENT_ALTAIR, MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR,
+            PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR,
+        );
+        in_both!(usize: SYNC_COMMITTEE_SIZE);
+        in_both!(u64:
+            EPOCHS_PER_SYNC_COMMITTEE_PERIOD, MIN_SYNC_COMMITTEE_PARTICIPANTS, UPDATE_TIMEOUT,
+        );
 
-        let _: usize = mainnet::MAX_BLS_TO_EXECUTION_CHANGES;
-        let _: usize = minimal::MAX_BLS_TO_EXECUTION_CHANGES;
-        let _: usize = mainnet::MAX_WITHDRAWALS_PER_PAYLOAD;
-        let _: usize = minimal::MAX_WITHDRAWALS_PER_PAYLOAD;
-        let _: u64 = mainnet::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP;
-        let _: u64 = minimal::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP;
+        in_both!(u64:
+            INACTIVITY_PENALTY_QUOTIENT_BELLATRIX, MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX,
+            PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX,
+        );
+        in_both!(usize:
+            MAX_BYTES_PER_TRANSACTION, MAX_TRANSACTIONS_PER_PAYLOAD, BYTES_PER_LOGS_BLOOM,
+            MAX_EXTRA_DATA_BYTES,
+        );
 
-        let _: usize = mainnet::MAX_BLOB_COMMITMENTS_PER_BLOCK;
-        let _: usize = minimal::MAX_BLOB_COMMITMENTS_PER_BLOCK;
-        let _: usize = mainnet::KZG_COMMITMENT_INCLUSION_PROOF_DEPTH;
-        let _: usize = minimal::KZG_COMMITMENT_INCLUSION_PROOF_DEPTH;
-        let _: usize = mainnet::FIELD_ELEMENTS_PER_BLOB;
-        let _: usize = minimal::FIELD_ELEMENTS_PER_BLOB;
-        let _: usize = mainnet::BYTES_PER_BLOB;
-        let _: usize = minimal::BYTES_PER_BLOB;
+        in_both!(usize: MAX_BLS_TO_EXECUTION_CHANGES, MAX_WITHDRAWALS_PER_PAYLOAD);
+        in_both!(u64: MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
 
-        let _: u64 = mainnet::MIN_ACTIVATION_BALANCE;
-        let _: u64 = minimal::MIN_ACTIVATION_BALANCE;
-        let _: u64 = mainnet::MAX_EFFECTIVE_BALANCE_ELECTRA;
-        let _: u64 = minimal::MAX_EFFECTIVE_BALANCE_ELECTRA;
-        let _: u64 = mainnet::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA;
-        let _: u64 = minimal::MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA;
-        let _: u64 = mainnet::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA;
-        let _: u64 = minimal::WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA;
-        let _: usize = mainnet::PENDING_DEPOSITS_LIMIT;
-        let _: usize = minimal::PENDING_DEPOSITS_LIMIT;
-        let _: usize = mainnet::PENDING_PARTIAL_WITHDRAWALS_LIMIT;
-        let _: usize = minimal::PENDING_PARTIAL_WITHDRAWALS_LIMIT;
-        let _: usize = mainnet::PENDING_CONSOLIDATIONS_LIMIT;
-        let _: usize = minimal::PENDING_CONSOLIDATIONS_LIMIT;
-        let _: usize = mainnet::MAX_ATTESTER_SLASHINGS_ELECTRA;
-        let _: usize = minimal::MAX_ATTESTER_SLASHINGS_ELECTRA;
-        let _: usize = mainnet::MAX_ATTESTATIONS_ELECTRA;
-        let _: usize = minimal::MAX_ATTESTATIONS_ELECTRA;
-        let _: usize = mainnet::MAX_VALIDATORS_PER_SLOT;
-        let _: usize = minimal::MAX_VALIDATORS_PER_SLOT;
-        let _: usize = mainnet::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD;
-        let _: usize = minimal::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD;
-        let _: usize = mainnet::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD;
-        let _: usize = minimal::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD;
-        let _: usize = mainnet::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD;
-        let _: usize = minimal::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD;
-        let _: u64 = mainnet::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP;
-        let _: u64 = minimal::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP;
-        let _: u64 = mainnet::MAX_PENDING_DEPOSITS_PER_EPOCH;
-        let _: u64 = minimal::MAX_PENDING_DEPOSITS_PER_EPOCH;
+        in_both!(usize:
+            MAX_BLOB_COMMITMENTS_PER_BLOCK, KZG_COMMITMENT_INCLUSION_PROOF_DEPTH,
+            FIELD_ELEMENTS_PER_BLOB, BYTES_PER_BLOB,
+        );
 
-        let _: usize = mainnet::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH;
-        let _: usize = minimal::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH;
-        let _: usize = mainnet::FIELD_ELEMENTS_PER_CELL;
-        let _: usize = minimal::FIELD_ELEMENTS_PER_CELL;
-        let _: usize = mainnet::FIELD_ELEMENTS_PER_EXT_BLOB;
-        let _: usize = minimal::FIELD_ELEMENTS_PER_EXT_BLOB;
-        let _: usize = mainnet::CELLS_PER_EXT_BLOB;
-        let _: usize = minimal::CELLS_PER_EXT_BLOB;
-        let _: usize = mainnet::NUMBER_OF_COLUMNS;
-        let _: usize = minimal::NUMBER_OF_COLUMNS;
-        let _: usize = mainnet::BYTES_PER_CELL;
-        let _: usize = minimal::BYTES_PER_CELL;
-        let _: usize = mainnet::PROPOSER_LOOKAHEAD_LENGTH;
-        let _: usize = minimal::PROPOSER_LOOKAHEAD_LENGTH;
+        in_both!(u64:
+            MIN_ACTIVATION_BALANCE, MAX_EFFECTIVE_BALANCE_ELECTRA,
+            MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA, WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA,
+        );
+        in_both!(usize:
+            PENDING_DEPOSITS_LIMIT, PENDING_PARTIAL_WITHDRAWALS_LIMIT, PENDING_CONSOLIDATIONS_LIMIT,
+            MAX_ATTESTER_SLASHINGS_ELECTRA, MAX_ATTESTATIONS_ELECTRA, MAX_VALIDATORS_PER_SLOT,
+            MAX_DEPOSIT_REQUESTS_PER_PAYLOAD, MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
+            MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
+        );
+        in_both!(u64: MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP, MAX_PENDING_DEPOSITS_PER_EPOCH);
+
+        in_both!(usize:
+            KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH, FIELD_ELEMENTS_PER_CELL,
+            FIELD_ELEMENTS_PER_EXT_BLOB, CELLS_PER_EXT_BLOB, NUMBER_OF_COLUMNS, BYTES_PER_CELL,
+            PROPOSER_LOOKAHEAD_LENGTH,
+        );
     }
 }

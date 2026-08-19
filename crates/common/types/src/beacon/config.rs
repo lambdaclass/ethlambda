@@ -32,7 +32,8 @@
 
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
-use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, Uint256, Version};
+use crate::beacon::lean_unreachable;
+use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
 
 /// One entry in fulu's blob schedule: from `epoch` onward (until a later
 /// entry takes over), a block may carry up to `max_blobs_per_block` blobs.
@@ -241,6 +242,21 @@ pub struct Config {
     pub blob_schedule: Vec<BlobScheduleEntry>,
 }
 
+/// Mainnet's `TERMINAL_TOTAL_DIFFICULTY`, 58750000000000000000000, as the
+/// little-endian 64-bit limbs [`Uint256`] stores.
+///
+/// A `const` rather than `Uint256::from_dec_str(..).expect(..)` inside
+/// [`Config::mainnet`], so the digits are converted once at compile time instead
+/// of on every construction, and a typo is a build failure rather than a panic.
+/// The limbs are unreadable by construction, so a test below pins both sets
+/// against the decimal strings the config files actually carry.
+const MAINNET_TERMINAL_TOTAL_DIFFICULTY: Uint256 = U256([0xd808_a128_d738_0000, 0xc70, 0, 0]);
+
+/// Minimal's `TERMINAL_TOTAL_DIFFICULTY`, 2^256 - 2^10, in the same form. See
+/// [`MAINNET_TERMINAL_TOTAL_DIFFICULTY`].
+const MINIMAL_TERMINAL_TOTAL_DIFFICULTY: Uint256 =
+    U256([0xffff_ffff_ffff_fc00, u64::MAX, u64::MAX, u64::MAX]);
+
 impl Config {
     /// The configuration matching Ethereum mainnet, as of the pinned
     /// specification version's `configs/mainnet.yaml`.
@@ -293,8 +309,7 @@ impl Config {
             // proof of stake ever since, so this and the two fields below
             // never trigger again in practice, but are still read by any
             // faithful implementation of `validate_merge_block`.
-            terminal_total_difficulty: Uint256::from_dec_str("58750000000000000000000")
-                .expect("valid decimal literal"),
+            terminal_total_difficulty: MAINNET_TERMINAL_TOTAL_DIFFICULTY,
             terminal_block_hash: ExecutionBlockHash::zero(),
             terminal_block_hash_activation_epoch: constants::FAR_FUTURE_EPOCH,
 
@@ -368,10 +383,7 @@ impl Config {
 
             // configs/minimal.yaml sets this to 2**256 - 2**10: large enough
             // that no spec test's simulated PoW chain reaches it.
-            terminal_total_difficulty: Uint256::from_dec_str(
-                "115792089237316195423570985008687907853269984665640564039457584007913129638912",
-            )
-            .expect("valid decimal literal"),
+            terminal_total_difficulty: MINIMAL_TERMINAL_TOTAL_DIFFICULTY,
             terminal_block_hash: ExecutionBlockHash::zero(),
             terminal_block_hash_activation_epoch: constants::FAR_FUTURE_EPOCH,
 
@@ -388,16 +400,12 @@ impl Config {
     /// For code that already knows its preset at compile time (unlike the
     /// `transition` fixture suite, which needs to pick a configuration, and
     /// possibly override a fork epoch, per test case).
-    #[cfg(not(feature = "preset-minimal"))]
     pub fn active() -> Self {
-        Self::mainnet()
-    }
-
-    /// See the `preset-minimal` branch of [`Config::active`] above; `cfg`
-    /// picks exactly one of the two to compile.
-    #[cfg(feature = "preset-minimal")]
-    pub fn active() -> Self {
-        Self::minimal()
+        if cfg!(feature = "preset-minimal") {
+            Self::minimal()
+        } else {
+            Self::mainnet()
+        }
     }
 
     /// The fork active at `epoch`: the newest fork whose activation epoch is
@@ -439,10 +447,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version,
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
-            ForkName::Lean => unreachable!(
-                "lean state reached a beacon accessor (fork_version); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
+            ForkName::Lean => lean_unreachable!(fork: "Config::fork_version"),
         }
     }
 
@@ -459,10 +464,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch,
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
-            ForkName::Lean => unreachable!(
-                "lean state reached a beacon accessor (fork_epoch); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
+            ForkName::Lean => lean_unreachable!(fork: "Config::fork_epoch"),
         }
     }
 
@@ -486,42 +488,65 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch = epoch,
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
-            ForkName::Lean => unreachable!(
-                "lean state reached a beacon accessor (with_fork_epoch); \
-                 BlockChainServer must dispatch on fork_name() before this point"
-            ),
+            ForkName::Lean => lean_unreachable!(fork: "Config::with_fork_epoch"),
         }
         self
     }
 
-    /// The blob count limit for a block proposed in `epoch`, from fulu's
-    /// [`Self::blob_schedule`].
+    /// The blob parameters in effect at `epoch`, as
+    /// `(epoch, max_blobs_per_block)`, from fulu's [`Self::blob_schedule`].
     ///
-    /// Mirrors `get_blob_parameters`: the schedule is searched from its
+    /// This is `get_blob_parameters`: the schedule is searched from its
     /// latest entry backward for the first one whose epoch is at or before
     /// `epoch`; if none matches (the schedule is empty, as in
     /// [`Config::minimal`]'s default, or every entry is still in the future),
-    /// this falls back to [`Self::max_blobs_per_block_electra`], exactly as
-    /// the specification's own `get_blob_parameters` falls back to
-    /// `MAX_BLOBS_PER_BLOCK_ELECTRA`.
+    /// this falls back to electra's own activation and
+    /// [`Self::max_blobs_per_block_electra`], exactly as the specification's
+    /// own `get_blob_parameters` falls back to `MAX_BLOBS_PER_BLOCK_ELECTRA`.
+    ///
+    /// The pair's *epoch* matters as much as its limit, since
+    /// [`crate::beacon::fork_digest::compute_fork_digest`] hashes both: that is
+    /// why this returns the pair and [`Self::max_blobs_per_block`] is the thin
+    /// half of it, rather than the search being written once per caller.
+    pub fn blob_parameters(&self, epoch: Epoch) -> (Epoch, u64) {
+        self.blob_schedule
+            .iter()
+            .rev()
+            .find(|entry| entry.epoch <= epoch)
+            .map(|entry| (entry.epoch, entry.max_blobs_per_block))
+            .unwrap_or((self.electra_fork_epoch, self.max_blobs_per_block_electra))
+    }
+
+    /// The blob count limit for a block proposed in `epoch`. See
+    /// [`Self::blob_parameters`].
     ///
     /// This is fulu's helper: a deneb- or electra-only block's blob count is
     /// bounded by [`Self::max_blobs_per_block_deneb`] or
     /// [`Self::max_blobs_per_block_electra`] directly instead, matching how
     /// the specification only introduces `get_blob_parameters` at fulu.
     pub fn max_blobs_per_block(&self, epoch: Epoch) -> u64 {
-        self.blob_schedule
-            .iter()
-            .rev()
-            .find(|entry| entry.epoch <= epoch)
-            .map(|entry| entry.max_blobs_per_block)
-            .unwrap_or(self.max_blobs_per_block_electra)
+        self.blob_parameters(epoch).1
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_terminal_total_difficulty_limbs_match_the_config_files() {
+        assert_eq!(
+            Config::mainnet().terminal_total_difficulty,
+            Uint256::from_dec_str("58750000000000000000000").unwrap(),
+        );
+        assert_eq!(
+            Config::minimal().terminal_total_difficulty,
+            Uint256::from_dec_str(
+                "115792089237316195423570985008687907853269984665640564039457584007913129638912",
+            )
+            .unwrap(),
+        );
+    }
 
     #[test]
     fn fork_at_epoch_matches_mainnet_boundaries() {

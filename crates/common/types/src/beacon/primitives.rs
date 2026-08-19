@@ -124,6 +124,27 @@ byte_vector!(
     KZG_POINT_SIZE
 );
 
+/// The beacon [`Root`] and the lean `H256` are the same 32 bytes in two types:
+/// [`Root`] is `ethereum_types::H256`, while `crate::primitives::H256` is this
+/// crate's own newtype. Every beacon block root that reaches a store lookup
+/// crosses this line, and the conversion is total, so it lives here rather than
+/// being open-coded per call site.
+///
+/// On the beacon side of the namespace deliberately, even though module placement
+/// is free for the orphan rule: beacon is the half that knows about lean, so
+/// lean's own `primitives` module names nothing beacon.
+impl From<Root> for crate::primitives::H256 {
+    fn from(root: Root) -> Self {
+        crate::primitives::H256(root.0)
+    }
+}
+
+impl From<crate::primitives::H256> for Root {
+    fn from(hash: crate::primitives::H256) -> Self {
+        Root::from(hash.0)
+    }
+}
+
 /// Calls `hash_tree_root` with this crate's hasher, so callers do not pass one.
 ///
 /// Every type deriving `libssz_derive::HashTreeRoot` gets this through the
@@ -142,6 +163,21 @@ impl<T: libssz_merkle::HashTreeRoot> HashTreeRoot for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_round_trips_through_the_lean_hash() {
+        // Non-palindromic, so a reversed conversion would be visible.
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes[31] = 2;
+        let root = Root::from(bytes);
+
+        let lean: crate::primitives::H256 = root.into();
+        let back: Root = lean.into();
+
+        assert_eq!(lean.0, bytes, "the bytes must survive unchanged, in order");
+        assert_eq!(back, root);
+    }
 
     #[test]
     fn byte_vectors_round_trip_through_ssz() {

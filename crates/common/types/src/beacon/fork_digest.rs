@@ -28,25 +28,6 @@ pub fn compute_fork_data_root(current_version: Version, genesis_validators_root:
     .hash_tree_root()
 }
 
-/// The blob parameters in effect at `epoch`, as `(epoch, max_blobs_per_block)`.
-///
-/// Mirrors `get_blob_parameters`: the schedule is searched backward for the
-/// first entry at or before `epoch`, falling back to electra's fixed pair when
-/// the schedule is empty or every entry is still in the future. The fallback's
-/// *epoch* matters as much as its limit, because both are hashed below.
-fn blob_parameters(config: &Config, epoch: Epoch) -> (Epoch, u64) {
-    config
-        .blob_schedule
-        .iter()
-        .rev()
-        .find(|entry| entry.epoch <= epoch)
-        .map(|entry| (entry.epoch, entry.max_blobs_per_block))
-        .unwrap_or((
-            config.electra_fork_epoch,
-            config.max_blobs_per_block_electra,
-        ))
-}
-
 /// The four bytes every gossip topic name and the `eth2` ENR entry carry, for a
 /// chain with this schedule, this genesis validator set, and this epoch.
 ///
@@ -62,21 +43,17 @@ pub fn compute_fork_digest(
     let fork = config.fork_at_epoch(epoch);
     let base = compute_fork_data_root(config.fork_version(fork), genesis_validators_root);
 
-    if epoch < config.fulu_fork_epoch {
+    if fork < ForkName::Fulu {
         return base.0[..4].try_into().expect("a Root is 32 bytes");
     }
 
-    let (bp_epoch, bp_max_blobs) = blob_parameters(config, epoch);
+    let (bp_epoch, bp_max_blobs) = config.blob_parameters(epoch);
     let mut hasher = Sha256::new();
     hasher.update(bp_epoch.to_le_bytes());
     hasher.update(bp_max_blobs.to_le_bytes());
     let mask = hasher.finalize();
 
-    let mut digest = [0u8; 4];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        *byte = base.0[index] ^ mask[index];
-    }
-    digest
+    core::array::from_fn(|index| base.0[index] ^ mask[index])
 }
 
 /// The next epoch at which [`compute_fork_digest`] changes, if there is one.
