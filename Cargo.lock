@@ -4526,7 +4526,7 @@ dependencies = [
 [[package]]
 name = "libssz"
 version = "0.3.0"
-source = "git+https://github.com/lambdaclass/libssz?branch=main#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
 dependencies = [
  "ethereum-types",
  "smallvec",
@@ -4535,7 +4535,7 @@ dependencies = [
 [[package]]
 name = "libssz-derive"
 version = "0.3.0"
-source = "git+https://github.com/lambdaclass/libssz?branch=main#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4545,7 +4545,7 @@ dependencies = [
 [[package]]
 name = "libssz-merkle"
 version = "0.3.0"
-source = "git+https://github.com/lambdaclass/libssz?branch=main#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
 dependencies = [
  "ethereum-types",
  "libssz",
@@ -4555,7 +4555,7 @@ dependencies = [
 [[package]]
 name = "libssz-types"
 version = "0.3.0"
-source = "git+https://github.com/lambdaclass/libssz?branch=main#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
 dependencies = [
  "libssz",
  "libssz-merkle",

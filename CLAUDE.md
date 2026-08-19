@@ -324,10 +324,11 @@ existing once per chain.
   two of phase0's fields are *replaced* in altair, one field changes type in
   five separate forks, and the state's merkle tree gains a level at electra.
 - **Requires mutable element access on `SszList`**, which no published libssz
-  release has, so all four libssz crates are **git dependencies** tracking
-  `lambdaclass/libssz` `main` (for lambdaclass/libssz#33). `Cargo.lock` pins the
-  exact commit, so this does not drift on its own. Return them to a crates.io
-  version once a release carries #33. A git dependency rather than a
+  release has, so all four libssz crates are **git dependencies** on
+  `lambdaclass/libssz` (for lambdaclass/libssz#33), pinned by `rev` rather than
+  tracking `main`: this is the SSZ encoder and merkleizer behind every
+  `hash_tree_root`, so a routine `cargo update` must not be able to move it.
+  Return them to a crates.io version once a release carries #33. A git dependency rather than a
   `[patch.crates-io]` override because nothing outside this workspace depends on
   libssz, so there is no second copy to unify; that also keeps the manifest free
   of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.

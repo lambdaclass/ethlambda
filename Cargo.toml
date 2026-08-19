@@ -85,10 +85,14 @@ clap = { version = "4.3", features = ["derive", "env"] }
 # libssz's `ethereum_types` feature is built against.
 ethereum-types = "0.15.1"
 
-# `asm` selects the CPU's SHA-256 instructions where it has them. Merkleizing a
-# beacon state is almost entirely SHA-256 compressions, so this is not a
-# micro-optimization. Selection is at run time through `cpufeatures`, so the
-# build stays portable to hardware lacking the extensions.
+# Merkleizing a beacon state is almost entirely SHA-256 compressions, so which
+# implementation `sha2` picks matters. What `asm` actually buys is aarch64: on
+# x86/x86_64, sha2 0.10.9 compiles its `x86` backend and dispatches to the SHA-NI
+# intrinsics through `cpufeatures` whether or not this feature is set, and `asm`
+# only swaps the *fallback* for that dispatch from pure Rust to `sha2-asm`. On
+# aarch64 the feature is the whole hardware path: without it the crate falls
+# through to the pure-Rust backend. Selection stays at run time either way, so the
+# build remains portable to hardware lacking the extensions.
 sha2 = { version = "0.10.9", features = ["asm"] }
 
 # XMSS signatures
@@ -102,13 +106,15 @@ leansig = { git = "https://github.com/leanEthereum/leanSig", branch = "devnet4" 
 # it exposes only `Deref` and `Index`. `DerefMut` and `IndexMut` landed after
 # that release, in lambdaclass/libssz#33.
 #
-# `Cargo.lock` pins the exact commit, so this does not drift on its own; it
-# moves when someone runs `cargo update`. Return these to a crates.io version
-# once a release carrying #33 exists.
-libssz = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
-libssz-derive = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
-libssz-merkle = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
-libssz-types = { git = "https://github.com/lambdaclass/libssz", branch = "main" }
+# Pinned by `rev` rather than tracking `main`: the requirement is a commit that
+# carries #33, not whatever `main` holds today, and `main` here is the SSZ encoder
+# and merkleizer that decides every `hash_tree_root`, so a routine `cargo update`
+# must not be able to move it. Return these to a crates.io version once a release
+# carrying #33 exists.
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }
