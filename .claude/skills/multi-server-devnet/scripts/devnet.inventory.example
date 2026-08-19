@@ -1,0 +1,52 @@
+# The deployment's servers: what each one is called, where it is, what it belongs
+# to, and how big its devnet is. Copy to devnet.inventory (gitignored) and fill in.
+#
+# This is the operator's inventory, in the same sense devnet.env's values are: the
+# authority on a RUNNING devnet is always its own genesis/config.yaml
+# (ATTESTATION_COMMITTEE_COUNT), and the scripts still take NODES/SUBNETS as
+# positional args. Recorded here so a restart doesn't have to guess, and so
+# "which hosts are in devnet-c" has one answer instead of living in someone's head.
+#
+# Read it with inventory.sh rather than by hand:
+#
+#   bash scripts/inventory.sh --tag devnet-ab --field ip        # ips, for a loop
+#   bash scripts/inventory.sh --tag devnet-ab --tag aggregator  # AND: both needed
+#   bash scripts/inventory.sh --tag validator                   # derived, see TAGS
+#   SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
+#   SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
+#
+# FORMAT: whitespace-separated columns, aligned however you like. Blank lines and
+# lines whose first non-space character is '#' are ignored. Five columns:
+#
+#   name      ssh target / display name. Need not equal the machine's hostname,
+#             and often doesn't after a host is repurposed -- inventory.sh never
+#             resolves it, so a stale name here misroutes every ssh that uses it.
+#   ip        address. The one field worth re-deriving from the fleet rather than
+#             trusting after a rebuild.
+#   tags      COMMA-separated, NO spaces (a space would start the next column;
+#             inventory.sh rejects the file rather than answer from shifted rows).
+#   nodes     NODES on this server, or '-' if it runs no devnet.
+#   subnets   ATTESTATION_COMMITTEE_COUNT, or '-'.
+#
+# TAGS: free-form, with two conventions inventory.sh knows about:
+#
+#   devnet-*    names the chain this server's nodes belong to. Two servers sharing
+#               one tag means they share one genesis, i.e. the split-chain model
+#               (nodes 0..N on one, N+1.. on the other) -- NOT two devnets that
+#               happen to be named alike. Also the `network` Prometheus label.
+#   aggregator  this server runs the aggregator duty. A whole-server role, not a
+#               per-node one.
+#
+#   `validator` is DERIVED, never written here: it means "has a devnet-* tag and
+#   is not tagged aggregator". Writing it as a literal tag would let it disagree
+#   with the aggregator column, so inventory.sh computes it instead.
+#
+# The example below shows both supported topologies at once: host-a + host-b share
+# the chain `devnet-ab` (64 nodes total, 32 each), host-c runs its own independent
+# `devnet-c`, and metrics-1 carries the Grafana/Prometheus/Loki stack and no nodes.
+
+# name        ip              tags                    nodes  subnets
+host-a        10.0.0.1        devnet-ab,aggregator    32     8
+host-b        10.0.0.2        devnet-ab               32     8
+host-c        10.0.0.3        devnet-c                16     2
+metrics-1     10.0.0.4        tooling                 -      -
