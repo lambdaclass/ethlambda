@@ -229,6 +229,64 @@ pub(crate) struct Behaviour {
     identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<Codec>,
+    /// Refuses connections past the configured ceiling. A deny from any member
+    /// behaviour denies the connection, so registering this is the whole
+    /// mechanism; see [`beacon_connection_limits`] for the numbers and why the
+    /// beacon network needs them while lean does not.
+    connection_limits: libp2p::connection_limits::Behaviour,
+}
+
+/// Ceiling on connections the beacon swarm keeps established at once.
+///
+/// Mainnet dials us far faster than we dial it: a 22-hour run accepted 12,521
+/// inbound connections against 235 successful outbound dials, and settled at
+/// 371 held peers. Every one of them feeds the same gossip decode path, which
+/// competes with block import for the single core that decides how fast the
+/// head advances. Left uncapped the peer count is set by how popular we are,
+/// not by what we can afford, so it is bounded here by policy.
+pub const MAX_BEACON_CONNECTIONS: u32 = 200;
+
+/// How many of [`MAX_BEACON_CONNECTIONS`] stay reserved for connections we
+/// open ourselves.
+///
+/// Without a reservation, inbound demand takes every slot and discovery can
+/// never dial a peer of its own choosing. That is the eclipse-adjacent case
+/// libp2p's own documentation warns about for a total-only limit, and it also
+/// costs us the ability to seek out peers that serve the ranges we need.
+pub const MAX_BEACON_OUTBOUND_CONNECTIONS: u32 = 20;
+
+/// Connections a single peer may hold. Two rather than one because the swarm
+/// listens on both QUIC and TCP, so a remote is free to establish over each.
+pub const MAX_CONNECTIONS_PER_PEER: u32 = 2;
+
+// The inbound allowance below is the ceiling minus the outbound reservation, so
+// a reservation at or above the ceiling underflows. Release builds wrap that to
+// roughly four billion and silently remove the cap, which is exactly the
+// regression a runtime test would be least likely to catch, so it is refused at
+// compile time instead.
+const _: () = assert!(
+    MAX_BEACON_OUTBOUND_CONNECTIONS < MAX_BEACON_CONNECTIONS,
+    "the outbound reservation has to fit inside the connection ceiling"
+);
+
+/// Connection limits for the beacon network, where inbound supply is
+/// effectively unbounded. See [`MAX_BEACON_CONNECTIONS`].
+pub(crate) fn beacon_connection_limits() -> libp2p::connection_limits::Behaviour {
+    let limits = libp2p::connection_limits::ConnectionLimits::default()
+        .with_max_established(Some(MAX_BEACON_CONNECTIONS))
+        .with_max_established_incoming(Some(
+            MAX_BEACON_CONNECTIONS - MAX_BEACON_OUTBOUND_CONNECTIONS,
+        ))
+        .with_max_established_outgoing(Some(MAX_BEACON_OUTBOUND_CONNECTIONS))
+        .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER));
+    libp2p::connection_limits::Behaviour::new(limits)
+}
+
+/// No connection limits, which is what the lean network has always run with: a
+/// devnet's peer count is bounded by the size of the devnet itself, so a cap
+/// there would only ever cap the operator.
+pub(crate) fn unlimited_connections() -> libp2p::connection_limits::Behaviour {
+    libp2p::connection_limits::Behaviour::new(Default::default())
 }
 
 /// Configuration for building the libp2p swarm.
@@ -371,11 +429,13 @@ impl Behaviour {
         identify: libp2p::identify::Behaviour,
         gossipsub: libp2p::gossipsub::Behaviour,
         req_resp: request_response::Behaviour<Codec>,
+        connection_limits: libp2p::connection_limits::Behaviour,
     ) -> Self {
         Self {
             identify,
             gossipsub,
             req_resp,
+            connection_limits,
         }
     }
 }
@@ -419,7 +479,7 @@ pub fn build_swarm(
         identity.public(),
     ));
 
-    let behavior = Behaviour::new(identify, gossipsub, req_resp);
+    let behavior = Behaviour::new(identify, gossipsub, req_resp, unlimited_connections());
 
     // TODO: set peer scoring params
 
@@ -1093,12 +1153,34 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-            metrics::notify_peer_connected(
-                server.resolve_node_name(peer_id.as_ref()),
-                "inbound",
-                "error",
+            // A connection our own limit refused is policy working, not a
+            // fault. Once the cap is reached every further dial arrives here,
+            // so counting these as errors would bury the real ones under the
+            // steady rate of peers we are deliberately turning away, and warn
+            // once per rejection while doing it. See `beacon_connection_limits`.
+            let refused_at_capacity = matches!(
+                &error,
+                libp2p::swarm::ListenError::Denied { cause }
+                    if cause
+                        .downcast_ref::<libp2p::connection_limits::Exceeded>()
+                        .is_some()
             );
-            warn!(%error, "Incoming connection error");
+            if refused_at_capacity {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "refused_at_capacity",
+                );
+                let peer_count = server.connected_peers.len();
+                debug!(peer_count, "Refused an inbound connection at capacity");
+            } else {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "error",
+                );
+                warn!(%error, "Incoming connection error");
+            }
         }
         _ => {
             trace!(?event, "Ignored swarm event");

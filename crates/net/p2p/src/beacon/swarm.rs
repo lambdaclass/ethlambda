@@ -94,7 +94,14 @@ pub fn build_beacon_swarm(
         )
         .expect("failed to add TCP transport to swarm")
         .with_quic()
-        .with_behaviour(|_| Behaviour::new(identify, gossipsub, req_resp))
+        .with_behaviour(|_| {
+            Behaviour::new(
+                identify,
+                gossipsub,
+                req_resp,
+                crate::beacon_connection_limits(),
+            )
+        })
         .expect("failed to add behaviour to swarm")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
