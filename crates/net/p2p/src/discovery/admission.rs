@@ -186,18 +186,6 @@ pub fn rank_by_uncovered_subnets(candidates: &mut [DiscoveredPeer], covered: &Ha
 }
 
 #[cfg(test)]
-impl DiscoveredPeer {
-    /// A candidate carrying only what ranking looks at.
-    fn for_test(subnets: Vec<u64>) -> Self {
-        Self {
-            peer_id: PeerId::random(),
-            addr: Multiaddr::empty(),
-            subnets,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use ethrex_p2p::types::{Node, NodeRecordPairs};
@@ -274,6 +262,17 @@ mod tests {
     fn raw_record(mut pairs: NodeRecordPairs) -> NodeRecord {
         set_admissible_entries(&mut pairs);
         NodeRecord::new(ethrex_common::H512::zero(), 1, pairs)
+    }
+
+    impl DiscoveredPeer {
+        /// A candidate carrying only what ranking looks at.
+        fn for_test(subnets: Vec<u64>) -> Self {
+            Self {
+                peer_id: PeerId::random(),
+                addr: Multiaddr::empty(),
+                subnets,
+            }
+        }
     }
 
     #[test]
