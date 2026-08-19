@@ -12,8 +12,8 @@
 #   bash scripts/inventory.sh --tag devnet-ab --field ip        # ips, for a loop
 #   bash scripts/inventory.sh --tag devnet-ab --tag aggregator  # AND: both needed
 #   bash scripts/inventory.sh --tag validator                   # derived, see TAGS
-#   hosts=$(bash scripts/inventory.sh --tag devnet-ab --field name) || exit
-#   for h in $(echo $hosts); do ssh "$SSH_USER@$h" uptime; done  # bash + zsh
+#   SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
+#   SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
 #
 # FORMAT: whitespace-separated columns, aligned however you like. Blank lines and
 # lines whose first non-space character is '#' are ignored. Five columns:
