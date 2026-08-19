@@ -15,7 +15,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
-use futures::StreamExt;
+use futures::{StreamExt, future::OptionFuture};
 use libp2p::{
     Multiaddr, StreamProtocol,
     gossipsub::{MessageAuthenticity, ValidationMode},
@@ -398,13 +398,14 @@ impl P2P {
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
     ) -> Result<P2P, DiscoveryError> {
-        let discovery = match discovery {
-            Some(config) => Some(spawn_discovery(config).await?),
-            None => {
-                info!("discv5 discovery disabled; peering from the static bootnode list only");
-                None
-            }
-        };
+        if discovery.is_none() {
+            info!("discv5 discovery disabled; peering from the static bootnode list only");
+        }
+        // `OptionFuture` awaits the spawn only when there is one to await, so the
+        // disabled case stays a plain `None` without a branch of its own.
+        let discovery = OptionFuture::from(discovery.map(spawn_discovery))
+            .await
+            .transpose()?;
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
@@ -837,12 +838,12 @@ impl Bootnode {
 /// entry in the bootnode file should not stop the node from booting.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
     enrs.into_iter()
-        .filter_map(|enr_str| match parse_enr(&enr_str) {
-            Ok(bootnode) => Some(bootnode),
-            Err(reason) => {
-                warn!(%reason, enr = %enr_str, "Skipping unusable bootnode ENR");
-                None
-            }
+        .filter_map(|enr_str| {
+            parse_enr(&enr_str)
+                .inspect_err(
+                    |reason| warn!(%reason, enr = %enr_str, "Skipping unusable bootnode ENR"),
+                )
+                .ok()
         })
         .collect()
 }

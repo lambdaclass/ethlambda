@@ -95,11 +95,10 @@ impl LeanFilter {
 
 impl PeerFilter for LeanFilter {
     fn accepts(&self, record: &NodeRecord) -> bool {
-        match admit(record, &self.fork_id, self.attestation_committee_count) {
-            Ok(_) => true,
-            Err(reason) => {
-                // The only place a rejection is visible: the peer table records
-                // that the record failed the filter but says nothing about why.
+        admit(record, &self.fork_id, self.attestation_committee_count)
+            // The only place a rejection is visible: the peer table records
+            // that the record failed the filter but says nothing about why.
+            .inspect_err(|reason| {
                 debug!(
                     ip = ?record.pairs().ip,
                     udp_port = ?record.pairs().udp_port,
@@ -107,9 +106,8 @@ impl PeerFilter for LeanFilter {
                     ?reason,
                     "Rejecting discovered peer"
                 );
-                false
-            }
-        }
+            })
+            .is_ok()
     }
 }
 
