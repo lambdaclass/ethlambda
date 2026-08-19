@@ -40,8 +40,10 @@ B owns `k+1..N-1`). Everything below still applies with three changes, and
 
 Nothing about the servers is hardcoded. Establish these from the operator:
 
-- `SERVERS` — the SSH targets (any count, any names), one devnet each.
-- `SSH_USER` — login user. `docker` is invoked with `sudo`.
+- `SERVERS`: the SSH targets for the operation at hand (any count, any names),
+  one devnet each. A working set taken FROM the inventory below, not a second
+  list of hosts to keep in step with it.
+- `SSH_USER`: login user. `docker` is invoked with `sudo`.
 - Per-devnet `NODES` (validators on that server) and `SUBNETS`
   (`ATTESTATION_COMMITTEE_COUNT`); these can differ between servers.
 - A central host for Grafana + the federating Prometheus (often one of the
@@ -53,7 +55,7 @@ gitignored) instead of retyping them: the operator-side scripts source it via
 file. It is the one place a deployment's urls and Grafana ids live.
 
 **The servers themselves live in `scripts/devnet.inventory`** (copy
-`scripts/devnet.inventory.example`; gitignored) — name, ip, tags, and per-devnet
+`scripts/devnet.inventory.example`; gitignored): name, ip, tags, and per-devnet
 `NODES`/`SUBNETS`, one row per host. Query it with `scripts/inventory.sh` rather
 than reading it by hand:
 
@@ -67,9 +69,10 @@ SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
 
 Tag conventions: a `devnet-*` tag names the chain a host's nodes belong to (two
 hosts sharing one means the split-chain model, *not* two like-named devnets), and
-`aggregator` is a whole-server role. `validator` is **derived** — "has a `devnet-*`
-tag and is not tagged `aggregator`" — so it can never disagree with the aggregator
-tag. An unknown or empty `--tag` exits 2 rather than returning nothing (or, worse,
+`aggregator` is a whole-server role. `validator` is **derived**: "has a `devnet-*`
+tag and is not tagged `aggregator`", so it can never disagree with the aggregator
+tag, and writing it literally in the file is an error rather than a second opinion.
+An unknown or empty `--tag` exits 2 rather than returning nothing (or, worse,
 everything): a typo that yields an empty loop reports success while doing nothing,
 and `--tag "$UNSET"` would act on hosts the caller never named.
 
@@ -151,7 +154,8 @@ redirect must run under sudo).
 ## Workflows
 
 Examples assume `SSH_USER` is set and you iterate over `SERVERS`. Per server you
-pass its own `NODES`/`SUBNETS`.
+pass its own `NODES`/`SUBNETS`. `for h in $SERVERS` splits under bash; zsh does not
+split parameter expansions, so there write `for h in $(echo $SERVERS)`.
 
 ### Pull the latest images on all servers
 ```bash

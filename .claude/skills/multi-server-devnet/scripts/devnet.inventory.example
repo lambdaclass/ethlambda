@@ -15,7 +15,7 @@
 #   SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
 #   SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
 #
-# FORMAT — whitespace-separated columns, aligned however you like. Blank lines and
+# FORMAT: whitespace-separated columns, aligned however you like. Blank lines and
 # lines whose first non-space character is '#' are ignored. Five columns:
 #
 #   name      ssh target / display name. Need not equal the machine's hostname,
@@ -28,7 +28,7 @@
 #   nodes     NODES on this server, or '-' if it runs no devnet.
 #   subnets   ATTESTATION_COMMITTEE_COUNT, or '-'.
 #
-# TAGS — free-form, with two conventions inventory.sh knows about:
+# TAGS: free-form, with two conventions inventory.sh knows about:
 #
 #   devnet-*    names the chain this server's nodes belong to. Two servers sharing
 #               one tag means they share one genesis, i.e. the split-chain model
