@@ -9,10 +9,11 @@
 #
 # Read it with inventory.sh rather than by hand:
 #
-#   inventory.sh --tag devnet-ab --field ip        # ips, one per line, for a loop
-#   inventory.sh --tag devnet-ab --tag aggregator  # AND: both tags must be present
-#   inventory.sh --tag validator                   # derived, see TAGS below
-#   SERVERS=$(inventory.sh --field name | tr '\n' ' ')
+#   bash scripts/inventory.sh --tag devnet-ab --field ip        # ips, for a loop
+#   bash scripts/inventory.sh --tag devnet-ab --tag aggregator  # AND: both needed
+#   bash scripts/inventory.sh --tag validator                   # derived, see TAGS
+#   SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
+#   SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
 #
 # FORMAT — whitespace-separated columns, aligned however you like. Blank lines and
 # lines whose first non-space character is '#' are ignored. Five columns:
@@ -22,7 +23,8 @@
 #             resolves it, so a stale name here misroutes every ssh that uses it.
 #   ip        address. The one field worth re-deriving from the fleet rather than
 #             trusting after a rebuild.
-#   tags      COMMA-separated, NO spaces (a space would start the next column).
+#   tags      COMMA-separated, NO spaces (a space would start the next column;
+#             inventory.sh rejects the file rather than answer from shifted rows).
 #   nodes     NODES on this server, or '-' if it runs no devnet.
 #   subnets   ATTESTATION_COMMITTEE_COUNT, or '-'.
 #

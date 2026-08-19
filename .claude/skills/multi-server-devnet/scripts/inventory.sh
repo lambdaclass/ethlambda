@@ -18,15 +18,44 @@
 # It is computed, not read, so it can never disagree with the aggregator tag.
 # `--tag validator` is exactly `--tag <that devnet> --not-tag aggregator`.
 #
-# An unknown tag is an ERROR, not an empty result. A typo ('devnet5' for
+# An unknown `--tag` is an ERROR, not an empty result. A typo ('devnet5' for
 # 'devnet-5') that quietly returns no hosts turns `for h in $(inventory.sh ...)`
 # into a loop that does nothing and reports success, which is the same class of
 # failure devnet-env.sh guards against: acting on the wrong deployment, silently.
-# A tag that IS known but matches nothing is likewise exit 1 -- a real fleet has
-# no empty groups, so an empty match means the inventory is stale.
+# An EMPTY --tag value is an error for the mirror-image reason: an unset variable
+# in `--tag "$DEVNET"` would drop the filter and return the whole fleet, exit 0,
+# including hosts on other chains. A tag that IS known but matches nothing is
+# exit 1 -- a real fleet has no empty groups, so that means a stale inventory.
+#
+# `--not-tag` is deliberately NOT checked against the file: an exclusion that
+# matches nothing is well-defined, and demanding the tag exist would break the
+# documented `--tag <devnet> --not-tag aggregator` on any fleet whose aggregator
+# role is currently unassigned.
 set -u
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Sliced from the header block above, ending at the first non-comment line, so
+# editing the comment can't silently truncate --help.
+help_text() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"; }
+
+# Help goes to stdout for -h, but to stderr on the error path: callers capture
+# this script's stdout ($(inventory.sh --field name)), so help text printed there
+# becomes a list of "hosts" to ssh into.
+usage() {
+  code=${1:-0}
+  if [ "$code" = 0 ]; then help_text; else help_text >&2; fi
+  exit "$code"
+}
+
+# Whitespace-split a tag argument into SPLIT with globbing OFF: a tag is data, and
+# `--tag 'devnet-*'` must not expand against whatever happens to sit in the cwd.
+split_tags() {
+  case $2 in
+    *[![:space:]]*) ;;
+    *) echo "$1 needs a non-empty value (an empty tag would match every host)" >&2
+       exit 2 ;;
+  esac
+  set -f; SPLIT=($2); set +f
+}
 
 file=""; field="default"; count=0
 tags=(); nottags=()
@@ -35,9 +64,9 @@ while [ $# -gt 0 ]; do
   case $1 in
     --tag)     [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
                # Split on whitespace so --tag 'devnet-5 aggregator' is two tags.
-               for t in $2; do tags+=("$t"); done; shift 2 ;;
+               split_tags "$1" "$2"; tags+=("${SPLIT[@]}"); shift 2 ;;
     --not-tag) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
-               for t in $2; do nottags+=("$t"); done; shift 2 ;;
+               split_tags "$1" "$2"; nottags+=("${SPLIT[@]}"); shift 2 ;;
     --field)   [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
                field=$2; shift 2 ;;
     --file)    [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
@@ -95,6 +124,17 @@ awk -v want="${tags[*]-}" -v nowant="${nottags[*]-}" \
     name = $1; ip = $2; tags = $3
     nodes   = (NF >= 4 ? $4 : "-")
     subnets = (NF >= 5 ? $5 : "-")
+
+    # A space inside the tags column (or a trailing comment on a data row) shifts
+    # every later field: $3 loses tags, and a ROLE lands in nodes. Unlike a short
+    # row, which only drops one host, that silently reassigns roles and hands a
+    # word to a caller expecting a count -- so refuse the whole file instead.
+    if (nodes !~ /^([0-9]+|-)$/ || subnets !~ /^([0-9]+|-)$/) {
+      printf "%s:%d: nodes/subnets must be a number or '\''-'\'', got '\''%s'\'' '\''%s'\''", \
+        src, FNR, nodes, subnets > "/dev/stderr"
+      printf " -- a space in the tags column shifts the columns right\n" > "/dev/stderr"
+      malformed = 1; next
+    }
     t = "," tags ","
 
     # Every literal tag in the file, so a typo can be told from a real absence.
@@ -113,14 +153,17 @@ awk -v want="${tags[*]-}" -v nowant="${nottags[*]-}" \
   }
 
   END {
+    # Answering from a file whose columns do not line up would mean answering
+    # about tags that were never written; the row numbers are already on stderr.
+    if (malformed) {
+      printf "%s: refusing to answer from a file that does not parse\n", src > "/dev/stderr"
+      exit 2
+    }
+
     bad = 0
     for (i = 1; i <= nw; i++)
       if (W[i] != "validator" && !(W[i] in seen)) {
         printf "no such tag in %s: %s\n", src, W[i] > "/dev/stderr"; bad = 1
-      }
-    for (i = 1; i <= nn; i++)
-      if (NW[i] != "validator" && !(NW[i] in seen)) {
-        printf "no such tag in %s: %s\n", src, NW[i] > "/dev/stderr"; bad = 1
       }
     if (bad) {
       printf "known tags: " > "/dev/stderr"

@@ -58,18 +58,20 @@ file. It is the one place a deployment's urls and Grafana ids live.
 than reading it by hand:
 
 ```bash
-inventory.sh --tag devnet-ab --field ip        # ips, one per line, for a loop
-inventory.sh --tag devnet-ab --tag aggregator  # AND across tags
-inventory.sh --tag validator                   # derived, see below
-SERVERS=$(inventory.sh --field name | tr '\n' ' ')
+bash scripts/inventory.sh --tag devnet-ab --field ip        # ips, for a loop
+bash scripts/inventory.sh --tag devnet-ab --tag aggregator  # AND across tags
+bash scripts/inventory.sh --tag validator                   # derived, see below
+SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
+SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
 ```
 
 Tag conventions: a `devnet-*` tag names the chain a host's nodes belong to (two
 hosts sharing one means the split-chain model, *not* two like-named devnets), and
 `aggregator` is a whole-server role. `validator` is **derived** — "has a `devnet-*`
 tag and is not tagged `aggregator`" — so it can never disagree with the aggregator
-tag. An unknown tag exits 2 with the known-tag list rather than returning nothing,
-because a typo that yields an empty loop reports success while doing nothing.
+tag. An unknown or empty `--tag` exits 2 rather than returning nothing (or, worse,
+everything): a typo that yields an empty loop reports success while doing nothing,
+and `--tag "$UNSET"` would act on hosts the caller never named.
 
 `NODES`/`SUBNETS` there are still the operator's inventory: the scripts take them
 as positional args, and the authority on a running devnet is always its own
