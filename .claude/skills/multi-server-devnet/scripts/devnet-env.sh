@@ -4,6 +4,9 @@
 #
 #   . "$SCRIPT_DIR/devnet-env.sh"; devnet_load_env
 #
+# Also provides devnet_find_file, the file-lookup ladder both this and
+# inventory.sh use.
+#
 # Lookup order, first hit wins: $DEVNET_ENV, ./devnet.env, <scripts dir>/devnet.env.
 # Copy devnet.env.example -> devnet.env and fill it in (devnet.env is gitignored,
 # since it names your hosts and may point at a webhook file).
@@ -17,21 +20,32 @@
 # fine. A line that looks like an assignment but whose name isn't usable is
 # reported on stderr rather than dropped in silence, because a config line that
 # goes unread is how you deploy against the wrong deployment.
-devnet_load_env() {
-  local dir file line key val
+
+# Resolve one of the deployment's config files. First hit wins: the path in $2 (an
+# env var NAME), ./<name>, <scripts dir>/<name>. Prints the path on stdout.
+# Returns 1 when nothing exists, and 2 when the env var names a path that doesn't
+# -- an explicit path that isn't there is a typo, not a licence to fall back to
+# another deployment's file. Shared with inventory.sh so devnet.env and
+# devnet.inventory can't end up with two ideas of where they live.
+devnet_find_file() {
+  local name=$1 envvar=$2 dir explicit candidate
   dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  file=""
-  if [ -n "${DEVNET_ENV:-}" ]; then
-    # An explicit path that doesn't exist is a typo, not a reason to silently fall
-    # back to some other devnet.env and deploy against the wrong deployment.
-    [ -f "$DEVNET_ENV" ] || { echo "DEVNET_ENV=$DEVNET_ENV does not exist" >&2; return 1; }
-    file=$DEVNET_ENV
-  else
-    for candidate in "./devnet.env" "$dir/devnet.env"; do
-      [ -f "$candidate" ] && { file=$candidate; break; }
-    done
+  explicit=${!envvar:-}
+  if [ -n "$explicit" ]; then
+    [ -f "$explicit" ] || { echo "$envvar=$explicit does not exist" >&2; return 2; }
+    printf '%s\n' "$explicit"; return 0
   fi
-  [ -n "$file" ] || return 0
+  for candidate in "./$name" "$dir/$name"; do
+    [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+devnet_load_env() {
+  local file line key val rc
+  file=$(devnet_find_file devnet.env DEVNET_ENV); rc=$?
+  [ "$rc" -eq 2 ] && return 1        # DEVNET_ENV names a missing file: reported
+  [ "$rc" -eq 0 ] || return 0        # no env file at all is not an error
 
   while IFS= read -r line || [ -n "$line" ]; do
     line=${line#"${line%%[![:space:]]*}"}          # ltrim, so an indented line is read
