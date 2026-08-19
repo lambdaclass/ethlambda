@@ -1,0 +1,165 @@
+{
+  "uid": "devnet-logs",
+  "title": "Devnet Logs",
+  "tags": ["lean", "devnet", "logs"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 0,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ds_prom",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "ds_loki",
+        "label": "Loki",
+        "type": "datasource",
+        "query": "loki",
+        "refresh": 1,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "network",
+        "type": "query",
+        "label": "Devnet",
+        "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(lean_head_slot, network)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {}
+      },
+      {
+        "name": "node",
+        "type": "query",
+        "label": "Node",
+        "datasource": { "type": "loki", "uid": "${ds_loki}" },
+        "query": "label_values({network=\"$network\"}, node)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": ["All"], "value": ["$__all"] }
+      },
+      {
+        "name": "stream",
+        "type": "query",
+        "label": "Stream",
+        "datasource": { "type": "loki", "uid": "${ds_loki}" },
+        "query": "label_values({network=\"$network\"}, stream)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": ["All"], "value": ["$__all"] }
+      },
+      {
+        "name": "search",
+        "type": "textbox",
+        "label": "Search (substring)",
+        "query": "",
+        "current": { "text": "", "value": "" },
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Log volume by level — $network",
+      "datasource": { "type": "loki", "uid": "${ds_loki}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "lineWidth": 0,
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "INFO" },  "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] },
+          { "matcher": { "id": "byName", "options": "DEBUG" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
+          { "matcher": { "id": "byName", "options": "TRACE" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } } ] },
+          { "matcher": { "id": "byName", "options": "WARN" },  "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "ERROR" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "${ds_loki}" },
+          "editorMode": "code",
+          "queryType": "range",
+          "legendFormat": "{{level}}",
+          "expr": "sum by (level) (count_over_time({network=\"$network\", node=~\"${node:pipe}\", stream=~\"${stream:pipe}\"} |= \"$search\" [$__interval]))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "logs",
+      "title": "Logs — $network",
+      "datasource": { "type": "loki", "uid": "${ds_loki}" },
+      "gridPos": { "h": 21, "w": 24, "x": 0, "y": 7 },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "loki", "uid": "${ds_loki}" },
+          "editorMode": "code",
+          "queryType": "range",
+          "maxLines": 1000,
+          "expr": "{network=\"$network\", node=~\"${node:pipe}\", stream=~\"${stream:pipe}\"} |= \"$search\""
+        }
+      ]
+    }
+  ]
+}
