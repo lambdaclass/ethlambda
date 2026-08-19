@@ -42,8 +42,8 @@ mod tests {
     async fn genesis_returns_time_and_validator_count() {
         // Build a state with 3 validators so the assertion is non-vacuous.
         let dummy_validator = |index: u64| Validator {
-            attestation_pubkey: [0u8; 52],
-            proposal_pubkey: [0u8; 52],
+            attestation_pubkey: [0u8; 32],
+            proposal_pubkey: [0u8; 32],
             index,
         };
         let validators = vec![dummy_validator(0), dummy_validator(1), dummy_validator(2)];

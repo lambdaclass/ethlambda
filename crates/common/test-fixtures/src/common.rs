@@ -329,7 +329,12 @@ where
     let pubkey: ValidatorPubkeyBytes = hex::decode(value.strip_prefix("0x").unwrap_or(&value))
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
-        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+        .map_err(|_| {
+            D::Error::custom(format!(
+                "ValidatorPubkey length != {}",
+                ethlambda_types::state::PUBLIC_KEY_SIZE
+            ))
+        })?;
     Ok(pubkey)
 }
 
