@@ -53,9 +53,6 @@ The layout follows the discovery domain of the beacon-chain
 | `eth2` | SSZ `ENRForkID`, 16 bytes |
 | `attnets` | subscribed attestation subnet bitfield |
 
-There is no `tcp` entry: the spec defines it as the libp2p TCP listening port
-and ethlambda speaks QUIC only.
-
 The local ENR is logged once at startup.
 
 This same record is handed to ethrex's `DiscoveryServer`, so it is what answers
@@ -102,8 +99,8 @@ answer different questions:
 Neither absence is an error, and a record carrying just one of them is still
 kept. The ENRs `lean-quickstart` generates today carry `ip`/`quic`/`secp256k1`
 and no `udp`, so they stay reachable but contribute nothing to discovery. Every
-beacon-chain bootnode published today is the mirror image: `ip`/`udp`/`tcp` and
-no `quic`, usable as a discv5 seed but never dialed. A record with neither is
+beacon-chain bootnode published today is the mirror image: a `udp` port but no
+`quic`, usable as a discv5 seed but never dialed. A record with neither is
 dropped with a warning, as is one missing an `ip` or a `secp256k1` key.
 
 The ENR a node logs at startup is only useful to a peer if that node was
@@ -113,18 +110,6 @@ list produces a `udp`/`quic` target that cannot be dialed, since `0.0.0.0`
 names no reachable host. Set `--discovery.advertise-ip` before pointing other
 nodes at this one's ENR: `127.0.0.1` on a local devnet, or the host's public
 address otherwise.
-
-## If lean ever meets a real network
-
-Two details are worth copying the day lean peers with a network carrying a live
-fork schedule:
-
-- Learn the fork digest by plurality vote over discovered ENRs rather than
-  hardcoding it, so a fork does not strand the node. Bootnode records are poor
-  witnesses here: mainnet's still advertise the phase0 digest.
-- Gossip message ids follow Altair's function, which inserts the topic length
-  and topic bytes between the domain and the payload. Phase0's shorter form
-  produces ids no peer agrees with, which breaks IWANT/IHAVE silently.
 
 ## Known limitations
 
@@ -138,18 +123,6 @@ another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
 
-### A beacon-chain client cannot discover us, and `tcp` is why
-
-Beyond the fork digest never matching a real beacon network, there is a second,
-independent blocker. Lighthouse's discovery predicate is stricter than the spec
-text: alongside the `fork_digest` comparison it requires
-`enr.tcp4().is_some() || enr.tcp6().is_some()`, and it applies that as a
-discv5 query filter, so a `tcp`-less record is dropped before lighthouse's dial
-logic ever sees it. Our records deliberately carry no `tcp`, so they would be
-filtered out even if the digests did match. That is the right trade for a
-QUIC-only client, but it means the omission is a real interop cost and not a
-free simplification.
-
 ### `attnets` is not a fixed-width SSZ `Bitvector`
 
 The spec's `attnets` is `Bitvector[ATTESTATION_SUBNET_COUNT]`, a constant every
@@ -160,8 +133,3 @@ lengths. The bit-packing convention is identical to the spec's; only the width
 is negotiable. Readers tolerate a foreign length by treating bits past the end
 as unset, and a peer's advertised subnets are clamped to the local committee
 count before they influence anything.
-
-## Metrics
-
-`lean_discovered_peers_dialed_total` counts dials initiated by discovery.
-Connection outcomes are covered by the existing peer connect/disconnect metrics.
