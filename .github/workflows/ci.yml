@@ -49,6 +49,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The beacon containers' SSZ bounds are const-generic arguments, so the
+      # minimal preset is a whole second compilation of ethlambda-types that
+      # nothing above reaches: every step so far builds the default (mainnet)
+      # preset only. Without this the `preset-minimal` feature would rot between
+      # merges, and the fixture suites that select it live on another branch.
+      - name: Check the minimal preset
+        run: cargo test -p ethlambda-types --features preset-minimal
+
       # tooling/event-monitor declares its own [workspace] table, so every step
       # above stops at the root workspace members and never reaches it. Its
       # tests run in this job rather than in `test` because clippy has already
