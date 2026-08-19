@@ -1,0 +1,116 @@
+# Grafana unified-alerting provisioning: per-devnet "lost finality" alert.
+# Deployed to the central Grafana on the metrics host (see deploy-finality-alert.sh).
+#
+# Fires when a devnet's (`network`) CHAIN TIP gap exceeds 512 slots — the network's
+# highest head minus its highest finalized — i.e. the canonical chain stopped finalizing.
+# A plain magnitude threshold (no slope term) so it can't flap on a sawtoothing gap: a
+# real stall stays above 512, a recovering devnet drops below and resolves.
+# `lean_head_slot` and `lean_latest_finalized_slot` are the cross-client metrics
+# every lean client exports (ethlambda, zeam, ream, qlean, gean, lantern).
+#
+# IMPORTANT: this is max(head) - max(finalized), NOT max(head - finalized). The per-node
+# difference would surface the WORST single client: a canary that forks off and stops
+# finalizing (e.g. zeam/qlean stuck at an old finalized while head tracks the tip) shows a
+# per-series gap of thousands even when the supermajority chain finalizes fine, firing a
+# false alert. Subtracting the two network maxima measures the chain itself — one stuck
+# straggler can't drag down max(finalized) — while still catching a true network-wide stall.
+#
+# Placeholders substituted by deploy-finality-alert.sh (nothing host-specific is
+# committed here): __SLACK_WEBHOOK_URL__ from webhook.txt (a secret — the rendered
+# file is never committed), __GRAFANA_BASE_URL__ for the dashboard link in the Slack
+# message, and __PROM_DS_UID__ for the central-prometheus datasource. A provisioned
+# alert rule needs a CONCRETE datasource uid, so unlike the dashboards it can't use a
+# datasource template variable.
+
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: slack-finality
+    receivers:
+      - uid: slack-finality
+        type: slack
+        disableResolveMessage: false
+        settings:
+          url: __SLACK_WEBHOOK_URL__
+          # One single-line message per devnet (grouped by network). Variable-free
+          # template (Grafana's Slack templater rejects `:=`). No label dump / URLs.
+          title: 'Devnet finality'
+          text: |
+            {{ range .Alerts }}{{ if eq .Status "firing" }}:red_circle: *{{ .Labels.network }}* losing finality (distance from head to finalized exceeds 512 slots). <__GRAFANA_BASE_URL__/d/devnet-finality-overview?var-network={{ .Labels.network }}|dashboard>{{ else }}:large_green_circle: *{{ .Labels.network }}* recovered finality.{{ end }}
+            {{ end }}
+
+groups:
+  - orgId: 1
+    name: finality
+    folder: Devnet Alerts
+    interval: 1m
+    rules:
+      - uid: devnet-lost-finality
+        title: Devnet lost finality
+        condition: B
+        # Require a signal to hold for 5m before firing, so a brief blip doesn't alert.
+        # (Set to 0s temporarily only when force-testing a fresh notification.)
+        for: 5m
+        # Anti-flap: once firing, stay firing until the condition has been false for 15m
+        # straight. Collapses a gap oscillating around 512 into one alert so it can't spam;
+        # with repeat_interval that's at most one notification per 12h. NOTE camelCase key
+        # (file-provisioning uses camelCase: noDataState, isPaused, datasourceUid, ...).
+        keepFiringFor: 15m
+        # The query filters to firing series only, so an empty result means "no devnet is
+        # losing finality" (healthy) — must be OK, not NoData, or it false-alarms when fine.
+        noDataState: OK
+        execErrState: Error
+        isPaused: false
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __PROM_DS_UID__
+            model:
+              refId: A
+              datasource:
+                type: prometheus
+                uid: __PROM_DS_UID__
+              # One series per network whose chain-tip gap (max head - max finalized)
+              # exceeds 512 slots. Both sides aggregate `by (network)`, so the `network`
+              # label survives the subtraction and routing/grouping still works.
+              expr: "(max by (network) (lean_head_slot) - max by (network) (lean_latest_finalized_slot)) > 512"
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              # query A already filters to firing series (all positive values), so any
+              # value >0 means a signal tripped
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        labels:
+          severity: critical
+          alert_class: finality
+        annotations:
+          summary: "{{ $labels.network }} losing finality (head-to-finalized distance >512 slots)."
+          description: "{{ $labels.network }}: head-to-finalized distance is {{ $values.A.Value }} slots (>512)."
+        notification_settings:
+          receiver: slack-finality
+          # Group per network so each devnet notifies independently. Without
+          # `network` here, all devnets share one group (default group_by is
+          # grafana_folder + alertname), so every notification re-lists every
+          # currently-firing devnet and the same network appears repeatedly.
+          group_by:
+            - grafana_folder
+            - alertname
+            - network
+          # re-notify at most once every 12h while a devnet stays in the firing state
+          repeat_interval: 12h
