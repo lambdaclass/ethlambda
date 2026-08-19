@@ -64,7 +64,7 @@ devnet_load_env() {
     esac
     # Quotes, when present, DELIMIT the value, so a '#' or a trailing space inside
     # them survives. Unquoted, a `# comment` tail is dropped: it used to end up
-    # inside the value, and for SERVERS that means sweep.sh ssh-ing to a host '#'.
+    # inside the value, and for METRICS_HOST that means ssh-ing to 'host # ssh'.
     case $val in
       \"*) val=${val#\"}; val=${val%%\"*} ;;
       \'*) val=${val#\'}; val=${val%%\'*} ;;
@@ -73,8 +73,8 @@ devnet_load_env() {
     esac
     # File provides defaults only: keep an already-set value. No eval anywhere --
     # `${!key}` is bash indirect expansion, and `export` gets ONE quoted
-    # name=value word, so a multi-word value (SERVERS="host-a host-b") arrives
-    # whole and nothing in it is ever reparsed as shell.
+    # name=value word, so a multi-word value (a quoted path with a space, say)
+    # arrives whole and nothing in it is ever reparsed as shell.
     [ -n "${!key:-}" ] || export "$key=$val"
   done < "$file"
   echo "loaded deployment env from $file" >&2

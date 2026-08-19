@@ -6,9 +6,9 @@ SKILL.md has the workflows; this file has the depth and the failure modes.
 
 ## Topology model
 
-- Operator supplies SSH targets via `SERVERS` (any count, any names) and
-  `SSH_USER`; `docker` runs under `sudo`. No host count, address, or spec is
-  assumed.
+- SSH targets come from `scripts/devnet.inventory`, queried with
+  `scripts/inventory.sh` (any count, any names); the operator supplies `SSH_USER`
+  and `docker` runs under `sudo`. No host count, address, or spec is assumed.
 - **Each server runs its own complete devnet** — its own genesis, GENESIS_TIME,
   fork choice, and finality. No cross-server peering: every ENR is pinned to
   `127.0.0.1`, so discovery never leaves the host even though all devnets share

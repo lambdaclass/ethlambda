@@ -40,16 +40,15 @@ B owns `k+1..N-1`). Everything below still applies with three changes, and
 
 Nothing about the servers is hardcoded. Establish these from the operator:
 
-- `SERVERS`: the SSH targets for the operation at hand (any count, any names),
-  one devnet each. A working set taken FROM the inventory below, not a second
-  list of hosts to keep in step with it.
+- The hosts: one row each in `scripts/devnet.inventory` (below), queried with
+  `scripts/inventory.sh`. There is no second host list to hold in step with it.
 - `SSH_USER`: login user. `docker` is invoked with `sudo`.
 - Per-devnet `NODES` (validators on that server) and `SUBNETS`
   (`ATTESTATION_COMMITTEE_COUNT`); these can differ between servers.
 - A central host for Grafana + the federating Prometheus (often one of the
   servers); each server's per-host Prometheus remote-writes to it.
 
-Put those values in `scripts/devnet.env` (copy `scripts/devnet.env.example`;
+Put the non-host values in `scripts/devnet.env` (copy `scripts/devnet.env.example`;
 gitignored) instead of retyping them: the operator-side scripts source it via
 `scripts/devnet-env.sh`, and an env var exported in the shell still wins over the
 file. It is the one place a deployment's urls and Grafana ids live.
@@ -63,8 +62,8 @@ than reading it by hand:
 bash scripts/inventory.sh --tag devnet-ab --field ip        # ips, for a loop
 bash scripts/inventory.sh --tag devnet-ab --tag aggregator  # AND across tags
 bash scripts/inventory.sh --tag validator                   # derived, see below
-SERVERS=$(bash scripts/inventory.sh --field name) || exit   # exit 2 = typo'd tag
-SERVERS=${SERVERS//$'\n'/ }                                 # newlines -> spaces
+hosts=$(bash scripts/inventory.sh --tag devnet-ab --field name) || exit
+for h in $(echo $hosts); do ssh "$SSH_USER@$h" uptime; done  # splits in bash + zsh
 ```
 
 Tag conventions: a `devnet-*` tag names the chain a host's nodes belong to (two
@@ -153,13 +152,20 @@ redirect must run under sudo).
 
 ## Workflows
 
-Examples assume `SSH_USER` is set and you iterate over `SERVERS`. Per server you
-pass its own `NODES`/`SUBNETS`. `for h in $SERVERS` splits under bash; zsh does not
-split parameter expansions, so there write `for h in $(echo $SERVERS)`.
+Examples assume `SSH_USER` is set and `$h` is one host. Per server you pass its own
+`NODES`/`SUBNETS`. Keep the host query and the loop in ONE command, since a shell's
+variables don't outlive it, and `|| exit` so a typo'd tag can't leave a loop that
+does nothing and reports success:
+
+```bash
+hosts=$(bash scripts/inventory.sh --tag <devnet> --field name) || exit
+for h in $(echo $hosts); do ...; done   # $(echo ...) splits under bash and zsh
+```
 
 ### Pull the latest images on all servers
 ```bash
-for h in $SERVERS; do ssh "$SSH_USER@$h" 'sudo docker pull ghcr.io/lambdaclass/ethlambda:devnet5'; done
+hosts=$(bash scripts/inventory.sh --tag <devnet> --field name) || exit
+for h in $(echo $hosts); do ssh "$SSH_USER@$h" 'sudo docker pull ghcr.io/lambdaclass/ethlambda:devnet5'; done
 ```
 `devnet5` is the current devnet tag; it tracks the chain's leanVM/proof format,
 so it (and the other clients' tags in `references/clients.md`) move together on a
