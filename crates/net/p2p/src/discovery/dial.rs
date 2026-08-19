@@ -44,17 +44,15 @@ impl DiscoveryState {
     }
 }
 
-impl P2PServer {
-    /// Drop a peer's discovery bookkeeping.
-    ///
-    /// Called from both teardown paths — a connection that closed and a dial
-    /// that never established — so the map cannot outlive the peers in it and
-    /// [`covered_subnets`] cannot credit a subnet to someone who left. A no-op
-    /// when discovery is off.
-    pub(crate) fn forget_discovered_peer(&mut self, peer_id: &PeerId) {
-        if let Some(discovery) = self.discovery.as_mut() {
-            discovery.peer_attnets.remove(peer_id);
-        }
+/// Drop a peer's discovery bookkeeping.
+///
+/// Called from both teardown paths — a connection that closed and a dial that
+/// never established — so the map cannot outlive the peers in it and
+/// [`covered_subnets`] cannot credit a subnet to someone who left. A no-op when
+/// discovery is off.
+pub(crate) fn forget_discovered_peer(server: &mut P2PServer, peer_id: &PeerId) {
+    if let Some(discovery) = server.discovery.as_mut() {
+        discovery.peer_attnets.remove(peer_id);
     }
 }
 
@@ -62,19 +60,21 @@ impl P2PServer {
 pub(crate) async fn dial_tick(server: &mut P2PServer) {
     // Snapshot what the refill needs before any `.await`, so no borrow of
     // `server.discovery` has to live across the async boundary. Both are handle
-    // clones: an actor ref and two `Copy` fields.
+    // clones: an actor ref and two `Copy` fields, taken only when a refill is
+    // actually due rather than on every tick that just drains the queue.
     let Some(discovery) = server.discovery.as_ref() else {
         return;
     };
     if server.connected_peers.len() >= discovery.target_peers {
         return;
     }
-    let peer_table = discovery.peer_table.clone();
-    let filter = discovery.filter.clone();
-    let mut admitted = if discovery.candidates.is_empty() {
-        draw_candidates(&peer_table, &filter).await
-    } else {
-        Vec::new()
+    let refill = discovery
+        .candidates
+        .is_empty()
+        .then(|| (discovery.peer_table.clone(), discovery.filter.clone()));
+    let mut admitted = match refill {
+        Some((peer_table, filter)) => draw_candidates(&peer_table, &filter).await,
+        None => Vec::new(),
     };
 
     let Some(discovery) = server.discovery.as_mut() else {

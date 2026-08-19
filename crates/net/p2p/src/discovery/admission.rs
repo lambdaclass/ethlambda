@@ -18,7 +18,6 @@
 //! ([`rank_by_uncovered_subnets`]).
 
 use std::collections::HashSet;
-use std::net::IpAddr;
 
 use ethrex_p2p::peer_filter::PeerFilter;
 use ethrex_p2p::types::NodeRecord;
@@ -26,16 +25,19 @@ use libp2p::{Multiaddr, PeerId};
 use libssz::SszDecode;
 use tracing::debug;
 
-use super::enr::{ATTNETS_ENR_KEY, ETH2_ENR_KEY, EnrForkId, read_quic_port, subnets_from_attnets};
+use super::enr::{
+    ATTNETS_ENR_KEY, ETH2_ENR_KEY, EnrForkId, read_ip, read_public_key, read_quic_port,
+    subnets_from_attnets,
+};
 use crate::quic_multiaddr;
 
 /// A peer that passed admission and is ready to dial.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DiscoveredPeer {
-    pub peer_id: PeerId,
-    pub addr: Multiaddr,
+pub(crate) struct DiscoveredPeer {
+    pub(crate) peer_id: PeerId,
+    pub(crate) addr: Multiaddr,
     /// Attestation subnets the peer advertises in `attnets`.
-    pub subnets: Vec<u64>,
+    pub(crate) subnets: Vec<u64>,
 }
 
 /// Why a discovered peer was turned away.
@@ -44,7 +46,7 @@ pub struct DiscoveredPeer {
 /// record, so a peer that adds a `quic` entry or gains an address through
 /// discv5's IP voting is reconsidered without restarting the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RejectReason {
+pub(crate) enum RejectReason {
     /// No `eth2` entry, or one that does not decode. Cannot be our network.
     MissingForkId,
     /// On a different network.
@@ -73,7 +75,7 @@ pub struct LeanFilter {
 }
 
 impl LeanFilter {
-    pub fn new(fork_id: EnrForkId, attestation_committee_count: u64) -> Self {
+    pub(crate) fn new(fork_id: EnrForkId, attestation_committee_count: u64) -> Self {
         Self {
             fork_id,
             attestation_committee_count,
@@ -88,7 +90,7 @@ impl LeanFilter {
     /// `expect` because the two are only guaranteed to agree while the record is
     /// unchanged, and the peer table hands out clones: a caller that reaches
     /// this with an arbitrary record should get nothing to dial, not a panic.
-    pub fn dial_target(&self, record: &NodeRecord) -> Option<DiscoveredPeer> {
+    pub(crate) fn dial_target(&self, record: &NodeRecord) -> Option<DiscoveredPeer> {
         admit(record, &self.fork_id, self.attestation_committee_count).ok()
     }
 }
@@ -144,17 +146,10 @@ fn admit(
 
     let quic_port = read_quic_port(record).ok_or(RejectReason::NoQuicPort)?;
 
-    let public_key_bytes = pairs.secp256k1.ok_or(RejectReason::BadPublicKey)?;
-    let public_key =
-        libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
-            .map_err(|_| RejectReason::BadPublicKey)?;
+    let public_key = read_public_key(pairs).ok_or(RejectReason::BadPublicKey)?;
     let peer_id = PeerId::from_public_key(&libp2p::identity::PublicKey::from(public_key));
 
-    let ip = pairs
-        .ip
-        .map(IpAddr::from)
-        .or_else(|| pairs.ip6.map(IpAddr::from))
-        .ok_or(RejectReason::MissingAddress)?;
+    let ip = read_ip(pairs).ok_or(RejectReason::MissingAddress)?;
 
     let subnets = pairs
         .extra(ATTNETS_ENR_KEY)
@@ -173,7 +168,7 @@ fn admit(
 ///
 /// A candidate advertising no subnets scores zero and sorts last, but is never
 /// dropped: with few peers, any peer is better than none.
-pub fn rank_by_uncovered_subnets(candidates: &mut [DiscoveredPeer], covered: &HashSet<u64>) {
+pub(crate) fn rank_by_uncovered_subnets(candidates: &mut [DiscoveredPeer], covered: &HashSet<u64>) {
     candidates.sort_by_key(|candidate| {
         std::cmp::Reverse(
             candidate
@@ -192,7 +187,7 @@ mod tests {
     use ethrex_p2p::utils::public_key_from_signing_key;
     use libssz::SszEncode;
     use std::collections::HashSet;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use super::super::enr::{FAR_FUTURE_EPOCH, QUIC_ENR_KEY, encode_attnets};
 

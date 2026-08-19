@@ -43,15 +43,15 @@ pub(crate) const FAR_FUTURE_EPOCH: u64 = u64::MAX;
 /// The `eth2` ENR entry: SSZ, 16 bytes, byte-identical to the beacon-chain
 /// `ENRForkID` container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
-pub struct EnrForkId {
-    pub fork_digest: [u8; 4],
-    pub next_fork_version: [u8; 4],
-    pub next_fork_epoch: u64,
+pub(crate) struct EnrForkId {
+    pub(crate) fork_digest: [u8; 4],
+    pub(crate) next_fork_version: [u8; 4],
+    pub(crate) next_fork_epoch: u64,
 }
 
 impl EnrForkId {
     /// This node's fork id. Constant for the lifetime of the process.
-    pub fn local() -> Self {
+    pub(crate) fn local() -> Self {
         Self {
             fork_digest: fork_digest(),
             next_fork_version: NEXT_FORK_VERSION,
@@ -169,6 +169,31 @@ impl LocalEnrParams {
 pub(crate) fn build_local_enr(params: &LocalEnrParams) -> Result<NodeRecord, DiscoveryError> {
     NodeRecord::from_pairs(INITIAL_ENR_SEQ, &params.signer, params.local_pairs())
         .map_err(DiscoveryError::BuildEnr)
+}
+
+/// The address a record advertises, preferring IPv4 when it carries both.
+///
+/// `None` for a record with neither `ip` nor `ip6`, which names no host to
+/// reach. Shared with the bootnode parser so both readers agree on which family
+/// wins.
+pub(crate) fn read_ip(pairs: &NodeRecordPairs) -> Option<IpAddr> {
+    pairs
+        .ip
+        .map(IpAddr::from)
+        .or_else(|| pairs.ip6.map(IpAddr::from))
+}
+
+/// The `secp256k1` entry as a libp2p key, or `None` when absent or not a valid
+/// compressed point.
+///
+/// libp2p derives the peer id from this key, so the bootnode parser and the
+/// admission filter must decode it the same way or they would disagree about who
+/// a record belongs to.
+pub(crate) fn read_public_key(
+    pairs: &NodeRecordPairs,
+) -> Option<libp2p::identity::secp256k1::PublicKey> {
+    let bytes = pairs.secp256k1?;
+    libp2p::identity::secp256k1::PublicKey::try_from_bytes(bytes.as_bytes()).ok()
 }
 
 /// The advertised libp2p QUIC port, if it is one we could dial.

@@ -80,9 +80,11 @@ pub struct DiscoverySpawnConfig {
 /// What the P2P actor needs from a running discovery server.
 pub struct DiscoveryHandle {
     pub peer_table: PeerTable,
-    /// This node's ENR as an `enr:`-prefixed string, for logs and the RPC
-    /// identity endpoint. Reflects startup state; discv5 may bump the sequence
-    /// number later if PONG voting changes our external IP.
+    /// This node's ENR as an `enr:`-prefixed string. `spawn_discovery` already
+    /// logs it; this copy is what the tests assert the published record against,
+    /// and what a future RPC identity endpoint would read. Reflects startup
+    /// state; discv5 may bump the sequence number later if PONG voting changes
+    /// our external IP.
     pub local_enr: String,
     /// The admission policy the peer table judges records with, kept so the dial
     /// loop can apply the same rules when it turns a contact into a dial target.

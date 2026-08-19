@@ -37,8 +37,8 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     discovery::{
         DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_tick},
-        enr::read_quic_port,
+        dial::{DiscoveryState, dial_tick, forget_discovered_peer},
+        enr::{read_ip, read_public_key, read_quic_port},
         spawn_discovery,
     },
     gossipsub::{
@@ -681,7 +681,7 @@ async fn handle_swarm_event(
             };
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
-                server.forget_discovered_peer(&peer_id);
+                forget_discovered_peer(server, &peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
                     server.resolve_node_name(Some(&peer_id)),
@@ -723,24 +723,23 @@ async fn handle_swarm_event(
             );
             warn!(?peer_id, %error, "Outgoing connection error");
 
-            // A dial that never establishes ends up here rather than in
-            // `ConnectionClosed`, so this is the only place a peer we dialed but
-            // never connected to can be forgotten.
             if let Some(pid) = peer_id {
-                server.forget_discovered_peer(&pid);
-            }
+                // A dial that never establishes ends up here rather than in
+                // `ConnectionClosed`, so this is the only place a peer we dialed
+                // but never connected to can be forgotten.
+                forget_discovered_peer(server, &pid);
 
-            // Schedule redial if this was a bootnode
-            if let Some(pid) = peer_id
-                && server.bootnode_addrs.contains_key(&pid)
-                && !server.connected_peers.contains(&pid)
-            {
-                send_after(
-                    Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
-                    ctx.clone(),
-                    p2p_protocol::RetryPeerRedial { peer_id: pid },
-                );
-                info!(%pid, "Scheduled bootnode redial after connection error");
+                // Schedule redial if this was a bootnode
+                if server.bootnode_addrs.contains_key(&pid)
+                    && !server.connected_peers.contains(&pid)
+                {
+                    send_after(
+                        Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
+                        ctx.clone(),
+                        p2p_protocol::RetryPeerRedial { peer_id: pid },
+                    );
+                    info!(%pid, "Scheduled bootnode redial after connection error");
+                }
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
@@ -862,19 +861,10 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // `build_swarm` skip it when it picks static dial targets.
     let quic_port = read_quic_port(&record);
 
-    let public_key_bytes = pairs
-        .secp256k1
-        .ok_or_else(|| "node record missing public key".to_string())?;
-    let public_key =
-        libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
-            .map_err(|err| format!("bad secp256k1 key: {err}"))?;
+    let public_key = read_public_key(pairs)
+        .ok_or_else(|| "node record missing or malformed public key".to_string())?;
 
-    // Prefer IPv4 if both are present.
-    let ip = pairs
-        .ip
-        .map(IpAddr::from)
-        .or_else(|| pairs.ip6.map(IpAddr::from))
-        .ok_or_else(|| "node record missing IP address".to_string())?;
+    let ip = read_ip(pairs).ok_or_else(|| "node record missing IP address".to_string())?;
 
     // `quic` and `udp` are independently optional, but a record with neither is
     // reachable by nothing we speak: it can be neither dialed nor seeded. Drop
