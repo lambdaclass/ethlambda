@@ -726,8 +726,14 @@ async fn handle_swarm_event(
             if let Some(pid) = peer_id {
                 // A dial that never establishes ends up here rather than in
                 // `ConnectionClosed`, so this is the only place a peer we dialed
-                // but never connected to can be forgotten.
-                forget_discovered_peer(server, &pid);
+                // but never connected to can be forgotten. Gated on the peer
+                // being gone: a *second* dial to an already-connected peer can
+                // fail here (the bootnode redial path is one way), and dropping
+                // a live peer's `attnets` would make `covered_subnets`
+                // under-count subnets we do in fact cover.
+                if !server.connected_peers.contains(&pid) {
+                    forget_discovered_peer(server, &pid);
+                }
 
                 // Schedule redial if this was a bootnode
                 if server.bootnode_addrs.contains_key(&pid)
