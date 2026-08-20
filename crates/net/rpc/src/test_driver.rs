@@ -30,8 +30,7 @@ use axum::{
     routing::{get, post},
 };
 use ethlambda_blockchain::{
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    store::{self, verify_block_signatures},
+    spec_test_runner::apply_fork_choice_step, store::verify_block_signatures,
 };
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_test_fixtures::{
@@ -39,11 +38,7 @@ use ethlambda_test_fixtures::{
     state_transition::StateTransitionRunRequest, verify_signatures::TestSignedBlock,
 };
 use ethlambda_types::{
-    attestation::{
-        AggregationBits as EthAggregationBits, HashedAttestationData, SignedAggregatedAttestation,
-        SignedAttestation,
-    },
-    block::{Block, ByteList512KiB, SingleMessageAggregate},
+    block::Block,
     checkpoint::Checkpoint,
     primitives::H256,
     state::{State, anchor_pair_is_consistent},
@@ -57,13 +52,6 @@ use tracing::debug;
 /// The hive simulator sets this to `"1"` for each spec-asset fixture run; any
 /// of `"1"`, `"true"`, or `"yes"` (case-insensitive) enables the driver.
 pub const TEST_DRIVER_ENV: &str = "HIVE_LEAN_TEST_DRIVER";
-
-/// Sentinel prefixing every placeholder proof leanSpec's mocked prover emits
-/// (`proofSetting: 0` fixtures). Matches `MOCK_PROOF_PREFIX` in leanSpec's
-/// `packages/testing/src/consensus_testing/crypto_mode.py`. Proofs carrying it
-/// are accepted without cryptographic verification, mirroring leanSpec's mocked
-/// verifier; genuine (`proofSetting: 1`) proofs still run the real verifier.
-const MOCK_PROOF_PREFIX: &[u8] = b"\x00MOCKED-AGGREGATION-PROOF\x00";
 
 /// Whether the supplied env-var value should activate the driver.
 fn parse_truthy_env_value(value: &str) -> bool {
@@ -238,12 +226,12 @@ async fn step_fork_choice(
     // mutate the store in between, even though the hive simulator drives
     // steps serially per fixture).
     let mut guard = driver.write().await;
-    let outcome = apply_step(&mut guard, step);
+    let outcome = apply_fork_choice_step(&mut guard, &step, None);
     let (accepted, error) = match outcome {
         Ok(()) => (true, None),
         Err(err) => {
             debug!(%err, "fork-choice step rejected");
-            (false, Some(err))
+            (false, Some(err.to_string()))
         }
     };
     let snapshot = snapshot_store(&guard);
@@ -259,14 +247,14 @@ async fn step_fork_choice(
 ///
 /// Runs `state_transition(pre, block)` for each block in sequence. The
 /// `succeeded` flag reflects whether the full STF chain executed without
-/// error; the simulator compares it to the fixture's `expectException` field.
+/// error; the simulator compares it to the fixture's `rejectionReason` field.
 async fn run_state_transition(
     Json(request): Json<StateTransitionRunRequest>,
 ) -> Json<StateTransitionResponse> {
     let mut state: State = request.pre.into();
     let blocks: Vec<Block> = request.blocks.into_iter().map(Into::into).collect();
 
-    let response = match apply_state_transition(&mut state, &blocks, request.expect_exception) {
+    let response = match apply_state_transition(&mut state, &blocks, request.rejection_reason) {
         Ok(()) => StateTransitionResponse {
             succeeded: true,
             error: None,
@@ -283,22 +271,22 @@ async fn run_state_transition(
 
 /// Run the STF for each block in `blocks` and return the first error (if any).
 ///
-/// When `blocks` is empty and `expect_exception` is set the spec fixture wants
+/// When `blocks` is empty and `rejection_reason` is set the spec fixture wants
 /// failure but the STF entry point never runs, so call `process_slots(slot)`
 /// against the current slot. That call returns `Err(StateSlotIsNewer)` because
 /// the STF rejects `target_slot <= current_slot`, giving the simulator a
-/// deterministic non-2xx outcome that matches the fixture's `expectException`.
+/// deterministic non-2xx outcome that matches the fixture's `rejectionReason`.
 fn apply_state_transition(
     state: &mut State,
     blocks: &[Block],
-    expect_exception: Option<String>,
+    rejection_reason: Option<String>,
 ) -> Result<(), String> {
     for block in blocks {
         ethlambda_state_transition::state_transition(state, block)
             .map_err(|err| err.to_string())?;
     }
 
-    if blocks.is_empty() && expect_exception.is_some() {
+    if blocks.is_empty() && rejection_reason.is_some() {
         let target_slot = state.slot;
         ethlambda_state_transition::process_slots(state, target_slot)
             .map_err(|err| err.to_string())?;
@@ -342,110 +330,6 @@ async fn run_verify_signatures(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Dispatch a fork-choice step against the held Store.
-fn apply_step(store: &mut Store, step: ForkChoiceStep) -> Result<(), String> {
-    match step.step_type.as_str() {
-        "tick" => {
-            let genesis_time = store.config().expect("config exists").genesis_time;
-            let timestamp_ms = match (step.time, step.interval) {
-                (Some(time_s), _) => time_s * 1000,
-                (None, Some(interval)) => {
-                    genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
-                }
-                (None, None) => return Err("tick step missing time and interval".to_string()),
-            };
-            store::on_tick(store, timestamp_ms, step.has_proposal.unwrap_or(false));
-            Ok(())
-        }
-        "block" => {
-            let block_data = step
-                .block
-                .ok_or_else(|| "block step missing block data".to_string())?;
-            let signed_block = block_data.to_blank_signed_block();
-            // Match the spec-test runner: advance time to the block's slot
-            // before importing, unless the step delivers the block ahead of
-            // the store clock.
-            if step.tick_to_slot {
-                let block_time_ms = store.config().expect("config exists").genesis_time * 1000
-                    + signed_block.message.slot * MILLISECONDS_PER_SLOT;
-                store::on_tick(store, block_time_ms, true);
-            }
-            store::on_block_without_verification(store, signed_block).map_err(|e| e.to_string())?;
-
-            // Fold the block's attestations into the fork-choice known pool so
-            // block-borne votes carry weight. The production node SNARK-splits
-            // the block's merged proof and folds the recovered single-message
-            // aggregates; fixture blocks are blank, so reconstruct structurally
-            // from aggregation_bits (fork choice reads only the participant set,
-            // not the proof bytes). Mirrors the same fold in
-            // crates/blockchain/tests/forkchoice_spectests.rs.
-            let block = block_data.to_block();
-            let entries: Vec<_> = block
-                .body
-                .attestations
-                .iter()
-                .map(|att| {
-                    let hashed_attestation = HashedAttestationData::new(att.data.clone());
-                    let aggregate = SingleMessageAggregate::empty(att.aggregation_bits.clone());
-                    (hashed_attestation, aggregate)
-                })
-                .collect();
-            store.insert_known_aggregated_payloads_batch(entries);
-            store::update_head(store, false);
-            Ok(())
-        }
-        "attestation" => {
-            let att = step
-                .attestation
-                .ok_or_else(|| "attestation step missing data".to_string())?;
-            let signed = SignedAttestation {
-                validator_id: att
-                    .validator_id
-                    .ok_or_else(|| "attestation step missing validatorId".to_string())?,
-                data: att.data.into(),
-                signature: att
-                    .signature
-                    .ok_or_else(|| "attestation step missing signature".to_string())?,
-            };
-            store::on_gossip_attestation(store, &signed, step.is_aggregator.unwrap_or(false))
-                .map_err(|e| e.to_string())
-        }
-        "gossipAggregatedAttestation" => {
-            let att = step
-                .attestation
-                .ok_or_else(|| "gossipAggregatedAttestation step missing data".to_string())?;
-            let proof = att
-                .proof
-                .ok_or_else(|| "gossipAggregatedAttestation step missing proof".to_string())?;
-            let participants: EthAggregationBits = proof.participants.into();
-            let proof_bytes: Vec<u8> = proof.proof.into();
-            // leanSpec's mocked prover (proofSetting=0) emits placeholder proofs
-            // prefixed with MOCK_PROOF_PREFIX and expects verifiers to accept them
-            // unchecked. Route those through the non-verifying path; genuine proofs
-            // still run the real verifier.
-            let is_mocked = proof_bytes.starts_with(MOCK_PROOF_PREFIX);
-            let proof_data = ByteList512KiB::try_from(proof_bytes)
-                .map_err(|err| format!("aggregated proof data too large: {err:?}"))?;
-            let data: ethlambda_types::attestation::AttestationData = att.data.into();
-            let aggregated = SignedAggregatedAttestation {
-                proof: SingleMessageAggregate::new(participants, proof_data),
-                data,
-            };
-            if is_mocked {
-                store::on_gossip_aggregated_attestation_without_verification(store, aggregated)
-                    .map_err(|e| e.to_string())
-            } else {
-                store::on_gossip_aggregated_attestation(store, aggregated)
-                    .map_err(|e| e.to_string())
-            }
-        }
-        // `checks`-only steps are no-ops here: the simulator validates them
-        // against the snapshot returned alongside this response.
-        "checks" => Ok(()),
-        other => Err(format!("unknown step type: {other}")),
-    }
-}
 
 /// Read the post-state summary expected by the hive `state_transition/run`
 /// schema.

@@ -2,12 +2,11 @@ use ethlambda_types::{
     attestation::{
         AggregatedAttestation as DomainAggregatedAttestation,
         AggregationBits as DomainAggregationBits, AttestationData as DomainAttestationData,
-        XmssSignature,
+        SIGNATURE_SIZE, XmssSignature,
     },
     block::{Block as DomainBlock, BlockBody as DomainBlockBody},
     checkpoint::Checkpoint as DomainCheckpoint,
     primitives::H256,
-    signature::SIGNATURE_SIZE,
     state::{
         ChainConfig, JustificationValidators, JustifiedSlots, State, Validator as DomainValidator,
         ValidatorPubkeyBytes,
@@ -21,6 +20,7 @@ use serde::Deserialize;
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Container<T> {
     pub data: Vec<T>,
 }
@@ -30,6 +30,7 @@ pub struct Container<T> {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(rename = "genesisTime")]
     pub genesis_time: u64,
@@ -48,6 +49,7 @@ impl From<Config> for ChainConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub root: H256,
     pub slot: u64,
@@ -67,6 +69,7 @@ impl From<Checkpoint> for DomainCheckpoint {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockHeader {
     pub slot: u64,
     #[serde(rename = "proposerIndex")]
@@ -96,6 +99,7 @@ impl From<BlockHeader> for ethlambda_types::block::BlockHeader {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Validator {
     index: u64,
     #[serde(rename = "attestationPublicKey")]
@@ -121,6 +125,7 @@ impl From<Validator> for DomainValidator {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestState {
     pub config: Config,
     pub slot: u64,
@@ -186,6 +191,7 @@ impl From<TestState> for State {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Block {
     pub slot: u64,
     #[serde(rename = "proposerIndex")]
@@ -210,6 +216,7 @@ impl From<Block> for DomainBlock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockBody {
     pub attestations: Container<AggregatedAttestation>,
 }
@@ -233,6 +240,7 @@ impl From<BlockBody> for DomainBlockBody {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregatedAttestation {
     #[serde(rename = "aggregationBits")]
     pub aggregation_bits: AggregationBits,
@@ -249,6 +257,7 @@ impl From<AggregatedAttestation> for DomainAggregatedAttestation {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregationBits {
     pub data: Vec<bool>,
 }
@@ -264,6 +273,7 @@ impl From<AggregationBits> for DomainAggregationBits {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationData {
     pub slot: u64,
     pub head: Checkpoint,
@@ -287,6 +297,7 @@ impl From<AttestationData> for DomainAttestationData {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestInfo {
     pub hash: String,
     pub comment: String,
@@ -295,6 +306,12 @@ pub struct TestInfo {
     pub description: String,
     #[serde(rename = "fixtureFormat")]
     pub fixture_format: String,
+    /// Digest of the validator key set the fixture was generated against.
+    /// Present on every current fixture; captured only so `deny_unknown_fields`
+    /// does not reject it.
+    #[serde(rename = "keySetDigest")]
+    #[allow(dead_code)]
+    pub key_set_digest: String,
 }
 
 // ============================================================================

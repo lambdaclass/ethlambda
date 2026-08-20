@@ -4,17 +4,23 @@
 consensus client, written in Rust.
 
 This book collects the design notes and operator-facing references for ethlambda.
-It is split into two parts:
+It is split into four parts:
 
-- **Consensus** explains the algorithms ethlambda implements: the
-  [3SF-mini](./3sf_mini.md) justification and finalization rules, and the
-  [LMD-GHOST](./lmd_ghost.md) fork choice algorithm. Both documents are
-  implementation-agnostic; ethlambda-specific behaviour is called out in
-  blockquotes.
+- **Design** describes the shape of a running node: the
+  [architecture](./architecture.md) of its actors, workers and shared storage,
+  and how they are wired together at startup.
+- **Consensus** explains how the chain advances: the
+  [slot and interval structure](./slots_and_intervals.md) that schedules every
+  validator duty, the [3SF-mini](./3sf_mini.md) justification and finalization
+  rules, and the [LMD-GHOST](./lmd_ghost.md) fork choice algorithm. These
+  documents are implementation-agnostic; ethlambda-specific behaviour is called
+  out in blockquotes.
 - **Operations** documents observable surfaces of a running node:
   [Prometheus metrics](./metrics.md), [checkpoint sync](./checkpoint_sync.md),
   and the [fork choice visualization](./fork_choice_visualization.md) served
   by the API.
+- **Development** collects notes for contributors, starting with the
+  [spec deviations](./spec_deviations.md) where ethlambda departs from leanSpec.
 
 For build and contribution instructions, see the
 [`README`](https://github.com/lambdaclass/ethlambda/blob/main/README.md) and

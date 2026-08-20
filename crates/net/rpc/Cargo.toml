@@ -26,6 +26,7 @@ serde_json.workspace = true
 hex.workspace = true
 tracing.workspace = true
 jemalloc_pprof.workspace = true
+futures-util = "0.3"
 
 [dev-dependencies]
 ethlambda-types.workspace = true

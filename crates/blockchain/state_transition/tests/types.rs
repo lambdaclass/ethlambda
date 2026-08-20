@@ -23,6 +23,7 @@ impl StateTransitionTestVector {
 
 /// A single state transition test case
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateTransitionTest {
     #[allow(dead_code)]
     pub network: String,
@@ -32,6 +33,20 @@ pub struct StateTransitionTest {
     pub pre: TestState,
     pub blocks: Vec<Block>,
     pub post: Option<PostState>,
+    /// Expected post-state `hash_tree_root`, present alongside `post`. Asserted
+    /// against the full post-state root after the per-field `post` checks, so
+    /// any state field those checks don't enumerate is still pinned.
+    #[serde(rename = "postStateRoot")]
+    pub post_state_root: Option<H256>,
+    /// Expected rejection reason for negative cases. A missing `post` asserts
+    /// that the transition failed; this pins *why* it had to fail.
+    #[serde(rename = "rejectionReason")]
+    pub rejection_reason: Option<RejectionReason>,
+    /// Aggregation proof regime (unused by the STF runner). Captured only so
+    /// `deny_unknown_fields` accepts it.
+    #[serde(rename = "proofSetting")]
+    #[allow(dead_code)]
+    pub proof_setting: Option<u8>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
     pub info: TestInfo,

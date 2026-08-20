@@ -10,7 +10,7 @@
 //!     block:  {...standard block fields...}
 //!     proof:  { proof: { data: "0x<hex-encoded merged multi-message aggregate bytes>" } }
 
-use crate::{Block, TestInfo, TestState};
+use crate::{Block, RejectionReason, TestInfo, TestState};
 use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -34,6 +34,7 @@ impl VerifySignaturesTestVector {
 
 /// A single verify-signatures test case.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifySignaturesTest {
     #[allow(dead_code)]
     pub network: String,
@@ -44,11 +45,14 @@ pub struct VerifySignaturesTest {
     pub anchor_state: TestState,
     #[serde(rename = "signedBlock")]
     pub signed_block: TestSignedBlock,
-    /// Expected rejection, when present. Newer fixtures name this field
-    /// `rejectionReason` (leanSpec replaced `expectException`); both
-    /// spellings are accepted.
-    #[serde(default, rename = "expectException", alias = "rejectionReason")]
-    pub expect_exception: Option<String>,
+    /// Expected rejection reason, when present.
+    #[serde(default, rename = "rejectionReason")]
+    pub rejection_reason: Option<RejectionReason>,
+    /// Aggregation proof regime (see [`crate::fork_choice::ForkChoiceTest`]).
+    /// Captured only so `deny_unknown_fields` accepts it.
+    #[serde(rename = "proofSetting")]
+    #[allow(dead_code)]
+    pub proof_setting: Option<u8>,
     #[serde(rename = "_info")]
     #[allow(dead_code)]
     pub info: TestInfo,
@@ -57,6 +61,7 @@ pub struct VerifySignaturesTest {
 /// Fixture-side signed block: a block plus its raw merged multi-message
 /// aggregate proof bytes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestSignedBlock {
     #[serde(alias = "message")]
     pub block: Block,
@@ -69,6 +74,7 @@ pub struct TestSignedBlock {
 /// The multi-signature container nests the raw lean-multisig wire one level
 /// deep: `{ "proof": { "data": "0x..." } }`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergedProof {
     pub proof: HexBytes,
 }
@@ -81,6 +87,7 @@ impl MergedProof {
 
 /// `{ "data": "0x..." }` wrapper used by leanSpec fixtures for byte fields.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HexBytes {
     pub data: String,
 }
@@ -113,7 +120,7 @@ impl std::error::Error for SignedBlockConvertError {}
 /// Lossy fixture-to-SignedBlock conversion that preserves the merged proof.
 ///
 /// The conversion is fallible because the proof bytes may not decode as hex
-/// or may exceed the wire cap. Tests with `expectException` set tolerate
+/// or may exceed the wire cap. Tests with `rejectionReason` set tolerate
 /// failures upstream; the From impl panics so test runners get a clear
 /// signal when fixture shape drifts.
 impl From<TestSignedBlock> for SignedBlock {

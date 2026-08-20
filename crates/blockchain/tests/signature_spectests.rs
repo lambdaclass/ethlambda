@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, store};
+use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, spec_test_runner, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     block::{Block, SignedBlock},
@@ -9,7 +9,9 @@ use ethlambda_types::{
     state::State,
 };
 
-use ethlambda_test_fixtures::verify_signatures::VerifySignaturesTestVector;
+use ethlambda_test_fixtures::{
+    rejection::check_rejection_reason, verify_signatures::VerifySignaturesTestVector,
+};
 
 const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 
@@ -37,6 +39,9 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         }
 
         println!("Running test: {}", name);
+
+        // Read before the fixture is consumed field by field below.
+        let expected_reason = test.rejection_reason.clone();
 
         // Step 1: Populate the pre-state with the test fixture
         let anchor_state: State = test.anchor_state.into();
@@ -66,28 +71,27 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Process the block (this includes signature verification)
         let result = store::on_block(&mut st, signed_block);
 
-        // Step 3: Check that it succeeded or failed as expected
-        match (result.is_ok(), test.expect_exception.as_ref()) {
-            (true, None) => {
+        // Step 3: Check that it succeeded or failed as expected, and that a
+        // rejection is the one the fixture named rather than any failure at all.
+        match (result, expected_reason.as_ref()) {
+            (Ok(_), None) => {
                 // Expected success, got success
             }
-            (true, Some(expected_err)) => {
+            (Ok(_), Some(expected)) => {
                 return Err(format!(
-                    "Test '{}' failed: expected exception '{}' but got success",
-                    name, expected_err
+                    "Test '{name}' failed: expected rejection {expected} but got success"
                 )
                 .into());
             }
-            (false, None) => {
+            (Err(err), None) => {
                 return Err(format!(
-                    "Test '{}' failed: expected success but got failure: {:?}",
-                    name,
-                    result.err()
+                    "Test '{name}' failed: expected success but got failure: {err:?}"
                 )
                 .into());
             }
-            (false, Some(_)) => {
-                // Expected failure, got failure
+            (Err(err), Some(expected)) => {
+                let actual = spec_test_runner::rejection_reason(&err);
+                check_rejection_reason(&name, expected, actual.as_ref(), &err)?;
             }
         }
     }

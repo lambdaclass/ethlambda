@@ -1,0 +1,608 @@
+{
+ "uid": "devnet-finality-overview",
+ "title": "Devnet Finality Overview",
+ "tags": [
+  "lean",
+  "devnet"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "refresh": "10s",
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "ds_prom",
+    "label": "Prometheus",
+    "type": "datasource",
+    "query": "prometheus",
+    "refresh": 1,
+    "current": {},
+    "options": []
+   },
+   {
+    "name": "network",
+    "label": "Devnet",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${ds_prom}"
+    },
+    "query": {
+     "qryType": 1,
+     "query": "label_values(lean_head_slot, network)",
+     "refId": "PrometheusVariableQueryEditor-VariableQuery"
+    },
+    "definition": "label_values(lean_head_slot, network)",
+    "refresh": 2,
+    "sort": 1,
+    "includeAll": true,
+    "allValue": ".*",
+    "multi": true,
+    "current": {
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    },
+    "options": []
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Finalized slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 0,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_latest_finalized_slot{network=~\"$network\"})",
+     "instant": true,
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "seriesToRows",
+     "options": {}
+    },
+    {
+     "id": "sortBy",
+     "options": {
+      "fields": {},
+      "sort": [
+       {
+        "field": "Metric"
+       }
+      ]
+     }
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/^Value$/",
+     "values": true
+    },
+    "orientation": "auto",
+    "textMode": "value_and_name",
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Justified slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 8,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_latest_justified_slot{network=~\"$network\"})",
+     "instant": true,
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "seriesToRows",
+     "options": {}
+    },
+    {
+     "id": "sortBy",
+     "options": {
+      "fields": {},
+      "sort": [
+       {
+        "field": "Metric"
+       }
+      ]
+     }
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/^Value$/",
+     "values": true
+    },
+    "orientation": "auto",
+    "textMode": "value_and_name",
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 1,
+   "type": "stat",
+   "title": "Head slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 8,
+    "x": 16,
+    "y": 0
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_head_slot{network=~\"$network\"})",
+     "instant": true,
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "seriesToRows",
+     "options": {}
+    },
+    {
+     "id": "sortBy",
+     "options": {
+      "fields": {},
+      "sort": [
+       {
+        "field": "Metric"
+       }
+      ]
+     }
+    }
+   ],
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/^Value$/",
+     "values": true
+    },
+    "orientation": "auto",
+    "textMode": "value_and_name",
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Finalized slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 0,
+    "y": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_latest_finalized_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Justified slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 8,
+    "y": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_latest_justified_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Head slot",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 16,
+    "y": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_head_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 7,
+   "type": "timeseries",
+   "title": "Justified − Finalized",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 0,
+    "y": 16
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_latest_justified_slot{network=~\"$network\"}) - max by (network) (lean_latest_finalized_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Head − Justified",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 8,
+    "y": 16
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_head_slot{network=~\"$network\"}) - max by (network) (lean_latest_justified_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Head − Finalized",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prom}"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 16,
+    "y": 16
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prom}"
+     },
+     "expr": "max by (network) (lean_head_slot{network=~\"$network\"}) - max by (network) (lean_latest_finalized_slot{network=~\"$network\"})",
+     "legendFormat": "{{network}}",
+     "refId": "A"
+    }
+   ],
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": []
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 2,
+      "fillOpacity": 5,
+      "showPoints": "never"
+     },
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   }
+  }
+ ]
+}

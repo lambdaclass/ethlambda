@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: ["**"]
+  merge_group:
   workflow_dispatch:
 
 # Cancel in-progress runs when a new commit is pushed to the same PR or branch
@@ -26,11 +27,18 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.97.1"
           components: rustfmt, clippy
 
       - name: Setup cache
+        # Tools under tooling/ are separate Cargo workspaces with their own
+        # target dir and Cargo.lock, so they need listing explicitly or their
+        # builds are neither cached nor reflected in the cache key.
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tooling/event-monitor
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -40,6 +48,24 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # tooling/event-monitor declares its own [workspace] table, so every step
+      # above stops at the root workspace members and never reaches it. Its
+      # tests run in this job rather than in `test` because clippy has already
+      # compiled the test targets, and because they need none of that job's
+      # leanSpec fixtures.
+      # `--locked` so the committed Cargo.lock is actually enforced: without it
+      # cargo silently resolves and rewrites the lockfile in CI, and a stale or
+      # missing entry never fails the build.
+      - name: Lint tooling
+        working-directory: tooling/event-monitor
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test tooling
+        working-directory: tooling/event-monitor
+        run: cargo test --locked
 
   test:
     name: Test

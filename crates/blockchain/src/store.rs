@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
 use ethlambda_storage::{ForkCheckpoints, Store};
 use ethlambda_types::{
@@ -11,7 +12,6 @@ use ethlambda_types::{
     block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    signature::{ValidatorPublicKey, ValidatorSignature},
     state::{HISTORICAL_ROOTS_LIMIT, State},
 };
 use tracing::{info, trace, warn};
@@ -25,19 +25,44 @@ use crate::{
 
 const JUSTIFICATION_LOOKBACK_SLOTS: u64 = 3;
 
+/// Intermediate fork-choice data produced by [`update_head`], carried so the
+/// fork choice tree can be rendered without recomputing LMD GHOST.
+pub struct HeadUpdate {
+    blocks: HashMap<H256, (u64, H256)>,
+    weights: HashMap<H256, u64>,
+    head: H256,
+}
+
+/// Log an ASCII fork choice tree to the terminal, reusing the weights and
+/// block set already computed by [`update_head`].
+fn log_fork_choice_tree(store: &Store, update: &HeadUpdate) {
+    let tree = crate::fork_choice_tree::format_fork_choice_tree(
+        &update.blocks,
+        &update.weights,
+        update.head,
+        store
+            .latest_justified()
+            .expect("latest justified checkpoint exists"),
+        store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists"),
+    );
+    info!("\n{tree}");
+}
+
 /// Accept new aggregated payloads, promoting them to known for fork choice.
-fn accept_new_attestations(store: &mut Store, log_tree: bool) {
+fn accept_new_attestations(store: &mut Store) -> HeadUpdate {
     store.promote_new_aggregated_payloads();
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_latest_known_aggregated_payloads(store.known_aggregated_payloads_count());
-    update_head(store, log_tree);
+    update_head(store)
 }
 
 /// Update the head based on the fork choice rule.
 ///
-/// When `log_tree` is true, also computes block weights and logs an ASCII
-/// fork choice tree to the terminal.
-pub fn update_head(store: &mut Store, log_tree: bool) {
+/// Returns the block set, block weights, and new head computed during the
+/// update so callers can render the fork choice tree without recomputing it.
+pub fn update_head(store: &mut Store) -> HeadUpdate {
     let blocks = store
         .get_live_chain()
         .expect("get_live_chain should succeed");
@@ -104,19 +129,10 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
         );
     }
 
-    if log_tree {
-        let tree = crate::fork_choice_tree::format_fork_choice_tree(
-            &blocks,
-            &weights,
-            new_head,
-            store
-                .latest_justified()
-                .expect("latest justified checkpoint exists"),
-            store
-                .latest_finalized()
-                .expect("latest finalized checkpoint exists"),
-        );
-        info!("\n{tree}");
+    HeadUpdate {
+        blocks,
+        weights,
+        head: new_head,
     }
 }
 
@@ -132,10 +148,7 @@ pub fn update_head(store: &mut Store, log_tree: bool) {
 /// evidence even when live participation has collapsed: exactly the failure
 /// mode safe target is supposed to prevent. See leanSpec PR #680.
 fn update_safe_target(store: &mut Store) {
-    let head_state = store
-        .get_state(&store.head().unwrap())
-        .expect("head state exists");
-    let num_validators = head_state.unwrap().validators.len() as u64;
+    let num_validators = store.head_state().validators.len() as u64;
 
     let min_target_score = (num_validators * 2).div_ceil(3);
 
@@ -315,7 +328,7 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let genesis_time_ms = store.config().unwrap().genesis_time * 1000;
+    let genesis_time_ms = store.config().genesis_time * 1000;
     let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
     let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
 
@@ -332,7 +345,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             .set_time(store.time().unwrap() + 1)
             .expect("set_time should succeed");
 
-        let slot = store.time().unwrap() / INTERVALS_PER_SLOT;
+        let slot = store.current_slot();
         let interval = SlotInterval::from_intervals_since_genesis(store.time().unwrap());
 
         trace!(%slot, ?interval, "processing tick");
@@ -350,7 +363,7 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
                 if should_signal_proposal {
-                    accept_new_attestations(store, false);
+                    accept_new_attestations(store);
                 }
             }
             SlotInterval::AttestationProduction => {
@@ -365,7 +378,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
             }
             SlotInterval::EndOfSlot => {
                 // End of slot - accept accumulated attestations and log tree
-                accept_new_attestations(store, true);
+                let update = accept_new_attestations(store);
+                log_fork_choice_tree(store, &update);
             }
         }
     }
@@ -399,11 +413,14 @@ pub fn on_gossip_attestation(
         .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(target.root))?;
     if validator_id >= target_state.validators.len() as u64 {
-        return Err(StoreError::InvalidValidatorIndex);
+        return Err(StoreError::ValidatorNotInState {
+            validator_index: validator_id,
+        });
     }
-    let validator_pubkey = target_state.validators[validator_id as usize]
-        .get_attestation_pubkey()
-        .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
+    let validator_pubkey = ValidatorPublicKey::from_bytes(
+        &target_state.validators[validator_id as usize].attestation_pubkey,
+    )
+    .map_err(|_| StoreError::PubkeyDecodingFailed(validator_id))?;
 
     // Verify the validator's XMSS signature
     let slot: u32 = attestation.data.slot.try_into().expect("slot exceeds u32");
@@ -427,7 +444,7 @@ pub fn on_gossip_attestation(
         metrics::update_gossip_signatures(store.gossip_signatures_count());
     }
 
-    metrics::inc_attestations_valid(1);
+    metrics::inc_attestations_valid();
 
     let slot = attestation.data.slot;
     let target_slot = attestation.data.target.slot;
@@ -489,15 +506,17 @@ fn on_gossip_aggregated_attestation_core(
     if participant_indices.is_empty() {
         return Err(StoreError::EmptyAggregationBits);
     }
-    if participant_indices.iter().any(|&vid| vid >= num_validators) {
-        return Err(StoreError::InvalidValidatorIndex);
+    if let Some(&validator_index) = participant_indices
+        .iter()
+        .find(|&&vid| vid >= num_validators)
+    {
+        return Err(StoreError::ValidatorNotInState { validator_index });
     }
 
     let pubkeys: Vec<_> = participant_indices
         .iter()
         .map(|&vid| {
-            validators[vid as usize]
-                .get_attestation_pubkey()
+            ValidatorPublicKey::from_bytes(&validators[vid as usize].attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
         })
         .collect::<Result<_, _>>()?;
@@ -514,6 +533,8 @@ fn on_gossip_aggregated_attestation_core(
             &data_root,
             slot,
         )
+        .inspect(|_| metrics::inc_pq_sig_aggregated_signatures_valid())
+        .inspect_err(|_| metrics::inc_pq_sig_aggregated_signatures_invalid())
         .map_err(StoreError::AggregateVerificationFailed)?;
     }
 
@@ -536,7 +557,7 @@ fn on_gossip_aggregated_attestation_core(
         "Aggregated attestation processed"
     );
 
-    metrics::inc_attestations_valid(1);
+    metrics::inc_attestations_valid();
 
     Ok(())
 }
@@ -569,7 +590,7 @@ fn on_block_core(
     signed_block: SignedBlock,
     verify: bool,
 ) -> Result<(), StoreError> {
-    let _timing = metrics::time_fork_choice_block_processing();
+    let timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
 
     let block = &signed_block.message;
@@ -581,6 +602,7 @@ fn on_block_core(
         .has_state(&block_root)
         .expect("DB read should succeed")
     {
+        timing.discard();
         return Ok(());
     }
 
@@ -612,7 +634,7 @@ fn on_block_core(
     // Horizon is the current slot plus one whole slot of margin, so an intended
     // early block still imports (mirrors the attestation future-slot guard, but
     // with a whole-slot rather than one-interval margin).
-    let current_slot = store.time().expect("DB read should succeed") / INTERVALS_PER_SLOT;
+    let current_slot = store.current_slot();
     if slot > current_slot + 1 {
         return Err(StoreError::BlockTooFarInFuture {
             block_slot: slot,
@@ -682,14 +704,14 @@ fn on_block_core(
         .insert_state(block_root, post_state)
         .expect("DB insert should succeed");
 
-    for att in block.body.attestations.iter() {
-        // Count each participating validator as a valid attestation.
-        let count = validator_indices(&att.aggregation_bits).count() as u64;
-        metrics::inc_attestations_valid(count);
-    }
+    // Block-included attestations are intentionally not counted here.
+    // `lean_attestations_valid_total` tracks the gossip validation pipeline
+    // (symmetric with `inc_attestations_invalid`), matching leanSpec. Votes
+    // arriving inside a block are counted by
+    // `lean_state_transition_attestations_processed_total` instead.
 
     // Update forkchoice head based on new block and attestations
-    update_head(store, false);
+    update_head(store);
 
     let block_total = block_start.elapsed();
     info!(
@@ -864,14 +886,13 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time_ms =
-        store.config().expect("config exists").genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
 
     // Process any pending attestations before proposal
-    accept_new_attestations(store, false);
+    accept_new_attestations(store);
 
     store.head().expect("store head exists")
 }
@@ -956,8 +977,28 @@ pub enum StoreError {
     #[error("Parent state not found for slot {slot}. Missing block: {parent_root}")]
     MissingParentState { parent_root: H256, slot: u64 },
 
-    #[error("Validator index out of range")]
-    InvalidValidatorIndex,
+    /// A gossiped vote names a validator the target state's registry does not
+    /// hold (spec `VALIDATOR_NOT_IN_STATE`).
+    #[error("Validator {validator_index} is not in the state registry")]
+    ValidatorNotInState { validator_index: u64 },
+
+    /// A block attestation's participant bits reach past the registry
+    /// (spec `VALIDATOR_INDEX_OUT_OF_RANGE`).
+    #[error(
+        "Attester index {validator_index} is beyond the {num_validators} registered validators"
+    )]
+    AttesterIndexOutOfRange {
+        validator_index: u64,
+        num_validators: u64,
+    },
+
+    /// A block's `proposer_index` reaches past the registry
+    /// (spec `PROPOSER_INDEX_OUT_OF_RANGE`).
+    #[error("Proposer index {proposer_index} is beyond the {num_validators} registered validators")]
+    ProposerIndexOutOfRange {
+        proposer_index: u64,
+        num_validators: u64,
+    },
 
     #[error("Failed to decode validator {0}'s public key")]
     PubkeyDecodingFailed(u64),
@@ -1040,6 +1081,9 @@ pub enum StoreError {
     #[error("Aggregated signature verification failed: {0}")]
     AggregateVerificationFailed(ethlambda_crypto::VerificationError),
 
+    #[error("Block proof verification failed: {0}")]
+    BlockProofVerificationFailed(ethlambda_crypto::VerificationError),
+
     #[error("Signature aggregation failed: {0}")]
     SignatureAggregationFailed(ethlambda_crypto::AggregationError),
 
@@ -1098,12 +1142,18 @@ pub fn verify_block_signatures(
     for attestation in attestations.iter() {
         for vid in validator_indices(&attestation.aggregation_bits) {
             if vid >= num_validators {
-                return Err(StoreError::InvalidValidatorIndex);
+                return Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: vid,
+                    num_validators,
+                });
             }
         }
     }
     if block.proposer_index >= num_validators {
-        return Err(StoreError::InvalidValidatorIndex);
+        return Err(StoreError::ProposerIndexOutOfRange {
+            proposer_index: block.proposer_index,
+            num_validators,
+        });
     }
 
     let block_root = block.hash_tree_root();
@@ -1121,11 +1171,12 @@ pub fn verify_block_signatures(
     for attestation in attestations.iter() {
         let mut pubkeys = Vec::new();
         for vid in validator_indices(&attestation.aggregation_bits) {
-            let validator = validators
-                .get(vid as usize)
-                .ok_or(StoreError::InvalidValidatorIndex)?;
-            let pk = validator
-                .get_attestation_pubkey()
+            let out_of_range = StoreError::AttesterIndexOutOfRange {
+                validator_index: vid,
+                num_validators,
+            };
+            let validator = validators.get(vid as usize).ok_or(out_of_range)?;
+            let pk = ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pk);
         }
@@ -1135,11 +1186,14 @@ pub fn verify_block_signatures(
         expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
     }
 
+    let proposer_out_of_range = StoreError::ProposerIndexOutOfRange {
+        proposer_index: block.proposer_index,
+        num_validators,
+    };
     let proposer_validator = validators
         .get(block.proposer_index as usize)
-        .ok_or(StoreError::InvalidValidatorIndex)?;
-    let proposer_pubkey = proposer_validator
-        .get_proposal_pubkey()
+        .ok_or(proposer_out_of_range)?;
+    let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
     pubkeys_per_component.push(vec![proposer_pubkey]);
     let block_slot_u32 =
@@ -1154,7 +1208,7 @@ pub fn verify_block_signatures(
         pubkeys_per_component,
         &expected_bindings,
     )
-    .map_err(StoreError::AggregateVerificationFailed)?;
+    .map_err(StoreError::BlockProofVerificationFailed)?;
     let crypto_elapsed = crypto_start.elapsed();
 
     let total_elapsed = total_start.elapsed();
@@ -1771,6 +1825,87 @@ mod tests {
                     if gap == gap_slot && max == HISTORICAL_ROOTS_LIMIT as u64
             ),
             "Expected BlockSlotGapTooLarge, got: {result:?}"
+        );
+    }
+
+    /// A registry of `count` validators with placeholder keys.
+    ///
+    /// The bounds checks under test run before any key is decoded, so zeroed
+    /// pubkeys are enough.
+    fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
+        (0..count)
+            .map(|index| ethlambda_types::state::Validator {
+                attestation_pubkey: [0u8; 52],
+                proposal_pubkey: [0u8; 52],
+                index,
+            })
+            .collect()
+    }
+
+    /// An out-of-range attester and an out-of-range proposer are distinct
+    /// rejections, because the spec names them distinctly
+    /// (`VALIDATOR_INDEX_OUT_OF_RANGE` vs `PROPOSER_INDEX_OUT_OF_RANGE`,
+    /// `signatures.py`). Reporting one variant for both would classify whichever
+    /// fixture arrives second for the wrong reason.
+    #[test]
+    fn verify_block_signatures_separates_attester_and_proposer_bounds() {
+        let state = State::from_genesis(1000, make_validators(2));
+
+        let att_data = AttestationData {
+            slot: 0,
+            head: Checkpoint::default(),
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        };
+        // Bit 2 is one past the last registered validator.
+        let attestations = AggregatedAttestations::try_from(vec![AggregatedAttestation {
+            aggregation_bits: make_bits(&[2]),
+            data: att_data,
+        }])
+        .unwrap();
+
+        let out_of_range_attester = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 1,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody { attestations },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let result = verify_block_signatures(&state, &out_of_range_attester);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: 2,
+                    num_validators: 2,
+                })
+            ),
+            "Expected AttesterIndexOutOfRange, got: {result:?}"
+        );
+
+        let out_of_range_proposer = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 2,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let result = verify_block_signatures(&state, &out_of_range_proposer);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::ProposerIndexOutOfRange {
+                    proposer_index: 2,
+                    num_validators: 2,
+                })
+            ),
+            "Expected ProposerIndexOutOfRange, got: {result:?}"
         );
     }
 }

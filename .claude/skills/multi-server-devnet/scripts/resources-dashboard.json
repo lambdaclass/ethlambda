@@ -1,0 +1,372 @@
+{
+  "uid": "devnet-resources",
+  "title": "Devnet Resources (cAdvisor)",
+  "tags": ["lean", "devnet", "resources"],
+  "schemaVersion": 39,
+  "version": 8,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "ds_prom",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "network",
+        "type": "query",
+        "label": "Devnet",
+        "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+        "query": { "qryType": 1, "query": "label_values(lean_head_slot, network)", "refId": "var-network" },
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {}
+      },
+      {
+        "name": "name",
+        "type": "query",
+        "label": "Node",
+        "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+        "query": { "qryType": 1, "query": "label_values(container_memory_working_set_bytes{network=\"$network\"}, name)", "refId": "var-name" },
+        "regex": "/^[a-z]+_\\d+$/",
+        "refresh": 2,
+        "sort": 5,
+        "multi": true,
+        "includeAll": true,
+        "allValue": "[a-z]+_[0-9]+",
+        "current": { "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "CPU usage by node (cores) — $network",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" },
+          "unit": "short",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "{{name}}",
+          "expr": "rate(container_cpu_usage_seconds_total{network=\"$network\", name=~\"${name:pipe}\"}[$__rate_interval])"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Memory working set by node — $network",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "limit" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "{{name}}",
+          "expr": "container_memory_working_set_bytes{network=\"$network\", name=~\"${name:pipe}\"}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "limit",
+          "expr": "max(container_spec_memory_limit_bytes{network=\"$network\", name=~\"${name:pipe}\"})"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Memory used (% of limit) by node — $network",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" },
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 70 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom", "calcs": ["mean"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "{{name}}",
+          "expr": "100 * container_memory_working_set_bytes{network=\"$network\", name=~\"${name:pipe}\"} / container_spec_memory_limit_bytes{network=\"$network\", name=~\"${name:pipe}\"}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "bargauge",
+      "title": "Memory now (% of limit) — $network",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 70 },
+              { "color": "red", "value": 85 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "instant": true,
+          "legendFormat": "{{name}}",
+          "expr": "100 * container_memory_working_set_bytes{network=\"$network\", name=~\"${name:pipe}\"} / container_spec_memory_limit_bytes{network=\"$network\", name=~\"${name:pipe}\"}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "OOM kills by node — $network",
+      "description": "Per-node OOM-kill events from cAdvisor (container_oom_events_total), counted over each time bucket. Legend 'sum' = total OOM kills in the selected range. Summed by node name so a container that was recreated after an OOM doesn't split into two series.",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "normal", "group": "A" } },
+          "unit": "short",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "table", "placement": "right", "calcs": ["sum", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "{{name}}",
+          "expr": "sum by (name) (increase(container_oom_events_total{network=\"$network\", name=~\"${name:pipe}\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Restart events by node — $network",
+      "description": "(Re)starts detected as jumps in the newest start time per node: changes(max by(name)(container_start_time_seconds)). Cgroup-agnostic and mechanism-agnostic — catches BOTH in-place restarts (docker restart / crash+restart-policy, same container id) AND full recreations (docker rm+run: image upgrade, client conversion, config change), which the naive per-series changes() misses. Legend 'sum' = total (re)starts in the selected range. Does not count a node's very first start within the window if its start time never changed.",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "normal", "group": "A" } },
+          "unit": "short",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "showLegend": true, "displayMode": "table", "placement": "right", "calcs": ["sum", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "legendFormat": "{{name}}",
+          "expr": "changes((max by (name) (container_start_time_seconds{network=\"$network\", name=~\"${name:pipe}\"}))[$__rate_interval:15s])"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Current uptime by node — $network",
+      "description": "Time since each container last (re)started = time() - container_start_time_seconds. A low value means a recent restart or a fresh (re)deploy. Red < 5m, orange < 30m, green otherwise.",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 300 },
+              { "color": "green", "value": 1800 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "instant": true,
+          "legendFormat": "{{name}}",
+          "expr": "time() - max by (name) (container_start_time_seconds{network=\"$network\", name=~\"${name:pipe}\"})"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Image build (commit per node) — $network",
+      "description": "Which build each node is actually running, read from the OCI labels baked into its container image (org.opencontainers.image.revision / .ref.name): docker copies an image's labels onto every container created from it, and cAdvisor re-exports them as container_label_*. It is the label of the image the container was CREATED with, so it stays correct after a `docker pull` that was not followed by a recreate, unlike the mutable tag in Image. An empty Commit means that client's Dockerfile does not set the label. Read it next to 'Restart events' / 'Current uptime': a fresh uptime with an unchanged Commit means the node came back on the SAME build, a changed one means the restart also upgraded it.",
+      "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true, "inspect": false },
+          "noValue": "No cAdvisor data for this network. Is its cadvisor container being scraped?"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Node" }, "properties": [{ "id": "custom.width", "value": 130 }] },
+          { "matcher": { "id": "byName", "options": "Client" }, "properties": [{ "id": "custom.width", "value": 110 }] },
+          { "matcher": { "id": "byName", "options": "Commit" }, "properties": [{ "id": "custom.width", "value": 350 }] },
+          { "matcher": { "id": "byName", "options": "Branch / tag" }, "properties": [{ "id": "custom.width", "value": 230 }] },
+          { "matcher": { "id": "byName", "options": "Image built" }, "properties": [{ "id": "custom.width", "value": 230 }] }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "sortBy": [{ "desc": false, "displayName": "Node" }]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${ds_prom}" },
+          "editorMode": "code",
+          "instant": true,
+          "legendFormat": "__auto",
+          "expr": "last_over_time(container_last_seen{network=\"$network\", name=~\"${name:pipe}\"}[5m])"
+        }
+      ],
+      "transformations": [
+        { "id": "labelsToFields", "options": { "keepLabels": ["name", "client_type", "container_label_org_opencontainers_image_revision", "container_label_org_opencontainers_image_ref_name", "image", "container_label_org_opencontainers_image_created"] } },
+        { "id": "merge", "options": {} },
+        { "id": "filterFieldsByName", "options": { "include": { "names": ["name", "client_type", "container_label_org_opencontainers_image_revision", "container_label_org_opencontainers_image_ref_name", "image", "container_label_org_opencontainers_image_created"] } } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "includeByName": {},
+            "indexByName": { "name": 0, "client_type": 1, "container_label_org_opencontainers_image_revision": 2, "container_label_org_opencontainers_image_ref_name": 3, "image": 4, "container_label_org_opencontainers_image_created": 5 },
+            "renameByName": {
+              "name": "Node",
+              "client_type": "Client",
+              "container_label_org_opencontainers_image_revision": "Commit",
+              "container_label_org_opencontainers_image_ref_name": "Branch / tag",
+              "image": "Image",
+              "container_label_org_opencontainers_image_created": "Image built"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

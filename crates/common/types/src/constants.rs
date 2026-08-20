@@ -8,3 +8,10 @@
 /// eventually be derived from the fork version and genesis validators root.
 // TODO: derive dynamically once the spec defines fork identification.
 pub const FORK_DIGEST: &str = "12345678";
+
+/// Milliseconds per interval (800ms ticks).
+pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
+/// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
+pub const INTERVALS_PER_SLOT: u64 = 5;
+/// Milliseconds in a slot (derived from interval duration and count).
+pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;

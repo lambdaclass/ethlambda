@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -269,31 +270,17 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         return Vec::new();
     };
 
-    let mut roots_by_slot = HashMap::new();
-    let mut current_root = store.head().expect("head block exists");
-
-    while !current_root.is_zero() {
-        let Ok(Some(header)) = store.get_block_header(&current_root) else {
-            break;
-        };
-
-        if header.slot < start_slot {
-            break;
-        }
-
-        if header.slot <= end_slot {
-            roots_by_slot.insert(header.slot, current_root);
-        }
-
-        current_root = header.parent_root;
-    }
-
-    (start_slot..=end_slot)
-        .filter_map(|slot| {
-            let root = roots_by_slot.get(&slot)?;
-            store.get_signed_block(root).ok().flatten()
+    store
+        .get_signed_blocks_by_slot_range(start_slot, end_slot)
+        .inspect_err(|err| {
+            warn!(
+                start_slot,
+                end_slot,
+                ?err,
+                "Failed to get signed blocks by slot range"
+            )
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 async fn handle_blocks_by_root_response(
@@ -335,7 +322,7 @@ async fn handle_blocks_by_root_response(
 
         if let Some(ref blockchain) = server.blockchain {
             let _ = blockchain
-                .new_block(block)
+                .new_block(block, BlockSource::Sync)
                 .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
         }
     }
@@ -371,7 +358,7 @@ async fn handle_blocks_by_range_response(
         }
 
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(block) {
+        if let Err(err) = blockchain.new_block(block, BlockSource::Sync) {
             error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
