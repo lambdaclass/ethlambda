@@ -182,7 +182,11 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
         );
 
         if measured {
-            let overhead_seconds = wall_seconds - phases.values().sum::<f64>();
+            // Clamped: the unattributed preamble makes the remainder
+            // positive in practice, but summing many small phase values can
+            // round just above the wall measurement, and a negative overhead
+            // in the report would read as an accounting bug.
+            let overhead_seconds = (wall_seconds - phases.values().sum::<f64>()).max(0.0);
             samples.push(Sample {
                 iteration: slot - options.warmup_slots,
                 slot,
