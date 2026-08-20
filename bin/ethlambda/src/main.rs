@@ -67,13 +67,7 @@ const ASCII_ART: &str = r#"
  \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
 "#;
 
-// Shadow single-steps execution in a discrete-event simulation, so the default
-// multi-threaded runtime's worker threads add only scheduling noise, never
-// parallelism. Use a single-threaded runtime under Shadow. This is an
-// optimization, not a correctness requirement.
-#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
-#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
     let options = CliOptions::parse();
     options.validate_discovery()?;
 
@@ -108,10 +102,23 @@ async fn main() -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 
+    // The benchmark is synchronous, CPU-bound work: run it on the main thread
+    // and never start the tokio runtime, rather than parking a worker thread
+    // for the whole run.
     if let Some(cli::Command::Benchmark(benchmark_options)) = options.command {
         return benchmark::run(benchmark_options);
     }
 
+    run_node(options)
+}
+
+// Shadow single-steps execution in a discrete-event simulation, so the default
+// multi-threaded runtime's worker threads add only scheduling noise, never
+// parallelism. Use a single-threaded runtime under Shadow. This is an
+// optimization, not a correctness requirement.
+#[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
+#[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
+async fn run_node(options: CliOptions) -> eyre::Result<()> {
     let rpc_config = RpcConfig {
         http_address: options.http_address,
         api_port: options.api_port,
