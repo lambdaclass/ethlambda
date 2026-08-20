@@ -1880,12 +1880,22 @@ pub fn on_block(
 
     // Check the block is valid and compute the post-state. See the module
     // documentation for why this always passes `ExecutionEngine::valid`.
-    stf::state_transition(
+    //
+    // The parent's post-state root is handed in when this node has it, which
+    // for a follower importing one block per slot is every time after the
+    // first: the previous import computed it to check that block's own
+    // `state_root`. Without it, `process_slot` re-merkleizes the parent state to
+    // recover a value already known, and a mainnet state costs ~1.4s to hash.
+    // Only roots this node computed itself are ever cached, never one read off a
+    // header; see `stf::process_slot_with_known_root`.
+    let known_parent_state_root = store.cached_beacon_state_root(parent_root);
+    let post_state_root = stf::state_transition_with_known_root(
         &mut state,
         &signed_block,
         true,
         config,
         &stf::ExecutionEngine::valid(),
+        known_parent_state_root,
     )?;
 
     // [New in Bellatrix] Check the merge transition block conditions.
@@ -1923,6 +1933,11 @@ pub fn on_block(
     let state = Arc::new(state);
     store.insert_beacon_block(block_root, &signed_block);
     store.cache_beacon_state(block_root, Arc::clone(&state));
+    // Remember what the check above already computed, so this block's child
+    // does not merkleize the same state again.
+    if let Some(post_state_root) = post_state_root {
+        store.cache_beacon_state_root(block_root, post_state_root);
+    }
 
     // Add block timeliness to the store.
     let seconds_since_genesis = store

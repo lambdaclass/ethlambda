@@ -262,6 +262,30 @@ impl Store {
             .put((checkpoint.epoch, checkpoint.root), state);
     }
 
+    /// The root of `root`'s post-state, if this node computed it.
+    ///
+    /// Only ever holds roots the node merkleized itself, never one read off a
+    /// block header: the value feeds `state.state_roots`, which is a consensus
+    /// input. See
+    /// [`BEACON_STATE_ROOT_CACHE_CAPACITY`](crate::store::BEACON_STATE_ROOT_CACHE_CAPACITY).
+    pub fn cached_beacon_state_root(&self, root: Root) -> Option<Root> {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .state_roots
+            .get(&root)
+            .copied()
+    }
+
+    /// Remembers `state_root` as the root of `root`'s post-state.
+    pub fn cache_beacon_state_root(&self, root: Root, state_root: Root) {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .state_roots
+            .put(root, state_root);
+    }
+
     /// The pinned post-state for `root`, if it is held.
     ///
     /// Checked by `block_state` after the recency cache and before the on-disk

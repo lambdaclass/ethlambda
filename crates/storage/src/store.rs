@@ -652,6 +652,9 @@ pub(crate) struct BeaconCaches {
     /// Post-states of epoch-boundary blocks, held by *distance* rather than by
     /// recency. See [`BEACON_PINNED_STATE_CAPACITY`].
     pub(crate) pinned_states: HashMap<BeaconRoot, Arc<BeaconState>>,
+    /// Block root -> the root of that block's post-state, for roots this node
+    /// merkleized itself. See [`BEACON_STATE_ROOT_CACHE_CAPACITY`].
+    pub(crate) state_roots: LruCache<BeaconRoot, BeaconRoot>,
 }
 
 /// Block post-states held resident. See [`BeaconCaches`].
@@ -691,6 +694,18 @@ pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
 /// cached: three covers the finalized checkpoint, the justified one, and the
 /// boundary the current epoch is building on.
 pub const BEACON_PINNED_STATE_CAPACITY: usize = 3;
+/// Post-state roots remembered, keyed by block root. See [`BeaconCaches`].
+///
+/// Merkleizing a mainnet state costs ~1.4s and an import pays for two of them:
+/// one in `process_slot`, recording the pre-block state root into history, and
+/// one to check the block's own `state_root`. Those are different states, so
+/// neither call can be skipped -- but the first is the *previous* block's
+/// post-state, which the previous import's check already computed. Remembering
+/// it turns two hashes per block into one.
+///
+/// A root is 32 bytes, so this is sized for the fork-choice window rather than
+/// against memory the way the state caches are.
+pub(crate) const BEACON_STATE_ROOT_CACHE_CAPACITY: usize = 512;
 
 impl BeaconCaches {
     pub(crate) fn new() -> Self {
@@ -703,6 +718,9 @@ impl BeaconCaches {
                     .expect("capacity is non-zero"),
             ),
             pinned_states: HashMap::new(),
+            state_roots: LruCache::new(
+                NonZeroUsize::new(BEACON_STATE_ROOT_CACHE_CAPACITY).expect("capacity is non-zero"),
+            ),
         }
     }
 }

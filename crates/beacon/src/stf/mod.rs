@@ -69,7 +69,7 @@ use crate::error::{Error, Result, verify};
 use crate::helpers::accessors::get_domain;
 use crate::helpers::misc::compute_signing_root;
 use crate::preset;
-use crate::primitives::{HashTreeRoot as _, Slot};
+use crate::primitives::{HashTreeRoot as _, Root, Slot};
 use crate::{bls, config::Config, constants};
 
 /// What the execution layer would answer for a block's payload.
@@ -132,8 +132,26 @@ pub fn state_transition(
     config: &Config,
     engine: &ExecutionEngine,
 ) -> Result<()> {
+    state_transition_with_known_root(state, signed_block, validate_result, config, engine, None)
+        .map(|_| ())
+}
+
+/// [`state_transition`], given the root of `state` as passed in, returning the
+/// post-state root when `validate_result` made it compute one.
+///
+/// The returned root is what lets a caller importing a chain of blocks pay for
+/// one full-state merkleization per block instead of two: hand it back as the
+/// next block's `known_root`. See [`process_slot_with_known_root`].
+pub fn state_transition_with_known_root(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    known_root: Option<Root>,
+) -> Result<Option<Root>> {
     let started = std::time::Instant::now();
-    process_slots(state, signed_block.slot(), config)?;
+    process_slots_with_known_root(state, signed_block.slot(), config, known_root)?;
     let slots_done = started.elapsed();
 
     // After `process_slots`, never before it. A block proposed at the first slot
@@ -159,12 +177,16 @@ pub fn state_transition(
     let block_done = block_started.elapsed();
 
     let hash_started = std::time::Instant::now();
-    if validate_result {
+    let post_state_root = if validate_result {
+        let computed = state.hash_tree_root();
         verify(
-            signed_block.state_root() == state.hash_tree_root(),
+            signed_block.state_root() == computed,
             "block state root matches the post-state",
         )?;
-    }
+        Some(computed)
+    } else {
+        None
+    };
     let hash_done = hash_started.elapsed();
 
     // A mainnet import costs seconds against a 12s slot, and that budget is the
@@ -184,7 +206,7 @@ pub fn state_transition(
         );
     }
 
-    Ok(())
+    Ok(post_state_root)
 }
 
 /// Whether the block carries its proposer's signature.
@@ -206,10 +228,26 @@ pub fn verify_block_signature(
 /// Rejects a slot at or before the current one, so this can only ever move
 /// forward.
 pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Result<()> {
+    process_slots_with_known_root(state, slot, config, None)
+}
+
+/// [`process_slots`], given the root of `state` when the caller already holds
+/// it. See [`process_slot_with_known_root`] for why that is worth passing.
+///
+/// The root applies to the first slot advanced and no other: every later
+/// iteration hashes an intermediate state this function produced itself, which
+/// no caller could have known in advance.
+pub fn process_slots_with_known_root(
+    state: &mut BeaconState,
+    slot: Slot,
+    config: &Config,
+    known_root: Option<Root>,
+) -> Result<()> {
     verify(state.slot() < slot, "target slot is after the current slot")?;
 
+    let mut known_root = known_root;
     while state.slot() < slot {
-        process_slot(state)?;
+        process_slot_with_known_root(state, known_root.take())?;
         // Epoch processing runs on the last slot of an epoch, before the counter
         // moves into the next one.
         if (state.slot() + 1).is_multiple_of(preset::SLOTS_PER_EPOCH) {
@@ -270,7 +308,27 @@ fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<
 /// it. It is left zero and filled in here, one slot later, which is the first
 /// moment the value exists.
 pub fn process_slot(state: &mut BeaconState) -> Result<()> {
-    let previous_state_root = state.hash_tree_root();
+    process_slot_with_known_root(state, None)
+}
+
+/// [`process_slot`], given the root of `state` when the caller already holds it.
+///
+/// Merkleizing a mainnet state costs ~1.4s, and this is one of two such hashes
+/// an import pays: this one records the pre-block state root into history, and
+/// [`state_transition`] computes the post-block one to check `block.state_root`.
+/// For consecutive blocks the value this needs is the previous import's
+/// post-state root, which that check computed moments earlier, so a caller that
+/// kept it can hand it back instead of paying for it twice.
+///
+/// `known_root` must be the root of `state` exactly as passed in. Callers supply
+/// only roots they computed themselves and verified: a root taken on trust from
+/// a block header would land unchecked in `state.state_roots`, which is a
+/// consensus input, so "we hashed this ourselves" is the whole safety argument.
+pub fn process_slot_with_known_root(
+    state: &mut BeaconState,
+    known_root: Option<Root>,
+) -> Result<()> {
+    let previous_state_root = known_root.unwrap_or_else(|| state.hash_tree_root());
     let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
     state.state_roots_mut()[position] = previous_state_root;
 
@@ -312,5 +370,54 @@ pub(crate) fn phase0_state_ref<'a>(
             function,
             fork: other.fork_name(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole optimization rests on this: handing `process_slot` the root it
+    /// would otherwise compute has to be indistinguishable from letting it
+    /// compute one. If these ever diverge, `state.state_roots` picks up a value
+    /// the chain did not agree on, so the equivalence is asserted on the state
+    /// as a whole rather than on the recorded root alone.
+    #[test]
+    fn a_known_state_root_produces_the_same_slot_as_computing_it() {
+        let mut computed = crate::helpers::test_state::with_validators(8);
+        let mut supplied = computed.clone();
+        let root = supplied.hash_tree_root();
+
+        process_slot(&mut computed).expect("the slot processes");
+        process_slot_with_known_root(&mut supplied, Some(root)).expect("the slot processes");
+
+        assert_eq!(
+            computed.hash_tree_root(),
+            supplied.hash_tree_root(),
+            "a supplied root must leave the state exactly where computing one does"
+        );
+    }
+
+    /// A root is only ever supplied for the first slot advanced: later
+    /// iterations hash states this function produced itself, which no caller
+    /// could have known. Advancing several slots at once is where a stale root
+    /// would leak in if `known_root` were reused, so it is checked directly.
+    #[test]
+    fn a_known_state_root_applies_only_to_the_first_slot_advanced() {
+        let config = Config::active();
+        let mut computed = crate::helpers::test_state::with_validators(8);
+        let mut supplied = computed.clone();
+        let root = supplied.hash_tree_root();
+        let target = computed.slot() + 3;
+
+        process_slots(&mut computed, target, &config).expect("the slots process");
+        process_slots_with_known_root(&mut supplied, target, &config, Some(root))
+            .expect("the slots process");
+
+        assert_eq!(
+            computed.hash_tree_root(),
+            supplied.hash_tree_root(),
+            "reusing the root past the first slot would corrupt the later ones"
+        );
     }
 }
