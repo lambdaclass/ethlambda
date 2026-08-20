@@ -1281,9 +1281,16 @@ impl BlockChainServer {
             return;
         }
 
+        let import_started = Instant::now();
         match self.import_beacon_block(signed_block) {
             Ok(()) => {
-                info!(%slot, block_root = %ShortRoot(&block_root.0), "Beacon block imported");
+                let import_ms = import_started.elapsed().as_millis();
+                info!(
+                    %slot,
+                    block_root = %ShortRoot(&block_root.0),
+                    import_ms,
+                    "Beacon block imported"
+                );
                 if source == BlockSource::Sync {
                     metrics::inc_sync_range_blocks();
                 }

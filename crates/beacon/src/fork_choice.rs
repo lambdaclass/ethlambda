@@ -1647,6 +1647,17 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
 
     // `replay` runs target -> anchor child; reverse to anchor child -> target.
     replay.reverse();
+    // A replay is the expensive path this function exists to avoid, and its
+    // depth is the cost: each block is a full state transition. Logged rather
+    // than silent because "which lookups still miss, and by how far" is the
+    // only way to tell a cache that is sized wrong from one that is *shaped*
+    // wrong. See `BEACON_PINNED_STATE_CAPACITY`.
+    tracing::info!(
+        blocks = replay.len(),
+        from_slot = state.slot(),
+        to_slot = replay.last().map(|block| block.slot()).unwrap_or_default(),
+        "Replaying beacon states to serve a block-state miss"
+    );
     for block in &replay {
         stf::state_transition(
             &mut state,
