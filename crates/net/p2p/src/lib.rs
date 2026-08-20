@@ -303,6 +303,7 @@ pub fn build_swarm(
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let mut bootnode_addrs = HashMap::new();
+    let mut quic_less_bootnodes = 0usize;
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
@@ -311,12 +312,24 @@ pub fn build_swarm(
         // Discovery-only seed: reachable over discv5, but with no QUIC port
         // there is nothing for the swarm to dial.
         let Some(quic_port) = bootnode.quic_port else {
+            quic_less_bootnodes += 1;
             debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no quic port, discv5 seed only");
             continue;
         };
         let addr = quic_multiaddr(bootnode.ip, quic_port, peer_id);
         bootnode_addrs.insert(peer_id, addr.clone());
         swarm.dial(addr).unwrap();
+    }
+    // Every skip above is individually unremarkable and logged at `debug`, but a
+    // list that produces no dial target at all leaves the node isolated unless
+    // discovery is on, which is worth one line at `warn`. A beacon-chain
+    // bootstrap list is exactly this shape: `tcp` and `udp`, never `quic`.
+    if bootnode_addrs.is_empty() && quic_less_bootnodes > 0 {
+        warn!(
+            quic_less_bootnodes,
+            "No bootnode advertises a quic port, so nothing will be dialed statically; \
+             peering depends entirely on discv5 discovery"
+        );
     }
     let addr = Multiaddr::empty()
         .with(config.listening_socket.ip().into())
@@ -844,7 +857,9 @@ impl Bootnode {
 /// from booting. A record carrying only one of `quic` and `udp` is kept, since
 /// each is useful on its own.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
-    enrs.into_iter()
+    let configured = enrs.len();
+    let bootnodes: Vec<Bootnode> = enrs
+        .into_iter()
         .filter_map(|enr_str| {
             parse_enr(&enr_str)
                 .inspect_err(
@@ -852,7 +867,17 @@ pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
                 )
                 .ok()
         })
-        .collect()
+        .collect();
+    // Each rejection above already warned, but a file where *every* entry is
+    // unusable boots a node with an empty bootnode list, which otherwise looks
+    // identical to having configured none at all.
+    if bootnodes.is_empty() && configured > 0 {
+        warn!(
+            configured,
+            "No bootnode ENR could be used; the node starts with no bootnodes"
+        );
+    }
+    bootnodes
 }
 
 fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
