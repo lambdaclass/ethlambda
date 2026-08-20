@@ -39,7 +39,8 @@ use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
-    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm, parse_enrs,
+    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm,
+    discovery::DiscoverySpawnConfig, parse_enrs,
 };
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
@@ -262,12 +263,12 @@ async fn main() -> eyre::Result<()> {
     );
 
     let built = build_swarm(SwarmConfig {
-        node_key: node_p2p_key,
-        bootnodes,
+        node_key: node_p2p_key.clone(),
+        bootnodes: bootnodes.clone(),
         listening_socket: p2p_socket,
         validator_ids,
         attestation_committee_count,
-        subscription_subnets: subscribed_subnets,
+        subscription_subnets: subscribed_subnets.clone(),
     })
     .wrap_err("failed to build swarm")?;
 
@@ -275,7 +276,23 @@ async fn main() -> eyre::Result<()> {
     // RPC `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
-    let p2p = P2P::spawn(built, store.clone(), node_names);
+    // `None` when discovery is disabled; `P2P::spawn` starts the discv5 server
+    // from it and owns the resulting handle.
+    let discovery = options.discovery.enable.then(|| DiscoverySpawnConfig {
+        node_key: node_p2p_key,
+        bind_ip: p2p_socket.ip(),
+        discovery_port: options.discovery.port,
+        quic_port: p2p_socket.port(),
+        subscription_subnets: subscribed_subnets,
+        attestation_committee_count,
+        bootnodes,
+        advertise_ip: options.discovery.advertise_ip,
+        target_peers: options.discovery.target_peers,
+    });
+
+    let p2p = P2P::spawn(built, store.clone(), node_names, discovery)
+        .await
+        .wrap_err("failed to start discv5 discovery")?;
 
     // Wire actors together via protocol refs
     blockchain
