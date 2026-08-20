@@ -830,11 +830,13 @@ impl Bootnode {
     }
 }
 
-/// Decode `enr:`-prefixed records into dialable bootnodes.
+/// Decode `enr:`-prefixed records into usable bootnodes.
 ///
-/// Records that cannot be decoded, or that lack a QUIC port, an IP or a public
-/// key, are skipped with a warning rather than aborting startup: one malformed
-/// entry in the bootnode file should not stop the node from booting.
+/// Records that cannot be decoded, or that lack an IP, a public key or any
+/// dialable port at all, are skipped with a warning rather than aborting
+/// startup: one malformed entry in the bootnode file should not stop the node
+/// from booting. A record carrying only one of `quic` and `udp` is kept, since
+/// each is useful on its own.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
     enrs.into_iter()
         .filter_map(|enr_str| {
@@ -861,6 +863,11 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // `build_swarm` skip it when it picks static dial targets.
     let quic_port = read_quic_port(&record);
 
+    // An explicit `udp: 0` is no more reachable than a `quic: 0`, which
+    // `read_quic_port` already rejects. Reading it verbatim would seed discv5
+    // with a contact on a port nothing listens on.
+    let udp_port = pairs.udp_port.filter(|port| *port != 0);
+
     let public_key = read_public_key(pairs)
         .ok_or_else(|| "node record missing or malformed public key".to_string())?;
 
@@ -869,14 +876,14 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // `quic` and `udp` are independently optional, but a record with neither is
     // reachable by nothing we speak: it can be neither dialed nor seeded. Drop
     // it here rather than carry a contact that no code path can ever use.
-    if quic_port.is_none() && pairs.udp_port.is_none() {
+    if quic_port.is_none() && udp_port.is_none() {
         return Err("node advertises neither a quic nor a udp port".to_string());
     }
 
     Ok(Bootnode {
         ip,
         quic_port,
-        udp_port: pairs.udp_port,
+        udp_port,
         public_key: public_key.into(),
     })
 }
@@ -1064,6 +1071,53 @@ mod tests {
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, Some(9001));
         assert_eq!(bootnodes[0].udp_port, Some(9010));
+    }
+
+    #[test]
+    fn parse_enrs_treats_a_zero_udp_port_as_absent() {
+        use ::secp256k1 as raw_secp256k1;
+
+        // `udp: 0` names no listener, exactly as `quic: 0` does not. Reading it
+        // verbatim would seed discv5 with an undialable contact, so the record
+        // survives only as a static dial target.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(0),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 9001);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
+
+        let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
+
+        assert_eq!(bootnodes.len(), 1);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
+        assert_eq!(bootnodes[0].udp_port, None);
+        assert!(
+            bootnodes[0].as_discovery_node().is_none(),
+            "a zero udp port must not become a discv5 seed"
+        );
+    }
+
+    #[test]
+    fn parse_enrs_drops_a_record_whose_only_ports_are_zero() {
+        use ::secp256k1 as raw_secp256k1;
+
+        // Neither port is dialable, so nothing downstream can ever use this
+        // record: the same outcome as a record carrying no ports at all.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(0),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 0);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
+
+        assert!(parse_enrs(vec![record.enr_url().unwrap()]).is_empty());
     }
 
     #[test]

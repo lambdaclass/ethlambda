@@ -199,9 +199,11 @@ pub(crate) fn read_public_key(
 /// The advertised libp2p QUIC port, if it is one we could dial.
 ///
 /// `None` covers an absent entry, an encoding `extra_int` cannot read (including
-/// the non-minimal forms some clients emit), and a literal `0`. The three
-/// coincide by construction, since an absent entry RLP-decodes to `0u16` via
-/// left-padding, and none of them names a port worth dialing.
+/// the non-minimal forms some clients emit), and a literal `0`. The first two
+/// come straight from `extra_int`, which looks the key up before it decodes
+/// anything and so reports a missing entry rather than a zero; the explicit `0`
+/// is what the filter here is for. None of the three names a port worth dialing,
+/// which is why they collapse into one answer.
 pub(crate) fn read_quic_port(record: &NodeRecord) -> Option<u16> {
     record
         .pairs()
