@@ -132,7 +132,9 @@ pub fn state_transition(
     config: &Config,
     engine: &ExecutionEngine,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     process_slots(state, signed_block.slot(), config)?;
+    let slots_done = started.elapsed();
 
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
@@ -152,13 +154,34 @@ pub fn state_transition(
         )?;
     }
 
+    let block_started = std::time::Instant::now();
     block::process_block(state, signed_block, config, engine)?;
+    let block_done = block_started.elapsed();
 
+    let hash_started = std::time::Instant::now();
     if validate_result {
         verify(
             signed_block.state_root() == state.hash_tree_root(),
             "block state root matches the post-state",
         )?;
+    }
+    let hash_done = hash_started.elapsed();
+
+    // A mainnet import costs seconds against a 12s slot, and that budget is the
+    // whole headroom the node has. Which of these three phases owns it decides
+    // what is worth optimizing, and it cannot be read off any existing metric.
+    // Logged only past a threshold so the replay path, which runs the same
+    // function per block with `validate_result` false, does not flood.
+    const SLOW_TRANSITION: std::time::Duration = std::time::Duration::from_millis(1500);
+    if started.elapsed() > SLOW_TRANSITION {
+        tracing::info!(
+            slot = signed_block.slot(),
+            fork = signed_block.fork_name().as_str(),
+            process_slots_ms = slots_done.as_millis(),
+            process_block_ms = block_done.as_millis(),
+            state_root_hash_ms = hash_done.as_millis(),
+            "Slow beacon state transition"
+        );
     }
 
     Ok(())

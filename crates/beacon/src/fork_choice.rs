@@ -2503,6 +2503,31 @@ mod tests {
         );
     }
 
+    /// Measures what a mainnet-scale block import actually spends its time on.
+    ///
+    /// The live follower imports at ~5.2s per block against a 12s slot, and
+    /// that number is the whole headroom budget: everything else the node does
+    /// has to fit in what is left. `state_transition` verifies the block's
+    /// `state_root` by merkleizing the post-state, and on mainnet the registry
+    /// is ~1M validators, so this asks how much of the import is that one hash.
+    ///
+    /// Prints a number rather than gating CI, same as the benchmarks above.
+    #[test]
+    fn measures_the_cost_of_hashing_a_mainnet_scale_state() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 3;
+        for validator_count in [4_096usize, 1_048_576] {
+            let state = crate::helpers::test_state::with_validators(validator_count);
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = state.hash_tree_root();
+            }
+            let each = start.elapsed() / ITERATIONS;
+            println!("hash_tree_root, {validator_count} validators -> {each:?}/call");
+        }
+    }
+
     /// Measures `on_attestation`'s warm-path cost: this is the number
     /// `ethlambda-blockchain`'s gossip-ingress wiring needs before it can
     /// decide whether the chain actor's single mailbox can absorb a slot's
@@ -2617,6 +2642,45 @@ mod tests {
                     .expect("the constructed attestation verifies");
             }
             let elapsed = start.elapsed();
+
+            // Split the call. `validate_on_attestation` and `checkpoint_state`
+            // both measured in nanoseconds on the warm path, so the entire cost
+            // is in deriving and verifying the attesters: committee derivation
+            // is cacheable in principle, BLS verification is not, and which one
+            // dominates is what decides where optimization is worth spending.
+            let data = attestation.data();
+            let target_state = checkpoint_state(&store, data.target, &config).expect("cached");
+            // The last split that matters: committee derivation is cacheable,
+            // BLS verification is not, so which one dominates decides the fix.
+            let phase0_attestation_inner = match &attestation {
+                Attestation::Phase0(inner) => inner.clone(),
+                Attestation::Electra(_) => unreachable!("the benchmark builds a phase0 aggregate"),
+            };
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = phase0_attestation::get_indexed_attestation(
+                    &target_state,
+                    &phase0_attestation_inner,
+                )
+                .expect("indexed");
+            }
+            let committees_only = start.elapsed() / ITERATIONS;
+
+            let indexed = phase0_attestation::get_indexed_attestation(
+                &target_state,
+                &phase0_attestation_inner,
+            )
+            .expect("indexed");
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                assert!(phase0_attestation::is_valid_indexed_attestation(
+                    &target_state,
+                    &indexed
+                ));
+            }
+            let bls_only = start.elapsed() / ITERATIONS;
+
+            println!("  {label} split: committees={committees_only:?} bls={bls_only:?}");
             println!(
                 "{label}: {validator_count} validators, {} in committee 0 -> {:?}/call \
                  ({ITERATIONS} calls, {elapsed:?} total)",
