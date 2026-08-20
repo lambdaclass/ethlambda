@@ -73,5 +73,230 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Run fixture-based tests
-        uses: ./.github/actions/run-fixture-tests
+      - name: Get leanSpec fixtures release info
+        id: fixtures-release
+        run: |
+          api_url="https://api.github.com/repos/leanEthereum/leanSpec/releases/latest"
+          json=$(curl -sL "$api_url")
+            fixtures_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz'))")
+            sha_url=$(echo "$json" | python3 -c "import sys,json; j=json.load(sys.stdin); print(next(a.get('browser_download_url') for a in j.get('assets',[]) if a.get('name')=='fixtures-prod-scheme.tar.gz.sha256'))")
+          sha=$(curl -sL "$sha_url" | cut -d' ' -f1)
+          {
+            echo "url=$fixtures_url"
+            echo "sha_url=$sha_url"
+            echo "sha=$sha"
+          } >> $GITHUB_OUTPUT
+
+      - name: Restore test fixtures cache
+        id: cache-fixtures
+        uses: actions/cache/restore@v5
+        with:
+          path: leanSpec/fixtures
+          key: leanspec-fixtures-${{ steps.fixtures-release.outputs.sha }}
+
+      - name: Download leanSpec fixtures release
+        id: download-fixtures
+        if: steps.cache-fixtures.outputs.cache-hit != 'true'
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          fixtures_url="${{ steps.fixtures-release.outputs.url }}"
+          sha_url="${{ steps.fixtures-release.outputs.sha_url }}"
+          echo "Downloading fixtures from $fixtures_url"
+          curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz" "$fixtures_url"
+          curl -L -f -o "$tmpdir/fixtures-prod-scheme.tar.gz.sha256" "$sha_url"
+          expected=$(cut -d' ' -f1 "$tmpdir/fixtures-prod-scheme.tar.gz.sha256")
+          actual=$(sha256sum "$tmpdir/fixtures-prod-scheme.tar.gz" | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "SHA256 mismatch: expected $expected, got $actual"
+            exit 1
+          fi
+          rm -rf leanSpec/fixtures
+          mkdir -p leanSpec/fixtures
+          tar -xzf "$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
+
+      # Save fixtures only when the download actually SUCCEEDED, so a
+      # cancelled or failed download never persists a partial fixture set,
+      # while still saving even if the later Rust test step fails.
+      - name: Save test fixtures cache
+        if: >-
+          always()
+          && steps.cache-fixtures.outputs.cache-hit != 'true'
+          && steps.download-fixtures.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: leanSpec/fixtures
+          key: ${{ steps.cache-fixtures.outputs.cache-primary-key }}
+
+      # Ensure make sees fixtures as up-to-date (its timestamp must be
+      # newer than leanSpec/, which intermediate steps may have modified).
+      - name: Mark fixtures as up-to-date
+        run: touch leanSpec/fixtures
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: make test
+
+  docker_build:
+    name: Build Docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ethlambda Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+          push: false
+          tags: |
+            ghcr.io/lambdaclass/ethlambda:devnet4
+            ghcr.io/lambdaclass/ethlambda:devnet5
+          outputs: type=docker,dest=/tmp/ethlambda_image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ethlambda_image
+          path: /tmp/ethlambda_image.tar
+
+  run-hive:
+    name: Hive - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: docker_build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Lean Validation"
+            limit: "validation"
+            artifact_prefix: lean_validation
+          - name: "Lean Gossip"
+            limit: "gossip"
+            artifact_prefix: lean_gossip
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ethlambda image artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: ethlambda_image
+          path: /tmp
+
+      - name: Load image
+        run: docker load --input /tmp/ethlambda_image.tar
+
+      - name: Load hive client config
+        id: client-config
+        shell: bash
+        run: |
+          {
+            echo "config<<EOF"
+            cat .github/config/hive/clients.yaml
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Determine hive flags
+        id: hive-flags
+        shell: bash
+        env:
+          SIM_LIMIT: ${{ matrix.limit }}
+        run: |
+          FLAGS="--sim.parallelism 4 --sim.loglevel 3"
+          if [[ -n "$SIM_LIMIT" ]]; then
+            escaped_limit=${SIM_LIMIT//\'/\'\\\'\'}
+            FLAGS+=" --sim.limit '$escaped_limit'"
+          fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Checkout hive
+        uses: actions/checkout@v6
+        with:
+          repository: ethereum/hive
+          ref: dde4f59d04ff0ff8b6585670b08cea1b6c8ab65c
+          path: src
+
+      - name: Patch Hive Lean Dockerfile
+        run: python3 .github/scripts/patch-hive-lean-dockerfile.py src/simulators/lean/Dockerfile
+
+      - name: Build Hive
+        working-directory: src
+        run: go build -o hive .
+
+      - name: Create Hive results directory
+        working-directory: src
+        run: mkdir -p results
+
+      - name: Write Hive client config
+        working-directory: src
+        run: |
+          cat > client-config.yaml <<'EOF'
+          ${{ steps.client-config.outputs.config }}
+          EOF
+
+      - name: Run Hive Simulation
+        working-directory: src
+        run: |
+          set -x
+          (./hive \
+            --sim lean \
+            --client ethlambda_devnet4 \
+            --results-root results \
+            --client-file=client-config.yaml \
+            ${{ steps.hive-flags.outputs.flags }} \
+            2>&1 || true) | tee hive.log
+
+          if tail -n 10 hive.log | grep -q "simulation .* finished"; then
+            exit 0
+          fi
+
+          exit 1
+
+      - name: Check Hive Results For Failures
+        id: verify-hive-results
+        if: ${{ success() }}
+        shell: bash
+        run: bash ./.github/scripts/check-hive-results.sh src/results
+
+      - name: Upload Hive Failure Logs
+        if: ${{ failure() && steps.verify-hive-results.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hive_failed_logs_${{ matrix.artifact_prefix }}
+          path: src/results/failed_logs
+          if-no-files-found: warn
+
+      - name: Upload Hive Run Artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hive_run_artifacts_${{ matrix.artifact_prefix }}
+          path: |
+            src/hive.log
+            src/results
+          if-no-files-found: warn
