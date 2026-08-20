@@ -1,4 +1,4 @@
-.PHONY: help fmt lint docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -13,6 +13,11 @@ test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during
 	# signature verification/aggregation, without paying for LTO on every rebuild
 	cargo test --workspace --profile release-fast
+
+BENCH_ARGS ?= synthetic --mock-crypto
+
+bench: ## 🏁 Benchmark block building offline (override BENCH_ARGS to customize)
+	cargo run --release --bin ethlambda -- benchmark $(BENCH_ARGS)
 
 GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
