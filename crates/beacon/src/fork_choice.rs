@@ -1624,14 +1624,17 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
     }
 
     // Walk back to the nearest state we have, collecting the blocks to replay.
-    let mut replay: Vec<SignedBeaconBlock> = Vec::new();
+    // Each entry keeps its own root alongside the block: the walk already knows
+    // it as the cursor, and the forward pass needs it to pin the epoch-boundary
+    // states it computes on the way.
+    let mut replay: Vec<(Root, SignedBeaconBlock)> = Vec::new();
     let mut cursor = root;
     let mut state = loop {
         let block = store
             .beacon_block(cursor)
             .ok_or(Error::SpecAssert("block_root in store.block_states"))?;
         let parent_root = block.parent_root();
-        replay.push(block);
+        replay.push((cursor, block));
 
         if let Some(state) = store.cached_beacon_state(parent_root) {
             break (*state).clone();
@@ -1655,10 +1658,13 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
     tracing::info!(
         blocks = replay.len(),
         from_slot = state.slot(),
-        to_slot = replay.last().map(|block| block.slot()).unwrap_or_default(),
+        to_slot = replay
+            .last()
+            .map(|(_, block)| block.slot())
+            .unwrap_or_default(),
         "Replaying beacon states to serve a block-state miss"
     );
-    for block in &replay {
+    for (index, (block_root, block)) in replay.iter().enumerate() {
         stf::state_transition(
             &mut state,
             block,
@@ -1666,6 +1672,21 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
             config,
             &stf::ExecutionEngine::valid(),
         )?;
+
+        // Pin the boundary states this replay passes through, on the same rule
+        // `on_block` uses: the last block of an epoch is that epoch's
+        // checkpoint block. `on_block` can only pin boundaries the node
+        // actually imported across, and a checkpoint sync lands mid-epoch, so
+        // the boundaries between the anchor and the head are never crossed by
+        // an import and never pinned there. Without this, every later lookup
+        // for one of them replays from the anchor again: the observed cost was
+        // a single import taking 188s on two such replays, 70 blocks and 64.
+        let next_epoch = replay
+            .get(index + 1)
+            .map(|(_, next)| compute_epoch_at_slot(next.slot()));
+        if next_epoch.is_some_and(|next| next > compute_epoch_at_slot(block.slot())) {
+            store.pin_beacon_state(*block_root, Arc::new(state.clone()));
+        }
     }
 
     let state = Arc::new(state);
