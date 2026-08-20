@@ -84,7 +84,9 @@ currently connected peer covers, so discovery preferentially fills gaps in subne
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
 Dialing stops once `--discovery.target-peers` peers are connected, and resumes
-if that count drops. The same number sizes the discv5 peer table.
+if that count drops. That is all the flag does: it is the dial loop's cutoff, and
+nothing in ethrex's peer table or discv5's own pacing enforces it (see
+[below](#discv5-lookups-run-at-the-startup-rate)).
 
 ## Bootnodes
 
@@ -122,6 +124,22 @@ check therefore separates lean from non-lean but **not one lean devnet from
 another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
+
+### discv5 lookups run at the startup rate
+
+ethrex paces its discv5 iterative lookups by how full its own peer table is,
+easing from one lookup every 500ms at startup to one every 10s once the table
+reaches its target. That table only counts peers registered through
+`NewConnectedPeer`, which carries an RLPx connection; ethlambda connects over
+libp2p and registers nothing, so the count is permanently zero and the pacing
+never eases off the startup rate. A lean node therefore keeps looking up every
+500ms rather than settling at 10s, roughly 20x the intended steady-state
+`FindNode` traffic, for the life of the process.
+
+`--discovery.target-peers` deliberately does *not* feed that computation, since a
+target of `0` would make it divide by zero and re-fire the lookup timer with no
+delay at all. Closing the gap properly means ethrex learning about non-RLPx
+connections, which is an upstream change.
 
 ### `attnets` is not a fixed-width SSZ `Bitvector`
 

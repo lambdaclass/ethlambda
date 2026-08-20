@@ -29,10 +29,22 @@ use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 /// How often the dial loop looks for a new peer.
 pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Default connected-peer count above which discovery stops dialing, and the
-/// peer table's own target. Overridable per node via
-/// [`DiscoverySpawnConfig::target_peers`].
+/// Default connected-peer count above which the dial loop stops dialing.
+/// Overridable per node via [`DiscoverySpawnConfig::target_peers`].
 pub const DEFAULT_DISCOVERY_TARGET_PEERS: usize = 200;
+
+/// The target we hand ethrex's peer table, which is not
+/// [`DiscoverySpawnConfig::target_peers`] and deliberately so.
+///
+/// ethrex's table counts only peers registered through `NewConnectedPeer`, which
+/// carries an RLPx `PeerConnection`. ethlambda connects over libp2p and never
+/// registers anything, so `peers.len()` is permanently 0 and the table's target
+/// cannot mean "how many peers we have". Its one live consumer here is the discv5
+/// lookup pacing, which divides by it: passing 0 would yield `0/0 = NaN`, and
+/// `NaN as u64` saturates to zero, turning the lookup timer into an unthrottled
+/// re-fire loop. Any non-zero value gives the same pacing, so this is 1 with the
+/// reason attached rather than a number pretending to be a peer budget.
+const PEER_TABLE_TARGET_PEERS: usize = 1;
 
 /// Candidates drawn from the peer table per refill.
 pub const DISCOVERY_CANDIDATE_BATCH: usize = 8;
@@ -70,10 +82,13 @@ pub struct DiscoverySpawnConfig {
     /// IP address to advertise in the ENR. Defaults to `bind_ip` when unset,
     /// which is undialable if `bind_ip` is the wildcard `0.0.0.0`.
     pub advertise_ip: Option<IpAddr>,
-    /// Connected-peer count above which the dial loop stops dialing, and the
-    /// target the peer table sizes itself to. Defaults to
+    /// Connected-peer count above which the dial loop stops dialing. Defaults to
     /// [`DEFAULT_DISCOVERY_TARGET_PEERS`]; a target of 0 leaves the dial loop
     /// ticking without ever dialing.
+    ///
+    /// Governs the dial loop only. ethrex's peer table is handed a fixed value
+    /// instead, because it counts only peers registered over RLPx and so can
+    /// never see ours; see `PEER_TABLE_TARGET_PEERS`.
     pub target_peers: usize,
 }
 
@@ -90,8 +105,8 @@ pub struct DiscoveryHandle {
     /// loop can apply the same rules when it turns a contact into a dial target.
     /// See [`LeanFilter`].
     pub filter: LeanFilter,
-    /// The configured [`DiscoverySpawnConfig::target_peers`], carried through so
-    /// the dial loop stops at the same count the peer table was sized to.
+    /// The configured [`DiscoverySpawnConfig::target_peers`], carried through to
+    /// the dial loop, which is the only thing it governs.
     pub target_peers: usize,
 }
 
@@ -143,7 +158,7 @@ pub async fn spawn_discovery(
     let filter = LeanFilter::new(EnrForkId::local(), config.attestation_committee_count);
     let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
-        config.target_peers,
+        PEER_TABLE_TARGET_PEERS,
         filter.clone(),
     );
 

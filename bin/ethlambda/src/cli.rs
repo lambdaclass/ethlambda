@@ -149,9 +149,10 @@ pub(crate) struct DiscoveryConfig {
     pub(crate) advertise_ip: Option<std::net::IpAddr>,
     /// Connected-peer count above which discovery stops dialing.
     ///
-    /// Also the size the discv5 peer table targets. The dial loop keeps
-    /// ticking either way and resumes dialing as soon as the connected count
-    /// drops back below this, so 0 means "discover and serve, never dial".
+    /// Governs the dial loop only, not discv5's own lookup pacing. The loop
+    /// keeps ticking either way and resumes dialing as soon as the connected
+    /// count drops back below this, so 0 means "discover and serve, never
+    /// dial".
     #[arg(long = "discovery.target-peers", default_value_t = DEFAULT_DISCOVERY_TARGET_PEERS)]
     pub(crate) target_peers: usize,
 }
