@@ -1664,6 +1664,19 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
             .unwrap_or_default(),
         "Replaying beacon states to serve a block-state miss"
     );
+    // A deep replay costs seconds per block, so it is worth a backtrace to name
+    // the caller: `block_state` has seven call sites and the expensive one is
+    // whichever asks for a root the recency cache cannot reach. Forced rather
+    // than `capture()`, which needs `RUST_BACKTRACE` set, and gated on depth so
+    // the one-block replays of ordinary operation stay quiet.
+    const DEEP_REPLAY_BLOCKS: usize = 8;
+    if replay.len() > DEEP_REPLAY_BLOCKS {
+        tracing::info!(
+            blocks = replay.len(),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "Deep beacon state replay"
+        );
+    }
     for (index, (block_root, block)) in replay.iter().enumerate() {
         stf::state_transition(
             &mut state,
