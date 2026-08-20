@@ -1611,6 +1611,12 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
     if let Some(state) = store.cached_beacon_state(root) {
         return Ok(state);
     }
+    // Before the snapshot, because a pin is the same value in memory: the
+    // epoch-boundary states this reaches are exactly the ones the recency cache
+    // above cannot hold. See `BEACON_PINNED_STATE_CAPACITY`.
+    if let Some(state) = store.pinned_beacon_state(root) {
+        return Ok(state);
+    }
     if let Some(state) = store.beacon_state_snapshot(root) {
         let state = Arc::new(state);
         store.cache_beacon_state(root, Arc::clone(&state));
@@ -1628,6 +1634,9 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
         replay.push(block);
 
         if let Some(state) = store.cached_beacon_state(parent_root) {
+            break (*state).clone();
+        }
+        if let Some(state) = store.pinned_beacon_state(parent_root) {
             break (*state).clone();
         }
         if let Some(state) = store.beacon_state_snapshot(parent_root) {
@@ -1865,6 +1874,20 @@ pub fn on_block(
     // Add new block to the store, and the new state for this block to the
     // store.
     let block_slot = signed_block.slot();
+
+    // This block is the first of its epoch on this branch, which makes its
+    // parent the epoch's checkpoint block: the last block at or before the
+    // boundary slot, and so the root that `get_checkpoint_block` will name
+    // when this epoch is justified and later finalized. Pin the parent's
+    // post-state now, while it is already materialized in hand, because by the
+    // time finalization asks for it the recency cache will have evicted it and
+    // rebuilding it costs a whole epoch of replay. Nothing about correctness
+    // rests on this: a pin only ever saves `block_state` the derivation it
+    // would otherwise do.
+    if compute_epoch_at_slot(block_slot) > compute_epoch_at_slot(parent_state.slot()) {
+        store.pin_beacon_state(parent_root, Arc::clone(&parent_state));
+    }
+
     let state = Arc::new(state);
     store.insert_beacon_block(block_root, &signed_block);
     store.cache_beacon_state(block_root, Arc::clone(&state));
@@ -2290,6 +2313,68 @@ mod tests {
             store.cached_beacon_state(root).is_some(),
             "a snapshot read must repopulate the cache, or every later read replays"
         );
+    }
+
+    /// A `BeaconState` whose only interesting property is its slot, which is
+    /// what the pin eviction orders by.
+    fn state_at(slot: u64) -> Arc<BeaconState> {
+        let mut state = crate::helpers::test_state::with_validators(1);
+        match &mut state {
+            BeaconState::Phase0(inner) => inner.slot = slot,
+            _ => unreachable!("test_state::with_validators builds a phase0 state"),
+        }
+        Arc::new(state)
+    }
+
+    #[test]
+    fn a_pinned_state_is_served_without_a_snapshot_or_a_replay() {
+        // The shape the pin exists for: the root is 2-3 epochs behind the head,
+        // so the recency cache has long evicted it, and it is not an anchor so
+        // there is no snapshot either. Without the pin this store can only
+        // answer by walking back and replaying, and with no snapshot anywhere
+        // to replay from it cannot answer at all.
+        let config = Config::active();
+        let mut store = empty_store();
+        let root = Root::repeat_byte(1);
+        let expected = state_at(preset::SLOTS_PER_EPOCH);
+
+        store.insert_beacon_block(root, &block(0, Root::zero()));
+        store.pin_beacon_state(root, Arc::clone(&expected));
+        assert!(store.cached_beacon_state(root).is_none());
+        assert!(store.beacon_state_snapshot(root).is_none());
+
+        let served = block_state(&store, root, &config).expect("the pin serves the read");
+        assert_eq!(served.hash_tree_root(), expected.hash_tree_root());
+    }
+
+    #[test]
+    fn pinning_past_capacity_drops_the_lowest_slot_not_the_oldest_insert() {
+        // Eviction is by slot because a pin below finalization can never be
+        // asked for again, while the newest boundary is the one finalization is
+        // about to want. Inserting the highest slot first and the lowest last
+        // separates the two policies: insertion order would drop the highest.
+        let store = empty_store();
+        let capacity = ethlambda_storage::BEACON_PINNED_STATE_CAPACITY;
+        let roots: Vec<Root> = (0..capacity + 1)
+            .map(|i| Root::repeat_byte(i as u8 + 1))
+            .collect();
+
+        for (offset, root) in roots.iter().enumerate() {
+            let slot = (capacity + 1 - offset) as u64 * preset::SLOTS_PER_EPOCH;
+            store.pin_beacon_state(*root, state_at(slot));
+        }
+
+        let lowest = roots.last().expect("a non-empty root list");
+        assert!(
+            store.pinned_beacon_state(*lowest).is_none(),
+            "the lowest-slot pin is the one that must go"
+        );
+        for root in &roots[..capacity] {
+            assert!(
+                store.pinned_beacon_state(*root).is_some(),
+                "a higher-slot pin must survive an over-capacity insert"
+            );
+        }
     }
 
     #[test]

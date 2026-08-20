@@ -11,5 +11,6 @@ pub use beacon_store::BeaconBlockIndex;
 /// callers can match on it (e.g. to distinguish [`Error::GenesisMismatch`]).
 pub use error::Error;
 pub use store::{
-    Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, MAX_RESUMABLE_DB_STATE_AGE, Store,
+    BEACON_PINNED_STATE_CAPACITY, Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError,
+    MAX_RESUMABLE_DB_STATE_AGE, Store,
 };

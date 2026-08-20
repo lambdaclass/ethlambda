@@ -43,7 +43,7 @@ use libssz_derive::{SszDecode as SszDecodeDerive, SszEncode as SszEncodeDerive};
 
 use crate::api::Table;
 use crate::store::{
-    BEACON_ANCHORS_KEPT, KEY_BEACON_ANCHORS, KEY_BEACON_FINALIZED,
+    BEACON_ANCHORS_KEPT, BEACON_PINNED_STATE_CAPACITY, KEY_BEACON_ANCHORS, KEY_BEACON_FINALIZED,
     KEY_BEACON_HIGHEST_IMPORTED_SLOT, KEY_BEACON_JUSTIFIED, KEY_BEACON_UNREALIZED_FINALIZED,
     KEY_BEACON_UNREALIZED_JUSTIFIED, KEY_TIME, Store, decode_state_value, encode_state_value,
 };
@@ -260,6 +260,42 @@ impl Store {
             .unwrap()
             .checkpoint_states
             .put((checkpoint.epoch, checkpoint.root), state);
+    }
+
+    /// The pinned post-state for `root`, if it is held.
+    ///
+    /// Checked by `block_state` after the recency cache and before the on-disk
+    /// snapshot, so a pin turns a whole-epoch replay into a lookup. See
+    /// [`BEACON_PINNED_STATE_CAPACITY`](crate::store::BEACON_PINNED_STATE_CAPACITY).
+    pub fn pinned_beacon_state(&self, root: Root) -> Option<Arc<BeaconState>> {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .pinned_states
+            .get(&root)
+            .cloned()
+    }
+
+    /// Pins `state` as `root`'s post-state, evicting the lowest-slot pin once
+    /// the capacity is exceeded.
+    ///
+    /// Eviction is by slot rather than by insertion order because what makes a
+    /// pin worth keeping is being *recent enough to still be reached*: the
+    /// roots asked for by distance are always the newest boundaries, and a pin
+    /// below finalization can never be asked for again. Takes `&self` for the
+    /// same reason [`Store::cache_beacon_state`] does.
+    pub fn pin_beacon_state(&self, root: Root, state: Arc<BeaconState>) {
+        let mut cache = self.beacon_cache.lock().unwrap();
+        cache.pinned_states.insert(root, state);
+        while cache.pinned_states.len() > BEACON_PINNED_STATE_CAPACITY {
+            let oldest = cache
+                .pinned_states
+                .iter()
+                .min_by_key(|(_, state)| state.slot())
+                .map(|(root, _)| *root)
+                .expect("a map over capacity is not empty");
+            cache.pinned_states.remove(&oldest);
+        }
     }
 
     /// The roots of the finalized anchor states held in `States`, oldest first.

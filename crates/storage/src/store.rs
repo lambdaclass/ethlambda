@@ -649,6 +649,9 @@ pub(crate) struct BeaconScratch {
 pub(crate) struct BeaconCaches {
     pub(crate) states: LruCache<BeaconRoot, Arc<BeaconState>>,
     pub(crate) checkpoint_states: LruCache<(u64, BeaconRoot), Arc<BeaconState>>,
+    /// Post-states of epoch-boundary blocks, held by *distance* rather than by
+    /// recency. See [`BEACON_PINNED_STATE_CAPACITY`].
+    pub(crate) pinned_states: HashMap<BeaconRoot, Arc<BeaconState>>,
 }
 
 /// Block post-states held resident. See [`BeaconCaches`].
@@ -669,6 +672,25 @@ const BEACON_CHECKPOINT_STATE_CACHE_CAPACITY: usize = 8;
 /// Finalized anchor snapshots kept in `States`. The second is the margin that
 /// lets a replay start below the newest one.
 pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
+/// Epoch-boundary post-states pinned in memory. See [`BeaconCaches`].
+///
+/// The block-state cache above is *recency*-ordered, so it reaches back about
+/// as far as its capacity in imported blocks. Three call sites instead ask for a
+/// root at a fixed *distance* behind the head: `promote_finalized_anchor` wants
+/// the finalized checkpoint's block state, 2-3 epochs back, and
+/// `checkpoint_state` and `on_attester_slashing` want the justified one. On
+/// mainnet that is 30-82 slots, so a recency cache can never hold it while also
+/// holding the head's working set, and every finalization advance replayed a
+/// whole epoch of blocks to rebuild a state the node had computed itself an
+/// epoch earlier. Measured cost: 95s of a 12s slot budget, once per epoch,
+/// on the actor thread.
+///
+/// Sizing it by recency instead would need `head - finalized` entries, 62-82 on
+/// mainnet at ~350 MB each. The set of roots actually reached by distance is
+/// this small and known in advance, which is why they are pinned rather than
+/// cached: three covers the finalized checkpoint, the justified one, and the
+/// boundary the current epoch is building on.
+pub const BEACON_PINNED_STATE_CAPACITY: usize = 3;
 
 impl BeaconCaches {
     pub(crate) fn new() -> Self {
@@ -680,6 +702,7 @@ impl BeaconCaches {
                 NonZeroUsize::new(BEACON_CHECKPOINT_STATE_CACHE_CAPACITY)
                     .expect("capacity is non-zero"),
             ),
+            pinned_states: HashMap::new(),
         }
     }
 }
