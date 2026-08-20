@@ -189,7 +189,6 @@ pub async fn spawn_discovery(
         DiscoveryConfig {
             discv4_enabled: false,
             discv5_enabled: true,
-            ..Default::default()
         },
     )
     .await
