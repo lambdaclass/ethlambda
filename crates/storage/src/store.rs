@@ -655,6 +655,9 @@ pub(crate) struct BeaconCaches {
     /// Block root -> the root of that block's post-state, for roots this node
     /// merkleized itself. See [`BEACON_STATE_ROOT_CACHE_CAPACITY`].
     pub(crate) state_roots: LruCache<BeaconRoot, BeaconRoot>,
+    /// Block root -> the `current_justified_checkpoint` of that block's
+    /// post-state. See [`BEACON_STATE_ROOT_CACHE_CAPACITY`], which sizes both.
+    pub(crate) block_justified: LruCache<BeaconRoot, BeaconCheckpoint>,
 }
 
 /// Block post-states held resident. See [`BeaconCaches`].
@@ -719,6 +722,9 @@ impl BeaconCaches {
             ),
             pinned_states: HashMap::new(),
             state_roots: LruCache::new(
+                NonZeroUsize::new(BEACON_STATE_ROOT_CACHE_CAPACITY).expect("capacity is non-zero"),
+            ),
+            block_justified: LruCache::new(
                 NonZeroUsize::new(BEACON_STATE_ROOT_CACHE_CAPACITY).expect("capacity is non-zero"),
             ),
         }

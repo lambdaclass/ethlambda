@@ -692,6 +692,14 @@ pub fn get_voting_source(
             .ok_or(Error::SpecAssert(
                 "block_root in store.unrealized_justifications",
             ))
+    } else if let Some(justified) = store.block_justified_checkpoint(block_root) {
+        // The one field this branch needs, remembered by `on_block` when it had
+        // the post-state in hand. Without it, a head computation materializes a
+        // whole state to read a single checkpoint, and for a current-epoch block
+        // far enough back to have left the recency cache that means replaying
+        // the epoch so far: measured at 26-29 blocks and 87-92s, once per epoch,
+        // which was the last thing keeping the follower's head off the tip.
+        Ok(justified)
     } else {
         let head_state = block_state(store, block_root, config)?;
         Ok(head_state.current_justified_checkpoint())
@@ -1951,6 +1959,9 @@ pub fn on_block(
     if let Some(post_state_root) = post_state_root {
         store.cache_beacon_state_root(block_root, post_state_root);
     }
+    // And the one field `get_voting_source` needs for a current-epoch block, so
+    // reading it later does not have to rebuild this state.
+    store.cache_block_justified_checkpoint(block_root, state.current_justified_checkpoint());
 
     // Add block timeliness to the store.
     let seconds_since_genesis = store
@@ -2384,6 +2395,39 @@ mod tests {
             _ => unreachable!("test_state::with_validators builds a phase0 state"),
         }
         Arc::new(state)
+    }
+
+    #[test]
+    fn a_remembered_justified_checkpoint_matches_deriving_it_from_the_state() {
+        // `get_voting_source` reads one field off a current-epoch block's
+        // post-state, and the memo answers from `on_block`'s copy of it instead.
+        // The two paths pick the head, so they have to agree exactly; a store
+        // with the memo absent is the pre-cache path, and one with it present is
+        // the fast path.
+        let config = Config::active();
+        let mut store = empty_store();
+        let block_root = Root::repeat_byte(7);
+        let state = crate::helpers::test_state::with_validators(4);
+        let expected = state.current_justified_checkpoint();
+
+        store.insert_beacon_block(block_root, &block(state.slot(), Root::zero()));
+        store.cache_beacon_state(block_root, Arc::new(state));
+        let index = store.beacon_block_index();
+
+        // Absent: derived from the state, which is what the branch did before.
+        assert!(store.block_justified_checkpoint(block_root).is_none());
+        let derived = get_voting_source(&store, &index, block_root, &config)
+            .expect("the state serves the read");
+
+        store.cache_block_justified_checkpoint(block_root, expected);
+        let remembered = get_voting_source(&store, &index, block_root, &config)
+            .expect("the memo serves the read");
+
+        assert_eq!(
+            derived, remembered,
+            "the memo must answer exactly what deriving from the state answers"
+        );
+        assert_eq!(remembered, expected);
     }
 
     #[test]

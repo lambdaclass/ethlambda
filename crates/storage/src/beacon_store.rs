@@ -262,6 +262,31 @@ impl Store {
             .put((checkpoint.epoch, checkpoint.root), state);
     }
 
+    /// The `current_justified_checkpoint` of `root`'s post-state, if it is
+    /// still remembered.
+    ///
+    /// `get_voting_source` needs exactly this one field for a block in the
+    /// current epoch, and materializing a whole ~350MB state to read it was
+    /// costing a 26-block replay per epoch on mainnet. A miss is not an error:
+    /// the caller falls back to the state, same as every other beacon cache.
+    pub fn block_justified_checkpoint(&self, root: Root) -> Option<Checkpoint> {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .block_justified
+            .get(&root)
+            .copied()
+    }
+
+    /// Remembers `checkpoint` as `root`'s post-state justified checkpoint.
+    pub fn cache_block_justified_checkpoint(&self, root: Root, checkpoint: Checkpoint) {
+        self.beacon_cache
+            .lock()
+            .unwrap()
+            .block_justified
+            .put(root, checkpoint);
+    }
+
     /// The root of `root`'s post-state, if this node computed it.
     ///
     /// Only ever holds roots the node merkleized itself, never one read off a
