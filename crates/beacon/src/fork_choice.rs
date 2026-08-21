@@ -1694,6 +1694,16 @@ pub fn block_state(store: &Store, root: Root, config: &Config) -> Result<Arc<Bea
             &stf::ExecutionEngine::valid(),
         )?;
 
+        // Harvest what this state cheaply answers before it is dropped. A
+        // replay computes every intermediate state and then keeps only the
+        // last, so the blocks it passed through stay unmemoized and the next
+        // lookup for any of them replays again from the same anchor. That is
+        // what kept `filter_block_tree` paying 24-79 block replays per epoch:
+        // it asks `get_voting_source` about every block in the unfinalized
+        // tree, and for a current-epoch block that reads one checkpoint off a
+        // state the recency cache no longer holds.
+        store.cache_block_justified_checkpoint(*block_root, state.current_justified_checkpoint());
+
         // Pin the boundary states this replay passes through, on the same rule
         // `on_block` uses: the last block of an epoch is that epoch's
         // checkpoint block. `on_block` can only pin boundaries the node
