@@ -224,6 +224,28 @@ impl Attestation {
             }
         }
     }
+
+    /// The attesters this attestation names, taking `state`'s word for the
+    /// committees and checking nothing else.
+    ///
+    /// Only sound for an attestation that has already been through
+    /// `process_block`, which is why [`on_block_attestation`] is its only
+    /// caller: `process_attestation` runs the same `get_indexed_attestation`
+    /// and the same `is_valid_indexed_attestation` the verifying sibling above
+    /// does, so for a block's own attestations that verdict is already in hand
+    /// and re-reaching it is the expensive part of the import.
+    pub fn attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
+        match self {
+            Attestation::Phase0(attestation) => {
+                let indexed = phase0_attestation::get_indexed_attestation(state, attestation)?;
+                Ok(indexed.attesting_indices.into_inner())
+            }
+            Attestation::Electra(attestation) => {
+                let indexed = electra_helpers::get_indexed_attestation(state, attestation)?;
+                Ok(indexed.attesting_indices.into_inner())
+            }
+        }
+    }
 }
 
 /// Evidence that a set of validators made two conflicting attestations, in
@@ -1835,12 +1857,19 @@ pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
 /// needs one. A pre-deneb block, or one with no blob commitments, never
 /// reads it; [`DataAvailability::NotRequired`] is the right value to pass in
 /// that case.
+///
+/// Returns the imported block's root, which the specification's version has
+/// no reason to: `signed_block` moved in, and a caller that goes on to feed
+/// the block's own attestations to fork choice needs to name the block it
+/// just imported to reach its post-state. Recomputing it outside would be a
+/// second `hash_tree_root` of the block for a value this function already
+/// has.
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBeaconBlock,
     config: &Config,
     blob_evidence: &DataAvailability,
-) -> Result<()> {
+) -> Result<Root> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
 
@@ -2013,7 +2042,9 @@ pub fn on_block(
     index.insert(block_root, (block_slot, parent_root));
     compute_pulled_up_tip(store, &index, block_root, config)?;
 
-    promote_finalized_anchor(store, config)
+    promote_finalized_anchor(store, config)?;
+
+    Ok(block_root)
 }
 
 /// Validates `attestation` and, if valid, records it as each attester's
@@ -2044,6 +2075,52 @@ pub fn on_attestation(
     };
 
     // Update latest messages for attesting indices.
+    update_latest_messages(store, &attesting_indices, data);
+
+    Ok(())
+}
+
+/// [`on_attestation`] for an attestation carried inside a block, given the
+/// post-state of the block that carried it.
+///
+/// Has the same effect on `store` as `on_attestation(store, attestation, true,
+/// config)`, and reaches it without materializing the target checkpoint's
+/// state. Two things make that equivalent rather than merely cheaper:
+///
+/// * The aggregate signature does not need checking again. `process_block`
+///   ran `process_attestation` over this exact attestation on the way to
+///   producing `block_state`, and that runs the same
+///   `is_valid_indexed_attestation` the verifying path here would. A block
+///   whose attestation failed it never became a block; one that is in the
+///   store carries a verdict this node reached itself.
+/// * `block_state` names the same committees the target checkpoint's state
+///   would. `get_beacon_committee` for a slot in epoch `E` reads the active
+///   validator set at `E` and the seed at `E`, and that seed is the randao mix
+///   from `E - MIN_SEED_LOOKAHEAD - 1`, fixed before `E` began. The target
+///   checkpoint is an ancestor of this block by
+///   [`validate_on_attestation`]'s own LMD/FFG consistency check, so both
+///   states share that history. It is the same equivalence `process_attestation`
+///   relies on when it validates a previous-epoch attestation against the
+///   current state.
+///
+/// What it buys: a target checkpoint's root is the last block at or before
+/// the boundary *on the attester's branch*, so an attester whose view lagged
+/// names a mid-epoch block. Once that block's post-state falls out of the
+/// recency cache, [`checkpoint_state`] rebuilds a ~350MB state by replaying
+/// every block since the last pinned boundary, and the attestation is not
+/// even the reason the import is happening. Observed on a mainnet follower:
+/// one import at 78.9s against a 3.6s steady state, on a 23-block replay for
+/// a target 16 blocks behind the head.
+pub fn on_block_attestation(
+    store: &mut Store,
+    attestation: &Attestation,
+    block_state: &BeaconState,
+    config: &Config,
+) -> Result<()> {
+    let data = attestation.data();
+    validate_on_attestation(store, data, true, config)?;
+
+    let attesting_indices = attestation.attesting_indices(block_state)?;
     update_latest_messages(store, &attesting_indices, data);
 
     Ok(())
@@ -2644,28 +2721,7 @@ mod tests {
     fn measures_the_warm_path_cost_of_on_attestation() {
         use std::time::Instant;
 
-        use blst::min_pk::SecretKey;
-
-        use crate::helpers::accessors::{get_beacon_committee, get_domain};
-        use crate::helpers::misc::compute_signing_root;
-        use crate::primitives::{BlsSignature, HashTreeRoot as _};
-
-        // Mirrors `bls::DST`, private to that module: the IETF ciphersuite
-        // domain separation tag every signature in this crate is checked
-        // against. Duplicated here rather than exported, since nothing else
-        // needs to sign a message outside of this benchmark.
-        const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
         const ITERATIONS: u32 = 50;
-
-        /// Regenerates the secret key behind `test_state::with_validators`'s
-        /// deterministic public key for `index`, from the identical KDF
-        /// input. That helper only ever returns public keys, and this
-        /// benchmark needs a real signature that verifies against one.
-        fn secret_key_for(index: u64) -> SecretKey {
-            let mut ikm = [0u8; 32];
-            ikm[..8].copy_from_slice(&(index + 1).to_le_bytes());
-            SecretKey::key_gen(&ikm, &[]).expect("32 bytes of ikm is enough for key generation")
-        }
 
         /// Builds a store and a genuinely-verifying gossip aggregate over
         /// `validator_count` validators, then times `on_attestation` against
@@ -2674,23 +2730,13 @@ mod tests {
             let config = Config::active();
             let genesis_root = Root::repeat_byte(1);
 
-            let mut store = empty_store();
-            let genesis_checkpoint = Checkpoint {
+            let mut store = store_for_attestation_at_genesis(genesis_root, &config);
+            let target = Checkpoint {
                 epoch: constants::GENESIS_EPOCH,
                 root: genesis_root,
             };
-            store.set_beacon_justified_checkpoint(genesis_checkpoint);
-            store.set_beacon_finalized_checkpoint(genesis_checkpoint);
-            store.insert_beacon_block(genesis_root, &block(0, Root::zero()));
-            // `validate_on_attestation` requires `get_current_slot(store) >=
-            // data.slot + 1`; one slot past genesis is the least that holds.
-            store.set_beacon_time(config.seconds_per_slot);
 
             let state = crate::helpers::test_state::with_validators(validator_count);
-            let committee =
-                get_beacon_committee(&state, 0, 0).expect("a committee exists at slot 0");
-
-            let target = genesis_checkpoint;
             let data = AttestationData {
                 slot: 0,
                 index: 0,
@@ -2698,27 +2744,7 @@ mod tests {
                 source: target,
                 target,
             };
-            let domain = get_domain(&state, constants::DOMAIN_BEACON_ATTESTER, Some(0));
-            let signing_root = compute_signing_root(data.hash_tree_root(), domain);
-
-            let mut bits = phase0::AggregationBits::with_length(committee.len())
-                .expect("committee is non-empty and within the bitlist bound");
-            let mut signatures = Vec::with_capacity(committee.len());
-            for (position, &validator_index) in committee.iter().enumerate() {
-                bits.set(position, true)
-                    .expect("position is within the bitlist's own length");
-                let signature =
-                    secret_key_for(validator_index).sign(signing_root.as_bytes(), DST, &[]);
-                signatures.push(BlsSignature(signature.to_bytes()));
-            }
-            let aggregate_signature =
-                crate::bls::aggregate(&signatures).expect("at least one signer");
-
-            let attestation = Attestation::Phase0(phase0::Attestation {
-                aggregation_bits: bits,
-                data,
-                signature: aggregate_signature,
-            });
+            let attestation = signed_aggregate(&state, data);
 
             // Pre-populates the cache `on_attestation` reads, so every timed
             // call takes the "already warm" branch: see this test's own doc
@@ -2773,7 +2799,7 @@ mod tests {
             println!(
                 "{label}: {validator_count} validators, {} in committee 0 -> {:?}/call \
                  ({ITERATIONS} calls, {elapsed:?} total)",
-                committee.len(),
+                indexed.attesting_indices.len(),
                 elapsed / ITERATIONS,
             );
         }
@@ -2970,5 +2996,159 @@ mod tests {
              {:?}/call",
             shared / committees_per_slot as u32
         );
+    }
+
+    /// Mirrors `bls::DST`, private to that module: see
+    /// `measures_the_warm_path_cost_of_on_attestation`, which needs the same
+    /// tag for the same reason.
+    const TEST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+    /// Regenerates the secret key behind `test_state::with_validators`'s
+    /// deterministic public key for `index`, from the identical KDF input.
+    /// That helper only ever returns public keys, and a test that needs an
+    /// attestation to actually verify needs the signing half.
+    fn secret_key_for(index: u64) -> blst::min_pk::SecretKey {
+        let mut ikm = [0u8; 32];
+        ikm[..8].copy_from_slice(&(index + 1).to_le_bytes());
+        blst::min_pk::SecretKey::key_gen(&ikm, &[])
+            .expect("32 bytes of ikm is enough for key generation")
+    }
+
+    /// A phase0 aggregate over the whole of committee 0 at slot 0, carrying a
+    /// real aggregate signature over `data` that verifies against `state`.
+    fn signed_aggregate(state: &BeaconState, data: AttestationData) -> Attestation {
+        use crate::helpers::accessors::{get_beacon_committee, get_domain};
+        use crate::helpers::misc::compute_signing_root;
+        use crate::primitives::{BlsSignature, HashTreeRoot as _};
+
+        let committee = get_beacon_committee(state, data.slot, data.index)
+            .expect("a committee exists at the requested slot and index");
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_BEACON_ATTESTER,
+            Some(data.target.epoch),
+        );
+        let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+
+        let mut bits = phase0::AggregationBits::with_length(committee.len())
+            .expect("committee is non-empty and within the bitlist bound");
+        let mut signatures = Vec::with_capacity(committee.len());
+        for (position, &validator_index) in committee.iter().enumerate() {
+            bits.set(position, true)
+                .expect("position is within the bitlist's own length");
+            let signature =
+                secret_key_for(validator_index).sign(signing_root.as_bytes(), TEST_DST, &[]);
+            signatures.push(BlsSignature(signature.to_bytes()));
+        }
+
+        Attestation::Phase0(phase0::Attestation {
+            aggregation_bits: bits,
+            data,
+            signature: crate::bls::aggregate(&signatures).expect("at least one signer"),
+        })
+    }
+
+    /// A store that satisfies every `validate_on_attestation` check for an
+    /// attestation at slot 0 whose target and LMD vote are both `root`.
+    fn store_for_attestation_at_genesis(root: Root, config: &Config) -> Store {
+        let mut store = empty_store();
+        let checkpoint = Checkpoint {
+            epoch: constants::GENESIS_EPOCH,
+            root,
+        };
+        store.set_beacon_justified_checkpoint(checkpoint);
+        store.set_beacon_finalized_checkpoint(checkpoint);
+        store.insert_beacon_block(root, &block(0, Root::zero()));
+        // `validate_on_attestation` requires `get_current_slot(store) >=
+        // data.slot + 1`; one slot past genesis is the least that holds.
+        store.set_beacon_time(config.seconds_per_slot);
+        store
+    }
+
+    /// Every latest message the store holds, for comparing what two paths
+    /// recorded rather than only that both returned `Ok`.
+    fn latest_messages(store: &Store) -> Vec<(u64, LatestMessage)> {
+        let mut collected = Vec::new();
+        store.for_each_non_equivocating_latest_message(|index, message| {
+            collected.push((index, message));
+        });
+        collected.sort_by_key(|(index, _)| *index);
+        collected
+    }
+
+    /// `on_block_attestation` is only worth having if it leaves the store in
+    /// the state the verifying path would have: it skips a BLS verification
+    /// and a `checkpoint_state` derivation, and neither of those is supposed
+    /// to change *which* attesters get recorded or what they are recorded as.
+    #[test]
+    fn a_block_attestation_records_what_the_verifying_path_records() {
+        let config = Config::active();
+        let genesis_root = Root::repeat_byte(1);
+        let state = crate::helpers::test_state::with_validators(64);
+        let target = Checkpoint {
+            epoch: constants::GENESIS_EPOCH,
+            root: genesis_root,
+        };
+        let attestation = signed_aggregate(
+            &state,
+            AttestationData {
+                slot: 0,
+                index: 0,
+                beacon_block_root: genesis_root,
+                source: target,
+                target,
+            },
+        );
+
+        let mut verifying = store_for_attestation_at_genesis(genesis_root, &config);
+        verifying.cache_checkpoint_state(target, Arc::new(state.clone()));
+        on_attestation(&mut verifying, &attestation, true, &config)
+            .expect("the constructed attestation verifies against the target state");
+
+        let mut fast = store_for_attestation_at_genesis(genesis_root, &config);
+        on_block_attestation(&mut fast, &attestation, &state, &config)
+            .expect("the block state names the same committee");
+
+        assert!(!latest_messages(&fast).is_empty(), "nothing was recorded");
+        assert_eq!(latest_messages(&fast), latest_messages(&verifying));
+    }
+
+    /// The point of the fast path: it never asks for the target checkpoint's
+    /// state, so a target whose post-state this store cannot reach without a
+    /// replay costs nothing. Here that state is not merely evicted but
+    /// unreachable, which turns the difference between the two paths into an
+    /// `Err` rather than a slow `Ok` a test cannot time reliably.
+    #[test]
+    fn a_block_attestation_does_not_need_the_target_checkpoint_state() {
+        let config = Config::active();
+        let genesis_root = Root::repeat_byte(1);
+        let state = crate::helpers::test_state::with_validators(64);
+        let target = Checkpoint {
+            epoch: constants::GENESIS_EPOCH,
+            root: genesis_root,
+        };
+        let attestation = signed_aggregate(
+            &state,
+            AttestationData {
+                slot: 0,
+                index: 0,
+                beacon_block_root: genesis_root,
+                source: target,
+                target,
+            },
+        );
+
+        // No `cache_checkpoint_state`, and the target block's parent is not in
+        // the store either, so `block_state` has nothing to replay from.
+        let mut store = store_for_attestation_at_genesis(genesis_root, &config);
+        assert!(
+            on_attestation(&mut store, &attestation, true, &config).is_err(),
+            "the verifying path is supposed to need the state this store lacks"
+        );
+
+        let mut store = store_for_attestation_at_genesis(genesis_root, &config);
+        on_block_attestation(&mut store, &attestation, &state, &config)
+            .expect("the fast path reads no state out of the store");
+        assert!(!latest_messages(&store).is_empty());
     }
 }

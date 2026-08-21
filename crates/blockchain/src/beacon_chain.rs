@@ -54,7 +54,7 @@ use ethlambda_beacon::fork_choice::{
 };
 use ethlambda_beacon::primitives::{Root, Slot};
 use ethlambda_storage::Store;
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// Bound on how far [`reorg_depth`] walks back before giving up.
 ///
@@ -83,7 +83,20 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, config: &Config) {
 pub fn on_block(store: &mut Store, block: SignedBeaconBlock, config: &Config) -> Result<()> {
     let (attestations, slashings) = block_operations(&block);
     let slot = block.slot();
-    fork_choice::on_block(store, block, config, &DataAvailability::NotRequired)?;
+    let block_root = fork_choice::on_block(store, block, config, &DataAvailability::NotRequired)?;
+    // The committee source for this block's own attestations, rather than each
+    // one's target checkpoint state: see `fork_choice::on_block_attestation`
+    // for why the two name the same committees, and for what asking the
+    // checkpoint instead costs. A cache hit, since the import above stored this
+    // state under `block_root` a moment ago, and `Option` rather than `?` for
+    // the same reason the loop below swallows its own errors: the block is in
+    // the store whatever this returns, so a miss skips the body rather than
+    // reporting the import as failed.
+    let block_state = fork_choice::block_state(store, block_root, config)
+        .inspect_err(|err| {
+            warn!(%slot, ?err, "Skipping a block's attestations: its own post-state is unreachable")
+        })
+        .ok();
 
     // The block is imported by the line above; what follows is fork choice
     // learning from its body, and a body item this store cannot evaluate is not
@@ -102,10 +115,13 @@ pub fn on_block(store: &mut Store, block: SignedBeaconBlock, config: &Config) ->
     // Returning `Err` here also cost more than a log line: the caller reads it
     // as "this block did not import" and stops the cascade, leaving every held
     // descendant held behind a block that is in fact in the store.
-    for attestation in &attestations {
-        let _ = fork_choice::on_attestation(store, attestation, true, config).inspect_err(
-            |err| trace!(%slot, ?err, "Ignoring an unusable attestation from a block"),
-        );
+    if let Some(block_state) = block_state {
+        for attestation in &attestations {
+            let _ = fork_choice::on_block_attestation(store, attestation, &block_state, config)
+                .inspect_err(
+                    |err| trace!(%slot, ?err, "Ignoring an unusable attestation from a block"),
+                );
+        }
     }
     for slashing in &slashings {
         let _ = fork_choice::on_attester_slashing(store, slashing, config)

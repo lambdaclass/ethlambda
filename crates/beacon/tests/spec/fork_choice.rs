@@ -564,7 +564,7 @@ fn apply_block(
         fork_choice::on_block(store, signed_block, config, &blob_evidence),
         expect_valid,
     ) {
-        (Ok(()), false) => {
+        (Ok(_), false) => {
             return Err(format!(
                 "{name} was accepted, but the step expects it to be rejected"
             ));
@@ -573,7 +573,7 @@ fn apply_block(
         // Correctly rejected: the handler's contract leaves `store` untouched,
         // so there is nothing from this block left to replay.
         (Err(_), false) => return Ok(()),
-        (Ok(()), true) => {}
+        (Ok(_), true) => {}
     }
 
     for attestation in &attestations {
