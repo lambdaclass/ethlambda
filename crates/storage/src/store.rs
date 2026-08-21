@@ -694,9 +694,19 @@ pub(crate) const BEACON_ANCHORS_KEPT: usize = 2;
 /// Sizing it by recency instead would need `head - finalized` entries, 62-82 on
 /// mainnet at ~350 MB each. The set of roots actually reached by distance is
 /// this small and known in advance, which is why they are pinned rather than
-/// cached: three covers the finalized checkpoint, the justified one, and the
-/// boundary the current epoch is building on.
-pub const BEACON_PINNED_STATE_CAPACITY: usize = 3;
+/// cached.
+///
+/// Eight, not three. Three covers the finalized checkpoint, the justified one
+/// and the boundary the current epoch is building on, which is what the roots
+/// reached *by name* need. It is not what the roots reached by
+/// `checkpoint_state` need: a checkpoint's root is the last block at or before
+/// its boundary slot, so when slots are missed before a boundary that root is a
+/// mid-epoch block, and the block-borne attestations of a single import can name
+/// several such checkpoints across two epochs. At three, each of those evicted
+/// the boundary the next one wanted, and the live follower paid a 26-block
+/// replay per epoch for it. Eight states is ~2.8GB worst case against a measured
+/// ~10GB resident, which is the trade this makes deliberately.
+pub const BEACON_PINNED_STATE_CAPACITY: usize = 8;
 /// Post-state roots remembered, keyed by block root. See [`BeaconCaches`].
 ///
 /// Merkleizing a mainnet state costs ~1.4s and an import pays for two of them:

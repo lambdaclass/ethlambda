@@ -1744,7 +1744,14 @@ pub fn checkpoint_state(
     // `process_slots` advances this copy toward the checkpoint's epoch boundary
     // in place, and the block's own post-state must be left as the block
     // produced it.
-    let mut base_state = (*block_state(store, checkpoint.root, config)?).clone();
+    let base = block_state(store, checkpoint.root, config)?;
+    // A checkpoint's root is the last block at or before its boundary, which is
+    // a mid-epoch block whenever slots were missed. Reaching it may have just
+    // cost a replay, and the attestations of one import name several
+    // checkpoints, so pin what that replay produced rather than letting the
+    // next one rebuild it.
+    store.pin_beacon_state(checkpoint.root, Arc::clone(&base));
+    let mut base_state = (*base).clone();
     let target_slot = compute_start_slot_at_epoch(checkpoint.epoch);
     if base_state.slot() < target_slot {
         stf::process_slots(&mut base_state, target_slot, config)?;
