@@ -8,7 +8,7 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
-use tracing::{error, warn};
+use tracing::{debug, error};
 
 use crate::{Behaviour, BehaviourEvent, metrics, req_resp::Request, req_resp::Response};
 
@@ -44,14 +44,14 @@ impl SwarmHandle {
         let _ = self
             .cmd_tx
             .send(SwarmCommand::Publish { topic, data })
-            .inspect_err(|_| warn!("Swarm adapter closed, cannot publish"));
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot publish"));
     }
 
     pub fn dial(&self, addr: Multiaddr) {
         let _ = self
             .cmd_tx
             .send(SwarmCommand::Dial(addr))
-            .inspect_err(|_| warn!("Swarm adapter closed, cannot dial"));
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot dial"));
     }
 
     /// Send a request and return the assigned OutboundRequestId.
@@ -73,7 +73,7 @@ impl SwarmHandle {
             })
             .is_err()
         {
-            warn!("Swarm adapter closed, cannot send request");
+            debug!("Swarm adapter closed, cannot send request");
             return None;
         }
         rx.await.ok()
@@ -87,7 +87,7 @@ impl SwarmHandle {
         let _ = self
             .cmd_tx
             .send(SwarmCommand::SendResponse { channel, response })
-            .inspect_err(|_| warn!("Swarm adapter closed, cannot send response"));
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot send response"));
     }
 }
 
@@ -144,13 +144,13 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .behaviour_mut()
                 .gossipsub
                 .publish(topic, data)
-                .inspect_err(|err| warn!(%err, "Swarm adapter: publish failed"))
+                .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
                 .ok();
         }
         SwarmCommand::Dial(addr) => {
             let _ = swarm
                 .dial(addr)
-                .inspect_err(|err| warn!(%err, "Swarm adapter: dial failed"));
+                .inspect_err(|err| debug!(%err, "Swarm adapter: dial failed"));
         }
         SwarmCommand::SendRequest {
             peer,
@@ -171,7 +171,7 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .behaviour_mut()
                 .req_resp
                 .send_response(channel, response)
-                .inspect_err(|err| warn!(?err, "Swarm adapter: send_response failed"));
+                .inspect_err(|err| debug!(?err, "Swarm adapter: send_response failed"));
         }
     }
 }

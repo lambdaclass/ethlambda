@@ -31,7 +31,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
     let topic_kind = message.topic.as_str().split("/").nth(3);
     match topic_kind {
         Some(BLOCK_TOPIC_KIND) => {
-            info!(kind = "block", peer_count, "P2P message received");
+            trace!(kind = "block", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped block"))
@@ -65,7 +65,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(AGGREGATION_TOPIC_KIND) => {
-            info!(kind = "aggregation", peer_count, "P2P message received");
+            trace!(kind = "aggregation", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped aggregation"))
@@ -97,7 +97,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             }
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
-            info!(kind = "attestation", peer_count, "P2P message received");
+            trace!(kind = "attestation", peer_count, "P2P message received");
             let compressed_len = message.data.len();
             let Ok(uncompressed_data) = decompress_message(&message.data)
                 .inspect_err(|err| error!(%err, "Failed to decompress gossipped attestation"))
@@ -113,7 +113,7 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
             };
             let slot = signed_attestation.data.slot;
             let validator = signed_attestation.validator_id;
-            info!(
+            trace!(
                 %slot,
                 validator,
                 head_root = %ShortRoot(&signed_attestation.data.head.root.0),
@@ -156,7 +156,7 @@ pub async fn publish_attestation(server: &mut P2PServer, attestation: SignedAtte
         .unwrap_or_else(|| attestation_subnet_topic(subnet_id));
 
     server.swarm_handle.publish(topic, compressed);
-    info!(
+    trace!(
         %slot,
         validator,
         subnet_id,

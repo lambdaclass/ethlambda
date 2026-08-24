@@ -66,6 +66,44 @@ const ASCII_ART: &str = r#"
  \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
 "#;
 
+/// `libp2p_gossipsub::behaviour` is the target of `WARN Send Queue full. Could
+/// not send Rpc.`, emitted once per dropped gossipsub RPC on a full per-peer
+/// send queue. Measured at 100k-170k lines/hour/node on devnet-5 -- the single
+/// largest contributor to overall log volume, and not ours to downgrade at the
+/// source (it's the vendored LambdaClass libp2p fork, not our code).
+///
+/// This is our own default RUST_LOG, applied only when the operator hasn't set
+/// one: everything stays at the usual INFO default, except this one target,
+/// which drops to ERROR-and-below. That silences the noisy WARN (along with
+/// the module's other per-peer/per-message WARNs -- gossipsub's own logging
+/// isn't fine-grained enough to single one line out) while leaving its ERROR
+/// diagnostics (e.g. peer/mesh bookkeeping invariant violations) visible.
+///
+/// It stays reachable: `RUST_LOG=info,libp2p_gossipsub::behaviour=debug` (or
+/// any RUST_LOG that raises this target back to warn/debug) turns it back on,
+/// since any operator-supplied RUST_LOG bypasses this default entirely -- see
+/// `build_env_filter`.
+const DEFAULT_RUST_LOG: &str = "info,libp2p_gossipsub::behaviour=error";
+
+/// Builds the global tracing filter.
+///
+/// An operator-supplied `RUST_LOG` is honored exactly as given, matching the
+/// standard `EnvFilter` contract where any directive string replaces the whole
+/// filter rather than layering onto it. Only when `RUST_LOG` is unset (or
+/// empty) do we substitute our own default (see [`DEFAULT_RUST_LOG`]) instead
+/// of the crate-wide `INFO` default `EnvFilter` would otherwise fall back to.
+fn build_env_filter() -> EnvFilter {
+    let rust_log = std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    let directives = if rust_log.trim().is_empty() {
+        DEFAULT_RUST_LOG
+    } else {
+        rust_log.as_str()
+    };
+    EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .parse_lossy(directives)
+}
+
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
 // parallelism. Use a single-threaded runtime under Shadow. This is an
@@ -73,9 +111,7 @@ const ASCII_ART: &str = r#"
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn main() -> eyre::Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
+    let filter = build_env_filter();
     let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")?;

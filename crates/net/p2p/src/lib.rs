@@ -33,7 +33,7 @@ use spawned_concurrency::protocol;
 use spawned_concurrency::tasks::{
     Actor, ActorRef, ActorStart, Context, Handler, send_after, spawn_listener,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     gossipsub::{
@@ -466,7 +466,7 @@ impl P2PServer {
             return;
         }
 
-        info!(%root, "Retrying block fetch after backoff");
+        trace!(%root, "Retrying block fetch after backoff");
 
         if !fetch_block_from_peer(self, root).await {
             tracing::error!(%root, "Failed to retry block fetch, giving up");
@@ -661,7 +661,7 @@ async fn handle_swarm_event(
                 "outbound",
                 result,
             );
-            warn!(?peer_id, %error, "Outgoing connection error");
+            debug!(?peer_id, %error, "Outgoing connection error");
 
             // Schedule redial if this was a bootnode
             if let Some(pid) = peer_id
@@ -682,7 +682,7 @@ async fn handle_swarm_event(
                 "inbound",
                 "error",
             );
-            warn!(%error, "Incoming connection error");
+            debug!(%error, "Incoming connection error");
         }
         _ => {
             trace!(?event, "Ignored swarm event");

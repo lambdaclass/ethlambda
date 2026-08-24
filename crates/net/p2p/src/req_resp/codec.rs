@@ -2,7 +2,7 @@ use std::io;
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libssz::{SszDecode, SszEncode};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::{
     encoding::{MAX_PAYLOAD_SIZE, decode_payload, write_payload},
@@ -151,7 +151,7 @@ impl libp2p::request_response::Codec for Codec {
                         for block in blocks {
                             let encoded = block.to_ssz();
                             if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
-                                warn!(
+                                debug!(
                                     size = encoded.len(),
                                     "Skipping oversized block in block response"
                                 );
