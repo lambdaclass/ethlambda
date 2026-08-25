@@ -242,6 +242,24 @@ pub fn build_swarm(
         .max_messages_per_rpc(Some(500))
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000)
+        // Flood publish (default: true) fans our own publishes out to every
+        // connected peer instead of just the mesh. The gossipsub v1.1 spec
+        // defines it as score-gated ("all connected peers with a score above a
+        // publish threshold"), but we never configure peer scoring, and
+        // `PeerScoreState::Disabled` makes that gate pass every peer, so we run
+        // the ungated form. Neither leanSpec nor the Ethereum consensus-specs
+        // p2p interface mentions the parameter; lighthouse and ream both set it
+        // false.
+        //
+        // Effect is confined to topics with more than `mesh_n` subscribed
+        // peers, since below that the mesh-bounded path selects everyone
+        // anyway. On devnet-5 that means `block` and `aggregation`, which all
+        // 32 nodes subscribe to: publish fanout drops from 31 peers to 8. The
+        // `attestation_N` topics are UNAFFECTED, because only the 4 nodes
+        // sharing a subnet subscribe to it (3 peers, under `mesh_n`). So this
+        // targets egress bytes, aggregates being 220 KiB apiece, not the
+        // per-peer send-queue entry count, which is dominated by attestations.
+        .flood_publish(false)
         .build()
         .expect("invalid gossipsub config");
 
