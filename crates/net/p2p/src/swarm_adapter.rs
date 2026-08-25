@@ -167,9 +167,6 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
             }
         }
         SwarmCommand::SendResponse { channel, response } => {
-            // On failure libp2p hands the whole undelivered response back as the
-            // error value, so this is the response itself, not a diagnostic.
-            // Log it via `Display` (a bounded summary), never `Debug`.
             let _ = swarm
                 .behaviour_mut()
                 .req_resp
