@@ -86,23 +86,37 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
         discovery.candidates.extend(admitted);
     }
 
+    let mut next = None;
     while let Some(candidate) = discovery.candidates.pop_front() {
         if candidate.peer_id == discovery.local_peer_id
             || server.connected_peers.contains(&candidate.peer_id)
         {
             continue;
         }
-        info!(
-            peer_id = %candidate.peer_id,
-            subnets = ?candidate.subnets,
-            "Dialing discovered peer"
-        );
+        next = Some(candidate);
+        break;
+    }
+    let Some(candidate) = next else {
+        return;
+    };
+
+    info!(
+        peer_id = %candidate.peer_id,
+        subnets = ?candidate.subnets,
+        "Dialing discovered peer"
+    );
+    // Record the peer only once the swarm has taken the dial. A dial it rejects
+    // synchronously — already connected, already dialing, no addresses, denied —
+    // raises no `OutgoingConnectionError`, so `forget_discovered_peer` would
+    // never run and the entry would outlive the process's interest in it.
+    if !server.swarm_handle.dial_accepted(candidate.addr).await {
+        return;
+    }
+    metrics::inc_discovered_peers_dialed();
+    if let Some(discovery) = server.discovery.as_mut() {
         discovery
             .peer_attnets
             .insert(candidate.peer_id, candidate.subnets);
-        metrics::inc_discovered_peers_dialed();
-        server.swarm_handle.dial(candidate.addr);
-        break;
     }
 }
 
