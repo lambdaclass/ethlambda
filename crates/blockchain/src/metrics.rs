@@ -1099,26 +1099,6 @@ pub fn set_attestation_aggregate_coverage_diff_validators(direction: &str, value
         .set(value);
 }
 
-/// Read back `lean_attestation_aggregate_coverage_validators{section, subnet}`.
-///
-/// Test-only: lets `coverage.rs` unit tests assert on the gauge a call
-/// actually set, rather than trusting it was called.
-#[cfg(test)]
-pub(crate) fn get_attestation_aggregate_coverage_validators(section: &str, subnet: &str) -> i64 {
-    LEAN_ATTESTATION_AGGREGATE_COVERAGE_VALIDATORS
-        .with_label_values(&[section, subnet])
-        .get()
-}
-
-/// Read back `lean_attestation_aggregate_coverage_diff_validators{direction}`. Test-only, see
-/// [`get_attestation_aggregate_coverage_validators`].
-#[cfg(test)]
-pub(crate) fn get_attestation_aggregate_coverage_diff_validators(direction: &str) -> i64 {
-    LEAN_ATTESTATION_AGGREGATE_COVERAGE_DIFF_VALIDATORS
-        .with_label_values(&[direction])
-        .get()
-}
-
 /// Observe the depth of a fork choice reorg.
 pub fn observe_fork_choice_reorg_depth(depth: u64) {
     LEAN_FORK_CHOICE_REORG_DEPTH.observe(depth as f64);
