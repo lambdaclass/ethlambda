@@ -167,11 +167,14 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
             }
         }
         SwarmCommand::SendResponse { channel, response } => {
+            // On failure libp2p hands the whole undelivered response back as the
+            // error value, so this is the response itself, not a diagnostic.
+            // Log it via `Display` (a bounded summary), never `Debug`.
             let _ = swarm
                 .behaviour_mut()
                 .req_resp
                 .send_response(channel, response)
-                .inspect_err(|err| debug!(?err, "Swarm adapter: send_response failed"));
+                .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
         }
     }
 }
