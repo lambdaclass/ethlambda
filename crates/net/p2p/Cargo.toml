@@ -35,14 +35,13 @@ rand = "0.8"
 
 # Required for NodeEnr parsing.
 #
-# Pinned to an ethrex `main` commit, for the unified discovery module, the peer
-# table, and the `PeerFilter` seam this crate builds on. ethrex publishes no
-# release we can name, so `rev` rather than `branch`: a `main` that moves under
-# us would change what this crate builds against with nothing in the manifest
-# saying so.
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "275da9269765af83abe49f29ad96eb641ec49b55" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "275da9269765af83abe49f29ad96eb641ec49b55" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "275da9269765af83abe49f29ad96eb641ec49b55" }
+# Pinned to an ethrex release tag, for the unified discovery module, the peer
+# table, and the `PeerFilter` seam this crate builds on. A tag rather than a
+# branch: a `main` that moves under us would change what this crate builds
+# against with nothing in the manifest saying so.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
 
 # Version pinned to ethrex's workspace: `SecretKey` crosses the API boundary.
 secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context"] }
