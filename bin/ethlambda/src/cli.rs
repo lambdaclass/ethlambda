@@ -24,7 +24,11 @@ pub(crate) struct CliOptions {
     /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
     #[arg(long)]
     pub(crate) hash_sig_keys_dir: PathBuf,
-    #[arg(long, default_value = "9000")]
+    /// UDP port for the libp2p QUIC listener.
+    ///
+    /// Defaults one above `--discovery.port` so that `--discovery.enable` works
+    /// on its own: both are UDP sockets and cannot share a port.
+    #[arg(long, default_value = "9001")]
     pub(crate) gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) http_address: IpAddr,
@@ -129,14 +133,15 @@ pub(crate) struct CliOptions {
 pub(crate) struct DiscoveryConfig {
     /// Enable discv5 peer discovery.
     ///
-    /// Requires `--discovery.port` to differ from `--gossipsub-port`: both are
-    /// UDP sockets and they cannot share one port.
+    /// Works with the default ports. If either is overridden, `--discovery.port`
+    /// must still differ from `--gossipsub-port`: both are UDP sockets and they
+    /// cannot share one port.
     #[arg(long = "discovery.enable", default_value = "false")]
     pub(crate) enable: bool,
     /// UDP port for the discv5 socket.
     ///
-    /// Independent of `--gossipsub-port`, which carries libp2p QUIC. Both
-    /// default to 9000, so enabling discovery means changing one of them.
+    /// Independent of `--gossipsub-port`, which carries libp2p QUIC and
+    /// defaults one port above this one.
     #[arg(long = "discovery.port", default_value = "9000")]
     pub(crate) port: u16,
     /// IP address to advertise in the ENR.
@@ -210,4 +215,53 @@ pub(crate) struct ShadowOptions {
         value_parser = clap::value_parser!(u64).range(1..=524_288)
     )]
     pub(crate) shadow_xmss_fake_proof_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    /// The required flags, so a test can vary only what it cares about.
+    fn parse(extra: &[&str]) -> CliOptions {
+        let mut argv = vec![
+            "ethlambda",
+            "--genesis",
+            "config.yaml",
+            "--validators",
+            "validators.yaml",
+            "--bootnodes",
+            "nodes.yaml",
+            "--validator-config",
+            "validator-config.yaml",
+            "--hash-sig-keys-dir",
+            "keys",
+            "--node-key",
+            "node.key",
+            "--node-id",
+            "ethlambda_0",
+        ];
+        argv.extend_from_slice(extra);
+        CliOptions::parse_from(argv)
+    }
+
+    /// `--discovery.enable` on its own has to work: a default that is never
+    /// valid makes the flag a guaranteed startup failure.
+    #[test]
+    fn default_ports_let_discovery_be_enabled_alone() {
+        let options = parse(&["--discovery.enable"]);
+
+        assert_ne!(options.discovery.port, options.gossipsub_port);
+        assert!(options.validate_discovery().is_ok());
+    }
+
+    #[test]
+    fn colliding_ports_are_rejected_only_when_discovery_is_enabled() {
+        let ports = ["--gossipsub-port", "9000", "--discovery.port", "9000"];
+        let mut enabled = ports.to_vec();
+        enabled.push("--discovery.enable");
+
+        assert!(parse(&ports).validate_discovery().is_ok());
+        assert!(parse(&enabled).validate_discovery().is_err());
+    }
 }

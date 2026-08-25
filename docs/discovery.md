@@ -13,10 +13,7 @@ only finds other ethlambda nodes.
 ## Enabling it
 
 ```bash
-ethlambda \
-  --gossipsub-port 9000 \    # libp2p QUIC (UDP)
-  --discovery.enable \
-  --discovery.port 9010      # discv5 (UDP)
+ethlambda --discovery.enable
 ```
 
 | Flag | Default | Meaning |
@@ -26,9 +23,9 @@ ethlambda \
 | `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
 | `--discovery.target-peers` | `200` | Connected-peer count above which dialing stops |
 
-Both `--discovery.port` and `--gossipsub-port` default to 9000 and both bind
-UDP, so they cannot share a port. Enabling discovery without changing one of
-them is rejected at startup.
+`--discovery.port` and `--gossipsub-port` (default `9001`, libp2p QUIC) are both
+UDP and so cannot share a port. The defaults are one apart, so `--discovery.enable`
+works on its own; overriding either onto the other is rejected at startup.
 
 The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the

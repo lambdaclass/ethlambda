@@ -75,8 +75,8 @@ COPY --from=builder /app/ethlambda /usr/local/bin
 # Copy licenses
 COPY LICENSE ./
 
-# 9000/tcp, 9000/udp - P2P networking
-# 9001/udp - QUIC connections
+# 9000/tcp, 9000/udp - P2P networking (discv5 when --discovery.enable)
+# 9001/udp - libp2p QUIC connections
 # 5052 - API RPC
 # 5054 - Prometheus metrics
 EXPOSE 9000/tcp 9000/udp 9001/udp 5052 5054
