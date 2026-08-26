@@ -9,41 +9,84 @@
 //! same arguments it saw before this module existed. Its error messages, exit
 //! codes and `--version` output are therefore unchanged by construction rather
 //! than by test; only `--help` differs, by the [`HELP_NOTE`] it appends.
+//!
+//! `benchmark` parses through [`BenchmarkCommand`] instead, so the harness
+//! arguments stay out of `CliOptions` entirely: nothing the benchmark needs can
+//! reshape the parser the node depends on.
 
 use std::ffi::OsString;
 
 use clap::Parser;
 
+use crate::benchmark::BenchmarkOptions;
 use crate::cli::CliOptions;
 
-/// The sub-command token accepted in first position.
+/// The sub-command tokens accepted in first position.
 ///
 /// `CliOptions` declares no positional arguments, so the first token after the
-/// program name is either a flag or this sub-command: a flag *value* never
-/// lands there and is never mistaken for it.
+/// program name is either a flag or one of these: a flag *value* never lands
+/// there and is never mistaken for a sub-command.
 const NODE: &str = "node";
+const BENCHMARK: &str = "benchmark";
 
-/// Appended to `--help` by `CliOptions`. The token never reaches clap, so
-/// without this the sub-command would be undiscoverable from the help output.
-pub(crate) const HELP_NOTE: &str = "Sub-commands:\n  node  \
-                                    Run the consensus node (assumed when omitted)";
+/// Appended to `--help` by `CliOptions`. The tokens never reach clap, so
+/// without this the sub-commands would be undiscoverable from the help output.
+pub(crate) const HELP_NOTE: &str = "Sub-commands:\n  \
+     node       Run the consensus node (assumed when omitted)\n  \
+     benchmark  Benchmark block building offline \
+                (see `ethlambda benchmark --help`)";
+
+/// What the command line asked the binary to do.
+///
+/// `Node` is ~312 bytes against `Benchmark`'s ~80, but exactly one of these is
+/// built per process and consumed immediately by `main`, so boxing would buy an
+/// allocation and nothing else.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Invocation {
+    /// Run the consensus node.
+    Node(CliOptions),
+    /// Run the offline block-building benchmark.
+    Benchmark(BenchmarkOptions),
+}
+
+/// The `benchmark` sub-command, parsed on its own so that its arguments never
+/// enter `CliOptions`.
+#[derive(Debug, clap::Parser)]
+#[command(about = "Benchmark block building offline against a controlled workload")]
+struct BenchmarkCommand {
+    #[command(flatten)]
+    options: BenchmarkOptions,
+}
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
 /// `--help` or `--version`.
-pub(crate) fn parse() -> CliOptions {
+pub(crate) fn parse() -> Invocation {
     try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
 }
 
-fn try_parse_from<I>(args: I) -> Result<CliOptions, clap::Error>
+fn try_parse_from<I>(args: I) -> Result<Invocation, clap::Error>
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
 {
     let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    if args.get(1).is_some_and(|arg| arg == NODE) {
-        args.remove(1);
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some(NODE) => {
+            args.remove(1);
+            CliOptions::try_parse_from(args).map(Invocation::Node)
+        }
+        Some(BENCHMARK) => {
+            // clap renders usage from argv[0], so the two tokens collapse into
+            // one program name and its usage lines read `ethlambda benchmark
+            // <COMMAND>` rather than dropping the sub-command they belong to.
+            args.drain(..2);
+            let argv = std::iter::once(OsString::from("ethlambda benchmark")).chain(args);
+            BenchmarkCommand::try_parse_from(argv).map(|cmd| Invocation::Benchmark(cmd.options))
+        }
+        // No sub-command named: the flat node form, byte for byte as before.
+        _ => CliOptions::try_parse_from(args).map(Invocation::Node),
     }
-    CliOptions::try_parse_from(args)
 }
 
 #[cfg(test)]
@@ -85,7 +128,12 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> CliOptions {
-        try_parse_from(args.iter().map(OsString::from)).expect("invocation parses")
+        let invocation =
+            try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        match invocation {
+            Invocation::Node(options) => options,
+            other => panic!("expected a node invocation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -185,9 +233,53 @@ mod tests {
     }
 
     #[test]
-    fn help_documents_the_node_sub_command() {
+    fn help_documents_the_sub_commands() {
         let err = try_parse_from(["ethlambda", "--help"].iter().map(OsString::from))
             .expect_err("--help short-circuits parsing");
-        assert!(err.to_string().contains(NODE), "{err}");
+        let help = err.to_string();
+        assert!(help.contains(NODE), "{help}");
+        assert!(help.contains(BENCHMARK), "{help}");
+    }
+
+    #[test]
+    fn benchmark_parses_without_any_node_argument() {
+        // The point of parsing the harness separately: none of --genesis,
+        // --validators, --node-key … is required, or even accepted, here.
+        let args = ["ethlambda", BENCHMARK, "synthetic", "--num-validators", "4"];
+        let invocation = try_parse_from(args.iter().map(OsString::from)).expect("benchmark parses");
+        let Invocation::Benchmark(options) = invocation else {
+            panic!("expected a benchmark invocation, got {invocation:?}");
+        };
+        assert!(
+            format!("{options:?}").contains("num_validators: 4"),
+            "{options:?}"
+        );
+    }
+
+    #[test]
+    fn benchmark_rejects_node_arguments() {
+        let args = [
+            "ethlambda",
+            BENCHMARK,
+            "synthetic",
+            "--genesis",
+            "config.yaml",
+        ];
+        let err = try_parse_from(args.iter().map(OsString::from))
+            .expect_err("node flags are not benchmark flags");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn benchmark_usage_names_the_sub_command() {
+        // The token never reaches clap, so without `name` the usage line would
+        // read `ethlambda synthetic …` and mislead.
+        let err = try_parse_from(
+            ["ethlambda", BENCHMARK, "--help"]
+                .iter()
+                .map(OsString::from),
+        )
+        .expect_err("--help short-circuits parsing");
+        assert!(err.to_string().contains("ethlambda benchmark"), "{err}");
     }
 }
