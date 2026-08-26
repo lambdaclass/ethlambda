@@ -145,20 +145,31 @@ pub(crate) fn emit_post_block_coverage(
     or_into(&mut combined_v, &block_v);
     or_into(&mut combined_s, &block_s);
 
-    // Only report a round once the canonical head block actually carries its
-    // votes (`block_v` non-empty). Gating on `combined` instead would still
-    // fire on a missed slot — the `timely` snapshot for the round is populated
-    // while `block_v` is all-false — pushing exactly the misleading
-    // `block_only=0, timely_only=N` the diff is meant to avoid. When there is
-    // no block for the round the gauges retain their previous value.
-    if !block_v.iter().any(|&b| b) {
-        return;
-    }
-
+    // Always record the four section gauges, including a genuine all-zero
+    // reading. A round can legitimately see no votes for `reporting_slot`
+    // (an empty slot, or a proposer that dropped every attestation), and
+    // that zero is real information a Grafana reader needs: it renders as a
+    // dip on the section's timeseries, distinguishable from a gauge that
+    // silently kept its last value. Do not gate these on `block_v` — that
+    // guard below is scoped to the diff gauges only.
     cov_record("timely", &timely_v, &timely_s);
     cov_record("late", &late_v, &late_s);
     cov_record("block", &block_v, &block_s);
     cov_record("combined", &combined_v, &combined_s);
+
+    // The `block_only`/`timely_only` diff is only meaningful once the
+    // canonical head block has actually reported this round (`block_v`
+    // non-empty). Gating on `combined` instead would still fire on a missed
+    // slot — the `timely` snapshot for the round is populated while
+    // `block_v` is all-false — pushing exactly the misleading
+    // `block_only=0, timely_only=N` this guard exists to avoid. Unlike the
+    // four sections above, there is no "genuine zero" to fall back on here
+    // (the comparison itself is undefined, not merely empty), so when there
+    // is no block for the round yet the diff gauges keep their previous
+    // value.
+    if !block_v.iter().any(|&b| b) {
+        return;
+    }
 
     let (block_only, timely_only) =
         block_v
