@@ -1,4 +1,4 @@
-//! Sub-command dispatch.
+//! Sub-command handling.
 //!
 //! `node` is the default sub-command: it can be named explicitly
 //! (`ethlambda node --genesis ...`) or left out entirely
@@ -6,9 +6,9 @@
 //! lean-quickstart, the hive shim and the devnet skills all do, so that form
 //! stays the one this module is careful about: the token is simply removed
 //! before parsing, and the very same [`CliOptions`] parser then sees the very
-//! same arguments it saw before this module existed. Help text, error
-//! messages, exit codes and `--version` are therefore unchanged for it, by
-//! construction rather than by test.
+//! same arguments it saw before this module existed. Its error messages, exit
+//! codes and `--version` output are therefore unchanged by construction rather
+//! than by test; only `--help` differs, by the [`HELP_NOTE`] it appends.
 
 use std::ffi::OsString;
 
@@ -23,23 +23,18 @@ use crate::cli::CliOptions;
 /// lands there and is never mistaken for it.
 const NODE: &str = "node";
 
-/// What the command line asked the binary to do.
-#[derive(Debug)]
-pub(crate) enum Invocation {
-    /// Run the consensus node.
-    Node(CliOptions),
-}
+/// Appended to `--help` by `CliOptions`. The token never reaches clap, so
+/// without this the sub-command would be undiscoverable from the help output.
+pub(crate) const HELP_NOTE: &str = "Sub-commands:\n  node  \
+                                    Run the consensus node (assumed when omitted)";
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
 /// `--help` or `--version`.
-pub(crate) fn parse() -> Invocation {
-    match try_parse_from(std::env::args_os()) {
-        Ok(invocation) => invocation,
-        Err(err) => err.exit(),
-    }
+pub(crate) fn parse() -> CliOptions {
+    try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
 }
 
-fn try_parse_from<I>(args: I) -> Result<Invocation, clap::Error>
+fn try_parse_from<I>(args: I) -> Result<CliOptions, clap::Error>
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
@@ -48,7 +43,7 @@ where
     if args.get(1).is_some_and(|arg| arg == NODE) {
         args.remove(1);
     }
-    CliOptions::try_parse_from(args).map(Invocation::Node)
+    CliOptions::try_parse_from(args)
 }
 
 #[cfg(test)]
@@ -90,9 +85,7 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> CliOptions {
-        let Invocation::Node(options) =
-            try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
-        options
+        try_parse_from(args.iter().map(OsString::from)).expect("invocation parses")
     }
 
     #[test]
@@ -109,6 +102,9 @@ mod tests {
     fn node_sub_command_accepts_the_same_flags_as_the_flat_form() {
         let flat = node_options(FLAT);
         let scoped = node_options(&with_node_token());
+        // Compared through `Debug`, which the derive prints field by field,
+        // because `CliOptions` derives no `PartialEq` — and deriving one for a
+        // test would touch the parser this module deliberately leaves alone.
         assert_eq!(format!("{flat:?}"), format!("{scoped:?}"));
     }
 
@@ -131,6 +127,17 @@ mod tests {
         args.push(NODE);
         let err = try_parse_from(args.iter().map(OsString::from))
             .expect_err("a trailing token must not be swallowed");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn only_the_leading_node_token_is_stripped() {
+        // `ethlambda node node --genesis ...`: the second token is left for
+        // clap, which rejects it like any other stray positional.
+        let mut args = with_node_token();
+        args.insert(1, NODE);
+        let err = try_parse_from(args.iter().map(OsString::from))
+            .expect_err("only one leading token is a sub-command");
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
@@ -175,5 +182,12 @@ mod tests {
                 .expect_err("help and version short-circuit parsing");
             assert_eq!(err.kind(), expected);
         }
+    }
+
+    #[test]
+    fn help_documents_the_node_sub_command() {
+        let err = try_parse_from(["ethlambda", "--help"].iter().map(OsString::from))
+            .expect_err("--help short-circuits parsing");
+        assert!(err.to_string().contains(NODE), "{err}");
     }
 }
