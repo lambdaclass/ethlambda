@@ -14,12 +14,20 @@
 //! harsh slow-peer weights. Rates and decay horizons are re-derived for lean,
 //! which has no epochs and where every validator attests every slot.
 //!
-//! DEVIATION: `mesh_message_deliveries` is not configured. It is the only
-//! negative topic-level term, its weight is `-topic_weight`, and it punishes a
+//! DEVIATION: the `mesh_message_deliveries` terms are explicitly zeroed. They
+//! are the negative topic-level terms, weighted `-topic_weight`, that punish a
 //! peer for delivering fewer mesh messages than expected. Getting the expected
-//! rate wrong would drive healthy peers negative and prune them, which is the
-//! failure mode this scoring is meant to prevent. Lighthouse itself passes
-//! `None` for its low-rate topics. Left out until the rates are measured.
+//! rate wrong drives healthy peers negative and prunes them, which is the
+//! failure mode this scoring exists to prevent, so they stay off until lean's
+//! real rates are measured. Lighthouse does the same for its low-rate topics.
+//!
+//! Zeroing them has to be explicit. `TopicScoreParams::default()` ships
+//! `mesh_message_deliveries_weight: -1.0` with a threshold of 20 messages per
+//! 10ms window, activating 5s after a peer joins the mesh. No node can meet
+//! that, so leaving the fields at their defaults penalises every peer on a
+//! healthy network: a 6-node devnet run scored every peer between -20 and -67
+//! and pruned every mesh to empty. Lighthouse's `get_topic_params` has an
+//! `else` branch zeroing all eight fields for exactly this reason.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -163,6 +171,7 @@ pub fn params(topology: &ScoringTopology) -> PeerScoreParams {
             decay_interval,
             decay_to_zero,
             topology.mesh_n,
+            max_positive_score,
         ),
     );
 
@@ -176,6 +185,7 @@ pub fn params(topology: &ScoringTopology) -> PeerScoreParams {
             decay_interval,
             decay_to_zero,
             topology.mesh_n,
+            max_positive_score,
         ),
     );
 
@@ -194,6 +204,7 @@ pub fn params(topology: &ScoringTopology) -> PeerScoreParams {
                 decay_interval,
                 decay_to_zero,
                 topology.mesh_n,
+                max_positive_score,
             ),
         );
     }
@@ -202,7 +213,8 @@ pub fn params(topology: &ScoringTopology) -> PeerScoreParams {
     params
 }
 
-/// Mirrors lighthouse's `get_topic_params` with `mesh_message_info: None`.
+/// Mirrors lighthouse's `get_topic_params` with `mesh_message_info: None`,
+/// including its `else` branch.
 fn topic_params(
     topic_weight: f64,
     expected_message_rate: f64,
@@ -210,6 +222,7 @@ fn topic_params(
     decay_interval: Duration,
     decay_to_zero: f64,
     mesh_n: usize,
+    max_positive_score: f64,
 ) -> TopicScoreParams {
     let mut t = TopicScoreParams::default();
     t.topic_weight = topic_weight;
@@ -226,6 +239,24 @@ fn topic_params(
     );
     t.first_message_deliveries_weight =
         MAX_FIRST_MESSAGE_DELIVERIES_SCORE / t.first_message_deliveries_cap;
+
+    // P3 and P3b off. Every field must be zeroed, not merely left alone: see
+    // the module note on what `TopicScoreParams::default()` puts here.
+    t.mesh_message_deliveries_weight = 0.0;
+    t.mesh_message_deliveries_threshold = 0.0;
+    t.mesh_message_deliveries_decay = 0.0;
+    t.mesh_message_deliveries_cap = 0.0;
+    t.mesh_message_deliveries_window = Duration::ZERO;
+    t.mesh_message_deliveries_activation = Duration::ZERO;
+    t.mesh_failure_penalty_weight = 0.0;
+    t.mesh_failure_penalty_decay = 0.0;
+
+    // P4. Kept, and set to lighthouse's weight rather than the default -1.0:
+    // an invalid message is a protocol violation, and one is enough to cancel
+    // out everything a peer can earn.
+    t.invalid_message_deliveries_weight = -max_positive_score / topic_weight;
+    t.invalid_message_deliveries_decay =
+        score_parameter_decay(score_epoch() * 50, decay_interval, decay_to_zero);
 
     t
 }
@@ -287,6 +318,27 @@ mod tests {
             params.topics.len(),
             2 + topology.attestation_committee_count as usize
         );
+    }
+
+    #[test]
+    fn no_topic_carries_a_mesh_delivery_penalty() {
+        // Regression test for a real 6-node devnet failure. Leaving the P3/P3b
+        // fields at `TopicScoreParams::default()` enables them with a
+        // threshold of 20 messages per 10ms window, which no node can meet, so
+        // every peer on a healthy network went negative and every mesh emptied.
+        // Not configuring these is not the same as disabling them.
+        for (topic, t) in params(&topology()).topics {
+            assert_eq!(t.mesh_message_deliveries_weight, 0.0, "{topic}");
+            assert_eq!(t.mesh_message_deliveries_threshold, 0.0, "{topic}");
+            assert_eq!(t.mesh_failure_penalty_weight, 0.0, "{topic}");
+            assert_eq!(t.mesh_message_deliveries_window, Duration::ZERO, "{topic}");
+            // The positive terms must still be live, or peers never build the
+            // buffer that keeps a transient penalty from pruning them.
+            assert!(t.time_in_mesh_weight > 0.0, "{topic}");
+            assert!(t.first_message_deliveries_weight > 0.0, "{topic}");
+            // An invalid message must still cost more than a peer can earn.
+            assert!(t.invalid_message_deliveries_weight < 0.0, "{topic}");
+        }
     }
 
     #[test]
