@@ -801,15 +801,17 @@ fn extend_proofs_greedily(
     selected: &mut Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     att_data: &AttestationData,
 ) {
-    if proofs.is_empty() {
-        return;
-    }
-
     let mut covered: HashSet<u64> = HashSet::new();
-    let mut remaining_indices: HashSet<usize> = (0..proofs.len()).collect();
+    let mut remaining_indices: Vec<usize> = (0..proofs.len()).collect();
 
-    while !remaining_indices.is_empty() {
-        // Pick proof covering the most uncovered validators (count only, no allocation)
+    loop {
+        // Pick proof covering the most uncovered validators (count only, no
+        // allocation). Coverage ties break to the lowest index (pool insertion
+        // order): a HashSet here would let hash-iteration order pick an
+        // arbitrary equal-coverage winner, making the built block's
+        // aggregation bits differ from run to run. The candidates must
+        // therefore stay in ascending order, which is why the winner leaves
+        // via `retain` below and not `swap_remove`.
         let best = remaining_indices
             .iter()
             .map(|&idx| {
@@ -819,14 +821,12 @@ fn extend_proofs_greedily(
                     .count();
                 (idx, count)
             })
-            .max_by_key(|&(_, count)| count);
+            .max_by_key(|&(idx, count)| (count, Reverse(idx)));
 
-        let Some((best_idx, best_count)) = best else {
+        // Stops on an empty pool, and once no candidate adds coverage.
+        let Some((best_idx, _)) = best.filter(|&(_, count)| count > 0) else {
             break;
         };
-        if best_count == 0 {
-            break;
-        }
 
         let proof = &proofs[best_idx];
 
@@ -846,7 +846,7 @@ fn extend_proofs_greedily(
 
         covered.extend(new_covered);
         selected.push((att, proof.clone()));
-        remaining_indices.remove(&best_idx);
+        remaining_indices.retain(|&idx| idx != best_idx);
     }
 }
 
@@ -1957,5 +1957,42 @@ mod tests {
         assert_eq!(selected.len(), 1);
         let covered: HashSet<u64> = selected[0].1.participant_indices().collect();
         assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+    }
+
+    /// Equal-coverage proofs must be selected in pool order, so that the same
+    /// pool always yields the same block. Iterating a `HashSet` of candidate
+    /// indices made the winner depend on hash order, which varies per process.
+    #[test]
+    fn extend_proofs_greedily_breaks_coverage_ties_by_pool_order() {
+        let data = make_att_data(1);
+
+        // Six proofs of identical coverage size, disjoint so that every round
+        // is again a six-way tie: selection order is decided purely by the
+        // tie-break, and must follow the order they sit in the pool. Six of
+        // them rather than two so an arbitrary order cannot match pool order
+        // by luck (1 in 720 rather than 1 in 2).
+        let proofs: Vec<SingleMessageAggregate> = (0..6)
+            .map(|group| SingleMessageAggregate::empty(make_bits(&[group * 2, group * 2 + 1])))
+            .collect();
+
+        let mut selected = Vec::new();
+        extend_proofs_greedily(&proofs, &mut selected, &data);
+
+        let order: Vec<Vec<u64>> = selected
+            .iter()
+            .map(|(_, proof)| proof.participant_indices().collect())
+            .collect();
+        let pool_order: Vec<Vec<u64>> = (0..6).map(|g| vec![g * 2, g * 2 + 1]).collect();
+        assert_eq!(order, pool_order);
+    }
+
+    /// An empty pool selects nothing: the candidate loop finds no best proof
+    /// and stops on its first round, so no `proofs.is_empty()` guard is needed
+    /// ahead of it.
+    #[test]
+    fn extend_proofs_greedily_selects_nothing_from_an_empty_pool() {
+        let mut selected = Vec::new();
+        extend_proofs_greedily(&[], &mut selected, &make_att_data(1));
+        assert!(selected.is_empty());
     }
 }

@@ -20,7 +20,12 @@ pub enum SwarmCommand {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
     },
-    Dial(Multiaddr),
+    Dial {
+        addr: Multiaddr,
+        /// Callback reporting whether the swarm accepted the dial. `None` when
+        /// the caller does not need to know.
+        accepted_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    },
     SendRequest {
         peer: PeerId,
         request: Request,
@@ -50,8 +55,37 @@ impl SwarmHandle {
     pub fn dial(&self, addr: Multiaddr) {
         let _ = self
             .cmd_tx
-            .send(SwarmCommand::Dial(addr))
+            .send(SwarmCommand::Dial {
+                addr,
+                accepted_tx: None,
+            })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot dial"));
+    }
+
+    /// Dial and report whether the swarm took the dial.
+    ///
+    /// `Swarm::dial` rejects some dials synchronously — `LocalPeerId`,
+    /// `NoAddresses`, `Denied`, and `DialPeerConditionFalse` (already connected,
+    /// or already dialing) — and those produce **no** `OutgoingConnectionError`
+    /// event. A caller that keeps per-dial bookkeeping has to know, or nothing
+    /// will ever tear that bookkeeping down. `false` also covers a dead adapter.
+    ///
+    /// A `true` only means the dial was queued: success or failure still arrives
+    /// later as `ConnectionEstablished` or `OutgoingConnectionError`.
+    pub async fn dial_accepted(&self, addr: Multiaddr) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SwarmCommand::Dial {
+                addr,
+                accepted_tx: Some(tx),
+            })
+            .is_err()
+        {
+            debug!("Swarm adapter closed, cannot dial");
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     /// Send a request and return the assigned OutboundRequestId.
@@ -147,10 +181,14 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
                 .ok();
         }
-        SwarmCommand::Dial(addr) => {
-            let _ = swarm
+        SwarmCommand::Dial { addr, accepted_tx } => {
+            let accepted = swarm
                 .dial(addr)
-                .inspect_err(|err| debug!(%err, "Swarm adapter: dial failed"));
+                .inspect_err(|err| debug!(%err, "Swarm adapter: dial failed"))
+                .is_ok();
+            if let Some(tx) = accepted_tx {
+                let _ = tx.send(accepted);
+            }
         }
         SwarmCommand::SendRequest {
             peer,

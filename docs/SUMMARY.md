@@ -19,6 +19,7 @@
 - [Checkpoint Sync](./checkpoint_sync.md)
 - [Fork Choice Visualization](./fork_choice_visualization.md)
 - [Data Storage](./data_storage.md)
+- [Peer discovery](./discovery.md)
 
 # Development
 

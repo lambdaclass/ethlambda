@@ -29,13 +29,22 @@ snap = "1.1"
 
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 
 rand = "0.8"
 
-# Required for NodeEnr parsing
-ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
-ethrex-common = { git = "https://github.com/lambdaclass/ethrex", rev = "1af63a4de7c93eb7413b9b003df1be82e1484c69" }
+# Required for NodeEnr parsing.
+#
+# Pinned to an ethrex release tag, for the unified discovery module, the peer
+# table, and the `PeerFilter` seam this crate builds on. A tag rather than a
+# branch: a `main` that moves under us would change what this crate builds
+# against with nothing in the manifest saying so.
+ethrex-p2p = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+ethrex-rlp = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+ethrex-common = { git = "https://github.com/lambdaclass/ethrex", tag = "v25.0.0" }
+
+# Version pinned to ethrex's workspace: `SecretKey` crosses the API boundary.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context"] }
 
 # SSZ
 libssz.workspace = true
@@ -47,3 +56,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 hex.workspace = true
+# `rand` seeds the throwaway signing keys the ENR tests build records with.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }

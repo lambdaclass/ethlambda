@@ -126,6 +126,18 @@ The metrics below are not part of the [leanMetrics specification](https://github
 | `lean_reqresp_request_size_bytes` | Histogram | Bytes size of a req/resp request (raw SSZ or snappy on-wire) | On req/resp request send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 64, 128, 256, 512, 1024, 4096, 16384, 65536 |
 | `lean_reqresp_response_chunk_size_bytes` | Histogram | Bytes size of a single req/resp response chunk (raw SSZ or snappy on-wire) | On req/resp response chunk send/receive | protocol=status,blocks_by_root<br>compression=raw,snappy | 128, 1024, 10000, 100000, 500000, 1000000, 5000000, 10000000 |
 
+### Peer Discovery
+
+Only emitted when discv5 discovery is enabled (`--discovery.enable`); see
+[Peer discovery](./discovery.md). Counts dials discovery initiated, as opposed to
+the static bootnode dials every node makes. Connection outcomes are not repeated
+here: a discovery dial that succeeds or fails shows up in
+`lean_peer_connection_events_total` like any other.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_discovered_peers_dialed_total` | Counter | Peers dialed as a result of discv5 discovery | On dialing a discovered peer | |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
