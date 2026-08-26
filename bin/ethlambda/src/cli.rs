@@ -217,7 +217,6 @@ pub(crate) struct ShadowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
 
     /// The required flags, so a test can vary only what it cares about.
     fn parse(extra: &[&str]) -> CliOptions {
@@ -239,7 +238,7 @@ mod tests {
             "ethlambda_0",
         ];
         argv.extend_from_slice(extra);
-        CliOptions::parse_from(argv)
+        crate::command::parse_node_options(argv)
     }
 
     /// `--discovery.enable` on its own has to work: a default that is never
