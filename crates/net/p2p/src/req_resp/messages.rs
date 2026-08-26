@@ -1,4 +1,4 @@
-use ethlambda_types::{block::SignedBlock, checkpoint::Checkpoint, primitives::H256};
+use ethlambda_types::{ShortRoot, block::SignedBlock, checkpoint::Checkpoint, primitives::H256};
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 
@@ -35,6 +35,49 @@ impl Response {
     /// Create an error response with the given code and message.
     pub fn error(code: ResponseCode, message: ErrorMessage) -> Self {
         Self::Error { code, message }
+    }
+}
+
+/// Bounded summary for logs.
+///
+/// Prefer this over `Debug` anywhere a `Response` reaches a log line. The derived
+/// `Debug` on a `Blocks` payload expands every block header and every attestation
+/// bitlist byte-by-byte, so a full `BlocksByRange` answer renders as hundreds of
+/// kilobytes on a single line — enough to be rejected outright by a log backend.
+/// `SignedBlock`'s own `Debug` already truncates the opaque proof bytes for the
+/// same reason; this covers the rest of the envelope.
+impl std::fmt::Display for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success {
+                payload: ResponsePayload::Status(status),
+            } => write!(
+                f,
+                "Success(Status head={}/{} finalized={}/{})",
+                status.head.slot,
+                ShortRoot(&status.head.root.0),
+                status.finalized.slot,
+                ShortRoot(&status.finalized.root.0),
+            ),
+            Self::Success {
+                payload: ResponsePayload::Blocks(blocks),
+            } => {
+                write!(f, "Success(Blocks count={}", blocks.len())?;
+                // Reported as first/last rather than a range: a BlocksByRoot
+                // response follows the requested root order, so the slots are
+                // not necessarily contiguous or ascending.
+                if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
+                    let first_slot = first.message.slot;
+                    let last_slot = last.message.slot;
+                    write!(f, " first_slot={first_slot} last_slot={last_slot}")?;
+                }
+                write!(f, ")")
+            }
+            Self::Error { code, message } => {
+                let message = String::from_utf8_lossy(message);
+                write!(f, "Error({code:?}: {message})")
+            }
+        }
     }
 }
 

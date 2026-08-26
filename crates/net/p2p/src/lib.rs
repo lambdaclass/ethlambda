@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     ops::Range,
     time::Duration,
 };
@@ -13,10 +13,9 @@ use ethlambda_network_api::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
-use ethrex_common::H264;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
-use futures::StreamExt;
+use futures::{StreamExt, future::OptionFuture};
 use libp2p::{
     Multiaddr, StreamProtocol,
     gossipsub::{MessageAuthenticity, ValidationMode},
@@ -36,6 +35,12 @@ use spawned_concurrency::tasks::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
+    discovery::{
+        DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
+        dial::{DiscoveryState, dial_tick, forget_discovered_peer},
+        enr::{read_ip, read_public_key, read_quic_port},
+        spawn_discovery,
+    },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_block,
@@ -48,6 +53,7 @@ use crate::{
     swarm_adapter::SwarmHandle,
 };
 
+pub mod discovery;
 mod gossipsub;
 pub mod metrics;
 mod req_resp;
@@ -297,19 +303,33 @@ pub fn build_swarm(
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let mut bootnode_addrs = HashMap::new();
+    let mut quic_less_bootnodes = 0usize;
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
             continue;
         }
-        let addr = Multiaddr::empty()
-            .with(bootnode.ip.into())
-            .with(Protocol::Udp(bootnode.quic_port))
-            .with(Protocol::QuicV1)
-            .with_p2p(peer_id)
-            .expect("failed to add peer ID to multiaddr");
+        // Discovery-only seed: reachable over discv5, but with no QUIC port
+        // there is nothing for the swarm to dial.
+        let Some(quic_port) = bootnode.quic_port else {
+            quic_less_bootnodes += 1;
+            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no quic port, discv5 seed only");
+            continue;
+        };
+        let addr = quic_multiaddr(bootnode.ip, quic_port, peer_id);
         bootnode_addrs.insert(peer_id, addr.clone());
         swarm.dial(addr).unwrap();
+    }
+    // Every skip above is individually unremarkable and logged at `debug`, but a
+    // list that produces no dial target at all leaves the node isolated unless
+    // discovery is on, which is worth one line at `warn`. A beacon-chain
+    // bootstrap list is exactly this shape: `tcp` and `udp`, never `quic`.
+    if bootnode_addrs.is_empty() && quic_less_bootnodes > 0 {
+        warn!(
+            quic_less_bootnodes,
+            "No bootnode advertises a quic port, so nothing will be dialed statically; \
+             peering depends entirely on discv5 discovery"
+        );
     }
     let addr = Multiaddr::empty()
         .with(config.listening_socket.ip().into())
@@ -374,11 +394,35 @@ pub struct P2P {
 }
 
 impl P2P {
-    /// Build swarm, start I/O adapter, spawn actor, and wire the swarm event stream.
-    pub fn spawn(built: BuiltSwarm, store: Store, node_names: HashMap<PeerId, String>) -> P2P {
+    /// Start discovery, start the I/O adapter, spawn the actor, and wire the
+    /// swarm event stream.
+    ///
+    /// `discovery` is `Some` when discv5 discovery is enabled: the discv5
+    /// server is started here, and its handle seeds the dial loop's state and
+    /// schedules its first tick. `None` leaves the dial loop permanently
+    /// dormant, so peering relies solely on the static bootnode list dialed by
+    /// `build_swarm`.
+    ///
+    /// Discovery is started before the swarm adapter so a fatal discovery
+    /// failure (a busy UDP port, say) surfaces before any actor is running.
+    pub async fn spawn(
+        built: BuiltSwarm,
+        store: Store,
+        node_names: HashMap<PeerId, String>,
+        discovery: Option<DiscoverySpawnConfig>,
+    ) -> Result<P2P, DiscoveryError> {
+        if discovery.is_none() {
+            info!("discv5 discovery disabled; peering from the static bootnode list only");
+        }
+        // `OptionFuture` awaits the spawn only when there is one to await, so the
+        // disabled case stays a plain `None` without a branch of its own.
+        let discovery = OptionFuture::from(discovery.map(spawn_discovery))
+            .await
+            .transpose()?;
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
+        let discovery_enabled = discovery.is_some();
         let server = P2PServer {
             swarm_handle,
             store,
@@ -393,10 +437,18 @@ impl P2P {
             range_sync_state: None,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
+            discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
         };
         let handle = server.start();
+        if discovery_enabled {
+            send_after(
+                DISCOVERY_DIAL_INTERVAL,
+                handle.context(),
+                p2p_protocol::DiscoverPeers,
+            );
+        }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
-        P2P { handle }
+        Ok(P2P { handle })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<P2PServer> {
@@ -430,6 +482,9 @@ pub struct P2PServer {
     pub(crate) range_sync_state: Option<RangeSyncState>,
     bootnode_addrs: HashMap<PeerId, Multiaddr>,
     node_names: HashMap<PeerId, String>,
+
+    /// Set when discovery is enabled. `None` disables the dial loop entirely.
+    pub(crate) discovery: Option<DiscoveryState>,
 }
 
 impl P2PServer {
@@ -449,6 +504,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn discover_peers(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -492,6 +549,21 @@ impl P2PServer {
             trace!(%peer_id, "Redialing disconnected bootnode");
             self.swarm_handle.dial(addr.clone());
         }
+    }
+
+    #[send_handler]
+    async fn handle_discover_peers(
+        &mut self,
+        _msg: p2p_protocol::DiscoverPeers,
+        ctx: &Context<Self>,
+    ) {
+        // Reschedule first, so an early return never stops the loop.
+        send_after(
+            DISCOVERY_DIAL_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::DiscoverPeers,
+        );
+        dial_tick(self).await;
     }
 }
 
@@ -622,6 +694,7 @@ async fn handle_swarm_event(
             };
             if num_established == 0 {
                 server.connected_peers.remove(&peer_id);
+                forget_discovered_peer(server, &peer_id);
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
                     server.resolve_node_name(Some(&peer_id)),
@@ -663,17 +736,29 @@ async fn handle_swarm_event(
             );
             debug!(?peer_id, %error, "Outgoing connection error");
 
-            // Schedule redial if this was a bootnode
-            if let Some(pid) = peer_id
-                && server.bootnode_addrs.contains_key(&pid)
-                && !server.connected_peers.contains(&pid)
-            {
-                send_after(
-                    Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
-                    ctx.clone(),
-                    p2p_protocol::RetryPeerRedial { peer_id: pid },
-                );
-                trace!(%pid, "Scheduled bootnode redial after connection error");
+            if let Some(pid) = peer_id {
+                // A dial that never establishes ends up here rather than in
+                // `ConnectionClosed`, so this is the only place a peer we dialed
+                // but never connected to can be forgotten. Gated on the peer
+                // being gone: a *second* dial to an already-connected peer can
+                // fail here (the bootnode redial path is one way), and dropping
+                // a live peer's `attnets` would make `covered_subnets`
+                // under-count subnets we do in fact cover.
+                if !server.connected_peers.contains(&pid) {
+                    forget_discovered_peer(server, &pid);
+                }
+
+                // Schedule redial if this was a bootnode
+                if server.bootnode_addrs.contains_key(&pid)
+                    && !server.connected_peers.contains(&pid)
+                {
+                    send_after(
+                        Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
+                        ctx.clone(),
+                        p2p_protocol::RetryPeerRedial { peer_id: pid },
+                    );
+                    trace!(%pid, "Scheduled bootnode redial after connection error");
+                }
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
@@ -715,66 +800,141 @@ pub fn derive_peer_ids(names_and_privkeys: HashMap<String, H256>) -> HashMap<Pee
 
 // --- Bootnode parsing ---
 
+/// [`Clone`] so one parse of the bootnode file can serve both `build_swarm` and
+/// discovery: every field is plain data, and cloning beats reading the file twice.
+#[derive(Clone)]
 pub struct Bootnode {
     pub(crate) ip: IpAddr,
-    pub(crate) quic_port: u16,
+    /// The libp2p QUIC port, when the ENR advertises one.
+    ///
+    /// `None` for records that are discv5-reachable but speak no transport we
+    /// have: every beacon-chain bootnode published today advertises `tcp` and
+    /// `udp` but no `quic`. Such a bootnode still seeds the discv5 routing
+    /// table; it just is never dialed statically.
+    pub(crate) quic_port: Option<u16>,
+    /// The discv5 UDP port, when the ENR advertises one.
+    ///
+    /// `None` for the ENRs lean-quickstart generates today, which carry only
+    /// `ip`/`quic`/`secp256k1`. Such a bootnode is still dialed statically over
+    /// QUIC; it just cannot seed the discv5 routing table.
+    pub(crate) udp_port: Option<u16>,
     pub(crate) public_key: PublicKey,
 }
 
+impl Bootnode {
+    /// This bootnode as a discv5 seed, or `None` when its ENR advertises no
+    /// `udp` port and it therefore cannot be reached by discovery.
+    ///
+    /// `tcp_port` is 0: ethrex reads that as "no TCP listener".
+    pub(crate) fn as_discovery_node(&self) -> Option<ethrex_p2p::types::Node> {
+        let udp_port = self.udp_port?;
+        // libp2p and ethrex hold the same key in different representations:
+        // ethrex wants the 65-byte uncompressed SEC1 form with its leading 0x04
+        // tag stripped.
+        let uncompressed = self
+            .public_key
+            .clone()
+            .try_into_secp256k1()
+            .ok()?
+            .to_bytes_uncompressed();
+        // `Node::from_enr` would compute the same identity from the record, but
+        // it falls back to `tcp` when `udp` is absent, which would seed a
+        // tcp-only bootnode under a port discv5 does not listen on.
+        Some(ethrex_p2p::types::Node::new(
+            self.ip,
+            udp_port,
+            0,
+            ethrex_common::H512::from_slice(&uncompressed[1..]),
+        ))
+    }
+}
+
+/// Decode `enr:`-prefixed records into usable bootnodes.
+///
+/// Records that cannot be decoded, or that lack an IP, a public key or any
+/// dialable port at all, are skipped with a warning rather than aborting
+/// startup: one malformed entry in the bootnode file should not stop the node
+/// from booting. A record carrying only one of `quic` and `udp` is kept, since
+/// each is useful on its own.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
-    let mut bootnodes = vec![];
-
-    // File is YAML, but we try to avoid pulling a full YAML parser just for this
-    for enr_str in enrs {
-        let base64_decoded = ethrex_common::base64::decode(&enr_str.as_bytes()[4..]);
-        let record = NodeRecord::decode(&base64_decoded).unwrap();
-        let (_, quic_port_bytes) = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"quic")
-            .expect("node doesn't support QUIC");
-
-        let (_, public_key_rlp) = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"secp256k1")
-            .expect("node record missing public key");
-
-        let public_key_bytes = H264::decode(public_key_rlp).unwrap();
-        let public_key =
-            libp2p::identity::secp256k1::PublicKey::try_from_bytes(public_key_bytes.as_bytes())
-                .unwrap();
-
-        let quic_port = u16::decode(quic_port_bytes.as_ref()).unwrap();
-
-        let ipv4 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv4Addr::decode(bytes.as_ref()).expect("invalid IPv4 address"))
-            });
-        let ipv6 = record
-            .pairs
-            .iter()
-            .find(|(key, _)| key.as_ref() == b"ip6")
-            .map(|(_, bytes)| {
-                IpAddr::from(Ipv6Addr::decode(bytes.as_ref()).expect("invalid IPv6 address"))
-            });
-
-        // Prefer IPv4 if both are present
-        let ip = ipv4.or(ipv6).expect("node record missing IP address");
-
-        bootnodes.push(Bootnode {
-            ip,
-            quic_port,
-            public_key: public_key.into(),
-        });
+    let configured = enrs.len();
+    let bootnodes: Vec<Bootnode> = enrs
+        .into_iter()
+        .filter_map(|enr_str| {
+            parse_enr(&enr_str)
+                .inspect_err(
+                    |reason| warn!(%reason, enr = %enr_str, "Skipping unusable bootnode ENR"),
+                )
+                .ok()
+        })
+        .collect();
+    // Each rejection above already warned, but a file where *every* entry is
+    // unusable boots a node with an empty bootnode list, which otherwise looks
+    // identical to having configured none at all.
+    if bootnodes.is_empty() && configured > 0 {
+        warn!(
+            configured,
+            "No bootnode ENR could be used; the node starts with no bootnodes"
+        );
     }
     bootnodes
 }
 
+fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
+    let stripped = enr_str
+        .strip_prefix("enr:")
+        .ok_or_else(|| "missing enr: prefix".to_string())?;
+    let decoded = ethrex_common::base64::decode(stripped.as_bytes());
+    let record = NodeRecord::decode(&decoded).map_err(|err| format!("RLP decode failed: {err}"))?;
+    let pairs = record.pairs();
+
+    // A record with no dialable `quic` entry is not an error: it is
+    // discv5-reachable but speaks no transport we have, which is exactly what
+    // every beacon-chain bootnode looks like. Keep it as a discovery seed and let
+    // `build_swarm` skip it when it picks static dial targets.
+    let quic_port = read_quic_port(&record);
+
+    // An explicit `udp: 0` is no more reachable than a `quic: 0`, which
+    // `read_quic_port` already rejects. Reading it verbatim would seed discv5
+    // with a contact on a port nothing listens on.
+    let udp_port = pairs.udp_port.filter(|port| *port != 0);
+
+    let public_key = read_public_key(pairs)
+        .ok_or_else(|| "node record missing or malformed public key".to_string())?;
+
+    let ip = read_ip(pairs).ok_or_else(|| "node record missing IP address".to_string())?;
+
+    // `quic` and `udp` are independently optional, but a record with neither is
+    // reachable by nothing we speak: it can be neither dialed nor seeded. Drop
+    // it here rather than carry a contact that no code path can ever use.
+    if quic_port.is_none() && udp_port.is_none() {
+        return Err("node advertises neither a quic nor a udp port".to_string());
+    }
+
+    Ok(Bootnode {
+        ip,
+        quic_port,
+        udp_port,
+        public_key: public_key.into(),
+    })
+}
+
 // --- Utility functions ---
+
+/// The address of a libp2p QUIC listener, as both dial paths spell it: static
+/// bootnodes in [`build_swarm`] and discovered peers in
+/// [`admission::admit`](discovery::admission).
+///
+/// Infallible: `with_p2p` only rejects a multiaddr that already carries a `p2p`
+/// component, and this one is built fresh.
+pub(crate) fn quic_multiaddr(ip: IpAddr, quic_port: u16, peer_id: PeerId) -> Multiaddr {
+    Multiaddr::empty()
+        .with(ip.into())
+        .with(Protocol::Udp(quic_port))
+        .with(Protocol::QuicV1)
+        .with_p2p(peer_id)
+        .expect("a freshly built multiaddr carries no p2p component")
+}
 
 fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
     if endpoint.is_dialer() {
@@ -808,6 +968,7 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
@@ -877,10 +1038,10 @@ mod tests {
         }
 
         // Each ENR encodes a distinct QUIC port
-        assert_eq!(bootnodes[0].quic_port, 9001);
-        assert_eq!(bootnodes[1].quic_port, 9002);
-        assert_eq!(bootnodes[2].quic_port, 9003);
-        assert_eq!(bootnodes[3].quic_port, 9007);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
+        assert_eq!(bootnodes[1].quic_port, Some(9002));
+        assert_eq!(bootnodes[2].quic_port, Some(9003));
+        assert_eq!(bootnodes[3].quic_port, Some(9007));
 
         // Verify the secp256k1 public keys (33-byte compressed format)
         let expected_pubkeys: Vec<[u8; 33]> = vec![
@@ -907,5 +1068,132 @@ mod tests {
             let expected_key: PublicKey = secp_key.into();
             assert_eq!(bootnode.public_key, expected_key);
         }
+
+        // Devnet ENRs from lean-quickstart carry no `udp` entry, so they cannot
+        // seed discv5 even though they remain dialable over QUIC.
+        for bootnode in &bootnodes {
+            assert_eq!(bootnode.udp_port, None);
+        }
+    }
+
+    #[test]
+    fn parse_enrs_extracts_the_udp_port_when_present() {
+        // `secp256k1` is already bound in this module to `libp2p::identity::secp256k1`
+        // (see the top-of-file `use`), so reach the raw `secp256k1` crate that
+        // `ethrex_p2p::types::NodeRecord::from_pairs` expects via an explicit
+        // crate-root path instead of the shadowed name.
+        use ::secp256k1 as raw_secp256k1;
+
+        // Build an ENR the way ethlambda does once discovery is enabled: udp for
+        // discv5, quic for libp2p, no tcp.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(9010),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 9001);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
+
+        let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
+
+        assert_eq!(bootnodes.len(), 1);
+        assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
+        assert_eq!(bootnodes[0].udp_port, Some(9010));
+    }
+
+    #[test]
+    fn parse_enrs_treats_a_zero_udp_port_as_absent() {
+        use ::secp256k1 as raw_secp256k1;
+
+        // `udp: 0` names no listener, exactly as `quic: 0` does not. Reading it
+        // verbatim would seed discv5 with an undialable contact, so the record
+        // survives only as a static dial target.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(0),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 9001);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
+
+        let bootnodes = parse_enrs(vec![record.enr_url().unwrap()]);
+
+        assert_eq!(bootnodes.len(), 1);
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
+        assert_eq!(bootnodes[0].udp_port, None);
+        assert!(
+            bootnodes[0].as_discovery_node().is_none(),
+            "a zero udp port must not become a discv5 seed"
+        );
+    }
+
+    #[test]
+    fn parse_enrs_drops_a_record_whose_only_ports_are_zero() {
+        use ::secp256k1 as raw_secp256k1;
+
+        // Neither port is dialable, so nothing downstream can ever use this
+        // record: the same outcome as a record carrying no ports at all.
+        let signer = raw_secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let mut pairs = ethrex_p2p::types::NodeRecordPairs {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            udp_port: Some(0),
+            tcp_port: None,
+            ..Default::default()
+        };
+        pairs.set_extra_int(b"quic", 0);
+        let record = NodeRecord::from_pairs(1, &signer, pairs).unwrap();
+
+        assert!(parse_enrs(vec![record.enr_url().unwrap()]).is_empty());
+    }
+
+    #[test]
+    fn parse_enrs_keeps_a_quic_less_record_as_a_discovery_seed() {
+        // Some nodes advertise `tcp` and `udp` but no `quic`, so requiring
+        // `quic` here would drop the entire mainnet bootstrap list and leave
+        // discv5 with nothing to seed from. Such a record is kept, with
+        // `quic_port: None` telling `build_swarm` not to dial it.
+        //
+        // The two ENRs are from eth-clients/mainnet's `bootstrap_nodes.yaml`.
+        let enrs = vec![
+            "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo".to_string(),
+            "enr:-Le4QPUXJS2BTORXxyx2Ia-9ae4YqA_JWX3ssj4E_J-3z1A-HmFGrU8BpvpqhNabayXeOZ2Nq_sbeDgtzMJpLLnXFgAChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISsaa0Zg2lwNpAkAIkHAAAAAPA8kv_-awoTiXNlY3AyNTZrMaEDHAD2JKYevx89W0CcFJFiskdcEzkH_Wdv9iW42qLK79ODdWRwgiMohHVkcDaCI4I".to_string(),
+        ];
+
+        let bootnodes = parse_enrs(enrs);
+
+        assert_eq!(bootnodes.len(), 2, "a quic-less ENR is still a valid seed");
+        for bootnode in &bootnodes {
+            assert_eq!(bootnode.quic_port, None);
+            // The whole point of keeping them: a `udp` port means discv5 can
+            // use them, which is what `as_discovery_node` reports.
+            assert_eq!(bootnode.udp_port, Some(9000));
+            assert!(bootnode.as_discovery_node().is_some());
+        }
+    }
+
+    #[test]
+    fn parse_enrs_skips_malformed_records_but_keeps_the_valid_one() {
+        // The rewrite's whole point is that one bad line in the bootnode file
+        // must not take the others down with it. Feed it a mix of the ways an
+        // entry can be malformed, plus one genuinely valid ENR (reused from
+        // `parse_enrs_extracts_ip_port_and_public_key`), and check the valid
+        // one survives and nothing panics along the way.
+        let enrs = vec![
+            "not-an-enr-at-all".to_string(), // missing "enr:" prefix
+            "enr:not valid base64!!!".to_string(), // non-base64 garbage
+            "enr:AAAAAAAAAAAAAAAA".to_string(), // valid base64, not valid RLP
+            "enr:-IW4QGGifTt9ypyMtChDISUNX3z4z5iPdiEPOmBoILvnDuWIKbWVmKXxZERPnw0piQyaBNCENFEPoIi-vxsnsrBig9MBgmlkgnY0gmlwhH8AAAGEcXVpY4IjKYlzZWNwMjU2azGhAhMMnGF1rmIPQ9tWgqfkNmvsG-aIyc9EJU5JFo3Tegys".to_string(),
+        ];
+
+        let bootnodes = parse_enrs(enrs);
+
+        assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
+        assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(bootnodes[0].quic_port, Some(9001));
     }
 }
