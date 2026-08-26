@@ -13,6 +13,7 @@ mod corpus;
 mod report;
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
@@ -119,6 +120,19 @@ struct CommonOptions {
     /// Mirrors the node flag: distinct AttestationData cap per built block.
     #[arg(long, default_value = "3")]
     max_attestations_per_block: usize,
+    /// Report format printed to stdout. Logs go to stderr, so JSON output can
+    /// be piped directly (e.g. into jq).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
+    /// Also write the JSON report to this file.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Human,
+    Json,
 }
 
 pub(crate) fn run(options: BenchmarkOptions) -> eyre::Result<()> {
@@ -168,7 +182,16 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
     );
 
     let report = Report::new(Environment::collect(), Params::from(&options), samples);
-    println!("{}", report.human_table());
+
+    match common.format {
+        OutputFormat::Human => println!("{}", report.human_table()),
+        OutputFormat::Json => println!("{}", report.to_json()?),
+    }
+    if let Some(path) = &common.output {
+        std::fs::write(path, report.to_json()?)
+            .wrap_err_with(|| format!("failed to write report to {}", path.display()))?;
+        eprintln!("report written to {}", path.display());
+    }
 
     Ok(())
 }
