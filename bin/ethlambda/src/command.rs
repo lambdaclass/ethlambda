@@ -1,8 +1,8 @@
 //! Sub-command definition and dispatch.
 //!
-//! `node` is an ordinary clap sub-command, so clap owns its help, usage lines
-//! and error messages. The one thing clap cannot express is a *default*
-//! sub-command, and the node needs one: the Dockerfile,
+//! `node` and `benchmark` are ordinary clap sub-commands, so clap owns their
+//! help, usage lines and error messages. The one thing clap cannot express is a
+//! *default* sub-command, and the node needs one: the Dockerfile,
 //! lean-quickstart, the hive shim and the devnet skills all invoke the binary as
 //! a bare list of node flags, from before there was anything else to run. That
 //! form keeps working because a missing sub-command is filled in as `node`
@@ -12,14 +12,16 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
+use crate::benchmark::BenchmarkOptions;
 use crate::cli::NodeOptions;
 use crate::version;
 
 /// Tokens that already say what to run, so no default is inserted ahead of
 /// them. `help` is clap's own generated sub-command (`ethlambda help node`).
-const EXPLICIT: &[&str] = &[NODE, "help", "-h", "--help", "-V", "--version"];
+const EXPLICIT: &[&str] = &[NODE, BENCHMARK, "help", "-h", "--help", "-V", "--version"];
 
 const NODE: &str = "node";
+const BENCHMARK: &str = "benchmark";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -50,8 +52,18 @@ pub(crate) enum Command {
     // printing `ethlambda <version>` after node flags, as it did when the node
     // flags were the whole command line. It is still listed and invoked as
     // `node`.
+    // Boxed because the node options dwarf every other variant's payload
+    // (~312 bytes against ~80), which `clippy::large_enum_variant` rightly
+    // flags: one allocation per process is cheaper than carrying that size in
+    // every value of this enum.
     #[command(display_name = "ethlambda")]
-    Node(NodeOptions),
+    // Boxed because the node options dwarf the other variant's payload (~312
+    // bytes against ~80), which `clippy::large_enum_variant` rightly flags: one
+    // allocation per process is cheaper than carrying that size in every value
+    // of this enum.
+    Node(Box<NodeOptions>),
+    /// Benchmark block building offline against a controlled workload.
+    Benchmark(BenchmarkOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -123,9 +135,10 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> NodeOptions {
-        let Command::Node(options) =
-            try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
-        options
+        match try_parse_from(args.iter().map(OsString::from)).expect("invocation parses") {
+            Command::Node(options) => *options,
+            other => panic!("expected a node invocation, got {other:?}"),
+        }
     }
 
     #[test]
