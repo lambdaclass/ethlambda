@@ -209,7 +209,7 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .behaviour_mut()
                 .req_resp
                 .send_response(channel, response)
-                .inspect_err(|err| debug!(?err, "Swarm adapter: send_response failed"));
+                .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
         }
     }
 }
