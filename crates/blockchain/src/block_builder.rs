@@ -801,19 +801,17 @@ fn extend_proofs_greedily(
     selected: &mut Vec<(AggregatedAttestation, SingleMessageAggregate)>,
     att_data: &AttestationData,
 ) {
-    if proofs.is_empty() {
-        return;
-    }
-
     let mut covered: HashSet<u64> = HashSet::new();
     let mut remaining_indices: Vec<usize> = (0..proofs.len()).collect();
 
-    while !remaining_indices.is_empty() {
+    loop {
         // Pick proof covering the most uncovered validators (count only, no
         // allocation). Coverage ties break to the lowest index (pool insertion
         // order): a HashSet here would let hash-iteration order pick an
         // arbitrary equal-coverage winner, making the built block's
-        // aggregation bits differ from run to run.
+        // aggregation bits differ from run to run. The candidates must
+        // therefore stay in ascending order, which is why the winner leaves
+        // via `retain` below and not `swap_remove`.
         let best = remaining_indices
             .iter()
             .map(|&idx| {
@@ -825,12 +823,10 @@ fn extend_proofs_greedily(
             })
             .max_by_key(|&(idx, count)| (count, Reverse(idx)));
 
-        let Some((best_idx, best_count)) = best else {
+        // Stops on an empty pool, and once no candidate adds coverage.
+        let Some((best_idx, _)) = best.filter(|&(_, count)| count > 0) else {
             break;
         };
-        if best_count == 0 {
-            break;
-        }
 
         let proof = &proofs[best_idx];
 
@@ -1988,5 +1984,15 @@ mod tests {
             .collect();
         let pool_order: Vec<Vec<u64>> = (0..6).map(|g| vec![g * 2, g * 2 + 1]).collect();
         assert_eq!(order, pool_order);
+    }
+
+    /// An empty pool selects nothing: the candidate loop finds no best proof
+    /// and stops on its first round, so no `proofs.is_empty()` guard is needed
+    /// ahead of it.
+    #[test]
+    fn extend_proofs_greedily_selects_nothing_from_an_empty_pool() {
+        let mut selected = Vec::new();
+        extend_proofs_greedily(&[], &mut selected, &make_att_data(1));
+        assert!(selected.is_empty());
     }
 }
