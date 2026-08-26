@@ -496,11 +496,27 @@ mod tests {
             still_connected,
             "scoring must not disconnect: the peer is still useful for request/response"
         );
-        // The stronger property: we stop *attempting* to publish to it, which
-        // is what actually ends the `Send Queue full` flood. The crossing point
-        // is `publish_threshold / slow_peer_weight` = 8000 / 10 dropped
-        // messages, so at the ~33/s seen on devnet-5 a wedged peer stops being
-        // targeted about 24s in, rather than never.
+        // Past `publish_threshold` the peer also leaves the publish candidate
+        // set. Reaching it here is an artifact of this test publishing 8000
+        // times in a tight synchronous loop, with no `decay_interval` tick in
+        // between, so `slow_peer_penalty` accumulates unchecked to 800.
+        //
+        // It does NOT work that way against a live network. The penalty decays
+        // by `slow_peer_decay` every `decay_interval`, so it settles at
+        //
+        //     penalty_steady = rate * decay_interval / (1 - slow_peer_decay)
+        //     score_steady   = slow_peer_weight * penalty_steady
+        //
+        // which for our parameters is `-44.4 * rate`. Crossing
+        // `publish_threshold` therefore needs a sustained ~180 failed
+        // sends/second; the ~33/s measured on devnet-5 settles near -1500 and
+        // never gets there. So the publish gate is not the mechanism that ends
+        // the flood in production, and this assertion only pins the tight-loop
+        // behaviour. What ends it is the mesh prune below, which needs nothing
+        // more than a negative score: an A/B on a 6-node devnet cut dropped
+        // `Forward` RPCs by 99.2% (2441 -> 20) while dropped `Publish` stayed
+        // flat, because a network with fewer peers than `mesh_n` re-selects the
+        // pruned peer as a publish top-up in `filter_publish_candidates`.
         assert!(
             not_targeted > 0,
             "past publish_threshold the peer should be dropped from the publish set"
