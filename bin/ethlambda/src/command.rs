@@ -1,49 +1,87 @@
-//! Sub-command handling.
+//! Sub-command definition and dispatch.
 //!
-//! `node` is the default sub-command: it can be named explicitly
-//! (`ethlambda node --genesis ...`) or left out entirely
-//! (`ethlambda --genesis ...`). Leaving it out is what the Dockerfile,
-//! lean-quickstart, the hive shim and the devnet skills all do, so that form
-//! stays the one this module is careful about: the token is simply removed
-//! before parsing, and the very same [`CliOptions`] parser then sees the very
-//! same arguments it saw before this module existed. Its error messages, exit
-//! codes and `--version` output are therefore unchanged by construction rather
-//! than by test; only `--help` differs, by the [`HELP_NOTE`] it appends.
+//! `node` is an ordinary clap sub-command, so clap owns its help, usage lines
+//! and error messages. The one thing clap cannot express is a *default*
+//! sub-command, and the node needs one: the Dockerfile,
+//! lean-quickstart, the hive shim and the devnet skills all invoke the binary as
+//! a bare list of node flags, from before there was anything else to run. That
+//! form keeps working because a missing sub-command is filled in as `node`
+//! before parsing — see [`default_subcommand`].
 
 use std::ffi::OsString;
 
 use clap::Parser;
 
 use crate::cli::CliOptions;
+use crate::version;
 
-/// The sub-command token accepted in first position.
-///
-/// `CliOptions` declares no positional arguments, so the first token after the
-/// program name is either a flag or this sub-command: a flag *value* never
-/// lands there and is never mistaken for it.
+/// Tokens that already say what to run, so no default is inserted ahead of
+/// them. `help` is clap's own generated sub-command (`ethlambda help node`).
+const EXPLICIT: &[&str] = &[NODE, "help", "-h", "--help", "-V", "--version"];
+
 const NODE: &str = "node";
 
-/// Appended to `--help` by `CliOptions`. The token never reaches clap, so
-/// without this the sub-command would be undiscoverable from the help output.
-pub(crate) const HELP_NOTE: &str = "Sub-commands:\n  node  \
-                                    Run the consensus node (assumed when omitted)";
+#[derive(Debug, clap::Parser)]
+#[command(
+    name = "ethlambda",
+    author = "LambdaClass",
+    version = version::CLIENT_VERSION,
+    about = "ethlambda consensus client",
+    // `--version` used to sit on the node options, so it was accepted after
+    // node flags; `ethereum/hive` builds its image that way. Propagating it to
+    // the sub-commands keeps those invocations working.
+    propagate_version = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// What the command line asked the binary to do.
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum Command {
+    /// Run the consensus node (assumed when no sub-command is given).
+    ///
+    /// `ethlambda --genesis ...` and `ethlambda node --genesis ...` are the
+    /// same invocation.
+    //
+    // Deliberately not part of the doc comment above, which clap renders as
+    // this sub-command's `long_about`: `display_name` keeps `--version`
+    // printing `ethlambda <version>` after node flags, as it did when the node
+    // flags were the whole command line. It is still listed and invoked as
+    // `node`.
+    #[command(display_name = "ethlambda")]
+    Node(CliOptions),
+}
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
 /// `--help` or `--version`.
-pub(crate) fn parse() -> CliOptions {
+pub(crate) fn parse() -> Command {
     try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
 }
 
-fn try_parse_from<I>(args: I) -> Result<CliOptions, clap::Error>
+fn try_parse_from<I>(args: I) -> Result<Command, clap::Error>
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
 {
     let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    if args.get(1).is_some_and(|arg| arg == NODE) {
-        args.remove(1);
+    if let Some(token) = default_subcommand(&args) {
+        args.insert(1, token.into());
     }
-    CliOptions::try_parse_from(args)
+    Cli::try_parse_from(args).map(|cli| cli.command)
+}
+
+/// The sub-command to insert, if the arguments do not name one.
+///
+/// `CliOptions` declares no positional arguments, so the first token after the
+/// program name is either a flag or a sub-command — a flag *value* never lands
+/// there and is never mistaken for one. A leading flag therefore means the flat
+/// node form, and gets `node` inserted ahead of it; a bare invocation is left
+/// alone so clap prints its own "requires a subcommand" help.
+fn default_subcommand(args: &[OsString]) -> Option<&'static str> {
+    let first = args.get(1)?.to_str()?;
+    (!EXPLICIT.contains(&first)).then_some(NODE)
 }
 
 #[cfg(test)]
@@ -85,7 +123,10 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> CliOptions {
-        try_parse_from(args.iter().map(OsString::from)).expect("invocation parses")
+        let command = try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        match command {
+            Command::Node(options) => options,
+        }
     }
 
     #[test]
@@ -121,8 +162,8 @@ mod tests {
 
     #[test]
     fn a_node_token_after_the_flags_is_still_rejected() {
-        // Only a leading token is a sub-command; anywhere else it stays the
-        // stray positional argument it has always been.
+        // The default is inserted at the front or not at all, so a later token
+        // stays the stray positional argument it has always been.
         let mut args: Vec<&str> = FLAT.to_vec();
         args.push(NODE);
         let err = try_parse_from(args.iter().map(OsString::from))
@@ -131,13 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_leading_node_token_is_stripped() {
-        // `ethlambda node node --genesis ...`: the second token is left for
-        // clap, which rejects it like any other stray positional.
+    fn a_second_node_token_is_rejected_by_clap() {
         let mut args = with_node_token();
         args.insert(1, NODE);
         let err = try_parse_from(args.iter().map(OsString::from))
-            .expect_err("only one leading token is a sub-command");
+            .expect_err("only one sub-command is accepted");
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
     }
 
@@ -158,12 +197,16 @@ mod tests {
     }
 
     #[test]
-    fn bare_invocation_still_errors_on_the_required_flags() {
-        for args in [vec!["ethlambda"], vec!["ethlambda", NODE]] {
-            let err = try_parse_from(args.iter().map(OsString::from))
-                .expect_err("an argument-less invocation must not start a node");
-            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
-        }
+    fn bare_invocation_asks_for_a_sub_command() {
+        // Nothing to default: clap prints the top-level help, which lists the
+        // sub-commands, rather than a missing-argument list for one of them.
+        let err = try_parse_from(["ethlambda"].iter().map(OsString::from))
+            .expect_err("an argument-less invocation must not start a node");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert_ne!(err.exit_code(), 0, "a bare invocation must not exit 0");
     }
 
     #[test]
@@ -185,7 +228,31 @@ mod tests {
     }
 
     #[test]
-    fn help_documents_the_node_sub_command() {
+    fn version_output_is_identical_for_every_form() {
+        // `--version` moved from the node options to the top-level command, so
+        // pin that it still prints one string: `ethereum/hive` records this
+        // output as the client version.
+        let mut after_flags: Vec<&str> = FLAT.to_vec();
+        after_flags.push("--version");
+        let printed: Vec<String> = [
+            vec!["ethlambda", "--version"],
+            vec!["ethlambda", NODE, "--version"],
+            after_flags,
+        ]
+        .into_iter()
+        .map(|args| {
+            try_parse_from(args.iter().map(OsString::from))
+                .expect_err("--version short-circuits parsing")
+                .to_string()
+        })
+        .collect();
+        assert_eq!(printed[0], printed[1]);
+        assert_eq!(printed[0], printed[2]);
+    }
+
+    #[test]
+    fn help_lists_the_sub_commands() {
+        // Listed by clap itself, because they are real sub-commands.
         let err = try_parse_from(["ethlambda", "--help"].iter().map(OsString::from))
             .expect_err("--help short-circuits parsing");
         assert!(err.to_string().contains(NODE), "{err}");

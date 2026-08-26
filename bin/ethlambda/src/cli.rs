@@ -3,16 +3,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::version;
-
-#[derive(Debug, clap::Parser)]
-#[command(
-    name = "ethlambda",
-    author = "LambdaClass",
-    version = version::CLIENT_VERSION,
-    about = "ethlambda consensus client",
-    after_help = crate::command::HELP_NOTE
-)]
+#[derive(Debug, clap::Args)]
 pub(crate) struct CliOptions {
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]

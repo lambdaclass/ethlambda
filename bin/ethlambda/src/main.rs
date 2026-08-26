@@ -32,6 +32,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+use command::Command;
+
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -79,7 +81,7 @@ async fn main() -> eyre::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .wrap_err("failed to set global tracing subscriber")?;
 
-    let options = command::parse();
+    let Command::Node(options) = command::parse();
     options.validate_discovery()?;
 
     #[cfg(feature = "shadow-integration")]
