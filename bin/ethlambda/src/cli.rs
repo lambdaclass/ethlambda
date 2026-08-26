@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
-pub(crate) struct CliOptions {
+pub(crate) struct NodeOptions {
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     pub(crate) genesis: PathBuf,
@@ -159,7 +159,7 @@ pub(crate) struct DiscoveryConfig {
     pub(crate) target_peers: usize,
 }
 
-impl CliOptions {
+impl NodeOptions {
     /// Reject a discovery port that collides with the QUIC port.
     ///
     /// Both are UDP. Without this the collision surfaces at bind time as an
@@ -219,7 +219,7 @@ mod tests {
     use super::*;
 
     /// The required flags, so a test can vary only what it cares about.
-    fn parse(extra: &[&str]) -> CliOptions {
+    fn parse(extra: &[&str]) -> NodeOptions {
         let mut argv = vec![
             "ethlambda",
             "--genesis",

@@ -12,7 +12,7 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
-use crate::cli::CliOptions;
+use crate::cli::NodeOptions;
 use crate::version;
 
 /// Tokens that already say what to run, so no default is inserted ahead of
@@ -40,7 +40,7 @@ struct Cli {
 /// What the command line asked the binary to do.
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum Command {
-    /// Run the consensus node (assumed when no sub-command is given).
+    /// Run the consensus node (default when no sub-command is given).
     ///
     /// `ethlambda --genesis ...` and `ethlambda node --genesis ...` are the
     /// same invocation.
@@ -51,7 +51,7 @@ pub(crate) enum Command {
     // flags were the whole command line. It is still listed and invoked as
     // `node`.
     #[command(display_name = "ethlambda")]
-    Node(CliOptions),
+    Node(NodeOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -74,11 +74,11 @@ where
 
 /// The sub-command to insert, if the arguments do not name one.
 ///
-/// `CliOptions` declares no positional arguments, so the first token after the
-/// program name is either a flag or a sub-command — a flag *value* never lands
-/// there and is never mistaken for one. A leading flag therefore means the flat
-/// node form, and gets `node` inserted ahead of it; a bare invocation is left
-/// alone so clap prints its own "requires a subcommand" help.
+/// `NodeOptions` declares no positional arguments, so the first token after
+/// the program name is either a flag or a sub-command — a flag *value* never
+/// lands there and is never mistaken for one. A leading flag therefore means
+/// the flat node form, and gets `node` inserted ahead of it; a bare invocation
+/// is left alone so clap prints its own "requires a subcommand" help.
 fn default_subcommand(args: &[OsString]) -> Option<&'static str> {
     let first = args.get(1)?.to_str()?;
     (!EXPLICIT.contains(&first)).then_some(NODE)
@@ -87,10 +87,10 @@ fn default_subcommand(args: &[OsString]) -> Option<&'static str> {
 /// Parse a command line that is expected to run the node, returning just its
 /// options.
 ///
-/// `CliOptions` is a `clap::Args` group rather than a parser of its own, so
+/// `NodeOptions` is a `clap::Args` group rather than a parser of its own, so
 /// tests that exercise it go through the real dispatch like everything else.
 #[cfg(test)]
-pub(crate) fn parse_node_options<I>(args: I) -> CliOptions
+pub(crate) fn parse_node_options<I>(args: I) -> NodeOptions
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
@@ -137,7 +137,7 @@ mod tests {
         args
     }
 
-    fn node_options(args: &[&str]) -> CliOptions {
+    fn node_options(args: &[&str]) -> NodeOptions {
         parse_node_options(args.iter().map(OsString::from))
     }
 
@@ -156,8 +156,8 @@ mod tests {
         let flat = node_options(FLAT);
         let scoped = node_options(&with_node_token());
         // Compared through `Debug`, which the derive prints field by field,
-        // because `CliOptions` derives no `PartialEq` — and deriving one for a
-        // test would touch the parser this module deliberately leaves alone.
+        // because `NodeOptions` derives no `PartialEq` — and deriving one for
+        // a test would touch the parser this module deliberately leaves alone.
         assert_eq!(format!("{flat:?}"), format!("{scoped:?}"));
     }
 
