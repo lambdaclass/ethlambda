@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e6677ac6.js";
+            window.path_to_searchindex_js = "searchindex-6e96cfa5.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3e38a8b2.js"></script>
+        <script src="toc-cb75f9b5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -2132,6 +2132,22 @@ phases it contains.</p>
 </tbody>
 </table>
 </div>
+<h3 id="peer-discovery"><a class="header" href="#peer-discovery">Peer Discovery</a></h3>
+<p>Only emitted when discv5 discovery is enabled (<code>--discovery.enable</code>); see
+<a href="#peer-discovery-discv5">Peer discovery</a>. Counts dials discovery initiated, as opposed to
+the static bootnode dials every node makes. Connection outcomes are not repeated
+here: a discovery dial that succeeds or fails shows up in
+<code>lean_peer_connection_events_total</code> like any other.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_discovered_peers_dialed_total</code></td><td>Counter</td><td>Peers dialed as a result of discv5 discovery</td><td>On dialing a discovered peer</td><td></td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
 <p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
 <p>Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a <code>data.slot</code> several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out <code>before</code> entirely.</p>
@@ -2844,6 +2860,147 @@ to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 </tbody>
 </table>
 </div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="peer-discovery-discv5"><a class="header" href="#peer-discovery-discv5">Peer discovery (discv5)</a></h1>
+<p>ethlambda can find peers over
+<a href="https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md">discv5</a>
+instead of relying only on the static bootnode list. The implementation reuses
+<a href="https://github.com/lambdaclass/ethrex">ethrex</a>’s discovery stack, with discv4
+disabled.</p>
+<p>Discovery is <strong>off by default</strong>. Nothing else on the lean network speaks discv5
+today: not leanSpec, not ream’s lean network, not zeam. Enabling it currently
+only finds other ethlambda nodes.</p>
+<h2 id="enabling-it"><a class="header" href="#enabling-it">Enabling it</a></h2>
+<pre><code class="language-bash">ethlambda --discovery.enable
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--discovery.enable</code></td><td><code>false</code></td><td>Run the discv5 server and the dial loop</td></tr>
+<tr><td><code>--discovery.port</code></td><td><code>9000</code></td><td>UDP port for the discv5 socket</td></tr>
+<tr><td><code>--discovery.advertise-ip</code></td><td>bind address (<code>0.0.0.0</code>)</td><td>IP address to advertise in the ENR</td></tr>
+<tr><td><code>--discovery.target-peers</code></td><td><code>200</code></td><td>Connected-peer count above which dialing stops</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>--discovery.port</code> and <code>--gossipsub-port</code> (default <code>9001</code>, libp2p QUIC) are both
+UDP and so cannot share a port. The defaults are one apart, so <code>--discovery.enable</code>
+works on its own; overriding either onto the other is rejected at startup.</p>
+<p>The discv5 socket always binds the wildcard <code>0.0.0.0</code>, since that is where we
+listen, not where peers should dial us. Without <code>--discovery.advertise-ip</code> the
+published ENR inherits that same <code>0.0.0.0</code>, which is not a dialable address:
+set the flag to <code>127.0.0.1</code> for a local devnet or to the host’s public address
+so the ENR is usable as soon as it is published. discv5’s PONG-based IP voting
+may still replace the advertised address later, once a peer’s response tells
+the node what its external address looks like.</p>
+<h2 id="the-enr"><a class="header" href="#the-enr">The ENR</a></h2>
+<p>The layout follows the discovery domain of the beacon-chain
+<a href="https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md">phase0 p2p interface spec</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Entry</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td><code>v4</code></td></tr>
+<tr><td><code>ip</code></td><td><code>--discovery.advertise-ip</code>, or the bind address (<code>0.0.0.0</code>) if unset</td></tr>
+<tr><td><code>udp</code></td><td><code>--discovery.port</code></td></tr>
+<tr><td><code>quic</code></td><td><code>--gossipsub-port</code>, the libp2p QUIC listener</td></tr>
+<tr><td><code>secp256k1</code></td><td>compressed public key from <code>--node-key</code></td></tr>
+<tr><td><code>eth2</code></td><td>SSZ <code>ENRForkID</code>, 16 bytes</td></tr>
+<tr><td><code>attnets</code></td><td>subscribed attestation subnet bitfield</td></tr>
+</tbody>
+</table>
+</div>
+<p>The local ENR is logged once at startup.</p>
+<p>This same record is handed to ethrex’s <code>DiscoveryServer</code>, so it is what answers
+discv5 queries: what we report and what peers see are the same bytes. If IP
+voting later changes our external address, ethrex edits and re-signs that record
+rather than rebuilding one, so the consensus entries survive the bump; only the
+sequence number and <code>ip</code> move, which the reported ENR then lags.</p>
+<h2 id="which-peers-get-dialed"><a class="header" href="#which-peers-get-dialed">Which peers get dialed</a></h2>
+<p>A discovered peer is admitted only if:</p>
+<ul>
+<li>its ENR carries a decodable <code>eth2</code> entry, <strong>and</strong></li>
+<li>that entry’s <code>fork_digest</code> equals ours, <strong>and</strong></li>
+<li>it advertises a <code>quic</code> port.</li>
+</ul>
+<p>A differing <code>next_fork_version</code> or <code>next_fork_epoch</code> is <em>not</em> grounds for
+rejection: the spec permits connecting to a peer that is incompatible with an
+upcoming fork but compatible now.</p>
+<p>These checks are handed to ethrex’s peer table as a <code>PeerFilter</code>, so each record
+is judged the moment it arrives and a peer that fails is not offered for dialing.
+No rejection is final: the peer table runs the filter again as soon as the peer
+publishes a higher-<code>seq</code> ENR, so a node that adds a <code>quic</code> entry, or gains an
+address through discv5’s IP voting, is reconsidered without a restart.</p>
+<p>Admitted peers are ranked by how many attestation subnets they advertise that no
+currently connected peer covers, so discovery preferentially fills gaps in subnet
+coverage. A peer advertising no <code>attnets</code> is ranked last but never dropped.</p>
+<p>Dialing stops once <code>--discovery.target-peers</code> peers are connected, and resumes
+if that count drops. That is all the flag does: it is the dial loop’s cutoff, and
+nothing in ethrex’s peer table or discv5’s own pacing enforces it (see
+<a href="#discv5-lookups-run-at-the-startup-rate">below</a>).</p>
+<h2 id="bootnodes"><a class="header" href="#bootnodes">Bootnodes</a></h2>
+<p>The two entries a bootnode ENR can carry are read independently, because they
+answer different questions:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Entry</th><th>Absent means</th></tr>
+</thead>
+<tbody>
+<tr><td><code>quic</code></td><td>Not dialed statically by <code>build_swarm</code>; discv5 seed only</td></tr>
+<tr><td><code>udp</code></td><td>Not seeded into the discv5 routing table; static dial target only</td></tr>
+</tbody>
+</table>
+</div>
+<p>Neither absence is an error, and a record carrying just one of them is still
+kept. The ENRs <code>lean-quickstart</code> generates today carry <code>ip</code>/<code>quic</code>/<code>secp256k1</code>
+and no <code>udp</code>, so they stay reachable but contribute nothing to discovery. Every
+beacon-chain bootnode published today is the mirror image: a <code>udp</code> port but no
+<code>quic</code>, usable as a discv5 seed but never dialed. A record with neither is
+dropped with a warning, as is one missing an <code>ip</code> or a <code>secp256k1</code> key.</p>
+<p>The ENR a node logs at startup is only useful to a peer if that node was
+started with a real <code>--discovery.advertise-ip</code>.
+Copying an ENR built from the default <code>0.0.0.0</code> into another node’s bootnode
+list produces a <code>udp</code>/<code>quic</code> target that cannot be dialed, since <code>0.0.0.0</code>
+names no reachable host. Set <code>--discovery.advertise-ip</code> before pointing other
+nodes at this one’s ENR: <code>127.0.0.1</code> on a local devnet, or the host’s public
+address otherwise.</p>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known limitations</a></h2>
+<h3 id="one-lean-devnet-is-not-separated-from-another"><a class="header" href="#one-lean-devnet-is-not-separated-from-another">One lean devnet is not separated from another</a></h3>
+<p>The spec’s <code>fork_digest</code> is derived from genesis, so it separates one chain from
+another. ethlambda’s is the hardcoded cross-client dummy <code>0x12345678</code>, and lean
+defines no fork schedule, so every <code>ENRForkID</code> field is a constant. The <code>eth2</code>
+check therefore separates lean from non-lean but <strong>not one lean devnet from
+another</strong>: two devnets running this code will peer with each other. Closing that
+gap requires lean adopting a genesis-derived fork digest, which is a
+cross-client change to gossip topic names.</p>
+<h3 id="discv5-lookups-run-at-the-startup-rate"><a class="header" href="#discv5-lookups-run-at-the-startup-rate">discv5 lookups run at the startup rate</a></h3>
+<p>ethrex paces its discv5 iterative lookups by how full its own peer table is,
+easing from one lookup every 500ms at startup to one every 10s once the table
+reaches its target. That table only counts peers registered through
+<code>NewConnectedPeer</code>, which carries an RLPx connection; ethlambda connects over
+libp2p and registers nothing, so the count is permanently zero and the pacing
+never eases off the startup rate. A lean node therefore keeps looking up every
+500ms rather than settling at 10s, roughly 20x the intended steady-state
+<code>FindNode</code> traffic, for the life of the process.</p>
+<p><code>--discovery.target-peers</code> deliberately does <em>not</em> feed that computation, since a
+target of <code>0</code> would make it divide by zero and re-fire the lookup timer with no
+delay at all. Closing the gap properly means ethrex learning about non-RLPx
+connections, which is an upstream change.</p>
+<h3 id="attnets-is-not-a-fixed-width-ssz-bitvector"><a class="header" href="#attnets-is-not-a-fixed-width-ssz-bitvector"><code>attnets</code> is not a fixed-width SSZ <code>Bitvector</code></a></h3>
+<p>The spec’s <code>attnets</code> is <code>Bitvector[ATTESTATION_SUBNET_COUNT]</code>, a constant every
+conformant client shares, which is what makes an undelimited bitfield decodable.
+ethlambda derives the width from <code>attestation_committee_count</code>, which is runtime
+configuration, so two nodes can legitimately exchange bitfields of different
+lengths. The bit-packing convention is identical to the spec’s; only the width
+is negotiable. Readers tolerate a foreign length by treating bits past the end
+as unset, and a peer’s advertised subnets are clamped to the local committee
+count before they influence anything.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="spec-deviations"><a class="header" href="#spec-deviations">Spec Deviations</a></h1>
 <p>ethlambda diverges from the <a href="https://github.com/leanEthereum/leanSpec">leanSpec</a>
