@@ -38,7 +38,7 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_block,
+        publish_attestation, publish_block, scoring,
     },
     req_resp::{
         BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
@@ -152,6 +152,55 @@ pub(crate) struct Behaviour {
     req_resp: request_response::Behaviour<Codec>,
 }
 
+/// The gossipsub configuration every node runs. Extracted from
+/// [`build_swarm`] so tests can exercise the real parameters rather than a
+/// hand-rolled approximation of them.
+pub(crate) fn gossipsub_config() -> libp2p::gossipsub::Config {
+    libp2p::gossipsub::ConfigBuilder::default()
+        // d
+        .mesh_n(GOSSIP_MESH_N)
+        // d_low
+        .mesh_n_low(6)
+        // d_high
+        .mesh_n_high(12)
+        // d_lazy
+        .gossip_lazy(6)
+        .heartbeat_interval(Duration::from_millis(700))
+        .fanout_ttl(Duration::from_secs(60))
+        .history_length(6)
+        .history_gossip(3)
+        // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
+        .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
+        .validation_mode(ValidationMode::Anonymous)
+        .message_id_fn(compute_message_id)
+        // Taken from ream
+        .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
+        .max_messages_per_rpc(Some(500))
+        .allow_self_origin(true)
+        .idontwant_message_size_threshold(1000)
+        // Flood publish (default: true) fans our own publishes out to every
+        // connected peer instead of just the mesh. The gossipsub v1.1 spec
+        // defines it as score-gated, and with scoring enabled below that gate
+        // is real, but the parameter stays off: neither leanSpec nor the
+        // Ethereum consensus-specs p2p interface asks for flooding, and both
+        // lighthouse and ream disable it.
+        //
+        // Only topics with more than `mesh_n` subscribed peers are affected,
+        // since below that the mesh-bounded path selects everyone anyway. That
+        // means `block` and `aggregation`, which every node subscribes to. An
+        // `attestation_N` topic is unaffected wherever its subnet has fewer
+        // than `mesh_n` subscribers. So this cuts egress bytes and does
+        // nothing for the per-peer send-queue entry count.
+        .flood_publish(false)
+        .build()
+        .expect("invalid gossipsub config")
+}
+
+/// Gossipsub `d`: the target mesh degree. Shared between the gossipsub config
+/// and the scoring parameters, which divide expected message rates by it to
+/// work out a peer's fair share of first deliveries.
+pub(crate) const GOSSIP_MESH_N: usize = 8;
+
 /// Configuration for building the libp2p swarm.
 ///
 /// INVARIANT: `subscription_subnets` is the fixed set of attestation subnets
@@ -169,6 +218,11 @@ pub struct SwarmConfig {
     pub bootnodes: Vec<Bootnode>,
     pub listening_socket: SocketAddr,
     pub validator_ids: Vec<u64>,
+    /// Validators in the whole network, from genesis. Distinct from
+    /// `validator_ids`, which are only this node's. Peer scoring needs the
+    /// network figure because the message rate a topic carries is a property
+    /// of the network, not of us.
+    pub network_validator_count: u64,
     pub attestation_committee_count: u64,
     /// Attestation subnets to subscribe to, precomputed via
     /// [`attestation_subscription_subnets`].
@@ -220,34 +274,24 @@ pub struct BuiltSwarm {
 pub fn build_swarm(
     config: SwarmConfig,
 ) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
-    let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
-        // d
-        .mesh_n(8)
-        // d_low
-        .mesh_n_low(6)
-        // d_high
-        .mesh_n_high(12)
-        // d_lazy
-        .gossip_lazy(6)
-        .heartbeat_interval(Duration::from_millis(700))
-        .fanout_ttl(Duration::from_secs(60))
-        .history_length(6)
-        .history_gossip(3)
-        // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
-        .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
-        .validation_mode(ValidationMode::Anonymous)
-        .message_id_fn(compute_message_id)
-        // Taken from ream
-        .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
-        .max_messages_per_rpc(Some(500))
-        .allow_self_origin(true)
-        .idontwant_message_size_threshold(1000)
-        .build()
-        .expect("invalid gossipsub config");
+    let gossipsub_config = gossipsub_config();
 
-    let gossipsub =
+    let mut gossipsub =
         libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
             .expect("failed to initiate behaviour");
+
+    // Turn on peer scoring. Until this call gossipsub sits in
+    // `PeerScoreState::Disabled`, which makes its slow-peer penalty, its
+    // negative-score mesh prune and its publish/gossip gates all no-ops. See
+    // `gossipsub::scoring` for the parameters and how they were derived.
+    let scoring_topology = scoring::ScoringTopology {
+        network_validator_count: config.network_validator_count,
+        attestation_committee_count: config.attestation_committee_count,
+        mesh_n: GOSSIP_MESH_N,
+    };
+    gossipsub
+        .with_peer_score(scoring::params(&scoring_topology), scoring::thresholds())
+        .expect("invalid gossipsub peer score parameters");
 
     let req_resp = request_response::Behaviour::new(
         vec![
@@ -555,6 +599,33 @@ async fn handle_swarm_event(
             message @ libp2p::gossipsub::Event::Message { .. },
         )) => {
             gossipsub::handle_gossipsub_message(server, message).await;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::SlowPeer {
+            peer_id,
+            failed_messages,
+        })) => {
+            // Raised from the gossipsub heartbeat for every peer whose send
+            // queue rejected at least one message since the previous
+            // heartbeat, the same condition behind the `Send Queue full` WARN
+            // from `libp2p_gossipsub::behaviour`. Before this arm existed the
+            // event fell into the catch-all, so that WARN was the only trace
+            // of a peer we could not reach.
+            //
+            // Deliberately no disconnect. Lighthouse scales gossipsub's
+            // negative score contribution so it can never disconnect a peer on
+            // its own and leaves that to a separate application-level score we
+            // do not have. The reaction here is gossipsub's own: the scoring
+            // enabled in `build_swarm` charges `slow_peer_weight` per failed
+            // message, which drives the peer negative and lets the heartbeat
+            // prune it from the mesh. We only record it.
+            let priority = failed_messages.priority;
+            let non_priority = failed_messages.non_priority;
+            let node_name = server.resolve_node_name(Some(&peer_id));
+            metrics::observe_slow_peer(node_name, priority, non_priority);
+            // The resulting score is published by the periodic
+            // `lean_gossip_peer_score` refresh on the swarm task, which reads
+            // the behaviour directly instead of round-tripping a command.
+            debug!(%peer_id, priority, non_priority, "Slow gossipsub peer");
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,

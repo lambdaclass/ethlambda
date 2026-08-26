@@ -251,3 +251,85 @@ pub fn update_gossip_mesh_peers<'a>(
             .set(count);
     }
 }
+
+/// Refresh the per-peer gossipsub score gauge.
+///
+/// Scores only exist once `with_peer_score` has been called; `peer_score`
+/// returns `None` for an unscored peer, and those are skipped rather than
+/// published as 0.0, so a missing series means scoring is off rather than a
+/// peer sitting at neutral.
+pub fn update_gossip_peer_scores<'a>(
+    scores: impl Iterator<Item = (&'a PeerId, f64)>,
+    node_names: &HashMap<PeerId, String>,
+) {
+    static LEAN_GOSSIP_PEER_SCORE: LazyLock<GaugeVec> = LazyLock::new(|| {
+        register_gauge_vec!(
+            "lean_gossip_peer_score",
+            "Current gossipsub score for each connected peer",
+            &["node_name"]
+        )
+        .unwrap()
+    });
+    for (peer_id, score) in scores {
+        let name = node_names
+            .get(peer_id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        LEAN_GOSSIP_PEER_SCORE.with_label_values(&[name]).set(score);
+    }
+}
+
+/// Record a gossipsub `Event::SlowPeer` report.
+///
+/// The event fires from the gossipsub heartbeat and carries the messages that
+/// failed to enqueue for that peer since the previous heartbeat, split by
+/// queue. `non_priority` covers Publish, Forward, IHave and IWant, which share
+/// one bounded queue sized by `connection_handler_queue_len`; `priority`
+/// covers the separate control queue, whose cap is hardcoded in the fork.
+pub fn observe_slow_peer(node_name: &str, priority: usize, non_priority: usize) {
+    static LEAN_GOSSIP_SLOW_PEER_REPORTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_slow_peer_reports_total",
+            "Gossipsub SlowPeer events, one per heartbeat in which a peer failed to consume",
+            &["node_name"]
+        )
+        .unwrap()
+    });
+    static LEAN_GOSSIP_FAILED_MESSAGES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_failed_messages_total",
+            "Messages that could not be enqueued for a peer, by queue",
+            &["node_name", "queue"]
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIP_SLOW_PEER_REPORTS
+        .with_label_values(&[node_name])
+        .inc();
+    LEAN_GOSSIP_FAILED_MESSAGES
+        .with_label_values(&[node_name, "priority"])
+        .inc_by(priority as u64);
+    LEAN_GOSSIP_FAILED_MESSAGES
+        .with_label_values(&[node_name, "non_priority"])
+        .inc_by(non_priority as u64);
+}
+
+/// Record a gossipsub publish that never reached the wire.
+///
+/// Previously these were logged and discarded, so a node losing every publish
+/// looked identical to a healthy one in metrics. `reason` is the
+/// `PublishError` variant, which distinguishes total loss (`AllQueuesFull`,
+/// every recipient's queue was full) from the benign cases.
+pub fn inc_gossip_publish_failed(reason: &str) {
+    static LEAN_GOSSIP_PUBLISH_FAILED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_gossip_publish_failed_total",
+            "Gossipsub publishes rejected before reaching the wire, by PublishError variant",
+            &["reason"]
+        )
+        .unwrap()
+    });
+    LEAN_GOSSIP_PUBLISH_FAILED
+        .with_label_values(&[reason])
+        .inc();
+}

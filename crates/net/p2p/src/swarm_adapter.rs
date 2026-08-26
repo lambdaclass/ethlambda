@@ -127,10 +127,12 @@ async fn swarm_loop(
                 execute_command(&mut swarm, cmd);
             }
             _ = mesh_metric_tick.tick() => {
-                metrics::update_gossip_mesh_peers(
-                    swarm.behaviour().gossipsub.all_mesh_peers(),
-                    &node_names,
-                );
+                let gossipsub = &swarm.behaviour().gossipsub;
+                metrics::update_gossip_mesh_peers(gossipsub.all_mesh_peers(), &node_names);
+                let scores = gossipsub.all_peers().filter_map(|(peer_id, _)| {
+                    gossipsub.peer_score(peer_id).map(|score| (peer_id, score))
+                });
+                metrics::update_gossip_peer_scores(scores, &node_names);
             }
         }
     }
@@ -144,7 +146,10 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .behaviour_mut()
                 .gossipsub
                 .publish(topic, data)
-                .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
+                .inspect_err(|err| {
+                    metrics::inc_gossip_publish_failed(publish_error_kind(err));
+                    debug!(%err, "Swarm adapter: publish failed");
+                })
                 .ok();
         }
         SwarmCommand::Dial(addr) => {
@@ -173,5 +178,24 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .send_response(channel, response)
                 .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
         }
+    }
+}
+
+/// Stable label for a `PublishError`, keeping the publish-failure counter
+/// low-cardinality. `AllQueuesFull` is the variant that means real loss: every
+/// recipient's send queue was full, so the message never reached the wire.
+///
+/// Matched exhaustively on purpose, with no catch-all: the fork gates one more
+/// variant behind its `partial_messages` feature, and if that is ever enabled
+/// the compiler should point here rather than silently bucketing it.
+fn publish_error_kind(err: &libp2p::gossipsub::PublishError) -> &'static str {
+    use libp2p::gossipsub::PublishError;
+    match err {
+        PublishError::Duplicate => "duplicate",
+        PublishError::SigningError(_) => "signing_error",
+        PublishError::NoPeersSubscribedToTopic => "no_peers_subscribed",
+        PublishError::MessageTooLarge => "message_too_large",
+        PublishError::TransformFailed(_) => "transform_failed",
+        PublishError::AllQueuesFull(_) => "all_queues_full",
     }
 }

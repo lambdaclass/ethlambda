@@ -5,10 +5,10 @@ pub mod timing;
 
 // Re-export prometheus types and macros we use
 pub use prometheus::{
-    Encoder, Error as PrometheusError, Histogram, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec, TextEncoder, core::Collector, gather, register_histogram,
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec,
+    Encoder, Error as PrometheusError, GaugeVec, Histogram, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder, core::Collector, gather, register_gauge_vec,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, register_int_gauge_vec,
 };
 
 // Re-export commonly used items

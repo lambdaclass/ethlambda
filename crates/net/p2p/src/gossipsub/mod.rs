@@ -1,6 +1,7 @@
 mod encoding;
 mod handler;
 mod messages;
+pub mod scoring;
 
 pub use encoding::decompress_message;
 pub use handler::{

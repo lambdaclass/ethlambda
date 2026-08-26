@@ -266,6 +266,7 @@ async fn main() -> eyre::Result<()> {
         bootnodes,
         listening_socket: p2p_socket,
         validator_ids,
+        network_validator_count: genesis_config.genesis_validators.len() as u64,
         attestation_committee_count,
         subscription_subnets: subscribed_subnets,
     })
