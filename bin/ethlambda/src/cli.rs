@@ -217,8 +217,12 @@ pub(crate) struct ShadowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{Command, try_parse_from};
 
     /// The required flags, so a test can vary only what it cares about.
+    ///
+    /// `NodeOptions` is a `clap::Args` group rather than a parser of its own,
+    /// so this parses through the real dispatch, as the binary does.
     fn parse(extra: &[&str]) -> NodeOptions {
         let mut argv = vec![
             "ethlambda",
@@ -238,7 +242,8 @@ mod tests {
             "ethlambda_0",
         ];
         argv.extend_from_slice(extra);
-        crate::command::parse_node_options(argv)
+        let Command::Node(options) = try_parse_from(argv).expect("node options parse");
+        options
     }
 
     /// `--discovery.enable` on its own has to work: a default that is never

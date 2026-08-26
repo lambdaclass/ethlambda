@@ -60,7 +60,7 @@ pub(crate) fn parse() -> Command {
     try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
 }
 
-fn try_parse_from<I>(args: I) -> Result<Command, clap::Error>
+pub(crate) fn try_parse_from<I>(args: I) -> Result<Command, clap::Error>
 where
     I: IntoIterator,
     I::Item: Into<OsString>,
@@ -82,21 +82,6 @@ where
 fn default_subcommand(args: &[OsString]) -> Option<&'static str> {
     let first = args.get(1)?.to_str()?;
     (!EXPLICIT.contains(&first)).then_some(NODE)
-}
-
-/// Parse a command line that is expected to run the node, returning just its
-/// options.
-///
-/// `NodeOptions` is a `clap::Args` group rather than a parser of its own, so
-/// tests that exercise it go through the real dispatch like everything else.
-#[cfg(test)]
-pub(crate) fn parse_node_options<I>(args: I) -> NodeOptions
-where
-    I: IntoIterator,
-    I::Item: Into<OsString>,
-{
-    let Command::Node(options) = try_parse_from(args).expect("node options parse");
-    options
 }
 
 #[cfg(test)]
@@ -138,7 +123,9 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> NodeOptions {
-        parse_node_options(args.iter().map(OsString::from))
+        let Command::Node(options) =
+            try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        options
     }
 
     #[test]
