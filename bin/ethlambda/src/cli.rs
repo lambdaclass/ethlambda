@@ -4,11 +4,8 @@ use ethlambda_p2p::discovery::DEFAULT_DISCOVERY_TARGET_PEERS;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::version;
-
-#[derive(Debug, clap::Parser)]
-#[command(name = "ethlambda", author = "LambdaClass", version = version::CLIENT_VERSION, about = "ethlambda consensus client")]
-pub(crate) struct CliOptions {
+#[derive(Debug, clap::Args)]
+pub(crate) struct NodeOptions {
     /// Path to the chain genesis config (e.g., config.yaml).
     #[arg(long)]
     pub(crate) genesis: PathBuf,
@@ -173,7 +170,7 @@ pub(crate) struct DiscoveryConfig {
     pub(crate) target_peers: usize,
 }
 
-impl CliOptions {
+impl NodeOptions {
     /// Reject a discovery port that collides with the QUIC port.
     ///
     /// Both are UDP. Without this the collision surfaces at bind time as an
@@ -231,10 +228,13 @@ pub(crate) struct ShadowOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
+    use crate::command::{Command, try_parse_from};
 
     /// The required flags, so a test can vary only what it cares about.
-    fn parse(extra: &[&str]) -> CliOptions {
+    ///
+    /// `NodeOptions` is a `clap::Args` group rather than a parser of its own,
+    /// so this parses through the real dispatch, as the binary does.
+    fn parse(extra: &[&str]) -> NodeOptions {
         let mut argv = vec![
             "ethlambda",
             "--genesis",
@@ -253,7 +253,8 @@ mod tests {
             "ethlambda_0",
         ];
         argv.extend_from_slice(extra);
-        CliOptions::parse_from(argv)
+        let Command::Node(options) = try_parse_from(argv).expect("node options parse");
+        options
     }
 
     /// `--discovery.enable` on its own has to work: a default that is never
