@@ -503,8 +503,8 @@ pub fn slot_is_justifiable_after(slot: u64, finalized_slot: u64) -> bool {
 /// funnel votes towards only some slots, increasing finalization chances.
 ///
 /// When the `lean-ffi` feature is enabled, this calls the formally verified
-/// Lean4 implementation via FFI. The Lean implementation has been proven correct
-/// for all natural numbers (see `formal/EthLambda/Justifiability/`).
+/// Lean4 implementation via FFI. Its equivalence theorem covers deltas below
+/// `2^62`, the range where the pronic discriminant fits in `u64`.
 ///
 /// Without the feature, uses the native Rust implementation.
 #[cfg(not(feature = "lean-ffi"))]

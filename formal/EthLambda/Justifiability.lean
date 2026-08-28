@@ -33,12 +33,16 @@ def isqrt (n : UInt64) : UInt64 :=
     -- r+1 ≤ n/(r+1)  ↔  (r+1)*(r+1) ≤ n  (when r+1 > 0)
     if r + 1 <= n / (r + 1) then r + 1 else r
 
-/-- Computable justifiability check mirroring the Rust implementation. -/
+/-- Computable justifiability check mirroring Rust's checked arithmetic.
+    The pronic discriminant is evaluated only when `4 * delta + 1` fits in
+    `UInt64`; otherwise that branch returns `false`. -/
 def justifiable (delta : UInt64) : Bool :=
   delta <= 5
     || isqrt delta ^ 2 == delta
-    || (let val := 4 * delta + 1
-        isqrt val ^ 2 == val && val % 2 == 1)
+    || if delta <= 4611686018427387903 then
+         let val := 4 * delta + 1
+         isqrt val ^ 2 == val && val % 2 == 1
+       else false
 
 /-- Full slot-level function matching the Rust `slot_is_justifiable_after` API. -/
 def slotIsJustifiableAfter (slot finalizedSlot : UInt64) : Bool :=
