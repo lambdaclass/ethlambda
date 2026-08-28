@@ -401,6 +401,12 @@ private lemma uint64_sq_toNat (a : UInt64) (ha : a.toNat < 2 ^ 32) :
 theorem justifiable_equiv (d : UInt64) (h : d.toNat < 2 ^ 62) :
     justifiable d = true ↔ Justifiable d.toNat := by
   rw [justifiable_iff]
+  have hguard : d ≤ 4611686018427387903 := by
+    apply UInt64.le_iff_toNat_le_toNat.mpr
+    have hlimit : (4611686018427387903 : UInt64).toNat = 2 ^ 62 - 1 := by
+      decide
+    rw [hlimit]
+    omega
   -- Bounds for 4 * d + 1 not overflowing
   have hval_nat : (4 * d + 1).toNat = 4 * d.toNat + 1 := by
     have h4_eq : (4 : UInt64).toNat = 4 := by decide
@@ -427,7 +433,8 @@ theorem justifiable_equiv (d : UInt64) (h : d.toNat < 2 ^ 62) :
     simp [UInt64.toNat_one]
   -- Unfold justifiable and convert Bool to Prop
   unfold justifiable
-  simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq]
+  simp only [hguard, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true,
+    decide_eq_true_eq, beq_iff_eq]
   -- The let binding in justifiable introduces `val := 4 * d + 1`; after simp, it becomes
   -- direct UInt64 expressions that we can rewrite with our bridge lemmas
   constructor
