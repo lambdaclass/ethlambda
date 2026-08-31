@@ -1,7 +1,9 @@
 # Slots and Intervals
 
-A Lean Chain slot has a duration of 4 seconds and is divided in 5 intervals of 800 ms.
-Every duty a validator owes the chain is due in one of them:
+A Lean Chain slot is divided in 5 intervals of equal length. Every duty a validator
+owes the chain is due in one of them. The slot lasts 4 seconds by default, so the
+offsets below are the 800 ms grid; a network that sets `MILLISECONDS_PER_SLOT` in its
+config file scales every offset by the same factor:
 
 | Interval | Offset | Duty | Who acts | What it publishes |
 | --- | --- | --- | --- | --- |
@@ -30,9 +32,12 @@ what the previous one produced. A duty that overruns its interval is not resched
 lands late, and the slot moves on without it.
 
 > **In ethlambda:** the intervals are the `SlotInterval` variants in
-> `crates/blockchain/src/lib.rs`, and their length comes from
-> `MILLISECONDS_PER_INTERVAL` and `INTERVALS_PER_SLOT` in
-> `crates/common/types/src/constants.rs`.
+> `crates/blockchain/src/lib.rs`. `INTERVALS_PER_SLOT` is fixed in
+> `crates/common/types/src/constants.rs` (each interval carries a distinct duty, so
+> the count is not a knob), while the slot duration is read from the network's config
+> file into `ChainConfig`, which derives the interval length from it. Every node
+> on a network must agree on the value, and other clients still hold it at compile
+> time: setting it only has an effect where every node reads the key.
 
 ## Interval 0: Block proposal
 

@@ -9,9 +9,17 @@
 // TODO: derive dynamically once the spec defines fork identification.
 pub const FORK_DIGEST: &str = "12345678";
 
-/// Milliseconds per interval (800ms ticks).
-pub const MILLISECONDS_PER_INTERVAL: u64 = 800;
-/// Number of intervals per slot (5 intervals of 800ms = 4 seconds).
+/// Number of intervals per slot.
+///
+/// Fixed rather than configurable: each interval carries a distinct validator
+/// duty (see `SlotInterval` in `ethlambda-blockchain`), so the count is part of
+/// the protocol rather than a tuning knob. The slot duration is configurable;
+/// see [`crate::chain_config::ChainConfig`].
 pub const INTERVALS_PER_SLOT: u64 = 5;
-/// Milliseconds in a slot (derived from interval duration and count).
-pub const MILLISECONDS_PER_SLOT: u64 = MILLISECONDS_PER_INTERVAL * INTERVALS_PER_SLOT;
+
+/// Slot duration used when the network's config file omits
+/// `MILLISECONDS_PER_SLOT`.
+///
+/// Matches the spec's `SECONDS_PER_SLOT = 4`, so a config file written before
+/// the key existed keeps the cadence it was running.
+pub const DEFAULT_MILLISECONDS_PER_SLOT: u64 = 4_000;

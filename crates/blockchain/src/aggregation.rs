@@ -2,7 +2,7 @@
 //! pure functions it runs.
 //!
 //! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
+//! or up to [`early_aggregation_window`] early when the 2/3 signature
 //! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
@@ -36,35 +36,41 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
-use crate::{MILLISECONDS_PER_INTERVAL, metrics};
+use crate::metrics;
 
 /// Soft deadline for committee-signature aggregation measured from session
-/// start. After this much wall time elapses, the actor signals the worker to
-/// stop via its cancellation token. A session started exactly at interval 2
-/// gets the full interval (interval 3 is one interval later); a session
-/// started early (see `maybe_start_early_aggregation`) ends correspondingly
-/// earlier. The deadline only stops new jobs from starting — a job mid-proof
-/// finishes and publishes right after.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
+/// start: one full interval. After this much wall time elapses, the actor
+/// signals the worker to stop via its cancellation token. A session started
+/// exactly at interval 2 therefore runs until interval 3; a session started
+/// early (see `maybe_start_early_aggregation`) ends correspondingly earlier.
+/// The deadline only stops new jobs from starting — a job mid-proof finishes
+/// and publishes right after.
+pub(crate) fn aggregation_deadline(milliseconds_per_interval: u64) -> Duration {
+    Duration::from_millis(milliseconds_per_interval)
+}
+
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
 pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Width of the early-aggregation window: a session may start at most this
-/// long before the interval-2 boundary, provided the signature threshold is
-/// met (see the check in `maybe_start_early_aggregation`).
-pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
+/// Nominal width of the early-aggregation window: a session may start at most
+/// this long before the interval-2 boundary, provided the signature threshold
+/// is met (see the check in `maybe_start_early_aggregation`).
+const NOMINAL_EARLY_AGGREGATION_WINDOW_MS: u64 = 600;
 
-// The window must fit within one interval: `maybe_start_early_aggregation`
-// subtracts it from the interval-2 offset, and the interval-1 tick schedules
-// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW`. Keep
-// this invariant self-enforcing so a future bump to the window can't silently
-// underflow either subtraction.
-const _: () = assert!(
-    EARLY_AGGREGATION_WINDOW.as_millis() <= MILLISECONDS_PER_INTERVAL as u128,
-    "EARLY_AGGREGATION_WINDOW must not exceed one interval"
-);
+/// Width of the early-aggregation window, capped to one interval.
+///
+/// The window must fit within one interval: `maybe_start_early_aggregation`
+/// subtracts it from the interval-2 offset, and the interval-1 tick schedules
+/// the check at `milliseconds_per_interval - window`. The slot duration is
+/// configurable, so a short enough cadence can make the nominal window wider
+/// than an interval; clamping here keeps both subtractions in range instead of
+/// underflowing them, and keeps the invariant enforced at the one place the
+/// window is produced.
+pub(crate) fn early_aggregation_window(milliseconds_per_interval: u64) -> Duration {
+    Duration::from_millis(NOMINAL_EARLY_AGGREGATION_WINDOW_MS.min(milliseconds_per_interval))
+}
 
 /// A single pre-prepared aggregation group.
 ///
@@ -165,7 +171,7 @@ impl Message for AggregationDeadline {
 }
 
 /// One-shot self-message scheduled at the interval-1 tick; fires when the
-/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW) to run
+/// early-aggregation window opens (T2 - `early_aggregation_window`) to run
 /// the threshold check for signatures that all arrived before the window.
 /// Arrivals inside the window are checked per insert instead.
 pub(crate) struct EarlyAggregationCheck;
@@ -174,7 +180,7 @@ impl Message for EarlyAggregationCheck {
 }
 
 /// Maximum number of aggregation jobs selected per interval-2 session. Caps
-/// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
+/// leanVM prover work against [`aggregation_deadline`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
@@ -772,10 +778,11 @@ pub(crate) fn run_aggregation_worker(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
         checkpoint::Checkpoint,
-        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
+        state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz_types::SszList;
     use std::sync::Arc;
@@ -840,7 +847,7 @@ mod tests {
             body_root: H256::ZERO,
         };
         State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: head_slot,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -855,7 +862,7 @@ mod tests {
 
     fn new_test_store(head_state: State) -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
-        Store::from_anchor_state(backend, head_state)
+        Store::from_anchor_state(backend, head_state, DEFAULT_MILLISECONDS_PER_SLOT)
     }
 
     /// Insert a header-only block at `root` so it shows up in
