@@ -273,7 +273,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ## Networking (libp2p)
 
 ### Protocols
-- **Transport**: QUIC over UDP (TLS 1.3)
+- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -283,8 +283,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Peer Discovery (discv5, opt-in)
 - Off by default; `--discovery.enable` plus `--discovery.port` (own UDP socket, must differ from `--gossipsub-port`)
 - Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
-- ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`secp256k1`/`eth2`/`attnets`
-- Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, `quic` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
+- ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
+- Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
 - Candidates ranked by uncovered attestation subnets. See [`docs/discovery.md`](docs/discovery.md)
 
 ### Retry Strategy on Block Requests
