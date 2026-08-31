@@ -243,7 +243,7 @@ mod tests {
         ];
         argv.extend_from_slice(extra);
         match try_parse_from(argv).expect("node options parse") {
-            Command::Node(options) => *options,
+            Command::Node(options) => options,
             other => panic!("expected a node invocation, got {other:?}"),
         }
     }

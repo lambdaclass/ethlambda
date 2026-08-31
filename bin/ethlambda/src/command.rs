@@ -40,7 +40,12 @@ struct Cli {
 }
 
 /// What the command line asked the binary to do.
+///
+/// The variants are lopsided — the node options are far larger than the
+/// benchmark's — but exactly one is built per process and consumed immediately
+/// by `main`, so the imbalance costs nothing worth a `Box` at every use site.
 #[derive(Debug, clap::Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Run the consensus node (default when no sub-command is given).
     ///
@@ -52,16 +57,8 @@ pub(crate) enum Command {
     // printing `ethlambda <version>` after node flags, as it did when the node
     // flags were the whole command line. It is still listed and invoked as
     // `node`.
-    // Boxed because the node options dwarf every other variant's payload
-    // (~312 bytes against ~80), which `clippy::large_enum_variant` rightly
-    // flags: one allocation per process is cheaper than carrying that size in
-    // every value of this enum.
     #[command(display_name = "ethlambda")]
-    // Boxed because the node options dwarf the other variant's payload (~312
-    // bytes against ~80), which `clippy::large_enum_variant` rightly flags: one
-    // allocation per process is cheaper than carrying that size in every value
-    // of this enum.
-    Node(Box<NodeOptions>),
+    Node(NodeOptions),
     /// Benchmark block building offline against a controlled workload.
     Benchmark(BenchmarkOptions),
 }
@@ -136,7 +133,7 @@ mod tests {
 
     fn node_options(args: &[&str]) -> NodeOptions {
         match try_parse_from(args.iter().map(OsString::from)).expect("invocation parses") {
-            Command::Node(options) => *options,
+            Command::Node(options) => options,
             other => panic!("expected a node invocation, got {other:?}"),
         }
     }

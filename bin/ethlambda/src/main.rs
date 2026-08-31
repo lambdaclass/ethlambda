@@ -73,7 +73,7 @@ fn main() -> eyre::Result<()> {
     match command::parse() {
         Command::Node(options) => {
             init_node_logging()?;
-            run_node(*options)
+            run_node(options)
         }
         // The benchmark is synchronous, CPU-bound work, so it runs on this
         // thread and the tokio runtime is never started — rather than parking
