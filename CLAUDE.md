@@ -312,10 +312,12 @@ GENESIS_VALIDATORS:
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
-- `MILLISECONDS_PER_SLOT` must be a positive multiple of `INTERVALS_PER_SLOT`; it is
-  persisted in the DB's `Metadata["config"]` and a resume with a different value is
-  refused. Other clients ignore the key and stay at their compile-time 4s, so it only
-  takes effect on an all-ethlambda network
+- `MILLISECONDS_PER_SLOT` must be a multiple of `INTERVALS_PER_SLOT` and at least
+  `MIN_MILLISECONDS_PER_SLOT`: the knob slows a network down, it does not speed one up,
+  since timings fixed in milliseconds (`EARLY_AGGREGATION_WINDOW`) are sized for the spec
+  cadence. It is persisted in the DB's `Metadata["config"]` and a resume with a different
+  value is refused. Other clients ignore the key and stay at their compile-time 4s, so it
+  only takes effect on an all-ethlambda network
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 

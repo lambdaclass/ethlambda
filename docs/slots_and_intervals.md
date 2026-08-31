@@ -3,7 +3,9 @@
 A Lean Chain slot is divided in 5 intervals of equal length. Every duty a validator
 owes the chain is due in one of them. The slot lasts 4 seconds by default, so the
 offsets below are the 800 ms grid; a network that sets `MILLISECONDS_PER_SLOT` in its
-config file scales every offset by the same factor:
+config file scales every offset by the same factor. That key can only stretch the
+grid: 4 seconds is also the floor, since a few client timings are fixed in
+milliseconds rather than expressed as a fraction of the slot.
 
 | Interval | Offset | Duty | Who acts | What it publishes |
 | --- | --- | --- | --- | --- |

@@ -2,7 +2,7 @@
 //! pure functions it runs.
 //!
 //! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`early_aggregation_window`] early when the 2/3 signature
+//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
 //! threshold is met — via
 //! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
 //! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
@@ -27,6 +27,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{AggregationBits, AttestationData, HashedAttestationData},
     block::{ByteList512KiB, SingleMessageAggregate},
+    constants::{INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT},
     primitives::H256,
     state::Validator,
 };
@@ -54,23 +55,27 @@ pub(crate) fn aggregation_deadline(milliseconds_per_interval: u64) -> Duration {
 /// (mismatched timers, stuck proofs); we warn before blocking.
 pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Nominal width of the early-aggregation window: a session may start at most
-/// this long before the interval-2 boundary, provided the signature threshold
-/// is met (see the check in `maybe_start_early_aggregation`).
-const NOMINAL_EARLY_AGGREGATION_WINDOW_MS: u64 = 600;
-
-/// Width of the early-aggregation window, capped to one interval.
+/// Width of the early-aggregation window: a session may start at most this
+/// long before the interval-2 boundary, provided the signature threshold is
+/// met (see the check in `maybe_start_early_aggregation`).
 ///
-/// The window must fit within one interval: `maybe_start_early_aggregation`
-/// subtracts it from the interval-2 offset, and the interval-1 tick schedules
-/// the check at `milliseconds_per_interval - window`. The slot duration is
-/// configurable, so a short enough cadence can make the nominal window wider
-/// than an interval; clamping here keeps both subtractions in range instead of
-/// underflowing them, and keeps the invariant enforced at the one place the
-/// window is produced.
-pub(crate) fn early_aggregation_window(milliseconds_per_interval: u64) -> Duration {
-    Duration::from_millis(NOMINAL_EARLY_AGGREGATION_WINDOW_MS.min(milliseconds_per_interval))
-}
+/// Fixed rather than scaled with the slot duration. What the window buys is
+/// wall time for the leanVM proof to land before the block that carries it,
+/// and a proof costs the same however long the network's slot is.
+pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
+
+// The window must fit within one interval: `maybe_start_early_aggregation`
+// subtracts it from the interval-2 offset, and the interval-1 tick schedules
+// the check at `milliseconds_per_interval - EARLY_AGGREGATION_WINDOW`. The
+// slot duration is configurable, so the binding case is the narrowest interval
+// a config file can ask for. Keep this invariant self-enforcing so a future
+// bump to the window, or a lowered floor, can't silently underflow either
+// subtraction.
+const _: () = assert!(
+    EARLY_AGGREGATION_WINDOW.as_millis()
+        <= (MIN_MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT) as u128,
+    "EARLY_AGGREGATION_WINDOW must not exceed the shortest configurable interval"
+);
 
 /// A single pre-prepared aggregation group.
 ///
@@ -171,7 +176,7 @@ impl Message for AggregationDeadline {
 }
 
 /// One-shot self-message scheduled at the interval-1 tick; fires when the
-/// early-aggregation window opens (T2 - `early_aggregation_window`) to run
+/// early-aggregation window opens (T2 - [`EARLY_AGGREGATION_WINDOW`]) to run
 /// the threshold check for signatures that all arrived before the window.
 /// Arrivals inside the window are checked per insert instead.
 pub(crate) struct EarlyAggregationCheck;

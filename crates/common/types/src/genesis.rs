@@ -1,7 +1,9 @@
 use serde::Deserialize;
 
 use crate::chain_config::ChainConfig;
-use crate::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
+use crate::constants::{
+    DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT,
+};
 use crate::state::{State, Validator, ValidatorPubkeyBytes};
 
 /// Ways a state can fail to belong to the configured genesis.
@@ -112,11 +114,14 @@ fn default_milliseconds_per_slot() -> u64 {
 }
 
 /// Parse `MILLISECONDS_PER_SLOT`, rejecting values the interval grid cannot
-/// represent.
+/// represent and cadences faster than the client is built for.
 ///
 /// A slot is cut into [`INTERVALS_PER_SLOT`] equal intervals and every duty is
 /// scheduled off that boundary, so a duration that does not divide evenly would
 /// leave the last interval short and drift the grid against the wall clock.
+/// [`MIN_MILLISECONDS_PER_SLOT`] is the other bound: the knob is there to slow
+/// a network down, and the timings the client fixes in milliseconds rather than
+/// as a fraction of the slot assume a slot no shorter than that.
 fn deser_milliseconds_per_slot<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -124,9 +129,10 @@ where
     use serde::de::Error;
 
     let ms = u64::deserialize(d)?;
-    if ms == 0 || ms % INTERVALS_PER_SLOT != 0 {
+    if ms < MIN_MILLISECONDS_PER_SLOT || ms % INTERVALS_PER_SLOT != 0 {
         return Err(D::Error::custom(format!(
-            "MILLISECONDS_PER_SLOT is {ms}; expected a positive multiple of {INTERVALS_PER_SLOT}"
+            "MILLISECONDS_PER_SLOT is {ms}; expected a multiple of {INTERVALS_PER_SLOT} \
+             no smaller than {MIN_MILLISECONDS_PER_SLOT}"
         )));
     }
     Ok(ms)
@@ -410,6 +416,31 @@ GENESIS_VALIDATORS:
     fn slot_duration_must_be_positive() {
         let yaml = format!("MILLISECONDS_PER_SLOT: 0\n{TEST_CONFIG_YAML}");
         assert!(serde_yaml_ng::from_str::<GenesisConfig>(&yaml).is_err());
+    }
+
+    /// A whole number of intervals is not enough on its own: the client's
+    /// fixed-millisecond timings need the slot to be at least
+    /// [`MIN_MILLISECONDS_PER_SLOT`] wide.
+    #[test]
+    fn slot_duration_must_not_be_faster_than_the_minimum() {
+        let too_fast = MIN_MILLISECONDS_PER_SLOT - INTERVALS_PER_SLOT;
+        let yaml = format!("MILLISECONDS_PER_SLOT: {too_fast}\n{TEST_CONFIG_YAML}");
+        let err = serde_yaml_ng::from_str::<GenesisConfig>(&yaml).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("MILLISECONDS_PER_SLOT is {too_fast}")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn slot_duration_accepts_the_minimum_itself() {
+        let yaml =
+            format!("MILLISECONDS_PER_SLOT: {MIN_MILLISECONDS_PER_SLOT}\n{TEST_CONFIG_YAML}");
+        let config: GenesisConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+
+        assert_eq!(config.milliseconds_per_slot, MIN_MILLISECONDS_PER_SLOT);
     }
 
     #[test]

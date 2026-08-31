@@ -16,8 +16,8 @@ use ethlambda_types::{
 
 use crate::aggregation::{
     AggregateProduced, AggregationDeadline, AggregationDone, AggregationSession,
-    EarlyAggregationCheck, MAX_AGGREGATION_JOBS, PRIOR_WORKER_JOIN_TIMEOUT, aggregation_deadline,
-    early_aggregation_window, run_aggregation_worker,
+    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
+    PRIOR_WORKER_JOIN_TIMEOUT, aggregation_deadline, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -409,12 +409,11 @@ impl BlockChainServer {
 
                 // Schedule the early-aggregation window check. This tick is
                 // one interval before T2, so the timer fires right as the
-                // window opens at T2 - `early_aggregation_window`.
+                // window opens at T2 - EARLY_AGGREGATION_WINDOW.
                 if is_aggregator {
-                    let ms_per_interval = time_config.milliseconds_per_interval();
                     send_after(
-                        Duration::from_millis(ms_per_interval)
-                            - early_aggregation_window(ms_per_interval),
+                        Duration::from_millis(time_config.milliseconds_per_interval())
+                            - EARLY_AGGREGATION_WINDOW,
                         ctx.clone(),
                         EarlyAggregationCheck,
                     );
@@ -577,7 +576,7 @@ impl BlockChainServer {
     }
 
     /// Early-aggregation trigger: start the slot's session ahead of the
-    /// interval-2 tick when, inside the window `[T2 - early_aggregation_window, T2)`,
+    /// interval-2 tick when, inside the window `[T2 - EARLY_AGGREGATION_WINDOW, T2)`,
     /// a single attestation-data group already holds 2/3 of the signatures
     /// expected from this node's aggregation subnets. Called after every
     /// stored current-slot gossip signature and once at the window opening via
@@ -592,7 +591,7 @@ impl BlockChainServer {
             return;
         }
         // Only fire inside the early-aggregation window
-        // `[T2 - early_aggregation_window, T2)`, where T2 is the current
+        // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
         // slot's interval-2 boundary; the slot is derived from the wall clock.
         let time_config = *self.store.config();
         let Some(ms_since_genesis) = unix_now_ms().checked_sub(time_config.genesis_time_ms())
@@ -602,7 +601,7 @@ impl BlockChainServer {
         let ms_per_interval = time_config.milliseconds_per_interval();
         let ms_into_slot = ms_since_genesis % time_config.milliseconds_per_slot;
         let t2_offset = 2 * ms_per_interval;
-        let window_ms = early_aggregation_window(ms_per_interval).as_millis() as u64;
+        let window_ms = EARLY_AGGREGATION_WINDOW.as_millis() as u64;
         if ms_into_slot < t2_offset - window_ms || ms_into_slot >= t2_offset {
             return;
         }
@@ -1607,19 +1606,6 @@ mod tests {
         let genesis_ms = config.genesis_time_ms();
 
         assert_eq!(ms_until_next_interval(genesis_ms - 500, &config), 500);
-    }
-
-    /// The window is subtracted from an interval offset in two places, so it
-    /// must never exceed one interval however short the configured slot is.
-    #[test]
-    fn early_aggregation_window_never_exceeds_one_interval() {
-        for milliseconds_per_slot in [1_000, 2_000, DEFAULT_MILLISECONDS_PER_SLOT, 8_000] {
-            let ms_per_interval = config(milliseconds_per_slot).milliseconds_per_interval();
-            assert!(
-                early_aggregation_window(ms_per_interval).as_millis() as u64 <= ms_per_interval,
-                "window overflows the interval at {milliseconds_per_slot} ms per slot"
-            );
-        }
     }
 
     #[test]
