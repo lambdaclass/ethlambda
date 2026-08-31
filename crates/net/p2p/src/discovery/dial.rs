@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServerProtocol as _};
 use libp2p::PeerId;
+use libp2p::swarm::dial_opts::DialOpts;
 use tracing::info;
 
 use super::admission::{DiscoveredPeer, LeanFilter, rank_by_uncovered_subnets};
@@ -109,7 +110,13 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
     // synchronously — already connected, already dialing, no addresses, denied —
     // raises no `OutgoingConnectionError`, so `forget_discovered_peer` would
     // never run and the entry would outlive the process's interest in it.
-    if !server.swarm_handle.dial_accepted(candidate.addr).await {
+    // One `DialOpts` carrying every address, not one dial per address: libp2p
+    // races them within the attempt, which is what lets a live TCP address
+    // rescue a peer whose advertised QUIC port does not answer.
+    let opts = DialOpts::peer_id(candidate.peer_id)
+        .addresses(candidate.addrs)
+        .build();
+    if !server.swarm_handle.dial_accepted(opts).await {
         return;
     }
     metrics::inc_discovered_peers_dialed();

@@ -22,7 +22,7 @@ use libp2p::{
     identity::{Keypair, PublicKey, secp256k1},
     multiaddr::Protocol,
     request_response::{self, OutboundRequestId},
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use sha2::Digest;
 use spawned_concurrency::actor;
@@ -219,7 +219,9 @@ pub struct BuiltSwarm {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    /// Dial targets per bootnode, QUIC first then TCP. Empty entries are never
+    /// inserted; see [`bootnode_dial_addrs`].
+    pub(crate) bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -293,6 +295,12 @@ pub fn build_swarm(
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default().nodelay(true),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .expect("failed to add TCP transport to swarm")
         .with_quic()
         .with_behaviour(|_| behavior)
         .expect("failed to add behaviour to swarm")
@@ -303,41 +311,50 @@ pub fn build_swarm(
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let mut bootnode_addrs = HashMap::new();
-    let mut quic_less_bootnodes = 0usize;
+    let mut undialable_bootnodes = 0usize;
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
         if peer_id == local_peer_id {
             continue;
         }
-        // Discovery-only seed: reachable over discv5, but with no QUIC port
-        // there is nothing for the swarm to dial.
-        let Some(quic_port) = bootnode.quic_port else {
-            quic_less_bootnodes += 1;
-            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no quic port, discv5 seed only");
+        let addrs = bootnode_dial_addrs(&bootnode, peer_id);
+        if addrs.is_empty() {
+            // Discovery-only seed: reachable over discv5, but with no QUIC or
+            // TCP port there is nothing for the swarm to dial.
+            undialable_bootnodes += 1;
+            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no dialable transport, discv5 seed only");
             continue;
-        };
-        let addr = quic_multiaddr(bootnode.ip, quic_port, peer_id);
-        bootnode_addrs.insert(peer_id, addr.clone());
-        swarm.dial(addr).unwrap();
+        }
+        bootnode_addrs.insert(peer_id, addrs.clone());
+        swarm
+            .dial(DialOpts::peer_id(peer_id).addresses(addrs).build())
+            .unwrap();
     }
     // Every skip above is individually unremarkable and logged at `debug`, but a
     // list that produces no dial target at all leaves the node isolated unless
-    // discovery is on, which is worth one line at `warn`. A beacon-chain
-    // bootstrap list is exactly this shape: `tcp` and `udp`, never `quic`.
-    if bootnode_addrs.is_empty() && quic_less_bootnodes > 0 {
+    // discovery is on, which is worth one line at `warn`.
+    if bootnode_addrs.is_empty() && undialable_bootnodes > 0 {
         warn!(
-            quic_less_bootnodes,
-            "No bootnode advertises a quic port, so nothing will be dialed statically; \
+            undialable_bootnodes,
+            "No bootnode advertises a quic or tcp port, so nothing will be dialed statically; \
              peering depends entirely on discv5 discovery"
         );
     }
-    let addr = Multiaddr::empty()
+    let quic_addr = Multiaddr::empty()
         .with(config.listening_socket.ip().into())
         .with(Protocol::Udp(config.listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
-        .listen_on(addr)
-        .expect("failed to bind gossipsub listening address");
+        .listen_on(quic_addr)
+        .expect("failed to bind gossipsub QUIC listening address");
+    // Same port number as the QUIC listener above: TCP and UDP are separate
+    // namespaces, so this cannot collide with it.
+    let tcp_addr = Multiaddr::empty()
+        .with(config.listening_socket.ip().into())
+        .with(Protocol::Tcp(config.listening_socket.port()));
+    swarm
+        .listen_on(tcp_addr)
+        .expect("failed to bind gossipsub TCP listening address");
 
     // Subscribe to block topic (all nodes)
     let block_topic = block_topic();
@@ -480,7 +497,7 @@ pub struct P2PServer {
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
     pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
-    bootnode_addrs: HashMap<PeerId, Multiaddr>,
+    bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
     /// Set when discovery is enabled. `None` disables the dial loop entirely.
@@ -545,9 +562,10 @@ impl P2PServer {
             return;
         }
 
-        if let Some(addr) = self.bootnode_addrs.get(&peer_id) {
+        if let Some(addrs) = self.bootnode_addrs.get(&peer_id) {
             trace!(%peer_id, "Redialing disconnected bootnode");
-            self.swarm_handle.dial(addr.clone());
+            self.swarm_handle
+                .dial(DialOpts::peer_id(peer_id).addresses(addrs.clone()).build());
         }
     }
 
@@ -635,6 +653,11 @@ async fn handle_swarm_event(
             ..
         } => {
             let direction = connection_direction(&endpoint);
+            // Read off the connection's own address rather than which one we
+            // dialed: with both QUIC and TCP offered, libp2p races every
+            // address in a dial and may connect over either. This is the
+            // field that answers "did the TCP fallback actually help".
+            let transport = transport_label(endpoint.get_remote_address());
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
                 let peer_count = server.connected_peers.len();
@@ -650,6 +673,7 @@ async fn handle_swarm_event(
                 trace!(
                     %peer_id,
                     %direction,
+                    %transport,
                     peer_count,
                     our_finalized_slot,
                     our_head_slot,
@@ -664,7 +688,7 @@ async fn handle_swarm_event(
                     )
                     .await;
             } else {
-                trace!(%peer_id, %direction, "Added peer connection");
+                trace!(%peer_id, %direction, %transport, "Added peer connection");
             }
         }
         SwarmEvent::ConnectionClosed {
@@ -807,16 +831,23 @@ pub struct Bootnode {
     pub(crate) ip: IpAddr,
     /// The libp2p QUIC port, when the ENR advertises one.
     ///
-    /// `None` for records that are discv5-reachable but speak no transport we
-    /// have: every beacon-chain bootnode published today advertises `tcp` and
-    /// `udp` but no `quic`. Such a bootnode still seeds the discv5 routing
-    /// table; it just is never dialed statically.
+    /// `None` for a record that does not advertise one. See
+    /// [`Bootnode::tcp_port`] for the other transport that can still make such
+    /// a record dialable: every beacon-chain bootnode published today is
+    /// exactly that case, `tcp` and `udp` but no `quic`.
     pub(crate) quic_port: Option<u16>,
+    /// The libp2p TCP port, when the ENR advertises one.
+    ///
+    /// `None` for the ENRs lean-quickstart generates today, which carry only
+    /// `ip`/`quic`/`secp256k1`. Every published mainnet beacon-chain bootnode
+    /// carries this instead of `quic`, which is what makes them statically
+    /// dialable now that the swarm speaks both transports.
+    pub(crate) tcp_port: Option<u16>,
     /// The discv5 UDP port, when the ENR advertises one.
     ///
     /// `None` for the ENRs lean-quickstart generates today, which carry only
     /// `ip`/`quic`/`secp256k1`. Such a bootnode is still dialed statically over
-    /// QUIC; it just cannot seed the discv5 routing table.
+    /// QUIC or TCP; it just cannot seed the discv5 routing table.
     pub(crate) udp_port: Option<u16>,
     pub(crate) public_key: PublicKey,
 }
@@ -825,7 +856,9 @@ impl Bootnode {
     /// This bootnode as a discv5 seed, or `None` when its ENR advertises no
     /// `udp` port and it therefore cannot be reached by discovery.
     ///
-    /// `tcp_port` is 0: ethrex reads that as "no TCP listener".
+    /// `tcp_port` carries this bootnode's real advertised TCP port when it has
+    /// one, now that ethlambda dials TCP too; it is `0` only when the ENR
+    /// advertises none, which ethrex reads as "no TCP listener".
     pub(crate) fn as_discovery_node(&self) -> Option<ethrex_p2p::types::Node> {
         let udp_port = self.udp_port?;
         // libp2p and ethrex hold the same key in different representations:
@@ -843,7 +876,7 @@ impl Bootnode {
         Some(ethrex_p2p::types::Node::new(
             self.ip,
             udp_port,
-            0,
+            self.tcp_port.unwrap_or(0),
             ethrex_common::H512::from_slice(&uncompressed[1..]),
         ))
     }
@@ -854,8 +887,8 @@ impl Bootnode {
 /// Records that cannot be decoded, or that lack an IP, a public key or any
 /// dialable port at all, are skipped with a warning rather than aborting
 /// startup: one malformed entry in the bootnode file should not stop the node
-/// from booting. A record carrying only one of `quic` and `udp` is kept, since
-/// each is useful on its own.
+/// from booting. A record carrying only one of `quic`, `tcp` and `udp` is kept,
+/// since each is useful on its own.
 pub fn parse_enrs(enrs: Vec<String>) -> Vec<Bootnode> {
     let configured = enrs.len();
     let bootnodes: Vec<Bootnode> = enrs
@@ -888,10 +921,10 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     let record = NodeRecord::decode(&decoded).map_err(|err| format!("RLP decode failed: {err}"))?;
     let pairs = record.pairs();
 
-    // A record with no dialable `quic` entry is not an error: it is
-    // discv5-reachable but speaks no transport we have, which is exactly what
-    // every beacon-chain bootnode looks like. Keep it as a discovery seed and let
-    // `build_swarm` skip it when it picks static dial targets.
+    // A record with no dialable `quic` entry is not an error: it may still
+    // advertise `tcp`, and even a record with neither is worth keeping as a
+    // discv5 seed. Keep it and let `build_swarm` skip it when it picks static
+    // dial targets.
     let quic_port = read_quic_port(&record);
 
     // An explicit `udp: 0` is no more reachable than a `quic: 0`, which
@@ -899,27 +932,47 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // with a contact on a port nothing listens on.
     let udp_port = pairs.udp_port.filter(|port| *port != 0);
 
+    // Same rule for `tcp`, the transport every published beacon-chain bootnode
+    // advertises and none of them pairs with a `quic` entry.
+    let tcp_port = pairs.tcp_port.filter(|port| *port != 0);
+
     let public_key = read_public_key(pairs)
         .ok_or_else(|| "node record missing or malformed public key".to_string())?;
 
     let ip = read_ip(pairs).ok_or_else(|| "node record missing IP address".to_string())?;
 
-    // `quic` and `udp` are independently optional, but a record with neither is
-    // reachable by nothing we speak: it can be neither dialed nor seeded. Drop
-    // it here rather than carry a contact that no code path can ever use.
-    if quic_port.is_none() && udp_port.is_none() {
-        return Err("node advertises neither a quic nor a udp port".to_string());
+    // `quic`, `tcp` and `udp` are independently optional, but a record with none
+    // of them is reachable by nothing we speak: it can be neither dialed nor
+    // seeded. Drop it here rather than carry a contact no code path can use.
+    if quic_port.is_none() && tcp_port.is_none() && udp_port.is_none() {
+        return Err("node advertises neither a quic, tcp nor a udp port".to_string());
     }
 
     Ok(Bootnode {
         ip,
         quic_port,
+        tcp_port,
         udp_port,
         public_key: public_key.into(),
     })
 }
 
 // --- Utility functions ---
+
+/// Dial targets for a static bootnode, QUIC first then TCP.
+///
+/// Empty when the record advertises neither, which is a discv5-only seed: it can
+/// still answer FINDNODE, but there is nothing for the swarm to dial.
+pub(crate) fn bootnode_dial_addrs(bootnode: &Bootnode, peer_id: PeerId) -> Vec<Multiaddr> {
+    let mut addrs = Vec::with_capacity(2);
+    if let Some(quic_port) = bootnode.quic_port {
+        addrs.push(quic_multiaddr(bootnode.ip, quic_port, peer_id));
+    }
+    if let Some(tcp_port) = bootnode.tcp_port {
+        addrs.push(tcp_multiaddr(bootnode.ip, tcp_port, peer_id));
+    }
+    addrs
+}
 
 /// The address of a libp2p QUIC listener, as both dial paths spell it: static
 /// bootnodes in [`build_swarm`] and discovered peers in
@@ -936,12 +989,40 @@ pub(crate) fn quic_multiaddr(ip: IpAddr, quic_port: u16, peer_id: PeerId) -> Mul
         .expect("a freshly built multiaddr carries no p2p component")
 }
 
+/// The address of a libp2p TCP listener, the fallback path for a peer whose
+/// advertised `quic` entry does not answer.
+///
+/// Infallible for the same reason [`quic_multiaddr`] is.
+pub(crate) fn tcp_multiaddr(ip: IpAddr, tcp_port: u16, peer_id: PeerId) -> Multiaddr {
+    Multiaddr::empty()
+        .with(ip.into())
+        .with(Protocol::Tcp(tcp_port))
+        .with_p2p(peer_id)
+        .expect("a freshly built multiaddr carries no p2p component")
+}
+
 fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
     if endpoint.is_dialer() {
         "outbound"
     } else {
         "inbound"
     }
+}
+
+/// "quic" or "tcp", read off which protocol the connection's own multiaddr
+/// carries. `"unknown"` is unreachable in practice: every address this swarm
+/// ever connects over came from one of the two transports it was built with,
+/// but a swarm event is not proof of that, so this stays total rather than
+/// panicking on a shape it does not expect.
+fn transport_label(addr: &Multiaddr) -> &'static str {
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Quic | Protocol::QuicV1 => return "quic",
+            Protocol::Tcp(_) => return "tcp",
+            _ => {}
+        }
+    }
+    "unknown"
 }
 
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
@@ -972,6 +1053,73 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    /// Proves the TCP transport `build_swarm` now adds actually completes a
+    /// connection end to end, rather than only compiling. Builds two real
+    /// swarms via the production entry point (port `0`, so this cannot collide
+    /// with a running node or a sibling test), learns the first swarm's TCP
+    /// listen address off its own `NewListenAddr` event, dials it from the
+    /// second swarm, and polls both until each reports `ConnectionEstablished`.
+    /// A regression to QUIC-only, or a misconfigured TCP transport, hangs here
+    /// until the timeout rather than racing to a false positive.
+    #[tokio::test]
+    async fn two_swarms_connect_over_tcp() {
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                validator_ids: Vec::new(),
+                attestation_committee_count: 1,
+                subscription_subnets: HashSet::new(),
+            })
+            .expect("swarm builds")
+        }
+
+        let mut dialer = build(1);
+        let mut listener = build(2);
+
+        // Both a QUIC and a TCP `NewListenAddr` arrive for `listener`; only the
+        // TCP one is wanted here.
+        let listener_tcp_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } =
+                listener.swarm.select_next_some().await
+                && address.iter().any(|p| matches!(p, Protocol::Tcp(_)))
+            {
+                break address
+                    .with_p2p(listener.local_peer_id)
+                    .expect("failed to add peer ID to multiaddr");
+            }
+        };
+
+        dialer
+            .swarm
+            .dial(listener_tcp_addr)
+            .expect("dial is accepted");
+
+        let (mut dialer_connected, mut listener_connected) = (false, false);
+        let both_connect = async {
+            while !(dialer_connected && listener_connected) {
+                tokio::select! {
+                    event = dialer.swarm.select_next_some() => {
+                        if let SwarmEvent::ConnectionEstablished { endpoint, .. } = event {
+                            assert_eq!(transport_label(endpoint.get_remote_address()), "tcp");
+                            dialer_connected = true;
+                        }
+                    }
+                    event = listener.swarm.select_next_some() => {
+                        if let SwarmEvent::ConnectionEstablished { endpoint, .. } = event {
+                            assert_eq!(transport_label(endpoint.get_remote_address()), "tcp");
+                            listener_connected = true;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), both_connect)
+            .await
+            .expect("both swarms must connect over TCP within the timeout");
     }
 
     #[test]

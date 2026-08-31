@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol,
+    PeerId, StreamProtocol,
     futures::StreamExt,
     request_response::{self, OutboundRequestId},
-    swarm::SwarmEvent,
+    swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{debug, error};
@@ -21,7 +21,12 @@ pub enum SwarmCommand {
         data: Vec<u8>,
     },
     Dial {
-        addr: Multiaddr,
+        /// Carries the full set of addresses worth trying for one dial attempt
+        /// (a peer's QUIC and TCP ports both, say): libp2p races every address
+        /// in a single `DialOpts` rather than treating each as a separate
+        /// attempt, which is what lets a live TCP address rescue a dial whose
+        /// advertised QUIC port does not answer.
+        opts: DialOpts,
         /// Callback reporting whether the swarm accepted the dial. `None` when
         /// the caller does not need to know.
         accepted_tx: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -52,11 +57,11 @@ impl SwarmHandle {
             .inspect_err(|_| debug!("Swarm adapter closed, cannot publish"));
     }
 
-    pub fn dial(&self, addr: Multiaddr) {
+    pub fn dial(&self, opts: DialOpts) {
         let _ = self
             .cmd_tx
             .send(SwarmCommand::Dial {
-                addr,
+                opts,
                 accepted_tx: None,
             })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot dial"));
@@ -72,12 +77,12 @@ impl SwarmHandle {
     ///
     /// A `true` only means the dial was queued: success or failure still arrives
     /// later as `ConnectionEstablished` or `OutgoingConnectionError`.
-    pub async fn dial_accepted(&self, addr: Multiaddr) -> bool {
+    pub async fn dial_accepted(&self, opts: DialOpts) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .cmd_tx
             .send(SwarmCommand::Dial {
-                addr,
+                opts,
                 accepted_tx: Some(tx),
             })
             .is_err()
@@ -181,9 +186,9 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
                 .ok();
         }
-        SwarmCommand::Dial { addr, accepted_tx } => {
+        SwarmCommand::Dial { opts, accepted_tx } => {
             let accepted = swarm
-                .dial(addr)
+                .dial(opts)
                 .inspect_err(|err| debug!(%err, "Swarm adapter: dial failed"))
                 .is_ok();
             if let Some(tx) = accepted_tx {

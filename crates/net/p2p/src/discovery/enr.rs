@@ -3,14 +3,16 @@
 //! The entry set follows the beacon-chain phase0 p2p spec's discovery domain:
 //!
 //! ```text
-//! id, ip, udp=<discovery port>, quic=<libp2p QUIC port>, secp256k1,
+//! id, ip, udp=<discovery port>, quic=<libp2p QUIC port>, tcp=<libp2p TCP port>,
+//! secp256k1,
 //! eth2    = SSZ(ENRForkID)
 //! attnets = subscribed attestation subnet bitfield
 //! ```
 //!
-//! There is deliberately no `tcp` entry. The spec defines it as the libp2p TCP
-//! listening port and makes it optional; ethlambda speaks QUIC only, so
-//! advertising one would invite a dial that cannot succeed.
+//! `tcp` is the spec's own entry for the libp2p TCP listening port: ethlambda
+//! binds one alongside QUIC (see `crates/net/p2p/src/lib.rs`'s `build_swarm`),
+//! on the same port number, so advertising it is what lets a peer whose
+//! advertised `quic` does not answer still reach us.
 //!
 //! Lean defines no fork schedule and its fork digest is a compile-time constant
 //! rather than a genesis-derived value, so every field of [`EnrForkId`] is
@@ -113,6 +115,10 @@ pub(crate) struct LocalEnrParams {
     pub(crate) discovery_port: u16,
     /// UDP port the libp2p QUIC transport is bound to.
     pub(crate) quic_port: u16,
+    /// TCP port the libp2p TCP transport is bound to. The same port number as
+    /// [`Self::quic_port`]: TCP and UDP are separate namespaces, so `build_swarm`
+    /// binds both without a collision.
+    pub(crate) tcp_port: u16,
     pub(crate) subscription_subnets: HashSet<u64>,
     pub(crate) attestation_committee_count: u64,
 }
@@ -120,21 +126,18 @@ pub(crate) struct LocalEnrParams {
 impl LocalEnrParams {
     /// The `Node` ethrex's discovery server takes as its local identity.
     ///
-    /// `tcp_port` is 0, which ethrex reads as "no TCP listener" and omits from
-    /// the record.
+    /// `tcp_port` is the real port the libp2p TCP transport is bound to, now
+    /// that ethlambda has one.
     pub(crate) fn local_node(&self) -> Node {
         Node::new(
             self.ip,
             self.discovery_port,
-            0,
+            self.tcp_port,
             public_key_from_signing_key(&self.signer),
         )
     }
 
     /// The full entry set this node advertises.
-    ///
-    /// `tcp_port` is left unset rather than zero: `from_pairs` takes the entry
-    /// set verbatim, so "no TCP listener" is spelled by the entry's absence.
     ///
     /// The three consensus entries go through `set_extra`/`set_extra_int`,
     /// which pick the RLP codec once. Encoding them by hand is the trap that
@@ -145,7 +148,7 @@ impl LocalEnrParams {
     fn local_pairs(&self) -> NodeRecordPairs {
         let mut pairs = NodeRecordPairs {
             udp_port: Some(self.discovery_port),
-            tcp_port: None,
+            tcp_port: Some(self.tcp_port),
             ..Default::default()
         };
         match self.ip.to_canonical() {
@@ -224,6 +227,7 @@ mod tests {
             ip: IpAddr::from(Ipv4Addr::LOCALHOST),
             discovery_port: 9010,
             quic_port: 9001,
+            tcp_port: 9001,
             subscription_subnets: HashSet::from([1u64, 4]),
             attestation_committee_count: 8,
         })
@@ -291,13 +295,17 @@ mod tests {
     }
 
     #[test]
-    fn local_enr_advertises_udp_and_quic_but_no_tcp() {
+    fn local_enr_advertises_udp_quic_and_tcp() {
+        // Inverts what this test used to pin: ethlambda now binds a TCP
+        // transport alongside QUIC (see `build_swarm`), so the ENR must
+        // advertise all three ports rather than omitting `tcp`.
         let record = build();
         let pairs = record.pairs();
         assert_eq!(pairs.udp_port, Some(9010));
         assert_eq!(
-            pairs.tcp_port, None,
-            "ethlambda has no TCP listener, so it must not advertise one"
+            pairs.tcp_port,
+            Some(9001),
+            "ethlambda now has a TCP listener and must advertise it"
         );
         assert_eq!(read_quic_port(&record), Some(9001));
     }
