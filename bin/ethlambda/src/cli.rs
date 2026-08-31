@@ -242,8 +242,10 @@ mod tests {
             "ethlambda_0",
         ];
         argv.extend_from_slice(extra);
-        let Command::Node(options) = try_parse_from(argv).expect("node options parse");
-        options
+        match try_parse_from(argv).expect("node options parse") {
+            Command::Node(options) => options,
+            other => panic!("expected a node invocation, got {other:?}"),
+        }
     }
 
     /// `--discovery.enable` on its own has to work: a default that is never

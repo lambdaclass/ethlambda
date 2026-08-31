@@ -131,7 +131,9 @@ const AGGREGATED_PAYLOAD_CAP: usize = 512;
 
 /// Hard cap for the new (pending) aggregated payload buffer.
 /// Smaller than known since new payloads are drained every interval.
-const NEW_PAYLOAD_CAP: usize = 64;
+/// Public so pool-seeding callers (the block-building benchmark) can reject
+/// workloads that a single insertion batch would silently evict.
+pub const NEW_PAYLOAD_CAP: usize = 64;
 
 /// Hard cap for the gossip signature buffer (individual signatures, not distinct data_roots).
 /// With 4 validators, 2048 signatures covers ~512 slots (~34 min at the
