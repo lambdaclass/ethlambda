@@ -6,8 +6,8 @@
 //! and the slot-alignment sleep are outside the measured span, matching the
 //! node's own `lean_block_building_time_seconds` boundary.
 //!
-//! See docs/plans/block-building-benchmark.md for the design and roadmap
-//! (real-crypto pools and replay-from-datadir land in later milestones).
+//! See docs/benchmarking.md for what is and is not measured, how to read a
+//! report, and the current limitations.
 
 mod corpus;
 mod report;
