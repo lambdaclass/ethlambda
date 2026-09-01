@@ -80,6 +80,6 @@ jobs:
       # harness end-to-end and its JSON output contract in a few seconds.
       - name: Benchmark smoke (mock crypto)
         run: |
-          cargo run --release --bin ethlambda -- benchmark synthetic --mock-crypto \
+          cargo run --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
             --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
             | jq -e '.schema_version == 1 and (.samples | length == 3)'
