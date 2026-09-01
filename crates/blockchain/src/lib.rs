@@ -121,7 +121,13 @@ impl SlotInterval {
             Self::SafeTargetUpdate => 3,
             Self::EndOfSlot => 4,
         };
-        slot * config.milliseconds_per_slot + interval * config.milliseconds_per_interval()
+        // Saturating so a caller that has not yet bounded `slot` (arrival
+        // metrics see gossip slots before validation) cannot panic the actor in
+        // a debug build or wrap into a small timestamp in a release one. The
+        // clamped value is still meaningless: callers wanting a usable delta
+        // must bound the slot themselves.
+        slot.saturating_mul(config.milliseconds_per_slot)
+            .saturating_add(interval * config.milliseconds_per_interval())
     }
 }
 
@@ -1290,6 +1296,22 @@ impl BlockChainServer {
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
     }
+
+    /// Whether `slot` is close enough to the store clock for its arrival to be
+    /// worth measuring.
+    ///
+    /// Arrival metrics are observed before `on_block` /
+    /// `on_gossip_attestation` validate anything, so a gossip-supplied slot
+    /// reaches them unchecked. Reuse the same future bound both validators
+    /// reject on: past it the delta is not a timeliness measurement but an
+    /// attacker-chosen number, and one fabricated far-future slot would
+    /// dominate the histogram's sum and mislabel its `position` bucket for the
+    /// lifetime of the process.
+    fn is_arrival_observable(&self, slot: u64) -> bool {
+        let slot_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
+        let store_time = self.store.time().expect("store time exists");
+        slot_start_interval <= store_time + GOSSIP_DISPARITY_INTERVALS
+    }
 }
 
 // Protocol trait for internal messages only (tick scheduling).
@@ -1402,7 +1424,9 @@ impl Handler<NewBlock> for BlockChainServer {
                 slot,
                 block: msg.block.message.hash_tree_root(),
             });
-            metrics::observe_gossip_block_arrival(arrival_ms, self.store.config(), slot);
+            if self.is_arrival_observable(slot) {
+                metrics::observe_gossip_block_arrival(arrival_ms, self.store.config(), slot);
+            }
         }
         self.on_block(msg.block);
     }
@@ -1411,17 +1435,16 @@ impl Handler<NewBlock> for BlockChainServer {
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        metrics::observe_gossip_attestation_arrival(
-            arrival_ms,
-            self.store.config(),
-            msg.attestation.data.slot,
-        );
+        let data_slot = msg.attestation.data.slot;
+        if self.is_arrival_observable(data_slot) {
+            metrics::observe_gossip_attestation_arrival(arrival_ms, self.store.config(), data_slot);
+        }
         self.on_gossip_attestation(&msg.attestation);
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
         // the check unless this attestation is for the store's current slot.
         let current_slot = self.store.current_slot();
-        if msg.attestation.data.slot == current_slot {
+        if data_slot == current_slot {
             self.maybe_start_early_aggregation(ctx).await;
         }
     }
@@ -1559,6 +1582,24 @@ mod tests {
         ] {
             let at_default = interval.to_ms_since_genesis(7, &default);
             assert_eq!(interval.to_ms_since_genesis(7, &doubled), 2 * at_default);
+        }
+    }
+
+    #[test]
+    fn a_hostile_slot_saturates_instead_of_overflowing() {
+        let config = config(DEFAULT_MILLISECONDS_PER_SLOT);
+
+        // Arrival metrics reach `to_ms_since_genesis` with an unvalidated
+        // gossip slot, so neither the multiply nor the interval offset may
+        // panic in a debug build or wrap in a release one.
+        for interval in [
+            SlotInterval::BlockPublication,
+            SlotInterval::AttestationProduction,
+            SlotInterval::Aggregation,
+            SlotInterval::SafeTargetUpdate,
+            SlotInterval::EndOfSlot,
+        ] {
+            assert_eq!(interval.to_ms_since_genesis(u64::MAX, &config), u64::MAX);
         }
     }
 
