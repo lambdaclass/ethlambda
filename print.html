@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-6e96cfa5.js";
+            window.path_to_searchindex_js = "searchindex-61a695e0.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-cb75f9b5.js"></script>
+        <script src="toc-a5d5bf8e.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -3001,6 +3001,131 @@ lengths. The bit-packing convention is identical to the spec’s; only the width
 is negotiable. Readers tolerate a foreign length by treating bits past the end
 as unset, and a peer’s advertised subnets are clamped to the local committee
 count before they influence anything.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="benchmarking-block-building"><a class="header" href="#benchmarking-block-building">Benchmarking block building</a></h1>
+<p><code>ethlambda benchmark</code> measures block building the way the node performs it when
+it proposes, against a reproducible synthetic workload, with no devnet running.</p>
+<p>Block building is otherwise only observable through the Prometheus histograms a
+live node exports. Those are noisy, depend on whatever the network happened to
+be doing, and cannot be diffed against a baseline — which makes them a poor
+instrument for tracking performance. The benchmark
+trades network realism for repeatability: the same parameters produce the same
+blocks every run, so two reports differ only where the code differs.</p>
+<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
+<pre><code class="language-bash">make bench                                  # defaults, mock crypto
+BENCH_ARGS="synthetic --iterations 50" make bench
+</code></pre>
+<p><code>make bench</code> is a thin wrapper. The binary takes the same arguments directly:</p>
+<pre><code class="language-bash">ethlambda benchmark synthetic --mock-crypto --num-validators 8 --iterations 10
+</code></pre>
+<p>A default mock run finishes in well under a second, which is why CI can afford
+to run one on every pull request.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--num-validators</code></td><td><code>8</code></td><td>Validators in the synthetic genesis</td></tr>
+<tr><td><code>--warmup-slots</code></td><td><code>8</code></td><td>Unmeasured slots built first, so measured builds run on a state with realistic historical roots and justifications</td></tr>
+<tr><td><code>--iterations</code></td><td><code>10</code></td><td>Measured builds, one block each</td></tr>
+<tr><td><code>--proofs-per-data</code></td><td><code>1</code></td><td>Aggregates seeded per <code>AttestationData</code>, mimicking committee aggregators over disjoint validator subsets</td></tr>
+<tr><td><code>--seed</code></td><td><code>42</code></td><td>Seed for the validator set; fixes the whole run</td></tr>
+<tr><td><code>--mock-crypto</code></td><td>off</td><td>Placeholder proofs instead of real XMSS/leanVM signatures. <strong>Currently required</strong> — see <a href="#limitations">Limitations</a></td></tr>
+<tr><td><code>--enable-proposer-aggregation</code></td><td>off</td><td>Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation</td></tr>
+<tr><td><code>--max-attestations-per-block</code></td><td><code>3</code></td><td>Mirrors the node flag: distinct <code>AttestationData</code> per block</td></tr>
+<tr><td><code>--format</code></td><td><code>human</code></td><td><code>human</code> or <code>json</code></td></tr>
+<tr><td><code>--output &lt;path&gt;</code></td><td>—</td><td>Also write the JSON report to a file</td></tr>
+</tbody>
+</table>
+</div>
+<p>Logs go to stderr and the report to stdout, so <code>--format json</code> pipes straight
+into <code>jq</code>.</p>
+<h2 id="what-it-measures"><a class="header" href="#what-it-measures">What it measures</a></h2>
+<p>Each iteration enters <code>produce_block_with_signatures</code> — the same function
+<code>BlockChainServer::propose_block</code> calls — and the harness reports the phases
+inside it:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Work</th></tr>
+</thead>
+<tbody>
+<tr><td><code>select_payloads</code></td><td>Choosing which attestations go in the block</td></tr>
+<tr><td><code>compact</code></td><td>Collapsing or picking among proofs for the same data</td></tr>
+<tr><td><code>stf_simulate</code></td><td>The state transition that seals <code>state_root</code></td></tr>
+<tr><td><code>overhead</code></td><td>The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone</td></tr>
+<tr><td><code>wall</code></td><td>The whole span</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>overhead</code> is <code>wall</code> minus the sum of the phases, so the columns add up by
+construction.</p>
+<p>Deliberately <strong>outside</strong> the measured span, matching the boundary of the node’s
+own <code>lean_block_building_time_seconds</code> metric: gossip publish, the
+slot-alignment sleep, and importing the block that was just built. The import
+still happens between iterations — otherwise every iteration would build on the
+same head and <code>process_slots</code> would get more expensive as the run went on.</p>
+<p>Phase times come from the sample sums of the existing
+<code>lean_block_proposal_attestation_build_phase_seconds</code> histogram, read before and
+after each build. Histogram sums accumulate raw f64 seconds, so the difference
+between two readings is the elapsed phase time and bucket boundaries play no
+part. Nothing is added to the hot path for the benchmark’s benefit. The harness
+asserts each phase was observed exactly once per build and fails the run
+otherwise, because a mis-attributed report is worse than no report.</p>
+<h2 id="reading-a-report"><a class="header" href="#reading-a-report">Reading a report</a></h2>
+<pre><code>Block-building benchmark — synthetic workload (mock crypto)
+  validators=8 warmup_slots=8 iterations=10 proofs_per_data=1 seed=42
+  enable_proposer_aggregation=false max_attestations_per_block=3
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
+
+  iter           compact  select_payloads     stf_simulate   overhead       wall         root
+  1              0.000ms          0.002ms          0.015ms    0.068ms    0.085ms   0x7282cc99
+  ...
+
+  phase              count        min       mean        p50        p90        max
+  select_payloads       10    0.002ms    0.002ms    0.002ms    0.003ms    0.003ms
+  ...
+</code></pre>
+<p>Every measured iteration gets its own row, and the summary follows below it.
+Outliers are never discarded: XMSS signing and OTS window advancement produce
+legitimate heavy tails, and hiding them would misrepresent the thing being
+measured. A coefficient of variation above 10% is flagged so a noisy run is not
+mistaken for a result.</p>
+<p>Percentiles are nearest-rank, without interpolation. Sample counts here are
+small, so an actual observed value is more informative than a blend of two
+neighbours.</p>
+<p>The <code>root</code> column is the block root of each built block. It is what makes a
+before/after comparison trustworthy: if an optimization leaves the root
+sequence unchanged, it changed only speed and not which attestations were
+selected. If the roots move, the change altered block contents and the timing
+comparison means something different than intended.</p>
+<h2 id="comparing-two-runs"><a class="header" href="#comparing-two-runs">Comparing two runs</a></h2>
+<p>Same seed and same parameters produce identical root sequences, so a baseline
+and a candidate can be diffed directly. The header line exists to tell you when
+they <em>cannot</em> be compared:</p>
+<ul>
+<li><code>leansig</code> and <code>leanvm</code> are the resolved revisions the binary was built
+against, read from <code>Cargo.lock</code> at build time. leanSig tracks a moving branch
+and leanVM performs the signature aggregation, so either one moving changes
+the measured crypto.</li>
+<li><code>os</code>, <code>arch</code> and <code>threads</code> change results across machines.</li>
+</ul>
+<p>Two reports that disagree on any of those are not measuring the same thing.</p>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<ul>
+<li><strong><code>--mock-crypto</code> is required.</strong> Real XMSS/leanVM pools are not wired up yet,
+so the run measures selection, compaction and the state transition — not
+signing or aggregation.</li>
+<li><strong>The seal phase is not measured.</strong> Signing, type-1 wrapping and type-2
+merging happen after the measured span and are not reported.</li>
+<li><strong>Synthetic workloads only.</strong> Replaying a real datadir is not implemented, so
+results reflect a synthetic chain rather than a deep production state.</li>
+</ul>
+<h2 id="in-ci"><a class="header" href="#in-ci">In CI</a></h2>
+<p>The Test job runs a short mock benchmark and asserts the JSON report’s shape
+(<code>schema_version</code>, one sample per iteration). It costs seconds, and it means a
+change to the report contract cannot land unnoticed.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="spec-deviations"><a class="header" href="#spec-deviations">Spec Deviations</a></h1>
 <p>ethlambda diverges from the <a href="https://github.com/leanEthereum/leanSpec">leanSpec</a>
