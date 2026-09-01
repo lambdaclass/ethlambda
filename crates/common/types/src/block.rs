@@ -51,10 +51,11 @@ pub type ByteList512KiB = ByteList<524_288>;
 /// Also known as a *type-2* proof: leanVM's term for an aggregate binding
 /// several distinct messages, each with its own participant set.
 ///
-/// The proof bytes are the `to_bytes()` (postcard) form of leanVM's
-/// `MultiMessageAggregateSignature`, which embeds each component's participant
-/// pubkeys. SSZ encoding this container adds the offset required for its
-/// variable-length field.
+/// The proof bytes are the `to_bytes_without_pubkeys()` form of leanVM's
+/// `MultiMessageAggregateSignature`: participant pubkeys stay off the wire, and
+/// a verifier rebuilds each component's set from the surrounding block body
+/// before decoding. SSZ encoding this container adds the offset required for
+/// its variable-length field.
 #[derive(Debug, Default, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct MultiMessageAggregate {
     /// Serialized multi-message aggregate proof bytes.
@@ -121,15 +122,18 @@ pub const MAX_ATTESTATIONS_DATA: usize = 8;
 ///     building a block proof.
 ///
 /// `participants` and `proof` are independent fields: the proof bytes are the
-/// `to_bytes()` form of leanVM's `SingleMessageAggregateSignature` (which
-/// embeds the participant pubkeys); `participants` is the bitfield identifying
-/// which validators are bound. The verifier resolves the expected pubkeys from
-/// `participants` and cross-checks them against the set embedded in the proof.
+/// `to_bytes_without_pubkeys()` form of leanVM's
+/// `SingleMessageAggregateSignature`, and `participants` is the bitfield
+/// identifying which validators are bound. Pubkeys are not on the wire: the
+/// verifier resolves them from `participants` against its own validator
+/// registry and attaches them when decoding. Attaching a set other than the one
+/// aggregated succeeds at decode and fails at verification, since the proof
+/// binds a hash of the set.
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SingleMessageAggregate {
     /// Bitfield identifying validators bound by this proof.
     pub participants: AggregationBits,
-    /// Aggregated proof bytes in leanVM's `to_bytes()` form (pubkeys embedded).
+    /// Aggregated proof bytes in leanVM's `to_bytes_without_pubkeys()` form.
     pub proof: ByteList512KiB,
 }
 

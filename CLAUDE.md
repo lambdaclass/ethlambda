@@ -30,7 +30,7 @@ crates/
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
-    ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
@@ -262,9 +262,15 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
+- Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
+  (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
+  constants in `common/crypto/src/signature.rs`
 - Epoch-based to prevent reuse
-- Aggregation via leanVM (previously leanMultisig) for efficiency
+- Signing, verification, and aggregation all come from leanVM, which internalized
+  XMSS in its own `xmss` crate; there is no external leanSig dependency
+- `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
+  proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
+  which trades bounded RSS for proving throughput
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM
@@ -307,7 +313,7 @@ one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.m
 ```yaml
 GENESIS_TIME: 1770407233
 GENESIS_VALIDATORS:
-  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # XMSS pubkeys, hex, PUBLIC_KEY_SIZE bytes
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
@@ -392,7 +398,8 @@ behavior.
 ## External Dependencies
 
 **Critical:**
-- `leansig`: XMSS signatures (leanEthereum project)
+- `xmss` / `lean-multisig` (leanVM): XMSS signatures and recursive aggregation,
+  pinned to one revision (leanEthereum project)
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model

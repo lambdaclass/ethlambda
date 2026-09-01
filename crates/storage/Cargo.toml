@@ -25,4 +25,3 @@ lru.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-rand.workspace = true

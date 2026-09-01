@@ -18,7 +18,6 @@ ssz.workspace = true
 postcard.workspace = true
 
 thiserror.workspace = true
-rand.workspace = true
 tracing.workspace = true
 
 [features]

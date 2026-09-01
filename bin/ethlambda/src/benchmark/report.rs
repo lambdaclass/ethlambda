@@ -41,11 +41,9 @@ pub(crate) struct Sample {
 #[derive(Debug, Serialize)]
 pub(crate) struct Environment {
     pub client_version: &'static str,
-    /// Resolved leansig git revision from Cargo.lock. leansig is pinned to a
-    /// moving branch, so results are not comparable across revisions.
-    pub leansig_rev: &'static str,
-    /// Resolved leanVM git revision from Cargo.lock. leanVM does the signature
-    /// aggregation, so a rev bump moves the measured crypto too.
+    /// Resolved leanVM git revision from Cargo.lock. leanVM owns the whole
+    /// signature stack (XMSS and aggregation), so a rev bump moves the
+    /// measured crypto and results are not comparable across revisions.
     pub leanvm_rev: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
@@ -56,7 +54,6 @@ impl Environment {
     pub(crate) fn collect() -> Self {
         Self {
             client_version: version::CLIENT_VERSION,
-            leansig_rev: env!("ETHLAMBDA_LEANSIG_REV"),
             leanvm_rev: env!("ETHLAMBDA_LEANVM_REV"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
@@ -185,13 +182,8 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "  {} leansig={} leanvm={} os={} arch={} threads={}",
-            env.client_version,
-            env.leansig_rev,
-            env.leanvm_rev,
-            env.os,
-            env.arch,
-            env.available_parallelism
+            "  {} leanvm={} os={} arch={} threads={}",
+            env.client_version, env.leanvm_rev, env.os, env.arch, env.available_parallelism
         );
         let _ = writeln!(out);
 
