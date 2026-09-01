@@ -726,8 +726,8 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let time_config = *self.store.config();
-        let slot_start_ms =
-            time_config.genesis_time_ms() + slot * time_config.milliseconds_per_slot;
+        let slot_start_ms = time_config.genesis_time_ms()
+            + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config);
 
         // Build the block. `produce_block_with_signatures` advances the store to
         // this slot's interval 0 (accepting attestations) before building — one

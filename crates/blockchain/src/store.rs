@@ -885,8 +885,9 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time_ms =
-        store.config().genesis_time_ms() + slot * store.config().milliseconds_per_slot;
+    let config = *store.config();
+    let slot_time_ms = config.genesis_time_ms()
+        + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &config);
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
