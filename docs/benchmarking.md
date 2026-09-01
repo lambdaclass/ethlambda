@@ -6,8 +6,7 @@ it proposes, against a reproducible synthetic workload, with no devnet running.
 Block building is otherwise only observable through the Prometheus histograms a
 live node exports. Those are noisy, depend on whatever the network happened to
 be doing, and cannot be diffed against a baseline — which makes them a poor
-instrument for the work tracked in
-[#465](https://github.com/lambdaclass/ethlambda/issues/465). The benchmark
+instrument for tracking performance. The benchmark
 trades network realism for repeatability: the same parameters produce the same
 blocks every run, so two reports differ only where the code differs.
 
