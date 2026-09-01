@@ -1,8 +1,8 @@
 //! Sub-command definition and dispatch.
 //!
-//! `node` is an ordinary clap sub-command, so clap owns its help, usage lines
-//! and error messages. The one thing clap cannot express is a *default*
-//! sub-command, and the node needs one: the Dockerfile,
+//! `node` and `benchmark` are ordinary clap sub-commands, so clap owns their
+//! help, usage lines and error messages. The one thing clap cannot express is a
+//! *default* sub-command, and the node needs one: the Dockerfile,
 //! lean-quickstart, the hive shim and the devnet skills all invoke the binary as
 //! a bare list of node flags, from before there was anything else to run. That
 //! form keeps working because a missing sub-command is filled in as `node`
@@ -12,14 +12,16 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
+use crate::benchmark::BenchmarkOptions;
 use crate::cli::NodeOptions;
 use crate::version;
 
 /// Tokens that already say what to run, so no default is inserted ahead of
 /// them. `help` is clap's own generated sub-command (`ethlambda help node`).
-const EXPLICIT: &[&str] = &[NODE, "help", "-h", "--help", "-V", "--version"];
+const EXPLICIT: &[&str] = &[NODE, BENCHMARK, "help", "-h", "--help", "-V", "--version"];
 
 const NODE: &str = "node";
+const BENCHMARK: &str = "benchmark";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -38,7 +40,12 @@ struct Cli {
 }
 
 /// What the command line asked the binary to do.
+///
+/// The variants are lopsided — the node options are far larger than the
+/// benchmark's — but exactly one is built per process and consumed immediately
+/// by `main`, so the imbalance costs nothing worth a `Box` at every use site.
 #[derive(Debug, clap::Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Run the consensus node (default when no sub-command is given).
     ///
@@ -52,6 +59,8 @@ pub(crate) enum Command {
     // `node`.
     #[command(display_name = "ethlambda")]
     Node(NodeOptions),
+    /// Benchmark block building offline against a controlled workload.
+    Benchmark(BenchmarkOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -123,9 +132,10 @@ mod tests {
     }
 
     fn node_options(args: &[&str]) -> NodeOptions {
-        let Command::Node(options) =
-            try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
-        options
+        match try_parse_from(args.iter().map(OsString::from)).expect("invocation parses") {
+            Command::Node(options) => options,
+            other => panic!("expected a node invocation, got {other:?}"),
+        }
     }
 
     #[test]

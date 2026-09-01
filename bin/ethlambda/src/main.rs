@@ -1,3 +1,4 @@
+mod benchmark;
 mod checkpoint_sync;
 mod cli;
 mod command;
@@ -32,8 +33,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+use cli::NodeOptions;
 use command::Command;
-
 use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
@@ -68,21 +69,54 @@ const ASCII_ART: &str = r#"
  \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
 "#;
 
+fn main() -> eyre::Result<()> {
+    match command::parse() {
+        Command::Node(options) => {
+            init_node_logging()?;
+            run_node(options)
+        }
+        // The benchmark is synchronous, CPU-bound work, so it runs on this
+        // thread and the tokio runtime is never started — rather than parking
+        // a worker thread for the whole run.
+        Command::Benchmark(options) => {
+            init_benchmark_logging()?;
+            benchmark::run(options)
+        }
+    }
+}
+
+/// Node logging: INFO and above, on stdout.
+fn init_node_logging() -> eyre::Result<()> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
+    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
+    tracing::subscriber::set_global_default(subscriber)
+        .wrap_err("failed to set global tracing subscriber")
+}
+
+/// Benchmark logging: WARN and above, on stderr, so that the report owns stdout
+/// and stays pipe-clean for `--format json | jq`.
+fn init_benchmark_logging() -> eyre::Result<()> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::WARN.into())
+        .from_env_lossy();
+    let subscriber = Registry::default().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(subscriber)
+        .wrap_err("failed to set global tracing subscriber")
+}
+
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
 // parallelism. Use a single-threaded runtime under Shadow. This is an
 // optimization, not a correctness requirement.
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
-async fn main() -> eyre::Result<()> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(tracing::Level::INFO.into())
-        .from_env_lossy();
-    let subscriber = Registry::default().with(tracing_subscriber::fmt::layer().with_filter(filter));
-    tracing::subscriber::set_global_default(subscriber)
-        .wrap_err("failed to set global tracing subscriber")?;
-
-    let Command::Node(options) = command::parse();
+async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     options.validate_discovery()?;
 
     #[cfg(feature = "shadow-integration")]
