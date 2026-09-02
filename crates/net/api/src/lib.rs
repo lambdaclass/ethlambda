@@ -1,6 +1,6 @@
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::SignedBlock,
+    block::{BlockBodyProof, SignedBlock},
     primitives::H256,
 };
 use spawned_concurrency::error::ActorError;
@@ -17,6 +17,9 @@ pub trait BlockChainToP2P: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
+    /// Gossip a candidate block body and the aggregate binding its
+    /// attestations, for the next slot's proposer to adopt.
+    fn publish_block_body_proof(&self, body_proof: BlockBodyProof) -> Result<(), ActorError>;
     fn fetch_block(&self, root: H256) -> Result<(), ActorError>;
 }
 
@@ -43,6 +46,9 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
+    /// A candidate block body plus attestation aggregate seen on gossip. Kept
+    /// as a proposal candidate; see `BlockChainServer`'s body-proof buffer.
+    fn new_block_body_proof(&self, body_proof: BlockBodyProof) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---

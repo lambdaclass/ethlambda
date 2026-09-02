@@ -18,6 +18,27 @@ grid.
 - **leanSpec:** `aggregate()` is called inline and synchronously from `tick_interval`, at interval 2 only. It walks every attestation data with fresh evidence, with no worker, no gate, and no separation between producing an aggregate and publishing it.
 - **Equivalence:** the worker produces the same aggregates over a slot, at different times; what a block may carry is unchanged. Where the two can differ is count: a slot whose proving overruns publishes fewer aggregates than the synchronous path would, which affects how many votes are included rather than signature validity.
 
+## Proposer signature outside the block proof
+
+The block proof is a pair — the proposer's raw signature and the attestation aggregate —
+rather than one merged proof over both.
+
+- **ethlambda:** `SignedBlock.proof` is a `BlockProof { proposer_signature, attestation_proof }` (`crates/common/types/src/block.rs`). `proposer_signature` is the raw XMSS signature over the block root, verified directly against the proposer's `proposal_pubkey` with the hash-based verifier; `attestation_proof` is the lean-multisig Type-2 over the body's attestations only, and is empty when the block carries none (`verify_block_signatures`, `crates/blockchain/src/store.rs`).
+- **leanSpec:** the proposer signature is wrapped as a singleton Type-1 and merged into a single block Type-2 alongside every attestation.
+- **Why:** the merged form makes the proposer signature the reason a block needs a prover at all — even an attestation-less one — and it ties the merge to the block root, so nothing can be merged before the block exists. Splitting removes prover work from the empty case entirely and is what makes a gossiped block body proof possible.
+- **Consequence:** this is a wire-format divergence. The signature and SSZ fixtures no longer apply, and a node running this cannot interop with one that does not.
+
+## Block body proofs, and a proposer that packs no body
+
+Candidate bodies are built by aggregators and gossiped; the proposer adopts one instead of
+packing its own.
+
+- **ethlambda:** during the head-update interval the aggregation worker packs a candidate body for the next slot and merges its attestation proofs into one Type-2, and the actor gossips the pair as a `BlockBodyProof` on `/leanconsensus/{fork_digest}/block_body_proof/ssz_snappy` (`crates/blockchain/src/body_proof.rs`). At the slot boundary the proposer scores the candidates it has collected and adopts the most valuable one — or signs an empty block if none beats one (`choose_body`).
+- **leanSpec:** the proposer selects attestations from its own pool, merges their proofs itself, and does both inside its proposal slot.
+- **Why:** the merge is the one part of proposing that costs seconds, and it does not need the proposer, the block root, or the slot. Moving it to the aggregators that already hold the proofs takes it off the critical path; the proposer is left with a state transition, a verification and a signature.
+- **Safety:** the proposer keeps the last word. A candidate is dropped if any of its votes does not sit on the chain the block extends (`attestation_data_matches_chain` — the state transition does not check those roots), if its attestations do not survive that transition, or if its aggregate fails verification; the state root is computed from the transition rather than trusted. Verification happens before signing: XMSS keys are one-time, so a proposer cannot try a candidate, fail the import, and try another. The screen deliberately stops there: a body is all-or-nothing, so dropping one for a merely stale entry would cost the whole block, and staleness is already discounted by the adoption score.
+- **Consequence:** a proposer whose candidates all fail, or that received none, proposes an empty block instead of packing what its own pool holds. On a chain with no aggregator gossiping body proofs, every block is empty.
+
 ## Attestation scoring on block building
 
 Attestations are scored and selected when packing a block, rather than taken in

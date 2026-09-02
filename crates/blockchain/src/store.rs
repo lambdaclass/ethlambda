@@ -20,6 +20,7 @@ use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
     MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
+    body_proof::{self, BodyProofBuffer, ChosenBody},
     metrics,
 };
 
@@ -900,7 +901,46 @@ fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     store.head().expect("store head exists")
 }
 
+/// Produce the block for `slot` from the buffered candidate body proofs.
+///
+/// The proposer's path: it packs no body of its own any more. Advancing the
+/// store to `slot`'s interval 0 (which promotes the pending attestations)
+/// still happens here, so the candidates are judged against the same state the
+/// block will be built on, then [`body_proof::choose_body`] picks the body and
+/// seals the block.
+pub(crate) fn produce_block_from_candidates(
+    store: &mut Store,
+    slot: u64,
+    validator_index: u64,
+    candidates: &BodyProofBuffer,
+) -> Result<ChosenBody, StoreError> {
+    let head_root = get_proposal_head(store, slot);
+    let head_state = store
+        .get_state(&head_root)
+        .expect("head state exists")
+        .ok_or(StoreError::MissingParentState {
+            parent_root: head_root,
+            slot,
+        })?;
+
+    let num_validators = head_state.validators.len() as u64;
+    if !is_proposer(validator_index, slot, num_validators) {
+        return Err(StoreError::NotProposer {
+            validator_index,
+            slot,
+        });
+    }
+
+    body_proof::choose_body(&head_state, slot, validator_index, head_root, candidates)
+}
+
 /// Produce a block and per-aggregated-attestation signature payloads for the target slot.
+///
+/// Packs a body straight from this node's own pool, which is what the
+/// aggregation worker does for a candidate body proof (via
+/// `body_proof::build_body_proof`) and what the offline block-building
+/// benchmark measures. A live proposer instead adopts a candidate body through
+/// [`produce_block_from_candidates`].
 ///
 /// Returns the finalized block and attestation signature payloads aligned
 /// with `block.body.attestations`.

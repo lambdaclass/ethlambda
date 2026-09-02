@@ -387,6 +387,46 @@ static LEAN_AGGREGATED_PROOF_SIZE_BYTES: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+static LEAN_BLOCK_BODY_PROOF_BUILDING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_body_proof_building_time_seconds",
+            "Time taken to build a candidate block body proof",
+            vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BODY_PROOF_CANDIDATES: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_body_proof_candidates",
+            "Candidate block body proofs a proposer had to choose from",
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BODY_SOURCE_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_block_body_source_total",
+            "Where a proposed block's body came from, by source",
+            &["source"]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_BODY_PROOF_REJECTED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_block_body_proof_rejected_total",
+            "Candidate block body proofs a proposer rejected, by reason",
+            &["reason"]
+        )
+        .unwrap()
+    });
+
 static LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -748,6 +788,17 @@ const AGGREGATOR_SKIP_REASONS: &[&str] = &[
     "other",
 ];
 
+/// Label values for `lean_block_body_source_total`: a proposer either adopted
+/// a gossiped candidate body or fell back to an empty one. Both are seeded at
+/// zero so a dashboard can read the ratio from the first block.
+const BLOCK_BODY_SOURCES: &[&str] = &["body_proof", "empty"];
+
+/// Label values for `lean_block_body_proof_rejected_total`: a candidate
+/// carrying a vote this node cannot place on the chain the block would extend,
+/// one whose attestations its own state transition rejected, and one whose
+/// aggregate failed verification.
+const BODY_PROOF_REJECT_REASONS: &[&str] = &["off_chain_vote", "state_transition", "verification"];
+
 static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
     std::sync::LazyLock::new(|| {
         register_int_counter_vec!(
@@ -857,6 +908,16 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_AGGREGATOR_SKIPPED_TOTAL);
     for &reason in AGGREGATOR_SKIP_REASONS {
         LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
+    }
+    // Block body proofs: both body sources and both reject reasons are seeded
+    // so a dashboard can read the adoption ratio from the first block.
+    std::sync::LazyLock::force(&LEAN_BLOCK_BODY_PROOF_BUILDING_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_BODY_PROOF_CANDIDATES);
+    for &source in BLOCK_BODY_SOURCES {
+        LEAN_BLOCK_BODY_SOURCE_TOTAL.with_label_values(&[source]);
+    }
+    for &reason in BODY_PROOF_REJECT_REASONS {
+        LEAN_BLOCK_BODY_PROOF_REJECTED_TOTAL.with_label_values(&[reason]);
     }
 }
 
@@ -998,6 +1059,40 @@ pub fn observe_aggregated_proof_size(bytes: usize) {
 /// is not appropriate here.
 pub fn observe_committee_signatures_aggregation(elapsed: std::time::Duration) {
     LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS.observe(elapsed.as_secs_f64());
+}
+
+/// Observe how long the worker took to build a candidate body proof: the
+/// merge of the body's attestation Type-1s into one Type-2.
+pub fn observe_body_proof_building(elapsed: Duration) {
+    LEAN_BLOCK_BODY_PROOF_BUILDING_TIME_SECONDS.observe(elapsed.as_secs_f64());
+}
+
+/// Observe how many candidate body proofs a proposer had to choose from.
+/// A zero reading means the block could only be empty.
+pub fn observe_body_proof_candidates(count: usize) {
+    LEAN_BLOCK_BODY_PROOF_CANDIDATES.observe(count as f64);
+}
+
+/// A proposed block's body came from a candidate body proof.
+pub fn inc_block_body_from_proof() {
+    LEAN_BLOCK_BODY_SOURCE_TOTAL
+        .with_label_values(&["body_proof"])
+        .inc();
+}
+
+/// A proposed block carried an empty body: no candidate was usable.
+pub fn inc_block_body_empty() {
+    LEAN_BLOCK_BODY_SOURCE_TOTAL
+        .with_label_values(&["empty"])
+        .inc();
+}
+
+/// A candidate body proof a proposer rejected, by reason (see
+/// [`BODY_PROOF_REJECT_REASONS`]).
+pub fn inc_body_proof_rejected(reason: &str) {
+    LEAN_BLOCK_BODY_PROOF_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
 }
 
 /// One vote-aggregation interval passed with this node holding no aggregation

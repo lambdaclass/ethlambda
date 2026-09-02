@@ -60,23 +60,9 @@ pub struct ProposerConfig {
 
 /// Build a valid block on top of this state.
 ///
-/// Selects attestations via `select_attestations`, collapses entries sharing
-/// the same `AttestationData` down to one (a block may carry at most one entry
-/// per data; `on_block` rejects duplicates), and runs the STF once to seal the
-/// state root. The proposer signature is NOT included; it is appended by the
-/// caller.
-///
-/// The collapse strategy is gated by `enable_proposer_aggregation`:
-/// - **enabled**: same-data proofs are merged via recursive single-message
-///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes voter
-///   coverage per entry at the cost of a leanVM aggregation per duplicated
-///   data entry.
-/// - **disabled** (default): the single best-coverage proof per data is kept
-///   and the rest dropped. Skips the leanVM work; coverage is bounded by the
-///   best individual proof.
-///
-/// Either way the output has one entry per `AttestationData` and the
-/// attestation-to-proof correspondence stays 1:1.
+/// Picks the body's attestations via [`select_and_compact`], then runs the STF
+/// once to seal the state root. The proposer signature is NOT included; it is
+/// appended by the caller.
 ///
 /// `config.max_attestations_per_block` bounds how many distinct
 /// `AttestationData` entries are packed (a proposer-side self-limit). It is
@@ -93,6 +79,96 @@ pub(crate) fn build_block(
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
+    let (attestations, aggregated_signatures) = select_and_compact(
+        head_state,
+        slot,
+        parent_root,
+        known_block_roots,
+        aggregated_payloads,
+        config,
+    )?;
+
+    let (final_block, post_checkpoints) = seal_block(
+        head_state,
+        slot,
+        proposer_index,
+        parent_root,
+        BlockBody { attestations },
+    )?;
+
+    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
+    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
+
+    Ok((final_block, aggregated_signatures, post_checkpoints))
+}
+
+/// Seal a block around `body`: run the state transition once to compute the
+/// state root, and report the post-state checkpoints.
+///
+/// The body need not be one this node packed. Running the STF is what makes
+/// adopting a gossiped [`ethlambda_types::block::BlockBodyProof`] safe: an
+/// `Err` here means those attestations are not valid on top of `head_state`,
+/// and the state root is computed from the transition rather than trusted.
+pub(crate) fn seal_block(
+    head_state: &State,
+    slot: u64,
+    proposer_index: u64,
+    parent_root: H256,
+    body: BlockBody,
+) -> Result<(Block, PostBlockCheckpoints), StoreError> {
+    let mut block = Block {
+        slot,
+        proposer_index,
+        parent_root,
+        state_root: H256::ZERO,
+        body,
+    };
+    let mut post_state = head_state.clone();
+    // ethlambda runs the STF once after selection (it projects justification
+    // incrementally instead of re-running the STF per loop round), so this is
+    // a single `stf_simulate` observation per build.
+    let stf_start = Instant::now();
+    process_slots(&mut post_state, slot)?;
+    process_block(&mut post_state, &block)?;
+    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
+    block.state_root = post_state.hash_tree_root();
+
+    let post_checkpoints = PostBlockCheckpoints {
+        justified: post_state.latest_justified,
+        finalized: post_state.latest_finalized,
+    };
+
+    Ok((block, post_checkpoints))
+}
+
+/// Pick the attestations a block at `slot` should carry, and the proof that
+/// goes with each.
+///
+/// Selection (`select_attestations`) followed by the collapse every block needs
+/// — one entry per `AttestationData`, since `on_block` rejects duplicates —
+/// with no state transition and no block assembled, so it serves both the
+/// proposer (`build_block`) and the aggregation worker building a candidate
+/// body proof.
+///
+/// The collapse strategy is gated by `enable_proposer_aggregation`:
+/// - **enabled**: same-data proofs are merged via recursive single-message
+///   aggregation into a single union-coverage proof (leanSpec #510). Maximizes
+///   voter coverage per entry at the cost of a leanVM aggregation per
+///   duplicated data entry.
+/// - **disabled** (default): the single best-coverage proof per data is kept
+///   and the rest dropped. Skips the leanVM work; coverage is bounded by the
+///   best individual proof.
+///
+/// Either way the output has one entry per `AttestationData` and the
+/// attestation-to-proof correspondence stays 1:1.
+pub(crate) fn select_and_compact(
+    head_state: &State,
+    slot: u64,
+    parent_root: H256,
+    known_block_roots: &HashSet<H256>,
+    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    config: ProposerConfig,
+) -> Result<(AggregatedAttestations, Vec<SingleMessageAggregate>), StoreError> {
     let select_start = Instant::now();
     let selected = select_attestations(
         head_state,
@@ -106,13 +182,6 @@ pub(crate) fn build_block(
 
     let child_payloads_consumed = selected.len();
 
-    // Each AttestationData may appear at most once per block (`on_block`
-    // rejects duplicates), so same-data entries must be collapsed to one.
-    // Gated by `enable_proposer_aggregation`: when enabled, proofs sharing an
-    // AttestationData are merged via recursive single-message aggregation into
-    // a union-coverage proof (leanSpec #510); when disabled, we skip that leanVM
-    // work and keep only the single best-coverage proof per data. Both paths
-    // log the entry / unique-entry counts they already compute.
     let compact_start = Instant::now();
     let compacted = if config.enable_proposer_aggregation {
         compact_attestations(selected, head_state, slot)?
@@ -121,40 +190,32 @@ pub(crate) fn build_block(
         keep_best_proof_per_data(selected, &running_votes, slot)
     };
     metrics::observe_block_proposal_phase("compact", compact_start.elapsed());
+    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
 
     let (aggregated_attestations, aggregated_signatures): (Vec<_>, Vec<_>) =
         compacted.into_iter().unzip();
-
     let attestations: AggregatedAttestations = aggregated_attestations
         .try_into()
         .expect("attestation count exceeds limit");
-    let mut final_block = Block {
-        slot,
-        proposer_index,
-        parent_root,
-        state_root: H256::ZERO,
-        body: BlockBody { attestations },
-    };
-    let mut post_state = head_state.clone();
-    // ethlambda runs the STF once after selection (it projects justification
-    // incrementally instead of re-running the STF per loop round), so this is
-    // a single `stf_simulate` observation per build.
-    let stf_start = Instant::now();
-    process_slots(&mut post_state, slot)?;
-    process_block(&mut post_state, &final_block)?;
-    metrics::observe_block_proposal_phase("stf_simulate", stf_start.elapsed());
-    final_block.state_root = post_state.hash_tree_root();
 
-    metrics::inc_block_proposal_child_payloads_consumed(child_payloads_consumed as u64);
-    metrics::observe_block_proposal_attestation_data_selected(final_block.body.attestations.len());
-    metrics::observe_block_proposal_aggregates_selected(aggregated_signatures.len());
+    Ok((attestations, aggregated_signatures))
+}
 
-    let post_checkpoints = PostBlockCheckpoints {
-        justified: post_state.latest_justified,
-        finalized: post_state.latest_finalized,
-    };
-
-    Ok((final_block, aggregated_signatures, post_checkpoints))
+/// The chain view `process_block_header` would produce on a candidate block at
+/// `slot`: covering `[0, slot - 1]` with `parent_root` at the parent's slot and
+/// `ZERO_HASH` for the empty slots in between.
+///
+/// Lets a caller validate a vote's head/source/target roots against the chain
+/// the block would extend, instead of waiting for the state transition — which
+/// does not check them at all, and would happily carry a vote for a root this
+/// node has never seen.
+pub(crate) fn extended_chain_view(head_state: &State, slot: u64, parent_root: H256) -> Vec<H256> {
+    let parent_slot = head_state.latest_block_header.slot;
+    let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
+    let mut hashes: Vec<H256> = head_state.historical_block_hashes.iter().copied().collect();
+    hashes.push(parent_root);
+    hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
+    hashes
 }
 
 /// Tiered greedy attestation selection for block proposal.
@@ -181,16 +242,7 @@ fn select_attestations(
         return selected;
     }
 
-    // Chain view that `process_block_header` would produce on the candidate
-    // block: covering [0, slot - 1] with parent_root at parent.slot and
-    // ZERO_HASH for empty slots in between. Lets us validate source/target
-    // roots without waiting for the STF to drop mismatches.
-    let parent_slot = head_state.latest_block_header.slot;
-    let num_empty_slots = slot.saturating_sub(parent_slot).saturating_sub(1) as usize;
-    let mut extended_historical_block_hashes: Vec<H256> =
-        head_state.historical_block_hashes.iter().copied().collect();
-    extended_historical_block_hashes.push(parent_root);
-    extended_historical_block_hashes.extend(std::iter::repeat_n(H256::ZERO, num_empty_slots));
+    let extended_historical_block_hashes = extended_chain_view(head_state, slot, parent_root);
 
     let chain = ChainContext {
         aggregated_payloads,

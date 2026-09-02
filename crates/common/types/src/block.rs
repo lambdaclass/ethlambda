@@ -165,6 +165,41 @@ impl Default for BlockProof {
 }
 
 // ============================================================================
+// Block body proof
+// ============================================================================
+
+/// A candidate block body together with the aggregate that binds its
+/// attestations: everything a proposer needs for a block except the header and
+/// its own signature.
+///
+/// Only possible because the proposer signature sits outside the aggregate
+/// (see [`BlockProof`]): the Type-2 over a body's attestations does not depend
+/// on the block root, so it can be built by a node that is not the proposer,
+/// before the block exists. Aggregators gossip these so the slot's proposer
+/// can adopt one instead of running the merge itself.
+///
+/// A proposer that adopts one carries `proof` verbatim as
+/// [`BlockProof::attestation_proof`], so the pair is only meaningful together:
+/// the proof binds exactly these attestations, in this order.
+#[derive(Clone, SszEncode, SszDecode)]
+pub struct BlockBodyProof {
+    /// The candidate body, carrying the attestations the proof binds.
+    pub block_body: BlockBody,
+    /// Type-2 aggregate over `block_body`'s attestations.
+    pub proof: MultiMessageAggregate,
+}
+
+// Manual Debug impl because the proof bytes are large and opaque.
+impl core::fmt::Debug for BlockBodyProof {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BlockBodyProof")
+            .field("attestations", &self.block_body.attestations.len())
+            .field("proof", &format_args!("<{} bytes>", self.proof.proof.len()))
+            .finish()
+    }
+}
+
+// ============================================================================
 // Single-message aggregate
 // ============================================================================
 //
