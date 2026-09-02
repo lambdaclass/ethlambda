@@ -9,7 +9,7 @@ Every duty a validator owes the chain is due in one of them:
 | 1 | t+800 ms | [Vote propagation](#interval-1-vote-propagation) | every validator | a signed attestation, on its subnet topic |
 | 2 | t+1600 ms | [Vote aggregation](#interval-2-vote-aggregation) | aggregators | an aggregated attestation, on the `aggregation` topic |
 | 3 | t+2400 ms | [Safe target computation](#interval-3-safe-target-computation) | every validator | nothing: local bookkeeping |
-| 4 | t+3200 ms | [Head update](#interval-4-head-update) | every validator | nothing: local bookkeeping |
+| 4 | t+3200 ms | [Head update](#interval-4-head-update) | every validator | in ethlambda: a candidate block body proof, on the `block_body_proof` topic |
 
 ```text
                              ONE SLOT (4000 ms)
@@ -20,7 +20,7 @@ Every duty a validator owes the chain is due in one of them:
     │   block    │    vote    │    vote    │safe target │    head    │
     │  proposal  │propagation │aggregation │computation │   update   │
     └────────────┴────────────┴────────────┴────────────┴────────────┘
-     ◄───────────── gossiped ─────────────▶ ◄───── local only ───────▶
+     ◄───────────── gossiped ─────────────▶ ◄─ local ─▶ ◄─ gossiped ─▶
 ```
 
 The grid comes from a genesis timestamp every node shares, so the schedule needs no
@@ -52,11 +52,13 @@ Genesis occupies slot 0, so proposals start at slot 1, and nothing forces a slot
 filled: a proposer that is offline or too slow leaves an empty slot, and the next block
 simply points its parent root at an older block.
 
-> **In ethlambda:** block proposal is merged into the previous slot's head-update
-> interval: the proposer advances its store to the next slot, builds the block there,
-> and holds publication until the slot boundary. That buys the build one extra interval
-> of headroom and leaves no actor work at the block-proposal tick itself. The aggregation
-> worker is paused for the duration, so the build does not share the prover with it.
+> **In ethlambda:** the proposer packs no body of its own. It adopts the most valuable
+> of the candidate [block body proofs](#block-body-proofs) gossiped during the previous
+> interval — validated against its own state, and only if it is worth more than an empty
+> body — or else signs an empty block, which costs no prover work at all. What is left of
+> proposing is a state transition, one aggregate verification and one signature, so it
+> runs at this tick rather than being prebuilt an interval early. The aggregation worker
+> is paused for the duration, so the assembly does not share the prover with it.
 
 ## Interval 1: Vote propagation
 
@@ -119,3 +121,27 @@ what keeps a validator's fork-choice view from shifting under it mid-slot. The s
 is the exception: it reads the unpromoted buffer directly, which is how it stays a view of
 this slot alone. See [why staged promotion](./lmd_ghost.md#why-staged-promotion) for the
 reasoning.
+
+> **In ethlambda:** the promote is followed by a second duty for aggregators, described
+> below: pack a candidate body for the next slot and gossip it as a block body proof.
+
+## Block body proofs
+
+An ethlambda addition, not in leanSpec. The costly part of proposing is not picking
+attestations, it is merging their proofs into the single aggregate a block body carries.
+That merge does not depend on the block root — the proposer's signature is carried beside
+the aggregate, not inside it — so it need not be done by the proposer, and need not wait
+for the slot to open.
+
+So the promote at interval 4 is followed by a second duty for aggregators: pack a candidate
+body for the next slot out of the pool as it now stands, merge its proofs, and gossip the
+pair as a `BlockBodyProof` on its own topic. The next slot's proposer collects whatever
+arrives and, at the slot boundary, adopts the most valuable candidate that survives its own
+checks.
+
+The proposer keeps the last word. A candidate is dropped if any of its votes does not sit
+on the chain the block extends, if its attestations do not survive the state transition, or
+if its aggregate fails verification; and it is adopted only if it justifies more, finalizes
+more, or adds voters the state does not already have. Otherwise the block
+goes out empty, which is cheap enough to be a real option: an attestation-less block
+carries no aggregate and needs no prover call.

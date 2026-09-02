@@ -116,10 +116,29 @@ The metrics below are not part of the [leanMetrics specification](https://github
 |------|------|-------|-------------------------|--------|---------|
 | `lean_aggregated_proof_size_bytes` | Histogram | Bytes size of an aggregated signature proof's `proof_data` field | On aggregated signature production | | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 |
 
+### Block Body Proofs
+
+Candidate block bodies and the aggregate binding their attestations, gossiped by
+aggregators during the head-update interval for the next slot's proposer to adopt. See
+[Slots and Intervals](./slots_and_intervals.md#interval-4-head-update).
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_block_body_proof_building_time_seconds` | Histogram | Time taken to build a candidate block body proof (the attestation Type-1 → Type-2 merge) | On body proof production | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4 |
+| `lean_block_body_proof_candidates` | Histogram | Candidate body proofs a proposer had to choose from; `0` means the block could only be empty | On block production | | 0, 1, 2, 3, 4, 6, 8 |
+| `lean_block_body_source_total` | Counter | Where a proposed block's body came from | On block production | source=body_proof,empty | |
+| `lean_block_body_proof_rejected_total` | Counter | Candidate body proofs a proposer rejected | On block production | reason=off_chain_vote,state_transition,verification | |
+
+Since the proposer no longer packs a body, `lean_block_building_time_seconds` now measures
+assembly only — choosing a candidate, verifying it, signing — and the merge it used to
+include shows up in `lean_block_body_proof_building_time_seconds` on whichever node built
+the candidate.
+
 ### Network Sizes
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
+| `lean_gossip_block_body_proof_size_bytes` | Histogram | Bytes size of a gossip block body proof message (raw SSZ or snappy on-wire) | On gossip body proof send/receive | compression=raw,snappy | 10000, 50000, 100000, 250000, 500000, 1000000, 2000000, 5000000 |
 | `lean_gossip_block_size_bytes` | Histogram | Bytes size of a gossip block message (raw SSZ or snappy on-wire) | On gossip block send/receive | compression=raw,snappy | 10000, 50000, 100000, 250000, 500000, 1000000, 2000000, 5000000 |
 | `lean_gossip_attestation_size_bytes` | Histogram | Bytes size of a gossip attestation message (raw SSZ or snappy on-wire) | On gossip attestation send/receive | compression=raw,snappy | 512, 1024, 2048, 4096, 8192, 16384 |
 | `lean_gossip_aggregation_size_bytes` | Histogram | Bytes size of a gossip aggregated attestation message (raw SSZ or snappy on-wire) | On gossip aggregation send/receive | compression=raw,snappy | 1024, 4096, 16384, 65536, 131072, 262144, 524288, 1048576 |

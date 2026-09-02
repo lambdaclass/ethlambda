@@ -34,8 +34,14 @@
 //! slot's committee aggregation.
 //!
 //! The actor can also park the worker outright: it raises the pause flag
-//! around its own block build, so the prover is not shared with it (see
+//! around its own proposal, so the prover is not shared with it (see
 //! [`AggregationWorker::pause`]).
+//!
+//! During the head-update interval the worker has one further duty: build the
+//! candidate [`BlockBodyProof`] for the upcoming slot (see
+//! [`body_proof::build_body_proof`]) and hand it to the actor, which gossips it
+//! for that slot's proposer to adopt. It takes priority over aggregation there,
+//! since it is the one job with a deadline.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,7 +55,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{AggregationBits, AttestationData, HashedAttestationData},
-    block::{ByteList512KiB, SingleMessageAggregate},
+    block::{BlockBodyProof, ByteList512KiB, SingleMessageAggregate},
     primitives::H256,
     state::Validator,
 };
@@ -58,8 +64,9 @@ use spawned_concurrency::tasks::ActorRef;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
-use crate::block_builder::{self, EntryScore};
-use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
+use crate::block_builder::{self, EntryScore, ProposerConfig};
+use crate::body_proof;
+use crate::{INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
 
 /// How long the worker waits before re-reading the pool when it found nothing
 /// to do — no eligible job, the pause flag raised, or no aggregation duty.
@@ -100,6 +107,11 @@ const _: () = assert!(
     EARLY_AGGREGATION_WINDOW.as_millis() <= VOTE_AGGREGATION_OFFSET_MS as u128,
     "EARLY_AGGREGATION_WINDOW must not reach past the slot boundary"
 );
+
+/// Offset within the slot at which the head-update interval — the slot's last
+/// — begins. From here the worker's first duty is the next slot's candidate
+/// body proof.
+const HEAD_UPDATE_OFFSET_MS: u64 = (INTERVALS_PER_SLOT - 1) * MILLISECONDS_PER_INTERVAL;
 
 /// A single pre-prepared aggregation group.
 ///
@@ -204,15 +216,17 @@ impl Drop for PauseGuard {
     }
 }
 
-/// Startup-fixed inputs the worker's vote-propagation gate needs. Both come
-/// from the CLI and never change at runtime, so the worker owns a copy instead
-/// of reaching back into the actor.
+/// Startup-fixed inputs the worker needs. All come from the CLI and never
+/// change at runtime, so the worker owns a copy instead of reaching back into
+/// the actor.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     /// Number of attestation committees (= subnet count).
     pub(crate) attestation_committee_count: u64,
     /// Attestation subnets this node subscribes to.
     pub(crate) subscribed_subnets: HashSet<u64>,
+    /// Body-packing policy, shared with the proposer path.
+    pub(crate) proposer_config: ProposerConfig,
 }
 
 /// One successful aggregate streamed back from the worker.
@@ -223,6 +237,27 @@ pub(crate) struct AggregateProduced {
 }
 impl Message for AggregateProduced {
     type Result = ();
+}
+
+/// A candidate body proof the worker built for `slot`.
+pub(crate) struct BodyProofProduced {
+    /// Slot the body was packed for: the one whose proposer may adopt it.
+    pub(crate) slot: u64,
+    pub(crate) body_proof: BlockBodyProof,
+    /// Wall time the merge took, observed on the worker thread.
+    pub(crate) elapsed: Duration,
+}
+impl Message for BodyProofProduced {
+    type Result = ();
+}
+
+/// What the worker does with a turn of its loop.
+enum WorkerJob {
+    /// Prove one aggregation group. Boxed: a job carries its whole aggregation
+    /// material, which dwarfs the other variant.
+    Aggregate(Box<AggregationJob>),
+    /// Build the candidate body proof for `slot`.
+    BodyProof { slot: u64 },
 }
 
 /// Validator ids this worker has already produced a proof for, keyed by
@@ -878,13 +913,14 @@ pub(crate) fn spawn_aggregation_worker(
 
 /// Worker loop — runs on its own thread for the actor's lifetime.
 ///
-/// Each round re-reads the pool through the store handle, picks the best job
-/// ([`select_best_job`]), proves it, and hands the result to the actor as an
-/// [`AggregateProduced`] message. With nothing to do — nothing eligible,
-/// paused for a block build, or no aggregation duty — it sleeps
+/// Each round re-reads the pool through the store handle, takes the job worth
+/// doing right now ([`next_job`]), and hands the result to the actor: an
+/// [`AggregateProduced`] for a proved group, a [`BodyProofProduced`] for the
+/// upcoming slot's candidate body. With nothing to do — nothing eligible,
+/// paused for a proposal, or no aggregation duty — it sleeps
 /// [`WORKER_IDLE_POLL`] and looks again.
 ///
-/// `aggregate_mixed` cannot be interrupted, so both cancellation and the pause
+/// leanVM proofs cannot be interrupted, so both cancellation and the pause
 /// flag are only observed between jobs.
 fn run_aggregation_worker(
     store: Store,
@@ -898,6 +934,9 @@ fn run_aggregation_worker(
 
     let genesis_time_ms = store.config().genesis_time * 1000;
     let mut emitted = EmittedCoverage::default();
+    // Slot the last candidate body proof was packed for, so the head-update
+    // interval produces one candidate rather than a stream of them.
+    let mut body_proof_slot: Option<u64> = None;
 
     while !cancel.is_cancelled() {
         let Some(job) = next_job(
@@ -907,48 +946,24 @@ fn run_aggregation_worker(
             &paused,
             &config,
             &mut emitted,
+            body_proof_slot,
         ) else {
             std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
 
-        let slot = job.slot;
-        let raw_sigs = job.raw_ids.len();
-        let children = job.children.len();
-        let data_root = job.hashed.root();
-        // Recorded whether or not the proof succeeds: a failed job re-reads
-        // identically, so without this the loop would retry it at full prover
-        // cost until a new signature arrives.
-        let attempted: Vec<u64> = job.coverage().into_iter().collect();
-
-        let job_start = Instant::now();
-        let output = aggregate_job(job);
-        let elapsed = job_start.elapsed();
-        emitted.record(data_root, &attempted);
-
-        let Some(output) = output else {
-            warn!(
-                slot,
-                raw_sigs,
-                children,
-                ?elapsed,
-                "Committee signature aggregation failed"
-            );
-            metrics::inc_aggregator_skipped_other(1);
-            continue;
+        let delivered = match job {
+            WorkerJob::Aggregate(job) => run_aggregate_job(*job, &actor, &mut emitted),
+            WorkerJob::BodyProof { slot } => {
+                // Marked before the build, not after: a failed or empty build
+                // would otherwise be retried for the rest of the interval.
+                body_proof_slot = Some(slot);
+                run_body_proof_job(slot, &store, &config, &actor)
+            }
         };
 
-        info!(
-            slot,
-            raw_sigs,
-            children,
-            participants = output.participants.len(),
-            ?elapsed,
-            "Committee signature aggregated"
-        );
-
-        if actor.send(AggregateProduced { output, elapsed }).is_err() {
-            // Actor is gone; nothing would consume further aggregates.
+        if !delivered {
+            // Actor is gone; nothing would consume further work.
             break;
         }
     }
@@ -956,11 +971,94 @@ fn run_aggregation_worker(
     info!("Aggregation worker stopped");
 }
 
-/// One round of job selection: honor the role flag and the pause flag, derive
-/// the slot and the [`JobPolicy`] from the wall clock, then ask
-/// [`select_best_job`] for the winner. `None` means "nothing to do right now",
-/// which inside the early window is a deliberate answer rather than an idle
-/// one.
+/// Prove one aggregation group and send it to the actor. Returns false when
+/// the actor is gone.
+fn run_aggregate_job(
+    job: AggregationJob,
+    actor: &ActorRef<crate::BlockChainServer>,
+    emitted: &mut EmittedCoverage,
+) -> bool {
+    let slot = job.slot;
+    let raw_sigs = job.raw_ids.len();
+    let children = job.children.len();
+    let data_root = job.hashed.root();
+    // Recorded whether or not the proof succeeds: a failed job re-reads
+    // identically, so without this the loop would retry it at full prover cost
+    // until a new signature arrives.
+    let attempted: Vec<u64> = job.coverage().into_iter().collect();
+
+    let job_start = Instant::now();
+    let output = aggregate_job(job);
+    let elapsed = job_start.elapsed();
+    emitted.record(data_root, &attempted);
+
+    let Some(output) = output else {
+        warn!(
+            slot,
+            raw_sigs,
+            children,
+            ?elapsed,
+            "Committee signature aggregation failed"
+        );
+        metrics::inc_aggregator_skipped_other(1);
+        return true;
+    };
+
+    info!(
+        slot,
+        raw_sigs,
+        children,
+        participants = output.participants.len(),
+        ?elapsed,
+        "Committee signature aggregated"
+    );
+
+    actor.send(AggregateProduced { output, elapsed }).is_ok()
+}
+
+/// Build the candidate body proof for `slot` and send it to the actor. Returns
+/// false when the actor is gone.
+fn run_body_proof_job(
+    slot: u64,
+    store: &Store,
+    config: &WorkerConfig,
+    actor: &ActorRef<crate::BlockChainServer>,
+) -> bool {
+    let job_start = Instant::now();
+    let Some(body_proof) = body_proof::build_body_proof(store, slot, config.proposer_config) else {
+        return true;
+    };
+    let elapsed = job_start.elapsed();
+
+    info!(
+        %slot,
+        attestation_count = body_proof.block_body.attestations.len(),
+        proof_bytes = body_proof.proof.proof.len(),
+        ?elapsed,
+        "Block body proof built"
+    );
+    metrics::observe_body_proof_building(elapsed);
+
+    actor
+        .send(BodyProofProduced {
+            slot,
+            body_proof,
+            elapsed,
+        })
+        .is_ok()
+}
+
+/// One round of job selection: honor the role flag and the pause flag, then
+/// derive from the wall clock what is worth doing.
+///
+/// In the head-update interval the next slot's candidate body proof comes
+/// first, unless one was already built for that slot: it is the job with a
+/// deadline (the proposer assembles before the slot boundary), while
+/// aggregation work keeps just as well for the next round. Otherwise the best
+/// aggregation job the [`JobPolicy`] admits wins. `None` means "nothing to do
+/// right now", which inside the early window is a deliberate answer rather
+/// than an idle one.
+#[allow(clippy::too_many_arguments)]
 fn next_job(
     store: &Store,
     genesis_time_ms: u64,
@@ -968,7 +1066,8 @@ fn next_job(
     paused: &AtomicBool,
     config: &WorkerConfig,
     emitted: &mut EmittedCoverage,
-) -> Option<AggregationJob> {
+    body_proof_slot: Option<u64>,
+) -> Option<WorkerJob> {
     if !aggregator.is_enabled() || paused.load(Ordering::Acquire) {
         return None;
     }
@@ -978,10 +1077,16 @@ fn next_job(
     let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
     let ms_into_slot = ms_since_genesis % MILLISECONDS_PER_SLOT;
 
+    if ms_into_slot >= HEAD_UPDATE_OFFSET_MS && body_proof_slot != Some(slot + 1) {
+        return Some(WorkerJob::BodyProof { slot: slot + 1 });
+    }
+
     emitted.roll_to(slot);
     let policy = job_policy(ms_into_slot, store, config);
 
     select_best_job(store, slot, policy, emitted)
+        .map(Box::new)
+        .map(WorkerJob::Aggregate)
 }
 
 #[cfg(test)]
@@ -989,7 +1094,7 @@ mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::{
-        block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
+        block::{Block, BlockBody, BlockHeader, BlockProof, SignedBlock},
         checkpoint::Checkpoint,
         state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
     };
@@ -1086,7 +1191,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         };
         store
             .insert_signed_block(root, signed_block)
@@ -1740,6 +1845,10 @@ mod tests {
         let config = WorkerConfig {
             attestation_committee_count: 4,
             subscribed_subnets: HashSet::from([0, 1]),
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: 1,
+            },
         };
         // 10 validators over 4 committees: subnets 0 and 1 hold 3 each, so a
         // group gathering both needs 4 of those 6.
