@@ -48,7 +48,10 @@ The handler emits a fixed, compact body (no whitespace):
 
 ### `GET /lean/v0/config/spec`
 
-Protocol constants the node was built with. Keys mirror the leanSpec constant names:
+Protocol parameters the node is running on. Keys mirror the leanSpec constant names.
+`MILLISECONDS_PER_SLOT` and `MILLISECONDS_PER_INTERVAL` reflect the network's config
+file rather than a compile-time constant, so a node on an 8-second network reports
+`8000` and `1600` here:
 
 ```json
 {

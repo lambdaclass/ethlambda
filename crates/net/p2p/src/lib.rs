@@ -179,7 +179,14 @@ pub struct SwarmConfig {
     /// Attestation subnets to subscribe to, precomputed via
     /// [`attestation_subscription_subnets`].
     pub subscription_subnets: HashSet<u64>,
+    /// Slot duration from the network's config file. Gossipsub's duplicate
+    /// cache is specified in slots, so it has to follow the network's cadence.
+    pub milliseconds_per_slot: u64,
 }
+
+/// Width of gossipsub's duplicate cache, in slots: leanSpec sets
+/// `seen_ttl = SECONDS_PER_SLOT * JUSTIFICATION_LOOKBACK_SLOTS * 2`.
+const DUPLICATE_CACHE_SLOTS: u64 = 3 * 2;
 
 /// The attestation subnets a node subscribes to: every validator subscribes
 /// to its own committee subnet (`validator_id % attestation_committee_count`)
@@ -259,8 +266,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
-        // seen_ttl_secs = seconds_per_slot * justification_lookback_slots * 2
-        .duplicate_cache_time(Duration::from_secs(4 * 3 * 2))
+        .duplicate_cache_time(Duration::from_millis(
+            config.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS,
+        ))
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
         // Taken from ream

@@ -12,6 +12,7 @@ use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AttestationData, validator_indices},
     block::Block,
+    constants::DEFAULT_MILLISECONDS_PER_SLOT,
     primitives::{H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
@@ -105,8 +106,13 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         let anchor_root = anchor_block.hash_tree_root();
 
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::get_forkchoice_store(backend, anchor_state, anchor_block)
-            .expect("anchor state and block must match");
+        let mut store = Store::get_forkchoice_store(
+            backend,
+            anchor_state,
+            anchor_block,
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
+        .expect("anchor state and block must match");
 
         // Block registry: maps block labels to their roots
         let mut block_registry: HashMap<String, H256> = HashMap::new();
