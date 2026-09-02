@@ -304,6 +304,64 @@ The RPC crate serves the API router (`--api-port`, default 5052) and the metrics
 when they are equal it merges all three routers onto a single listener, so pointing both flags at
 one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
+## Beacon Chain types (`crates/common/types/src/beacon/`)
+
+`ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0
+through fulu) alongside lean's own types. The Beacon Chain is a different
+protocol from the Lean consensus this repo implements; the types share a crate
+so that one `BlockChainServer` can dispatch on a single state type instead of
+existing once per chain.
+
+- `BeaconState` has a **`Lean` variant holding lean's `State`**, and `ForkName`
+  a matching `Lean`. Only `fork_name()` and `from_ssz()` handle it; every other
+  beacon accessor answers `unreachable!()` naming itself. The guarantee is the
+  single `match` at the top of each handler, not the type system, so a lean
+  state reaching a beacon accessor should fail as a named panic rather than a
+  silent wrong answer.
+- **`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
+  what `parse`, `previous` and `next` search, so its absence keeps
+  `parse("lean")` at `None` and `Fulu.next()` at `None`, meaning a fork upgrade
+  cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
+  fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
+  every beacon fork, which is what `fork >= ForkName::X` gating reads.
+- Preset is a **compile-time** choice (`preset-minimal` feature on this crate)
+  because SSZ container bounds are const-generic arguments; fork scheduling is
+  runtime (`beacon::config`) instead. Every lean crate depends on
+  `ethlambda-types`, so enabling the feature rebuilds it for the whole graph;
+  lean code reads none of the beacon preset constants, so it cannot change lean
+  behavior.
+- Per-fork containers are plain structs behind an enum, so SSZ stays derived:
+  two of phase0's fields are *replaced* in altair, one field changes type in
+  five separate forks, and the state's merkle tree gains a level at electra.
+- **`beacon::primitives::Root` *is* `primitives::H256`**, not a second 32-byte
+  hash converted at the boundary, and `beacon::primitives::HashTreeRoot`
+  re-exports lean's convenience trait rather than declaring its own. The
+  primitive family a beacon container needs beyond that is two newtypes,
+  `H160` and `U256`, so the crate declares them instead of depending on
+  `ethereum-types`. Two consequences worth knowing:
+  - `U256` holds the **32 little-endian bytes SSZ encodes it as**, so its
+    stored byte order is the reverse of its numeric one and `Ord` is written
+    out by hand. Do not derive it: a derived `Ord` compares the least
+    significant byte first, which would silently invert
+    `terminal_total_difficulty` comparisons.
+  - `H160` writes out `libssz_merkle::HashTreeRoot` because the derive drops
+    `is_basic_type`, and at 20 bytes wide that answer changes the merkle tree
+    of any list or vector of addresses. Everything else here is 32 bytes,
+    where packing and per-element padding coincide, so the derive is fine.
+- **Requires mutable element access on `SszList`**, which no published libssz
+  release has, so all four libssz crates are **git dependencies** on
+  `lambdaclass/libssz` (for lambdaclass/libssz#33), pinned by `rev` rather than
+  tracking `main`: this is the SSZ encoder and merkleizer behind every
+  `hash_tree_root`, so a routine `cargo update` must not be able to move it.
+  Return them to a crates.io version once a release carries #33. A git dependency rather than a
+  `[patch.crates-io]` override because nothing outside this workspace depends on
+  libssz, so there is no second copy to unify; that also keeps the manifest free
+  of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.
+- The state transition consuming these containers is **not** in this repo yet;
+  it lives on `feat/beacon-chain-stf`, where these types are verified against
+  consensus-specs v1.6.1 (5705 mainnet / 40009 minimal cases). What runs here
+  is the containers' own round-trip and shape tests.
+
 ## Configuration Files
 
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)

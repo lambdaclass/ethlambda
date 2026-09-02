@@ -1,5 +1,6 @@
 pub mod aggregator;
 pub mod attestation;
+pub mod beacon;
 pub mod block;
 pub mod chain_config;
 pub mod checkpoint;

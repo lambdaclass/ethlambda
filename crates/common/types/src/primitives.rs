@@ -21,7 +21,6 @@ pub type ByteList<const N: usize> = libssz_types::SszList<u8, N>;
 /// Encoded as a fixed 32-byte array (transparent SSZ wrapper).
 /// Serialized as a `"0x..."` hex string.
 #[derive(
-    Debug,
     Clone,
     Copy,
     Default,
@@ -64,6 +63,15 @@ impl<'de> serde::Deserialize<'de> for H256 {
 
 impl H256 {
     pub const ZERO: Self = Self([0u8; 32]);
+
+    /// Every byte set to `byte`.
+    ///
+    /// Test fixtures want a hash that is obviously not the zero hash and is
+    /// obviously not any other fixture's hash, which one repeated byte gives
+    /// while staying short enough to read at a call site.
+    pub const fn repeat_byte(byte: u8) -> Self {
+        Self([byte; 32])
+    }
 
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 32]
@@ -108,6 +116,19 @@ impl std::fmt::Display for H256 {
     }
 }
 
+/// Same as [`Display`](std::fmt::Display), rather than derived.
+///
+/// A derived `Debug` prints the inner array, so a hash comes out as 32 decimal
+/// numbers: unreadable on its own, and unreadable in bulk inside the `Debug` of
+/// a container holding thousands of roots. Assertion failures in the spec suites
+/// print roots this way, so the hex is the whole point. Truncate at a call site
+/// that wants it short with [`crate::ShortRoot`].
+impl std::fmt::Debug for H256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +153,16 @@ mod tests {
         let hex_str = format!("\"{}\"", hex::encode([0xcd; 32]));
         let h: H256 = serde_json::from_str(&hex_str).unwrap();
         assert_eq!(h, H256([0xcd; 32]));
+    }
+
+    /// Not the derived `Debug`, which would print the inner array as 32 decimal
+    /// numbers. Spec-suite assertion failures print roots through `Debug`, so
+    /// this is the difference between a readable diff and an unreadable one.
+    #[test]
+    fn h256_debug_is_the_same_hex_as_display() {
+        let h = H256::repeat_byte(0xab);
+        assert_eq!(format!("{h:?}"), format!("{h}"));
+        assert_eq!(format!("{h:?}"), format!("0x{}", "ab".repeat(32)));
     }
 
     #[test]

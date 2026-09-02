@@ -12,7 +12,7 @@ use crate::{
 use primitives::HashTreeRoot as _;
 
 /// The main consensus state object
-#[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
     /// The chain's configuration parameters
     pub config: StateConfig,
@@ -66,7 +66,7 @@ pub type JustificationValidators =
 /// Each validator has two independent XMSS keys: one for signing attestations
 /// and one for signing block proposals. This allows signing both in the same
 /// slot without violating OTS (one-time signature) constraints.
-#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Validator {
     /// XMSS public key used for attestation signing.
     #[serde(serialize_with = "serialize_pubkey_hex")]
@@ -120,7 +120,7 @@ impl State {
 /// Merkleized into the state root, so its layout is fixed by the spec and no
 /// field may be added here. [`crate::chain_config::ChainConfig`] is the node's
 /// own view: this plus the slot duration.
-#[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct StateConfig {
     pub genesis_time: u64,
 }
