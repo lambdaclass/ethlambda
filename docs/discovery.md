@@ -47,8 +47,8 @@ The layout follows the discovery domain of the beacon-chain
 | `id` | `v4` |
 | `ip` | `--discovery.advertise-ip`, or the bind address (`0.0.0.0`) if unset |
 | `udp` | `--discovery.port` |
-| `quic` | `--gossipsub-port`, the libp2p QUIC listener |
-| `tcp` | `--gossipsub-port`, the libp2p TCP listener |
+| `quic` | `--gossipsub-port`, the libp2p QUIC listener; omitted when `0` |
+| `tcp` | `--gossipsub-port`, the libp2p TCP listener; omitted when `0` |
 | `secp256k1` | compressed public key from `--node-key` |
 | `eth2` | SSZ `ENRForkID`, 16 bytes |
 | `attnets` | subscribed attestation subnet bitfield |
@@ -60,6 +60,20 @@ over TCP. It also gets us past lighthouse's discovery predicate, which requires
 `enr.tcp4().is_some() || enr.tcp6().is_some()` on top of the spec's
 `fork_digest` comparison; the lean fork digest is still the cross-client dummy
 `0x12345678`, so a beacon-chain client rejects us on that instead.
+
+Both ports come from configuration rather than from the bound listeners, so a
+`--gossipsub-port 0` would name neither of the two real OS-assigned ports.
+Startup rejects that combination when discovery is enabled, and the writer omits
+a `0` either way, matching every reader's rule that `0` means absent.
+
+Because the entry set is what a peer caches, the record carries a sequence
+number (`LOCAL_ENR_SEQ`) that has to be bumped whenever that set changes. A peer
+identifies a record by (node id, seq) and accepts a replacement only at a
+strictly higher seq — ethrex's WHOAREYOU responder does not even send the record
+when the requester's `enr_seq` already matches — so two ethlambda versions
+publishing different entries under one seq are indistinguishable to any peer
+that stayed up across the upgrade. Adding `tcp` bumped it; the constant's own
+doc comment records which entry set each value stands for.
 
 The local ENR is logged once at startup.
 
@@ -87,9 +101,17 @@ No rejection is final: the peer table runs the filter again as soon as the peer
 publishes a higher-`seq` ENR, so a node that adds a `quic` entry, or gains an
 address through discv5's IP voting, is reconsidered without a restart.
 
-A peer's dial list carries every address it advertises, QUIC first then TCP.
-libp2p races every address in one dial attempt, so a peer whose `quic` does not
-answer can still connect over `tcp` without a separate retry.
+A peer's dial list carries every address it advertises, `quic` and `tcp` both,
+in one dial attempt. libp2p races them: it starts up to `dial_concurrency_factor`
+handshakes at once and keeps whichever completes first, dropping the other. So a
+peer whose `quic` port does not answer still connects over `tcp` with no separate
+retry and no connect timeout waited out first.
+
+The list order is not a preference, and nothing should be read into it: the
+default concurrency factor exceeds the two addresses a lean peer can offer, so
+both are always attempted. The cost of that is the thing to know, since it is
+paid on every dial rather than only on a failure: two sockets and two handshakes
+per peer, on both ends, until one wins.
 
 Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet

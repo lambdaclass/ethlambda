@@ -3,7 +3,9 @@
 //! ethrex's `DiscoveryServer` runs discv5-only on its own UDP socket and writes
 //! what it finds into an ethrex `PeerTable`. ethlambda's `P2PServer` polls that
 //! table, applies the spec checks in [`admission`], and dials the survivors over
-//! libp2p QUIC. Static bootnode dialing is untouched.
+//! libp2p. Both dial paths, discovered peers and static bootnodes alike, hand
+//! the swarm every address a peer advertises (`quic` and `tcp`) in one attempt
+//! and let libp2p race them.
 //!
 //! See `docs/discovery.md` for the operator-facing description.
 
@@ -120,8 +122,10 @@ pub struct DiscoveryHandle {
 /// (ask the OS for a free port) still produces an ENR advertising the real
 /// bound port rather than the literal 0, which would be undialable.
 ///
-/// Only bootnodes whose ENR advertises a `udp` port can seed discv5; the rest
-/// are still dialed statically by `build_swarm`.
+/// Only bootnodes whose ENR advertises a `udp` port can seed discv5. That is a
+/// separate question from whether `build_swarm` dials one statically, which
+/// turns on its `quic`/`tcp` entries: a bootnode can do both, either, or
+/// neither.
 pub async fn spawn_discovery(
     config: DiscoverySpawnConfig,
 ) -> Result<DiscoveryHandle, DiscoveryError> {
@@ -180,9 +184,10 @@ pub async fn spawn_discovery(
 
     // The record we hand over is the same one `enr_url` above reported, so what
     // ethrex answers discv5 queries with carries the consensus entries (`eth2`,
-    // `attnets`, `quic`) and a lean peer applying our own admission rules to it
-    // admits us. ethrex re-signs it under `params.signer` whenever IP voting
-    // bumps the sequence number, keeping the extra entries.
+    // `attnets`, `quic`) and the `tcp` port of the fallback transport, and a
+    // lean peer applying our own admission rules to it admits us. ethrex
+    // re-signs it under `params.signer` whenever IP voting bumps the sequence
+    // number, keeping the extra entries.
     DiscoveryServer::spawn(
         local_node,
         local_record,

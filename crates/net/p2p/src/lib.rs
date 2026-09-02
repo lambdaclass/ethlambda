@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::{IpAddr, SocketAddr},
     ops::Range,
     time::Duration,
@@ -38,7 +38,7 @@ use crate::{
     discovery::{
         DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
         dial::{DiscoveryState, dial_tick, forget_discovered_peer},
-        enr::{read_ip, read_public_key, read_quic_port},
+        enr::{read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
     gossipsub::{
@@ -219,15 +219,33 @@ pub struct BuiltSwarm {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
-    /// Dial targets per bootnode, QUIC first then TCP. Empty entries are never
+    /// Every dial target per bootnode; see [`dial_addrs`]. Empty entries are never
     /// inserted; see [`bootnode_dial_addrs`].
     pub(crate) bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
+/// Why [`build_swarm`] could not produce a usable swarm.
+///
+/// Both listeners are fatal rather than best-effort. Carrying on after a failed
+/// TCP bind would leave the node advertising a `tcp` entry nothing answers,
+/// which is the failure this transport exists to remove, inverted. The
+/// configuration cases are caught before anything binds (`validate_ports` in
+/// the CLI), so reaching this means the port is genuinely taken.
+#[derive(Debug, thiserror::Error)]
+pub enum SwarmBuildError {
+    #[error("failed to bind the gossipsub {transport} listener on {addr}: {source}")]
+    Listen {
+        transport: &'static str,
+        addr: Multiaddr,
+        #[source]
+        source: libp2p::TransportError<std::io::Error>,
+    },
+    #[error("failed to subscribe to a gossipsub topic: {0}")]
+    Subscription(#[from] libp2p::gossipsub::SubscriptionError),
+}
+
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
-pub fn build_swarm(
-    config: SwarmConfig,
-) -> Result<BuiltSwarm, libp2p::gossipsub::SubscriptionError> {
+pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
@@ -310,7 +328,7 @@ pub fn build_swarm(
         })
         .build();
     let local_peer_id = *swarm.local_peer_id();
-    let mut bootnode_addrs = HashMap::new();
+    let mut bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut undialable_bootnodes = 0usize;
     for bootnode in config.bootnodes {
         let peer_id = PeerId::from_public_key(&bootnode.public_key);
@@ -325,10 +343,40 @@ pub fn build_swarm(
             debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no dialable transport, discv5 seed only");
             continue;
         }
-        bootnode_addrs.insert(peer_id, addrs.clone());
+        // One dial per peer id, not one per file entry. Two entries can name a
+        // single peer: the same ENR pasted twice, or an old and a new record
+        // for one secp256k1 key. `DialOpts::peer_id` dials under the default
+        // `DisconnectedAndNotDialing` condition, so the second attempt is
+        // refused while the first is still in flight, and `parse_enrs` does not
+        // dedup. Merging the address lists dials once with everything the
+        // duplicate entries offered between them.
+        match bootnode_addrs.entry(peer_id) {
+            Entry::Occupied(mut known) => {
+                debug!(
+                    %peer_id,
+                    ip = %bootnode.ip,
+                    "Bootnode list names this peer more than once, merging its addresses"
+                );
+                let merged = known.get_mut();
+                for addr in addrs {
+                    if !merged.contains(&addr) {
+                        merged.push(addr);
+                    }
+                }
+                continue;
+            }
+            Entry::Vacant(unknown) => {
+                unknown.insert(addrs.clone());
+            }
+        }
+        // A refused dial is not fatal: the entry stays in `bootnode_addrs`, so
+        // the redial path picks the peer up. Unwrapping here would abort a node
+        // over a bootnode file that is merely redundant.
         swarm
             .dial(DialOpts::peer_id(peer_id).addresses(addrs).build())
-            .unwrap();
+            .unwrap_or_else(|err| {
+                warn!(%peer_id, %err, "Swarm refused the initial bootnode dial");
+            });
     }
     // Every skip above is individually unremarkable and logged at `debug`, but a
     // list that produces no dial target at all leaves the node isolated unless
@@ -345,16 +393,24 @@ pub fn build_swarm(
         .with(Protocol::Udp(config.listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
-        .listen_on(quic_addr)
-        .expect("failed to bind gossipsub QUIC listening address");
+        .listen_on(quic_addr.clone())
+        .map_err(|source| SwarmBuildError::Listen {
+            transport: "QUIC",
+            addr: quic_addr,
+            source,
+        })?;
     // Same port number as the QUIC listener above: TCP and UDP are separate
     // namespaces, so this cannot collide with it.
     let tcp_addr = Multiaddr::empty()
         .with(config.listening_socket.ip().into())
         .with(Protocol::Tcp(config.listening_socket.port()));
     swarm
-        .listen_on(tcp_addr)
-        .expect("failed to bind gossipsub TCP listening address");
+        .listen_on(tcp_addr.clone())
+        .map_err(|source| SwarmBuildError::Listen {
+            transport: "TCP",
+            addr: tcp_addr,
+            source,
+        })?;
 
     // Subscribe to block topic (all nodes)
     let block_topic = block_topic();
@@ -934,7 +990,7 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 
     // Same rule for `tcp`, the transport every published beacon-chain bootnode
     // advertises and none of them pairs with a `quic` entry.
-    let tcp_port = pairs.tcp_port.filter(|port| *port != 0);
+    let tcp_port = read_tcp_port(pairs);
 
     let public_key = read_public_key(pairs)
         .ok_or_else(|| "node record missing or malformed public key".to_string())?;
@@ -945,7 +1001,7 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // of them is reachable by nothing we speak: it can be neither dialed nor
     // seeded. Drop it here rather than carry a contact no code path can use.
     if quic_port.is_none() && tcp_port.is_none() && udp_port.is_none() {
-        return Err("node advertises neither a quic, tcp nor a udp port".to_string());
+        return Err("node advertises none of quic, tcp, or udp".to_string());
     }
 
     Ok(Bootnode {
@@ -959,24 +1015,45 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 
 // --- Utility functions ---
 
-/// Dial targets for a static bootnode, QUIC first then TCP.
+/// Every address worth trying for one peer, from whichever of its two ports are
+/// present.
 ///
-/// Empty when the record advertises neither, which is a discv5-only seed: it can
-/// still answer FINDNODE, but there is nothing for the swarm to dial.
-pub(crate) fn bootnode_dial_addrs(bootnode: &Bootnode, peer_id: PeerId) -> Vec<Multiaddr> {
+/// Empty when neither is, which is a discv5-only seed: it can still answer
+/// FINDNODE, but there is nothing for the swarm to dial.
+///
+/// The order is not a preference. libp2p pushes up to `dial_concurrency_factor`
+/// of these into one `FuturesUnordered` and takes whichever handshake finishes
+/// first; the default factor is larger than this list can ever be, so both
+/// transports are always attempted and the position here decides nothing. That
+/// race is the point: a peer advertising a `quic` port nothing answers still
+/// connects over `tcp` without waiting out a connect timeout first.
+///
+/// Shared by both dial paths, so a change to what counts as dialable cannot
+/// apply to static bootnodes and discovered peers differently: static bootnodes
+/// in [`build_swarm`] and discovered peers in
+/// [`admission::admit`](discovery::admission).
+pub(crate) fn dial_addrs(
+    ip: IpAddr,
+    quic_port: Option<u16>,
+    tcp_port: Option<u16>,
+    peer_id: PeerId,
+) -> Vec<Multiaddr> {
     let mut addrs = Vec::with_capacity(2);
-    if let Some(quic_port) = bootnode.quic_port {
-        addrs.push(quic_multiaddr(bootnode.ip, quic_port, peer_id));
+    if let Some(port) = quic_port {
+        addrs.push(quic_multiaddr(ip, port, peer_id));
     }
-    if let Some(tcp_port) = bootnode.tcp_port {
-        addrs.push(tcp_multiaddr(bootnode.ip, tcp_port, peer_id));
+    if let Some(port) = tcp_port {
+        addrs.push(tcp_multiaddr(ip, port, peer_id));
     }
     addrs
 }
 
-/// The address of a libp2p QUIC listener, as both dial paths spell it: static
-/// bootnodes in [`build_swarm`] and discovered peers in
-/// [`admission::admit`](discovery::admission).
+/// Dial targets for a static bootnode. See [`dial_addrs`].
+pub(crate) fn bootnode_dial_addrs(bootnode: &Bootnode, peer_id: PeerId) -> Vec<Multiaddr> {
+    dial_addrs(bootnode.ip, bootnode.quic_port, bootnode.tcp_port, peer_id)
+}
+
+/// The address of a libp2p QUIC listener, as [`dial_addrs`] spells it.
 ///
 /// Infallible: `with_p2p` only rejects a multiaddr that already carries a `p2p`
 /// component, and this one is built fresh.
@@ -1120,6 +1197,74 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    /// A bootnode file naming one peer twice must not abort the node.
+    ///
+    /// `DialOpts::peer_id` dials under the default `DisconnectedAndNotDialing`
+    /// condition, so a second dial while the first is in flight comes back as
+    /// `Err(DialPeerConditionFalse)` synchronously. Two file entries decode to
+    /// one `PeerId` whenever they share a secp256k1 key: the same ENR pasted
+    /// twice, or an old and a new record for one node. `parse_enrs` does not
+    /// dedup, so `build_swarm` has to, and it merges the address lists rather
+    /// than dropping whichever entry came second.
+    ///
+    /// The QUIC-only condition (`From<Multiaddr>`) this replaced was `Always`,
+    /// which is why the duplicate went unnoticed before.
+    #[tokio::test]
+    async fn a_bootnode_named_twice_is_dialed_once_with_both_addresses() {
+        let key = secp256k1::Keypair::generate();
+        let public_key: PublicKey = key.public().clone().into();
+        let peer_id = PeerId::from_public_key(&public_key);
+        let ip = IpAddr::from(Ipv4Addr::new(203, 0, 113, 1));
+        // Two records for one key: the first advertising QUIC only, the second
+        // having since added TCP. Neither port is listening, which is fine —
+        // the dial only has to be *taken*.
+        let bootnodes = vec![
+            Bootnode {
+                ip,
+                quic_port: Some(9001),
+                tcp_port: None,
+                udp_port: Some(9000),
+                public_key: public_key.clone(),
+            },
+            Bootnode {
+                ip,
+                quic_port: Some(9001),
+                tcp_port: Some(9001),
+                udp_port: Some(9000),
+                public_key,
+            },
+        ];
+
+        let built = build_swarm(SwarmConfig {
+            node_key: vec![7u8; 32],
+            bootnodes,
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            validator_ids: Vec::new(),
+            attestation_committee_count: 1,
+            subscription_subnets: HashSet::new(),
+        })
+        .expect("a duplicated bootnode entry must not fail the build");
+
+        assert_eq!(
+            built.bootnode_addrs.len(),
+            1,
+            "the two entries name one peer, so they must collapse to one dial target"
+        );
+        let addrs = built
+            .bootnode_addrs
+            .get(&peer_id)
+            .expect("the bootnode is tracked under its peer id");
+        let expected: HashSet<Multiaddr> = HashSet::from([
+            quic_multiaddr(ip, 9001, peer_id),
+            tcp_multiaddr(ip, 9001, peer_id),
+        ]);
+        assert_eq!(
+            addrs.iter().cloned().collect::<HashSet<_>>(),
+            expected,
+            "the merged list must carry every address the duplicate entries offered"
+        );
     }
 
     #[test]
@@ -1300,13 +1445,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_enrs_keeps_a_quic_less_record_as_a_discovery_seed() {
+    fn parse_enrs_keeps_a_quic_less_record_and_dials_it_over_tcp() {
         // Some nodes advertise `tcp` and `udp` but no `quic`, so requiring
         // `quic` here would drop the entire mainnet bootstrap list and leave
-        // discv5 with nothing to seed from. Such a record is kept, with
-        // `quic_port: None` telling `build_swarm` not to dial it.
+        // discv5 with nothing to seed from. Now that TCP is a transport we
+        // speak, such a record is not merely kept as a seed: the one that
+        // carries `tcp` becomes a static dial target too, over that port alone.
         //
-        // The two ENRs are from eth-clients/mainnet's `bootstrap_nodes.yaml`.
+        // The two ENRs are from eth-clients/mainnet's `bootstrap_nodes.yaml`,
+        // and they differ in exactly the way that matters here: the first
+        // advertises `tcp` and the second does not.
         let enrs = vec![
             "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo".to_string(),
             "enr:-Le4QPUXJS2BTORXxyx2Ia-9ae4YqA_JWX3ssj4E_J-3z1A-HmFGrU8BpvpqhNabayXeOZ2Nq_sbeDgtzMJpLLnXFgAChGV0aDKQtTA_KgEAAAAAIgEAAAAAAIJpZIJ2NIJpcISsaa0Zg2lwNpAkAIkHAAAAAPA8kv_-awoTiXNlY3AyNTZrMaEDHAD2JKYevx89W0CcFJFiskdcEzkH_Wdv9iW42qLK79ODdWRwgiMohHVkcDaCI4I".to_string(),
@@ -1322,6 +1470,27 @@ mod tests {
             assert_eq!(bootnode.udp_port, Some(9000));
             assert!(bootnode.as_discovery_node().is_some());
         }
+
+        // What the TCP transport changed: the first record's `tcp` entry is now
+        // a dial target, where before it produced no address and the bootnode
+        // was a discv5 seed and nothing more.
+        assert_eq!(bootnodes[0].tcp_port, Some(9000));
+        let peer_id = PeerId::from_public_key(&bootnodes[0].public_key);
+        assert_eq!(
+            bootnode_dial_addrs(&bootnodes[0], peer_id),
+            vec![
+                format!("/ip4/3.147.37.0/tcp/9000/p2p/{peer_id}")
+                    .parse::<Multiaddr>()
+                    .unwrap()
+            ],
+            "a tcp-only bootnode is dialed over tcp alone"
+        );
+
+        // The second advertises neither, so it stays a seed with nothing to
+        // dial: this is the case the `warn` in `build_swarm` counts.
+        assert_eq!(bootnodes[1].tcp_port, None);
+        let seed_only = PeerId::from_public_key(&bootnodes[1].public_key);
+        assert!(bootnode_dial_addrs(&bootnodes[1], seed_only).is_empty());
     }
 
     #[test]

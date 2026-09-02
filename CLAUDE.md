@@ -273,7 +273,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ## Networking (libp2p)
 
 ### Protocols
-- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial
+- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial (list order confers no preference; the default `dial_concurrency_factor` starts both handshakes)
+  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `NodeOptions::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -314,7 +315,7 @@ GENESIS_VALIDATORS:
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 
-**Bootnodes:** ENR records (Base64-encoded, RLP decoded for QUIC port + secp256k1 pubkey)
+**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial
 
 ## Testing
 

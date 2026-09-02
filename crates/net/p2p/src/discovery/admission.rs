@@ -27,15 +27,15 @@ use tracing::debug;
 
 use super::enr::{
     ATTNETS_ENR_KEY, ETH2_ENR_KEY, EnrForkId, read_ip, read_public_key, read_quic_port,
-    subnets_from_attnets,
+    read_tcp_port, subnets_from_attnets,
 };
-use crate::{quic_multiaddr, tcp_multiaddr};
+use crate::dial_addrs;
 
 /// A peer that passed admission and is ready to dial.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DiscoveredPeer {
     pub(crate) peer_id: PeerId,
-    /// Dial targets, QUIC first then TCP, built from whichever of the two ports
+    /// Every dial target for this peer, built from whichever of the two ports
     /// the record actually advertises. Never empty: [`admit`] rejects a record
     /// with neither.
     pub(crate) addrs: Vec<Multiaddr>,
@@ -153,7 +153,7 @@ fn admit(
     // fall back to. A `0` port is absent for either transport: it RLP-decodes
     // the same way an absent entry does, and is undialable regardless.
     let quic_port = read_quic_port(record);
-    let tcp_port = pairs.tcp_port.filter(|port| *port != 0);
+    let tcp_port = read_tcp_port(pairs);
     if quic_port.is_none() && tcp_port.is_none() {
         return Err(RejectReason::NoDialableTransport);
     }
@@ -168,19 +168,9 @@ fn admit(
         .map(|bits| subnets_from_attnets(&bits, attestation_committee_count))
         .unwrap_or_default();
 
-    // QUIC first, so it stays the preferred path when a peer offers both and
-    // libp2p races the list.
-    let mut addrs = Vec::with_capacity(2);
-    if let Some(port) = quic_port {
-        addrs.push(quic_multiaddr(ip, port, peer_id));
-    }
-    if let Some(port) = tcp_port {
-        addrs.push(tcp_multiaddr(ip, port, peer_id));
-    }
-
     Ok(DiscoveredPeer {
         peer_id,
-        addrs,
+        addrs: dial_addrs(ip, quic_port, tcp_port, peer_id),
         subnets,
     })
 }
@@ -330,24 +320,26 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_peer_with_both_transports_and_orders_quic_first() {
+    fn accepts_a_peer_with_both_transports_and_offers_both_addresses() {
+        // Both addresses must reach the dial, and nothing here pins their
+        // order: libp2p races them within one attempt and takes whichever
+        // handshake finishes first, so position confers no preference (see
+        // `dial_addrs`).
         let record = record_with(|pairs| {
             set_eth2(pairs, EnrForkId::local());
             set_quic(pairs, 9001);
             pairs.tcp_port = Some(9002);
         });
         let peer = admit_record(&record).expect("accepted");
-        assert_eq!(
-            peer.addrs,
-            vec![
-                format!("/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{}", peer.peer_id)
-                    .parse()
-                    .unwrap(),
-                format!("/ip4/127.0.0.1/tcp/9002/p2p/{}", peer.peer_id)
-                    .parse()
-                    .unwrap(),
-            ]
-        );
+        let expected: HashSet<Multiaddr> = HashSet::from([
+            format!("/ip4/127.0.0.1/udp/9001/quic-v1/p2p/{}", peer.peer_id)
+                .parse()
+                .unwrap(),
+            format!("/ip4/127.0.0.1/tcp/9002/p2p/{}", peer.peer_id)
+                .parse()
+                .unwrap(),
+        ]);
+        assert_eq!(peer.addrs.iter().cloned().collect::<HashSet<_>>(), expected);
     }
 
     #[test]

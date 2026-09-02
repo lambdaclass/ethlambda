@@ -117,7 +117,7 @@ fn init_benchmark_logging() -> eyre::Result<()> {
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn run_node(options: NodeOptions) -> eyre::Result<()> {
-    options.validate_discovery()?;
+    options.validate_ports()?;
 
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
