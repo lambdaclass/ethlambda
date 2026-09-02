@@ -1136,6 +1136,8 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
+
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
     }
@@ -1158,6 +1160,7 @@ mod tests {
                 validator_ids: Vec::new(),
                 attestation_committee_count: 1,
                 subscription_subnets: HashSet::new(),
+                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
             })
             .expect("swarm builds")
         }
@@ -1252,6 +1255,7 @@ mod tests {
             validator_ids: Vec::new(),
             attestation_committee_count: 1,
             subscription_subnets: HashSet::new(),
+            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
         })
         .expect("a duplicated bootnode entry must not fail the build");
 
