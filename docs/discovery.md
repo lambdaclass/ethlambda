@@ -66,15 +66,6 @@ Both ports come from configuration rather than from the bound listeners, so a
 Startup rejects that combination when discovery is enabled, and the writer omits
 a `0` either way, matching every reader's rule that `0` means absent.
 
-Because the entry set is what a peer caches, the record carries a sequence
-number (`LOCAL_ENR_SEQ`) that has to be bumped whenever that set changes. A peer
-identifies a record by (node id, seq) and accepts a replacement only at a
-strictly higher seq — ethrex's WHOAREYOU responder does not even send the record
-when the requester's `enr_seq` already matches — so two ethlambda versions
-publishing different entries under one seq are indistinguishable to any peer
-that stayed up across the upgrade. Adding `tcp` bumped it; the constant's own
-doc comment records which entry set each value stands for.
-
 The local ENR is logged once at startup.
 
 This same record is handed to ethrex's `DiscoveryServer`, so it is what answers

@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ethlambda_types::constants::FORK_DIGEST;
-use ethrex_p2p::types::{Node, NodeRecord, NodeRecordPairs};
+use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
 use ethrex_p2p::utils::public_key_from_signing_key;
 use libssz::SszEncode;
 use libssz_derive::{SszDecode, SszEncode};
@@ -176,34 +176,9 @@ impl LocalEnrParams {
     }
 }
 
-/// Sequence number this node signs its ENR at.
-///
-/// **Bump this whenever [`LocalEnrParams::local_pairs`] changes which entries it
-/// publishes.** A record is identified by (node id, seq), so two ethlambda
-/// versions advertising different entry sets under one seq are indistinguishable
-/// to a peer: ethrex's WHOAREYOU responder omits the record when the requester's
-/// `enr_seq` already matches, and the peer table only accepts a record whose seq
-/// is strictly higher than the one it holds. A peer that stayed up across an
-/// in-place upgrade would keep the old entry set forever.
-///
-/// ethrex re-signs at a higher seq of its own whenever discv5's IP voting moves
-/// the advertised address, so this is a floor rather than the only value a
-/// record is ever seen at.
-///
-/// | Value | Entry set |
-/// | --- | --- |
-/// | 1 | `id`, `ip`, `udp`, `quic`, `secp256k1`, `eth2`, `attnets` |
-/// | 2 | the above plus `tcp` |
-const LOCAL_ENR_SEQ: u64 = 2;
-
-/// The `tcp`-less entry set was published at seq 1, so anything at or below it
-/// is a record peers may already hold under a different set. Checked here rather
-/// than in a test: a wrong value must not compile.
-const _: () = assert!(LOCAL_ENR_SEQ > 1);
-
 /// Build and sign this node's ENR.
 pub(crate) fn build_local_enr(params: &LocalEnrParams) -> Result<NodeRecord, DiscoveryError> {
-    NodeRecord::from_pairs(LOCAL_ENR_SEQ, &params.signer, params.local_pairs())
+    NodeRecord::from_pairs(INITIAL_ENR_SEQ, &params.signer, params.local_pairs())
         .map_err(DiscoveryError::BuildEnr)
 }
 
@@ -398,16 +373,6 @@ mod tests {
         assert_eq!(read_tcp_port(&pairs), None, "explicit zero");
         pairs.tcp_port = Some(9001);
         assert_eq!(read_tcp_port(&pairs), Some(9001));
-    }
-
-    /// A peer identifies a record by (node id, seq) and only accepts a strictly
-    /// higher seq, so an entry-set change under an unchanged seq is invisible to
-    /// every peer that already holds the old record. The floor itself is a
-    /// compile-time check next to the constant; what this pins is that the
-    /// builder actually signs at it, rather than at ethrex's `INITIAL_ENR_SEQ`.
-    #[test]
-    fn the_built_enr_carries_the_local_seq() {
-        assert_eq!(build().seq, LOCAL_ENR_SEQ);
     }
 
     #[test]
