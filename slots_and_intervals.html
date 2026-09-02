@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-61a695e0.js";
+            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -181,8 +181,12 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="slots-and-intervals"><a class="header" href="#slots-and-intervals">Slots and Intervals</a></h1>
-<p>A Lean Chain slot has a duration of 4 seconds and is divided in 5 intervals of 800 ms.
-Every duty a validator owes the chain is due in one of them:</p>
+<p>A Lean Chain slot is divided in 5 intervals of equal length. Every duty a validator
+owes the chain is due in one of them. The slot lasts 4 seconds by default, so the
+offsets below are the 800 ms grid; a network that sets <code>MILLISECONDS_PER_SLOT</code> in its
+config file scales every offset by the same factor. That key can only stretch the
+grid: 4 seconds is also the floor, since a few client timings are fixed in
+milliseconds rather than expressed as a fraction of the slot.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -214,9 +218,12 @@ what the previous one produced. A duty that overruns its interval is not resched
 lands late, and the slot moves on without it.</p>
 <blockquote>
 <p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
-<code>crates/blockchain/src/lib.rs</code>, and their length comes from
-<code>MILLISECONDS_PER_INTERVAL</code> and <code>INTERVALS_PER_SLOT</code> in
-<code>crates/common/types/src/constants.rs</code>.</p>
+<code>crates/blockchain/src/lib.rs</code>. <code>INTERVALS_PER_SLOT</code> is fixed in
+<code>crates/common/types/src/constants.rs</code> (each interval carries a distinct duty, so
+the count is not a knob), while the slot duration is read from the network’s config
+file into <code>ChainConfig</code>, which derives the interval length from it. Every node
+on a network must agree on the value, and other clients still hold it at compile
+time: setting it only has an effect where every node reads the key.</p>
 </blockquote>
 <h2 id="interval-0-block-proposal"><a class="header" href="#interval-0-block-proposal">Interval 0: Block proposal</a></h2>
 <p>A block proposer, selected in a round-robin fashion (<code>slot % num_validators</code>), proposes a

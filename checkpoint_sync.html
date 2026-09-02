@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-61a695e0.js";
+            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -244,7 +244,7 @@
 <p>When a checkpoint URL <em>is</em> set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for “resume whatever is on disk”; that path never exits.</p>
 <p>To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.</p>
 <h3 id="foreign-state"><a class="header" href="#foreign-state">Foreign State</a></h3>
-<p>Persisted state is accepted only after it is verified against the local genesis config: same <code>GENESIS_TIME</code> and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.</p>
+<p>Persisted state is accepted only after it is verified against the local genesis config: same <code>GENESIS_TIME</code>, same <code>MILLISECONDS_PER_SLOT</code>, and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.</p>
 <p>If the data directory belongs to a different network, startup <strong>aborts</strong> with <code>persisted state does not match the configured genesis: …</code>. It is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain’s rows in place, and the slot-indexed reads behind <code>BlocksByRange</code> would then serve those blocks to peers. Point <code>--data-dir</code> at the right directory, or remove it.</p>
 <p>Note that a genesis time comparison alone would not catch a network that was regenerated with the same <code>GENESIS_TIME</code> but a different validator set, which is why the whole registry is compared.</p>
 <h2 id="verification-checks"><a class="header" href="#verification-checks">Verification Checks</a></h2>

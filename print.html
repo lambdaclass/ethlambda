@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-61a695e0.js";
+            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -426,8 +426,12 @@ the genesis config or any other consensus prerequisite.</p>
 </blockquote>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="slots-and-intervals"><a class="header" href="#slots-and-intervals">Slots and Intervals</a></h1>
-<p>A Lean Chain slot has a duration of 4 seconds and is divided in 5 intervals of 800 ms.
-Every duty a validator owes the chain is due in one of them:</p>
+<p>A Lean Chain slot is divided in 5 intervals of equal length. Every duty a validator
+owes the chain is due in one of them. The slot lasts 4 seconds by default, so the
+offsets below are the 800 ms grid; a network that sets <code>MILLISECONDS_PER_SLOT</code> in its
+config file scales every offset by the same factor. That key can only stretch the
+grid: 4 seconds is also the floor, since a few client timings are fixed in
+milliseconds rather than expressed as a fraction of the slot.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -459,9 +463,12 @@ what the previous one produced. A duty that overruns its interval is not resched
 lands late, and the slot moves on without it.</p>
 <blockquote>
 <p><strong>In ethlambda:</strong> the intervals are the <code>SlotInterval</code> variants in
-<code>crates/blockchain/src/lib.rs</code>, and their length comes from
-<code>MILLISECONDS_PER_INTERVAL</code> and <code>INTERVALS_PER_SLOT</code> in
-<code>crates/common/types/src/constants.rs</code>.</p>
+<code>crates/blockchain/src/lib.rs</code>. <code>INTERVALS_PER_SLOT</code> is fixed in
+<code>crates/common/types/src/constants.rs</code> (each interval carries a distinct duty, so
+the count is not a knob), while the slot duration is read from the network’s config
+file into <code>ChainConfig</code>, which derives the interval length from it. Every node
+on a network must agree on the value, and other clients still hold it at compile
+time: setting it only has an effect where every node reads the key.</p>
 </blockquote>
 <h2 id="interval-0-block-proposal"><a class="header" href="#interval-0-block-proposal">Interval 0: Block proposal</a></h2>
 <p>A block proposer, selected in a round-robin fashion (<code>slot % num_validators</code>), proposes a
@@ -1585,9 +1592,11 @@ November 2018 due to superior stability properties.</p>
 <p>This section covers ethlambda-specific details: scheduling, Beacon Chain differences,
 source code locations, and performance.</p>
 <h3 id="tick-based-scheduling"><a class="header" href="#tick-based-scheduling">Tick-Based Scheduling</a></h3>
-<p>ethlambda divides time into <strong>4-second slots</strong>, each split into <strong>5 intervals</strong> (800 ms
-each), as described in <a href="#slots-and-intervals">Slots and Intervals</a>. Fork choice
-operations are scheduled at specific intervals:</p>
+<p>ethlambda divides time into slots, each split into <strong>5 intervals</strong>. The slot lasts
+4 seconds unless the network’s config file sets <code>MILLISECONDS_PER_SLOT</code>, so the 800 ms
+intervals below are the default grid, as described in
+<a href="#slots-and-intervals">Slots and Intervals</a>. Fork choice operations are scheduled
+at specific intervals:</p>
 <pre><code class="language-text">                             ONE SLOT (4000 ms)
     ┌────────────┬────────────┬────────────┬────────────┬────────────┐
     │ Interval 0 │ Interval 1 │ Interval 2 │ Interval 3 │ Interval 4 │
@@ -1655,7 +1664,7 @@ Ethereum Beacon Chain:</p>
 <tr><td><strong>Equivocation handling</strong></td><td>Not in fork choice</td><td>Equivocating validators’ weight excluded</td></tr>
 <tr><td><strong>Attestation frequency</strong></td><td>Every slot</td><td>Once per epoch</td></tr>
 <tr><td><strong>Committee structure</strong></td><td>All validators attest each slot</td><td>Validators split into per-slot committees</td></tr>
-<tr><td><strong>Slot duration</strong></td><td>4 seconds</td><td>12 seconds</td></tr>
+<tr><td><strong>Slot duration</strong></td><td>4 seconds (configurable)</td><td>12 seconds</td></tr>
 </tbody>
 </table>
 </div>
@@ -1782,7 +1791,10 @@ clients.</p>
 <pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
 </code></pre>
 <h3 id="get-leanv0configspec"><a class="header" href="#get-leanv0configspec"><code>GET /lean/v0/config/spec</code></a></h3>
-<p>Protocol constants the node was built with. Keys mirror the leanSpec constant names:</p>
+<p>Protocol parameters the node is running on. Keys mirror the leanSpec constant names.
+<code>MILLISECONDS_PER_SLOT</code> and <code>MILLISECONDS_PER_INTERVAL</code> reflect the network’s config
+file rather than a compile-time constant, so a node on an 8-second network reports
+<code>8000</code> and <code>1600</code> here:</p>
 <pre><code class="language-json">{
   "MILLISECONDS_PER_SLOT": 4000,
   "INTERVALS_PER_SLOT": 5,
@@ -2150,6 +2162,7 @@ here: a discovery dial that succeeds or fails shows up in
 </div>
 <h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
 <p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
+<p>The bucket boundaries are the interval and slot edges of the default 4-second cadence. Prometheus fixes buckets when a histogram is registered, so a network that sets <code>MILLISECONDS_PER_SLOT</code> reads these histograms against the default grid rather than its own; the <code>position</code> label still follows the configured interval width.</p>
 <p>Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a <code>data.slot</code> several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out <code>before</code> entirely.</p>
 <p>Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.</p>
 <p>The aggregate metrics do include an aggregator’s own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.</p>
@@ -2270,7 +2283,7 @@ To work around this, enable the <a href="https://docs.docker.com/enterprise/secu
 <p>When a checkpoint URL <em>is</em> set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for “resume whatever is on disk”; that path never exits.</p>
 <p>To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.</p>
 <h3 id="foreign-state"><a class="header" href="#foreign-state">Foreign State</a></h3>
-<p>Persisted state is accepted only after it is verified against the local genesis config: same <code>GENESIS_TIME</code> and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.</p>
+<p>Persisted state is accepted only after it is verified against the local genesis config: same <code>GENESIS_TIME</code>, same <code>MILLISECONDS_PER_SLOT</code>, and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.</p>
 <p>If the data directory belongs to a different network, startup <strong>aborts</strong> with <code>persisted state does not match the configured genesis: …</code>. It is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain’s rows in place, and the slot-indexed reads behind <code>BlocksByRange</code> would then serve those blocks to peers. Point <code>--data-dir</code> at the right directory, or remove it.</p>
 <p>Note that a genesis time comparison alone would not catch a network that was regenerated with the same <code>GENESIS_TIME</code> but a different validator set, which is why the whole registry is compared.</p>
 <h2 id="verification-checks"><a class="header" href="#verification-checks">Verification Checks</a></h2>
@@ -2626,7 +2639,7 @@ fields:</p>
 </thead>
 <tbody>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
-<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (currently just <code>genesis_time</code>)</td></tr>
+<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Genesis time and slot duration</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
 <tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="#-lmd-ghost-fork-choice-algorithm">lmd_ghost.md</a>)</td></tr>
 <tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
@@ -2641,6 +2654,11 @@ reads of it never reach the backend. It is also part of the DB’s fingerprint:
 <code>from_db_state</code> refuses to resume a data directory belonging to another
 network (see <a href="#startup-and-restore">Startup and Restore</a>). Every other
 <code>Metadata</code> key is mutated in place as the chain progresses.</p>
+<p>Note that this is <em>not</em> the SSZ <code>StateConfig</code> carried inside <code>State</code>. That one is
+merkleized into the state root, so its layout is fixed by the spec and holds only
+<code>genesis_time</code>; <code>ChainConfig</code> adds the slot duration, which the node needs to
+schedule duties but which never enters a state root. A blob written before the slot
+duration existed still decodes, filling in the 4-second default that chain ran on.</p>
 <h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
 <p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
 <code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
@@ -2836,11 +2854,14 @@ its <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <
 (the base of every future diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
 from <code>Metadata</code>, returning <code>None</code> for an empty DB. A populated DB from another
-network is fatal instead: the finalized state’s genesis time and validator
-registry are compared against the genesis config, and a mismatch fails with
+network is fatal instead: the persisted <code>config</code>’s genesis time and slot
+duration, plus the finalized state’s genesis time and validator registry, are
+compared against the genesis config, and a mismatch fails with
 <code>Error::GenesisMismatch</code> rather than being treated as empty, since writing a
 fresh anchor would leave the foreign chain’s rows in place to be served to
-peers. At startup the node prefers this path but only
+peers. The slot duration has to be checked against the persisted <code>config</code>
+because it is absent from the state by design. At startup the node prefers
+this path but only
 accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 <h2 id="key-files-1"><a class="header" href="#key-files-1">Key Files</a></h2>

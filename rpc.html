@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-61a695e0.js";
+            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -231,7 +231,10 @@
 <pre><code class="language-json">{"status":"healthy","service":"lean-rpc-api"}
 </code></pre>
 <h3 id="get-leanv0configspec"><a class="header" href="#get-leanv0configspec"><code>GET /lean/v0/config/spec</code></a></h3>
-<p>Protocol constants the node was built with. Keys mirror the leanSpec constant names:</p>
+<p>Protocol parameters the node is running on. Keys mirror the leanSpec constant names.
+<code>MILLISECONDS_PER_SLOT</code> and <code>MILLISECONDS_PER_INTERVAL</code> reflect the network’s config
+file rather than a compile-time constant, so a node on an 8-second network reports
+<code>8000</code> and <code>1600</code> here:</p>
 <pre><code class="language-json">{
   "MILLISECONDS_PER_SLOT": 4000,
   "INTERVALS_PER_SLOT": 5,

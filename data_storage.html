@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-61a695e0.js";
+            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -378,7 +378,7 @@ fields:</p>
 </thead>
 <tbody>
 <tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
-<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Chain configuration (currently just <code>genesis_time</code>)</td></tr>
+<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Genesis time and slot duration</td></tr>
 <tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
 <tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="lmd_ghost.html">lmd_ghost.md</a>)</td></tr>
 <tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
@@ -393,6 +393,11 @@ reads of it never reach the backend. It is also part of the DB’s fingerprint:
 <code>from_db_state</code> refuses to resume a data directory belonging to another
 network (see <a href="#startup-and-restore">Startup and Restore</a>). Every other
 <code>Metadata</code> key is mutated in place as the chain progresses.</p>
+<p>Note that this is <em>not</em> the SSZ <code>StateConfig</code> carried inside <code>State</code>. That one is
+merkleized into the state root, so its layout is fixed by the spec and holds only
+<code>genesis_time</code>; <code>ChainConfig</code> adds the slot duration, which the node needs to
+schedule duties but which never enters a state root. A blob written before the slot
+duration existed still decodes, filling in the 4-second default that chain ran on.</p>
 <h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
 <p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
 <code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
@@ -588,11 +593,14 @@ its <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <
 (the base of every future diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
 <p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
 from <code>Metadata</code>, returning <code>None</code> for an empty DB. A populated DB from another
-network is fatal instead: the finalized state’s genesis time and validator
-registry are compared against the genesis config, and a mismatch fails with
+network is fatal instead: the persisted <code>config</code>’s genesis time and slot
+duration, plus the finalized state’s genesis time and validator registry, are
+compared against the genesis config, and a mismatch fails with
 <code>Error::GenesisMismatch</code> rather than being treated as empty, since writing a
 fresh anchor would leave the foreign chain’s rows in place to be served to
-peers. At startup the node prefers this path but only
+peers. The slot duration has to be checked against the persisted <code>config</code>
+because it is absent from the state by design. At startup the node prefers
+this path but only
 accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
 <h2 id="key-files"><a class="header" href="#key-files">Key Files</a></h2>
