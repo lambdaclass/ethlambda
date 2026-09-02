@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod attestation;
 pub mod block;
+pub mod chain_config;
 pub mod checkpoint;
 pub mod constants;
 pub mod genesis;

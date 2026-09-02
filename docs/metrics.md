@@ -142,6 +142,8 @@ here: a discovery dial that succeeds or fails shows up in
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
 
+The bucket boundaries are the interval and slot edges of the default 4-second cadence. Prometheus fixes buckets when a histogram is registered, so a network that sets `MILLISECONDS_PER_SLOT` reads these histograms against the default grid rather than its own; the `position` label still follows the configured interval width.
+
 Blocks anchor to interval 0 of their own slot and attestations to interval 1 of their data slot; both are unbounded above, so a message that never arrives close to real time can be arbitrarily late. Aggregates anchor instead to the most recent aggregation-interval boundary rather than their own data slot, since a stale-group catch-up aggregate can carry a `data.slot` several slots in the past; anchoring to the latest boundary bounds the delay to one slot and rules out `before` entirely.
 
 Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.

@@ -341,7 +341,7 @@ mod tests {
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::primitives::H256;
-    use ethlambda_types::state::{ChainConfig, JustificationValidators, JustifiedSlots};
+    use ethlambda_types::state::{JustificationValidators, JustifiedSlots, StateConfig};
     use libssz_types::SszList;
 
     // Helper to create valid test state
@@ -364,7 +364,7 @@ mod tests {
                 slot: slot.saturating_sub(20),
                 root: H256::ZERO,
             },
-            config: ChainConfig { genesis_time },
+            config: StateConfig { genesis_time },
             historical_block_hashes: Default::default(),
             justified_slots: JustifiedSlots::new(),
             justifications_roots: Default::default(),

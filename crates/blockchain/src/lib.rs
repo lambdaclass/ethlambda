@@ -10,13 +10,14 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    chain_config::ChainConfig,
     primitives::{H256, HashTreeRoot as _},
 };
 
 use crate::aggregation::{
-    AGGREGATION_DEADLINE, AggregateProduced, AggregationDeadline, AggregationDone,
-    AggregationSession, EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
-    PRIOR_WORKER_JOIN_TIMEOUT, run_aggregation_worker,
+    AggregateProduced, AggregationDeadline, AggregationDone, AggregationSession,
+    EARLY_AGGREGATION_WINDOW, EarlyAggregationCheck, MAX_AGGREGATION_JOBS,
+    PRIOR_WORKER_JOIN_TIMEOUT, aggregation_deadline, run_aggregation_worker,
 };
 use crate::key_manager::ValidatorKeyPair;
 use crate::sync_status::SyncStatusTracker;
@@ -72,15 +73,14 @@ pub struct BlockChainConfig {
 // derives slots from `store.time()` and must not carry a second copy of a
 // consensus-critical constant.
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
-pub use ethlambda_types::constants::{
-    INTERVALS_PER_SLOT, MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-};
+pub use ethlambda_types::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
 pub use sync_status::SyncStatusController;
 /// Future-slot tolerance for gossip attestations, expressed in intervals.
 ///
 /// Bounds the clock skew the time check is willing to absorb when admitting a
-/// vote whose slot has not yet started locally. One interval is roughly 800 ms,
-/// the lean analogue of mainnet's `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+/// vote whose slot has not yet started locally. One interval is a fifth of the
+/// configured slot, the lean analogue of mainnet's
+/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
@@ -95,8 +95,8 @@ pub(crate) enum SlotInterval {
 }
 
 impl SlotInterval {
-    pub(crate) fn from_ms_since_genesis(ms_since_genesis: u64) -> Self {
-        Self::from_intervals_since_genesis(ms_since_genesis / MILLISECONDS_PER_INTERVAL)
+    pub(crate) fn from_ms_since_genesis(ms_since_genesis: u64, config: &ChainConfig) -> Self {
+        Self::from_intervals_since_genesis(ms_since_genesis / config.milliseconds_per_interval())
     }
 
     pub(crate) fn from_intervals_since_genesis(intervals_since_genesis: u64) -> Self {
@@ -113,7 +113,7 @@ impl SlotInterval {
     /// Milliseconds from genesis to the start of this interval in `slot`.
     ///
     /// Inverse of [`Self::from_ms_since_genesis`].
-    pub(crate) fn to_ms_since_genesis(self, slot: u64) -> u64 {
+    pub(crate) fn to_ms_since_genesis(self, slot: u64, config: &ChainConfig) -> u64 {
         let interval = match self {
             Self::BlockPublication => 0,
             Self::AttestationProduction => 1,
@@ -121,17 +121,25 @@ impl SlotInterval {
             Self::SafeTargetUpdate => 3,
             Self::EndOfSlot => 4,
         };
-        slot * MILLISECONDS_PER_SLOT + interval * MILLISECONDS_PER_INTERVAL
+        // Saturating so a caller that has not yet bounded `slot` (arrival
+        // metrics see gossip slots before validation) cannot panic the actor in
+        // a debug build or wrap into a small timestamp in a release one. The
+        // clamped value is still meaningless: callers wanting a usable delta
+        // must bound the slot themselves.
+        slot.saturating_mul(config.milliseconds_per_slot)
+            .saturating_add(interval * config.milliseconds_per_interval())
     }
 }
 
 /// Milliseconds until the next interval boundary, measured relative to genesis.
-fn ms_until_next_interval(now_ms: u64, genesis_time_ms: u64) -> u64 {
+fn ms_until_next_interval(now_ms: u64, config: &ChainConfig) -> u64 {
+    let genesis_time_ms = config.genesis_time_ms();
     // Before genesis: wait until genesis itself.
     let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
         return genesis_time_ms - now_ms;
     };
-    MILLISECONDS_PER_INTERVAL - (ms_since_genesis % MILLISECONDS_PER_INTERVAL)
+    let ms_per_interval = config.milliseconds_per_interval();
+    ms_per_interval - (ms_since_genesis % ms_per_interval)
 }
 
 /// Current UNIX timestamp in milliseconds.
@@ -164,15 +172,16 @@ impl BlockChain {
 
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
-        let genesis_time = store.config().genesis_time;
+        let time_config = *store.config();
+        let genesis_time = time_config.genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
         let now_ms = unix_now_ms();
-        let current_slot =
-            (now_ms.saturating_sub(genesis_time * 1000) / MILLISECONDS_PER_SLOT) as u32;
+        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
+            / time_config.milliseconds_per_slot) as u32;
         key_manager.advance_keys_to(current_slot);
 
         let handle = BlockChainServer {
@@ -285,12 +294,12 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
+        let time_config = *self.store.config();
 
         // Calculate current slot and interval from milliseconds
-        let time_since_genesis_ms = timestamp_ms.saturating_sub(genesis_time_ms);
-        let slot = time_since_genesis_ms / MILLISECONDS_PER_SLOT;
-        let interval = SlotInterval::from_ms_since_genesis(time_since_genesis_ms);
+        let time_since_genesis_ms = timestamp_ms.saturating_sub(time_config.genesis_time_ms());
+        let slot = time_since_genesis_ms / time_config.milliseconds_per_slot;
+        let interval = SlotInterval::from_ms_since_genesis(time_since_genesis_ms, &time_config);
 
         // Idempotency guard
         //
@@ -298,7 +307,7 @@ impl BlockChainServer {
         // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
         // inside VMs, so a tick scheduled for the next interval boundary can fire
         // while the wall clock still reads the previous interval.
-        let tick_interval = time_since_genesis_ms / MILLISECONDS_PER_INTERVAL;
+        let tick_interval = time_since_genesis_ms / time_config.milliseconds_per_interval();
         let store_time = self.store.time().expect("store time exists");
 
         if store_time > 0 && tick_interval <= store_time {
@@ -409,7 +418,8 @@ impl BlockChainServer {
                 // window opens at T2 - EARLY_AGGREGATION_WINDOW.
                 if is_aggregator {
                     send_after(
-                        Duration::from_millis(MILLISECONDS_PER_INTERVAL) - EARLY_AGGREGATION_WINDOW,
+                        Duration::from_millis(time_config.milliseconds_per_interval())
+                            - EARLY_AGGREGATION_WINDOW,
                         ctx.clone(),
                         EarlyAggregationCheck,
                     );
@@ -474,7 +484,7 @@ impl BlockChainServer {
     /// 2. Snapshot the aggregation inputs from the store, capped at a single job
     ///    when we propose next slot.
     /// 3. Spawn a `spawn_blocking` worker that streams results back as messages.
-    /// 4. Schedule the `AggregationDeadline` self-message at +`AGGREGATION_DEADLINE`.
+    /// 4. Schedule the `AggregationDeadline` self-message at one interval out.
     ///
     /// Both entry points land here — the interval-2 tick and the early
     /// 2/3-threshold trigger — so the proposer cap applies to whichever one
@@ -519,8 +529,9 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let t2_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT + 2 * MILLISECONDS_PER_INTERVAL;
+        let time_config = *self.store.config();
+        let t2_ms = time_config.genesis_time_ms()
+            + SlotInterval::Aggregation.to_ms_since_genesis(slot, &time_config);
         // Interval-2 boundary as a wall-clock instant; the worker holds each
         // produced aggregate until this before sending it back, so nothing
         // reaches gossip early.
@@ -540,7 +551,7 @@ impl BlockChainServer {
 
         // Independent token per session. Shutdown propagates via our
         // #[stopped] hook which cancels any current session; the deadline
-        // timer cancels this specific session at +AGGREGATION_DEADLINE.
+        // timer cancels this specific session at +`aggregation_deadline`.
         let cancel = CancellationToken::new();
         let actor_ref = ctx.actor_ref();
 
@@ -557,7 +568,7 @@ impl BlockChainServer {
         });
 
         let _deadline_timer = send_after(
-            AGGREGATION_DEADLINE,
+            aggregation_deadline(time_config.milliseconds_per_interval()),
             ctx.clone(),
             AggregationDeadline { session_id },
         );
@@ -588,17 +599,19 @@ impl BlockChainServer {
         // Only fire inside the early-aggregation window
         // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
         // slot's interval-2 boundary; the slot is derived from the wall clock.
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let Some(ms_since_genesis) = unix_now_ms().checked_sub(genesis_time_ms) else {
+        let time_config = *self.store.config();
+        let Some(ms_since_genesis) = unix_now_ms().checked_sub(time_config.genesis_time_ms())
+        else {
             return;
         };
-        let ms_into_slot = ms_since_genesis % MILLISECONDS_PER_SLOT;
-        let t2_offset = 2 * MILLISECONDS_PER_INTERVAL;
+        let ms_per_interval = time_config.milliseconds_per_interval();
+        let ms_into_slot = ms_since_genesis % time_config.milliseconds_per_slot;
+        let t2_offset = 2 * ms_per_interval;
         let window_ms = EARLY_AGGREGATION_WINDOW.as_millis() as u64;
         if ms_into_slot < t2_offset - window_ms || ms_into_slot >= t2_offset {
             return;
         }
-        let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
+        let slot = ms_since_genesis / time_config.milliseconds_per_slot;
         if self
             .current_aggregation
             .as_ref()
@@ -718,8 +731,9 @@ impl BlockChainServer {
     async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let slot_start_ms = genesis_time_ms + slot * MILLISECONDS_PER_SLOT;
+        let time_config = *self.store.config();
+        let slot_start_ms = time_config.genesis_time_ms()
+            + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config);
 
         // Build the block. `produce_block_with_signatures` advances the store to
         // this slot's interval 0 (accepting attestations) before building — one
@@ -889,7 +903,7 @@ impl BlockChainServer {
         // Align publication to the slot boundary. If the build finished before
         // the slot opened, wait out the remainder so the block is not published
         // early; if it overran, publish immediately.
-        if now_ms < genesis_time_ms + slot * crate::MILLISECONDS_PER_SLOT {
+        if now_ms < slot_start_ms {
             let wait_ms = slot_start_ms.saturating_sub(now_ms);
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         }
@@ -946,8 +960,9 @@ impl BlockChainServer {
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
         // compute the wall-clock slot fresh for the head-recency gate.
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let wall_clock_slot = unix_now_ms().saturating_sub(genesis_time_ms) / MILLISECONDS_PER_SLOT;
+        let time_config = *self.store.config();
+        let wall_clock_slot = unix_now_ms().saturating_sub(time_config.genesis_time_ms())
+            / time_config.milliseconds_per_slot;
         pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
 
         metrics::update_head_slot(self.store.head_slot());
@@ -1281,6 +1296,22 @@ impl BlockChainServer {
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
     }
+
+    /// Whether `slot` is close enough to the store clock for its arrival to be
+    /// worth measuring.
+    ///
+    /// Arrival metrics are observed before `on_block` /
+    /// `on_gossip_attestation` validate anything, so a gossip-supplied slot
+    /// reaches them unchecked. Reuse the same future bound both validators
+    /// reject on: past it the delta is not a timeliness measurement but an
+    /// attacker-chosen number, and one fabricated far-future slot would
+    /// dominate the histogram's sum and mislabel its `position` bucket for the
+    /// lifetime of the process.
+    fn is_arrival_observable(&self, slot: u64) -> bool {
+        let slot_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
+        let store_time = self.store.time().expect("store time exists");
+        slot_start_interval <= store_time + GOSSIP_DISPARITY_INTERVALS
+    }
 }
 
 // Protocol trait for internal messages only (tick scheduling).
@@ -1317,8 +1348,8 @@ impl BlockChainServer {
         let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
 
-        let genesis_time_ms = self.store.config().genesis_time * 1000;
-        let remaining_at_entry = ms_until_next_interval(now_ms, genesis_time_ms);
+        let time_config = *self.store.config();
+        let remaining_at_entry = ms_until_next_interval(now_ms, &time_config);
         let now_after_tick = unix_now_ms();
         let elapsed = now_after_tick.saturating_sub(now_ms);
 
@@ -1328,7 +1359,7 @@ impl BlockChainServer {
             0
         } else {
             // Schedule the next tick at the next interval boundary
-            ms_until_next_interval(now_after_tick, genesis_time_ms)
+            ms_until_next_interval(now_after_tick, &time_config)
         };
         send_after(
             Duration::from_millis(ms_to_next_interval),
@@ -1393,8 +1424,9 @@ impl Handler<NewBlock> for BlockChainServer {
                 slot,
                 block: msg.block.message.hash_tree_root(),
             });
-            let genesis_ms = self.store.config().genesis_time * 1000;
-            metrics::observe_gossip_block_arrival(arrival_ms, genesis_ms, slot);
+            if self.is_arrival_observable(slot) {
+                metrics::observe_gossip_block_arrival(arrival_ms, self.store.config(), slot);
+            }
         }
         self.on_block(msg.block);
     }
@@ -1403,18 +1435,16 @@ impl Handler<NewBlock> for BlockChainServer {
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        let genesis_ms = self.store.config().genesis_time * 1000;
-        metrics::observe_gossip_attestation_arrival(
-            arrival_ms,
-            genesis_ms,
-            msg.attestation.data.slot,
-        );
+        let data_slot = msg.attestation.data.slot;
+        if self.is_arrival_observable(data_slot) {
+            metrics::observe_gossip_attestation_arrival(arrival_ms, self.store.config(), data_slot);
+        }
         self.on_gossip_attestation(&msg.attestation);
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
         // the check unless this attestation is for the store's current slot.
         let current_slot = self.store.current_slot();
-        if msg.attestation.data.slot == current_slot {
+        if data_slot == current_slot {
             self.maybe_start_early_aggregation(ctx).await;
         }
     }
@@ -1423,8 +1453,7 @@ impl Handler<NewAttestation> for BlockChainServer {
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        let genesis_ms = self.store.config().genesis_time * 1000;
-        metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, self.store.config());
         self.on_gossip_aggregated_attestation(msg.attestation);
     }
 }
@@ -1458,8 +1487,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // and costs little in practice: a late aggregate is late for every node
         // at once, so both populations are dominated by production time rather
         // than propagation and their distributions look alike.
-        let genesis_ms = self.store.config().genesis_time * 1000;
-        metrics::observe_gossip_aggregation_arrival(arrival_ms, genesis_ms);
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, self.store.config());
 
         // Publish alignment is enforced upstream: the worker delays delivery of
         // this message until the interval-2 boundary, so by the time it lands
@@ -1511,7 +1539,9 @@ impl Handler<AggregationDone> for BlockChainServer {
             total_children = msg.total_children,
             cancelled = msg.cancelled,
             early,
-            aggregation_deadline_ms = AGGREGATION_DEADLINE.as_millis() as u64,
+            aggregation_deadline_ms =
+                aggregation_deadline(self.store.config().milliseconds_per_interval()).as_millis()
+                    as u64,
             "Committee signatures aggregated"
         );
     }
@@ -1524,5 +1554,107 @@ impl Handler<AggregationDeadline> for BlockChainServer {
         {
             session.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENESIS_TIME: u64 = 1_000;
+
+    fn config(milliseconds_per_slot: u64) -> ChainConfig {
+        ChainConfig::new(GENESIS_TIME, milliseconds_per_slot)
+    }
+
+    #[test]
+    fn interval_boundaries_scale_with_the_slot_duration() {
+        let default = config(DEFAULT_MILLISECONDS_PER_SLOT);
+        let doubled = config(2 * DEFAULT_MILLISECONDS_PER_SLOT);
+
+        // Same interval index, twice the offset.
+        for interval in [
+            SlotInterval::BlockPublication,
+            SlotInterval::AttestationProduction,
+            SlotInterval::Aggregation,
+            SlotInterval::SafeTargetUpdate,
+            SlotInterval::EndOfSlot,
+        ] {
+            let at_default = interval.to_ms_since_genesis(7, &default);
+            assert_eq!(interval.to_ms_since_genesis(7, &doubled), 2 * at_default);
+        }
+    }
+
+    #[test]
+    fn a_hostile_slot_saturates_instead_of_overflowing() {
+        let config = config(DEFAULT_MILLISECONDS_PER_SLOT);
+
+        // Arrival metrics reach `to_ms_since_genesis` with an unvalidated
+        // gossip slot, so neither the multiply nor the interval offset may
+        // panic in a debug build or wrap in a release one.
+        for interval in [
+            SlotInterval::BlockPublication,
+            SlotInterval::AttestationProduction,
+            SlotInterval::Aggregation,
+            SlotInterval::SafeTargetUpdate,
+            SlotInterval::EndOfSlot,
+        ] {
+            assert_eq!(interval.to_ms_since_genesis(u64::MAX, &config), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn interval_conversions_round_trip() {
+        let config = config(8_000);
+
+        for slot in [0, 1, 42] {
+            for interval in [
+                SlotInterval::BlockPublication,
+                SlotInterval::AttestationProduction,
+                SlotInterval::Aggregation,
+                SlotInterval::SafeTargetUpdate,
+                SlotInterval::EndOfSlot,
+            ] {
+                let start = interval.to_ms_since_genesis(slot, &config);
+                assert_eq!(
+                    SlotInterval::from_ms_since_genesis(start, &config),
+                    interval
+                );
+                // Still the same interval one millisecond before the next boundary.
+                let last_ms = start + config.milliseconds_per_interval() - 1;
+                assert_eq!(
+                    SlotInterval::from_ms_since_genesis(last_ms, &config),
+                    interval
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_interval_is_a_full_interval_away_at_a_boundary() {
+        let config = config(8_000);
+        let genesis_ms = config.genesis_time_ms();
+
+        assert_eq!(ms_until_next_interval(genesis_ms, &config), 1_600);
+        assert_eq!(ms_until_next_interval(genesis_ms + 1, &config), 1_599);
+        assert_eq!(ms_until_next_interval(genesis_ms + 1_599, &config), 1);
+        assert_eq!(ms_until_next_interval(genesis_ms + 1_600, &config), 1_600);
+    }
+
+    #[test]
+    fn before_genesis_the_next_tick_is_genesis_itself() {
+        let config = config(8_000);
+        let genesis_ms = config.genesis_time_ms();
+
+        assert_eq!(ms_until_next_interval(genesis_ms - 500, &config), 500);
+    }
+
+    #[test]
+    fn aggregation_deadline_is_one_interval() {
+        let config = config(8_000);
+        assert_eq!(
+            aggregation_deadline(config.milliseconds_per_interval()),
+            Duration::from_millis(1_600)
+        );
     }
 }

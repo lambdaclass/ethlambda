@@ -1,6 +1,6 @@
 use axum::{Extension, Router, extract::State, response::IntoResponse, routing::get};
+use ethlambda_blockchain::SyncStatusController;
 use ethlambda_blockchain::metrics::SyncStatus;
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, SyncStatusController};
 use ethlambda_storage::Store;
 use serde::Serialize;
 
@@ -38,12 +38,12 @@ async fn get_syncing(
     State(store): State<Store>,
     Extension(sync_status): Extension<SyncStatusController>,
 ) -> impl IntoResponse {
-    let genesis_ms = store.config().genesis_time.saturating_mul(1000);
+    let genesis_ms = store.config().genesis_time_ms();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(genesis_ms);
-    let wall_slot = now_ms.saturating_sub(genesis_ms) / MILLISECONDS_PER_SLOT;
+    let wall_slot = now_ms.saturating_sub(genesis_ms) / store.config().milliseconds_per_slot;
     let head_slot = store.head_slot();
     let sync_distance = wall_slot.saturating_sub(head_slot);
     let finalized_slot = store
@@ -85,7 +85,8 @@ mod tests {
     use ethlambda_blockchain::SyncStatusController;
     use ethlambda_blockchain::metrics::SyncStatus;
     use ethlambda_storage::{Store, backend::InMemoryBackend};
-    use ethlambda_types::state::ChainConfig;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
+    use ethlambda_types::state::StateConfig;
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -117,7 +118,11 @@ mod tests {
         // Assert it's clearly far behind, not a small transient lag. (is_syncing
         // comes from the controller, not sync_distance; see
         // node_syncing_reflects_controller.)
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            create_test_state(),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let json = get_syncing_json(store, SyncStatusController::default()).await;
         assert_eq!(json["head_slot"], 0);
         assert_eq!(json["finalized_slot"], 0);
@@ -133,10 +138,14 @@ mod tests {
         // Set genesis_time to far future so wall_slot=0 and head_slot=0 → sync_distance=0.
         let mut state = create_test_state();
         // Unix timestamp ~year 2100 (4102444800 seconds), well beyond any test run.
-        state.config = ChainConfig {
+        state.config = StateConfig {
             genesis_time: 4_102_444_800,
         };
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), state);
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let json = get_syncing_json(store, SyncStatusController::default()).await;
         assert_eq!(json["head_slot"], 0);
         assert_eq!(json["finalized_slot"], 0);
@@ -148,7 +157,11 @@ mod tests {
         // is_syncing comes from the shared SyncStatusController (the actor's sync
         // decision), not the raw wall-clock sync_distance. It follows the
         // controller and updates through the shared handle without rebuilding it.
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            create_test_state(),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let sync = SyncStatusController::new(SyncStatus::Syncing);
 
         assert_eq!(
@@ -167,7 +180,11 @@ mod tests {
         const VERSION: &str =
             "ethlambda/v9.9.9-test-deadbeef/x86_64-unknown-linux-gnu/rustc-v1.92.0";
         const PEER_ID: &str = "16Uiu2HAmTestPeerIdSentinel";
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            create_test_state(),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let app = crate::build_api_router(store, VERSION, PEER_ID.to_string());
         let resp = app
             .oneshot(

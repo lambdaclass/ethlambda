@@ -27,6 +27,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{AggregationBits, AttestationData, HashedAttestationData},
     block::{ByteList512KiB, SingleMessageAggregate},
+    constants::{INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT},
     primitives::H256,
     state::Validator,
 };
@@ -36,16 +37,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
-use crate::{MILLISECONDS_PER_INTERVAL, metrics};
+use crate::metrics;
 
 /// Soft deadline for committee-signature aggregation measured from session
-/// start. After this much wall time elapses, the actor signals the worker to
-/// stop via its cancellation token. A session started exactly at interval 2
-/// gets the full interval (interval 3 is one interval later); a session
-/// started early (see `maybe_start_early_aggregation`) ends correspondingly
-/// earlier. The deadline only stops new jobs from starting — a job mid-proof
-/// finishes and publishes right after.
-pub(crate) const AGGREGATION_DEADLINE: Duration = Duration::from_millis(800);
+/// start: one full interval. After this much wall time elapses, the actor
+/// signals the worker to stop via its cancellation token. A session started
+/// exactly at interval 2 therefore runs until interval 3; a session started
+/// early (see `maybe_start_early_aggregation`) ends correspondingly earlier.
+/// The deadline only stops new jobs from starting — a job mid-proof finishes
+/// and publishes right after.
+pub(crate) fn aggregation_deadline(milliseconds_per_interval: u64) -> Duration {
+    Duration::from_millis(milliseconds_per_interval)
+}
+
 /// Upper bound we wait for a prior worker to exit if it is still running when
 /// the next session is about to start. Reached only in pathological cases
 /// (mismatched timers, stuck proofs); we warn before blocking.
@@ -54,16 +58,23 @@ pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Width of the early-aggregation window: a session may start at most this
 /// long before the interval-2 boundary, provided the signature threshold is
 /// met (see the check in `maybe_start_early_aggregation`).
+///
+/// Fixed rather than scaled with the slot duration. What the window buys is
+/// wall time for the leanVM proof to land before the block that carries it,
+/// and a proof costs the same however long the network's slot is.
 pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
 
 // The window must fit within one interval: `maybe_start_early_aggregation`
 // subtracts it from the interval-2 offset, and the interval-1 tick schedules
-// the check at `MILLISECONDS_PER_INTERVAL - EARLY_AGGREGATION_WINDOW`. Keep
-// this invariant self-enforcing so a future bump to the window can't silently
-// underflow either subtraction.
+// the check at `milliseconds_per_interval - EARLY_AGGREGATION_WINDOW`. The
+// slot duration is configurable, so the binding case is the narrowest interval
+// a config file can ask for. Keep this invariant self-enforcing so a future
+// bump to the window, or a lowered floor, can't silently underflow either
+// subtraction.
 const _: () = assert!(
-    EARLY_AGGREGATION_WINDOW.as_millis() <= MILLISECONDS_PER_INTERVAL as u128,
-    "EARLY_AGGREGATION_WINDOW must not exceed one interval"
+    EARLY_AGGREGATION_WINDOW.as_millis()
+        <= (MIN_MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT) as u128,
+    "EARLY_AGGREGATION_WINDOW must not exceed the shortest configurable interval"
 );
 
 /// A single pre-prepared aggregation group.
@@ -165,7 +176,7 @@ impl Message for AggregationDeadline {
 }
 
 /// One-shot self-message scheduled at the interval-1 tick; fires when the
-/// early-aggregation window opens (T2 - EARLY_AGGREGATION_WINDOW) to run
+/// early-aggregation window opens (T2 - [`EARLY_AGGREGATION_WINDOW`]) to run
 /// the threshold check for signatures that all arrived before the window.
 /// Arrivals inside the window are checked per insert instead.
 pub(crate) struct EarlyAggregationCheck;
@@ -174,7 +185,7 @@ impl Message for EarlyAggregationCheck {
 }
 
 /// Maximum number of aggregation jobs selected per interval-2 session. Caps
-/// leanVM prover work against [`AGGREGATION_DEADLINE`]: the greedy loop in
+/// leanVM prover work against [`aggregation_deadline`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
@@ -772,10 +783,11 @@ pub(crate) fn run_aggregation_worker(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
         checkpoint::Checkpoint,
-        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
+        state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz_types::SszList;
     use std::sync::Arc;
@@ -831,7 +843,7 @@ mod tests {
             body_root: H256::ZERO,
         };
         State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: head_slot,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -846,7 +858,7 @@ mod tests {
 
     fn new_test_store(head_state: State) -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
-        Store::from_anchor_state(backend, head_state)
+        Store::from_anchor_state(backend, head_state, DEFAULT_MILLISECONDS_PER_SLOT)
     }
 
     /// Insert a header-only block at `root` so it shows up in
