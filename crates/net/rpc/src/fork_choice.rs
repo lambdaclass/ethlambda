@@ -99,6 +99,7 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request, http::StatusCode};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -113,7 +114,7 @@ mod tests {
     async fn test_get_fork_choice_returns_json() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         let app = build_test_router(store);
 
@@ -150,7 +151,7 @@ mod tests {
     async fn test_get_fork_choice_ui_returns_html() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         let app = build_test_router(store);
 

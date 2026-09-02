@@ -35,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use cli::NodeOptions;
 use command::Command;
-use ethlambda_blockchain::MILLISECONDS_PER_SLOT;
+
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
@@ -194,6 +194,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
 
     info!(
         genesis_time = genesis_config.genesis_time,
+        milliseconds_per_slot = genesis_config.milliseconds_per_slot,
         validator_count = genesis_config.genesis_validators.len(),
         "Loaded genesis configuration"
     );
@@ -304,6 +305,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         validator_ids,
         attestation_committee_count,
         subscription_subnets: subscribed_subnets.clone(),
+        milliseconds_per_slot: genesis_config.milliseconds_per_slot,
     })
     .wrap_err("failed to build swarm")?;
 
@@ -747,7 +749,7 @@ async fn fetch_initial_state(
             .expect("already past the unix epoch")
             .as_millis() as u64;
         let current_slot =
-            now_ms.saturating_sub(genesis.genesis_time * 1000) / MILLISECONDS_PER_SLOT;
+            now_ms.saturating_sub(genesis.genesis_time * 1000) / genesis.milliseconds_per_slot;
         let head_slot = store.head_slot();
         let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
@@ -771,7 +773,11 @@ async fn fetch_initial_state(
     if checkpoint_urls.is_empty() {
         info!("No checkpoint sync URL provided, initializing from genesis state");
         let genesis_state = State::from_genesis(genesis.genesis_time, validators);
-        return Ok(Store::from_anchor_state(backend, genesis_state));
+        return Ok(Store::from_anchor_state(
+            backend,
+            genesis_state,
+            genesis.milliseconds_per_slot,
+        ));
     }
 
     // Checkpoint sync path: try URLs in order, fail over to the next on error.
@@ -797,9 +803,14 @@ async fn fetch_initial_state(
     // overlaps with what `get_forkchoice_store` already wrote, but it's
     // idempotent and the only path that also stores `BlockProof`.
     let anchor_root = signed_block.message.header().hash_tree_root();
-    let mut store = Store::get_forkchoice_store(backend, state, signed_block.message.clone())
-        .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
-        .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
+    let mut store = Store::get_forkchoice_store(
+        backend,
+        state,
+        signed_block.message.clone(),
+        genesis.milliseconds_per_slot,
+    )
+    .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
+    .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
     store
         .insert_signed_block(anchor_root, signed_block)
         .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))
@@ -811,6 +822,7 @@ async fn fetch_initial_state(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
@@ -927,7 +939,7 @@ validators:
     /// elapsed time, and a whole slot of it would have to pass between this
     /// call and the read inside the function to shift the gap.
     fn genesis_time_for_gap(gap: u64) -> u64 {
-        let seconds_per_slot = MILLISECONDS_PER_SLOT / 1_000;
+        let seconds_per_slot = DEFAULT_MILLISECONDS_PER_SLOT / 1_000;
         now_secs() - (SEEDED_HEAD_SLOT + gap) * seconds_per_slot
     }
 
@@ -936,6 +948,7 @@ validators:
     fn test_genesis(genesis_time: u64) -> GenesisConfig {
         GenesisConfig {
             genesis_time,
+            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
             genesis_validators: vec![GenesisValidatorEntry {
                 attestation_pubkey: [1u8; 52],
                 proposal_pubkey: [2u8; 52],
@@ -949,7 +962,7 @@ validators:
         let mut anchor = State::from_genesis(genesis.genesis_time, genesis.validators());
         anchor.slot = SEEDED_HEAD_SLOT;
         anchor.latest_block_header.slot = SEEDED_HEAD_SLOT;
-        Store::from_anchor_state(backend, anchor);
+        Store::from_anchor_state(backend, anchor, DEFAULT_MILLISECONDS_PER_SLOT);
     }
 
     #[tokio::test]

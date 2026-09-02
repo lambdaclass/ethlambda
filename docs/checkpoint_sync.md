@@ -79,7 +79,7 @@ To deliberately discard existing state and start over from genesis or from a che
 
 ### Foreign State
 
-Persisted state is accepted only after it is verified against the local genesis config: same `GENESIS_TIME` and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.
+Persisted state is accepted only after it is verified against the local genesis config: same `GENESIS_TIME`, same `MILLISECONDS_PER_SLOT`, and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.
 
 If the data directory belongs to a different network, startup **aborts** with `persisted state does not match the configured genesis: …`. It is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain's rows in place, and the slot-indexed reads behind `BlocksByRange` would then serve those blocks to peers. Point `--data-dir` at the right directory, or remove it.
 

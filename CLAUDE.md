@@ -52,7 +52,7 @@ crates/
 - Communication via `mpsc::unbounded_channel`
 - Shared storage via `Arc<dyn StorageBackend>` (clone Store, share backend)
 
-### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
+### Tick-Based Validator Duties (5 intervals per slot; 4-second slots by default)
 ```
 Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
@@ -306,11 +306,18 @@ one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.m
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)
 ```yaml
 GENESIS_TIME: 1770407233
+MILLISECONDS_PER_SLOT: 4000  # optional, defaults to DEFAULT_MILLISECONDS_PER_SLOT
 GENESIS_VALIDATORS:
   - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
+- `MILLISECONDS_PER_SLOT` must be a multiple of `INTERVALS_PER_SLOT` and at least
+  `MIN_MILLISECONDS_PER_SLOT`: the knob slows a network down, it does not speed one up,
+  since timings fixed in milliseconds (`EARLY_AGGREGATION_WINDOW`) are sized for the spec
+  cadence. It is persisted in the DB's `Metadata["config"]` and a resume with a different
+  value is refused. Other clients ignore the key and stay at their compile-time 4s, so it
+  only takes effect on an all-ethlambda network
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 

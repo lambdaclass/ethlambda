@@ -12,10 +12,7 @@ use ethlambda_types::{
     block::{ByteList512KiB, SingleMessageAggregate},
 };
 
-use crate::{
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT,
-    store::{self, StoreError},
-};
+use crate::store::{self, StoreError};
 
 /// Prefix emitted by leanSpec's mocked aggregation prover.
 const MOCK_PROOF_PREFIX: &[u8] = b"\x00MOCKED-AGGREGATION-PROOF\x00";
@@ -114,11 +111,11 @@ pub fn apply_fork_choice_step(
 ) -> Result<(), StepError> {
     match step.step_type.as_str() {
         "tick" => {
-            let genesis_time = store.config().genesis_time;
+            let config = *store.config();
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
-                    genesis_time * 1000 + interval * MILLISECONDS_PER_INTERVAL
+                    config.genesis_time_ms() + interval * config.milliseconds_per_interval()
                 }
                 (None, None) => {
                     return Err(StepError::Harness(
@@ -136,8 +133,8 @@ pub fn apply_fork_choice_step(
                 .ok_or_else(|| StepError::Harness("block step missing block data".to_string()))?;
             let signed_block = block_data.to_blank_signed_block();
             if step.tick_to_slot {
-                let block_time_ms = store.config().genesis_time * 1000
-                    + signed_block.message.slot * MILLISECONDS_PER_SLOT;
+                let block_time_ms = store.config().genesis_time_ms()
+                    + signed_block.message.slot * store.config().milliseconds_per_slot;
                 store::on_tick(store, block_time_ms, true);
             }
             store::on_block_without_verification(store, signed_block)?;

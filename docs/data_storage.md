@@ -213,14 +213,14 @@ diff contains and how states are rebuilt.
 String keys mapping to SSZ-encoded scalars — the `Store`'s own persistent
 fields:
 
-| Key                | Type          | Meaning                                                |
-| ------------------ | ------------- | ------------------------------------------------------ |
-| `time`             | `u64`         | Intervals elapsed since genesis (the store clock)      |
-| `config`           | `ChainConfig` | Chain configuration (currently just `genesis_time`)    |
-| `head`             | `H256`        | Current fork choice head                               |
-| `safe_target`      | `H256`        | Current safe target (see [lmd_ghost.md](lmd_ghost.md)) |
-| `latest_justified` | `Checkpoint`  | Latest justified checkpoint                            |
-| `latest_finalized` | `Checkpoint`  | Latest finalized checkpoint                            |
+| Key                | Type              | Meaning                                                |
+| ------------------ | ----------------- | ------------------------------------------------------ |
+| `time`             | `u64`             | Intervals elapsed since genesis (the store clock)      |
+| `config`           | `ChainConfig` | Genesis time and slot duration                         |
+| `head`             | `H256`            | Current fork choice head                               |
+| `safe_target`      | `H256`            | Current safe target (see [lmd_ghost.md](lmd_ghost.md)) |
+| `latest_justified` | `Checkpoint`      | Latest justified checkpoint                            |
+| `latest_finalized` | `Checkpoint`      | Latest finalized checkpoint                            |
 
 `config` is the odd one out: `init_store` writes it once at bootstrap and
 nothing ever rewrites it afterward (it has a getter, `Store::config`, but no
@@ -229,6 +229,12 @@ reads of it never reach the backend. It is also part of the DB's fingerprint:
 `from_db_state` refuses to resume a data directory belonging to another
 network (see [Startup and Restore](#startup-and-restore)). Every other
 `Metadata` key is mutated in place as the chain progresses.
+
+Note that this is *not* the SSZ `StateConfig` carried inside `State`. That one is
+merkleized into the state root, so its layout is fixed by the spec and holds only
+`genesis_time`; `ChainConfig` adds the slot duration, which the node needs to
+schedule duties but which never enters a state root. A blob written before the slot
+duration existed still decodes, filling in the 4-second default that chain ran on.
 
 ### LiveChain
 
@@ -432,11 +438,14 @@ its `BlockRoots` entry, the body if non-empty, a full snapshot into `States`
 
 `from_db_state` is the restore path: it reads `config` and `latest_finalized`
 from `Metadata`, returning `None` for an empty DB. A populated DB from another
-network is fatal instead: the finalized state's genesis time and validator
-registry are compared against the genesis config, and a mismatch fails with
+network is fatal instead: the persisted `config`'s genesis time and slot
+duration, plus the finalized state's genesis time and validator registry, are
+compared against the genesis config, and a mismatch fails with
 `Error::GenesisMismatch` rather than being treated as empty, since writing a
 fresh anchor would leave the foreign chain's rows in place to be served to
-peers. At startup the node prefers this path but only
+peers. The slot duration has to be checked against the persisted `config`
+because it is absent from the state by design. At startup the node prefers
+this path but only
 accepts the on-disk store if its head is at most `MAX_RESUMABLE_DB_STATE_AGE
 = 450` slots (~30 minutes) behind the current slot; a staler DB falls through
 to checkpoint sync, which writes a fresh anchor on top of the existing data.
