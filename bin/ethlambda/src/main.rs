@@ -122,6 +122,14 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
 
+    // Compiles the aggregation bytecode and fixes the prover's allocator. Ahead of the
+    // test-driver branch below, which verifies signatures, and of every consensus path.
+    info!(
+        arena = options.prover_arena,
+        "Initializing leanVM prover and verifier"
+    );
+    ethlambda_crypto::init_leanvm(options.prover_arena);
+
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
@@ -534,8 +542,8 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> eyre::Result<Vec<Bootnode
 #[derive(Debug, Deserialize, Clone)]
 struct AnnotatedValidator {
     index: u64,
-    /// Parsed for hex-format validation only; not cross-checked against the
-    /// loaded secret key since leansig doesn't expose any pk getters.
+    /// Parsed for hex-format validation only; not currently cross-checked
+    /// against the loaded secret key's derived public key.
     #[serde(rename = "pubkey_hex", deserialize_with = "deser_pubkey_hex")]
     _pubkey_hex: ValidatorPubkeyBytes,
     privkey_file: PathBuf,
@@ -551,7 +559,12 @@ where
     let pubkey: ValidatorPubkeyBytes = hex::decode(&value)
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
-        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+        .map_err(|_| {
+            D::Error::custom(format!(
+                "ValidatorPubkey length != {}",
+                ethlambda_types::state::PUBLIC_KEY_SIZE
+            ))
+        })?;
     Ok(pubkey)
 }
 
@@ -824,6 +837,7 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
@@ -950,8 +964,8 @@ validators:
             genesis_time,
             milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
             genesis_validators: vec![GenesisValidatorEntry {
-                attestation_pubkey: [1u8; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [1u8; PUBLIC_KEY_SIZE],
+                proposal_pubkey: [2u8; PUBLIC_KEY_SIZE],
             }],
         }
     }
@@ -1080,7 +1094,7 @@ validators:
         seed_db(backend.clone(), &seeded_genesis);
 
         let mut other_genesis = test_genesis(genesis_time);
-        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
+        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; PUBLIC_KEY_SIZE];
         let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
             panic!("a foreign validator set must not be silently re-anchored");
         };
