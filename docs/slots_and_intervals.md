@@ -55,7 +55,8 @@ simply points its parent root at an older block.
 > **In ethlambda:** block proposal is merged into the previous slot's head-update
 > interval: the proposer advances its store to the next slot, builds the block there,
 > and holds publication until the slot boundary. That buys the build one extra interval
-> of headroom and leaves no actor work at the block-proposal tick itself.
+> of headroom and leaves no actor work at the block-proposal tick itself. The aggregation
+> worker is paused for the duration, so the build does not share the prover with it.
 
 ## Interval 1: Vote propagation
 
@@ -82,11 +83,18 @@ into one proof is the heaviest recurring computation in the client. It is also w
 block affordable, since a block carrying raw votes would need one full XMSS signature per
 voter, quickly going over the network bandwidth limit.
 
-> **In ethlambda:** the proofs run on an off-thread worker so the blockchain actor's
-> message loop stays responsive, and a session may start up to `EARLY_AGGREGATION_WINDOW`
-> before the interval boundary once two thirds of the signatures are in. At the session's
-> soft deadline the actor stops handing out new jobs, but a proof already in flight
-> finishes and publishes late rather than being discarded.
+> **In ethlambda:** the proofs run on an off-thread worker that never stops: it keeps its
+> own store handle and works through the pool a job at a time, so proving is not confined
+> to this interval. What the interval still owns is publication — the actor buffers each
+> finished aggregate and gossips the lot here.
+>
+> What the worker may pick up tightens as this boundary approaches. Early in the slot it
+> works the backlog (stale groups, merges of proofs it already holds) and takes a
+> current-slot group once two thirds of the signatures this node expects are in. In the
+> last 600 ms before the boundary it takes nothing but that group: a backlog job is a
+> recursive merge that can run well past the boundary, and the prover is single-threaded,
+> so starting one there would delay the very aggregate the slot is waiting on. From the
+> boundary on, everything is eligible.
 
 ## Interval 3: Safe target computation
 
