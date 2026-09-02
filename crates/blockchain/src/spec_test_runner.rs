@@ -83,6 +83,14 @@ pub fn rejection_reason(err: &StoreError) -> Option<RejectionReason> {
         StoreError::AttestationTooFarInFuture { .. } => RejectionReason::AttestationTooFarInFuture,
         StoreError::AggregateVerificationFailed(_) => RejectionReason::InvalidSignature,
         StoreError::BlockProofVerificationFailed(_) => RejectionReason::InvalidBlockProof,
+        // The proposer signature and the attestation aggregate are both
+        // components of the block proof, so a failure in either is the same
+        // spec rejection even though we carry them as separate wire fields. An
+        // attestation-free block carries no aggregate at all, so stray proof
+        // bytes are a malformed block proof rather than a distinct reason.
+        StoreError::ProposerSignatureDecodingFailed
+        | StoreError::ProposerSignatureVerificationFailed
+        | StoreError::UnexpectedAttestationProof => RejectionReason::InvalidBlockProof,
         StoreError::EmptyAggregationBits => RejectionReason::EmptyAggregationBits,
         StoreError::NotProposer { .. } => RejectionReason::WrongProposer,
         StoreError::DuplicateAttestationData { .. } => RejectionReason::DuplicateAttestationData,
