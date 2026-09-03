@@ -1,13 +1,12 @@
 //! Validator XMSS signatures, public/secret keys, and the leanVM-backed
 //! primitives behind them.
 
-use std::ops::Range;
+use std::ops::RangeInclusive;
 
 use ethlambda_types::{attestation::SIGNATURE_SIZE, primitives::H256, state::PUBLIC_KEY_SIZE};
-use ssz::{Decode, Encode};
-use xmss::{
-    PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey, XmssSignature,
-    XmssSignatureError, xmss_sign, xmss_verify,
+use leanvm::xmss::{
+    self, Decode, Encode, PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey,
+    XmssSignError, XmssSignature,
 };
 
 // `ethlambda-types` hardcodes the XMSS wire sizes so it can stay free of the
@@ -27,17 +26,6 @@ use xmss::{
 const _: [(); SIGNATURE_SIZE] = [(); SIGNATURE_SSZ_LEN];
 const _: [(); PUBLIC_KEY_SIZE] = [(); PUB_KEY_SSZ_LEN];
 
-/// The public key type from leanVM's xmss crate.
-pub type LeanSigPublicKey = XmssPublicKey;
-
-/// The signature type from leanVM's xmss crate.
-pub type LeanSigSignature = XmssSignature;
-
-/// The secret key type from leanVM's xmss crate.
-pub type LeanSigSecretKey = XmssSecretKey;
-
-pub type Signature = LeanSigSignature;
-
 /// Error returned when parsing signature or key bytes fails.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("signature parse error: {0}")]
@@ -45,13 +33,13 @@ pub struct SignatureParseError(pub String);
 
 #[derive(Clone)]
 pub struct ValidatorSignature {
-    inner: LeanSigSignature,
+    inner: XmssSignature,
 }
 
 impl ValidatorSignature {
     /// Parse from the SSZ-encoded wire form (`SIGNATURE_SIZE` bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
-        let sig = LeanSigSignature::from_ssz_bytes(bytes)
+        let sig = XmssSignature::from_ssz_bytes(bytes)
             .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sig })
     }
@@ -62,23 +50,25 @@ impl ValidatorSignature {
     }
 
     pub fn is_valid(&self, pubkey: &ValidatorPublicKey, slot: u32, message: &H256) -> bool {
-        xmss_verify(&pubkey.inner, slot, &message.0, &self.inner).is_ok()
+        xmss::verify(&pubkey.inner, &message.0, &self.inner, slot).is_ok()
     }
 
-    pub fn into_inner(self) -> LeanSigSignature {
+    pub fn into_inner(self) -> XmssSignature {
         self.inner
     }
 }
 
-#[derive(Clone)]
+// `Debug` only on the public key: the signature and the secret key carry
+// material that must not reach a log line by accident.
+#[derive(Clone, Debug)]
 pub struct ValidatorPublicKey {
-    inner: LeanSigPublicKey,
+    inner: XmssPublicKey,
 }
 
 impl ValidatorPublicKey {
     /// Parse from the SSZ-encoded wire form (`PUBLIC_KEY_SIZE` bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
-        let pk = LeanSigPublicKey::from_ssz_bytes(bytes)
+        let pk = XmssPublicKey::from_ssz_bytes(bytes)
             .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: pk })
     }
@@ -88,23 +78,28 @@ impl ValidatorPublicKey {
         self.inner.as_ssz_bytes()
     }
 
-    pub fn into_inner(self) -> LeanSigPublicKey {
+    pub fn into_inner(self) -> XmssPublicKey {
         self.inner
+    }
+
+    pub fn as_inner(&self) -> &XmssPublicKey {
+        &self.inner
     }
 }
 
 /// Validator private key for signing attestations and blocks.
 pub struct ValidatorSecretKey {
-    inner: LeanSigSecretKey,
+    inner: XmssSecretKey,
 }
 
 impl ValidatorSecretKey {
     /// Parse from the postcard-encoded key file produced by the genesis generator.
     ///
-    /// leanVM's `XmssSecretKey` uses serde (postcard) rather than the SSZ-style
-    /// `Serializable` of the old leanSig scheme.
+    /// leanVM's `XmssSecretKey` carries serde rather than an SSZ codec: the
+    /// secret key never appears in consensus data, so only the two wire types
+    /// get one.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureParseError> {
-        let sk = postcard::from_bytes::<LeanSigSecretKey>(bytes)
+        let sk = postcard::from_bytes::<XmssSecretKey>(bytes)
             .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sk })
     }
@@ -124,68 +119,63 @@ impl ValidatorSecretKey {
     /// Sign a message at `slot`.
     ///
     /// The slot indexes the one-time XMSS leaf; never sign two different
-    /// messages at the same slot.
-    pub fn sign(
-        &self,
-        slot: u32,
-        message: &H256,
-    ) -> Result<ValidatorSignature, XmssSignatureError> {
-        let sig = xmss_sign(&self.inner, slot, &message.0)?;
+    /// messages at the same slot. leanVM draws the signature randomness itself,
+    /// so even re-signing the same message at one slot leaks key material.
+    pub fn sign(&self, slot: u32, message: &H256) -> Result<ValidatorSignature, XmssSignError> {
+        let sig = xmss::sign(&mut leanvm::rand::rng(), &self.inner, &message.0, slot)?;
         Ok(ValidatorSignature { inner: sig })
     }
 
-    /// Returns true if the key can sign at the given slot.
+    /// Whether the key covers `slot` at all.
     ///
-    /// leanVM's xmss keys cover a fixed activation range (fixed at key
-    /// generation); there is no sliding preparation window as in the old
-    /// leanSig scheme.
-    pub fn is_prepared_for(&self, slot: u32) -> bool {
-        self.inner.activation_slots().contains(&slot)
+    /// The range is fixed at key generation; a slot outside it can never be
+    /// signed, however long the node waits.
+    pub fn can_sign_at(&self, slot: u32) -> bool {
+        self.inner.epoch_range().contains(&slot)
     }
 
-    /// The half-open slot range this key can sign for.
-    pub fn get_prepared_interval(&self) -> Range<u64> {
-        let range = self.inner.activation_slots();
-        (*range.start() as u64)..(*range.end() as u64 + 1)
+    /// The inclusive slot range this key can sign for.
+    pub fn signable_slots(&self) -> RangeInclusive<u32> {
+        self.inner.epoch_range()
     }
 
-    /// No-op retained for API compatibility.
+    /// Warm the signing cache for `slot`, so [`Self::sign`] there does not pay
+    /// for rebuilding the bottom Merkle subtree.
     ///
-    /// The old leanSig scheme advanced a two-bottom-tree preparation window;
-    /// leanVM's xmss keys have a fixed activation range and warm their signing
-    /// cache on demand inside `sign`, so there is nothing to advance.
-    pub fn advance_preparation(&mut self) {}
+    /// The key holds one cached subtree, so this is worth calling only for the
+    /// slot about to be signed, and it is pure latency shifting: a miss inside
+    /// `sign` rebuilds the same subtree. Errors only when `slot` is outside
+    /// [`Self::signable_slots`].
+    pub fn prepare(&self, slot: u32) -> Result<(), XmssSignError> {
+        self.inner.prepare(slot)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xmss::xmss_key_gen_from_seed;
 
-    /// Generate a validator key pair over a small activation range.
-    fn generate_key(
-        seed: [u8; 32],
-        activation_slot: u64,
-        num_active_slots: u64,
-    ) -> ValidatorSecretKey {
-        let (_pk, sk) = xmss_key_gen_from_seed(seed, activation_slot, num_active_slots)
-            .expect("valid activation range");
+    /// Generate a validator key pair over a small slot range (fast key generation).
+    fn generate_key(seed: [u8; 32], first_slot: u32, last_slot: u32) -> ValidatorSecretKey {
+        let (sk, _pk) =
+            xmss::key_gen_from_seed(seed, first_slot, last_slot).expect("valid slot range");
         ValidatorSecretKey { inner: sk }
     }
 
     #[test]
     #[ignore = "slow: XMSS key generation and signing"]
     fn sign_verify_round_trip() {
-        let sk = generate_key([7u8; 32], 0, 64);
+        let sk = generate_key([7u8; 32], 0, 63);
         let pk = sk.public_key();
 
-        assert!(sk.is_prepared_for(0));
-        assert!(sk.is_prepared_for(63));
-        assert!(!sk.is_prepared_for(64));
-        assert_eq!(sk.get_prepared_interval(), 0..64);
+        assert!(sk.can_sign_at(0));
+        assert!(sk.can_sign_at(63));
+        assert!(!sk.can_sign_at(64));
+        assert_eq!(sk.signable_slots(), 0..=63);
 
         let message = H256::from([42u8; 32]);
         let slot = 10u32;
+        sk.prepare(slot).expect("slot in range");
         let sig = sk.sign(slot, &message).expect("sign");
         assert!(sig.is_valid(&pk, slot, &message));
         assert!(!sig.is_valid(&pk, slot, &H256::from([43u8; 32])));
@@ -195,16 +185,17 @@ mod tests {
     #[test]
     #[ignore = "slow: XMSS key generation and signing"]
     fn sign_out_of_range_fails() {
-        let sk = generate_key([9u8; 32], 100, 32);
+        let sk = generate_key([9u8; 32], 100, 131);
         let message = H256::from([1u8; 32]);
-        // Slot 0 is outside the key's activation range [100, 132).
+        // Slot 0 is outside the key's range [100, 131].
         assert!(sk.sign(0, &message).is_err());
+        assert!(sk.prepare(0).is_err());
     }
 
     #[test]
     #[ignore = "slow: XMSS key generation"]
     fn public_key_ssz_round_trip() {
-        let sk = generate_key([3u8; 32], 0, 16);
+        let sk = generate_key([3u8; 32], 0, 15);
         let pk = sk.public_key();
         let bytes = pk.to_bytes();
         assert_eq!(bytes.len(), PUBLIC_KEY_SIZE);

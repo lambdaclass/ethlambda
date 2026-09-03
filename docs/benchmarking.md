@@ -79,7 +79,7 @@ otherwise, because a mis-attributed report is worse than no report.
 Block-building benchmark — synthetic workload (mock crypto)
   validators=8 warmup_slots=8 iterations=10 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=a5909d18 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=5a4f55c1 os=macos arch=aarch64 threads=14
 
   iter           compact  select_payloads     stf_simulate   overhead       wall         root
   1              0.000ms          0.002ms          0.015ms    0.068ms    0.085ms   0x7282cc99
@@ -91,7 +91,7 @@ Block-building benchmark — synthetic workload (mock crypto)
 ```
 
 Every measured iteration gets its own row, and the summary follows below it.
-Outliers are never discarded: XMSS signing and OTS window advancement produce
+Outliers are never discarded: XMSS signing and its Merkle-subtree cache misses produce
 legitimate heavy tails, and hiding them would misrepresent the thing being
 measured. A coefficient of variation above 10% is flagged so a noisy run is not
 mistaken for a result.

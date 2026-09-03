@@ -268,9 +268,26 @@ actual_slot = finalized_slot + 1 + relative_index
 - Epoch-based to prevent reuse
 - Signing, verification, and aggregation all come from leanVM, which internalized
   XMSS in its own `xmss` crate; there is no external leanSig dependency
+- BLAKE2s over binary fields, not Poseidon over KoalaBear: a leanVM `main` bump
+  across that rewrite invalidates every genesis key and every stored proof, even
+  when the wire sizes happen to match
 - `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
   proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
-  which trades bounded RSS for proving throughput
+  which recycles the prover's large buffers across proofs instead of re-faulting
+  them, so its pages stay resident for the node's lifetime
+
+**Aggregation shape (one leanVM `AggregateSignature`, grouped by epoch):**
+- Type-1 and Type-2 are the same object: one `XmssGroup` per slot, carrying the
+  one message signed at it and that group's sorted, deduplicated keys
+- **A slot carries one message.** Two distinct `AttestationData` at one slot
+  cannot share an aggregate; `ethlambda_crypto::ConflictingMessages` says so, and
+  nothing below it can work around the constraint
+- **The binding is off the wire.** `to_bytes_without_pubkeys()` carries neither
+  the keys nor the `(slot, message)` pairs, so every decode rebuilds the whole
+  signer set from a `SignerSet` per claim. A wrong set, message or slot decodes
+  fine and fails inside the SNARK verifier, so there is no cheap binding check
+- Narrowing replaces splitting: re-aggregate the parent with a `declare` naming
+  the group to keep (`split_type_2_by_message`)
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM
@@ -405,8 +422,9 @@ behavior.
 ## External Dependencies
 
 **Critical:**
-- `xmss` / `lean-multisig` (leanVM): XMSS signatures and recursive aggregation,
-  pinned to one revision (leanEthereum project)
+- `leanvm`: XMSS signatures and recursive aggregation, taken from leanVM's facade
+  crate (which re-exports `xmss`, `rec_aggregation` and its `rand`) and pinned to
+  one `main` revision (leanEthereum project)
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model

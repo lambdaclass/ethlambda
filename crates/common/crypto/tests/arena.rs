@@ -10,23 +10,21 @@ use ethlambda_crypto::{
     verify_aggregated_signature,
 };
 use ethlambda_types::primitives::H256;
-use lean_multisig::{xmss_key_gen_from_seed, xmss_sign};
-use ssz::Encode as _;
+use leanvm::xmss::{self, Encode as _, key_gen_from_seed};
 
-/// Mirrors the lib tests' helper: a small active range keeps key generation fast.
+/// Mirrors the lib tests' helper: a small slot range keeps key generation fast.
 fn keypair_and_signature(
     seed: u64,
-    activation_epoch: u32,
-    signing_epoch: u32,
+    first_slot: u32,
+    signing_slot: u32,
     message: &H256,
 ) -> (ValidatorPublicKey, ValidatorSignature) {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
 
-    let num_active_slots = 64u64;
-    let (pk, sk) = xmss_key_gen_from_seed(seed_bytes, activation_epoch as u64, num_active_slots)
-        .expect("valid activation range");
-    let sig = xmss_sign(&sk, signing_epoch, &message.0).expect("sign");
+    let (sk, pk) =
+        key_gen_from_seed(seed_bytes, first_slot, first_slot + 63).expect("valid slot range");
+    let sig = xmss::sign(&mut leanvm::rand::rng(), &sk, &message.0, signing_slot).expect("sign");
 
     (
         ValidatorPublicKey::from_bytes(&pk.as_ssz_bytes()).unwrap(),

@@ -75,16 +75,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "air"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "field",
- "koala-bear",
- "poly",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -658,24 +648,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "backend"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "air",
- "fiat-shamir",
- "field",
- "koala-bear",
- "parallel",
- "poly",
- "sumcheck",
- "symetric",
- "utils",
- "whir",
- "zk-alloc",
-]
-
-[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +701,15 @@ name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bindgen"
@@ -2011,14 +1992,12 @@ dependencies = [
 name = "ethlambda-crypto"
 version = "0.1.0"
 dependencies = [
- "ethereum_ssz",
  "ethlambda-types",
  "hex",
- "lean-multisig",
+ "leanvm",
  "postcard",
  "thiserror 2.0.18",
  "tracing",
- "xmss",
 ]
 
 [[package]]
@@ -2524,27 +2503,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
-name = "fiat-shamir"
+name = "fiat_shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "field",
- "koala-bear",
  "parallel",
+ "primitives",
  "serde",
- "symetric",
- "utils",
-]
-
-[[package]]
-name = "field"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "paste",
- "rand 0.10.1",
- "serde",
- "utils",
 ]
 
 [[package]]
@@ -2573,6 +2538,18 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "flock"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
+dependencies = [
+ "fiat_shamir",
+ "parallel",
+ "pcs",
+ "primitives",
+ "zk_alloc",
 ]
 
 [[package]]
@@ -3423,25 +3400,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "include_dir"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
-dependencies = [
- "include_dir_macros",
-]
-
-[[package]]
-name = "include_dir_macros"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3704,18 +3662,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "koala-bear"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "field",
- "paste",
- "rand 0.10.1",
- "serde",
- "utils",
-]
-
-[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3765,58 +3711,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
-name = "lean-multisig"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "backend",
- "clap",
- "lean_vm",
- "rec_aggregation",
- "serde_json",
- "sub_protocols",
- "system-info",
- "xmss",
- "zk-alloc",
-]
-
-[[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "backend",
- "include_dir",
  "lean_vm",
- "pest",
- "pest_derive",
- "sub_protocols",
- "xmss",
-]
-
-[[package]]
-name = "lean_prover"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "backend",
- "lean_compiler",
- "lean_vm",
- "rand 0.10.1",
- "serde",
- "sub_protocols",
- "tracing",
- "xmss",
+ "primitives",
 ]
 
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "backend",
+ "fiat_shamir",
+ "flock",
+ "parallel",
+ "pcs",
+ "primitives",
  "tracing",
+ "zk_alloc",
+]
+
+[[package]]
+name = "leanvm"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
+dependencies = [
+ "clap",
+ "lean_vm",
+ "primitives",
+ "rand 0.9.4",
+ "rec_aggregation",
+ "sphincs",
  "xmss",
+ "zk_alloc",
 ]
 
 [[package]]
@@ -5122,16 +5051,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
 
 [[package]]
-name = "objc2-foundation"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
-dependencies = [
- "bitflags 2.11.1",
- "objc2",
-]
-
-[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5192,9 +5111,9 @@ dependencies = [
 [[package]]
 name = "parallel"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "system-info",
+ "libc",
 ]
 
 [[package]]
@@ -5261,6 +5180,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pcs"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
+dependencies = [
+ "fiat_shamir",
+ "parallel",
+ "primitives",
+ "serde",
+ "tracing",
+ "zk_alloc",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5293,39 +5225,6 @@ checksum = "e0848c601009d37dfa3430c4666e147e49cdcf1b92ecd3e63657d8a5f19da662"
 dependencies = [
  "memchr",
  "ucd-trie",
-]
-
-[[package]]
-name = "pest_derive"
-version = "2.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11f486f1ea21e6c10ed15d5a7c77165d0ee443402f0780849d1768e7d9d6fe77"
-dependencies = [
- "pest",
- "pest_generator",
-]
-
-[[package]]
-name = "pest_generator"
-version = "2.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8040c4647b13b210a963c1ed407c1ff4fdfa01c31d6d2a098218702e6664f94f"
-dependencies = [
- "pest",
- "pest_meta",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "pest_meta"
-version = "2.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
-dependencies = [
- "pest",
- "sha2",
 ]
 
 [[package]]
@@ -5382,21 +5281,6 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "poly"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "field",
- "koala-bear",
- "parallel",
- "rand 0.10.1",
- "serde",
- "system-info",
- "utils",
- "zk-alloc",
 ]
 
 [[package]]
@@ -5530,6 +5414,19 @@ dependencies = [
  "impl-rlp",
  "impl-serde",
  "uint 0.10.0",
+]
+
+[[package]]
+name = "primitives"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
+dependencies = [
+ "libc",
+ "parallel",
+ "serde",
+ "tracing-forest",
+ "tracing-subscriber",
+ "zk_alloc",
 ]
 
 [[package]]
@@ -5971,19 +5868,18 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "backend",
- "include_dir",
+ "bincode",
+ "flock",
  "lean_compiler",
- "lean_prover",
  "lean_vm",
- "objc2",
- "objc2-foundation",
  "parallel",
- "postcard",
+ "pcs",
+ "primitives",
+ "rand 0.9.4",
  "serde",
- "sub_protocols",
+ "sphincs",
  "tracing",
  "xmss",
 ]
@@ -6851,6 +6747,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sphincs"
+version = "0.1.0"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
+dependencies = [
+ "parallel",
+ "primitives",
+ "rand 0.9.4",
+ "serde",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6915,46 +6822,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sub_protocols"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "backend",
- "lean_vm",
- "tracing",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "sumcheck"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "air",
- "fiat-shamir",
- "field",
- "koala-bear",
- "parallel",
- "poly",
- "tracing",
- "zk-alloc",
-]
-
-[[package]]
-name = "symetric"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "field",
- "koala-bear",
- "parallel",
- "zk-alloc",
-]
 
 [[package]]
 name = "syn"
@@ -7041,14 +6912,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
- "libc",
-]
-
-[[package]]
-name = "system-info"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
  "libc",
 ]
 
@@ -7577,17 +7440,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
-name = "utils"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "parallel",
- "serde",
- "tracing-forest",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "uuid"
 version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7844,25 +7696,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "whir"
-version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
-dependencies = [
- "fiat-shamir",
- "field",
- "koala-bear",
- "parallel",
- "poly",
- "rand 0.10.1",
- "sumcheck",
- "symetric",
- "system-info",
- "tracing",
- "utils",
- "zk-alloc",
 ]
 
 [[package]]
@@ -8407,12 +8240,12 @@ dependencies = [
 [[package]]
 name = "xmss"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
- "backend",
  "ethereum_ssz",
- "postcard",
- "rand 0.10.1",
+ "parallel",
+ "primitives",
+ "rand 0.9.4",
  "serde",
 ]
 
@@ -8574,13 +8407,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "zk-alloc"
+name = "zk_alloc"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=a5909d18647de6aed38640c098d9177fab2bf36a#a5909d18647de6aed38640c098d9177fab2bf36a"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=5a4f55c1138759f43f78483a7b70fde973e4a1ee#5a4f55c1138759f43f78483a7b70fde973e4a1ee"
 dependencies = [
  "libc",
- "parallel",
- "system-info",
 ]
 
 [[package]]

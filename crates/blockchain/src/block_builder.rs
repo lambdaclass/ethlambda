@@ -1101,7 +1101,7 @@ mod tests {
         );
 
         // Substitute a worst-case-size proof to model what `propose_block`
-        // would attach. The actual SNARK can't be built without lean-multisig,
+        // would attach. The actual SNARK can't be built without leanVM,
         // but the size cap (`ByteList512KiB`) bounds the worst case.
         let _ = signatures;
         let proof = MultiMessageAggregate::new(

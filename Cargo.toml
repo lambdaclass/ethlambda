@@ -81,15 +81,12 @@ prometheus = "0.14"
 
 clap = { version = "4.3", features = ["derive", "env"] }
 
-# XMSS signatures + recursive aggregation (leanVM).
-# leanVM's `main` internalized XMSS (dropping the external leanSig dependency)
-# and reworked the aggregation API (see "Xmss api rework").
-# Pinned to a `main` commit for reproducible builds; bump the revs to track main.
-xmss = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "a5909d18647de6aed38640c098d9177fab2bf36a" }
-
-# SSZ codec used by leanVM's xmss pubkey/signature types (ethereum_ssz, not libssz).
-ssz = { package = "ethereum_ssz", version = "0.10" }
+# XMSS signatures + recursive aggregation, through leanVM's own facade crate:
+# it re-exports the aggregation API, the `xmss` module (keys, signing, and the
+# SSZ codec for the two wire types) and the `rand` that signing draws from, so
+# the whole crypto stack arrives as one dependency at one revision.
+# Pinned to a `main` commit for reproducible builds; bump the rev to track main.
+leanvm = { git = "https://github.com/leanEthereum/leanVM.git", rev = "5a4f55c1138759f43f78483a7b70fde973e4a1ee" }
 
 # Secret-key (de)serialization for the leanVM xmss key format.
 postcard = { version = "1.1.3", features = ["alloc"] }
