@@ -144,6 +144,43 @@ address otherwise.
 
 ## Known limitations
 
+### Static bootnodes bypass admission and are redialed indefinitely
+
+Everything under [Which peers get dialed](#which-peers-get-dialed) applies to
+*discovered* peers. A static bootnode reaches the swarm by a different path:
+`parse_enr` reads `ip`, `secp256k1` and the three port entries and never looks at
+`eth2`, so a `--bootnodes` list is dialed as given. Now that a `tcp`-only record
+is dialable, a beacon-chain ENR is a valid static target, and the noise+yamux
+handshake to a lighthouse node succeeds: the peer occupies a
+`--discovery.target-peers` slot, contributes no attestation subnets, and is
+eventually dropped by the remote for sharing no protocols. Each drop re-arms the
+redial timer, which runs at a flat interval with no backoff and no cap for the
+life of the process.
+
+Accepted rather than fixed. Bootnodes are operator-supplied, so a list naming
+another network's infrastructure is a configuration mistake, and the unbounded
+redial is what keeps a devnet's own bootnode reachable across its restarts.
+Splitting the flag into initial peers, dialed once, and bootnodes, seeded into
+discv5, is the real fix and is left to a follow-up.
+
+### An upgrade's new ENR entries are invisible to peers that stayed up
+
+The record is signed at ethrex's `INITIAL_ENR_SEQ`, a constant. A peer
+identifies a record by (node id, seq) and accepts a replacement only at a
+strictly higher seq, and ethrex's WHOAREYOU responder does not even send the
+record when the requester's `enr_seq` already matches. So when an ethlambda
+release changes which entries it publishes, as adding `tcp` did, a peer holding
+the previous record under the same seq keeps it: the new entries reach only
+peers that meet this node for the first time.
+
+A fixed local floor above `INITIAL_ENR_SEQ` does not close this. ethrex re-signs
+the record at `seq + 1` whenever discv5's IP voting moves the advertised
+address, so a node behind NAT may already be serving a seq above any constant
+the code could pick, which is exactly the case the floor was meant to cover.
+Closing it needs a seq that grows without bound across restarts: a persisted
+counter bumped on every content change, or one derived from the wall clock at
+startup, which is what several beacon clients do.
+
 ### One lean devnet is not separated from another
 
 The spec's `fork_digest` is derived from genesis, so it separates one chain from
