@@ -30,7 +30,7 @@ crates/
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
-    ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
@@ -262,9 +262,37 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
+- Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
+  (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
+  constants in `common/crypto/src/signature.rs`
 - Epoch-based to prevent reuse
-- Aggregation via leanVM (previously leanMultisig) for efficiency
+- Signing, verification, and aggregation all come from leanVM, which internalized
+  XMSS in its own `xmss` crate; there is no external leanSig dependency
+- BLAKE2s over binary fields, not Poseidon over KoalaBear: a leanVM `main` bump
+  across that rewrite invalidates every genesis key and every stored proof, even
+  when the wire sizes happen to match
+- `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
+  proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
+  which recycles the prover's large buffers across proofs instead of re-faulting
+  them, so its pages stay resident for the node's lifetime
+- `ethlambda keygen` generates genesis validator keys through the same
+  `ValidatorSecretKey` the node loads them with, so a key set cannot be built
+  against a different leanVM than the client reading it. Keys are only usable by
+  a client on the matching revision, and no file size changes when the scheme
+  does, so the manifest records `leanvm_rev`. See [`docs/keygen.md`](docs/keygen.md)
+
+**Aggregation shape (one leanVM `AggregateSignature`, grouped by epoch):**
+- Type-1 and Type-2 are the same object: one `XmssGroup` per slot, carrying the
+  one message signed at it and that group's sorted, deduplicated keys
+- **A slot carries one message.** Two distinct `AttestationData` at one slot
+  cannot share an aggregate; `ethlambda_crypto::ConflictingMessages` says so, and
+  nothing below it can work around the constraint
+- **The binding is off the wire.** `to_bytes_without_pubkeys()` carries neither
+  the keys nor the `(slot, message)` pairs, so every decode rebuilds the whole
+  signer set from a `SignerSet` per claim. A wrong set, message or slot decodes
+  fine and fails inside the SNARK verifier, so there is no cheap binding check
+- Narrowing replaces splitting: re-aggregate the parent with a `declare` naming
+  the group to keep (`split_type_2_by_message`)
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM
@@ -309,7 +337,7 @@ one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.m
 GENESIS_TIME: 1770407233
 MILLISECONDS_PER_SLOT: 4000  # optional, defaults to DEFAULT_MILLISECONDS_PER_SLOT
 GENESIS_VALIDATORS:
-  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # XMSS pubkeys, hex, PUBLIC_KEY_SIZE bytes
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
@@ -400,7 +428,9 @@ behavior.
 ## External Dependencies
 
 **Critical:**
-- `leansig`: XMSS signatures (leanEthereum project)
+- `leanvm`: XMSS signatures and recursive aggregation, taken from leanVM's facade
+  crate (which re-exports `xmss`, `rec_aggregation` and its `rand`) and pinned to
+  one `main` revision (leanEthereum project)
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model

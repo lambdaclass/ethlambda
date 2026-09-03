@@ -6,7 +6,7 @@ use ethlambda_types::{
     attestation::{AttestationData, XmssSignature},
     primitives::{H256, HashTreeRoot as _},
 };
-use tracing::{info, warn};
+use tracing::{trace, warn};
 
 use crate::metrics;
 
@@ -23,9 +23,8 @@ pub enum KeyManagerError {
 
 /// A validator's dual XMSS key pair for attestation and block proposal signing.
 ///
-/// Each key is independent and advances its OTS preparation separately,
-/// allowing the validator to sign both an attestation and a block proposal
-/// within the same slot.
+/// Each key holds its own one-time leaves, so the validator can sign both an
+/// attestation and a block proposal within the same slot.
 pub struct ValidatorKeyPair {
     pub attestation_key: ValidatorSecretKey,
     pub proposal_key: ValidatorSecretKey,
@@ -49,14 +48,19 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Advances every validator's XMSS preparation windows to cover slot
-    pub fn advance_keys_to(&mut self, slot: u32) {
-        for (validator_id, key_pair) in self.keys.iter_mut() {
-            let _ = advance_key(*validator_id, &mut key_pair.attestation_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to advance attestation key preparation window"),
+    /// Warms every validator's signing cache for `slot`.
+    ///
+    /// Pure latency shifting: the key rebuilds the same bottom Merkle subtree
+    /// inside `sign` on a miss, so this only moves that cost off the duty's
+    /// critical path. Called one slot ahead, so a miss here is not yet a
+    /// failure to sign.
+    pub fn prepare_keys_for(&self, slot: u32) {
+        for (validator_id, key_pair) in &self.keys {
+            let _ = prepare_key(&key_pair.attestation_key, slot).inspect_err(
+                |err| warn!(validator_id, slot, %err, "Failed to warm attestation key signing cache"),
             );
-            let _ = advance_key(*validator_id, &mut key_pair.proposal_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to advance proposal key preparation window"),
+            let _ = prepare_key(&key_pair.proposal_key, slot).inspect_err(
+                |err| warn!(validator_id, slot, %err, "Failed to warm proposal key signing cache"),
             );
         }
     }
@@ -93,10 +97,10 @@ impl KeyManager {
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
-        // Advance XMSS key preparation window if the slot is outside the current window.
-        // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
-        // Multiple advances may be needed if the node was offline for an extended period.
-        advance_key(validator_id, &mut key_pair.attestation_key, slot)?;
+        // A slot outside the key's range can never be signed, however long the
+        // node waits, so name that rather than letting it surface as a generic
+        // signing error.
+        signable_at(validator_id, &key_pair.attestation_key, slot)?;
 
         let signature: ValidatorSignature = {
             let _timing = metrics::time_pq_sig_attestation_signing();
@@ -123,10 +127,7 @@ impl KeyManager {
             .get_mut(&validator_id)
             .ok_or(KeyManagerError::ValidatorKeyNotFound(validator_id))?;
 
-        // Advance XMSS key preparation window if the slot is outside the current window.
-        // Each bottom tree covers 65,536 slots; the window holds 2 at a time.
-        // Multiple advances may be needed if the node was offline for an extended period.
-        advance_key(validator_id, &mut key_pair.proposal_key, slot)?;
+        signable_at(validator_id, &key_pair.proposal_key, slot)?;
 
         let signature: ValidatorSignature = key_pair
             .proposal_key
@@ -139,32 +140,33 @@ impl KeyManager {
     }
 }
 
-fn advance_key(
+/// Reject a slot the key cannot sign at.
+///
+/// The signable range is fixed at key generation, so this is exhaustion, not a
+/// window that will catch up.
+fn signable_at(
     validator_id: u64,
-    key: &mut ValidatorSecretKey,
+    key: &ValidatorSecretKey,
     slot: u32,
 ) -> Result<(), KeyManagerError> {
-    if key.is_prepared_for(slot) {
+    if key.can_sign_at(slot) {
         return Ok(());
     }
-    info!(validator_id, slot, "Advancing XMSS key preparation window");
+    let range = key.signable_slots();
+    Err(KeyManagerError::SigningError(format!(
+        "XMSS key exhausted for validator {validator_id}: slot {slot} is outside \
+         the key's signable range [{}, {}]",
+        range.start(),
+        range.end()
+    )))
+}
+
+/// Warm one key's signing cache, timing the miss that rebuilds a subtree.
+fn prepare_key(key: &ValidatorSecretKey, slot: u32) -> Result<(), KeyManagerError> {
     let start = Instant::now();
-    while !key.is_prepared_for(slot) {
-        let before = key.get_prepared_interval();
-        key.advance_preparation();
-        if key.get_prepared_interval() == before {
-            return Err(KeyManagerError::SigningError(format!(
-                "XMSS key exhausted for validator {validator_id}: \
-                 slot {slot} is beyond the key's activation interval"
-            )));
-        }
-    }
-    info!(
-        validator_id,
-        slot,
-        elapsed = ?start.elapsed(),
-        "Advanced XMSS key preparation window"
-    );
+    key.prepare(slot)
+        .map_err(|err| KeyManagerError::SigningError(err.to_string()))?;
+    trace!(slot, elapsed = ?start.elapsed(), "Warmed XMSS signing cache");
     Ok(())
 }
 

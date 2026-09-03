@@ -56,6 +56,8 @@ libc.workspace = true
 # tests would otherwise wait out the real retry backoff. Dev-only, so the
 # feature never reaches the shipped binary.
 tokio = { workspace = true, features = ["test-util"] }
+# Keygen writes a directory of key files, so its tests need a throwaway one.
+tempfile = "3"
 
 [build-dependencies]
 vergen-git2.workspace = true

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ethlambda_crypto::SignerSet;
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_state_transition::{is_proposer, slot_is_justifiable_after};
 use ethlambda_storage::{ForkCheckpoints, Store};
@@ -1114,11 +1115,13 @@ pub enum StoreError {
 
 /// Full verification of a signed block's merged multi-message aggregate proof.
 ///
-/// Structural pre-checks (fast fail) ensure the merged proof's `info` list lines
-/// up with the block body (one entry per attestation plus a trailing proposer
-/// entry; messages, slots, and participants match what the body declares).
-/// On success, the lean-multisig devnet5 `verify_type_2` primitive runs the
-/// SNARK verifier over the merged proof bytes against the resolved pubkey set.
+/// Structural pre-checks (fast fail) bound the body itself: attestation count,
+/// no duplicate `AttestationData`, and every participant and the proposer in
+/// range of the validator registry. The claims the proof must carry are then
+/// rederived from the body, one `(message, slot, pubkeys)` per attestation plus
+/// a trailing proposer entry, and handed to leanVM's verifier. None of them is
+/// on the wire, so a proof over other messages, slots or keys fails inside the
+/// SNARK rather than at a compare ahead of it.
 ///
 /// Exposed publicly so RPC handlers (notably the Hive test-driver
 /// `verify_signatures/run` endpoint) can run the exact same verification path
@@ -1160,14 +1163,13 @@ pub fn verify_block_signatures(
     let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
 
-    // Resolve pubkeys per multi-message aggregate component for verify_type_2 and rederive the
-    // expected (message, slot) bindings from the block body. Attestation
-    // components use each participant's attestation_pubkey; the trailing
-    // proposer component uses the proposal_pubkey of `block.proposer_index`.
+    // Rederive the claims the merged proof must carry from the block body: one
+    // `(message, slot, pubkeys)` per attestation, then the proposer's. Nothing
+    // of this is on the wire, so it is the caller's view that binds the proof;
+    // attestation claims use each participant's attestation_pubkey, the
+    // trailing proposer claim the proposal_pubkey of `block.proposer_index`.
     let expected_components = attestations.len() + 1;
-    let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(expected_components);
-    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(expected_components);
+    let mut components: Vec<SignerSet> = Vec::with_capacity(expected_components);
 
     for attestation in attestations.iter() {
         let mut pubkeys = Vec::new();
@@ -1181,10 +1183,13 @@ pub fn verify_block_signatures(
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pk);
         }
-        pubkeys_per_component.push(pubkeys);
         let slot_u32 = u32::try_from(attestation.data.slot)
             .map_err(|_| StoreError::SlotOutOfRange(attestation.data.slot))?;
-        expected_bindings.push((attestation.data.hash_tree_root(), slot_u32));
+        components.push(SignerSet::new(
+            attestation.data.hash_tree_root(),
+            slot_u32,
+            pubkeys,
+        ));
     }
 
     let proposer_out_of_range = StoreError::ProposerIndexOutOfRange {
@@ -1196,20 +1201,19 @@ pub fn verify_block_signatures(
         .ok_or(proposer_out_of_range)?;
     let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
         .map_err(|_| StoreError::PubkeyDecodingFailed(block.proposer_index))?;
-    pubkeys_per_component.push(vec![proposer_pubkey]);
     let block_slot_u32 =
         u32::try_from(block.slot).map_err(|_| StoreError::SlotOutOfRange(block.slot))?;
-    expected_bindings.push((block_root, block_slot_u32));
+    components.push(SignerSet::new(
+        block_root,
+        block_slot_u32,
+        vec![proposer_pubkey],
+    ));
 
     let merged_bytes = signed_block.proof.proof_bytes();
 
     let crypto_start = std::time::Instant::now();
-    ethlambda_crypto::verify_type_2_signature(
-        merged_bytes,
-        pubkeys_per_component,
-        &expected_bindings,
-    )
-    .map_err(StoreError::BlockProofVerificationFailed)?;
+    ethlambda_crypto::verify_type_2_signature(merged_bytes, &components)
+        .map_err(StoreError::BlockProofVerificationFailed)?;
     let crypto_elapsed = crypto_start.elapsed();
 
     let total_elapsed = total_start.elapsed();
@@ -1291,9 +1295,9 @@ mod tests {
 
     /// Test helper: placeholder block proof bytes.
     ///
-    /// In production the merged proof is the raw `compress_without_pubkeys()`
-    /// output of `merge_many_type_1`, which can only be built by the
-    /// lean-multisig prover. Tests that don't go through
+    /// In production the merged proof is the raw `to_bytes_without_pubkeys()`
+    /// output of a recursive aggregation over every Type-1, which can only be
+    /// built by the leanVM prover. Tests that don't go through
     /// `verify_block_signatures` use an empty blob.
     fn make_signed_block_proof(
         _proposer_index: u64,
@@ -1869,8 +1873,8 @@ mod tests {
     fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
         (0..count)
             .map(|index| ethlambda_types::state::Validator {
-                attestation_pubkey: [0u8; 52],
-                proposal_pubkey: [0u8; 52],
+                attestation_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                proposal_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
                 index,
             })
             .collect()

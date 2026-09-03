@@ -987,8 +987,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1101,7 +1101,7 @@ mod tests {
         );
 
         // Substitute a worst-case-size proof to model what `propose_block`
-        // would attach. The actual SNARK can't be built without lean-multisig,
+        // would attach. The actual SNARK can't be built without leanVM,
         // but the size cap (`ByteList512KiB`) bounds the worst case.
         let _ = signatures;
         let proof = MultiMessageAggregate::new(
@@ -1147,8 +1147,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1276,8 +1276,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1580,8 +1580,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1707,8 +1707,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();

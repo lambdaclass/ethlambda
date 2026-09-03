@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
+use ethlambda_crypto::SignerSet;
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
@@ -174,15 +175,15 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Catch XMSS keys up to the current slot before the first tick
+        // Warm the XMSS signing caches for the current slot before the first tick.
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap we need to catch up through
+        // exactly the gap the first duty will be at
         let now_ms = unix_now_ms();
         let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
             / time_config.milliseconds_per_slot) as u32;
-        key_manager.advance_keys_to(current_slot);
+        key_manager.prepare_keys_for(current_slot);
 
         let handle = BlockChainServer {
             store,
@@ -475,8 +476,8 @@ impl BlockChainServer {
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
 
-        // Advance XMSS keys for next slot so the signing paths don't have to
-        self.key_manager.advance_keys_to((slot + 1) as u32);
+        // Warm the XMSS signing caches for the next slot so the signing paths don't have to
+        self.key_manager.prepare_keys_for((slot + 1) as u32);
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -836,10 +837,33 @@ impl BlockChainServer {
             return;
         };
 
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
+        // Each merge input pairs the proof bytes with the claim its Type-1
+        // binds: the message, the slot, and the participants' keys.
+        // `single_message_aggregates` is ordered to match
+        // `block.body.attestations`, which is how the claim is recovered for
+        // each proof. Checked rather than assumed: zipping two
+        // lists of different lengths would build a proof covering fewer claims
+        // than the body declares, which only surfaces at import.
+        if single_message_aggregates.len() != block.body.attestations.len() {
+            error!(
+                %slot, %validator_id,
+                aggregates = single_message_aggregates.len(),
+                attestations = block.body.attestations.len(),
+                "Proof list does not line up with the block body"
+            );
+            metrics::inc_block_building_failures();
+            return;
+        }
+
+        let mut merge_inputs: Vec<(SignerSet, ByteList512KiB)> =
             Vec::with_capacity(single_message_aggregates.len() + 1);
         let mut resolve_failed = false;
-        for sma in &single_message_aggregates {
+        for (attestation, sma) in block
+            .body
+            .attestations
+            .iter()
+            .zip(&single_message_aggregates)
+        {
             let mut pubkeys = Vec::new();
             for vid in sma.participant_indices() {
                 let Some(validator) = validators.get(vid as usize) else {
@@ -859,18 +883,27 @@ impl BlockChainServer {
             if resolve_failed {
                 break;
             }
-            merge_inputs.push((pubkeys, sma.proof.clone()));
+            let Ok(attestation_slot) = u32::try_from(attestation.data.slot) else {
+                error!(%slot, %validator_id, attestation_slot = attestation.data.slot,
+                    "Attestation slot out of range while assembling block");
+                resolve_failed = true;
+                break;
+            };
+            let claim =
+                SignerSet::new(attestation.data.hash_tree_root(), attestation_slot, pubkeys);
+            merge_inputs.push((claim, sma.proof.clone()));
         }
         if resolve_failed {
             metrics::inc_block_building_failures();
             return;
         }
-        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+        let proposer_claim = SignerSet::new(block_root, slot as u32, vec![proposer_pubkey]);
+        merge_inputs.push((proposer_claim, proposer_proof_bytes));
 
-        // Merge yields raw lean-multisig type-2 bytes. Per-component
-        // participants are rederived at verify time from
-        // `block.body.attestations[i].aggregation_bits` plus
-        // `block.proposer_index`, so nothing else needs persisting.
+        // Merge yields raw leanVM aggregate bytes. Per-component participants
+        // and bindings are rederived at verify time from
+        // `block.body.attestations[i]` plus `block.proposer_index`, so nothing
+        // else needs persisting.
         let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
             Ok(bytes) => bytes,
             Err(err) => {
