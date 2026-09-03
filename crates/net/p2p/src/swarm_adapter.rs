@@ -65,10 +65,24 @@ pub enum DialOutcome {
 }
 
 impl From<&libp2p::swarm::DialError> for DialOutcome {
+    /// Matched exhaustively on purpose. `DialError` is not `#[non_exhaustive]`
+    /// in the pinned fork, so a variant added on a fork upgrade breaks the build
+    /// here and forces a decision, rather than being absorbed by a wildcard as
+    /// `Unreachable` — the classification that leaks bookkeeping if it is wrong.
     fn from(err: &libp2p::swarm::DialError) -> Self {
+        use libp2p::swarm::DialError;
         match err {
-            libp2p::swarm::DialError::DialPeerConditionFalse(_) => Self::AlreadyInProgress,
-            _ => Self::Unreachable,
+            DialError::DialPeerConditionFalse(_) => Self::AlreadyInProgress,
+            // The other three refusals `Swarm::dial` returns synchronously.
+            DialError::LocalPeerId { .. } | DialError::NoAddresses | DialError::Denied { .. } => {
+                Self::Unreachable
+            }
+            // Reached only through a terminal `OutgoingConnectionError`, never
+            // from `Swarm::dial` itself, so no caller reads this answer; the
+            // conservative one is still the right default.
+            DialError::Aborted | DialError::WrongPeerId { .. } | DialError::Transport(_) => {
+                Self::Unreachable
+            }
         }
     }
 }
