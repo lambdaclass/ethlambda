@@ -19,7 +19,7 @@ crates/
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
     ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
-    ├─ src/aggregation.rs   # Interval-2 signature aggregation worker
+    ├─ src/aggregation.rs   # Always-on signature aggregation worker (own thread + Store clone)
     ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
     ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
     ├─ src/key_manager.rs   # Validator key management and signing
@@ -56,7 +56,7 @@ crates/
 ```
 Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
-Interval 2: Aggregation (aggregators create proofs from gossip signatures)
+Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor only buffers each finished aggregate until this tick.
 Interval 3: Safe target update (fork choice)
 Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
@@ -71,6 +71,27 @@ Fork choice head update
 ```
 (Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
 `extract_latest_new_attestations`/`extract_latest_known_attestations`.)
+
+### Always-On Aggregation Worker (`aggregation.rs`)
+- One plain `std::thread` spawned in the actor's `#[started]` hook, joined in `#[stopped]`.
+  Not `spawn_blocking`: it lives for the process and awaits nothing, so a blocking-pool
+  thread would be parked permanently for nothing
+- Holds its own `Store` clone (same backend, same in-memory buffers), so it re-reads the
+  pool itself rather than being handed a per-slot snapshot: `select_best_job` → prove →
+  `AggregateProduced` message → repeat. Nothing eligible means a `WORKER_IDLE_POLL` sleep
+- The actor **applies** each aggregate on arrival (the pool the worker re-reads must
+  account for it, or the same group gets proved twice) but **buffers** the gossip
+  publication in `pending_aggregates` until interval 2
+- `JobPolicy` gates what the worker may take, by wall-clock position in the slot: backlog
+  work early, a current-slot group once it holds `min_current_slot_group_sigs`, and inside
+  `EARLY_AGGREGATION_WINDOW` before interval 2 nothing but that group (a backlog job is a
+  recursive merge that would occupy the single prover across the boundary)
+- The actor raises a pause flag (`AggregationWorker::pause`, RAII guard) around its own
+  `propose_block`, since both compete for the same single-threaded leanVM prover. A proof
+  already in flight is not interrupted — `aggregate_mixed` cannot be
+- `EmittedCoverage` remembers per-slot what the worker emitted, closing the window between
+  `send` and the actor's apply. Recorded on *attempt*, so a failed proof is not retried at
+  full prover cost
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -350,7 +371,7 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
-- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregation worker picks it up on its next selection round → publish at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
 ### Runtime Aggregator Toggle (Hot-Standby Model)
