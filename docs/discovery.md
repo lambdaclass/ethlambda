@@ -31,9 +31,11 @@ The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the
 published ENR inherits that same `0.0.0.0`, which is not a dialable address:
 set the flag to `127.0.0.1` for a local devnet or to the host's public address
-so the ENR is usable as soon as it is published. discv5's PONG-based IP voting
-may still replace the advertised address later, once a peer's response tells
-the node what its external address looks like.
+so the ENR is usable as soon as it is published. Left unset, discv5's PONG-based
+IP voting replaces the advertised address once peers' responses agree on what
+the node's external address looks like. Set, the flag wins and voting cannot
+overwrite it: naming an address is the operator saying they know better than the
+vote.
 
 ## The ENR
 
@@ -70,20 +72,28 @@ A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
 upcoming fork but compatible now.
 
-These checks are handed to ethrex's peer table as a `PeerFilter`, so each record
-is judged the moment it arrives and a peer that fails is not offered for dialing.
-No rejection is final: the peer table runs the filter again as soon as the peer
-publishes a higher-`seq` ENR, so a node that adds a `quic` entry, or gains an
-address through discv5's IP voting, is reconsidered without a restart.
+These checks are handed to ethrex's discovery server as a `PeerFilter`, so each
+record is judged the moment it arrives and a peer that fails is not offered for
+dialing. No rejection is final: discovery runs the filter again as soon as the
+peer publishes a higher-`seq` ENR, so a node that adds a `quic` entry, or gains
+an address through discv5's IP voting, is reconsidered without a restart.
+
+Judging is also the only moment ethlambda holds a peer's ENR, so the filter files
+what it admits as it goes. Discovery hands back an `enode`-shaped `Node`, which
+knows an address and a public key and nothing about `quic` or `attnets`; the dial
+loop looks the node id back up in what the filter filed to recover the multiaddr
+and the subnets. A node discovery offers that we never read an admissible record
+for is skipped, which is what happens to a bootnode still known only as a bare
+endpoint.
 
 Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
-Dialing stops once `--discovery.target-peers` peers are connected, and resumes
-if that count drops. That is all the flag does: it is the dial loop's cutoff, and
-nothing in ethrex's peer table or discv5's own pacing enforces it (see
-[below](#discv5-lookups-run-at-the-startup-rate)).
+Dialing stops once `--discovery.target-peers` peers are connected, and resumes if
+that count drops. The same number also paces discovery itself: every connection
+the swarm opens or closes is reported to it, so it knows how close to the target
+we are and eases its lookups off the startup rate accordingly.
 
 ## Bootnodes
 
@@ -122,21 +132,11 @@ another**: two devnets running this code will peer with each other. Closing that
 gap requires lean adopting a genesis-derived fork digest, which is a
 cross-client change to gossip topic names.
 
-### discv5 lookups run at the startup rate
+### Only peers dialed from discovery contribute to subnet ranking
 
-ethrex paces its discv5 iterative lookups by how full its own peer table is,
-easing from one lookup every 500ms at startup to one every 10s once the table
-reaches its target. That table only counts peers registered through
-`NewConnectedPeer`, which carries an RLPx connection; ethlambda connects over
-libp2p and registers nothing, so the count is permanently zero and the pacing
-never eases off the startup rate. A lean node therefore keeps looking up every
-500ms rather than settling at 10s, roughly 20x the intended steady-state
-`FindNode` traffic, for the life of the process.
-
-`--discovery.target-peers` deliberately does *not* feed that computation, since a
-target of `0` would make it divide by zero and re-fire the lookup timer with no
-delay at all. Closing the gap properly means ethrex learning about non-RLPx
-connections, which is an upstream change.
+An inbound peer never tells us its `attnets`, so a subnet it covers is not
+credited when the dial loop ranks candidates. Treating an unknown peer as
+covering nothing makes the ranking more eager than it needs to be, never wrong.
 
 ### `attnets` is not a fixed-width SSZ `Bitvector`
 

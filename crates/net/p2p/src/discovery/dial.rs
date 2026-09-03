@@ -1,27 +1,31 @@
 //! The dial loop: turn what discv5 found into libp2p QUIC connections.
 //!
-//! Runs as a `P2PServer` tick every [`DISCOVERY_DIAL_INTERVAL`], drawing
-//! candidates from the ethrex peer table, ranking them by subnet coverage, and
-//! dialing one per tick until [`DiscoveryState::target_peers`] are connected.
+//! Runs as a `P2PServer` tick every [`DISCOVERY_DIAL_INTERVAL`], asking
+//! discovery for candidates, ranking them by subnet coverage, and dialing one
+//! per tick until [`DiscoveryState::target_peers`] are connected.
+//!
+//! Also the other direction: [`report_peer_connected`] and
+//! [`report_peer_disconnected`] tell discovery what the swarm did, which is the
+//! only way a libp2p connection becomes visible to it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use ethrex_p2p::peer_table::{PeerTable, PeerTableServerProtocol as _};
+use ethrex_p2p::discovery::{DiscoveryHandle, PeerEvent};
 use libp2p::PeerId;
 use tracing::info;
 
-use super::admission::{DiscoveredPeer, LeanFilter, rank_by_uncovered_subnets};
-use super::{DISCOVERY_CANDIDATE_BATCH, DiscoveryHandle};
+use super::admission::{DialTargets, DiscoveredPeer, rank_by_uncovered_subnets};
+use super::node_id::node_id_from_peer_id;
+use super::{DISCOVERY_CANDIDATE_BATCH, SpawnedDiscovery};
 use crate::{P2PServer, metrics};
 
 /// Everything the dial loop needs from a running discovery server.
 pub(crate) struct DiscoveryState {
-    peer_table: PeerTable,
-    /// The same policy the peer table judges records with, asked here for the
-    /// dial target behind an already-admitted record.
-    filter: LeanFilter,
-    /// Admitted candidates, best first, drained one per tick. Refilled from the
-    /// peer table when empty.
+    handle: DiscoveryHandle,
+    /// How to dial the peers the filter admitted, filed as their ENRs arrived.
+    dial_targets: DialTargets,
+    /// Admitted candidates, best first, drained one per tick. Refilled from
+    /// discovery when empty.
     candidates: VecDeque<DiscoveredPeer>,
     /// Subnets advertised by peers we dialed from discovery.
     peer_attnets: HashMap<PeerId, Vec<u64>>,
@@ -32,16 +36,46 @@ pub(crate) struct DiscoveryState {
 }
 
 impl DiscoveryState {
-    pub(crate) fn new(handle: DiscoveryHandle, local_peer_id: PeerId) -> Self {
+    pub(crate) fn new(spawned: SpawnedDiscovery, local_peer_id: PeerId) -> Self {
         Self {
-            peer_table: handle.peer_table,
-            filter: handle.filter,
+            handle: spawned.handle,
+            dial_targets: spawned.dial_targets,
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
             local_peer_id,
-            target_peers: handle.target_peers,
+            target_peers: spawned.target_peers,
         }
     }
+}
+
+/// Tell discovery we are connected to `peer_id`.
+///
+/// Two things follow upstream: the peer stops being offered as a dial
+/// candidate, and it counts towards the completion figure that paces discv5
+/// lookups, which eases off the startup rate as we approach `target_peers`.
+/// Without this a libp2p node looks permanently peerless to discovery and keeps
+/// looking at the startup rate for the life of the process.
+///
+/// A no-op when discovery is off, or for a peer whose id carries no secp256k1
+/// key to name it by; see [`node_id_from_peer_id`].
+pub(crate) fn report_peer_connected(server: &P2PServer, peer_id: &PeerId) {
+    report(server, peer_id, PeerEvent::Connected);
+}
+
+/// Tell discovery our connection to `peer_id` is gone, so it is dialable again
+/// and no longer counted.
+pub(crate) fn report_peer_disconnected(server: &P2PServer, peer_id: &PeerId) {
+    report(server, peer_id, PeerEvent::Disconnected);
+}
+
+fn report(server: &P2PServer, peer_id: &PeerId, event: PeerEvent) {
+    let Some(discovery) = server.discovery.as_ref() else {
+        return;
+    };
+    let Some(node_id) = node_id_from_peer_id(peer_id) else {
+        return;
+    };
+    discovery.handle.record_peer_event(node_id, event);
 }
 
 /// Drop a peer's discovery bookkeeping.
@@ -60,8 +94,8 @@ pub(crate) fn forget_discovered_peer(server: &mut P2PServer, peer_id: &PeerId) {
 pub(crate) async fn dial_tick(server: &mut P2PServer) {
     // Snapshot what the refill needs before any `.await`, so no borrow of
     // `server.discovery` has to live across the async boundary. Both are handle
-    // clones: an actor ref and two `Copy` fields, taken only when a refill is
-    // actually due rather than on every tick that just drains the queue.
+    // clones: an actor ref and an `Arc`, taken only when a refill is actually
+    // due rather than on every tick that just drains the queue.
     let Some(discovery) = server.discovery.as_ref() else {
         return;
     };
@@ -71,9 +105,9 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
     let refill = discovery
         .candidates
         .is_empty()
-        .then(|| (discovery.peer_table.clone(), discovery.filter.clone()));
+        .then(|| (discovery.handle.clone(), discovery.dial_targets.clone()));
     let mut admitted = match refill {
-        Some((peer_table, filter)) => draw_candidates(&peer_table, &filter).await,
+        Some((handle, dial_targets)) => draw_candidates(&handle, &dial_targets).await,
         None => Vec::new(),
     };
 
@@ -120,27 +154,31 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
     }
 }
 
-/// Draw up to [`DISCOVERY_CANDIDATE_BATCH`] dialable peers from the peer table.
+/// Draw up to [`DISCOVERY_CANDIDATE_BATCH`] dialable peers from discovery.
 ///
-/// ethrex serves one contact per call, skipping anything its `PeerFilter` (ours:
-/// [`LeanFilter`]) already rejected, and records each as tried before returning
-/// it. So successive calls never repeat, an early `None` means the pool is
-/// exhausted, and everything that arrives here has already passed admission.
-async fn draw_candidates(peer_table: &PeerTable, filter: &LeanFilter) -> Vec<DiscoveredPeer> {
+/// ethrex serves one node per call, skipping anything it has written off, is
+/// already connected to, or whose ENR our [`LeanFilter`](super::admission::LeanFilter)
+/// turned down, and records each as tried before returning it. So successive
+/// calls never repeat, an early `None` means the pool is exhausted, and
+/// everything that arrives here has already passed admission.
+///
+/// What arrives is a `Node`, which knows an address and a key and nothing about
+/// `quic` or `attnets`, so the dial target is looked back up in [`DialTargets`]
+/// under the node's id. A miss is ordinary: bootnodes are dialable to ethrex
+/// before they have published an ENR, and one we never read a record for is one
+/// we cannot build a libp2p multiaddr for. Skipping costs nothing, since the
+/// node was marked tried on the way out either way and that set is cleared once
+/// a full scan finds nothing eligible.
+async fn draw_candidates(
+    handle: &DiscoveryHandle,
+    dial_targets: &DialTargets,
+) -> Vec<DiscoveredPeer> {
     let mut admitted = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
     for _ in 0..DISCOVERY_CANDIDATE_BATCH {
-        let Ok(Some(contact)) = peer_table.get_contact_to_initiate().await else {
+        let Some(node) = handle.next_dial_candidate().await else {
             break;
         };
-        // A contact whose ENR has not arrived is unjudged, so the peer table
-        // still offers it, but it carries no address or peer id to dial.
-        // Skipping it costs nothing: it was marked tried on the way out either
-        // way, and that set is cleared once a full scan finds nothing eligible.
-        let Some(peer) = contact
-            .record
-            .as_ref()
-            .and_then(|record| filter.dial_target(record))
-        else {
+        let Some(peer) = dial_targets.get(&node.node_id()) else {
             continue;
         };
         admitted.push(peer);
