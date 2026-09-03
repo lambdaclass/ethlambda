@@ -686,6 +686,7 @@ async fn handle_swarm_event(
             // answers "did the TCP fallback actually help", as a metric because
             // the trace field alone is invisible at default verbosity.
             let transport = transport_label(endpoint.get_remote_address());
+            metrics::inc_peer_connection_transport(direction, transport);
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
                 let peer_count = server.connected_peers.len();
