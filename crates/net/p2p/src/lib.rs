@@ -38,7 +38,7 @@ use crate::{
     discovery::{
         DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
         dial::{DiscoveryState, dial_tick, forget_discovered_peer},
-        enr::{read_ip, read_public_key, read_quic_port, read_tcp_port},
+        enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
     gossipsub::{
@@ -336,59 +336,22 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         })
         .build();
     let local_peer_id = *swarm.local_peer_id();
-    let mut bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-    let mut undialable_bootnodes = 0usize;
-    for bootnode in config.bootnodes {
-        let peer_id = PeerId::from_public_key(&bootnode.public_key);
-        if peer_id == local_peer_id {
-            continue;
-        }
-        let addrs = bootnode_dial_addrs(&bootnode, peer_id);
-        if addrs.is_empty() {
-            // Discovery-only seed: reachable over discv5, but with no QUIC or
-            // TCP port there is nothing for the swarm to dial.
-            undialable_bootnodes += 1;
-            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no dialable transport, discv5 seed only");
-            continue;
-        }
-        // One dial per peer id, not one per file entry. Two entries can name a
-        // single peer: the same ENR pasted twice, or an old and a new record
-        // for one secp256k1 key. `DialOpts::peer_id` dials under the default
-        // `DisconnectedAndNotDialing` condition, so the second attempt is
-        // refused while the first is still in flight, and `parse_enrs` does not
-        // dedup. Merging the address lists dials once with everything the
-        // duplicate entries offered between them.
-        match bootnode_addrs.entry(peer_id) {
-            Entry::Occupied(mut known) => {
-                debug!(
-                    %peer_id,
-                    ip = %bootnode.ip,
-                    "Bootnode list names this peer more than once, merging its addresses"
-                );
-                let merged = known.get_mut();
-                for addr in addrs {
-                    if !merged.contains(&addr) {
-                        merged.push(addr);
-                    }
-                }
-                continue;
-            }
-            Entry::Vacant(unknown) => {
-                unknown.insert(addrs.clone());
-            }
-        }
-        // A refused dial is not fatal: the entry stays in `bootnode_addrs`, so
-        // the redial path picks the peer up. Unwrapping here would abort a node
-        // over a bootnode file that is merely redundant.
-        swarm
-            .dial(DialOpts::peer_id(peer_id).addresses(addrs).build())
-            .unwrap_or_else(|err| {
-                warn!(%peer_id, %err, "Swarm refused the initial bootnode dial");
-            });
+    let (bootnode_addrs, undialable_bootnodes) =
+        merge_bootnode_dial_addrs(config.bootnodes, local_peer_id);
+    // The merged map is the dial input, so every address a duplicate entry
+    // contributed is in the one attempt this peer gets. A refused dial is not
+    // fatal: the entry stays in `bootnode_addrs`, so the redial path picks the
+    // peer up. Unwrapping here would abort a node over a bootnode file that is
+    // merely redundant.
+    for (peer_id, addrs) in &bootnode_addrs {
+        let opts = DialOpts::peer_id(*peer_id).addresses(addrs.clone()).build();
+        let _ = swarm
+            .dial(opts)
+            .inspect_err(|err| warn!(%peer_id, %err, "Swarm refused the initial bootnode dial"));
     }
-    // Every skip above is individually unremarkable and logged at `debug`, but a
-    // list that produces no dial target at all leaves the node isolated unless
-    // discovery is on, which is worth one line at `warn`.
+    // Every skip in the merge is individually unremarkable and logged at
+    // `debug`, but a list that produces no dial target at all leaves the node
+    // isolated unless discovery is on, which is worth one line at `warn`.
     if bootnode_addrs.is_empty() && undialable_bootnodes > 0 {
         warn!(
             undialable_bootnodes,
@@ -719,8 +682,9 @@ async fn handle_swarm_event(
             let direction = connection_direction(&endpoint);
             // Read off the connection's own address rather than which one we
             // dialed: with both QUIC and TCP offered, libp2p races every
-            // address in a dial and may connect over either. This is the
-            // field that answers "did the TCP fallback actually help".
+            // address in a dial and may connect over either. This is what
+            // answers "did the TCP fallback actually help", as a metric because
+            // the trace field alone is invisible at default verbosity.
             let transport = transport_label(endpoint.get_remote_address());
             if num_established.get() == 1 {
                 server.connected_peers.insert(peer_id);
@@ -994,7 +958,7 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
     // An explicit `udp: 0` is no more reachable than a `quic: 0`, which
     // `read_quic_port` already rejects. Reading it verbatim would seed discv5
     // with a contact on a port nothing listens on.
-    let udp_port = pairs.udp_port.filter(|port| *port != 0);
+    let udp_port = pairs.udp_port.and_then(dialable_port);
 
     // Same rule for `tcp`, the transport every published beacon-chain bootnode
     // advertises and none of them pairs with a `quic` entry.
@@ -1054,6 +1018,61 @@ pub(crate) fn dial_addrs(
         addrs.push(tcp_multiaddr(ip, port, peer_id));
     }
     addrs
+}
+
+/// Static dial targets, one entry per peer id, merged across duplicate bootnode
+/// entries. Also reports how many entries named no dialable transport at all.
+///
+/// Two entries can name one peer: the same ENR pasted twice, or an old and a new
+/// record for a single secp256k1 key. `parse_enrs` does not dedup, and
+/// `DialOpts::peer_id` dials under the default `DisconnectedAndNotDialing`
+/// condition, so a second dial to a peer already being dialed is refused
+/// outright.
+///
+/// Merging before dialing rather than while dialing is what puts every address
+/// into the one attempt the peer gets. Dialing per entry would take only the
+/// first entry's addresses: with a stale QUIC-only record listed ahead of a
+/// newer one carrying a live TCP port, startup would race a dead address alone,
+/// burn the full connect timeout, and reach the live one only on the redial.
+fn merge_bootnode_dial_addrs(
+    bootnodes: Vec<Bootnode>,
+    local_peer_id: PeerId,
+) -> (HashMap<PeerId, Vec<Multiaddr>>, usize) {
+    let mut merged: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    let mut undialable = 0usize;
+    for bootnode in bootnodes {
+        let peer_id = PeerId::from_public_key(&bootnode.public_key);
+        if peer_id == local_peer_id {
+            continue;
+        }
+        let addrs = bootnode_dial_addrs(&bootnode, peer_id);
+        if addrs.is_empty() {
+            // Discovery-only seed: reachable over discv5, but with no QUIC or
+            // TCP port there is nothing for the swarm to dial.
+            undialable += 1;
+            debug!(%peer_id, ip = %bootnode.ip, "Bootnode advertises no dialable transport, discv5 seed only");
+            continue;
+        }
+        match merged.entry(peer_id) {
+            Entry::Occupied(mut known) => {
+                debug!(
+                    %peer_id,
+                    ip = %bootnode.ip,
+                    "Bootnode list names this peer more than once, merging its addresses"
+                );
+                let known = known.get_mut();
+                for addr in addrs {
+                    if !known.contains(&addr) {
+                        known.push(addr);
+                    }
+                }
+            }
+            Entry::Vacant(unknown) => {
+                unknown.insert(addrs);
+            }
+        }
+    }
+    (merged, undialable)
 }
 
 /// Dial targets for a static bootnode. See [`dial_addrs`].
@@ -1220,6 +1239,11 @@ mod tests {
     /// dedup, so `build_swarm` has to, and it merges the address lists rather
     /// than dropping whichever entry came second.
     ///
+    /// Asserting the map is asserting the dial: `build_swarm` merges first and
+    /// then dials one `DialOpts` per map entry, so what is checked here is the
+    /// list the initial dial races. The pure merge itself is pinned separately
+    /// by [`merging_bootnodes_keeps_every_address_for_the_initial_dial`].
+    ///
     /// The QUIC-only condition (`From<Multiaddr>`) this replaced was `Always`,
     /// which is why the duplicate went unnoticed before.
     #[tokio::test]
@@ -1276,6 +1300,89 @@ mod tests {
             addrs.iter().cloned().collect::<HashSet<_>>(),
             expected,
             "the merged list must carry every address the duplicate entries offered"
+        );
+    }
+
+    /// The merge has to happen before the dial, not during it.
+    ///
+    /// The case that distinguishes them: a stale QUIC-only record listed ahead
+    /// of a newer one for the same key that has since added a live TCP port,
+    /// with the QUIC port dead. Merging while dialing takes only the first
+    /// entry's addresses, so startup races a dead address alone and reaches the
+    /// live one a redial interval later; merging first puts both into the one
+    /// attempt the peer gets.
+    #[test]
+    fn merging_bootnodes_keeps_every_address_for_the_initial_dial() {
+        let key = secp256k1::Keypair::generate();
+        let public_key: PublicKey = key.public().clone().into();
+        let peer_id = PeerId::from_public_key(&public_key);
+        let ip = IpAddr::from(Ipv4Addr::new(203, 0, 113, 1));
+        let bootnodes = vec![
+            Bootnode {
+                ip,
+                quic_port: Some(9001),
+                tcp_port: None,
+                udp_port: Some(9000),
+                public_key: public_key.clone(),
+            },
+            Bootnode {
+                ip,
+                quic_port: None,
+                tcp_port: Some(9002),
+                udp_port: Some(9000),
+                public_key,
+            },
+            // A discv5-only seed: nothing to dial, counted separately so the
+            // caller can tell "no bootnode is dialable" from "no bootnodes".
+            Bootnode {
+                ip,
+                quic_port: None,
+                tcp_port: None,
+                udp_port: Some(9000),
+                public_key: secp256k1::Keypair::generate().public().clone().into(),
+            },
+        ];
+
+        let (merged, undialable) = merge_bootnode_dial_addrs(bootnodes, random_peer());
+
+        assert_eq!(undialable, 1, "the transport-less entry must be counted");
+        assert_eq!(merged.len(), 1, "the two records name one peer");
+        let addrs = merged
+            .get(&peer_id)
+            .expect("the peer is keyed by its peer id");
+        let expected: HashSet<Multiaddr> = HashSet::from([
+            quic_multiaddr(ip, 9001, peer_id),
+            tcp_multiaddr(ip, 9002, peer_id),
+        ]);
+        assert_eq!(
+            addrs.iter().cloned().collect::<HashSet<_>>(),
+            expected,
+            "the address only the second entry offered must reach the first dial"
+        );
+    }
+
+    /// Our own key in a bootnode list is a dial to ourselves, which
+    /// `Swarm::dial` refuses as `LocalPeerId`. Dropping it in the merge keeps it
+    /// out of `bootnode_addrs`, so the redial path never retries it either.
+    #[test]
+    fn merging_bootnodes_drops_our_own_record() {
+        let key = secp256k1::Keypair::generate();
+        let public_key: PublicKey = key.public().clone().into();
+        let local_peer_id = PeerId::from_public_key(&public_key);
+        let bootnodes = vec![Bootnode {
+            ip: IpAddr::from(Ipv4Addr::new(203, 0, 113, 1)),
+            quic_port: Some(9001),
+            tcp_port: Some(9001),
+            udp_port: Some(9000),
+            public_key,
+        }];
+
+        let (merged, undialable) = merge_bootnode_dial_addrs(bootnodes, local_peer_id);
+
+        assert!(merged.is_empty(), "we must not be a dial target");
+        assert_eq!(
+            undialable, 0,
+            "our own record is not an undialable bootnode, it is not a bootnode"
         );
     }
 
