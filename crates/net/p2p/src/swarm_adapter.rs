@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol,
+    PeerId, StreamProtocol,
     futures::StreamExt,
     request_response::{self, OutboundRequestId},
-    swarm::SwarmEvent,
+    swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{debug, error};
@@ -21,10 +21,15 @@ pub enum SwarmCommand {
         data: Vec<u8>,
     },
     Dial {
-        addr: Multiaddr,
-        /// Callback reporting whether the swarm accepted the dial. `None` when
-        /// the caller does not need to know.
-        accepted_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+        /// Carries the full set of addresses worth trying for one dial attempt
+        /// (a peer's QUIC and TCP ports both, say): libp2p races every address
+        /// in a single `DialOpts` rather than treating each as a separate
+        /// attempt, which is what lets a live TCP address rescue a dial whose
+        /// advertised QUIC port does not answer.
+        opts: DialOpts,
+        /// Callback reporting what the swarm did with the dial. `None` when the
+        /// caller does not need to know.
+        outcome_tx: Option<tokio::sync::oneshot::Sender<DialOutcome>>,
     },
     SendRequest {
         peer: PeerId,
@@ -37,6 +42,49 @@ pub enum SwarmCommand {
         channel: request_response::ResponseChannel<Response>,
         response: Response,
     },
+}
+
+/// What the swarm did with a dial, as far as a caller's bookkeeping cares.
+///
+/// The distinction matters because the two refusals want opposite handling. A
+/// dial refused because one is already in flight has a terminal event coming
+/// (`ConnectionEstablished` then eventually `ConnectionClosed`, or
+/// `OutgoingConnectionError`), so per-peer bookkeeping recorded now is still
+/// torn down later. A dial nothing will ever come of has no such event, so
+/// recording anything would leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialOutcome {
+    /// The swarm took the dial. A terminal event will follow.
+    Queued,
+    /// Refused because this peer is already connected or already being dialed.
+    /// That other attempt still produces a terminal event.
+    AlreadyInProgress,
+    /// Refused with nothing in flight and nothing to come: no address to dial, a
+    /// behaviour denied it, the peer is us, or the adapter is gone.
+    Unreachable,
+}
+
+impl From<&libp2p::swarm::DialError> for DialOutcome {
+    /// Matched exhaustively on purpose. `DialError` is not `#[non_exhaustive]`
+    /// in the pinned fork, so a variant added on a fork upgrade breaks the build
+    /// here and forces a decision, rather than being absorbed by a wildcard as
+    /// `Unreachable` — the classification that leaks bookkeeping if it is wrong.
+    fn from(err: &libp2p::swarm::DialError) -> Self {
+        use libp2p::swarm::DialError;
+        match err {
+            DialError::DialPeerConditionFalse(_) => Self::AlreadyInProgress,
+            // The other three refusals `Swarm::dial` returns synchronously.
+            DialError::LocalPeerId { .. } | DialError::NoAddresses | DialError::Denied { .. } => {
+                Self::Unreachable
+            }
+            // Reached only through a terminal `OutgoingConnectionError`, never
+            // from `Swarm::dial` itself, so no caller reads this answer; the
+            // conservative one is still the right default.
+            DialError::Aborted | DialError::WrongPeerId { .. } | DialError::Transport(_) => {
+                Self::Unreachable
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -52,40 +100,42 @@ impl SwarmHandle {
             .inspect_err(|_| debug!("Swarm adapter closed, cannot publish"));
     }
 
-    pub fn dial(&self, addr: Multiaddr) {
+    pub fn dial(&self, opts: DialOpts) {
         let _ = self
             .cmd_tx
             .send(SwarmCommand::Dial {
-                addr,
-                accepted_tx: None,
+                opts,
+                outcome_tx: None,
             })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot dial"));
     }
 
-    /// Dial and report whether the swarm took the dial.
+    /// Dial and report what the swarm did with it.
     ///
     /// `Swarm::dial` rejects some dials synchronously — `LocalPeerId`,
     /// `NoAddresses`, `Denied`, and `DialPeerConditionFalse` (already connected,
     /// or already dialing) — and those produce **no** `OutgoingConnectionError`
     /// event. A caller that keeps per-dial bookkeeping has to know, or nothing
-    /// will ever tear that bookkeeping down. `false` also covers a dead adapter.
+    /// will ever tear that bookkeeping down, and it has to know *which* refusal
+    /// it was: see [`DialOutcome`].
     ///
-    /// A `true` only means the dial was queued: success or failure still arrives
-    /// later as `ConnectionEstablished` or `OutgoingConnectionError`.
-    pub async fn dial_accepted(&self, addr: Multiaddr) -> bool {
+    /// [`DialOutcome::Queued`] only means the dial was taken: success or failure
+    /// still arrives later as `ConnectionEstablished` or
+    /// `OutgoingConnectionError`.
+    pub async fn dial_outcome(&self, opts: DialOpts) -> DialOutcome {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .cmd_tx
             .send(SwarmCommand::Dial {
-                addr,
-                accepted_tx: Some(tx),
+                opts,
+                outcome_tx: Some(tx),
             })
             .is_err()
         {
             debug!("Swarm adapter closed, cannot dial");
-            return false;
+            return DialOutcome::Unreachable;
         }
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or(DialOutcome::Unreachable)
     }
 
     /// Send a request and return the assigned OutboundRequestId.
@@ -181,13 +231,16 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
                 .ok();
         }
-        SwarmCommand::Dial { addr, accepted_tx } => {
-            let accepted = swarm
-                .dial(addr)
-                .inspect_err(|err| debug!(%err, "Swarm adapter: dial failed"))
-                .is_ok();
-            if let Some(tx) = accepted_tx {
-                let _ = tx.send(accepted);
+        SwarmCommand::Dial { opts, outcome_tx } => {
+            let outcome = match swarm.dial(opts) {
+                Ok(()) => DialOutcome::Queued,
+                Err(err) => {
+                    debug!(%err, "Swarm adapter: dial failed");
+                    DialOutcome::from(&err)
+                }
+            };
+            if let Some(tx) = outcome_tx {
+                let _ = tx.send(outcome);
             }
         }
         SwarmCommand::SendRequest {

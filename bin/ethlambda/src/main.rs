@@ -140,7 +140,7 @@ fn init_keygen_logging() -> eyre::Result<()> {
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn run_node(options: NodeOptions) -> eyre::Result<()> {
-    options.validate_discovery()?;
+    options.validate_ports()?;
 
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
@@ -350,7 +350,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         node_key: node_p2p_key,
         bind_ip: p2p_socket.ip(),
         discovery_port: options.discovery.port,
-        quic_port: p2p_socket.port(),
+        p2p_port: p2p_socket.port(),
         subscription_subnets: subscribed_subnets,
         attestation_committee_count,
         bootnodes,

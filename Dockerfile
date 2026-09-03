@@ -77,7 +77,12 @@ COPY LICENSE ./
 
 # 9000/tcp, 9000/udp - P2P networking (discv5 when --discovery.enable)
 # 9001/udp - libp2p QUIC connections
+# 9001/tcp - libp2p TCP (noise + yamux) connections, the fallback transport
 # 5052 - API RPC
 # 5054 - Prometheus metrics
-EXPOSE 9000/tcp 9000/udp 9001/udp 5052 5054
+#
+# The swarm binds both protocols on 9001 and the ENR advertises both, so a `tcp`
+# entry with no mapping behind it is worse than none: every peer racing the
+# address list burns a connect timeout on a black-holed port.
+EXPOSE 9000/tcp 9000/udp 9001/udp 9001/tcp 5052 5054
 ENTRYPOINT ["/usr/local/bin/ethlambda"]
