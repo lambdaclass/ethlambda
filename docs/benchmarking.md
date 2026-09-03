@@ -79,7 +79,7 @@ otherwise, because a mis-attributed report is worse than no report.
 Block-building benchmark — synthetic workload (mock crypto)
   validators=8 warmup_slots=8 iterations=10 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=a5909d18 os=macos arch=aarch64 threads=14
 
   iter           compact  select_payloads     stf_simulate   overhead       wall         root
   1              0.000ms          0.002ms          0.015ms    0.068ms    0.085ms   0x7282cc99
@@ -112,10 +112,9 @@ Same seed and same parameters produce identical root sequences, so a baseline
 and a candidate can be diffed directly. The header line exists to tell you when
 they *cannot* be compared:
 
-- `leansig` and `leanvm` are the resolved revisions the binary was built
-  against, read from `Cargo.lock` at build time. leanSig tracks a moving branch
-  and leanVM performs the signature aggregation, so either one moving changes
-  the measured crypto.
+- `leanvm` is the resolved revision the binary was built against, read from
+  `Cargo.lock` at build time. leanVM owns the whole signature stack (XMSS and
+  aggregation), so a rev bump changes the measured crypto.
 - `os`, `arch` and `threads` change results across machines.
 
 Two reports that disagree on any of those are not measuring the same thing.
