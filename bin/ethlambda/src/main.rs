@@ -319,10 +319,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         node_key: node_p2p_key,
         bind_ip: p2p_socket.ip(),
         discovery_port: options.discovery.port,
-        quic_port: p2p_socket.port(),
-        // Same port number as `quic_port`: TCP and UDP are separate namespaces,
-        // so `build_swarm` binds both without a collision.
-        tcp_port: p2p_socket.port(),
+        p2p_port: p2p_socket.port(),
         subscription_subnets: subscribed_subnets,
         attestation_committee_count,
         bootnodes,

@@ -77,10 +77,10 @@ pub struct DiscoverySpawnConfig {
     pub node_key: Vec<u8>,
     pub bind_ip: IpAddr,
     pub discovery_port: u16,
-    pub quic_port: u16,
-    /// TCP port the libp2p TCP transport is bound to. Same port number as
-    /// `quic_port`, since TCP and UDP are separate namespaces.
-    pub tcp_port: u16,
+    /// Port the libp2p transports are bound to, advertised in the ENR as both
+    /// `quic` (UDP) and `tcp`. One number for both: see
+    /// [`LocalEnrParams::p2p_port`](enr::LocalEnrParams::p2p_port).
+    pub p2p_port: u16,
     pub subscription_subnets: HashSet<u64>,
     pub attestation_committee_count: u64,
     pub bootnodes: Vec<Bootnode>,
@@ -146,8 +146,7 @@ pub async fn spawn_discovery(
         signer,
         ip: advertise_ip,
         discovery_port: bound.port(),
-        quic_port: config.quic_port,
-        tcp_port: config.tcp_port,
+        p2p_port: config.p2p_port,
         subscription_subnets: config.subscription_subnets,
         attestation_committee_count: config.attestation_committee_count,
     };
@@ -236,8 +235,7 @@ mod tests {
                 .to_vec(),
             bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
             discovery_port,
-            quic_port: 9001,
-            tcp_port: 9001,
+            p2p_port: 9001,
             subscription_subnets: HashSet::from([0u64]),
             attestation_committee_count: 4,
             bootnodes: Vec::new(),

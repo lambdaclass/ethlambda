@@ -113,12 +113,14 @@ pub(crate) struct LocalEnrParams {
     pub(crate) ip: IpAddr,
     /// UDP port the discv5 socket is bound to.
     pub(crate) discovery_port: u16,
-    /// UDP port the libp2p QUIC transport is bound to.
-    pub(crate) quic_port: u16,
-    /// TCP port the libp2p TCP transport is bound to. The same port number as
-    /// [`Self::quic_port`]: TCP and UDP are separate namespaces, so `build_swarm`
-    /// binds both without a collision.
-    pub(crate) tcp_port: u16,
+    /// Port the libp2p transports are bound to, published as both the `quic`
+    /// (UDP) and `tcp` entries.
+    ///
+    /// One field rather than two because there is only ever one number: TCP and
+    /// UDP are separate namespaces, so `build_swarm` binds both listeners from
+    /// the single `--gossipsub-port`. Two fields could be handed differing
+    /// values that no bind would ever produce.
+    pub(crate) p2p_port: u16,
     pub(crate) subscription_subnets: HashSet<u64>,
     pub(crate) attestation_committee_count: u64,
 }
@@ -126,13 +128,13 @@ pub(crate) struct LocalEnrParams {
 impl LocalEnrParams {
     /// The `Node` ethrex's discovery server takes as its local identity.
     ///
-    /// `tcp_port` is the real port the libp2p TCP transport is bound to, now
+    /// Its `tcp_port` is the real port the libp2p TCP transport is bound to, now
     /// that ethlambda has one.
     pub(crate) fn local_node(&self) -> Node {
         Node::new(
             self.ip,
             self.discovery_port,
-            self.tcp_port,
+            self.p2p_port,
             public_key_from_signing_key(&self.signer),
         )
     }
@@ -148,13 +150,7 @@ impl LocalEnrParams {
     fn local_pairs(&self) -> NodeRecordPairs {
         let mut pairs = NodeRecordPairs {
             udp_port: Some(self.discovery_port),
-            // A `0` here is spelled by the entry's absence, matching what
-            // `read_tcp_port` and `read_quic_port` make of one on the way in.
-            // The ports come from configuration rather than from the bound
-            // listeners, so `--gossipsub-port 0` reaches this with a `0` that
-            // describes neither of the two real OS-assigned ports; publishing
-            // it would advertise a transport nothing answers on.
-            tcp_port: Some(self.tcp_port).filter(|port| *port != 0),
+            tcp_port: dialable_port(self.p2p_port),
             ..Default::default()
         };
         match self.ip.to_canonical() {
@@ -169,11 +165,27 @@ impl LocalEnrParams {
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
         pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
-        if self.quic_port != 0 {
-            pairs.set_extra_int(QUIC_ENR_KEY, self.quic_port.into());
+        if let Some(quic_port) = dialable_port(self.p2p_port) {
+            pairs.set_extra_int(QUIC_ENR_KEY, quic_port.into());
         }
         pairs
     }
+}
+
+/// The `0` filter every port on a record goes through, on the way in and on the
+/// way out.
+///
+/// A port of `0` is spelled by the entry's absence: `--gossipsub-port 0` asks
+/// the OS to pick, so the number never describes a real listener, and a peer
+/// reading a literal `0` finds nothing dialable. Both readings collapse into
+/// `None` so a `0` cannot mean "absent" on one side of the wire and "port zero"
+/// on the other.
+///
+/// Deliberately the only place that rule is spelled: the ENR writer
+/// ([`LocalEnrParams::local_pairs`]), both port readers here, and the bootnode
+/// parser's `udp` filter all go through it.
+pub(crate) fn dialable_port(port: u16) -> Option<u16> {
+    Some(port).filter(|port| *port != 0)
 }
 
 /// Build and sign this node's ENR.
@@ -213,25 +225,22 @@ pub(crate) fn read_public_key(
 /// the non-minimal forms some clients emit), and a literal `0`. The first two
 /// come straight from `extra_int`, which looks the key up before it decodes
 /// anything and so reports a missing entry rather than a zero; the explicit `0`
-/// is what the filter here is for. None of the three names a port worth dialing,
-/// which is why they collapse into one answer.
+/// is [`dialable_port`]'s business. None of the three names a port worth
+/// dialing, which is why they collapse into one answer.
 pub(crate) fn read_quic_port(record: &NodeRecord) -> Option<u16> {
     record
         .pairs()
         .extra_int::<u16>(QUIC_ENR_KEY)
-        .filter(|port| *port != 0)
+        .and_then(dialable_port)
 }
 
 /// The advertised libp2p TCP port, if it is one we could dial.
 ///
 /// `tcp` is a first-class entry rather than an `extra`, so an absent one is
-/// already `None`; the filter is for the literal `0`, which decodes the same way
-/// an absent entry does and names nothing dialable either. Same answer as
-/// [`read_quic_port`] gives for `quic`, and it is deliberately the only place
-/// that rule is spelled: both dial paths and the ENR writer go through it, so a
-/// `0` cannot mean "absent" on one side and "port zero" on the other.
+/// already `None`; [`dialable_port`] is what folds a literal `0` into the same
+/// answer. Same answer as [`read_quic_port`] gives for `quic`.
 pub(crate) fn read_tcp_port(pairs: &NodeRecordPairs) -> Option<u16> {
-    pairs.tcp_port.filter(|port| *port != 0)
+    pairs.tcp_port.and_then(dialable_port)
 }
 
 #[cfg(test)]
@@ -246,8 +255,7 @@ mod tests {
             signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
             ip: IpAddr::from(Ipv4Addr::LOCALHOST),
             discovery_port: 9010,
-            quic_port: 9001,
-            tcp_port: 9001,
+            p2p_port: 9001,
             subscription_subnets: HashSet::from([1u64, 4]),
             attestation_committee_count: 8,
         })
@@ -342,8 +350,7 @@ mod tests {
             signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
             ip: IpAddr::from(Ipv4Addr::LOCALHOST),
             discovery_port: 9010,
-            quic_port: 0,
-            tcp_port: 0,
+            p2p_port: 0,
             subscription_subnets: HashSet::from([1u64]),
             attestation_committee_count: 8,
         })
