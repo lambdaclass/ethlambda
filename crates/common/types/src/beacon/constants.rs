@@ -54,8 +54,8 @@ pub const DEPOSIT_CONTRACT_TREE_DEPTH: usize = 32;
 /// `Bitvector`, hence `usize`.
 pub const JUSTIFICATION_BITS_LENGTH: usize = 4;
 
-/// `2**64 - 1`. Used only by `ethlambda_beacon::helpers::math`'s `integer_squareroot`
-/// helper as the boundary past which the doubling-based Newton's method
+/// `2**64 - 1`. Used only by the beacon STF's `helpers::math::integer_squareroot`
+/// as the boundary past which the doubling-based Newton's method
 /// bound is replaced by a precomputed answer; unrelated to
 /// [`FAR_FUTURE_EPOCH`] despite the identical bit pattern.
 pub const UINT64_MAX: u64 = u64::MAX;

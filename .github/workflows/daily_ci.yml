@@ -26,6 +26,9 @@ permissions:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
+  # See the same setting in ci.yml. This workflow runs the identical job, so it
+  # is under the identical disk pressure.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   test:
@@ -33,6 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
 
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests

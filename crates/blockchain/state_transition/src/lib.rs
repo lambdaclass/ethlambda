@@ -10,6 +10,15 @@ use ethlambda_types::{
 };
 use tracing::{info, warn};
 
+/// The Ethereum **Beacon Chain** state transition, phase0 through fulu.
+///
+/// A different protocol from the Lean consensus the rest of this crate
+/// implements, kept in its own namespace for the same reason
+/// `ethlambda_types::beacon` is: one crate can then hold both chains' rules, so
+/// a caller dispatching on a state's fork reaches either without the two living
+/// in separate dependency trees. Nothing above `beacon` here reads anything
+/// inside it, and nothing inside it reads lean's own module tree.
+pub mod beacon;
 pub mod justified_slots_ops;
 pub mod metrics;
 

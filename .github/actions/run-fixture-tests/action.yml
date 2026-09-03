@@ -112,3 +112,12 @@ runs:
     - name: Run tests
       shell: bash
       run: make test
+
+    # What the build actually consumed, which is the number that says how close
+    # the next run is to the ceiling; `free-disk-space` reports only what was
+    # available before it. `always()` because the reading matters most on the
+    # failure this instruments, where the build is the thing that ran out.
+    - name: Report disk usage after the build
+      if: always()
+      shell: bash
+      run: df -h /

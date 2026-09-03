@@ -2,7 +2,8 @@
 //!
 //! `ethlambda-types` already has `primitives`, `constants`, and `checkpoint`
 //! modules of its own, and lean's `Checkpoint` is a different type from
-//! beacon's by the same name. Everything moved out of `ethlambda-beacon` lives
+//! beacon's by the same name. Everything moved out of the beacon state
+//! transition lives
 //! under this module so both sets can coexist.
 
 pub mod config;

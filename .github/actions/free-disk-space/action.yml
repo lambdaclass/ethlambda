@@ -1,0 +1,71 @@
+name: "Free runner disk space"
+description: >-
+  Deletes preinstalled toolchains that nothing in this repository builds
+  against, so a cold `release-fast` build of the whole workspace has room to
+  link, and reports free space before and after. Callers must not run
+  containers: this prunes the runner's preinstalled Docker images.
+
+runs:
+  using: "composite"
+  steps:
+    # A cold `release-fast` build of this workspace no longer fits the runner's
+    # root filesystem. Two properties of that failure are worth knowing, because
+    # neither is visible from the error it produces:
+    #
+    # `lld` writes its output through `mmap`, so a full disk reaches it when it
+    # touches a page it cannot back, as SIGBUS rather than ENOSPC. The build
+    # reports `ld terminated with signal 7 [Bus error]` and refers the reader to
+    # the LLVM issue tracker, naming neither the disk nor the linker's output
+    # file. Whoever next sees that error should check this step's numbers first.
+    #
+    # And the runner's own diagnostic log shares the filesystem, so once it is
+    # full the failure can also land in a post-job step, attributed to whatever
+    # action happened to be unwinding rather than to the build that filled it.
+    #
+    # Hence reporting `df` on both sides even when nothing is short, so the
+    # headroom a run started with is in its log either way. Callers pair this
+    # with a reading after the build, which is what says how much of that
+    # headroom the build then used.
+    - name: Free disk space
+      shell: bash
+      run: |
+        echo "::group::Disk usage before cleanup"
+        df -h /
+        echo "::endgroup::"
+
+        # Removal is best-effort. A path that a future runner image drops or
+        # relocates is not a reason to fail the job: what actually matters is
+        # whether the build fits, which the build itself reports. `set -e` is
+        # deliberately absent for the same reason.
+        #
+        # Each entry is a toolchain for a language this repository does not
+        # build, ordered roughly largest first:
+        sudo rm -rf \
+          /usr/local/lib/android \
+          /usr/share/dotnet \
+          /usr/local/.ghcup \
+          /opt/ghc \
+          /usr/share/swift \
+          /opt/hostedtoolcache/CodeQL \
+          || true
+
+        # CodeQL is named on its own rather than clearing
+        # `/opt/hostedtoolcache` wholesale, because that directory is also where
+        # `dtolnay/rust-toolchain` and the `setup-*` actions install what later
+        # steps in the same job then run.
+        #
+        # Node is absent from the list for a similar reason. The runner's own
+        # bundled copy, which is what every `uses:` action here executes, lives
+        # elsewhere and would survive, but `/usr/local/lib/node_modules` is
+        # where npm installs itself, so clearing it would leave a caller that
+        # runs npm with a working `node` and no `npm`.
+
+        # The preinstalled images, which are only ever a cache for jobs that run
+        # containers. No caller of this action does; see the description.
+        if command -v docker >/dev/null 2>&1; then
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+        fi
+
+        echo "::group::Disk usage after cleanup"
+        df -h /
+        echo "::endgroup::"

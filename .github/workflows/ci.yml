@@ -16,6 +16,16 @@ concurrency:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
+  # Off in CI, on for local rebuilds, which is what the `release-fast` profile's
+  # `incremental = true` is for. An environment variable overrides the profile
+  # setting, so this turns it off here without touching the manifest.
+  #
+  # Incremental state is pure cost on a runner: `Swatinem/rust-cache` deletes
+  # `target/*/incremental` before saving, so it is never restored, and every job
+  # here starts from whatever the cache holds rather than from its own previous
+  # build. Nothing reads it, and it is comparable in size to the build output
+  # itself, on a filesystem that a cold workspace build has already outgrown.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   lint:
@@ -49,19 +59,43 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # The beacon containers' SSZ bounds are const-generic arguments, so the
-      # minimal preset is a whole second compilation of ethlambda-types that
-      # nothing above reaches: every step so far builds the default (mainnet)
-      # preset only. Without this the `preset-minimal` feature would rot between
-      # merges, and the fixture suites that select it live on another branch.
+      # Two features gate code that no step above reaches, so both would rot
+      # silently between merges.
       #
-      # `--lib`, because this job downloads no fixtures. The crate's other test
-      # target, `ssz_spectests`, walks `leanSpec/fixtures` and panics outright
-      # when it is absent, which only the `test` job below fetches. The unit
-      # tests are what the preset actually changes, and they read nothing from
-      # disk.
+      # `beacon-spec-tests` guards the beacon spec-test target, which declares it
+      # as a required feature so that `cargo test` skips a suite whose fixtures
+      # are a multi-gigabyte download. `--all-targets` above therefore never
+      # builds it. The `beacon-spec-tests` job below does download them and run
+      # the suite for real, so this step is not what proves the runners work; it
+      # is here because that job is by far the slowest in the workflow, and
+      # because this is the only place the runners are linted at `-D warnings`.
+      #
+      # `preset-minimal` is a whole second compilation, because the beacon
+      # containers' SSZ bounds are const-generic arguments and every step so far
+      # builds the default (mainnet) preset only. The fixture-reading unit tests
+      # stay `ignore`d here, since `beacon-spec-tests` is off.
+      #
+      # `--lib` on both: this job downloads no fixtures, and each crate's
+      # integration targets (`ssz_spectests`, `stf_spectests`) walk the leanSpec
+      # tree, which only the `test` job below has. The unit tests are what the
+      # preset actually changes, and they need nothing on disk.
+      #
+      # The spec suite is compiled under BOTH presets, not just the default. Its
+      # `genesis` runner is `#![cfg(feature = "preset-minimal")]`, because the
+      # release ships genesis fixtures for that preset only, so a mainnet-preset
+      # build type-checks every runner except that one, and it is the sole
+      # coverage `beacon::genesis` has. The minimal leg below would catch a break
+      # there as well, but only after a fixture download and a full release-fast
+      # build; this catches it in the lint job's already-warm cache.
+      - name: Check the beacon spec-test suite compiles
+        run: |
+          cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests -- -D warnings
+          cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests,preset-minimal -- -D warnings
+
       - name: Check the minimal preset
-        run: cargo test -p ethlambda-types --lib --features preset-minimal
+        run: |
+          cargo test -p ethlambda-types --lib --features preset-minimal
+          cargo test -p ethlambda-state-transition --lib --features preset-minimal
 
       # tooling/event-monitor declares its own [workspace] table, so every step
       # above stops at the root workspace members and never reaches it. Its
@@ -86,6 +120,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      # This job builds the entire workspace at `release-fast`, which is the
+      # largest build in the workflow and no longer fits the runner's root
+      # filesystem unmodified.
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
 
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
@@ -135,3 +175,65 @@ jobs:
             fi
           done
           exit $status
+  beacon-spec-tests:
+    name: Beacon spec tests (${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    # Far and away the longest job here: two full fixture trees to fetch and a
+    # release-grade build before the first case runs. Bounded well above what a
+    # healthy run takes, purely so a hang is reaped in tens of minutes rather
+    # than sitting on a runner for GitHub's six-hour default.
+    timeout-minutes: 120
+    strategy:
+      # Report both presets rather than cancelling the second the moment the
+      # first fails. They walk different fixture trees, and whether a failure is
+      # preset-specific or common to both is most of the triage.
+      fail-fast: false
+      matrix:
+        preset: [mainnet, minimal]
+    env:
+      # Read by the Makefile, which declares this `?=` and so defers to the
+      # environment. A run reads its own preset's tree plus `general` and nothing
+      # else, so fetching the other preset's would be the largest single download
+      # in the workflow spent on files no case opens.
+      CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Not yet observed to run out, unlike `test` above, but it is the same
+      # squeeze: a release-grade build plus the largest fixture download in the
+      # workflow, on the same root filesystem.
+      - name: Free disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      # Keyed per preset. The preset fixes the beacon containers' SSZ bounds,
+      # which are const-generic arguments, so the two legs share no artifacts at
+      # all; on one key they would evict each other on every single run.
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: beacon-${{ matrix.preset }}
+
+      # Deliberately not cached. The trees expand to several GiB, which against a
+      # repository-wide 10 GiB cache budget would evict the Rust build caches
+      # that actually save time here. The assets are pinned to a release and
+      # served from the same CDN as the runner, so re-fetching is the cheap half
+      # of that trade.
+      #
+      # Its own step rather than leaning on the make prerequisite, so the log
+      # separates download time from build-and-test time and a fixture outage is
+      # not reported as a test failure.
+      - name: Download the consensus spec test fixtures
+        run: make consensus-spec-tests
+
+      - name: Run the Beacon Chain spec tests
+        run: make test-beacon-${{ matrix.preset }}
+
+      # See the same step in the run-fixture-tests action.
+      - name: Report disk usage after the build
+        if: always()
+        run: df -h /

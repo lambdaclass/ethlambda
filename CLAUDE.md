@@ -362,6 +362,92 @@ existing once per chain.
   consensus-specs v1.6.1 (5705 mainnet / 40009 minimal cases). What runs here
   is the containers' own round-trip and shape tests.
 
+## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
+
+The **Ethereum Beacon Chain** consensus specs (phase0 through fulu), a different
+protocol from the Lean consensus the rest of this repo implements, live in the
+`beacon` module of `ethlambda-state-transition` beside lean's own state
+transition. The module holds the *behavior* (state transition, fork choice,
+helpers, BLS and KZG); the containers, presets, configuration and primitives it
+transitions are in `ethlambda-types`, per the section above. Nothing above
+`beacon` reads anything inside it, and nothing inside it reads lean's modules.
+
+- **`blst` and `c-kzg` are now on the lean binary's dependency path**, since
+  `ethlambda-blockchain`, `ethlambda-rpc` and `ethlambda-test-fixtures` all
+  depend on this crate. That is the cost of one crate holding both chains'
+  rules; the module is not feature-gated.
+- Tests: `make test-beacon` (builds once per preset), or `test-beacon-mainnet` /
+  `test-beacon-minimal` for one. CI runs the two as a job each, so they build and
+  run concurrently. `make test` runs the whole
+  workspace with nothing excluded, and still needs no fixture download: the
+  `beacon_spec_tests` target declares `required-features = ["beacon-spec-tests"]`
+  so `cargo test` skips it, and the BLS and KZG fixture vectors, which are unit
+  tests inside the module, are `#[cfg_attr(not(feature = ...), ignore)]` so they
+  report as ignored rather than silently absent. Turning the feature on is what
+  `make test-beacon` does, and it runs `--lib` too so those 15 are not missed.
+- Every fixture case is its own test, named `<runner>/<fork>/<handler>/<suite>/<case>`,
+  so a failure names the case and not the suite around it. The spec binary
+  therefore supplies its own harness (`harness = false`), since a case is only
+  known once the fixture tree is walked. A substring filter selects a whole
+  suite or one case: `cargo test -p ethlambda-state-transition --test
+  beacon_spec_tests --features beacon-spec-tests -- electra/attester_slashing`.
+- Fixtures: `make consensus-spec-tests`, pinned to a `consensus-specs` release.
+  The tree is stamped with the version *and* the configs it holds, so changing
+  either wipes and re-downloads rather than leaving the old cases in place and
+  silently green, or marking a partial tree complete.
+  `CONSENSUS_SPEC_TESTS_CONFIGS` narrows the download: a run reads its own
+  preset's tree plus `general` and nothing else, which is what each CI job sets.
+- Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
+  container bounds are const-generic arguments; fork scheduling is runtime
+  because the `transition` suite moves fork epochs per case.
+- Per-fork containers are plain structs behind an enum, so SSZ stays derived. See
+  [`docs/beacon_stf.md`](docs/beacon_stf.md) for why, including the fork-by-fork
+  field counts and the merkle depth change at electra.
+- The types are re-exported at their old paths (`crate::beacon::containers`,
+  `crate::beacon::preset`, `crate::beacon::config`, ...), so a use site inside
+  the module reads as if they were local, and
+  `ethlambda_state_transition::beacon::containers::X` and
+  `ethlambda_types::beacon::containers::X` name one type. Two things do move the
+  other way: `fork_choice` re-exports `LatestMessage` and `PowBlock` from types
+  (`ethlambda-storage` persists them), and `helpers::misc` re-exports
+  `compute_fork_data_root` (the networking crate needs the fork digest built on
+  it).
+- **`BeaconState` and `ForkName` carry a `Lean` variant**, so every match on
+  either needs an arm for it. Nothing here can transition a lean value, so those
+  arms panic through `lean_state_unreachable`/`lean_fork_unreachable`
+  (`src/beacon/lean_boundary.rs`, same names and wording as `ethlambda-types`'
+  own `pub(crate)` pair) rather than widening a signature to a `Result` no
+  correct caller would see. Functions, not a macro, and `#[cold]` +
+  `#[track_caller]` so the panic still reports the arm that was reached rather
+  than `lean_boundary.rs`. In the spec tests the same arms call
+  `lean_is_not_a_fixture_fork`, which is `#[track_caller]` for the same reason,
+  since a case's fork is parsed from a directory name and `ForkName::ALL` has no
+  lean entry. Both are named arms rather than a
+  catch-all `_`, so a real new fork still breaks every match that must grow one.
+- **Needs mutable element access on `SszList`/`SszVector`**, which no published
+  libssz release has yet. Nothing extra is required here: the workspace already
+  tracks all four libssz crates from git at `36802dd` for the beacon containers
+  in `ethlambda-types` (see the section above), and that rev is the `0.3.0`
+  release plus the single commit adding `DerefMut`/`IndexMut`
+  (lambdaclass/libssz#33). This module needs that commit for the same reason.
+- **Status:** all seven forks (phase0 through fulu) have containers, fork
+  upgrades, state transitions, and epoch processing. Every fixture case passes
+  on both presets: mainnet is 5705 cases and minimal 40009. The crate's lib
+  target holds 200 tests with `beacon-spec-tests` on, 185 plus 15 ignored
+  without; both figures cover lean's own unit tests as well, since the two
+  chains now share one lib target. Fork choice is fixture-verified too: 150 mainnet
+  `fork_choice` cases pass, covering bellatrix's `on_merge_block`/terminal-PoW
+  validation, `should_override_forkchoice_update`, deneb's blob data
+  availability, and fulu's column data availability.
+- Nothing is ignored for being unimplemented. Ignored cases are the
+  `LightClient*` containers (a different layer, out of scope) and the `gloas`
+  and `eip7805` fixture trees. Those two do not parse as a `ForkName`, so
+  `collect` would skip them silently; `UNMODELED_FORKS` names them and
+  `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
+  that is neither parseable nor listed, so a new fork forces a decision.
+- A fixture case with no `post` state asserts the input must be **rejected**. That
+  rule lives in `check_transition`; do not add a runner that ignores it.
+
 ## Configuration Files
 
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)

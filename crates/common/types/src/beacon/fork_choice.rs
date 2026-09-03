@@ -1,10 +1,10 @@
 //! The two fork-choice containers that are neither a block nor a state.
 //!
-//! They live here rather than in `ethlambda-beacon`'s `fork_choice` module
-//! because the DB-backed `ethlambda_storage::Store` holds them, and
-//! `ethlambda-storage` cannot depend on `ethlambda-beacon`: the dependency runs
-//! the other way. `ethlambda_beacon::fork_choice` re-exports both at their old
-//! paths, so every use site inside that crate is unchanged.
+//! They live here rather than in the `beacon::fork_choice` module of
+//! `ethlambda-state-transition` because the DB-backed `ethlambda_storage::Store`
+//! holds them, and `ethlambda-storage` cannot depend on that crate: the
+//! dependency runs the other way. That module re-exports both at their old paths,
+//! so every use site inside it is unchanged.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn a_pow_block_round_trips_through_ssz() {
         // The store persists these, so the derive has to survive the move out
-        // of `ethlambda-beacon` intact.
+        // of `ethlambda-state-transition` intact.
         let block = PowBlock {
             block_hash: Root::repeat_byte(1),
             parent_hash: Root::repeat_byte(2),

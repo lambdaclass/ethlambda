@@ -979,8 +979,9 @@ pub use minimal::*;
 /// (EIP-7251): its own copy restructures the division around the constant
 /// rather than only swapping the constant in, so from electra on a value
 /// selected here is no longer enough on its own to keep one shared copy of
-/// that function correct. `ethlambda_beacon::stf::epoch::electra::process_slashings` is
-/// a separate function for exactly that reason; see its own doc for the
+/// that function correct. The beacon STF's
+/// `stf::epoch::electra::process_slashings` is a separate function for exactly
+/// that reason; see its own doc for the
 /// arithmetic. `slash_validator` never breaks the pattern this module
 /// describes, so it keeps reading [`retuned::min_slashing_penalty_quotient`]
 /// and [`retuned::whistleblower_reward_quotient`] from here through every fork this crate

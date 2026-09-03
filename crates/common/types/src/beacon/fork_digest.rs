@@ -1,10 +1,10 @@
 //! The four bytes that separate one network, fork, and blob schedule from
 //! another on the wire.
 //!
-//! Lives here rather than in `ethlambda-beacon` because the networking crate
-//! needs it and must not depend on the state transition: `ethlambda-beacon`
-//! pulls in `blst` and `c-kzg`, neither of which a gossip topic name has any
-//! business requiring. `ethlambda_beacon::helpers::misc` re-exports
+//! Lives here rather than in `ethlambda-state-transition` because the networking
+//! crate needs it and must not depend on the state transition: that crate's
+//! `beacon` module pulls in `blst` and `c-kzg`, neither of which a gossip topic
+//! name has any business requiring. That module's `helpers::misc` re-exports
 //! [`compute_fork_data_root`] at its old path.
 
 use sha2::{Digest as _, Sha256};

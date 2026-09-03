@@ -16,7 +16,7 @@ use core::fmt;
 /// [`ForkName::Lean`] is last so that every such gate reads as true for a lean
 /// state, and is deliberately absent from [`ForkName::ALL`]: lean is not a point
 /// on the Beacon Chain's fork timeline, has no spec fixtures, and must never be
-/// a target of `ethlambda_beacon::upgrade`-style traversal. See
+/// a target of the beacon STF's `upgrade`-style traversal. See
 /// [`ForkName::ALL`].
 ///
 /// Forks after fulu exist upstream but are out of scope for this crate.
