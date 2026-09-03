@@ -275,6 +275,11 @@ actual_slot = finalized_slot + 1 + relative_index
   proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
   which recycles the prover's large buffers across proofs instead of re-faulting
   them, so its pages stay resident for the node's lifetime
+- `ethlambda keygen` generates genesis validator keys through the same
+  `ValidatorSecretKey` the node loads them with, so a key set cannot be built
+  against a different leanVM than the client reading it. Keys are only usable by
+  a client on the matching revision, and no file size changes when the scheme
+  does, so the manifest records `leanvm_rev`. See [`docs/keygen.md`](docs/keygen.md)
 
 **Aggregation shape (one leanVM `AggregateSignature`, grouped by epoch):**
 - Type-1 and Type-2 are the same object: one `XmssGroup` per slot, carrying the

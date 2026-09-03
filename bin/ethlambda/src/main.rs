@@ -3,6 +3,7 @@ mod checkpoint_sync;
 mod cli;
 mod command;
 mod fd_limit;
+mod keygen;
 mod version;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
@@ -82,6 +83,12 @@ fn main() -> eyre::Result<()> {
             init_benchmark_logging()?;
             benchmark::run(options)
         }
+        // Key generation is synchronous, CPU-bound work whose product is files,
+        // so it runs on this thread too and leaves stdout alone.
+        Command::Keygen(options) => {
+            init_keygen_logging()?;
+            keygen::run(options)
+        }
     }
 }
 
@@ -100,6 +107,22 @@ fn init_node_logging() -> eyre::Result<()> {
 fn init_benchmark_logging() -> eyre::Result<()> {
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::WARN.into())
+        .from_env_lossy();
+    let subscriber = Registry::default().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(subscriber)
+        .wrap_err("failed to set global tracing subscriber")
+}
+
+/// Keygen logging: INFO and above, on stderr. Key generation takes minutes for a
+/// large validator set, so progress has to be visible; stderr keeps stdout free
+/// for a machine-readable summary to claim later.
+fn init_keygen_logging() -> eyre::Result<()> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
         .from_env_lossy();
     let subscriber = Registry::default().with(
         tracing_subscriber::fmt::layer()

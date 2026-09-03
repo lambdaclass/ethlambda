@@ -5,8 +5,8 @@ use std::ops::RangeInclusive;
 
 use ethlambda_types::{attestation::SIGNATURE_SIZE, primitives::H256, state::PUBLIC_KEY_SIZE};
 use leanvm::xmss::{
-    self, Decode, Encode, PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey,
-    XmssSignError, XmssSignature,
+    self, Decode, Encode, LOG_LIFETIME, PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssKeyGenError,
+    XmssPublicKey, XmssSecretKey, XmssSignError, XmssSignature,
 };
 
 // `ethlambda-types` hardcodes the XMSS wire sizes so it can stay free of the
@@ -30,6 +30,48 @@ const _: [(); PUBLIC_KEY_SIZE] = [(); PUB_KEY_SSZ_LEN];
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("signature parse error: {0}")]
 pub struct SignatureParseError(pub String);
+
+/// What the pinned leanVM's XMSS is, for a genesis key manifest to record.
+///
+/// A key set is only usable by a client built against the same scheme, and no
+/// file size changes when the scheme does (leanVM's move from Poseidon over
+/// KoalaBear to BLAKE2s over binary fields kept both wire sizes), so a manifest
+/// has to say which scheme it holds rather than leave it to be inferred.
+///
+/// Only two of these fields are load-bearing. [`PUBLIC_KEY_BYTES`] and
+/// [`LIFETIME`] come from leanVM and so cannot drift; the two labels are
+/// hardcoded, because leanVM's facade exports neither a name for the hash nor
+/// the `V`/`CHAIN_LENGTH` the scheme label is conventionally built from. That is
+/// exactly why a manifest should also carry the leanVM revision, which is the
+/// one field that identifies the format on its own.
+pub mod scheme {
+    use super::{LOG_LIFETIME, PUB_KEY_SSZ_LEN};
+
+    /// The scheme label, in the form the genesis tooling has always read.
+    ///
+    /// `Dim`/`Base` are leanVM's `V` and `CHAIN_LENGTH`, neither re-exported;
+    /// keep this in step with the pinned revision. Note that all three
+    /// parameters survived the last change of hash function unchanged, so this
+    /// label does NOT distinguish the two key formats by itself.
+    pub const NAME: &str = "XmssTargetSumLifetime32Dim42Base8";
+
+    /// The hash the scheme is built on. Hardcoded, as [`NAME`] is.
+    pub const HASH_FUNCTION: &str = "BLAKE2s";
+
+    /// The WOTS encoding: the signer grinds randomness until the digest's
+    /// chunks sum to a fixed target, so there are no checksum chains.
+    pub const ENCODING: &str = "TargetSum";
+
+    /// Epochs a key could cover at most, whatever range it was generated for.
+    pub const LIFETIME: u64 = 1 << LOG_LIFETIME;
+
+    /// Bytes in an SSZ-encoded public key.
+    pub const PUBLIC_KEY_BYTES: usize = PUB_KEY_SSZ_LEN;
+
+    // [`NAME`] claims a 2^32 lifetime, which leanVM does export, so at least
+    // that much of the hardcoded label is checked rather than trusted.
+    const _: [(); 32] = [(); LOG_LIFETIME];
+}
 
 #[derive(Clone)]
 pub struct ValidatorSignature {
@@ -93,6 +135,30 @@ pub struct ValidatorSecretKey {
 }
 
 impl ValidatorSecretKey {
+    /// Generate a fresh key able to sign at each slot in `slots`, once.
+    ///
+    /// The range is inclusive and fixed for the key's life: a slot outside it
+    /// can never be signed. Nothing can regenerate the key, the seed coming
+    /// from the OS.
+    ///
+    /// Cost grows with the range, but sublinearly: leanVM stores
+    /// `O(sqrt(range))` of the tree and fans key generation out over the bottom
+    /// subtrees.
+    pub fn generate(slots: RangeInclusive<u32>) -> Result<Self, XmssKeyGenError> {
+        let (sk, _pk) = xmss::key_gen(&mut leanvm::rand::rng(), *slots.start(), *slots.end())?;
+        Ok(Self { inner: sk })
+    }
+
+    /// Deterministic [`Self::generate`]: one `(seed, slots)` always rebuilds the
+    /// same key, the seed being its entire secret material.
+    pub fn generate_from_seed(
+        seed: [u8; 32],
+        slots: RangeInclusive<u32>,
+    ) -> Result<Self, XmssKeyGenError> {
+        let (sk, _pk) = xmss::key_gen_from_seed(seed, *slots.start(), *slots.end())?;
+        Ok(Self { inner: sk })
+    }
+
     /// Parse from the postcard-encoded key file produced by the genesis generator.
     ///
     /// leanVM's `XmssSecretKey` carries serde rather than an SSZ codec: the
@@ -157,9 +223,57 @@ mod tests {
 
     /// Generate a validator key pair over a small slot range (fast key generation).
     fn generate_key(seed: [u8; 32], first_slot: u32, last_slot: u32) -> ValidatorSecretKey {
-        let (sk, _pk) =
-            xmss::key_gen_from_seed(seed, first_slot, last_slot).expect("valid slot range");
-        ValidatorSecretKey { inner: sk }
+        ValidatorSecretKey::generate_from_seed(seed, first_slot..=last_slot)
+            .expect("valid slot range")
+    }
+
+    /// The scheme label is what a key manifest is read back against, so a
+    /// leanVM bump that moves a parameter has to move the label with it.
+    #[test]
+    fn scheme_reports_the_pinned_parameters() {
+        assert_eq!(scheme::NAME, "XmssTargetSumLifetime32Dim42Base8");
+        assert_eq!(scheme::PUBLIC_KEY_BYTES, PUBLIC_KEY_SIZE);
+        assert_eq!(scheme::LIFETIME, 1 << 32);
+    }
+
+    /// A generated key has to survive the postcard round trip the node's key
+    /// loader performs, and keep signing for the same public key.
+    #[test]
+    #[ignore = "slow: XMSS key generation and signing"]
+    fn generated_key_round_trips_through_its_file_form() {
+        let sk = ValidatorSecretKey::generate(0..=63).expect("valid slot range");
+        let pk = sk.public_key();
+
+        let reloaded = ValidatorSecretKey::from_bytes(&sk.to_bytes().expect("serializes"))
+            .expect("its own file form parses");
+        assert_eq!(reloaded.public_key().to_bytes(), pk.to_bytes());
+        assert_eq!(reloaded.signable_slots(), sk.signable_slots());
+
+        let message = H256::from([5u8; 32]);
+        let signature = reloaded.sign(7, &message).expect("sign");
+        assert!(signature.is_valid(&pk, 7, &message));
+    }
+
+    /// The seeded path is what makes a key set reproducible.
+    #[test]
+    #[ignore = "slow: XMSS key generation"]
+    fn seeded_generation_is_deterministic() {
+        let first = ValidatorSecretKey::generate_from_seed([11u8; 32], 0..=15).expect("range");
+        let again = ValidatorSecretKey::generate_from_seed([11u8; 32], 0..=15).expect("range");
+        let other = ValidatorSecretKey::generate_from_seed([12u8; 32], 0..=15).expect("range");
+
+        assert_eq!(first.public_key().to_bytes(), again.public_key().to_bytes());
+        assert_ne!(first.public_key().to_bytes(), other.public_key().to_bytes());
+    }
+
+    /// An inverted range has no epochs to sign at, so it is rejected rather
+    /// than yielding a key that can do nothing.
+    #[test]
+    fn an_inverted_slot_range_is_rejected() {
+        // Built from variables: as a literal, `10..=9` is a clippy error rather
+        // than the input under test.
+        let (first, last) = (10u32, 9u32);
+        assert!(ValidatorSecretKey::generate_from_seed([0u8; 32], first..=last).is_err());
     }
 
     #[test]
