@@ -174,8 +174,17 @@ impl NodeOptions {
     /// swarm bound UDP only, and is now a real collision. Without these checks
     /// either surfaces at bind time as an opaque `EADDRINUSE` on whichever
     /// socket loses the race.
+    ///
+    /// Every comparison skips `0`, which is not a port but a request for one:
+    /// two `0` binds always land on different OS-assigned ports and can never
+    /// collide. Rejecting a pair of them would refuse the setup that exists to
+    /// avoid collisions, which test harnesses and several-nodes-per-host runs
+    /// rely on.
     pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
-        if self.discovery.enable && self.discovery.port == self.gossipsub_port {
+        if self.discovery.enable
+            && self.gossipsub_port != 0
+            && self.discovery.port == self.gossipsub_port
+        {
             eyre::bail!(
                 "--discovery.port ({}) must differ from --gossipsub-port ({}): \
                  both bind UDP and cannot share a port",
@@ -197,7 +206,7 @@ impl NodeOptions {
             ("--api-port", self.api_port),
             ("--metrics-port", self.metrics_port),
         ] {
-            if port == self.gossipsub_port {
+            if self.gossipsub_port != 0 && port == self.gossipsub_port {
                 eyre::bail!(
                     "{flag} ({port}) must differ from --gossipsub-port ({}): the \
                      libp2p swarm binds TCP on that port as well as UDP",
@@ -340,5 +349,34 @@ mod tests {
                 .validate_ports()
                 .is_err()
         );
+    }
+
+    /// Two `0`s are two OS-assigned ports, so the equality checks must not read
+    /// them as a clash: without discovery, `--gossipsub-port 0` is a supported
+    /// configuration (the test above pins that), and it stays supported when an
+    /// HTTP port asks the OS to pick as well.
+    #[test]
+    fn port_zero_never_counts_as_a_clash() {
+        for flag in ["--api-port", "--metrics-port", "--discovery.port"] {
+            let mut argv = vec!["--gossipsub-port", "0", flag, "0"];
+            if flag == "--discovery.port" {
+                argv.push("--discovery.enable");
+                // Discovery rejects a `0` gossipsub port on its own grounds:
+                // the ENR would publish a port no peer can dial. What must not
+                // happen is the pair being rejected as a collision.
+                let err = parse(&argv)
+                    .validate_ports()
+                    .expect_err("gossipsub port 0 stays invalid under discovery");
+                assert!(
+                    !err.to_string().contains("must differ"),
+                    "0 == 0 must not be reported as a clash, got: {err}"
+                );
+                continue;
+            }
+            assert!(
+                parse(&argv).validate_ports().is_ok(),
+                "{flag} 0 alongside --gossipsub-port 0 must be accepted"
+            );
+        }
     }
 }
