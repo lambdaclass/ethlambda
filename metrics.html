@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-aa59d95d.js";
+            window.path_to_searchindex_js = "searchindex-b76d671a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -360,6 +360,27 @@ here: a discovery dial that succeeds or fails shows up in
 </thead>
 <tbody>
 <tr><td><code>lean_discovered_peers_dialed_total</code></td><td>Counter</td><td>Peers dialed as a result of discv5 discovery</td><td>On dialing a discovered peer</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="transport-mix"><a class="header" href="#transport-mix">Transport Mix</a></h3>
+<p>Which transport actually carried each established connection, read off the
+connection’s own multiaddr rather than off the address we dialed: libp2p races a
+peer’s QUIC and TCP addresses within one dial, so the answer is not knowable
+before the connection exists. <code>tcp</code> counts are what say the fallback in
+<a href="./discovery.html">Peer discovery</a> is doing work rather than merely being
+advertised.</p>
+<p>Counts connections rather than peers, so it can exceed
+<code>lean_peer_connection_events_total{result="success"}</code>, which fires only on a
+peer’s first connection. <code>unknown</code> covers a multiaddr naming neither transport,
+which nothing ethlambda binds produces.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_peer_connections_by_transport_total</code></td><td>Counter</td><td>Established peer connections by the transport that carried them</td><td>On connection established</td><td>direction=inbound,outbound<br>transport=quic,tcp,unknown</td></tr>
 </tbody>
 </table>
 </div>
