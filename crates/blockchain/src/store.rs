@@ -17,8 +17,7 @@ use ethlambda_types::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA,
-    MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, SlotInterval,
+    GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
     metrics,
 };
@@ -323,14 +322,14 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 /// Process a tick event.
 ///
 /// `store.time()` represents interval-count-since-genesis: each increment is one
-/// 800ms interval. Slot and interval-within-slot are derived as:
+/// interval, a fifth of the configured slot. Slot and interval-within-slot are
+/// derived as:
 ///   slot     = store.time() / INTERVALS_PER_SLOT
 ///   interval = store.time() % INTERVALS_PER_SLOT
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let genesis_time_ms = store.config().genesis_time * 1000;
-    let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
-    let time = time_delta_ms / MILLISECONDS_PER_INTERVAL;
+    let time_delta_ms = timestamp_ms.saturating_sub(store.config().genesis_time_ms());
+    let time = time_delta_ms / store.config().milliseconds_per_interval();
 
     // If we're more than a slot behind, fast-forward to a slot before.
     // Operations are idempotent, so this should be fine.
@@ -889,7 +888,9 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let slot_time_ms = store.config().genesis_time * 1000 + slot * MILLISECONDS_PER_SLOT;
+    let config = *store.config();
+    let slot_time_ms = config.genesis_time_ms()
+        + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &config);
 
     // Advance time to current slot (ticking intervals)
     on_tick(store, slot_time_ms, true);
@@ -1280,6 +1281,7 @@ fn reorg_depth(old_head: H256, new_head: H256, store: &Store) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{
@@ -1312,6 +1314,35 @@ mod tests {
         bits
     }
 
+    /// The store clock counts intervals, so it has to advance once per
+    /// configured interval rather than once per hardcoded 800 ms.
+    #[test]
+    fn on_tick_advances_one_interval_per_configured_interval() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        const GENESIS_TIME: u64 = 1_000;
+        const MILLISECONDS_PER_SLOT: u64 = 8_000;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_state = State::from_genesis(GENESIS_TIME, vec![]);
+        let mut store = Store::from_anchor_state(backend, genesis_state, MILLISECONDS_PER_SLOT);
+        let genesis_ms = GENESIS_TIME * 1_000;
+
+        // One interval in: still short of the second boundary at 1600 ms.
+        on_tick(&mut store, genesis_ms + 1_599, false);
+        assert_eq!(store.time().unwrap(), 0);
+
+        on_tick(&mut store, genesis_ms + 1_600, false);
+        assert_eq!(store.time().unwrap(), 1);
+        assert_eq!(store.current_slot(), 0);
+
+        // A whole slot in: five intervals, so the slot rolls over.
+        on_tick(&mut store, genesis_ms + MILLISECONDS_PER_SLOT, false);
+        assert_eq!(store.time().unwrap(), INTERVALS_PER_SLOT);
+        assert_eq!(store.current_slot(), 1);
+    }
+
     #[test]
     fn on_block_rejects_duplicate_attestation_data() {
         use ethlambda_storage::backend::InMemoryBackend;
@@ -1322,7 +1353,8 @@ mod tests {
         // Use `from_anchor_state` here rather than `get_forkchoice_store`:
         // the latter now enforces `block.state_root == hash_tree_root(state)`,
         // which a synthetic genesis block with zero state_root cannot satisfy.
-        let mut store = Store::from_anchor_state(backend, genesis_state);
+        let mut store =
+            Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         let head_root = store.head().expect("store head exists");
         let att_data = AttestationData {
@@ -1417,7 +1449,7 @@ mod tests {
         use std::sync::Arc;
         let genesis_state = State::from_genesis(1000, vec![]);
         let backend = Arc::new(InMemoryBackend::new());
-        Store::from_anchor_state(backend, genesis_state)
+        Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT)
     }
 
     /// The produced attestation source must track the head state's justified
@@ -1763,7 +1795,8 @@ mod tests {
 
         let genesis_state = State::from_genesis(1000, vec![]);
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, genesis_state);
+        let mut store =
+            Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
         store.set_time(0).expect("set_time should succeed");
 
         // current_slot = 0, so the horizon is slot 1; a slot-2 block overshoots it.
@@ -1803,7 +1836,8 @@ mod tests {
 
         let genesis_state = State::from_genesis(1000, vec![]);
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, genesis_state);
+        let mut store =
+            Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
         store.set_time(0).expect("set_time should succeed");
 
         // Parent (genesis) sits at slot 0, so a slot one past the limit overshoots.

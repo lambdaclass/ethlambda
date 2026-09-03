@@ -618,9 +618,11 @@ source code locations, and performance.
 
 ### Tick-Based Scheduling
 
-ethlambda divides time into **4-second slots**, each split into **5 intervals** (800 ms
-each), as described in [Slots and Intervals](./slots_and_intervals.md). Fork choice
-operations are scheduled at specific intervals:
+ethlambda divides time into slots, each split into **5 intervals**. The slot lasts
+4 seconds unless the network's config file sets `MILLISECONDS_PER_SLOT`, so the 800 ms
+intervals below are the default grid, as described in
+[Slots and Intervals](./slots_and_intervals.md). Fork choice operations are scheduled
+at specific intervals:
 
 ```text
                              ONE SLOT (4000 ms)
@@ -692,7 +694,7 @@ Ethereum Beacon Chain:
 | **Equivocation handling** | Not in fork choice | Equivocating validators' weight excluded |
 | **Attestation frequency** | Every slot | Once per epoch |
 | **Committee structure** | All validators attest each slot | Validators split into per-slot committees |
-| **Slot duration** | 4 seconds | 12 seconds |
+| **Slot duration** | 4 seconds (configurable) | 12 seconds |
 
 **No proposer boost.** The Beacon Chain adds a "proposer boost", a temporary weight bonus
 given to newly proposed blocks to prevent balancing attacks. ethlambda does not implement

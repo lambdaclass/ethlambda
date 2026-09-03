@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use ethlambda_metrics::*;
+use ethlambda_types::chain_config::ChainConfig;
 
 // --- Label sets ---
 
@@ -407,6 +408,10 @@ static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+/// Buckets clustered just past 0.8 s, the interval width of the default
+/// 4-second cadence ([`crate::DEFAULT_MILLISECONDS_PER_SLOT`]). Prometheus
+/// fixes buckets at registration, so a network on a different slot duration
+/// reads this histogram against the default grid rather than its own.
 static LEAN_TICK_INTERVAL_DURATION_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -526,9 +531,14 @@ static LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED: std::sync::LazyLock<Histogram> =
 
 // --- Gossip Arrival Timing ---
 
-/// Bucket boundaries shared by the three gossip arrival-delay histograms,
-/// aligned to the interval and slot durations (see
-/// [`crate::MILLISECONDS_PER_INTERVAL`], [`crate::MILLISECONDS_PER_SLOT`]).
+/// Bucket boundaries shared by the three gossip arrival-delay histograms.
+///
+/// Fixed rather than derived from the configured slot duration: Prometheus
+/// bakes buckets in at registration, and these are the interval and slot
+/// boundaries of the default 4-second cadence
+/// ([`crate::DEFAULT_MILLISECONDS_PER_SLOT`]). A network running a different
+/// cadence still gets usable buckets, just ones that no longer line up with
+/// its interval edges.
 fn gossip_arrival_delay_buckets() -> Vec<f64> {
     vec![0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.4, 4.0, 8.0, 16.0]
 }
@@ -605,34 +615,34 @@ static LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL: std::sync::LazyLock<IntCounterVec>
 /// `arrival_ms`. Negative means the message arrived before it was due.
 fn interval_delta_ms(
     arrival_ms: u64,
-    genesis_ms: u64,
+    config: &ChainConfig,
     anchor_slot: u64,
     interval: crate::SlotInterval,
 ) -> i64 {
-    let expected_ms = genesis_ms + interval.to_ms_since_genesis(anchor_slot);
+    let expected_ms = config.genesis_time_ms() + interval.to_ms_since_genesis(anchor_slot, config);
     arrival_ms as i64 - expected_ms as i64
 }
 
 /// Milliseconds since the most recent `interval` boundary at or before
-/// `arrival_ms`. Always in `[0, MILLISECONDS_PER_SLOT)`, so it never reports
+/// `arrival_ms`. Always in `[0, milliseconds_per_slot)`, so it never reports
 /// a negative delta.
 fn latest_interval_delta_ms(
     arrival_ms: u64,
-    genesis_ms: u64,
+    config: &ChainConfig,
     interval: crate::SlotInterval,
 ) -> i64 {
-    let since_genesis = arrival_ms.saturating_sub(genesis_ms) as i64;
+    let since_genesis = arrival_ms.saturating_sub(config.genesis_time_ms()) as i64;
     // Slot 0 makes `to_ms_since_genesis` yield just the offset within a slot.
-    let anchor_offset = interval.to_ms_since_genesis(0) as i64;
-    (since_genesis - anchor_offset).rem_euclid(crate::MILLISECONDS_PER_SLOT as i64)
+    let anchor_offset = interval.to_ms_since_genesis(0, config) as i64;
+    (since_genesis - anchor_offset).rem_euclid(config.milliseconds_per_slot as i64)
 }
 
 /// Classify a signed delta against the interval width: `inside` is the
 /// half-open range from the interval's start up to its end.
-fn position_from_delta(delta_ms: i64) -> SlotPosition {
+fn position_from_delta(delta_ms: i64, config: &ChainConfig) -> SlotPosition {
     if delta_ms < 0 {
         SlotPosition::Before
-    } else if delta_ms < crate::MILLISECONDS_PER_INTERVAL as i64 {
+    } else if delta_ms < config.milliseconds_per_interval() as i64 {
         SlotPosition::Inside
     } else {
         SlotPosition::After
@@ -642,34 +652,34 @@ fn position_from_delta(delta_ms: i64) -> SlotPosition {
 /// Observe a gossip block's arrival against the start of its own slot's
 /// [`crate::SlotInterval::BlockPublication`] interval. Zero point: `block_slot`'s
 /// slot boundary.
-pub fn observe_gossip_block_arrival(arrival_ms: u64, genesis_ms: u64, block_slot: u64) {
+pub fn observe_gossip_block_arrival(arrival_ms: u64, config: &ChainConfig, block_slot: u64) {
     let delta_ms = interval_delta_ms(
         arrival_ms,
-        genesis_ms,
+        config,
         block_slot,
         crate::SlotInterval::BlockPublication,
     );
     LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS
         .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
     LEAN_GOSSIP_BLOCK_ARRIVAL_TOTAL
-        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .with_label_values(&[position_from_delta(delta_ms, config).as_str()])
         .inc();
 }
 
 /// Observe a gossip attestation's arrival against its data slot's
 /// [`crate::SlotInterval::AttestationProduction`] interval. Zero point:
 /// `data_slot`'s interval-1 boundary.
-pub fn observe_gossip_attestation_arrival(arrival_ms: u64, genesis_ms: u64, data_slot: u64) {
+pub fn observe_gossip_attestation_arrival(arrival_ms: u64, config: &ChainConfig, data_slot: u64) {
     let delta_ms = interval_delta_ms(
         arrival_ms,
-        genesis_ms,
+        config,
         data_slot,
         crate::SlotInterval::AttestationProduction,
     );
     LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS
         .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
     LEAN_GOSSIP_ATTESTATION_ARRIVAL_TOTAL
-        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .with_label_values(&[position_from_delta(delta_ms, config).as_str()])
         .inc();
 }
 
@@ -682,13 +692,12 @@ pub fn observe_gossip_attestation_arrival(arrival_ms: u64, genesis_ms: u64, data
 /// `aggregation.rs`), so anchoring to `data.slot` would fill the histogram
 /// with large values that are not a health problem. Assuming the latest
 /// aggregation interval bounds the value to one slot.
-pub fn observe_gossip_aggregation_arrival(arrival_ms: u64, genesis_ms: u64) {
-    let delta_ms =
-        latest_interval_delta_ms(arrival_ms, genesis_ms, crate::SlotInterval::Aggregation);
+pub fn observe_gossip_aggregation_arrival(arrival_ms: u64, config: &ChainConfig) {
+    let delta_ms = latest_interval_delta_ms(arrival_ms, config, crate::SlotInterval::Aggregation);
     LEAN_GOSSIP_AGGREGATION_ARRIVAL_DELAY_SECONDS
         .observe(Duration::from_millis(delta_ms.unsigned_abs()).as_secs_f64());
     LEAN_GOSSIP_AGGREGATION_ARRIVAL_TOTAL
-        .with_label_values(&[position_from_delta(delta_ms).as_str()])
+        .with_label_values(&[position_from_delta(delta_ms, config).as_str()])
         .inc();
 }
 

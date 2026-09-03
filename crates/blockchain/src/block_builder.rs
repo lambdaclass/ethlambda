@@ -972,7 +972,7 @@ mod tests {
     fn build_block_caps_attestation_data_entries() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz::SszEncode;
         use libssz_types::SszList;
@@ -1008,7 +1008,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1134,7 +1134,7 @@ mod tests {
     fn build_block_respects_configured_attestation_limit() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1165,7 +1165,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1266,7 +1266,7 @@ mod tests {
     fn build_block_without_proposer_aggregation_keeps_single_best_proof_per_data() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1294,7 +1294,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1568,7 +1568,7 @@ mod tests {
         use ethlambda_state_transition::justified_slots_ops;
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1601,7 +1601,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint {
@@ -1697,7 +1697,7 @@ mod tests {
     fn build_block_cascades_projected_justification_across_rounds() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1723,7 +1723,7 @@ mod tests {
             body_root: BlockBody::default().hash_tree_root(),
         };
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),

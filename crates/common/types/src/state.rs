@@ -15,7 +15,7 @@ use primitives::HashTreeRoot as _;
 #[derive(Debug, Clone, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
     /// The chain's configuration parameters
-    pub config: ChainConfig,
+    pub config: StateConfig,
     /// The current slot number
     pub slot: u64,
     /// The header of the most recent block
@@ -38,8 +38,9 @@ pub struct State {
 
 /// The maximum number of historical block roots to store in the state.
 ///
-/// With a 4-second slot, this corresponds to a history
-/// of approximately 12.1 days.
+/// With the default 4-second slot, this corresponds to a history of
+/// approximately 12.1 days; a network running a longer slot covers
+/// proportionally more time with the same limit.
 pub const HISTORICAL_ROOTS_LIMIT: usize = 262_144; // 2**18
 
 /// List of historical block root hashes up to historical_roots_limit.
@@ -100,7 +101,7 @@ impl State {
         let justifications_validators = JustificationValidators::new();
 
         Self {
-            config: ChainConfig { genesis_time },
+            config: StateConfig { genesis_time },
             slot: 0,
             latest_block_header: genesis_header,
             latest_justified: Checkpoint::default(),
@@ -114,8 +115,13 @@ impl State {
     }
 }
 
+/// The chain config carried inside [`State`], the spec's `Config` container.
+///
+/// Merkleized into the state root, so its layout is fixed by the spec and no
+/// field may be added here. [`crate::chain_config::ChainConfig`] is the node's
+/// own view: this plus the slot duration.
 #[derive(Debug, Clone, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
-pub struct ChainConfig {
+pub struct StateConfig {
     pub genesis_time: u64,
 }
 

@@ -50,6 +50,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     attestation::{AggregationBits, AttestationData, HashedAttestationData},
     block::{ByteList512KiB, SingleMessageAggregate},
+    chain_config::ChainConfig,
+    constants::{INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT},
     primitives::H256,
     state::Validator,
 };
@@ -59,7 +61,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
-use crate::{MILLISECONDS_PER_INTERVAL, MILLISECONDS_PER_SLOT, metrics};
+use crate::{SlotInterval, metrics};
 
 /// How long the worker waits before re-reading the pool when it found nothing
 /// to do — no eligible job, the pause flag raised, or no aggregation duty.
@@ -82,7 +84,13 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// of the vote-aggregation interval. Before it, a current-slot group needs
 /// [`min_current_slot_group_sigs`] signatures to be worth a proof; from it on,
 /// whatever the group holds is aggregated.
-const VOTE_AGGREGATION_OFFSET_MS: u64 = 2 * MILLISECONDS_PER_INTERVAL;
+///
+/// Derived from the configured slot duration, like every other interval
+/// boundary.
+fn vote_aggregation_offset_ms(config: &ChainConfig) -> u64 {
+    // Slot 0 reduces `to_ms_since_genesis` to the offset within a slot.
+    SlotInterval::Aggregation.to_ms_since_genesis(0, config)
+}
 
 /// How long before the vote-aggregation boundary the worker stops taking
 /// anything but the slot's committee signatures.
@@ -92,13 +100,21 @@ const VOTE_AGGREGATION_OFFSET_MS: u64 = 2 * MILLISECONDS_PER_INTERVAL;
 /// the aggregate the whole slot is waiting on. Idling instead costs little,
 /// since the backlog is not going anywhere, and this window is where the
 /// committee's signatures typically cross the two-thirds mark.
+///
+/// Fixed rather than scaled with the slot duration. What the window protects
+/// is wall time for one leanVM proof, and a proof costs the same however long
+/// the network's slot is.
 pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
 
 // The window must not reach past the start of the slot, so `job_policy`'s
-// subtraction cannot underflow into the previous one.
+// subtraction cannot underflow into the previous one. The slot duration is
+// configurable, so the binding case is the narrowest grid a config file can
+// ask for. Keep the invariant self-enforcing so a future bump to the window,
+// or a lowered floor, can't silently underflow that subtraction.
 const _: () = assert!(
-    EARLY_AGGREGATION_WINDOW.as_millis() <= VOTE_AGGREGATION_OFFSET_MS as u128,
-    "EARLY_AGGREGATION_WINDOW must not reach past the slot boundary"
+    EARLY_AGGREGATION_WINDOW.as_millis()
+        <= (2 * MIN_MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT) as u128,
+    "EARLY_AGGREGATION_WINDOW must not reach past the slot boundary at the shortest cadence"
 );
 
 /// A single pre-prepared aggregation group.
@@ -489,8 +505,14 @@ fn min_current_slot_group_sigs(
 }
 
 /// The policy in force `ms_into_slot` into the slot.
-fn job_policy(ms_into_slot: u64, store: &Store, config: &WorkerConfig) -> JobPolicy {
-    if ms_into_slot >= VOTE_AGGREGATION_OFFSET_MS {
+fn job_policy(
+    ms_into_slot: u64,
+    time_config: &ChainConfig,
+    store: &Store,
+    config: &WorkerConfig,
+) -> JobPolicy {
+    let vote_aggregation_offset_ms = vote_aggregation_offset_ms(time_config);
+    if ms_into_slot >= vote_aggregation_offset_ms {
         return JobPolicy::Open;
     }
 
@@ -505,7 +527,7 @@ fn job_policy(ms_into_slot: u64, store: &Store, config: &WorkerConfig) -> JobPol
     )
     .unwrap_or(usize::MAX);
 
-    let window_opens_at = VOTE_AGGREGATION_OFFSET_MS - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
+    let window_opens_at = vote_aggregation_offset_ms - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
     if ms_into_slot >= window_opens_at {
         JobPolicy::CommitteeOnly { min_sigs }
     } else {
@@ -896,13 +918,15 @@ fn run_aggregation_worker(
 ) {
     info!("Aggregation worker started");
 
-    let genesis_time_ms = store.config().genesis_time * 1000;
+    // The chain's time grid never changes at runtime, so one read covers the
+    // worker's whole life.
+    let time_config = *store.config();
     let mut emitted = EmittedCoverage::default();
 
     while !cancel.is_cancelled() {
         let Some(job) = next_job(
             &store,
-            genesis_time_ms,
+            &time_config,
             &aggregator,
             &paused,
             &config,
@@ -963,7 +987,7 @@ fn run_aggregation_worker(
 /// one.
 fn next_job(
     store: &Store,
-    genesis_time_ms: u64,
+    time_config: &ChainConfig,
     aggregator: &AggregatorController,
     paused: &AtomicBool,
     config: &WorkerConfig,
@@ -974,12 +998,12 @@ fn next_job(
     }
 
     // Before genesis there is no slot to aggregate for.
-    let ms_since_genesis = crate::unix_now_ms().checked_sub(genesis_time_ms)?;
-    let slot = ms_since_genesis / MILLISECONDS_PER_SLOT;
-    let ms_into_slot = ms_since_genesis % MILLISECONDS_PER_SLOT;
+    let ms_since_genesis = crate::unix_now_ms().checked_sub(time_config.genesis_time_ms())?;
+    let slot = ms_since_genesis / time_config.milliseconds_per_slot;
+    let ms_into_slot = ms_since_genesis % time_config.milliseconds_per_slot;
 
     emitted.roll_to(slot);
-    let policy = job_policy(ms_into_slot, store, config);
+    let policy = job_policy(ms_into_slot, time_config, store, config);
 
     select_best_job(store, slot, policy, emitted)
 }
@@ -988,10 +1012,11 @@ fn next_job(
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
         checkpoint::Checkpoint,
-        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
+        state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz_types::SszList;
     use std::sync::Arc;
@@ -1056,7 +1081,7 @@ mod tests {
             body_root: H256::ZERO,
         };
         State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: head_slot,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1071,7 +1096,7 @@ mod tests {
 
     fn new_test_store(head_state: State) -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
-        Store::from_anchor_state(backend, head_state)
+        Store::from_anchor_state(backend, head_state, DEFAULT_MILLISECONDS_PER_SLOT)
     }
 
     /// Insert a header-only block at `root` so it shows up in
@@ -1732,7 +1757,9 @@ mod tests {
 
     /// The policy is purely a function of where in the slot we are: backlog
     /// work early, committee signatures only inside the early window, and
-    /// everything from the vote-aggregation boundary to the slot's end.
+    /// everything from the vote-aggregation boundary to the slot's end. The
+    /// boundaries follow the configured slot duration; the window ahead of
+    /// them does not, since it is sized against one leanVM proof.
     #[test]
     fn job_policy_tightens_into_the_window_and_opens_at_the_boundary() {
         let hashes = vec![H256([1u8; 32])];
@@ -1744,32 +1771,37 @@ mod tests {
         // 10 validators over 4 committees: subnets 0 and 1 hold 3 each, so a
         // group gathering both needs 4 of those 6.
         let min_sigs = 4;
-        let window_opens_at =
-            VOTE_AGGREGATION_OFFSET_MS - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
 
-        assert_eq!(
-            job_policy(0, &store, &config),
-            JobPolicy::Backlog { min_sigs }
-        );
-        assert_eq!(
-            job_policy(window_opens_at - 1, &store, &config),
-            JobPolicy::Backlog { min_sigs }
-        );
-        assert_eq!(
-            job_policy(window_opens_at, &store, &config),
-            JobPolicy::CommitteeOnly { min_sigs }
-        );
-        assert_eq!(
-            job_policy(VOTE_AGGREGATION_OFFSET_MS - 1, &store, &config),
-            JobPolicy::CommitteeOnly { min_sigs }
-        );
-        assert_eq!(
-            job_policy(VOTE_AGGREGATION_OFFSET_MS, &store, &config),
-            JobPolicy::Open
-        );
-        assert_eq!(
-            job_policy(MILLISECONDS_PER_SLOT - 1, &store, &config),
-            JobPolicy::Open
-        );
+        for milliseconds_per_slot in [DEFAULT_MILLISECONDS_PER_SLOT, 8_000] {
+            let time_config = ChainConfig::new(1_000, milliseconds_per_slot);
+            let boundary = vote_aggregation_offset_ms(&time_config);
+            assert_eq!(boundary, 2 * milliseconds_per_slot / INTERVALS_PER_SLOT);
+            let window_opens_at = boundary - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
+
+            assert_eq!(
+                job_policy(0, &time_config, &store, &config),
+                JobPolicy::Backlog { min_sigs }
+            );
+            assert_eq!(
+                job_policy(window_opens_at - 1, &time_config, &store, &config),
+                JobPolicy::Backlog { min_sigs }
+            );
+            assert_eq!(
+                job_policy(window_opens_at, &time_config, &store, &config),
+                JobPolicy::CommitteeOnly { min_sigs }
+            );
+            assert_eq!(
+                job_policy(boundary - 1, &time_config, &store, &config),
+                JobPolicy::CommitteeOnly { min_sigs }
+            );
+            assert_eq!(
+                job_policy(boundary, &time_config, &store, &config),
+                JobPolicy::Open
+            );
+            assert_eq!(
+                job_policy(milliseconds_per_slot - 1, &time_config, &store, &config),
+                JobPolicy::Open
+            );
+        }
     }
 }

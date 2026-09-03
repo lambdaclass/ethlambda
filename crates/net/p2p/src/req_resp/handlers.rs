@@ -589,6 +589,7 @@ async fn handle_fetch_failure(
 mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         block::{Block, BlockBody, MultiMessageAggregate},
         state::State,
@@ -611,7 +612,11 @@ mod tests {
     #[test]
     fn blocks_by_range_returns_canonical_blocks_in_requested_order() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
 
         let block_1 = signed_block(1, store.head().expect("head block exists"));
         let root_1 = block_1.message.hash_tree_root();

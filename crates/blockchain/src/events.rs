@@ -322,6 +322,7 @@ fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
 mod tests {
     use super::*;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
         state::State,
@@ -435,7 +436,11 @@ mod tests {
 
     fn test_store() -> Store {
         let genesis_state = State::from_genesis(1000, vec![]);
-        Store::from_anchor_state(Arc::new(InMemoryBackend::new()), genesis_state)
+        Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            genesis_state,
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
     }
 
     /// Insert a header-only block at `root` so header reads (block root, slot,
